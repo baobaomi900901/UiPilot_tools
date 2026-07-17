@@ -1,4 +1,5 @@
 mod error;
+mod query;
 mod scope;
 mod windows_search;
 
@@ -7,6 +8,10 @@ use std::ffi::OsString;
 use serde::Serialize;
 
 pub use error::{ErrorEvidence, ErrorKind, OperationCounters, SpikeError};
+pub use query::{
+    QueryEvidence, QueryOperations, SearchBackend, SearchHit, execute_indexed_literal_query,
+    run_query_operations,
+};
 pub use scope::{CrawlRule, IndexedScope, ScopeEvidence, SearchStatus, validated_file_scopes};
 pub use windows_search::WindowsSearch;
 
@@ -56,7 +61,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
     }
 }
 
-fn validate_literal(literal: &str) -> Result<(), SpikeError> {
+pub(crate) fn validate_literal(literal: &str) -> Result<(), SpikeError> {
     let mut count = 0usize;
     for value in literal.chars() {
         count += 1;

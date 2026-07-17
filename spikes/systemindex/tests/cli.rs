@@ -151,17 +151,27 @@ fn status_and_scopes_report_zero_query_counters() {
 }
 
 #[test]
-fn query_is_not_runnable_before_task_three_and_reports_zero_counters() {
-    let output = run(&["query", "--literal", "report", "--limit", "20", "--json"]);
-    assert_eq!(output.status.code(), Some(2));
-    let evidence: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(evidence["kind"], "notRunnable");
+fn query_reports_structured_search_evidence_and_boundary_counters() {
+    let output = run(&[
+        "query",
+        "--literal",
+        "uipilot-systemindex-spike-definitely-missing-7f7130c4",
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    let evidence: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        evidence["literal"],
+        "uipilot-systemindex-spike-definitely-missing-7f7130c4"
+    );
     assert_eq!(
         evidence["counters"],
         serde_json::json!({
-            "searchFolderFactoryCreated": 0,
-            "scopeSet": 0,
-            "searchFolderEnumerated": 0,
+            "searchFolderFactoryCreated": 1,
+            "scopeSet": 1,
+            "searchFolderEnumerated": 1,
         })
     );
 }

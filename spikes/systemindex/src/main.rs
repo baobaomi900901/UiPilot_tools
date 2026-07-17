@@ -1,6 +1,9 @@
 use std::process::ExitCode;
 
-use systemindex_spike::{Command, OperationCounters, SpikeError, WindowsSearch, parse_args};
+use systemindex_spike::{
+    Command, OperationCounters, SpikeError, WindowsSearch, execute_indexed_literal_query,
+    parse_args,
+};
 
 fn main() -> ExitCode {
     match parse_args(std::env::args_os()) {
@@ -26,9 +29,12 @@ fn execute(command: Command) -> ExitCode {
             serde_json::to_value(evidence)
                 .map_err(|error| SpikeError::verification_failed(error.to_string()))
         }),
-        Command::Query { .. } => Err(SpikeError::not_runnable(
-            "query execution is gated by Task 3",
-        )),
+        Command::Query { literal, limit } => {
+            execute_indexed_literal_query(&search, &literal, limit).and_then(|evidence| {
+                serde_json::to_value(evidence)
+                    .map_err(|error| SpikeError::verification_failed(error.to_string()))
+            })
+        }
     });
 
     match result {
