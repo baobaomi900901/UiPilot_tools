@@ -216,10 +216,11 @@ Create `scripts/check-security-config.ps1` with checks for these exact invariant
 ```powershell
 $ErrorActionPreference = 'Stop'
 $config = Get-Content "$PSScriptRoot/../src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+$probeConfig = Get-Content "$PSScriptRoot/../src-tauri/tauri.security-probe.conf.json" -Raw | ConvertFrom-Json
 $capabilityDirectory = "$PSScriptRoot/../src-tauri/capabilities"
 $capabilityFiles = @(
   Get-ChildItem $capabilityDirectory -Recurse -File |
-    Where-Object { $_.Extension -in @('.json', '.toml') }
+    Where-Object { $_.Extension -in @('.json', '.json5', '.toml') }
 )
 $expectedCapability = [IO.Path]::GetFullPath((Join-Path $capabilityDirectory 'main.json'))
 if (
@@ -235,6 +236,19 @@ if ($config.app.security.csp -ne "default-src 'self'; script-src 'self'; style-s
 }
 if ($config.app.security.PSObject.Properties['capabilities']) {
   throw 'Inline or explicitly enabled capabilities are not allowed'
+}
+$expectedProbeProperties = @('$schema', 'build') | Sort-Object
+$actualProbeProperties = @($probeConfig.PSObject.Properties.Name) | Sort-Object
+if (Compare-Object $expectedProbeProperties $actualProbeProperties) {
+  throw 'Security probe override contains unexpected configuration'
+}
+$probeBuildProperties = @($probeConfig.build.PSObject.Properties.Name)
+if (
+  $probeBuildProperties.Count -ne 1 -or
+  $probeBuildProperties[0] -ne 'beforeBuildCommand' -or
+  $probeConfig.build.beforeBuildCommand -ne 'npm run build -- --mode security-probe'
+) {
+  throw 'Unexpected security probe build configuration'
 }
 if ($config.app.windows.Count -ne 1 -or $config.app.windows[0].label -ne 'main') {
   throw 'Only the main WebView is allowed'
@@ -317,7 +331,7 @@ if (-not (Test-Path -LiteralPath $probeExe)) { throw 'Probe executable was not p
 & .\scripts\test-security-probe.ps1 -Executable $probeExe
 ```
 
-Expected: `security config ok`; regression fixtures reject nested TOML and inline capabilities; normal Vite output omits the probe; Cargo exits 0; the unique probe build produces an executable whose non-main command call is rejected.
+Expected: `security config ok`; regression fixtures reject nested JSON/TOML/JSON5 capabilities plus capability changes in the base and probe override configs; normal Vite output omits the probe; Cargo exits 0; the unique probe build produces an executable whose non-main command call is rejected.
 
 - [ ] **Step 7: Commit**
 
