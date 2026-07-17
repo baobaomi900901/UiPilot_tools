@@ -112,6 +112,7 @@ struct DailyCounts {
     file_found: u64,
     file_not_found: u64,
     file_cancelled: u64,
+    unclean_sessions: u64,
     host_crashes: u64,
 }
 
@@ -126,7 +127,27 @@ struct ValidationExport {
 
 日期键固定为本地 `YYYY-MM-DD`，通过已使用的 `windows` crate 调用 `GetLocalTime` 获得，不增加日期依赖。活跃日由 `launcherInvocations > 0` 判定；该日成功动作等于 `applicationLaunchRequests + activationSuccesses + fileLocationRequests`。文件字段在 Foundation 阶段保持 0，供通过 Spike 后的文件计划沿用。
 
-事件映射固定为：窗口唤起增加 `launcherInvocations`；`LaunchRequested` 增加 `applicationLaunchRequests`；`ActivationRequested` 增加 `activationSuccesses`；`ActivationRefusedLaunchRequested` 同时增加 `activationRefusals` 与 `applicationLaunchRequests`；未关闭的上次会话增加其记录日期的 `hostCrashes`。失败动作不增加成功动作字段。
+事件映射固定为：窗口唤起增加 `launcherInvocations`；`LaunchRequested` 增加 `applicationLaunchRequests`；`ActivationRequested` 增加 `activationSuccesses`；`ActivationRefusedLaunchRequested` 同时增加 `activationRefusals` 与 `applicationLaunchRequests`。失败动作不增加成功动作字段。
+
+启动时为当前进程写入只含 opaque `sessionId` 和本地日期的 open-session marker。下次启动发现 marker 时，只增加其日期的 `uncleanSessions`。只有同一 `sessionId` 还存在由最外层 `catch_unwind(AssertUnwindSafe(run))` 在 panic 逃出 `run()` 后写入的 marker，或 Windows `SetUnhandledExceptionFilter` 写入的固定类别 marker，才同时增加 `hostCrashes`；已捕获 panic 和普通工作线程 panic 不写 confirmed marker。marker 不记录 panic 文本、异常地址、堆栈、应用名或路径。最外层守卫写标记后 `resume_unwind`，Windows filter 写标记后继续系统默认异常处理。Task Manager 强制结束、断电、未收到结束消息的系统重启等只有 open marker，没有 crash marker，因此只属于 unclean。
+
+正常清理路径固定为：托盘“退出”；Tauri `RunEvent::ExitRequested` 只 flush，真正的 `RunEvent::Exit` 才清除 marker；Windows `WM_QUERYENDSESSION` 只 flush，只有 `WM_ENDSESSION` 的 `wParam != 0` 才清除 marker（关机、注销、系统更新重启）。这样被取消的退出/关机不会被误记为 clean。主窗口 CloseRequested 仍只隐藏，不清理进程 session。研究报告不得把 `uncleanSessions` 自动提升为崩溃；存在尚未通过 WER/Application Error、crash dump 或主持记录完成分类的 unclean session 时，需求第 3.4 节的宿主崩溃 Go 条件只能标记为“证据不足”，不能判定通过。
+
+### Security probe build
+
+安全探针只有一个构建入口：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-security-probe.ps1
+```
+
+该脚本内部只能执行以下 Tauri 构建命令：
+
+```powershell
+npm run tauri build -- --no-bundle --features test-instrumentation --config src-tauri/tauri.security-probe.conf.json
+```
+
+override config 把 `build.beforeBuildCommand` 固定为 `npm run build -- --mode security-probe`，因此同一次 Tauri 构建同时启用 Vite probe mode 和 Cargo `test-instrumentation` feature。脚本把 npm/Tauri 日志发送到 host，成功时 stdout 最后一行只输出探针可执行文件的绝对路径。任何测试或 smoke 都不得直接运行裸 `--features test-instrumentation` 构建。
 
 ### Capability allowlist
 
@@ -162,6 +183,7 @@ Rust 侧使用的 single-instance、global-shortcut、autostart 和原生窗口 
 - Create: `src-tauri/Cargo.toml`
 - Create: `src-tauri/build.rs`
 - Create: `src-tauri/tauri.conf.json`
+- Create: `src-tauri/tauri.security-probe.conf.json`
 - Create: `src-tauri/capabilities/main.json`
 - Create: `src-tauri/src/main.rs`
 - Create: `src-tauri/src/lib.rs`
@@ -169,6 +191,7 @@ Rust 侧使用的 single-instance、global-shortcut、autostart 和原生窗口 
 - Create: `security-probe.html`
 - Create: `src/security-probe.ts`
 - Create: `scripts/check-security-config.ps1`
+- Create: `scripts/build-security-probe.ps1`
 - Create: `scripts/test-security-probe.ps1`
 
 - [ ] **Step 1: Initialize the smallest supported toolchain**
@@ -266,7 +289,7 @@ fn main() {
 }
 ```
 
-Give `main` exactly the permission set in `Capability allowlist`; there is no frontend window-hide permission. `vite.config.ts` includes `security-probe.html` only in `security-probe` mode, and `security_probe.rs` creates its `security-probe` WebView only under Cargo feature `test-instrumentation`. `scripts/test-security-probe.ps1` builds both modes, proves the production dist/binary omit the probe, then launches the instrumented build and asserts `load_settings` is rejected for the non-main label.
+Give `main` exactly the permission set in `Capability allowlist`; there is no frontend window-hide permission. `vite.config.ts` includes `security-probe.html` only in `security-probe` mode, and `security_probe.rs` creates its `security-probe` WebView only under Cargo feature `test-instrumentation`. `tauri.security-probe.conf.json` and `build-security-probe.ps1` implement the single `Security probe build` contract. `scripts/test-security-probe.ps1 -Executable <absolute-path>` never builds; it launches exactly the supplied artifact and asserts `load_settings` is rejected for the non-main label.
 
 - [ ] **Step 5: Add a boot-only Rust and frontend entry point**
 
@@ -278,12 +301,15 @@ Run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
-powershell -ExecutionPolicy Bypass -File scripts/test-security-probe.ps1
 npm run build
+if (Test-Path dist/security-probe.html) { throw 'Production frontend contains security probe' }
 cargo check --manifest-path src-tauri/Cargo.toml
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if (-not (Test-Path -LiteralPath $probeExe)) { throw 'Probe executable was not produced' }
+& .\scripts\test-security-probe.ps1 -Executable $probeExe
 ```
 
-Expected: `security config ok`; TypeScript/Vite build succeeds; Cargo exits 0.
+Expected: `security config ok`; normal Vite output omits the probe; Cargo exits 0; the unique probe build produces an executable whose non-main command call is rejected.
 
 - [ ] **Step 7: Commit**
 
@@ -546,6 +572,7 @@ git commit -m "feat: discover and rank Start Menu apps"
 **Files:**
 - Create: `src-tauri/src/settings.rs`
 - Create: `src-tauri/src/validation_data.rs`
+- Create: `src-tauri/src/crash_marker.rs`
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src/protocol.ts`
 
@@ -561,7 +588,12 @@ Use a unique directory under `std::env::temp_dir()` and remove it at the end of 
 - Two events on the same local date update one `DailyCounts`; the next date creates a second entry.
 - Export has `schemaVersion: 1`, optional `researchId`, and date-keyed `dailyCounts` with every field in the cross-task contract.
 - Three distinct active dates and per-day successful-action totals can be calculated from the exported structure.
-- An unclosed prior session increments `hostCrashes` on the recorded session date; a graceful exit does not.
+- A stale open-session marker without matching crash evidence increments `uncleanSessions` only.
+- A stale open-session marker plus a matching top-level Rust unwind or Windows unhandled-exception marker increments both `uncleanSessions` and `hostCrashes` exactly once.
+- A mismatched/stale crash marker cannot increment `hostCrashes`.
+- A caught panic or ordinary worker-thread panic does not create confirmed crash evidence.
+- `ExitRequested` and `WM_QUERYENDSESSION` alone retain the marker; tray exit, `RunEvent::Exit`, and `WM_ENDSESSION(wParam != 0)` remove it without incrementing either field.
+- Force-termination simulation leaves an unclean session but cannot claim a host crash.
 - Duplicate display names retain separate aliases through their distinct `appId` values.
 - Saving an alias for an unknown `appId` is rejected.
 - Clear resets all aggregates.
@@ -595,7 +627,7 @@ pub(crate) struct Settings {
 
 The aliases map key is `appId`; validate it against the current application cache before saving. `load_settings` joins stored aliases with the current cache and returns the `SettingsView` contract, so same-name applications remain independently editable.
 
-Persist `VALIDATION_SCHEMA_VERSION` and the `BTreeMap<String, DailyCounts>` shape from the cross-task contract. Obtain the local date with `GetLocalTime`; do not store a timestamp. At startup, record the current date as an open session. On graceful tray exit clear it. If the next startup finds an open session, increment `hostCrashes` for that saved date before opening the new session. Do not record raw inputs, result titles, executable names, shortcut paths, or precise behavior times.
+Persist `VALIDATION_SCHEMA_VERSION` and the `BTreeMap<String, DailyCounts>` shape from the cross-task contract. Obtain the local date with `GetLocalTime`; do not store a timestamp. `crash_marker.rs` owns the open-session/fixed-category crash markers, top-level Rust unwind guard and Windows unhandled-exception filter. On startup, reconcile markers exactly as defined in `Validation export`, consume matched crash evidence once, then open the new session. Clean exit removes both current-session markers. `clear_validation_data` clears historical counts but preserves the currently open session marker. Do not record raw inputs, result titles, executable names, shortcut paths, panic text, addresses, stacks, or precise behavior times.
 
 Implement export with Windows `IFileSaveDialog` inside the zero-argument Rust command. Write the aggregate JSON only after the user confirms the native dialog; return only success/cancel/error status to TypeScript. Do not grant dialog or filesystem capabilities to the WebView.
 
@@ -719,6 +751,7 @@ git commit -m "feat: launch and activate trusted app results"
 - Create: `src-tauri/src/lifecycle.rs`
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src-tauri/src/settings.rs`
+- Modify: `src-tauri/src/crash_marker.rs`
 - Modify: `src-tauri/tauri.conf.json`
 
 - [ ] **Step 1: Write failing lifecycle state tests**
@@ -732,6 +765,9 @@ Separate window-state decisions from Tauri handles and test:
 - Single-instance activation reuses the main window.
 - Invalid/conflicting configured hotkey preserves the previous registration and returns a visible error.
 - Autostart remains disabled until explicitly enabled.
+- `ExitRequested` and `WM_QUERYENDSESSION` flush but retain the open marker when exit is cancelled.
+- Tray exit, `RunEvent::Exit`, and `WM_ENDSESSION(wParam != 0)` clear the marker.
+- Main-window CloseRequested and ordinary hide paths do not clear the process-session marker.
 
 - [ ] **Step 2: Run the focused tests and confirm failure**
 
@@ -743,7 +779,7 @@ Expected: compile failure because lifecycle module does not exist.
 
 Install the single-instance plugin first in the builder. Register `Alt+Space` through the global-shortcut plugin. On invocation, generate the opaque monotonically increasing `invocationId`, call `ResultRegistry::on_show(invocationId.clone())`, center the fixed-size window near the top of the current monitor, show it, focus it, and emit the same `invocationId` in `launcher://shown` with a Rust `Instant` measurement in test builds.
 
-Create a tray menu with only `打开设置` and `退出`. Focus loss and window close call `clear_and_hide`; tray `退出` first marks the validation session clean, then terminates the process. Apply autostart changes only after the corresponding plugin call succeeds, then persist settings.
+Create a tray menu with only `打开设置` and `退出`. Focus loss and window close call `clear_and_hide` without touching the process marker. Tray `退出`, Tauri run events and a minimal Windows session-end message hook implement the exact clean-exit transitions in `Validation export`; the hook never blocks shutdown. Apply autostart changes only after the corresponding plugin call succeeds, then persist settings.
 
 - [ ] **Step 4: Verify lifecycle logic and compile the desktop binary**
 
@@ -881,7 +917,7 @@ Expected: compile failure because the performance module does not exist.
 
 - [ ] **Step 3: Implement test-build-only traces and a manual smoke script**
 
-`scripts/smoke-launcher.ps1` must verify that the built executable starts once, a second process exits, and the first process remains alive. It must not launch arbitrary applications automatically; application activation remains a manual checklist because it changes desktop state.
+`scripts/smoke-launcher.ps1 -Executable <absolute-path> [-RequireSecurityProbe]` must run exactly the supplied executable, verify it starts once, verify a second process exits, and confirm the first process remains alive. With `-RequireSecurityProbe`, it additionally requires the probe window and delegates its permission assertion to `test-security-probe.ps1`; absence of the page is a failure. It must not launch arbitrary applications automatically; application activation remains a manual checklist because it changes desktop state.
 
 Document these manual Windows 11 checks in `README.md`:
 
@@ -895,7 +931,7 @@ Document these manual Windows 11 checks in `README.md`:
 8. Visible focus, list selection, live error status, and a Windows Narrator smoke pass are recorded.
 9. No network request appears during ordinary use.
 
-`scripts/benchmark-launcher.ps1` must use Windows UI Automation and one external `Stopwatch` clock for the hot-launch measurement. Run 5 warmups followed by 200 measured `Alt+Space` invocations and assert `shortcut_sent_external -> input_focus_observed_external` P95 is at most 1 second. In a `test-instrumentation` build with a deterministic 500-application in-memory cache, run 1,000 fixed queries through the actual input/DOM path and assert `query_input_ui -> app_results_committed_ui` P95 is at most 100 ms. The report must include all reference-environment fields required by section 10.1 and must not contain query text or application names.
+`scripts/benchmark-launcher.ps1 -Executable <absolute-path>` must use exactly the supplied instrumented executable, Windows UI Automation and one external `Stopwatch` clock for the hot-launch measurement. Run 5 warmups followed by 200 measured `Alt+Space` invocations and assert `shortcut_sent_external -> input_focus_observed_external` P95 is at most 1 second. With the deterministic 500-application in-memory cache, run 1,000 fixed queries through the actual input/DOM path and assert `query_input_ui -> app_results_committed_ui` P95 is at most 100 ms. The report must include all reference-environment fields required by section 10.1 and must not contain query text or application names.
 
 - [ ] **Step 4: Run the complete automated gate**
 
@@ -908,15 +944,18 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
 npm run tauri build -- --no-bundle
-npm run tauri build -- --no-bundle --features test-instrumentation
-powershell -ExecutionPolicy Bypass -File scripts/smoke-launcher.ps1
-powershell -ExecutionPolicy Bypass -File scripts/benchmark-launcher.ps1
+$productionExe = (Resolve-Path 'src-tauri/target/release/uipilot.exe').Path
+& .\scripts\smoke-launcher.ps1 -Executable $productionExe
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if (-not (Test-Path -LiteralPath $probeExe)) { throw 'Probe executable was not produced' }
+& .\scripts\smoke-launcher.ps1 -Executable $probeExe -RequireSecurityProbe
+& .\scripts\benchmark-launcher.ps1 -Executable $probeExe
 git diff --check
 ```
 
 Expected: every command exits 0. Manual checks are recorded with Windows build, WebView2 version, application used, result, and allowed-difference classification.
 
-The smoke script must also launch the test-only `security-probe` WebView and assert its `load_settings` invocation is rejected. This assertion is required even though the static capability check already limits the window label.
+The probe test, probe smoke and benchmark must all receive the exact path emitted by `build-security-probe.ps1`. The gate must contain no direct `tauri build --features test-instrumentation` command.
 
 - [ ] **Step 5: Review against the frozen scope**
 
