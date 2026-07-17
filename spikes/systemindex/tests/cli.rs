@@ -7,6 +7,13 @@ fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
+fn run(values: &[&str]) -> std::process::Output {
+    ProcessCommand::new(env!("CARGO_BIN_EXE_systemindex-spike"))
+        .args(values)
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn parses_only_the_three_supported_command_shapes() {
     assert_eq!(
@@ -118,12 +125,43 @@ fn rejects_unknown_flags_and_caller_supplied_paths_or_scopes() {
 
 #[test]
 fn invalid_cli_input_exits_nonzero_with_json_on_stderr() {
-    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_systemindex-spike"))
-        .args(["query", "--literal", "", "--limit", "20", "--json"])
-        .output()
-        .unwrap();
+    let output = run(&["query", "--literal", "", "--limit", "20", "--json"]);
 
     assert!(!output.status.success());
     let evidence: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(evidence["kind"], "invalidInput");
+}
+
+#[test]
+fn status_and_scopes_report_zero_query_counters() {
+    for command in ["status", "scopes"] {
+        let output = run(&[command, "--json"]);
+        assert!(output.status.success(), "{command} failed");
+        let evidence: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(evidence["catalog"], "SystemIndex");
+        assert_eq!(
+            evidence["counters"],
+            serde_json::json!({
+                "searchFolderFactoryCreated": 0,
+                "scopeSet": 0,
+                "searchFolderEnumerated": 0,
+            })
+        );
+    }
+}
+
+#[test]
+fn query_is_not_runnable_before_task_three_and_reports_zero_counters() {
+    let output = run(&["query", "--literal", "report", "--limit", "20", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let evidence: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(evidence["kind"], "notRunnable");
+    assert_eq!(
+        evidence["counters"],
+        serde_json::json!({
+            "searchFolderFactoryCreated": 0,
+            "scopeSet": 0,
+            "searchFolderEnumerated": 0,
+        })
+    );
 }

@@ -1,10 +1,14 @@
 mod error;
+mod scope;
+mod windows_search;
 
 use std::ffi::OsString;
 
 use serde::Serialize;
 
-pub use error::{ErrorEvidence, ErrorKind, SpikeError};
+pub use error::{ErrorEvidence, ErrorKind, OperationCounters, SpikeError};
+pub use scope::{CrawlRule, IndexedScope, ScopeEvidence, SearchStatus, validated_file_scopes};
+pub use windows_search::WindowsSearch;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "command", rename_all = "camelCase")]

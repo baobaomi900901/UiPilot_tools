@@ -2,6 +2,14 @@ use std::fmt;
 
 use serde::Serialize;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationCounters {
+    pub search_folder_factory_created: u32,
+    pub scope_set: u32,
+    pub search_folder_enumerated: u32,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ErrorKind {
@@ -14,6 +22,7 @@ pub enum ErrorKind {
 pub struct SpikeError {
     kind: ErrorKind,
     message: String,
+    counters: OperationCounters,
 }
 
 #[derive(Serialize)]
@@ -21,6 +30,7 @@ pub struct SpikeError {
 pub struct ErrorEvidence<'a> {
     pub kind: ErrorKind,
     pub message: &'a str,
+    pub counters: OperationCounters,
 }
 
 impl SpikeError {
@@ -28,6 +38,7 @@ impl SpikeError {
         Self {
             kind: ErrorKind::InvalidInput,
             message: message.into(),
+            counters: OperationCounters::default(),
         }
     }
 
@@ -35,6 +46,7 @@ impl SpikeError {
         Self {
             kind: ErrorKind::NotRunnable,
             message: message.into(),
+            counters: OperationCounters::default(),
         }
     }
 
@@ -42,6 +54,7 @@ impl SpikeError {
         Self {
             kind: ErrorKind::VerificationFailed,
             message: message.into(),
+            counters: OperationCounters::default(),
         }
     }
 
@@ -52,10 +65,16 @@ impl SpikeError {
         }
     }
 
+    pub fn with_counters(mut self, counters: OperationCounters) -> Self {
+        self.counters = counters;
+        self
+    }
+
     pub fn evidence(&self) -> ErrorEvidence<'_> {
         ErrorEvidence {
             kind: self.kind,
             message: &self.message,
+            counters: self.counters,
         }
     }
 }
