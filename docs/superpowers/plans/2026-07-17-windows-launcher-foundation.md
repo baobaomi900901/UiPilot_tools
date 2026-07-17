@@ -342,6 +342,315 @@ git commit -m "build: scaffold secure Tauri launcher"
 
 ---
 
+## Task 1A: Close Security Gate Regression Gaps
+
+**Files:**
+- Modify: `scripts/check-security-config.ps1`
+- Modify: `scripts/test-security-config.ps1`
+- Modify: `scripts/test-security-probe.ps1`
+- Modify: `src/security-probe.ts`
+- Modify: `src-tauri/src/security_probe.rs`
+- Modify: `docs/superpowers/specs/2026-07-18-security-gate-hardening-design.md`
+
+**Interfaces:**
+- Consumes: the exact Task 1 production configuration and feature-only security probe build.
+- Produces: a configuration gate that rejects every unreviewed property or value, plus a probe where only the exact ACL denial exits with code `73`.
+
+- [ ] **Step 1: Add the three failing configuration counterexamples and missing JSON fixture**
+
+Extend `scripts/test-security-config.ps1` by restoring the canonical fixture before each mutation and asserting non-zero exit for these cases. Add the JSON fixture beside the existing JSON5/TOML fixtures so every supported capability extension is exercised:
+
+```powershell
+$nestedDirectory = New-Item -ItemType Directory -Path "$fixtureRoot/src-tauri/capabilities/nested" -Force
+'{"identifier":"json-extra","windows":["main"],"permissions":["core:default"]}' |
+  Set-Content -Encoding utf8 "$nestedDirectory/extra.json"
+if ((Invoke-FixtureCheck).ExitCode -eq 0) { throw 'Nested JSON capability was not rejected' }
+Remove-Item -LiteralPath "$nestedDirectory/extra.json"
+
+$configPath = "$fixtureRoot/src-tauri/tauri.conf.json"
+$config = Get-Content $configPath -Raw | ConvertFrom-Json
+$config.app.withGlobalTauri = $true
+$config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $configPath
+if ((Invoke-FixtureCheck).ExitCode -eq 0) { throw 'withGlobalTauri true was not rejected' }
+
+Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
+$config = Get-Content $configPath -Raw | ConvertFrom-Json
+$config.app.windows[0] | Add-Member -NotePropertyName url -NotePropertyValue 'https://example.com'
+$config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $configPath
+if ((Invoke-FixtureCheck).ExitCode -eq 0) { throw 'Remote window URL was not rejected' }
+
+Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
+$capabilityPath = "$fixtureRoot/src-tauri/capabilities/main.json"
+$capability = Get-Content $capabilityPath -Raw | ConvertFrom-Json
+$capability | Add-Member -NotePropertyName remote -NotePropertyValue ([pscustomobject]@{})
+$capability | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $capabilityPath
+if ((Invoke-FixtureCheck).ExitCode -eq 0) { throw 'Remote capability was not rejected' }
+```
+
+- [ ] **Step 2: Run the configuration regression and confirm the first new counterexample fails**
+
+Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1`
+
+Expected: non-zero exit ending with `withGlobalTauri true was not rejected`.
+
+- [ ] **Step 3: Replace partial checks with one exact object-property contract**
+
+Add this shared helper to `scripts/check-security-config.ps1`:
+
+```powershell
+function Assert-ExactProperties {
+  param(
+    [Parameter(Mandatory)] [object] $Object,
+    [Parameter(Mandatory)] [string[]] $Names,
+    [Parameter(Mandatory)] [string] $Label
+  )
+
+  $actual = @($Object.PSObject.Properties.Name) | Sort-Object
+  $expected = @($Names) | Sort-Object
+  if (Compare-Object $expected $actual) {
+    throw "$Label properties differ from the exact allowlist"
+  }
+}
+```
+
+Apply it to every configuration object with these exact property sets:
+
+```powershell
+Assert-ExactProperties $config @('$schema', 'productName', 'version', 'identifier', 'build', 'app', 'bundle') 'Tauri root'
+Assert-ExactProperties $config.build @('frontendDist', 'devUrl', 'beforeDevCommand', 'beforeBuildCommand') 'Tauri build'
+Assert-ExactProperties $config.app @('withGlobalTauri', 'windows', 'security') 'Tauri app'
+Assert-ExactProperties $config.app.windows[0] @('label', 'title', 'width', 'height', 'visible', 'decorations', 'resizable', 'fullscreen') 'Main window'
+Assert-ExactProperties $config.app.security @('csp') 'Tauri security'
+Assert-ExactProperties $config.bundle @('active', 'targets', 'icon', 'android') 'Tauri bundle'
+Assert-ExactProperties $config.bundle.android @('debugApplicationIdSuffix') 'Tauri Android bundle'
+Assert-ExactProperties $capability @('$schema', 'identifier', 'description', 'windows', 'permissions') 'Main capability'
+Assert-ExactProperties $probeConfig @('$schema', 'build') 'Security probe override'
+Assert-ExactProperties $probeConfig.build @('beforeBuildCommand') 'Security probe build'
+```
+
+Keep the exact capability file-set and permission-set checks, then add these exact value guards:
+
+```powershell
+$expectedCsp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'"
+if (
+  $config.'$schema' -ne '../node_modules/@tauri-apps/cli/config.schema.json' -or
+  $config.productName -ne 'UiPilot' -or
+  $config.version -ne '0.1.0' -or
+  $config.identifier -ne 'com.uipilot.launcher' -or
+  $config.build.frontendDist -ne '../dist' -or
+  $config.build.devUrl -ne 'http://localhost:1420' -or
+  $config.build.beforeDevCommand -ne 'npm run dev' -or
+  $config.build.beforeBuildCommand -ne 'npm run build' -or
+  $config.app.withGlobalTauri -ne $false -or
+  $config.app.windows.Count -ne 1 -or
+  $config.app.security.csp -ne $expectedCsp -or
+  $config.bundle.active -ne $true -or
+  $config.bundle.targets -ne 'all' -or
+  $config.bundle.android.debugApplicationIdSuffix -ne '.debug'
+) {
+  throw 'Tauri configuration values differ from the exact allowlist'
+}
+
+$window = $config.app.windows[0]
+if (
+  $window.label -ne 'main' -or
+  $window.title -ne 'UiPilot' -or
+  $window.width -ne 720 -or
+  $window.height -ne 420 -or
+  $window.visible -ne $false -or
+  $window.decorations -ne $false -or
+  $window.resizable -ne $false -or
+  $window.fullscreen -ne $false
+) {
+  throw 'Main window values differ from the exact allowlist'
+}
+
+$expectedIcons = @(
+  'icons/32x32.png',
+  'icons/128x128.png',
+  'icons/128x128@2x.png',
+  'icons/icon.icns',
+  'icons/icon.ico'
+)
+if (Compare-Object $expectedIcons @($config.bundle.icon)) {
+  throw 'Bundle icons differ from the exact allowlist'
+}
+
+if (
+  $capability.'$schema' -ne '../gen/schemas/desktop-schema.json' -or
+  $capability.identifier -ne 'main-capability' -or
+  $capability.description -ne 'Exact permissions for the local launcher WebView' -or
+  $capability.windows.Count -ne 1 -or
+  $capability.windows[0] -ne 'main' -or
+  $probeConfig.'$schema' -ne '../node_modules/@tauri-apps/cli/config.schema.json' -or
+  $probeConfig.build.beforeBuildCommand -ne 'npm run build -- --mode security-probe'
+) {
+  throw 'Capability or probe values differ from the exact allowlist'
+}
+```
+
+Do not add schema interpretation, JSON5 parsing, or a generic configuration framework.
+
+- [ ] **Step 4: Run the complete configuration gate**
+
+Run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+```
+
+Expected: `security config ok` and `security config regression tests ok`; all eight malicious fixtures are internally asserted non-zero.
+
+- [ ] **Step 5: Demonstrate that a normal executable currently passes the probe oracle**
+
+Run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-probe.ps1 -Executable "$env:SystemRoot\System32\hostname.exe"
+if ($LASTEXITCODE -ne 0) { throw 'Expected the old probe oracle counterexample to pass before the fix' }
+```
+
+Expected before the fix: `security probe ok` and exit code `0`.
+
+- [ ] **Step 6: Make exact ACL denial the only probe success state**
+
+Replace `src/security-probe.ts` with:
+
+```ts
+import { invoke } from '@tauri-apps/api/core'
+
+invoke('load_settings').catch((error: unknown) => {
+  if (String(error) === 'Command load_settings not allowed by ACL') {
+    window.location.hash = 'acl-denied'
+  }
+})
+```
+
+Replace `src-tauri/src/security_probe.rs` with:
+
+```rust
+use std::{thread, time::Duration};
+
+use tauri::{App, WebviewUrl, WebviewWindowBuilder};
+
+const ACL_DENIED_EXIT_CODE: i32 = 73;
+
+#[tauri::command]
+pub(crate) fn load_settings() -> &'static str {
+    "unexpectedly allowed"
+}
+
+pub(crate) fn setup(app: &mut App) -> tauri::Result<()> {
+    let probe = WebviewWindowBuilder::new(
+        app,
+        "security-probe",
+        WebviewUrl::App("security-probe.html".into()),
+    )
+    .title("UiPilot security probe")
+    .visible(false)
+    .build()?;
+    let app_handle = app.handle().clone();
+
+    thread::spawn(move || {
+        for _ in 0..200 {
+            let result = probe
+                .url()
+                .ok()
+                .and_then(|url| url.fragment().map(str::to_owned));
+
+            if result.as_deref() == Some("acl-denied") {
+                app_handle.exit(ACL_DENIED_EXIT_CODE);
+                return;
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        app_handle.exit(3);
+    });
+
+    Ok(())
+}
+```
+
+Replace `scripts/test-security-probe.ps1` with:
+
+```powershell
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory)]
+  [string] $Executable
+)
+
+$ErrorActionPreference = 'Stop'
+$executableUri = $null
+if (
+  -not [Uri]::TryCreate($Executable, [UriKind]::Absolute, [ref] $executableUri) -or
+  -not $executableUri.IsFile
+) {
+  throw 'Executable must be an absolute path'
+}
+$resolvedExecutable = (Resolve-Path -LiteralPath $Executable).Path
+$process = Start-Process -FilePath $resolvedExecutable -PassThru -WindowStyle Hidden
+
+try {
+  if (-not $process.WaitForExit(15000)) {
+    throw 'Security probe timed out'
+  }
+  if ($process.ExitCode -ne 73) {
+    throw "Security probe expected ACL denial exit code 73, got $($process.ExitCode)"
+  }
+}
+finally {
+  if (-not $process.HasExited) {
+    Stop-Process -Id $process.Id -Force
+  }
+}
+
+Write-Output 'security probe ok'
+```
+
+- [ ] **Step 7: Run the probe negative and positive gates**
+
+Run:
+
+```powershell
+$ErrorActionPreference = 'Continue'
+$negativeOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-probe.ps1 -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1
+$negativeExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($negativeExit -eq 0) { throw "Arbitrary executable passed probe gate: $negativeOutput" }
+
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if (-not (Test-Path -LiteralPath $probeExe)) { throw 'Probe executable was not produced' }
+& .\scripts\test-security-probe.ps1 -Executable $probeExe
+```
+
+Expected: `hostname.exe` is internally asserted non-zero; the feature-only probe exits `73`, and its wrapper prints `security probe ok` with exit code `0`.
+
+- [ ] **Step 8: Run Task 1's complete gate and commit**
+
+Run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+npm run build
+if (Test-Path dist/security-probe.html) { throw 'Production frontend contains security probe' }
+cargo check --manifest-path src-tauri/Cargo.toml
+git diff --check
+```
+
+Expected: every command exits `0`; production output contains no probe page.
+
+```powershell
+git add docs/superpowers/specs/2026-07-18-security-gate-hardening-design.md docs/superpowers/plans/2026-07-17-windows-launcher-foundation.md scripts/check-security-config.ps1 scripts/test-security-config.ps1 scripts/test-security-probe.ps1 src/security-probe.ts src-tauri/src/security_probe.rs
+git commit -m "fix: close security gate bypasses"
+```
+
+---
+
 ## Task 2: Lock the Result Protocol Behind a Rust Registry
 
 **Files:**

@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-07-18
-- 状态：待书面复审
+- 状态：已批准，待实施
 - 影响范围：Foundation Task 1 安全配置检查与测试探针
 
 ## 问题
@@ -21,21 +21,16 @@
 
 任何未知属性、缺失属性、额外 capability 文件、内联 capability、远程来源、宽权限或固定值变化都使检查失败。该规则不尝试理解未来配置字段；新增字段必须先显式修改并评审白名单。
 
-## 决策二：可认证探针结果
+## 决策二：固定退出码探针
 
-`scripts/test-security-probe.ps1` 不再以进程退出码作为成功证据：
+探针使用单一状态和固定专属退出码，不引入测试结果文件协议：
 
-1. 每次运行生成一个 128-bit 随机 nonce，以及系统临时目录下唯一的结果文件路径。
-2. 使用 `System.Diagnostics.ProcessStartInfo.EnvironmentVariables` 仅向被测子进程传递 nonce 和结果路径，不修改父进程环境。
-3. `security-probe.ts` 只把精确错误 `Command load_settings not allowed by ACL` 认定为目标 ACL 拒绝；其他拒绝、命令成功和超时都不是成功。
-4. 仅在 `test-instrumentation` feature 中，Rust 验证 nonce 格式和结果路径位于约定的临时目录，然后写入结果。
-5. 结果 JSON 固定为 `{ "protocolVersion": 1, "nonce": "...", "assertion": "load_settings_denied_by_acl" }`。
-6. PowerShell 要求进程退出码为 0、结果文件存在且三个字段精确匹配本次挑战；任一条件不满足都失败。
-7. 结果目录在 `finally` 中验证绝对路径前缀后删除。
+1. `security-probe.ts` 仅在收到精确错误 `Command load_settings not allowed by ACL` 时设置 `acl-denied` 状态。
+2. 命令成功、其他错误和超时均不设置 `acl-denied`。
+3. 仅在 `test-instrumentation` feature 中，Rust 将 `acl-denied` 映射为固定退出码 `73`；所有其他路径不得退出 `73`。
+4. `scripts/test-security-probe.ps1` 只接受退出码 `73`。退出码 `0`、命令成功、其他错误、其他非零退出码和超时全部失败。
 
-只有精确的目标 ACL 拒绝可以写入上述成功结果并以 0 退出。命令成功、其他错误和超时均以非零退出，且不能写入成功 assertion。
-
-该协议防止普通的任意可执行文件仅凭退出码 0 通过。它不尝试抵抗能够读取当前进程环境并主动仿造协议的恶意程序；门禁的目标是认证由本仓库探针协议产生的结果，不是建立代码签名信任链。
+固定退出码足以防止普通的任意可执行文件仅凭正常退出通过门禁。代码签名信任链属于后续签名安装包交付，不在本探针合同内。
 
 ## 回归测试
 
@@ -47,11 +42,11 @@
 - 增加嵌套 JSON、JSON5 或 TOML capability。
 - 基础配置或探针 override 增加 capability。
 
-探针协议回归必须证明：
+探针回归必须证明：
 
 - Windows `hostname.exe` 正常退出仍不能通过探针测试。
-- 当前 feature-only `uipilot.exe` 产生匹配 nonce 的 ACL 拒绝结果并通过。
-- nonce、协议版本、assertion、结果路径或 ACL 错误任一不匹配时失败。
+- 当前 feature-only `uipilot.exe` 仅在精确 ACL 拒绝时以 `73` 退出并通过。
+- 退出码 `0`、命令成功、其他错误、其他非零退出码和超时均失败。
 
 以上回归加入 Task 1 与最终完整门禁。生产构建继续排除探针页面和探针 Rust 代码。
 
