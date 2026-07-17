@@ -215,6 +215,7 @@ function Invoke-Create {
     $indexedPath = Join-Path $indexedDirectory $indexedFileName
     $unindexedPath = Join-Path $unindexedDirectory $unindexedFileName
     $manifestPath = Join-Path $sentinelRoot ("manifest-{0}.json" -f [Guid]::NewGuid().ToString('N'))
+    $evidencePath = [IO.Path]::ChangeExtension($manifestPath, '.evidence.json')
 
     try {
         [IO.Directory]::CreateDirectory($indexedDirectory) | Out-Null
@@ -234,13 +235,37 @@ function Invoke-Create {
             Start-Sleep -Seconds 2
         }
         if (-not $indexedObserved) { Throw-NotRunnable 'Indexed sentinel was not observed within 120 seconds' }
+        $indexedObservedAfterMs = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 3)
 
         [IO.Directory]::CreateDirectory($unindexedDirectory) | Out-Null
         [IO.File]::Create($unindexedPath).Dispose()
+        $unindexedStopwatch = [Diagnostics.Stopwatch]::StartNew()
         $unindexedQuery = Invoke-Query $unindexedFileName
+        $unindexedStopwatch.Stop()
         if (@($unindexedQuery.items).Count -ne 0) {
             throw 'Sentinel outside all included roots unexpectedly appeared in SystemIndex results'
         }
+
+        [ordered]@{
+            schemaVersion = 1
+            capturedAt = (Get-Date).ToString('o')
+            includedFileRoots = @($scopes.includedFileRoots)
+            exclusionRules = @($scopes.exclusionRules)
+            indexed = [ordered]@{
+                fileName = $indexedFileName
+                fullPath = [IO.Path]::GetFullPath($indexedPath)
+                observedAfterMs = $indexedObservedAfterMs
+                resultCount = @($query.items).Count
+                counters = $query.counters
+            }
+            unindexed = [ordered]@{
+                fileName = $unindexedFileName
+                fullPath = [IO.Path]::GetFullPath($unindexedPath)
+                elapsedMs = [math]::Round($unindexedStopwatch.Elapsed.TotalMilliseconds, 3)
+                resultCount = @($unindexedQuery.items).Count
+                counters = $unindexedQuery.counters
+            }
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding utf8
 
         [ordered]@{
             schemaVersion = 1
@@ -262,6 +287,7 @@ function Invoke-Create {
         if (Test-Path -LiteralPath $unindexedPath) { Remove-Item -LiteralPath $unindexedPath -Force }
         if (Test-Path -LiteralPath $unindexedDirectory) { [IO.Directory]::Delete($unindexedDirectory, $false) }
         if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force }
+        if (Test-Path -LiteralPath $evidencePath) { Remove-Item -LiteralPath $evidencePath -Force }
         throw
     }
 }

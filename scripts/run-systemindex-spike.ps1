@@ -53,9 +53,16 @@ function Invoke-SpikeCase {
 
     $stdout = Join-Path $evidenceDir "$Name.stdout.json"
     $stderr = Join-Path $evidenceDir "$Name.stderr.json"
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $binary -ArgumentList $Arguments -Wait -PassThru `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    [ordered]@{ case = $Name; exitCode = $process.ExitCode } |
+    $elapsed.Stop()
+    [ordered]@{
+        case = $Name
+        pid = $process.Id
+        exitCode = $process.ExitCode
+        elapsedMs = [math]::Round($elapsed.Elapsed.TotalMilliseconds, 3)
+    } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidenceDir "$Name.exit.json") -Encoding utf8
 }
 
