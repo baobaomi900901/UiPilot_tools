@@ -224,11 +224,11 @@ H4 使用两个指标：
 
 #### 2026-07-17 Spike 结论
 
-- 结论：`No-Go（必需证据 Not Runnable）`。
+- 结论：`No-Go（宿主 I/O 实证失败）`。
 - 结论报告：`docs/spikes/2026-07-17-systemindex-results.md`。
-- 已验证结构化 `System.FileName + COP_VALUE_CONTAINS`、显式 `SetScope`、已索引 sentinel 命中和未索引 sentinel 零结果。
-- 未验证管理员权限下的 WSearch 停用/恢复，也未取得 ProcMon A-D 宿主 I/O 证据；缺失证据不得视为通过。
-- `/find` 文件搜索保持阻塞，不得创建生产实现计划或进入排期。替代架构必须单独评审；若重新执行本 Spike，也必须取得完整证据并形成新的评审结论后才能解除阻塞。
+- 已验证结构化 `System.FileName + COP_VALUE_CONTAINS`、显式 `SetScope`、已索引 sentinel 命中、未索引 sentinel 零结果，以及 WSearch 停用时在工厂创建前失败并精确恢复服务状态。
+- ProcMon case A 将 5 次 `QueryDirectory` 和 11 次非 allowlist `ReadFile` 归因到宿主 PID；即使排除控制台 `conhost.exe` 启动噪声，仍违反“宿主不触发目录枚举或文件内容读取”的硬门槛。
+- `/find` 文件搜索保持阻塞，不得创建生产实现计划或进入排期。当前 `ISearchFolderItemFactory` 路线判定失败，下一步必须进入替代架构评审，不能通过重复采集解除阻塞。
 
 ### 6.4 查询行为
 
