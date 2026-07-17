@@ -75,6 +75,7 @@ docs/_build/
 .pybuilder/
 target/
 .worktrees/
+artifacts/systemindex-spike/
 
 # Jupyter Notebook
 .ipynb_checkpoints

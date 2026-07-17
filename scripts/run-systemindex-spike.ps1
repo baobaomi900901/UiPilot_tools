@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch] $VerifyFailFast
+    [switch] $VerifyFailFast,
+    [switch] $CaptureIo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,6 +80,14 @@ if ($VerifyFailFast) {
         & $sentinelScript -Cleanup -Manifest $sentinelManifest
         if ($LASTEXITCODE -ne 0) { throw 'Sentinel cleanup failed' }
     }
+}
+
+if ($CaptureIo) {
+    $captureScript = Join-Path $PSScriptRoot 'capture-systemindex-io.ps1'
+    $ioEvidence = & $captureScript
+    $ioExit = $LASTEXITCODE
+    $ioEvidence | Set-Content -LiteralPath (Join-Path $evidenceDir 'io-evidence-path.txt') -Encoding utf8
+    if ($ioExit -ne 0) { throw 'SystemIndex I/O capture failed or was not runnable' }
 }
 
 Write-Output $evidenceDir
