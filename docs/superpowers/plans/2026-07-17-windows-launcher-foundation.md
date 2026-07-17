@@ -10,7 +10,7 @@
 
 **Source Spec:** `docs/superpowers/specs/2026-07-17-cross-platform-launcher-mvp-design.md`
 
-**Scope Boundary:** 本计划不实现 `/find`、翻译、macOS、第三方插件、安装包签名或试用研究。文件搜索只有在 `2026-07-17-systemindex-spike.md` 得出 Go 后才能另写正式实现计划。本计划完成表示“启动器与应用能力可验收”，不表示完整 MVP-A 已完成。
+**Scope Boundary:** 本计划不实现文件搜索、翻译、macOS、第三方插件、安装包签名或试用研究。本计划完成表示“启动器与应用能力可验收”，不表示完整 MVP-A 已完成。
 
 ---
 
@@ -107,11 +107,6 @@ struct DailyCounts {
     application_launch_requests: u64,
     activation_successes: u64,
     activation_refusals: u64,
-    file_search_sessions: u64,
-    file_location_requests: u64,
-    file_found: u64,
-    file_not_found: u64,
-    file_cancelled: u64,
     unclean_sessions: u64,
     host_crashes: u64,
 }
@@ -125,7 +120,7 @@ struct ValidationExport {
 }
 ```
 
-日期键固定为本地 `YYYY-MM-DD`，通过已使用的 `windows` crate 调用 `GetLocalTime` 获得，不增加日期依赖。活跃日由 `launcherInvocations > 0` 判定；该日成功动作等于 `applicationLaunchRequests + activationSuccesses + fileLocationRequests`。文件字段在 Foundation 阶段保持 0，供通过 Spike 后的文件计划沿用。
+日期键固定为本地 `YYYY-MM-DD`，通过已使用的 `windows` crate 调用 `GetLocalTime` 获得，不增加日期依赖。活跃日由 `launcherInvocations > 0` 判定；该日成功动作等于 `applicationLaunchRequests + activationSuccesses`，只验证纯应用启动/激活使用频率。
 
 事件映射固定为：窗口唤起增加 `launcherInvocations`；`LaunchRequested` 增加 `applicationLaunchRequests`；`ActivationRequested` 增加 `activationSuccesses`；`ActivationRefusedLaunchRequested` 同时增加 `activationRefusals` 与 `applicationLaunchRequests`。失败动作不增加成功动作字段。
 
@@ -818,9 +813,7 @@ Use Vitest with jsdom and an injected command client. Cover:
 
 - Input focuses and selects its content after `launcher://shown`.
 - Empty input clears results without invoking Rust.
-- Normal text increments `querySequence` and invokes only `search_apps(query, invocationId, querySequence)`.
-- `/find` displays `文件搜索尚未启用` and invokes no file or generic command in this plan.
-- Any other slash-prefixed command displays `未知命令` and never falls through to app search.
+- Any non-empty text increments `querySequence` and invokes only `search_apps(query, invocationId, querySequence)`.
 - ArrowUp/ArrowDown wrap within the fixed result set.
 - Enter sends only current `requestId` and selected `resultId`.
 - Escape invokes only `hide_launcher`; no TypeScript code calls a direct window hide API.
@@ -965,7 +958,7 @@ Confirm all statements are true before marking the plan complete:
 - No command accepts a file path, executable path, URL, shell fragment, or arbitrary payload from TypeScript.
 - App discovery stays within the two Start Menu roots.
 - Activation ambiguity and refusal follow the frozen fallback policy.
-- `/find` is visibly gated and has no production backend.
+- The implementation introduces only launcher and application capabilities defined by this plan.
 - No translation, network, plugin, macOS, signing, or pilot code was introduced.
 - Keyboard and Narrator smoke results are recorded.
 - Windows 11 launcher and app-search performance sample counts and P95 values are recorded with one clock domain per subtraction.
@@ -981,7 +974,4 @@ git commit -m "test: verify Windows launcher foundation"
 
 ## Completion Gate
 
-This plan is complete only when Tasks 1-8 pass on Windows 11 x64 and the launcher-only acceptance evidence is recorded. The next production planning decision is determined by the SystemIndex Spike:
-
-- Spike Go: write a separate `/find` implementation plan, then a release/signing plan.
-- Spike No-Go: keep `/find` disabled, return to architecture review, and do not claim MVP-A completion.
+This plan is complete only when Tasks 1-8 pass on Windows 11 x64 and the launcher-only acceptance evidence is recorded. Foundation 完成不等于 MVP-A；下一必需交付物是签名安装包与发布验证计划。
