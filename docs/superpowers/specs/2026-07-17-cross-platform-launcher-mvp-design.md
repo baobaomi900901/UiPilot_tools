@@ -222,6 +222,14 @@ H4 使用两个指标：
 
 只有上述测试全部通过，才能采用 `ISearchFolderItemFactory` 路线。若出现文件系统枚举，或无法证明仅使用索引，则该路线判定为 No-Go；替代查询方案必须另行评审，不能静默降级。
 
+#### 2026-07-17 Spike 结论
+
+- 结论：`No-Go（必需证据 Not Runnable）`。
+- 结论报告：`docs/spikes/2026-07-17-systemindex-results.md`。
+- 已验证结构化 `System.FileName + COP_VALUE_CONTAINS`、显式 `SetScope`、已索引 sentinel 命中和未索引 sentinel 零结果。
+- 未验证管理员权限下的 WSearch 停用/恢复，也未取得 ProcMon A-D 宿主 I/O 证据；缺失证据不得视为通过。
+- `/find` 文件搜索保持阻塞，不得创建生产实现计划或进入排期。替代架构必须单独评审；若重新执行本 Spike，也必须取得完整证据并形成新的评审结论后才能解除阻塞。
+
 ### 6.4 查询行为
 
 - 输入变化后防抖 150ms。
