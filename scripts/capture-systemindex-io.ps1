@@ -355,10 +355,16 @@ if (-not (Test-Path -LiteralPath $procmon -PathType Leaf) -or
     Exit-NotRunnable 'PROCMON64_EXE must point to Procmon64.exe'
 }
 $versionText = (Get-Item -LiteralPath $procmon).VersionInfo.ProductVersion
-$versionMatch = [regex]::Match([string]$versionText, '(?<!\d)(?<major>\d+)\.(?<minor>\d+)')
-if (-not $versionMatch.Success -or
-    [int]$versionMatch.Groups['major'].Value -ne 4 -or
-    [int]$versionMatch.Groups['minor'].Value -ne 4) {
+$versionMatch = [regex]::Match([string]$versionText, '(?<!\d)(?<version>\d+\.\d+(?:\.\d+){0,2})(?![\d.])')
+$versionParts = if ($versionMatch.Success) {
+    @($versionMatch.Groups['version'].Value.Split('.') | ForEach-Object { [int]$_ })
+} else {
+    @()
+}
+if ($versionParts.Count -lt 2 -or
+    $versionParts[0] -ne 4 -or
+    $versionParts[1] -ne 4 -or
+    @($versionParts | Select-Object -Skip 2 | Where-Object { $_ -ne 0 }).Count -gt 0) {
     Exit-NotRunnable "Procmon64.exe product version '$versionText' is not pinned v4.04"
 }
 $signature = Get-AuthenticodeSignature -LiteralPath $procmon
