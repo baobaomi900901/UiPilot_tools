@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch] $VerifyFailFast
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -59,5 +61,24 @@ function Invoke-SpikeCase {
 Invoke-SpikeCase -Name 'status' -Arguments @('status', '--json')
 Invoke-SpikeCase -Name 'scopes' -Arguments @('scopes', '--json')
 Invoke-SpikeCase -Name 'query' -Arguments @('query', '--literal', 'uipilot-spike-probe', '--limit', '1', '--json')
+
+if ($VerifyFailFast) {
+    $sentinelScript = Join-Path $PSScriptRoot 'prepare-systemindex-sentinels.ps1'
+    $failfastScript = Join-Path $PSScriptRoot 'test-systemindex-failfast.ps1'
+    $sentinelManifest = & $sentinelScript -Create
+    if ($LASTEXITCODE -ne 0 -or -not $sentinelManifest) {
+        throw 'Sentinel preparation failed'
+    }
+    $sentinelManifest = ([string]$sentinelManifest).Trim()
+    try {
+        $failfastEvidence = & $failfastScript -SentinelManifest $sentinelManifest
+        $failfastExit = $LASTEXITCODE
+        $failfastEvidence | Set-Content -LiteralPath (Join-Path $evidenceDir 'failfast-evidence-path.txt') -Encoding utf8
+        if ($failfastExit -ne 0) { throw 'Fail-fast verification failed' }
+    } finally {
+        & $sentinelScript -Cleanup -Manifest $sentinelManifest
+        if ($LASTEXITCODE -ne 0) { throw 'Sentinel cleanup failed' }
+    }
+}
 
 Write-Output $evidenceDir
