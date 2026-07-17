@@ -49,7 +49,43 @@ permissions = ["core:default"]
   }
   Remove-Item -LiteralPath "$nestedDirectory/extra.json5"
 
+  '{"identifier":"json-extra","windows":["main"],"permissions":["core:default"]}' |
+    Set-Content -Encoding utf8 "$nestedDirectory/extra.json"
+  $jsonResult = Invoke-FixtureCheck
+  if ($jsonResult.ExitCode -eq 0) {
+    throw 'Nested JSON capability was not rejected'
+  }
+  Remove-Item -LiteralPath "$nestedDirectory/extra.json"
+
   $configPath = "$fixtureRoot/src-tauri/tauri.conf.json"
+  $config = Get-Content $configPath -Raw | ConvertFrom-Json
+  $config.app.withGlobalTauri = $true
+  $config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $configPath
+  $globalTauriResult = Invoke-FixtureCheck
+  if ($globalTauriResult.ExitCode -eq 0) {
+    throw 'withGlobalTauri true was not rejected'
+  }
+
+  Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
+  $config = Get-Content $configPath -Raw | ConvertFrom-Json
+  $config.app.windows[0] | Add-Member -NotePropertyName url -NotePropertyValue 'https://example.com'
+  $config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $configPath
+  $remoteWindowResult = Invoke-FixtureCheck
+  if ($remoteWindowResult.ExitCode -eq 0) {
+    throw 'Remote window URL was not rejected'
+  }
+
+  Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
+  $capabilityPath = "$fixtureRoot/src-tauri/capabilities/main.json"
+  $capability = Get-Content $capabilityPath -Raw | ConvertFrom-Json
+  $capability | Add-Member -NotePropertyName remote -NotePropertyValue ([pscustomobject]@{})
+  $capability | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $capabilityPath
+  $remoteCapabilityResult = Invoke-FixtureCheck
+  if ($remoteCapabilityResult.ExitCode -eq 0) {
+    throw 'Remote capability was not rejected'
+  }
+
+  Copy-Item "$repoRoot/src-tauri/capabilities/main.json" $capabilityPath -Force
   $config = Get-Content $configPath -Raw | ConvertFrom-Json
   $inlineCapability = [pscustomobject]@{
     identifier = 'inline-extra'

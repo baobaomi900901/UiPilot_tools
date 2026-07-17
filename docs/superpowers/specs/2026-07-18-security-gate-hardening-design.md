@@ -27,7 +27,7 @@
 
 1. `security-probe.ts` 仅在收到精确错误 `Command load_settings not allowed by ACL` 时设置 `acl-denied` 状态。
 2. 命令成功、其他错误和超时均不设置 `acl-denied`。
-3. 仅在 `test-instrumentation` feature 中，Rust 将 `acl-denied` 映射为固定退出码 `73`；所有其他路径不得退出 `73`。
+3. 仅在 `test-instrumentation` feature 中，Rust 使用 `std::process::exit(73)` 将 `acl-denied` 映射为固定退出码；所有其他路径不得退出 `73`。不使用 Windows 上会丢失请求退出码的 Tauri 事件循环退出路径。
 4. `scripts/test-security-probe.ps1` 只接受退出码 `73`。退出码 `0`、命令成功、其他错误、其他非零退出码和超时全部失败。
 
 固定退出码足以防止普通的任意可执行文件仅凭正常退出通过门禁。代码签名信任链属于后续签名安装包交付，不在本探针合同内。

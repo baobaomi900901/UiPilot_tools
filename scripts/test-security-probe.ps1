@@ -19,8 +19,8 @@ try {
   if (-not $process.WaitForExit(15000)) {
     throw 'Security probe timed out'
   }
-  if ($process.ExitCode -ne 0) {
-    throw "Security probe failed with exit code $($process.ExitCode)"
+  if ($process.ExitCode -ne 73) {
+    throw "Security probe expected ACL denial exit code 73, got $($process.ExitCode)"
   }
 }
 finally {

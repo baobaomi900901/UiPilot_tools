@@ -550,7 +550,6 @@ pub(crate) fn setup(app: &mut App) -> tauri::Result<()> {
     .title("UiPilot security probe")
     .visible(false)
     .build()?;
-    let app_handle = app.handle().clone();
 
     thread::spawn(move || {
         for _ in 0..200 {
@@ -560,19 +559,20 @@ pub(crate) fn setup(app: &mut App) -> tauri::Result<()> {
                 .and_then(|url| url.fragment().map(str::to_owned));
 
             if result.as_deref() == Some("acl-denied") {
-                app_handle.exit(ACL_DENIED_EXIT_CODE);
-                return;
+                std::process::exit(ACL_DENIED_EXIT_CODE);
             }
 
             thread::sleep(Duration::from_millis(50));
         }
 
-        app_handle.exit(3);
+        std::process::exit(3);
     });
 
     Ok(())
 }
 ```
+
+Use `std::process::exit` only in this feature-only probe. Tauri/Wry's Windows event-loop exit path does not preserve the requested numeric exit code, so `AppHandle::exit(73)` cannot satisfy this test contract.
 
 Replace `scripts/test-security-probe.ps1` with:
 
