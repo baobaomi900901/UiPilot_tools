@@ -14,6 +14,141 @@
 
 ---
 
+## Global Constraints
+
+- 每个任务开始前必须重读本节与 `Cross-Task Interfaces`；不得在单个任务内另造不兼容合同。
+- 只允许一个本地 `main` WebView。生产构建不包含测试探针、远程页面、动态 HTML、任意网络、Shell、通用文件系统或通用进程能力。
+- TypeScript 不接收或回传快捷方式路径、可执行文件路径或任意动作 payload；动作只能通过当前 Rust 注册表中的 `requestId + resultId` 解析。
+- 所有隐藏路径都必须进入 Rust 的同一个 `clear_and_hide` 函数；前端没有直接隐藏窗口的 capability。
+- 应用扫描只允许两个开始菜单根，拒绝任何 symlink 或带 `FILE_ATTRIBUTE_REPARSE_POINT` 的目录后再递归。
+- 只保存日期级验证计数，不保存精确行为时间、查询词、应用名称、快捷方式、可执行文件或文件路径。
+- 每个非平凡分支先写一个会失败的最小测试，再实现并运行该任务列出的完整验证命令。
+- 任务若必须改变本节接口，先修改本计划并重新审核；不能让实现者自行补合同。
+
+## Cross-Task Interfaces
+
+### Query ownership
+
+Rust 每次显示窗口时生成新的 opaque `invocationId` 并随 `launcher://shown` 发给前端。前端保存它、把 `querySequence` 重置为 0，每次普通应用查询先递增，再调用：
+
+```ts
+search_apps({ query: string, invocationId: string, querySequence: number }): Promise<SearchResponse | null>
+```
+
+Rust 注册表内部持有当前 generation、窗口 active 状态、最新序号和最多一份结果集：
+
+```rust
+struct RegistryState {
+    generation: u64,
+    active: bool,
+    active_invocation_id: Option<String>,
+    latest_query_sequence: u64,
+    current: Option<ResultSet>,
+}
+
+struct QueryToken {
+    generation: u64,
+    query_sequence: u64,
+}
+```
+
+`begin_query(invocation_id, sequence)` 只接受 active generation、匹配当前 `invocationId` 且严格大于当前值的序号并返回 token。`publish_if_latest(token, entries)` 只有在 generation 仍相同、窗口仍 active 且 token 序号仍为最新时才替换 `current`；否则返回 `None` 且不修改注册表。窗口隐藏会递增 generation、设为 inactive、清除 active invocation 并清空结果；窗口显示会递增 generation、写入新的 invocation、设为 active 并把最新序号重置为 0。这样旧查询晚完成、旧 IPC 在下一次唤起后才到达 Rust，以及隐藏后的在途查询都不能重新发布。
+
+成功响应固定为：
+
+```ts
+interface SearchResponse {
+  requestId: string
+  items: ResultItem[]
+}
+```
+
+`null` 只表示该查询已被更新序号或隐藏 generation 淘汰，前端直接忽略。
+
+### Window lifecycle
+
+```rust
+fn clear_and_hide(window: &WebviewWindow, registry: &ResultRegistry) -> Result<(), AppError>;
+```
+
+`hide_launcher` 命令、失焦、关闭请求和动作成功都调用这个函数。动作失败不隐藏。`Esc` 只能 invoke `hide_launcher`。
+
+### Application identity and settings
+
+`appId` 使用固定版本算法：对 `start-menu-v1\0 + rootKind + \0 + normalizedRelativeShortcutPath` 做 Windows CNG SHA-256，输出 `app-` 加小写十六进制。它在同一快捷方式的重复扫描间稳定、区分同名入口，且不暴露原始路径。应用移动后视为新入口。
+
+```ts
+interface AppAliasTarget {
+  appId: string
+  displayName: string
+  icon?: string
+  aliases: string[]
+}
+
+interface SettingsView {
+  hotkey: string
+  autostart: boolean
+  researchId?: string
+  applications: AppAliasTarget[]
+}
+```
+
+`load_settings` 返回 `SettingsView`；`save_settings` 只接受已存在 `appId` 对应的别名，不接受显示名称或路径作为键。
+
+### Validation export
+
+```rust
+const VALIDATION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DailyCounts {
+    launcher_invocations: u64,
+    application_launch_requests: u64,
+    activation_successes: u64,
+    activation_refusals: u64,
+    file_search_sessions: u64,
+    file_location_requests: u64,
+    file_found: u64,
+    file_not_found: u64,
+    file_cancelled: u64,
+    host_crashes: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationExport {
+    schema_version: u32,
+    research_id: Option<String>,
+    daily_counts: BTreeMap<String, DailyCounts>,
+}
+```
+
+日期键固定为本地 `YYYY-MM-DD`，通过已使用的 `windows` crate 调用 `GetLocalTime` 获得，不增加日期依赖。活跃日由 `launcherInvocations > 0` 判定；该日成功动作等于 `applicationLaunchRequests + activationSuccesses + fileLocationRequests`。文件字段在 Foundation 阶段保持 0，供通过 Spike 后的文件计划沿用。
+
+事件映射固定为：窗口唤起增加 `launcherInvocations`；`LaunchRequested` 增加 `applicationLaunchRequests`；`ActivationRequested` 增加 `activationSuccesses`；`ActivationRefusedLaunchRequested` 同时增加 `activationRefusals` 与 `applicationLaunchRequests`；未关闭的上次会话增加其记录日期的 `hostCrashes`。失败动作不增加成功动作字段。
+
+### Capability allowlist
+
+`main.json` 的 permissions 必须与以下集合完全相等，不能多也不能少：
+
+```text
+allow-search-apps
+allow-execute-result
+allow-load-settings
+allow-save-settings
+allow-rescan-apps
+allow-export-validation-data
+allow-clear-validation-data
+allow-hide-launcher
+core:event:allow-listen
+core:event:allow-unlisten
+```
+
+Rust 侧使用的 single-instance、global-shortcut、autostart 和原生窗口 API 不向 WebView 授权。
+
+---
+
 ## Task 1: Scaffold a Secure Tauri Shell
 
 **Files:**
@@ -30,7 +165,11 @@
 - Create: `src-tauri/capabilities/main.json`
 - Create: `src-tauri/src/main.rs`
 - Create: `src-tauri/src/lib.rs`
+- Create: `src-tauri/src/security_probe.rs`
+- Create: `security-probe.html`
+- Create: `src/security-probe.ts`
 - Create: `scripts/check-security-config.ps1`
+- Create: `scripts/test-security-probe.ps1`
 
 - [ ] **Step 1: Initialize the smallest supported toolchain**
 
@@ -58,7 +197,11 @@ Create `scripts/check-security-config.ps1` with checks for these exact invariant
 ```powershell
 $ErrorActionPreference = 'Stop'
 $config = Get-Content "$PSScriptRoot/../src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
-$capability = Get-Content "$PSScriptRoot/../src-tauri/capabilities/main.json" -Raw | ConvertFrom-Json
+$capabilityFiles = @(Get-ChildItem "$PSScriptRoot/../src-tauri/capabilities" -File -Filter '*.json')
+if ($capabilityFiles.Count -ne 1 -or $capabilityFiles[0].Name -ne 'main.json') {
+  throw 'Exactly one main capability file is allowed'
+}
+$capability = Get-Content $capabilityFiles[0].FullName -Raw | ConvertFrom-Json
 
 if ($config.app.security.csp -ne "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'") {
   throw 'Unexpected CSP'
@@ -69,8 +212,24 @@ if ($config.app.windows.Count -ne 1 -or $config.app.windows[0].label -ne 'main')
 if ($capability.windows.Count -ne 1 -or $capability.windows[0] -ne 'main') {
   throw 'Capability must target only the main window'
 }
-if ($capability.permissions -contains 'core:default') {
-  throw 'Broad core:default permission is not allowed'
+$expectedPermissions = @(
+  'allow-search-apps',
+  'allow-execute-result',
+  'allow-load-settings',
+  'allow-save-settings',
+  'allow-rescan-apps',
+  'allow-export-validation-data',
+  'allow-clear-validation-data',
+  'allow-hide-launcher',
+  'core:event:allow-listen',
+  'core:event:allow-unlisten'
+) | Sort-Object
+if ($capability.permissions | Where-Object { $_ -isnot [string] }) {
+  throw 'Scoped permission objects are not allowed'
+}
+$actualPermissions = @($capability.permissions) | Sort-Object
+if (Compare-Object $expectedPermissions $actualPermissions) {
+  throw 'Capability permission set differs from the exact allowlist'
 }
 Write-Output 'security config ok'
 ```
@@ -99,6 +258,7 @@ fn main() {
                 "rescan_apps",
                 "export_validation_data",
                 "clear_validation_data",
+                "hide_launcher",
             ]),
         ),
     )
@@ -106,7 +266,7 @@ fn main() {
 }
 ```
 
-Give `main` only the generated `allow-*` permissions for those commands plus the minimum event/window/plugin permissions needed by subsequent tasks. Do not grant shell, filesystem, HTTP, process, opener, clipboard, dialog, notification, updater, or wildcard permissions. Add a test-only `security-probe` WebView whose local page attempts `load_settings`; the integration harness must observe a permission rejection because that label is absent from the capability. The probe must not be compiled into production builds.
+Give `main` exactly the permission set in `Capability allowlist`; there is no frontend window-hide permission. `vite.config.ts` includes `security-probe.html` only in `security-probe` mode, and `security_probe.rs` creates its `security-probe` WebView only under Cargo feature `test-instrumentation`. `scripts/test-security-probe.ps1` builds both modes, proves the production dist/binary omit the probe, then launches the instrumented build and asserts `load_settings` is rejected for the non-main label.
 
 - [ ] **Step 5: Add a boot-only Rust and frontend entry point**
 
@@ -118,6 +278,7 @@ Run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-probe.ps1
 npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
@@ -145,30 +306,45 @@ git commit -m "build: scaffold secure Tauri launcher"
 
 Add tests that prove:
 
-1. Publishing assigns a new opaque `requestId` and stable per-set `resultId` values.
+1. Publishing the latest token assigns an opaque `requestId` and stable per-set `resultId` values.
 2. A valid `(requestId, resultId)` resolves to a Rust-owned action.
-3. An old request becomes stale after a newer publish.
-4. Unknown result IDs fail without exposing a path.
-5. Clearing the registry invalidates every result.
+3. Query 1 begins, query 2 begins and publishes, then query 1 finishes: query 1 returns `None` and query 2 remains executable.
+4. Query 2 reaches Rust before query 1: `begin_query(1)` returns `None` and cannot do work or publish.
+5. A query begins, the window hides, then the query finishes: it cannot repopulate the registry.
+6. An old invocation's IPC reaches Rust after a new show: its matching sequence is rejected by `invocationId`.
+7. Unknown and stale IDs fail without exposing a path.
 
 Use this public contract in the test:
 
 ```rust
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
-    LaunchApplication { shortcut: PathBuf, executable: Option<PathBuf> },
+    LaunchApplication {
+        app_id: String,
+        shortcut: PathBuf,
+        executable: Option<PathBuf>,
+    },
 }
 
 pub(crate) struct ResultRegistry {
     next_id: AtomicU64,
-    current: Mutex<Option<ResultSet>>,
+    state: Mutex<RegistryState>,
 }
 
 impl ResultRegistry {
-    pub(crate) fn publish(
+    pub(crate) fn on_show(&self, invocation_id: String);
+
+    pub(crate) fn begin_query(
         &self,
+        invocation_id: &str,
+        query_sequence: u64,
+    ) -> Option<QueryToken>;
+
+    pub(crate) fn publish_if_latest(
+        &self,
+        token: QueryToken,
         entries: Vec<(ResultItem, ResultAction)>,
-    ) -> SearchResponse;
+    ) -> Option<SearchResponse>;
 
     pub(crate) fn resolve(
         &self,
@@ -176,7 +352,7 @@ impl ResultRegistry {
         result_id: &str,
     ) -> Result<ResultAction, RegistryError>;
 
-    pub(crate) fn clear(&self);
+    pub(crate) fn hide_and_clear(&self);
 }
 ```
 
@@ -261,6 +437,7 @@ git commit -m "feat: add trusted result registry"
 - Create: `src-tauri/src/apps/icon.rs`
 - Modify: `src-tauri/Cargo.toml`
 - Modify: `src-tauri/src/lib.rs`
+- Create: `scripts/test-start-menu-boundary.ps1`
 
 - [ ] **Step 1: Write failing discovery and ranking tests**
 
@@ -290,9 +467,17 @@ fn cache_never_exposes_shortcut_or_executable_paths_in_result_items() {}
 
 #[test]
 fn icon_extraction_failure_uses_the_local_generic_icon() {}
+
+#[test]
+fn duplicate_display_names_have_distinct_stable_app_ids() {}
+
+#[test]
+fn aliases_are_bound_to_app_id_not_display_name() {}
 ```
 
 The ranking fixture must include `企业微信`, `微信`, `Visual Studio Code`, and unrelated entries. Assert that `企业` and `微信` find the expected applications through exact/prefix/contains/subsequence rules only.
+
+`scripts/test-start-menu-boundary.ps1` must create a temporary allowed root, a separate outside directory containing a fake `.lnk`, and a directory junction inside the allowed root pointing outside. It runs the focused scanner test and proves the outside entry is absent. The script verifies both temporary paths are under the process temp directory before cleanup and removes them in `finally`.
 
 - [ ] **Step 2: Run the focused tests and confirm failure**
 
@@ -309,10 +494,11 @@ Scan only:
 %ProgramData%\Microsoft\Windows\Start Menu\Programs
 ```
 
-Use `std::fs::read_dir` recursion, skip inaccessible entries, accept only `.lnk`, and never scan arbitrary drives. Represent the resolved record as:
+Use `std::fs::read_dir` recursion, skip inaccessible entries, accept only `.lnk`, and never scan arbitrary drives. Before descending into any directory, read Windows attributes and reject symlinks plus every directory carrying `FILE_ATTRIBUTE_REPARSE_POINT`; do not resolve the target to decide whether it looks safe. Represent the resolved record as:
 
 ```rust
 pub(crate) struct Application {
+    pub(crate) app_id: String,
     pub(crate) display_name: String,
     pub(crate) shortcut: PathBuf,
     pub(crate) executable: Option<PathBuf>,
@@ -323,6 +509,8 @@ pub(crate) struct Application {
 ```
 
 Resolve `.lnk` metadata through `IShellLinkW` and `IPersistFile` from the `windows` crate. Failure to resolve an executable is allowed; the shortcut remains a valid launch entry and simply skips activation mapping.
+
+Generate `app_id` exactly as specified in `Application identity and settings` with Windows CNG SHA-256. Detect duplicate IDs during a scan and fail the rescan instead of merging entries. The app ID may enter `AppAliasTarget` and trusted Rust actions, but shortcut and executable paths never enter a frontend DTO.
 
 - [ ] **Step 4: Cache application metadata and icons without widening frontend access**
 
@@ -338,6 +526,7 @@ Run:
 
 ```powershell
 cargo test --manifest-path src-tauri/Cargo.toml apps::
+powershell -ExecutionPolicy Bypass -File scripts/test-start-menu-boundary.ps1
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
@@ -346,13 +535,13 @@ Expected: all app tests pass; clippy exits 0.
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add src-tauri
+git add src-tauri scripts/test-start-menu-boundary.ps1
 git commit -m "feat: discover and rank Start Menu apps"
 ```
 
 ---
 
-## Task 4: Persist Settings and Local Validation Counts
+## Task 4: Persist Settings and Daily Validation Counts
 
 **Files:**
 - Create: `src-tauri/src/settings.rs`
@@ -369,13 +558,23 @@ Use a unique directory under `std::env::temp_dir()` and remove it at the end of 
 - Invalid current JSON is quarantined with a `.invalid` suffix and the last valid `.backup` file is loaded.
 - Defaults are used only when neither the current nor backup file is valid.
 - Validation counters never contain query text, application names, or paths.
-- Export produces only documented aggregate fields.
+- Two events on the same local date update one `DailyCounts`; the next date creates a second entry.
+- Export has `schemaVersion: 1`, optional `researchId`, and date-keyed `dailyCounts` with every field in the cross-task contract.
+- Three distinct active dates and per-day successful-action totals can be calculated from the exported structure.
+- An unclosed prior session increments `hostCrashes` on the recorded session date; a graceful exit does not.
+- Duplicate display names retain separate aliases through their distinct `appId` values.
+- Saving an alias for an unknown `appId` is rejected.
 - Clear resets all aggregates.
 - Export opens a native save dialog only after the user clicks Export and accepts no destination path from TypeScript.
 
 - [ ] **Step 2: Run tests and confirm failure**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml settings validation_data`
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml settings
+cargo test --manifest-path src-tauri/Cargo.toml validation_data
+```
 
 Expected: compile failure because persistence modules do not exist.
 
@@ -389,11 +588,14 @@ Store `settings.json` and `validation-data.json` under Tauri's application data 
 pub(crate) struct Settings {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
+    pub(crate) research_id: Option<String>,
     pub(crate) aliases: BTreeMap<String, Vec<String>>,
 }
 ```
 
-Keep aggregate counters for launcher invocations, successful launch requests, activation success, activation refusal, and error categories. Do not record raw inputs, result titles, executable names, shortcut paths, or timestamps precise enough to reconstruct a user's activity.
+The aliases map key is `appId`; validate it against the current application cache before saving. `load_settings` joins stored aliases with the current cache and returns the `SettingsView` contract, so same-name applications remain independently editable.
+
+Persist `VALIDATION_SCHEMA_VERSION` and the `BTreeMap<String, DailyCounts>` shape from the cross-task contract. Obtain the local date with `GetLocalTime`; do not store a timestamp. At startup, record the current date as an open session. On graceful tray exit clear it. If the next startup finds an open session, increment `hostCrashes` for that saved date before opening the new session. Do not record raw inputs, result titles, executable names, shortcut paths, or precise behavior times.
 
 Implement export with Windows `IFileSaveDialog` inside the zero-argument Rust command. Write the aggregate JSON only after the user confirms the native dialog; return only success/cancel/error status to TypeScript. Do not grant dialog or filesystem capabilities to the WebView.
 
@@ -402,7 +604,8 @@ Implement export with Windows `IFileSaveDialog` inside the zero-argument Rust co
 Run:
 
 ```powershell
-cargo test --manifest-path src-tauri/Cargo.toml settings validation_data
+cargo test --manifest-path src-tauri/Cargo.toml settings
+cargo test --manifest-path src-tauri/Cargo.toml validation_data
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
@@ -451,6 +654,9 @@ Test the exact policy:
 - Activation API errors: return a categorized error; do not claim success.
 - A cached shortcut that no longer exists keeps the launcher open and returns the rescan instruction.
 - Unknown or stale result IDs never reach the backend.
+- A command-level barrier makes query 1 finish after query 2; query 1 returns `null`, query 2 remains in the registry, and Enter executes query 2.
+- Hiding during an in-flight query makes its publish return `null` and leaves the registry empty.
+- `hide_launcher` clears the registry before attempting to hide; if hide fails it returns an error and the registry remains cleared.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -482,7 +688,7 @@ pub(crate) enum ExecuteOutcome {
 
 - [ ] **Step 4: Register narrow Tauri commands**
 
-`search_apps(query)` loads the current app cache, publishes a fresh result set, and returns `{ requestId, items }`. `execute_result(requestId, resultId)` resolves only through the registry and increments recent-use counts only after a successful launch/activation request. `rescan_apps()` refreshes only the two Start Menu roots. Settings and validation commands call their Rust services.
+`search_apps(query, invocationId, querySequence)` calls `begin_query` before doing cache/ranking work and finishes through `publish_if_latest`; it returns `null` for an old invocation, superseded query or hidden generation. It never calls an unconditional publish. `execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping and updates recent-use count only after a successful launch/activation request, then calls `clear_and_hide`; failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` refreshes only the two Start Menu roots. Settings and validation commands call their Rust services.
 
 Register exactly the commands already declared in `build.rs`. Do not add a generic `run`, `open`, `readFile`, `writeFile`, or `request` command.
 
@@ -521,7 +727,7 @@ Separate window-state decisions from Tauri handles and test:
 
 - Global hotkey toggles hidden -> shown and emits a new `invocationId`.
 - Repeated hotkey while visible focuses the existing window rather than creating another.
-- Escape and focus loss request hide, not process exit.
+- Escape command, focus loss, and close request all route through `clear_and_hide`, not process exit.
 - Every hide path clears the current `ResultRegistry` mapping.
 - Single-instance activation reuses the main window.
 - Invalid/conflicting configured hotkey preserves the previous registration and returns a visible error.
@@ -535,9 +741,9 @@ Expected: compile failure because lifecycle module does not exist.
 
 - [ ] **Step 3: Implement one-window lifecycle**
 
-Install the single-instance plugin first in the builder. Register `Alt+Space` through the global-shortcut plugin. On invocation, center the fixed-size window near the top of the current monitor, show it, focus it, and emit `launcher://shown` with a monotonically increasing `invocationId` and a Rust `Instant` measurement in test builds.
+Install the single-instance plugin first in the builder. Register `Alt+Space` through the global-shortcut plugin. On invocation, generate the opaque monotonically increasing `invocationId`, call `ResultRegistry::on_show(invocationId.clone())`, center the fixed-size window near the top of the current monitor, show it, focus it, and emit the same `invocationId` in `launcher://shown` with a Rust `Instant` measurement in test builds.
 
-Create a tray menu with only `打开设置` and `退出`. Closing the launcher hides it; tray `退出` terminates the process. Apply autostart changes only after the corresponding plugin call succeeds, then persist settings.
+Create a tray menu with only `打开设置` and `退出`. Focus loss and window close call `clear_and_hide`; tray `退出` first marks the validation session clean, then terminates the process. Apply autostart changes only after the corresponding plugin call succeeds, then persist settings.
 
 - [ ] **Step 4: Verify lifecycle logic and compile the desktop binary**
 
@@ -576,14 +782,15 @@ Use Vitest with jsdom and an injected command client. Cover:
 
 - Input focuses and selects its content after `launcher://shown`.
 - Empty input clears results without invoking Rust.
-- Normal text invokes only `search_apps`.
+- Normal text increments `querySequence` and invokes only `search_apps(query, invocationId, querySequence)`.
 - `/find` displays `文件搜索尚未启用` and invokes no file or generic command in this plan.
 - Any other slash-prefixed command displays `未知命令` and never falls through to app search.
 - ArrowUp/ArrowDown wrap within the fixed result set.
 - Enter sends only current `requestId` and selected `resultId`.
-- Escape hides the current window through the narrowly granted Tauri window permission.
-- Successful execution hides the window; failed execution keeps it open and announces the error.
-- A late response for an older query is ignored.
+- Escape invokes only `hide_launcher`; no TypeScript code calls a direct window hide API.
+- Successful execution relies on Rust to clear and hide; failed execution keeps the window open and announces the error.
+- A late response for an older query and a Rust `null` superseded response are ignored.
+- Each `launcher://shown` event resets `querySequence` to 0 before accepting input.
 - Results use `role="listbox"`, items use `role="option"`, and `aria-activedescendant` tracks selection.
 - Errors update a `role="status"` live region and are not conveyed by color alone.
 - The input uses combobox semantics and points `aria-controls` at the listbox.
@@ -603,6 +810,7 @@ Keep state explicit and framework-free:
 ```ts
 export interface LauncherState {
   query: string
+  invocationId?: string
   requestId?: string
   items: ResultItem[]
   selectedIndex: number
@@ -611,11 +819,11 @@ export interface LauncherState {
 }
 ```
 
-Use a monotonically increasing frontend sequence to discard out-of-order responses. Render text with `textContent`, never `innerHTML`. Use a generic local application icon when `icon` is absent. Do not load remote images or expose local paths.
+Use the monotonically increasing frontend `pendingSequence` both as `querySequence` sent to Rust and as a final UI stale-response guard. Render text with `textContent`, never `innerHTML`. Use a generic local application icon when `icon` is absent. Do not load remote images or expose local paths.
 
 - [ ] **Step 4: Implement settings in the same WebView**
 
-Use an unframed settings view, not a second WebView. Include hotkey input, autostart toggle, aliases editor, rescan button, validation export/clear buttons, and a back control. Display persistence/plugin errors inline and in the live region.
+Use an unframed settings view, not a second WebView. Include research ID, hotkey input, autostart toggle, aliases editor keyed by `AppAliasTarget.appId`, rescan button, validation export/clear buttons, and a back control. A DOM test with duplicate display names must edit one app without changing the other's aliases. Display persistence/plugin errors inline and in the live region.
 
 - [ ] **Step 5: Verify UI behavior**
 
