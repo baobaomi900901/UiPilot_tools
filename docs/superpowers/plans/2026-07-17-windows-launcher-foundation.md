@@ -186,6 +186,7 @@ Rust 侧使用的 single-instance、global-shortcut、autostart 和原生窗口 
 - Create: `security-probe.html`
 - Create: `src/security-probe.ts`
 - Create: `scripts/check-security-config.ps1`
+- Create: `scripts/test-security-config.ps1`
 - Create: `scripts/build-security-probe.ps1`
 - Create: `scripts/test-security-probe.ps1`
 
@@ -215,14 +216,25 @@ Create `scripts/check-security-config.ps1` with checks for these exact invariant
 ```powershell
 $ErrorActionPreference = 'Stop'
 $config = Get-Content "$PSScriptRoot/../src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
-$capabilityFiles = @(Get-ChildItem "$PSScriptRoot/../src-tauri/capabilities" -File -Filter '*.json')
-if ($capabilityFiles.Count -ne 1 -or $capabilityFiles[0].Name -ne 'main.json') {
+$capabilityDirectory = "$PSScriptRoot/../src-tauri/capabilities"
+$capabilityFiles = @(
+  Get-ChildItem $capabilityDirectory -Recurse -File |
+    Where-Object { $_.Extension -in @('.json', '.toml') }
+)
+$expectedCapability = [IO.Path]::GetFullPath((Join-Path $capabilityDirectory 'main.json'))
+if (
+  $capabilityFiles.Count -ne 1 -or
+  -not [string]::Equals($capabilityFiles[0].FullName, $expectedCapability, [StringComparison]::OrdinalIgnoreCase)
+) {
   throw 'Exactly one main capability file is allowed'
 }
 $capability = Get-Content $capabilityFiles[0].FullName -Raw | ConvertFrom-Json
 
 if ($config.app.security.csp -ne "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'") {
   throw 'Unexpected CSP'
+}
+if ($config.app.security.PSObject.Properties['capabilities']) {
+  throw 'Inline or explicitly enabled capabilities are not allowed'
 }
 if ($config.app.windows.Count -ne 1 -or $config.app.windows[0].label -ne 'main') {
   throw 'Only the main WebView is allowed'
@@ -296,6 +308,7 @@ Run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
 npm run build
 if (Test-Path dist/security-probe.html) { throw 'Production frontend contains security probe' }
 cargo check --manifest-path src-tauri/Cargo.toml
@@ -304,7 +317,7 @@ if (-not (Test-Path -LiteralPath $probeExe)) { throw 'Probe executable was not p
 & .\scripts\test-security-probe.ps1 -Executable $probeExe
 ```
 
-Expected: `security config ok`; normal Vite output omits the probe; Cargo exits 0; the unique probe build produces an executable whose non-main command call is rejected.
+Expected: `security config ok`; regression fixtures reject nested TOML and inline capabilities; normal Vite output omits the probe; Cargo exits 0; the unique probe build produces an executable whose non-main command call is rejected.
 
 - [ ] **Step 7: Commit**
 
@@ -727,6 +740,7 @@ Run:
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
 ```
 
 Expected: all tests pass; clippy and security check exit 0.
@@ -936,6 +950,7 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
 npm run tauri build -- --no-bundle
 $productionExe = (Resolve-Path 'src-tauri/target/release/uipilot.exe').Path
 & .\scripts\smoke-launcher.ps1 -Executable $productionExe
