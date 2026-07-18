@@ -121,7 +121,7 @@ Task 4C 的 native chooser 返回字段私有的 `ExportDestination`。Task 5 �
 
 ### Security probe build
 
-安全探针只有一个构建入口：
+安全探针通常只有一个构建入口：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build-security-probe.ps1
@@ -134,6 +134,13 @@ npm run tauri build -- --no-bundle --features test-instrumentation --config src-
 ```
 
 override config 把 `build.beforeBuildCommand` 固定为 `npm run build -- --mode security-probe`，因此同一次 Tauri 构建同时启用 Vite probe mode 和 Cargo `test-instrumentation` feature。脚本把 npm/Tauri 日志发送到 host，成功时 stdout 最后一行只输出探针可执行文件的绝对路径。任何测试或 smoke 都不得直接运行裸 `--features test-instrumentation` 构建。
+
+唯一例外是 Task 1A-R 的恢复环境可靠性门禁：该环境已实证上述脚本中的
+`Start-Process npm.cmd -Wait` 包装层会挂起而没有构建子进程。Task 1A-R 不修改脚本，
+而是在当前 PowerShell 测试进程内把 `Path`/`PATH` 规范化为单一 `Path` 键后，直接调用
+同一个 `npm.cmd run tauri build -- --no-bundle --features test-instrumentation --config
+src-tauri/tauri.security-probe.conf.json`。该例外仍使用同一 override config，不是裸 feature
+构建；每次必须认证原始退出码、Cargo metadata 定位的产物、UTC 时间和 SHA-256。
 
 Task 4A 扩展 `test-security-probe.ps1`：probe 启动前后比较正式 app-data 下 `settings.json*`、`validation-data.json*`、`open-session.json*` 的名称、长度、SHA-256 和最后写入 ticks。任何 current/backup/temp/invalid 文件新增、删除或变化都使 smoke 失败。4A/4B 的 app-data 查询、store load/manage 和 session open 只能存在于 `#[cfg(not(feature = "test-instrumentation"))]` setup 分支。
 
@@ -661,7 +668,7 @@ feature-only ACL 探针结果通道，同时保持只有精确 ACL 拒绝可退�
 
 - Modify and test: `src-tauri/src/security_probe.rs`
 - Modify: `src/security-probe.ts`
-- Read-only gate: `scripts/build-security-probe.ps1`
+- Unmodified legacy helper, not called by Task 1A-R: `scripts/build-security-probe.ps1`
 - Read-only gate: `scripts/test-security-probe.ps1`
 - Read-only gate: `scripts/check-security-config.ps1`
 - Read-only gate: `scripts/test-security-config.ps1`
@@ -678,10 +685,11 @@ Tauri configuration, capability files, production modules, Task 4 files or any o
 The approved design and this plan are committed before the implementation baseline tag and are
 therefore not part of the implementation diff.
 
-**Interfaces:**
+**Phase-specific interfaces:**
 
-The Rust implementation uses these exact private types and signatures. Equivalent naming or a
-single phase-switching classifier is not allowed because it would reopen the approved contract.
+R1 introduces only the following exact private diagnostic types and signatures. It must not
+declare or implement `ExactAclDenied` or `classify_final`. Equivalent naming or a single
+phase-switching classifier is not allowed because it would reopen the approved contract.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -732,7 +740,6 @@ enum IntermediateState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
     LegacyUrlChannelMatched,
-    ExactAclDenied,
     PageLoadTimeout,
     ProbeScriptNotStarted,
     InvokeTimeout,
@@ -760,19 +767,25 @@ fn classify_diagnostic(
     legacy_url_result: Option<LegacyUrlResult>,
 ) -> ProbeDecision;
 
+fn exit_code(outcome: ProbeOutcome) -> i32;
+```
+
+In R1, `exit_code` maps `LegacyUrlChannelMatched` to `73`; the remaining variants map in order
+to `74` through `84` exactly as the approved design. R2.1 first adds RED references to a new
+`ProbeOutcome::ExactAclDenied` variant and this new signature:
+
+```rust
 fn classify_final(
     page_load_finished: bool,
     observation: &ProbeObservation,
 ) -> ProbeDecision;
-
-fn exit_code(outcome: ProbeOutcome) -> i32;
 ```
 
-`exit_code` maps `LegacyUrlChannelMatched` and `ExactAclDenied` to `73`; the remaining variants
-map in order to `74` through `84` exactly as the approved design. Phase one never calls
-`classify_final`; phase two runtime never calls `classify_diagnostic` or `WebviewWindow::url()`.
-After phase two, diagnostic-only classifier tests may remain under `#[cfg(test)]`, but no legacy
-URL code may compile into the feature-only runtime.
+R2.3 implements both additions and maps `ExactAclDenied` to `73`. R1 must therefore pass
+all-features Clippy without a future-only private variant or temporary `allow(dead_code)`.
+After R2, the runtime never calls `classify_diagnostic` or `WebviewWindow::url()`.
+Diagnostic-only classifier tests may remain under `#[cfg(test)]`, but no legacy URL code may
+compile into the feature-only runtime.
 
 The browser callback returns exactly this JSON object shape:
 
@@ -799,9 +812,12 @@ interface ProbeObservation {
 - The page-load callback only signals a channel. It cannot wait, sleep, evaluate JavaScript or
   exit the process.
 - One worker owns the 10-second monotonic deadline and process exit decision.
-- Each eval callback has a 250ms timeout. Timeout is terminal `82`; no second eval may dispatch.
+- Each eval callback may wait at most 250ms and never beyond the single total deadline. A full
+  250ms callback timeout is terminal `82`; no second eval may dispatch. When the remaining total
+  budget is shorter, total-deadline classification wins and remains non-`73`.
 - A new eval may dispatch after 50ms only when the previous callback returned, was marked
-  completed, and classified as empty state or `invoke-pending`.
+  completed, and classified as empty state or `invoke-pending`; that delay is also capped by the
+  remaining total budget and cannot cause another dispatch after the deadline.
 - The outer PowerShell timeout remains 15 seconds. Only `std::process::exit` is used for the
   feature-only probe's exact numeric exit.
 - No Vitest file or dependency is added. The TypeScript state transition is exercised by the
@@ -924,7 +940,16 @@ Use these test helpers in the same module and add table tests proving:
    `evalError`, missing fields and extra fields never produce `73`, `79` or `80`;
 5. eval dispatch error is `81`, callback timeout is `82`, invalid payload is `83`, and caught
    eval script error is `84`;
-6. a late callback after terminal timeout cannot change the returned outcome.
+6. a late callback after terminal timeout cannot change the returned outcome;
+7. with total remaining below 250ms and no callback, callback wait is exactly capped by remaining,
+   the result is the last non-`73` intermediate outcome, and dispatch count is exactly `1`;
+8. after a completed retry observation with total remaining below 50ms, retry wait is exactly
+   capped by remaining, the corresponding `75` or `76` is returned, and dispatch count remains
+   exactly `1`.
+
+The two boundary tests must exercise `run_eval_loop_with`, not only a standalone duration helper.
+They may inject a private test clock/wait seam, but production and tests must share the same budget
+calculation and state transition. Do not use wall-clock tolerance as the sole oracle.
 
 - [ ] **Step R1.2: Run the focused RED test**
 
@@ -1058,9 +1083,21 @@ where
 
 Production timing is exactly 10 seconds total, 250ms per callback and 50ms after a completed
 retry observation. `dispatch` calls `probe.eval_with_callback(READ_OBSERVATION_SCRIPT, ...)` and
-maps its immediate `Err` to `EvalDispatchFailed/81`. `recv_timeout` maps directly to terminal
-`EvalCallbackTimeout/82` and returns without another dispatch. A received callback completes the
-current request before parse/classify. Retry sleeps only after completion.
+maps its immediate `Err` to `EvalDispatchFailed/81`. Track the last completed intermediate state,
+initialized to `ScriptNotStarted`. Immediately before every dispatch, recompute remaining time;
+zero remaining returns the last intermediate's `75` or `76` without dispatch. For an in-flight
+request, call `recv_timeout(min(callback_timeout, remaining))`. If the full callback timeout
+expires, return terminal `EvalCallbackTimeout/82` without another dispatch. If the wait was
+truncated because remaining was shorter, total deadline wins: return the last intermediate's
+`75` or `76`, never `82` or `73`. A received callback completes the current request before
+parse/classify.
+
+Retry sleeps only after a completed retry observation. Save that new intermediate state, recompute
+remaining, and wait `min(retry_delay, remaining)`. If remaining is shorter than the full retry
+delay, return that intermediate's `75` or `76` when the bounded wait ends and do not dispatch.
+Only a completed full 50ms retry delay may lead to the next loop iteration. Every deadline check,
+callback wait and retry wait uses the same monotonic clock; no branch may extend the original
+deadline.
 
 The worker records `deadline = Instant::now() + Duration::from_secs(10)` immediately after the
 window build. It waits for page-load using only the current remaining duration; timeout or channel
@@ -1106,20 +1143,33 @@ Clippy exit `0`. The existing independent junction test may remain ignored.
 Run:
 
 ```powershell
-npm run build
+npm.cmd run build
+if ($LASTEXITCODE -ne 0) { throw "production frontend build failed: $LASTEXITCODE" }
 if (Test-Path dist/security-probe.html) { throw 'production frontend contains security probe' }
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
 
-$negative = & powershell -NoProfile -ExecutionPolicy Bypass `
+$negative = @(& powershell -NoProfile -ExecutionPolicy Bypass `
   -File scripts/test-security-probe.ps1 `
-  -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1
-if ($LASTEXITCODE -eq 0) { throw "hostname.exe passed the security probe: $negative" }
+  -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1)
+$negativeExit = $LASTEXITCODE
+$negativeText = ($negative | ForEach-Object { $_.ToString() }) -join "`n"
+$expectedNegative = 'Security probe expected ACL denial exit code 73, got 0'
+if ($negativeExit -ne 1) {
+  throw "hostname.exe oracle returned $negativeExit instead of 1: $negativeText"
+}
+if ($negativeText -notmatch [regex]::Escape($expectedNegative)) {
+  throw "hostname.exe oracle did not authenticate the expected failure: $negativeText"
+}
+if ($negativeText -match 'security probe ok') {
+  throw "hostname.exe oracle emitted a success marker: $negativeText"
+}
 ```
 
 Expected: production build and both security configuration gates pass; production output has no
-probe page; `hostname.exe` is internally asserted non-zero. Do not launch a probe executable in
-this step.
+probe page; `hostname.exe` is authenticated as the expected exit-`1`, got-`0` negative result.
+Missing scripts, parse/start failures, other exits and any success marker fail the gate. Do not
+launch a probe executable in this step.
 
 - [ ] **Step R1.8: Build fresh and collect three raw diagnostic exit codes**
 
@@ -1128,10 +1178,40 @@ because that script must reject diagnostic exits `79` and `80`.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
+$processTarget = [EnvironmentVariableTarget]::Process
+$pathValue = [Environment]::GetEnvironmentVariable('Path', $processTarget)
+if ([string]::IsNullOrWhiteSpace($pathValue)) { throw 'process Path is unavailable' }
+$pathKeys = @(
+  [Environment]::GetEnvironmentVariables($processTarget).Keys |
+    Where-Object { [string] $_ -ieq 'Path' }
+)
+if ($pathKeys.Count -lt 1) { throw 'process Path key is unavailable' }
+foreach ($key in $pathKeys) {
+  [Environment]::SetEnvironmentVariable([string] $key, $null, $processTarget)
+}
+[Environment]::SetEnvironmentVariable('Path', $pathValue, $processTarget)
+$normalizedPathKeys = @(
+  [Environment]::GetEnvironmentVariables($processTarget).Keys |
+    Where-Object { [string] $_ -ieq 'Path' }
+)
+if ($normalizedPathKeys.Count -ne 1 -or [string] $normalizedPathKeys[0] -cne 'Path') {
+  throw 'process Path/PATH keys were not normalized to one Path key'
+}
+
+$npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $buildStarted = [DateTime]::UtcNow
-$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probeExe)) {
-  throw 'fresh diagnostic build failed'
+& $npm run tauri build -- --no-bundle --features test-instrumentation `
+  --config src-tauri/tauri.security-probe.conf.json
+$buildExit = $LASTEXITCODE
+if ($buildExit -ne 0) { throw "fresh diagnostic build failed: $buildExit" }
+
+$metadataJson = & cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1
+$metadataExit = $LASTEXITCODE
+if ($metadataExit -ne 0) { throw "cargo metadata failed: $metadataExit" }
+$metadata = $metadataJson | ConvertFrom-Json
+$probeExe = Join-Path ([string] $metadata.target_directory) 'release\uipilot.exe'
+if (-not (Test-Path -LiteralPath $probeExe -PathType Leaf)) {
+  throw "fresh diagnostic artifact is missing: $probeExe"
 }
 
 $probe = Get-Item -LiteralPath $probeExe
@@ -1227,7 +1307,13 @@ Run:
 
 ```powershell
 $allowed = @('src/security-probe.ts', 'src-tauri/src/security_probe.rs')
-$changed = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$tracked = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$untracked = @(git ls-files --others --exclude-standard)
+$changed = @(
+  @($tracked) + @($untracked) |
+    Where-Object { $_ } |
+    Sort-Object -Unique
+)
 $outside = @($changed | Where-Object { $_ -notin $allowed })
 if ($outside) { throw "R1 changed files outside allowlist: $($outside -join ', ')" }
 if (@($changed).Count -ne 2) { throw "R1 must change exactly two implementation files" }
@@ -1249,9 +1335,11 @@ approves R1 evidence and code.
 Checkpoint R2 may start only after R1 Go. It ends with a second code-review decision and does not
 authorize integration into Task 4.
 
-- [ ] **Step R2.1: Write RED final-classifier tests**
+- [ ] **Step R2.1: Write RED tests that first reference the phase-two interface**
 
-Add tests proving `classify_final` has no legacy input and follows the final predicate:
+R1 contains neither `ProbeOutcome::ExactAclDenied` nor `classify_final`. In this RED step, add
+tests that reference both names for the first time and prove the final classifier has no legacy
+input and follows the final predicate:
 
 ```rust
 #[test]
@@ -1327,12 +1415,13 @@ Run:
 cargo test --manifest-path src-tauri/Cargo.toml --features test-instrumentation final_ -- --nocapture
 ```
 
-Expected: compile failure because R1 deliberately did not implement `classify_final`. A passing
-command means the phase checkpoint was crossed early.
+Expected: compile failure because R1 deliberately contains neither `ExactAclDenied` nor
+`classify_final`. A passing command means the phase checkpoint was crossed early.
 
 - [ ] **Step R2.3: Implement final classification and remove runtime URL access**
 
-Implement `classify_final(page_load_finished, observation)` with the exact phase-two predicate.
+Add `ProbeOutcome::ExactAclDenied`, map it to `73`, and implement
+`classify_final(page_load_finished, observation)` with the exact phase-two predicate.
 Change the runtime loop classifier to `classify_final`; when it returns `ExactAclDenied`, exit
 `73` immediately. Delete all runtime calls to `probe.url()` and all runtime construction of
 `LegacyUrlResult`.
@@ -1370,26 +1459,45 @@ Expected: all tests/checks pass and the forbidden scan exits exactly `1` with no
 Run:
 
 ```powershell
-npm run build
+npm.cmd run build
+if ($LASTEXITCODE -ne 0) { throw "production frontend build failed: $LASTEXITCODE" }
 if (Test-Path dist/security-probe.html) { throw 'production frontend contains security probe' }
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
 
-$negative = & powershell -NoProfile -ExecutionPolicy Bypass `
+$negative = @(& powershell -NoProfile -ExecutionPolicy Bypass `
   -File scripts/test-security-probe.ps1 `
-  -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1
-if ($LASTEXITCODE -eq 0) { throw "hostname.exe passed the security probe: $negative" }
+  -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1)
+$negativeExit = $LASTEXITCODE
+$negativeText = ($negative | ForEach-Object { $_.ToString() }) -join "`n"
+$expectedNegative = 'Security probe expected ACL denial exit code 73, got 0'
+if ($negativeExit -ne 1) {
+  throw "hostname.exe oracle returned $negativeExit instead of 1: $negativeText"
+}
+if ($negativeText -notmatch [regex]::Escape($expectedNegative)) {
+  throw "hostname.exe oracle did not authenticate the expected failure: $negativeText"
+}
+if ($negativeText -match 'security probe ok') {
+  throw "hostname.exe oracle emitted a success marker: $negativeText"
+}
 
 $allowed = @('src/security-probe.ts', 'src-tauri/src/security_probe.rs')
-$changed = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$tracked = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$untracked = @(git ls-files --others --exclude-standard)
+$changed = @(
+  @($tracked) + @($untracked) |
+    Where-Object { $_ } |
+    Sort-Object -Unique
+)
 $outside = @($changed | Where-Object { $_ -notin $allowed })
 if ($outside) { throw "reliability work changed files outside allowlist: $($outside -join ', ')" }
 if (@($changed).Count -ne 2) { throw 'reliability implementation allowlist is incomplete' }
 git diff --check
 ```
 
-Expected: production and security gates pass, `hostname.exe` fails the oracle, and the cumulative
-implementation diff contains exactly the two approved source files.
+Expected: production and security gates pass, `hostname.exe` is authenticated as the expected
+exit-`1`, got-`0` negative result with no success marker, and the cumulative tracked plus untracked
+implementation set contains exactly the two approved source files.
 
 - [ ] **Step R2.6: Build a fresh final artifact and run the same SHA three times**
 
@@ -1398,10 +1506,40 @@ and the first loop iteration.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
+$processTarget = [EnvironmentVariableTarget]::Process
+$pathValue = [Environment]::GetEnvironmentVariable('Path', $processTarget)
+if ([string]::IsNullOrWhiteSpace($pathValue)) { throw 'process Path is unavailable' }
+$pathKeys = @(
+  [Environment]::GetEnvironmentVariables($processTarget).Keys |
+    Where-Object { [string] $_ -ieq 'Path' }
+)
+if ($pathKeys.Count -lt 1) { throw 'process Path key is unavailable' }
+foreach ($key in $pathKeys) {
+  [Environment]::SetEnvironmentVariable([string] $key, $null, $processTarget)
+}
+[Environment]::SetEnvironmentVariable('Path', $pathValue, $processTarget)
+$normalizedPathKeys = @(
+  [Environment]::GetEnvironmentVariables($processTarget).Keys |
+    Where-Object { [string] $_ -ieq 'Path' }
+)
+if ($normalizedPathKeys.Count -ne 1 -or [string] $normalizedPathKeys[0] -cne 'Path') {
+  throw 'process Path/PATH keys were not normalized to one Path key'
+}
+
+$npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $buildStarted = [DateTime]::UtcNow
-$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probeExe)) {
-  throw 'fresh final probe build failed'
+& $npm run tauri build -- --no-bundle --features test-instrumentation `
+  --config src-tauri/tauri.security-probe.conf.json
+$buildExit = $LASTEXITCODE
+if ($buildExit -ne 0) { throw "fresh final probe build failed: $buildExit" }
+
+$metadataJson = & cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1
+$metadataExit = $LASTEXITCODE
+if ($metadataExit -ne 0) { throw "cargo metadata failed: $metadataExit" }
+$metadata = $metadataJson | ConvertFrom-Json
+$probeExe = Join-Path ([string] $metadata.target_directory) 'release\uipilot.exe'
+if (-not (Test-Path -LiteralPath $probeExe -PathType Leaf)) {
+  throw "fresh final probe artifact is missing: $probeExe"
 }
 $probe = Get-Item -LiteralPath $probeExe
 if ($probe.LastWriteTimeUtc -lt $buildStarted) { throw 'final probe artifact is stale' }
@@ -1460,7 +1598,13 @@ Run:
 
 ```powershell
 $allowed = @('src/security-probe.ts', 'src-tauri/src/security_probe.rs')
-$changed = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$tracked = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$untracked = @(git ls-files --others --exclude-standard)
+$changed = @(
+  @($tracked) + @($untracked) |
+    Where-Object { $_ } |
+    Sort-Object -Unique
+)
 $outside = @($changed | Where-Object { $_ -notin $allowed })
 if ($outside) { throw "final reliability diff exceeds allowlist: $($outside -join ', ')" }
 if (@($changed).Count -ne 2) { throw 'final reliability diff must contain exactly two files' }
