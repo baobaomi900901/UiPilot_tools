@@ -8,14 +8,13 @@ use std::{
 };
 
 use windows::{
-    core::GUID,
+    core::{GUID, HRESULT, PWSTR},
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
         System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED},
         UI::Shell::{
-            FOLDERID_CommonPrograms, FOLDERID_Programs, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY,
-            KNOWN_FOLDER_FLAG,
+            FOLDERID_CommonPrograms, FOLDERID_Programs, KF_FLAG_DONT_VERIFY, KNOWN_FOLDER_FLAG,
         },
     },
 };
@@ -27,11 +26,27 @@ use super::{
 };
 use crate::{model::ResultItem, result_registry::ResultAction};
 
-struct KnownFolderPath(*mut u16);
+#[link(name = "shell32")]
+unsafe extern "system" {
+    #[link_name = "SHGetKnownFolderPath"]
+    fn sh_get_known_folder_path(
+        id: *const GUID,
+        flags: u32,
+        token: HANDLE,
+        output: *mut PWSTR,
+    ) -> HRESULT;
+}
 
-impl Drop for KnownFolderPath {
+struct KnownFolderPath<F: FnOnce(*mut u16)> {
+    pointer: *mut u16,
+    free: Option<F>,
+}
+
+impl<F: FnOnce(*mut u16)> Drop for KnownFolderPath<F> {
     fn drop(&mut self) {
-        unsafe { CoTaskMemFree(Some(self.0.cast::<c_void>())) };
+        self.free
+            .take()
+            .expect("known folder deallocator is missing")(self.pointer);
     }
 }
 
@@ -52,15 +67,44 @@ fn known_folder_path(
     flags: KNOWN_FOLDER_FLAG,
     token: Option<HANDLE>,
 ) -> Result<PathBuf, ()> {
-    let raw = unsafe { SHGetKnownFolderPath(id, flags, token) }.map_err(|_| ())?;
-    let owned = KnownFolderPath(raw.0);
+    known_folder_path_with(
+        id,
+        flags,
+        token,
+        |id, flags, token, output| unsafe {
+            sh_get_known_folder_path(id, flags.0 as u32, token.unwrap_or_default(), output)
+        },
+        |pointer| unsafe { CoTaskMemFree(Some(pointer.cast::<c_void>())) },
+    )
+}
+
+fn known_folder_path_with<C, F>(
+    id: &GUID,
+    flags: KNOWN_FOLDER_FLAG,
+    token: Option<HANDLE>,
+    call: C,
+    free: F,
+) -> Result<PathBuf, ()>
+where
+    C: FnOnce(&GUID, KNOWN_FOLDER_FLAG, Option<HANDLE>, *mut PWSTR) -> HRESULT,
+    F: FnOnce(*mut u16),
+{
+    let mut raw = PWSTR::null();
+    let status = call(id, flags, token, &mut raw);
+    let owned = KnownFolderPath {
+        pointer: raw.0,
+        free: Some(free),
+    };
+    if status.is_err() || owned.pointer.is_null() {
+        return Err(());
+    }
     let mut length = 0;
     unsafe {
-        while *owned.0.add(length) != 0 {
+        while *owned.pointer.add(length) != 0 {
             length += 1;
         }
         Ok(PathBuf::from(OsString::from_wide(
-            std::slice::from_raw_parts(owned.0, length),
+            std::slice::from_raw_parts(owned.pointer, length),
         )))
     }
 }
@@ -299,16 +343,21 @@ mod tests {
         fs, io,
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
+        ptr::NonNull,
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use windows::Win32::UI::Shell::{
-        FOLDERID_CommonPrograms, FOLDERID_Programs, KF_FLAG_DONT_VERIFY,
+    use windows::{
+        core::PWSTR,
+        Win32::{
+            Foundation::{E_FAIL, S_OK},
+            UI::Shell::{FOLDERID_CommonPrograms, FOLDERID_Programs, KF_FLAG_DONT_VERIFY},
+        },
     };
 
     use super::{
         classify_child_metadata, classify_root_metadata, discover_from_roots,
-        known_folder_roots_with, normalize_relative_path,
+        known_folder_path_with, known_folder_roots_with, normalize_relative_path,
     };
     use crate::apps::shortcut::{ShortcutError, ShortcutMetadata};
     use crate::{
@@ -401,6 +450,44 @@ mod tests {
             known_folder_roots_with(|_, _, _| Err(())).unwrap_err(),
             DiscoveryError::KnownFolderQuery,
         );
+    }
+
+    #[test]
+    fn raw_known_folder_result_frees_failure_pointer_and_rejects_null_success() {
+        let dangling = NonNull::<u16>::dangling().as_ptr();
+        let failure_freed = Cell::new(false);
+        let failure = known_folder_path_with(
+            &FOLDERID_Programs,
+            KF_FLAG_DONT_VERIFY,
+            None,
+            |id, flags, token, output| {
+                assert_eq!(id, &FOLDERID_Programs);
+                assert_eq!(flags, KF_FLAG_DONT_VERIFY);
+                assert!(token.is_none());
+                unsafe { *output = PWSTR(dangling) };
+                E_FAIL
+            },
+            |pointer| {
+                assert_eq!(pointer, dangling);
+                failure_freed.set(true);
+            },
+        );
+        assert_eq!(failure, Err(()));
+        assert!(failure_freed.get());
+
+        let null_freed = Cell::new(false);
+        let null_success = known_folder_path_with(
+            &FOLDERID_Programs,
+            KF_FLAG_DONT_VERIFY,
+            None,
+            |_, _, _, _| S_OK,
+            |pointer| {
+                assert!(pointer.is_null());
+                null_freed.set(true);
+            },
+        );
+        assert_eq!(null_success, Err(()));
+        assert!(null_freed.get());
     }
 
     #[test]
@@ -626,5 +713,21 @@ mod tests {
 
         assert_eq!(snapshot.diagnostics.reparse_entries, 1);
         assert!(!sentinel_seen.get());
+
+        let root_error = discover_from_roots(
+            [
+                StartMenuRoot {
+                    kind: RootKind::User,
+                    path: user.join("outside-link"),
+                },
+                StartMenuRoot {
+                    kind: RootKind::Common,
+                    path: common,
+                },
+            ],
+            no_target,
+        )
+        .unwrap_err();
+        assert_eq!(root_error, DiscoveryError::RootReparsePoint);
     }
 }
