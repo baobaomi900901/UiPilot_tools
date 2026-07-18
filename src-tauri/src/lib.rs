@@ -33,6 +33,15 @@ fn load_settings_store(
     settings::SettingsStore::load(app_data_dir)
 }
 
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+fn load_and_open_validation_store(
+    app_data_dir: &std::path::Path,
+) -> Result<validation_data::ValidationStore, validation_data::ValidationError> {
+    let store = validation_data::ValidationStore::load(app_data_dir)?;
+    store.reconcile_and_open_session()?;
+    Ok(store)
+}
+
 pub fn run() {
     let app_cache = Arc::new(apps::AppCache::new());
     let builder = tauri::Builder::default()
@@ -54,6 +63,9 @@ pub fn run() {
                 let app_data_dir = _app.path().app_data_dir()?;
                 let settings = load_settings_store(&app_data_dir)?;
                 assert!(_app.manage(settings), "settings store already managed");
+
+                let validation = load_and_open_validation_store(&app_data_dir)?;
+                assert!(_app.manage(validation), "validation store already managed");
             }
 
             let _ = apps::start_initial_refresh(Arc::clone(&app_cache))?;
@@ -73,7 +85,7 @@ mod tests {
 
     use super::{
         apps::{AppCache, Application},
-        load_settings_store,
+        load_and_open_validation_store, load_settings_store,
         settings::Settings,
     };
 
@@ -124,5 +136,14 @@ mod tests {
         let reloaded = load_settings_store(dir.path()).unwrap();
 
         assert_eq!(reloaded.snapshot().use_counts[APP_A], 1);
+    }
+
+    #[test]
+    fn load_and_open_validation_store_creates_marker_before_returning() {
+        let dir = TestDir::new();
+
+        let _store = load_and_open_validation_store(dir.path()).unwrap();
+
+        assert!(dir.path().join("open-session.json").exists());
     }
 }
