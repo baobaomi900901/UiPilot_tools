@@ -784,8 +784,9 @@ fn classify_final(
 R2.3 implements both additions and maps `ExactAclDenied` to `73`. R1 must therefore pass
 all-features Clippy without a future-only private variant or temporary `allow(dead_code)`.
 After R2, the runtime never calls `classify_diagnostic` or `WebviewWindow::url()`.
-Diagnostic-only classifier tests may remain under `#[cfg(test)]`, but no legacy URL code may
-compile into the feature-only runtime.
+The diagnostic classifier, `LegacyUrlResult`, the three legacy-only outcome variants and their
+three `exit_code` match arms may remain only under `#[cfg(test)]`; no legacy URL code or symbol may
+compile into the feature-only runtime. `allow(dead_code)` is forbidden in this module.
 
 The browser callback returns exactly this JSON object shape:
 
@@ -945,7 +946,11 @@ Use these test helpers in the same module and add table tests proving:
    the result is the last non-`73` intermediate outcome, and dispatch count is exactly `1`;
 8. after a completed retry observation with total remaining below 50ms, retry wait is exactly
    capped by remaining, the corresponding `75` or `76` is returned, and dispatch count remains
-   exactly `1`.
+   exactly `1`;
+9. when an injected dispatch advances the monotonic clock, the callback wait budget is recomputed
+   after dispatch from the same deadline, not reused from the pre-dispatch value; if dispatch
+   consumes the remaining budget, no callback wait occurs and the fixed last-intermediate result
+   is non-`73`.
 
 The two boundary tests must exercise `run_eval_loop_with`, not only a standalone duration helper.
 They may inject a private test clock/wait seam, but production and tests must share the same budget
@@ -1085,12 +1090,15 @@ Production timing is exactly 10 seconds total, 250ms per callback and 50ms after
 retry observation. `dispatch` calls `probe.eval_with_callback(READ_OBSERVATION_SCRIPT, ...)` and
 maps its immediate `Err` to `EvalDispatchFailed/81`. Track the last completed intermediate state,
 initialized to `ScriptNotStarted`. Immediately before every dispatch, recompute remaining time;
-zero remaining returns the last intermediate's `75` or `76` without dispatch. For an in-flight
-request, call `recv_timeout(min(callback_timeout, remaining))`. If the full callback timeout
+zero remaining returns the last intermediate's `75` or `76` without dispatch. After a successful
+`dispatch` return, recompute remaining again from the same monotonic deadline; never reuse the
+pre-dispatch value. If dispatch consumed the remaining budget, return the last intermediate's
+`75` or `76` without calling `recv_timeout`. Otherwise, for the now in-flight request call
+`recv_timeout(min(callback_timeout, post_dispatch_remaining))`. If the full callback timeout
 expires, return terminal `EvalCallbackTimeout/82` without another dispatch. If the wait was
-truncated because remaining was shorter, total deadline wins: return the last intermediate's
-`75` or `76`, never `82` or `73`. A received callback completes the current request before
-parse/classify.
+truncated because post-dispatch remaining was shorter, total deadline wins: return the last
+intermediate's `75` or `76`, never `82` or `73`. A received callback completes the current request
+before parse/classify.
 
 Retry sleeps only after a completed retry observation. Save that new intermediate state, recompute
 remaining, and wait `min(retry_delay, remaining)`. If remaining is shorter than the full retry
@@ -1427,8 +1435,12 @@ Change the runtime loop classifier to `classify_final`; when it returns `ExactAc
 `LegacyUrlResult`.
 
 Keep `classify_diagnostic`, `LegacyUrlResult`, and their evidence tests only under `#[cfg(test)]`.
-The non-test `test-instrumentation` build must contain no legacy URL query. Do not change the
-frontend state machine or timing established in R1.
+Also put `#[cfg(test)]` directly on the `LegacyUrlChannelMatched`, `LegacyUrlChannelMiss` and
+`LegacyUrlQueryFailed` enum variants and directly on their corresponding `exit_code` match arms.
+The final non-test all-features target must compile only `ExactAclDenied` and the shared failure
+variants. Do not use `allow(dead_code)` or another lint suppression. The non-test
+`test-instrumentation` build must contain no legacy URL query. Do not change the frontend state
+machine or timing established in R1.
 
 - [ ] **Step R2.4: Run focused, full Rust and source-boundary gates**
 
@@ -1446,13 +1458,35 @@ cargo check --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 Remove-Item Env:CARGO_INCREMENTAL
 
+$source = Get-Content -Raw -Encoding UTF8 src-tauri/src/security_probe.rs
+if ($source -match '(allow|expect)\s*\(\s*dead_code') {
+  throw 'security probe uses forbidden dead_code suppression'
+}
+foreach ($variant in @(
+  'LegacyUrlChannelMatched',
+  'LegacyUrlChannelMiss',
+  'LegacyUrlQueryFailed'
+)) {
+  $name = [regex]::Escape($variant)
+  $variantPattern = "(?m)^\s*#\[cfg\(test\)\]\r?\n\s*$name,\s*$"
+  $armPattern = "(?m)^\s*#\[cfg\(test\)\]\r?\n\s*ProbeOutcome::$name\s*=>"
+  if ($source -notmatch $variantPattern) {
+    throw "$variant is not directly test-gated"
+  }
+  if ($source -notmatch $armPattern) {
+    throw "$variant exit-code arm is not directly test-gated"
+  }
+}
+
 $forbidden = rg -n "\.url\(\)|WebviewWindow::url|data_directory|uipilot-security-probe-" `
   src-tauri/src/security_probe.rs
 if ($LASTEXITCODE -eq 0) { throw "final runtime keeps forbidden channel/profile code: $forbidden" }
 if ($LASTEXITCODE -ne 1) { throw 'forbidden-symbol scan failed' }
 ```
 
-Expected: all tests/checks pass and the forbidden scan exits exactly `1` with no matches.
+Expected: all tests/checks pass; final non-test all-features Clippy has no dead-code warning; the
+source oracle proves all three legacy variants and match arms are directly test-gated with no lint
+suppression; the forbidden scan exits exactly `1` with no matches.
 
 - [ ] **Step R2.5: Run production, configuration, negative oracle and allowlist gates**
 
