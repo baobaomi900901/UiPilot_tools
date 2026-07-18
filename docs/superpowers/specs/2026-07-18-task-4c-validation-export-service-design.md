@@ -35,20 +35,24 @@ pub(crate) enum ExportStatus {
     Cancelled,
 }
 
-pub(crate) fn export_validation_data(
+pub(crate) fn choose_export_destination(
     owner: HWND,
+) -> Result<Option<PathBuf>, ExportError>;
+
+pub(crate) fn write_validation_export(
+    destination: PathBuf,
     settings: &SettingsStore,
     validation: &ValidationStore,
-) -> Result<ExportStatus, ExportError>;
+) -> Result<(), ExportError>;
 ```
 
-该函数没有 path、filename、payload 或任意 JSON 参数。Task 5 wrapper 也必须保持零参数，从单一 main window 取得 HWND 和 managed stores 后调用本服务。
+两个函数均为 crate-private。`destination` 只能来自 `choose_export_destination` 的 Rust 返回值；Tauri command 没有 path、filename、payload 或任意 JSON 参数。Task 5 wrapper 必须保持零参数，从单一 main window 取得 HWND 后编排这两个函数。
 
 `src/protocol.ts` 在 Task 4C 中只定义 `ExportStatus` 类型，不调用 invoke；实际 invoke 封装由 Task 5/7 的相应计划负责。
 
 ## 对话框线程与 COM
 
-原生 adapter 使用 `IFileSaveDialog`，并固定在 Task 5 同步 command 所在的 Tauri main UI 线程调用。显示原生 modal dialog 是该同步命令唯一允许的阻塞操作；Task 5 不把它放入通用 blocking worker。
+`choose_export_destination` 使用 `IFileSaveDialog`，并固定在 Tauri main UI 线程调用；UI 线程只执行原生 modal dialog 和取得用户选择的路径。Task 5 必须使用 async command：先通过 Tauri main-thread dispatcher 执行该函数；返回 `None` 时立即映射为 `ExportStatus::Cancelled`，不得派发 writer；返回 `Some(path)` 时才把 owned `PathBuf` 和 cloned `AppHandle` 交给现有 `tauri::async_runtime::spawn_blocking`。worker 在内部取得 managed stores，调用一次 `write_validation_export` 完成 snapshot、序列化和落盘，成功后映射为 `ExportStatus::Exported`。不新增运行时，也不把借用的 Tauri state 跨线程传递。
 
 调用线程先执行 `CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)`：
 
@@ -63,18 +67,18 @@ file type: JSON (*.json)
 options: FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT | FOS_NOCHANGEDIR
 ```
 
-`HRESULT_FROM_WIN32(ERROR_CANCELLED)` 映射为 `ExportStatus::Cancelled`；cancel 不读取 store snapshot、不创建 temp、不写文件。其他 HRESULT 只映射为固定类别，不输出原始 HRESULT 或路径。
+`HRESULT_FROM_WIN32(ERROR_CANCELLED)` 映射为 `Ok(None)`；cancel 不读取 store snapshot、不创建 temp、不写文件。其他 HRESULT 只映射为固定类别，不输出原始 HRESULT 或路径。
 
 ## Snapshot 与锁边界
 
 保存对话框显示期间不持有 `SettingsStore` 或 `ValidationStore` 的锁。
 
-用户确认目标后，服务按以下顺序取得数据：
+用户确认目标后，blocking worker 按以下顺序取得数据：
 
-1. 调用 `settings.research_id()` 取得独立 `Option<String>` 克隆并释放设置锁。
+1. 调用 `settings.research_id()` 取得独立 `Option<String>` 克隆并释放设置锁；若为 `None`，返回固定 `ExportError::MissingResearchId`，不取得 validation snapshot、不创建 temp、不写文件。
 2. 调用 `validation.export_snapshot()` 取得 `schemaVersion + dailyCounts` 克隆并释放验证锁。
-3. 组合 `ValidationExport` 并序列化。
-4. 写出文件。
+3. 以必需的 research ID 组合 `ValidationExport` 并序列化。
+4. 在同一 blocking worker 中完成原子导出写入。
 
 两个 store 从不同时持锁。导出是用户确认后的一个时间点 snapshot；之后发生的事件留待下一次导出，不修改已经生成的文件。
 
@@ -85,7 +89,7 @@ options: FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT | FOS_NOC
 #[serde(rename_all = "camelCase")]
 struct ValidationExport {
     schema_version: u32,
-    research_id: Option<String>,
+    research_id: String,
     daily_counts: BTreeMap<String, DailyCounts>,
 }
 ```
@@ -102,11 +106,11 @@ uncleanSessions
 
 导出不得包含 `hostCrashes`、session ID、last reconciled ID、marker、hotkey、autostart、aliases、useCounts、查询词、应用名称、快捷方式、可执行文件或任意路径。
 
-research ID 使导出属于假名化数据。服务不添加用户姓名、设备 ID 或身份映射；身份映射仍由产品负责人单独保管。
+research ID 使导出属于假名化数据，并且是成功导出的必需字段；设置中仍允许暂未配置。服务不添加用户姓名、设备 ID 或身份映射；身份映射仍由产品负责人单独保管。
 
 ## 导出文件写入
 
-从 dialog 返回的 filesystem path 只驻留 Rust。服务在目标同目录创建唯一 sibling temp，使用 `create_new`、`write_all`、`sync_all` 并关闭句柄，再调用：
+从 dialog 返回的 filesystem path 只驻留 Rust，并以 owned `PathBuf` 移交 blocking worker。`write_validation_export` 在目标同目录创建唯一 sibling temp，使用 `create_new`、`write_all`、`sync_all` 并关闭句柄，再调用：
 
 ```text
 MoveFileExW(temp, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
@@ -118,26 +122,27 @@ MoveFileExW(temp, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUG
 
 ## 测试 seam
 
-生产函数只组合三个私有步骤：dialog、snapshot、atomic export write。测试通过私有 `export_with(dialog, snapshot, writer)` 闭包 seam 注入结果，不新增 trait、运行时或测试依赖，也不把 seam 暴露为 Tauri command。
+dialog adapter 和 atomic export writer 各自保留一个私有闭包 seam，用于注入系统结果和 I/O 失败。不新增 trait、运行时或测试依赖，也不把 seam 暴露为 Tauri command。
 
 Task 4C 进入 TDD 前，实施计划至少覆盖：
 
-1. cancel 返回 `Cancelled`，不取得 snapshot、不调用 writer。
-2. confirm 后才取得 research ID 与 validation snapshot。
-3. 输出 JSON 精确等于批准字段，明确不存在所有内部/敏感字段。
+1. dialog cancel 返回 `None`；Task 5 合同要求在 `spawn_blocking` 前返回 `Cancelled`，不取得 snapshot、不调用 writer。
+2. confirm 后才取得 research ID；缺少 ID 返回 `MissingResearchId`，不取得 validation snapshot、不创建文件。
+3. 输出 JSON 必含 research ID 且精确等于批准字段，明确不存在所有内部/敏感字段。
 4. writer 失败返回固定类别，不泄露路径。
 5. 目标 sibling temp、`sync_all` 和 MoveFileEx flags 的固定调用顺序。
 6. COM S_OK/S_FALSE 的配对释放和 changed-mode 固定失败。
 7. Show 使用 main HWND；cancel HRESULT 与普通错误分流。
 8. TypeScript/command 输入不存在 path 或 payload。
 9. Task 4C diff 中不存在 `#[tauri::command]`、`generate_handler` 变更、`commands.rs` 或 Task 5 action 文件。
+10. Task 5 后续集成测试必须证明 dialog 在 main UI 线程、cancel 不派发 worker，且 snapshot/序列化/`sync_all`/MoveFileEx 全部在 blocking worker。
 
 真实 native dialog 的人工 smoke 归入 Task 5 命令接线验收；Task 4C 自动测试不弹出对话框。
 
 ## 非目标与后续所有权
 
 - `clear_validation_data` 只是 Task 4B 的 store 方法，Task 5 才包装 command。
-- Task 5 负责 command 注册、managed state 获取和 fixed AppError 转换。
+- Task 5 负责 async command 注册、main-thread dialog 调度、`spawn_blocking` writer 调度、managed state 获取和 fixed AppError 转换。
 - Task 7 负责 Export/Clear 按钮、cancel UI 和无障碍状态提示。
 - Task 4C 不发送网络请求，也不实现自动上传。
 

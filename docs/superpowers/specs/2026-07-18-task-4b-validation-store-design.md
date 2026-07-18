@@ -25,7 +25,7 @@ src-tauri/src/session_marker.rs
 src-tauri/src/lib.rs
 ```
 
-进程只创建一个 `ValidationStore`。它同时拥有 `validation-data.json`、`validation-data.json.backup`、`open-session.json` 和一个 `Mutex<ValidationState>`；不会另建第二个计数 store 或 session manager。
+进程只创建一个 `ValidationStore`。它同时拥有 `validation-data.json`、`validation-data.json.backup`、`open-session.json` 和一个 `Mutex<ValidationStoreState>`；不会另建第二个计数 store 或 session manager。
 
 Task 4B 复用 Task 4A 已批准的 `atomic_file.rs`。所有路径由 Rust 从 Tauri application data directory 构造，前端不能提供。
 
@@ -54,6 +54,12 @@ struct ValidationState {
     last_reconciled_session_id: Option<String>,
 }
 
+struct ValidationStoreState {
+    value: ValidationState,
+    current_is_valid: bool,
+    current_session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionMarker {
@@ -63,7 +69,7 @@ struct SessionMarker {
 }
 ```
 
-导出 DTO 不复用 `ValidationState`，只包含 schema version、来自 `SettingsStore` 的可选 research ID 和 `dailyCounts`。`lastReconciledSessionId`、当前 `sessionId`、marker 字段和文件名永远不导出。
+`ValidationStoreState` 只驻留内存；`current_session_id` 不序列化，并在每次进程加载时固定初始化为 `None`。导出 snapshot 不复用 `ValidationState`，只包含 schema version 和 `dailyCounts`；Task 4C 另行加入必需的 research ID。`lastReconciledSessionId`、当前 `sessionId`、marker 字段和文件名永远不导出。
 
 ## 日期与事件合同
 
@@ -94,7 +100,7 @@ pub(crate) enum ValidationEvent {
 ```rust
 pub(crate) struct ValidationStore {
     paths: ValidationPaths,
-    state: Mutex<ValidationState>,
+    state: Mutex<ValidationStoreState>,
 }
 
 impl ValidationStore {
@@ -106,13 +112,13 @@ impl ValidationStore {
 }
 ```
 
-`record` 和 `clear_daily_counts` 每次只获取一次 `Mutex<ValidationState>`，在锁内完成克隆、checked mutation、序列化、backup/current 持久化和内存交换。写失败不修改内存。
+`record` 和 `clear_daily_counts` 每次只获取一次 `Mutex<ValidationStoreState>`，在锁内完成克隆、checked mutation、序列化、backup/current 持久化和内存交换。current 移动成功后把状态更新为 `{ value: candidate, current_is_valid: true, current_session_id: existing_id }`；写失败不修改内存。`record` 在 `current_session_id` 为空时返回固定 `SessionNotOpen`，不修改任何状态。
 
 `export_snapshot` 只在短临界区克隆 `schemaVersion + dailyCounts`。它不读取 `SettingsStore`，避免跨 store 嵌套锁。
 
 `clear_daily_counts` 只清空 `dailyCounts`；必须保留 `lastReconciledSessionId` 和当前 open-session marker，防止清除操作破坏 exactly-once 语义。
 
-validation current/backup 的加载、损坏隔离和默认恢复完全复用 Task 4A 的规则。权限、磁盘和原子移动错误不能降级为 defaults。
+validation current/backup 的加载、损坏隔离和默认恢复完全复用 Task 4A 的规则。current 加载成功时 `current_is_valid = true`；从 backup 或 defaults 恢复时为 `false`。首次成功持久化后必须变为 `true`，使下一次提交生成包含首次提交值的 backup。权限、磁盘和原子移动错误不能降级为 defaults。
 
 ## Session ID 与 marker
 
@@ -122,13 +128,15 @@ validation current/backup 的加载、损坏隔离和默认恢复完全复用 Ta
 
 ## Exactly-once 启动对账
 
-`reconcile_and_open_session` 在启动 setup 阶段、任何验证事件和命令暴露之前执行。算法固定为：
+`reconcile_and_open_session` 在启动 setup 阶段、任何验证事件和命令暴露之前执行。它先在锁内检查 `current_session_id`；已有 ID 时返回固定 `SessionAlreadyOpen`，且不读取文件、不生成 ID、不修改任何状态。首次调用算法固定为：
 
-1. 在锁内读取已验证的 `ValidationState` 和旧 `open-session.json`。
+1. 在锁内读取 `ValidationStoreState.value` 和旧 `open-session.json`。
 2. 若旧 marker 存在且 `sessionId != lastReconciledSessionId`，在 marker 的本地日期上对 `uncleanSessions` 做 checked increment，同时把 `lastReconciledSessionId` 设为旧 ID，并原子持久化 candidate validation state。
 3. 若旧 marker 的 ID 已等于 `lastReconciledSessionId`，不再增加计数，也不重写相同 validation state。
 4. 生成新 session ID 和当前本地日期，把新 marker 原子替换到 `open-session.json`。
-5. 新 marker 替换成功后返回；任何更早失败都不暴露半初始化的 store。
+5. 新 marker 替换成功后把同一 ID 写入内存 `current_session_id` 并返回；任何更早失败都不得设置该字段或暴露半初始化的 store。
+
+第 2 步的 validation current 一旦替换成功，内存 `value` 和 `current_is_valid` 立即同步为持久化结果，即使第 4 步随后失败也不得回滚成旧内存值。`current_session_id` 只在第 4 步成功后设置。
 
 本地验证会话的起点固定为第 4 步成功。该步骤成功前，应用不得注册命令、显示主窗口或记录验证事件；此前进程失败属于启动初始化失败，不由 open-session marker 计入 `uncleanSessions`，只能按外部 WER、Application Error、crash dump 或主持记录分类。
 
@@ -143,7 +151,7 @@ validation current/backup 的加载、损坏隔离和默认恢复完全复用 Ta
 
 ## 正常退出边界
 
-`mark_clean_exit` 读取当前 marker，只有其结构有效时才删除。不存在 marker 视为幂等成功；权限或删除错误返回固定类别。
+`mark_clean_exit` 在同一锁内取得内存 `current_session_id`。没有当前 ID 时幂等成功，不读取或删除 marker。存在当前 ID 时，磁盘 marker 必须结构有效且 ID 精确匹配；marker 缺失、损坏或不匹配都返回固定 `SessionOwnershipLost`，不得删除文件或清空内存 ID。只有匹配 marker 删除成功后才把 `current_session_id` 设为 `None`；删除错误保留 ID 并返回固定类别。
 
 Task 6 拥有生产接线：
 
@@ -166,14 +174,16 @@ Task 4B 进入 TDD 前，实施计划至少覆盖：
 1. 同日/跨日计数、全部事件映射和 checked overflow。
 2. 两个并发事件不丢失，内存与 current 一致。
 3. record、clear 的每个 I/O 失败点保持旧状态。
-4. validation current/backup 损坏恢复和严格日期 key 验证。
+4. validation current/backup 损坏恢复、严格日期 key 验证，以及从 defaults/backup 恢复后连续两次写入的 current/backup 状态。
 5. stale marker 正常增加一次。
 6. 在 validation 持久化前后、新 marker 替换前后模拟崩溃，反复启动仍 exactly once。
 7. malformed marker 被隔离但不冒充崩溃或计数。
 8. clear 只清 daily counts，保留 last reconciled ID 和当前 marker。
 9. 强制终止模拟留下 marker并在下次启动增加 `uncleanSessions`。
-10. 导出 snapshot 不含 session ID、last reconciled ID、路径或任何原始输入。
-11. 代码和产物不包含 `SetUnhandledExceptionFilter`、confirmed-crash marker 或 `hostCrashes` 字段。
+10. 重复 open 返回 `SessionAlreadyOpen` 且零状态修改；未 open 时 record 返回 `SessionNotOpen`。
+11. clean exit 只删除与内存 session ID 匹配的 marker；缺失、损坏或不匹配 marker 保持原样，成功删除后清空内存 ID，重复 clean 幂等且不访问 marker。
+12. 导出 snapshot 不含 session ID、last reconciled ID、路径或任何原始输入。
+13. 代码和产物不包含 `SetUnhandledExceptionFilter`、confirmed-crash marker 或 `hostCrashes` 字段。
 
 ## 非目标与后续所有权
 
