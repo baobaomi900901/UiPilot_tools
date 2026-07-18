@@ -875,13 +875,18 @@ pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application
 
 Its private tests may call `known_folder_roots_with` and `discover_from_roots` with closures. These are test seams, not traits, configuration or Tauri commands. Root and child `io::Result<Metadata>` values pass through private `classify_root_metadata` and `classify_child_metadata` helpers so permission errors are deterministic unit-test inputs while production traversal uses the same branches.
 
-`cache.rs` provides this process-memory surface backed by one `RwLock<Vec<Application>>`:
+`cache.rs` provides this process-memory surface backed by one `Mutex<()>` scan lock and one `RwLock<Vec<Application>>` snapshot:
 
 ```rust
+pub(crate) struct AppCache {
+    scan: Mutex<()>,
+    applications: RwLock<Vec<Application>>,
+}
+
 impl AppCache {
     pub(crate) fn new() -> Self;
     #[cfg(test)]
-    fn from_apps(applications: Vec<Application>) -> Self;
+    pub(crate) fn from_apps(applications: Vec<Application>) -> Self;
     pub(crate) fn snapshot(&self) -> Vec<Application>;
     pub(crate) fn contains(&self, app_id: &str) -> bool;
     pub(crate) fn refresh(&self) -> Result<DiscoveryDiagnostics, DiscoveryError>;
@@ -890,20 +895,40 @@ impl AppCache {
         F: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError>;
 }
 
-pub(crate) fn start_initial_refresh(cache: Arc<AppCache>) -> io::Result<JoinHandle<()>>;
+pub(crate) fn start_initial_refresh(cache: Arc<AppCache>) -> io::Result<JoinHandle<()>> {
+    start_initial_refresh_with(cache, discover)
+}
 
-#[cfg(test)]
 fn start_initial_refresh_with<F>(
     cache: Arc<AppCache>,
     discover: F,
 ) -> io::Result<JoinHandle<()>>
 where
-    F: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError> + Send + 'static;
+    F: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError> + Send + 'static,
+{
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let handle = thread::Builder::new()
+        .name("app-discovery".into())
+        .spawn(move || {
+            let _ = cache.refresh_with(|| {
+                let _ = entered_tx.send(());
+                discover()
+            });
+        })?;
+    entered_rx.recv().map_err(|_| {
+        io::Error::new(io::ErrorKind::Other, "app discovery worker did not start")
+    })?;
+    Ok(handle)
+}
 ```
 
 A failed refresh leaves the last good vector untouched. The cache never reads or writes `application-cache.json` because a user-modifiable path cache cannot be a trusted launch source.
 
+`refresh_with` acquires the scan lock before invoking its discovery closure and holds it through the one snapshot replacement. `snapshot` and `contains` take only the snapshot lock; no path takes the snapshot lock before the scan lock. Initial discovery and every manual rescan therefore execute one at a time without a generation system.
+
 `src-tauri/src/lib.rs` creates exactly one `Arc<AppCache>`, registers `Arc::clone(&app_cache)` with Tauri `manage`, and passes another clone to one named standard-library startup thread. The thread calls `AppCache::refresh`; its first failure leaves the new cache empty, while every later manual refresh failure preserves the last good snapshot. Task 4 and Task 5 must request `State<'_, Arc<AppCache>>`; they must not construct another `AppCache`.
+
+`start_initial_refresh_with` is the private production implementation, not a `#[cfg(test)]` copy. It spawns the worker and returns only after a zero-capacity standard-library channel confirms that the worker entered the discovery closure after acquiring the scan lock. `start_initial_refresh` contains no thread logic and may only delegate to `start_initial_refresh_with(cache, discover)`. This guarantees the startup scan owns the scan lock before setup exposes commands; tests inject only the discovery closure and exercise the same spawn/handshake path as production.
 
 Until Task 5 consumes discovery, ranking and registry conversion, declare the module exactly as `#[cfg_attr(not(test), allow(dead_code))] mod apps;`. Task 5 removes this scoped attribute when it wires the commands; do not add crate-wide or dependency-wide warning suppression.
 
@@ -1149,6 +1174,26 @@ fn failed_initial_refresh_leaves_shared_instance_empty() {
 }
 
 #[test]
+fn initial_refresh_and_later_rescan_are_serialized_and_later_result_wins() {
+    let cache = Arc::new(AppCache::new());
+    let (release_initial_tx, release_initial_rx) = mpsc::sync_channel(0);
+    let initial = start_initial_refresh_with(Arc::clone(&cache), move || {
+        release_initial_rx.recv().unwrap();
+        Ok(snapshot([application("Initial", 0)]))
+    }).unwrap();
+
+    let later_cache = Arc::clone(&cache);
+    let later = thread::spawn(move || {
+        later_cache.refresh_with(|| Ok(snapshot([application("Later", 0)]))).unwrap();
+    });
+    release_initial_tx.send(()).unwrap();
+    initial.join().unwrap();
+    later.join().unwrap();
+
+    assert_eq!(titles(&cache.snapshot()), ["Later"]);
+}
+
+#[test]
 fn exact_prefix_contains_and_subsequence_are_ordered() {
     let apps = ranking_fixture(["企业微信", "微信", "Visual Studio Code", "Unrelated"]);
     assert_eq!(titles(&rank(&apps, "微信")), ["微信", "企业微信"]);
@@ -1196,9 +1241,9 @@ Expected: non-zero exit because `AppCache` and ranking are not implemented.
 
 - [ ] **Step 7: Implement the process-memory cache and deterministic ranking**
 
-Implement `AppCache` with one `RwLock<Vec<Application>>`. `refresh` delegates to `refresh_with(discover)`. `refresh_with` completes discovery before taking the write lock, then replaces the vector once; an error never takes the write lock or changes state. Do not create a database, disk cache, watcher, async runtime or generic cache abstraction.
+Implement `AppCache` with one `Mutex<()>` scan lock and one `RwLock<Vec<Application>>`. `refresh` delegates to `refresh_with(discover)`. `refresh_with` holds the scan lock across discovery and the one write-lock replacement; an error leaves the vector unchanged. `snapshot` and `contains` never acquire the scan lock. Do not create a database, disk cache, watcher, async runtime or generic cache abstraction.
 
-In `src-tauri/src/lib.rs`, create the single `Arc<AppCache>` before building Tauri, register a clone with `.manage(...)`, and start the initial refresh from the existing `.setup(...)` closure after the security-probe setup branch. `start_initial_refresh_with` uses `std::thread::Builder::new().name("app-discovery")`, returns its `JoinHandle` for tests, and detaches it in production. The worker may retain only the shared `Arc`; it logs at most the fixed `DiscoveryError` category and never logs names, paths or HRESULT text.
+In `src-tauri/src/lib.rs`, create the single `Arc<AppCache>` before building Tauri, register a clone with `.manage(...)`, and start the initial refresh from the existing `.setup(...)` closure after the security-probe setup branch. `start_initial_refresh` delegates directly to the non-conditional private `start_initial_refresh_with(cache, discover)`. The shared helper uses `std::thread::Builder::new().name("app-discovery")`, the scan-lock-entry handshake, and returns its `JoinHandle`; tests join it and production detaches it. The worker may retain only the shared `Arc`; it logs at most the fixed `DiscoveryError` category and never logs names, paths or HRESULT text.
 
 Implement the ranking contract from Step 5 with standard-library strings and iterators. Do not transliterate, correct spelling, infer semantics or add a dependency. `registry_entry` sets `ResultItem.result_id` to an empty placeholder for Task 2 to overwrite, uses the display name as `title`, sets `subtitle` and `icon` to `None`, and places `app_id`, shortcut and executable only in `ResultAction`.
 
@@ -1262,6 +1307,7 @@ Use a unique directory under `std::env::temp_dir()` and remove it at the end of 
 - A structurally valid count for an application absent from the current `AppCache` is retained on disk but ignored when decorating the current snapshot.
 - Incrementing `use_count` for an `appId` absent from the current `AppCache` is rejected without changing memory or disk.
 - A successful known-ID increment writes a sibling temporary file, calls `sync_all`, atomically replaces `settings.json`, then swaps the in-memory settings; write failure leaves both previous states unchanged.
+- Two concurrent increments for one known `appId` produce count 2 in both `SettingsStore` memory and `settings.json`; neither update can overwrite the other.
 - Clear validation resets validation aggregates only and does not modify `useCounts` or aliases.
 - Export opens a native save dialog only after the user clicks Export and accepts no destination path from TypeScript.
 
@@ -1291,11 +1337,58 @@ pub(crate) struct Settings {
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
 }
+
+pub(crate) struct SettingsStore {
+    path: PathBuf,
+    settings: Mutex<Settings>,
+}
+
+impl SettingsStore {
+    pub(crate) fn decorate_applications(&self, applications: &mut [Application]);
+    pub(crate) fn increment_use_count(
+        &self,
+        app_id: &str,
+        cache: &AppCache,
+    ) -> Result<(), SettingsError>;
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Settings;
+}
 ```
 
 Every alias and use-count key must match `^app-[0-9a-f]{64}$`; malformed keys invalidate that settings file. A structurally valid key may refer to a temporarily absent application, so loading retains it without treating it as a trusted path or current application.
 
-`SettingsStore` owns the loaded `Settings` and its application-data path. It is managed once by Tauri and exposes crate-private `decorate_applications(&mut [Application])` and `increment_use_count(app_id, &AppCache)` operations. Task 4 commands request `State<'_, Arc<AppCache>>` and the single managed `SettingsStore`; they never construct a cache. Decoration copies aliases and counts only onto matching IDs from the current process-memory snapshot; absent entries remain at empty aliases and count zero. `increment_use_count` first requires `AppCache::contains(app_id)`, uses `checked_add`, persists a cloned settings value through the existing atomic-write/backup protocol, and swaps in-memory settings only after replacement succeeds. It never accepts a path and never exposes `use_counts` to TypeScript.
+`SettingsStore` owns the loaded `Settings` and its application-data path. It is managed once by Tauri and exposes crate-private `decorate_applications(&mut [Application])` and `increment_use_count(app_id, &AppCache)` operations. Task 4 commands request `State<'_, Arc<AppCache>>` and the single managed `SettingsStore`; they never construct a cache. Decoration holds the settings mutex only while copying aliases and counts onto matching IDs from the current process-memory snapshot; absent entries remain at empty aliases and count zero.
+
+Every mutation, including alias saves and `increment_use_count`, acquires the one `Mutex<Settings>` exactly once. The guard remains held while reading the old value, validating against `AppCache`, constructing the candidate, writing and syncing the sibling temporary file, replacing `settings.json`, and assigning the candidate to the guarded in-memory value. No mutation releases and reacquires the mutex between those operations. Validation, `checked_add`, serialization or disk failure leaves the guarded value unchanged; the existing backup/replacement protocol preserves the previous valid disk value. It never accepts a path and never exposes `use_counts` to TypeScript.
+
+Add this concurrency regression test using a temporary settings directory and one known cached application:
+
+```rust
+#[test]
+fn concurrent_use_count_increments_are_not_lost() {
+    let cache = Arc::new(AppCache::from_apps(vec![application("Known", 0)]));
+    let app_id = cache.snapshot()[0].app_id.clone();
+    let settings_path = unique_test_settings_path();
+    let store = Arc::new(test_settings_store(settings_path.clone()));
+    let start = Arc::new(Barrier::new(3));
+
+    let workers: Vec<_> = (0..2).map(|_| {
+        let cache = Arc::clone(&cache);
+        let app_id = app_id.clone();
+        let store = Arc::clone(&store);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            store.increment_use_count(&app_id, &cache).unwrap();
+        })
+    }).collect();
+    start.wait();
+    for worker in workers { worker.join().unwrap(); }
+
+    assert_eq!(store.snapshot().use_counts[&app_id], 2);
+    assert_eq!(read_settings(&settings_path).use_counts[&app_id], 2);
+}
+```
 
 The aliases map key is `appId`; validate it against the current `AppCache` before saving changes from the settings UI. `load_settings` decorates a clone of that same cache snapshot and returns the `SettingsView` contract, so same-name applications remain independently editable while trusted paths stay Rust-only.
 
@@ -1361,6 +1454,7 @@ Test the exact policy:
 - A command-level barrier makes query 1 finish after query 2; query 1 returns `null`, query 2 remains in the registry, and Enter executes query 2.
 - Hiding during an in-flight query makes its publish return `null` and leaves the registry empty.
 - `hide_launcher` clears the registry before attempting to hide; if hide fails it returns an error and the registry remains cleared.
+- `rescan_apps` moves discovery to a blocking runtime worker, returns only after that worker finishes, and never initializes COM on the command thread.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -1395,6 +1489,23 @@ pub(crate) enum ExecuteOutcome {
 All Task 5 commands request the same `State<'_, Arc<AppCache>>` created in Task 3; no command constructs or replaces the owner. `search_apps(query, invocationId, querySequence)` calls `begin_query`, clones `AppCache::snapshot`, asks the single `SettingsStore` to decorate only that clone with aliases and `use_count`, ranks it, and finishes through `publish_if_latest`. It returns `null` for an old invocation, superseded query or hidden generation and never calls an unconditional publish.
 
 `execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping, and after a successful launch/activation request asks `SettingsStore::increment_use_count` to atomically persist the trusted action's `app_id`. A count-write failure must not execute the application a second time or alter the already determined launch/activation outcome; report only the fixed settings-persistence category and no ID or path. Then call `clear_and_hide`; system-action failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` calls `refresh` on that same `AppCache`; failure preserves the current snapshot, while success replaces it once with the two roots returned by the fixed Known Folder provider. Settings and validation commands call their Rust services.
+
+`rescan_apps` is fixed as an async Tauri command and has no alternate synchronous entry point:
+
+```rust
+#[tauri::command]
+pub async fn rescan_apps(
+    cache: State<'_, Arc<AppCache>>,
+) -> Result<(), AppError> {
+    let cache = Arc::clone(cache.inner());
+    tauri::async_runtime::spawn_blocking(move || cache.refresh())
+        .await
+        .map_err(|_| AppError::ScanWorkerFailed)??;
+    Ok(())
+}
+```
+
+`DiscoveryError` converts only to the existing fixed path-free application error. `AppError::ScanWorkerFailed` also has one fixed path-free message. `discover` initializes its COM guard after entering the `spawn_blocking` closure, and the guard calls `CoUninitialize` on that same blocking worker before returning. Do not add Tokio, another runtime, `block_on`, or a synchronous command wrapper. Tauri documents that synchronous commands execute on the main thread and async commands are preferred for heavy work: [Calling Rust from the Frontend](https://v2.tauri.app/develop/calling-rust/#async-commands).
 
 When these commands consume the application module, replace `#[cfg_attr(not(test), allow(dead_code))] mod apps;` with plain `mod apps;`. No warning suppression remains after Task 5.
 
