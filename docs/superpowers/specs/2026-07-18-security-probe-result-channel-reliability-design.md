@@ -3,311 +3,308 @@
 ## 状态
 
 - 日期：2026-07-18
-- 状态：已批准，待实施计划复审
-- 基线：`6b2348e3694f4a8f45df97d84ccf6f1de3c6d516`
-- 分支：`codex/security-probe-reliability`
+- 状态：direct-eval readiness 修订，待书面复审
+- 基线：`157ad898c64abccfe26d1c76692011ea559b819e`
+- 分支：`codex/security-probe-eval-readiness-design`
 - 影响范围：Foundation Task 1A 的 feature-only 安全探针与门禁
 
 ## 背景
 
 现有安全探针已保证只有前端收到精确错误
 `Command load_settings not allowed by ACL` 时才把
-`window.location.hash` 设置为 `acl-denied`。Rust 侧随后通过
-`WebviewWindow::url()` 轮询 WebView2 native `Source`，仅把 fragment
-`acl-denied` 映射为进程退出码 `73`。
+`window.location.hash` 设置为 `acl-denied`。原 Rust 结果通道通过
+`WebviewWindow::url()` 读取 WebView2 native `Source`，但新的 feature-only
+产物在首次运行中反复不能稳定观察该 fragment。
 
-该结果通道不能稳定工作：
+第一次可靠性设计试图用 Tauri `on_page_load` 打开
+`eval_with_callback` 查询门。该候选通过了纯逻辑测试，却在真实 fresh Windows
+构建中失败：
 
-- 同一 release 产物曾连续六次通过 smoke，但新的 feature-only 构建在首次
-  smoke 中再次退出 `3`。
-- 2026-07-18 12:57:48 UTC 开始的新构建成功，产物时间为
-  12:58:08 UTC，SHA-256 为
-  `80FEEBE6D0E476441F95488A802B26B656C3B70248CAFBABD17B3F33412501CE`；
-  首次 smoke 仍返回 `3`，且正式 app-data 文件族没有变化。
-- 当前 `probe.url().ok()` 丢弃 URL 查询错误，并把页面未加载、探针脚本未执行、
-  invoke 结果异常和 native `Source` 未反映 same-document fragment 全部压成同一个
-  超时结果。继续预热或重跑不能提供可审计证据。
+1. 第一产物 SHA-256 为
+   `2F1061EF23A8F2E30B5A66E9B3AC211079E4C567283F790856112E5AEB89457B`。
+   未预热首次运行约 219ms 后退出 `74`；page-load channel 在事件到达前
+   disconnected。
+2. 在 worker 中保留一个不发送的 sender guard 后重新构建。新产物时间为
+   `2026-07-18T20:40:59.0763971Z`，SHA-256 为
+   `DC88EB7A7E899E11C9BF3D66382119E4B72E3303589C751BF90CEE097A39A8A3`。
+   未预热首次运行在约 10.236 秒后仍退出 `74`。正式 app-data 文件族、产物哈希、
+   临时 profile 与进程残留检查均通过，因此不能把结果归因于环境污染。
 
-因此 Task 4C completion gate 保持 No-Go。该问题先作为独立安全探针可靠性修订，
-不得通过放宽退出码或跳过首次运行来绕过。
+两次失败都发生在 parser、eval callback 和 ACL classifier 之前。单元测试全绿不构成
+对真实 WebView navigation 通道的证明，失败实现不得提交或进入最终阶段。
+
+## 根因边界
+
+项目当前锁定 `wry 0.55.1`。本地依赖源码
+`wry-0.55.1/src/webview2/mod.rs:647-670` 的
+`ContentLoading` 与 `NavigationCompleted` handler 都先调用：
+
+```rust
+Self::url_from_webview(&webview)?
+```
+
+成功后才调用用户 `on_page_load_handler`。同文件
+`1343-1346` 的 `url_from_webview` 直接调用 WebView2 `Source`：
+
+```rust
+unsafe { webview.Source(&mut pwstr)? };
+```
+
+因此 Tauri/Wry page-load handler 不是独立 readiness 信号。native `Source` 查询失败
+时，用户 handler 不会收到 `Started` 或 `Finished`。sender guard 只能把早期
+disconnect 延迟成完整 deadline timeout，不能消除该架构耦合。
 
 ## 目标
 
-1. 证明精确 ACL 拒绝可以通过可观察、可分类的 Rust 结果通道稳定传递。
-2. 保持 `73` 的单向安全语义：只有精确 ACL 拒绝可以退出 `73`。
-3. 让页面加载、前端执行、invoke 结果和 Rust 查询失败分别可诊断。
-4. 用全新 feature-only 产物的首次运行验证结果，禁止以预热运行掩盖冷启动问题。
+1. 不依赖 native URL、Wry page-load handler 或新增 IPC，直接证明 DOM 已可查询。
+2. 通过同一结构化 observation 同时证明页面 readiness、前端状态和精确 ACL 拒绝。
+3. 保持 `73` 单向语义：只有严格 DOM observation 中的精确 ACL 拒绝可以映射
+   `73`。
+4. 对启动期 eval 不可用、callback 丢失、脚本未执行、invoke 未完成和无效结果提供
+   互斥分类。
+5. 用 fresh feature-only 产物的未预热首次运行验证，不用追加重跑稀释失败。
 
 ## 不变安全边界
 
 - `security-probe.ts` 只有在错误字符串精确等于
-  `Command load_settings not allowed by ACL` 时，才能执行
-  `window.location.hash = 'acl-denied'`。
-- 命令成功、其他错误、空值、无效结构、查询错误和超时都不得映射为 `73`。
-- 不新增 Tauri command、capability、配置 override、网络访问、本地结果文件、
-  dependency 或生产代码路径。
-- 不设置新的 WebView `data_directory`，不创建需要额外所有权或清理协议的临时
-  profile。
+  `Command load_settings not allowed by ACL` 时，才能把状态和 hash 设为
+  `acl-denied`。
+- 命令成功、其他错误、loading、空状态、pending、无效 JSON、eval error 和超时均
+  不得映射为 `73`。
+- 不新增 Tauri command、event、capability、配置 override、dependency、网络访问、
+  本地结果文件、环境变量协议或生产代码路径。
+- 不设置新的 WebView `data_directory`，不创建临时 profile。
 - 不修改正式 `main` capability，不扩大探针窗口权限。
 - `std::process::exit(73)` 仍只存在于 `test-instrumentation` feature。
-- `test-instrumentation` 构建不得查询或修改正式 app-data，也不得加载或托管
-  `SettingsStore`、`ValidationStore` 或创建 session marker。
-- 生产前端不包含 `security-probe.html` 或探针 JavaScript；生产 Rust 构建不包含
-  探针模块。
+- feature-only 构建不得加载或托管 `SettingsStore`、`ValidationStore`，不得创建
+  session marker 或修改正式 app-data。
+- production 前端不包含探针页面或 JavaScript；production Rust 不包含探针模块。
 
 ## 方案比较
 
-### 方案 A：继续轮询 `WebviewWindow::url()`
+### 方案 A：窗口创建后直接重复结构化 DOM eval
 
-拒绝。WebView2 native `Source` 对 same-document fragment 的可见性已经出现不稳定
-实证，且 `.ok()` 会吞掉查询错误。增加重试次数只能延长不确定性，不能证明 ACL
-边界。
+推荐。窗口 build 成功后，单一 worker 立即进入
+`eval_with_callback` loop。每次 callback 返回严格结构：
+`documentReadyState`、`probeState`、`hash` 与 `evalError`。
 
-### 方案 B：页面加载完成后用 `eval_with_callback` 读取 DOM 状态
+该结构同时承担 readiness 和 ACL 结果，不注册 `on_page_load`，不维护 page-load
+channel/guard，也不需要 `page_load_finished` 重复谓词。启动期
+`eval_with_callback` 的同步 `Err` 在没有任何 callback 前是可重试的 readiness
+中间态；callback timeout 仍是未知在途请求，必须终止，不能重试。
 
-推荐，但必须先经独立诊断构建证明。Tauri 2.11.5 的
-`eval_with_callback` 会把 JavaScript 返回值序列化为 JSON 字符串交给 Rust；Windows
-上的 JavaScript exception 不会由 API 可靠上报，因此被执行的表达式必须自行捕获
-异常并返回结构化结果。
+### 方案 B：直接注册低层 WebView2 navigation event
 
-该方案直接读取页面真实的 `window.location.hash`，不再假定 WebView2 native
-`Source` 会同步 same-document fragment。
+拒绝。该路线需要取得低层 WebView2 接口、管理 COM event token 与 handler 生命周期，
+引入 Windows-only native/unsafe 边界，并绕开当前 Tauri/Wry 抽象。它还需要单独验证
+ABI、线程 apartment、窗口销毁、重复 navigation 和 handler 移除，复杂度与审计面
+远高于 feature-only 探针价值。
 
-### 方案 C：新增 IPC、capability、文件或网络结果通道
+### 方案 C：新增 command、event、文件或网络 backchannel
 
-拒绝。新增 command 或事件权限会改变被测 ACL，结果文件需要新的真实性和清理
-协议，网络通道扩大攻击面。这些方案会让探针改变它正在验证的权限边界。
+拒绝。新增 command/event 会改变被测 capability 和 ACL 面；文件需要真实性、原子性
+和清理协议；网络扩大攻击面。探针不能通过改变被测权限边界来报告权限结果。
+
+## 推荐架构
+
+### 前端状态机
+
+`security-probe.ts` 同步设置：
+
+```text
+invoke-pending
+```
+
+然后调用 `load_settings`：
+
+- resolve -> `invoke-succeeded`
+- 精确 ACL reject -> `acl-denied`，随后设置精确 `#acl-denied`
+- 其他 reject 或同步 throw -> `invoke-other-error`
+
+不得保存、返回或记录原始错误文本。只有精确 ACL 分支可以写 hash。
+
+### 结构化 observation
+
+Rust eval 表达式自行捕获 JavaScript exception，并只返回：
+
+- `documentReadyState`: `loading | interactive | complete`
+- `probeState`:
+  `null | invoke-pending | invoke-succeeded | acl-denied | invoke-other-error`
+- `hash`: string
+- `evalError`: `null | script-failed`
+
+Rust 使用 `deny_unknown_fields` 严格反序列化。JSON `null`、字符串、数组、缺字段、
+额外字段、未知枚举和值类型错误均立即分类为
+`InvalidEvalObservation/83`。
+
+### 直接 eval readiness loop
+
+窗口 build 成功后立即记录一个 10 秒 monotonic deadline，并启动唯一 worker：
+
+1. deadline 前且没有 eval 在途时发起一次 `eval_with_callback`。
+2. 在尚未收到任何 callback 前，eval 同步 `Err` 表示启动期 WebView 尚不可查询。
+   记录 `StartupEvalUnavailable`，按受剩余 deadline 限制的 50ms 间隔重试。它从不
+   映射 `73`。
+3. 任一 callback 已成功返回后，后续 eval 同步 `Err` 立即终止为
+   `EvalDispatchFailed/81`；不把已可工作的通道退化当作启动等待。
+4. dispatch 成功后重新从同一 deadline 计算剩余时间，再等待
+   `min(250ms, remaining)`。
+5. callback 在完整 250ms 内未返回是终态 `EvalCallbackTimeout/82`。请求可能仍在
+   WebView 中执行，因此不得派发第二次 eval。
+6. 若 callback wait 被总 deadline 截断时仍有成功 dispatch 的请求在途，结果为
+   `EvalCallbackTimeout/82`，并立即终止。只有所有启动期 dispatch 都同步返回 `Err`、
+   从未产生在途 callback 时，总 deadline 才返回 `EvalDispatchFailed/81`。
+7. callback 返回后先关闭本次请求，再 parse/classify。只有已完成 observation 被分类
+   为可重试中间态，才允许等待受 remaining 限制的 50ms 后发起下一次。
+8. 同时最多一个 eval callback 在途。晚到或重复 callback 不能覆盖已终止结果。
+
+总 deadline 不因 dispatch、callback 或 retry 重新开始。外层 PowerShell 继续使用
+15 秒硬超时。
+
+### readiness 与结果分类
+
+parser 后按以下互斥顺序分类：
+
+1. `evalError == script-failed` -> `EvalScriptFailed/84`
+2. `probeState == invoke-succeeded` -> `InvokeUnexpectedlyAllowed/77`
+3. `probeState == invoke-other-error` -> `InvokeOtherError/78`
+4. `probeState == null`、hash 为空且 `readyState == loading` ->
+   retry `DocumentNotReady`
+5. `probeState == null`、hash 为空且 ready -> retry `ProbeScriptNotStarted`
+6. `probeState == invoke-pending` 且 hash 为空 -> retry `InvokePending`
+7. `probeState == acl-denied`、hash 精确、但 readyState 仍为 loading ->
+   retry `DocumentNotReady`
+8. `probeState == acl-denied` 且
+   `readyState == interactive | complete`、`hash == #acl-denied`、
+   `evalError == null` -> 精确 ACL observation
+9. 其他状态/hash/readiness 组合，包括 null/pending 携带非空 hash ->
+   `InvalidEvalObservation/83`
+
+总 deadline 到达时，最后一个已完成中间态固定映射：
+
+| 中间态 | 最终分类 | 退出码 |
+|---|---|---:|
+| 启动期只有 eval dispatch `Err`，无 callback | `EvalDispatchFailed` | 81 |
+| `DocumentNotReady` | `DocumentNotReady` | 74 |
+| `ProbeScriptNotStarted` | `ProbeScriptNotStarted` | 75 |
+| `InvokePending` | `InvokeTimeout` | 76 |
 
 ## 两阶段决策
 
-本修订只能依次执行两个阶段，后续实施计划必须为两者设置独立审核检查点。
+### 阶段一：direct-eval 诊断
 
-### 阶段一：诊断构建
+阶段一使用：
 
-诊断构建仅在 `test-instrumentation` 中增加可分类状态，不改变 capability 或
-production build：
+```text
+classify_diagnostic(observation, legacy_url_result)
+```
 
-1. WebView builder 注册 page-load handler。只有目标窗口收到
-   `PageLoadEvent::Finished` 后，Rust 才允许发起 DOM 查询。
-2. 前端模块同步写入 feature-only 诊断状态
-   `window.__UIPILOT_SECURITY_PROBE_STATE__ = 'invoke-pending'`，然后调用
-   `load_settings`。同步 throw 与 Promise rejection 都必须进入固定分类。
-3. invoke 成功时状态变为 `invoke-succeeded`；精确 ACL 拒绝时状态变为
-   `acl-denied` 并设置 hash；其他错误变为 `invoke-other-error`。不得把原始错误文本
-   写入状态或日志。
-4. Rust 通过 `eval_with_callback` 读取一个自行捕获异常的结构化对象：
-   `documentReadyState`、`probeState`、`hash` 和 `evalError`。
-5. 只有 eval 已观察到精确 ACL 状态后，诊断阶段才执行一次显式
-   `WebviewWindow::url()` 查询作对照。不得使用 `.ok()`，必须把 `Err` 分类为查询
-   失败。该查询只用于证明旧通道是否漏报，不进入阶段二的最终判定。
-6. 若 DOM 观察为精确 ACL 状态和 `#acl-denied`，而 native URL 没有该 fragment，
-   分类为 `LegacyUrlChannelMiss`。这证明前端已设置状态但现有 Rust 结果通道没有
-   观察到。
+不得接收 `page_load_finished` 参数。只有 observation 已满足精确 ACL 条件后，才执行
+一次 `WebviewWindow::url()` 对照：
 
-诊断构建使用固定退出码暴露结果，不写结果文件：
+- fragment 精确匹配 -> `LegacyUrlChannelMatched/73`
+- Source 可读但 fragment 不匹配 -> `LegacyUrlChannelMiss/79`
+- URL 查询返回 `Err` -> `LegacyUrlQueryFailed/80`
+
+`79` 和 `80` 只证明 direct eval 已观察到精确 ACL，而旧 Source 通道漏报或失败；
+它们不得被安全 smoke 包装成成功。`73` 只表示该次旧通道也匹配，不能证明旧根因已
+消失。
+
+阶段一退出码：
 
 | 分类 | 退出码 |
 |---|---:|
-| `LegacyUrlChannelMatched` | `73` |
-| `PageLoadTimeout` | `74` |
-| `ProbeScriptNotStarted` | `75` |
-| `InvokeTimeout` | `76` |
-| `InvokeUnexpectedlyAllowed` | `77` |
-| `InvokeOtherError` | `78` |
-| `LegacyUrlChannelMiss` | `79` |
-| `LegacyUrlQueryFailed` | `80` |
-| `EvalDispatchFailed` | `81` |
-| `EvalCallbackTimeout` | `82` |
-| `InvalidEvalObservation` | `83` |
-| `EvalScriptFailed` | `84` |
-
-阶段一中的 `73` 只代表所有必需 ACL 条件成立，且 eval 与 native URL 两个观察通道
-都精确观察到 ACL fragment；该阶段的分类名固定为 `LegacyUrlChannelMatched`，不得
-复用阶段二的 `ExactAclDenied`。
-`LegacyUrlChannelMiss` 或 `LegacyUrlQueryFailed` 只有在 eval 已观察到精确 ACL 状态时
-才可分别退出 `79` 或 `80`，作为候选路线成立、旧通道失效的证据；它们不得被现有
-smoke 当成通过。其他场景不得借用 `79` 或 `80`。
-
-阶段一 Go 条件：构建一个 fresh 诊断产物，不预热地执行首次运行，再对同一未变化
-SHA-256 累计执行至少 3 次。每次 page-load finished 都必须发生，前端状态必须为
-`acl-denied`，DOM eval 必须返回精确 `#acl-denied`，且回调 JSON 必须严格解析。
-native URL 观察结果逐次记录为匹配、漏报或查询失败，并分别产生 `73`、`79` 或
-`80`。三次都只能产生这三个退出码；任一次产生 `74` 至 `78` 或 `81` 至 `84`，阶段一
-立即 No-Go，不追加运行稀释失败。
-
-三个允许结果都只证明 eval 候选路线在该次运行可观察精确 ACL。`79` 或 `80` 证明
-该次旧通道漏报或查询失败；`73` 只表示该次未复现旧通道故障，不能据此声明已经
-定位旧根因。三次中 `73`、`79`、`80` 发生变化本身是旧通道不稳定的直接证据。
-若 DOM eval 不能连续满足上述条件，立即回到书面设计复审，不叠加第二种修复。
-
-现有 `test-security-probe.ps1` 的安全 oracle 不变，始终只接受 `73`。阶段一诊断门禁
-直接记录每次原始退出码；它可以把 `79` 或 `80` 计为候选路线证据，但不得输出
-`security probe ok` 或把这两个退出码包装成安全 smoke 成功。
+| `LegacyUrlChannelMatched` | 73 |
+| `DocumentNotReady` | 74 |
+| `ProbeScriptNotStarted` | 75 |
+| `InvokeTimeout` | 76 |
+| `InvokeUnexpectedlyAllowed` | 77 |
+| `InvokeOtherError` | 78 |
+| `LegacyUrlChannelMiss` | 79 |
+| `LegacyUrlQueryFailed` | 80 |
+| `EvalDispatchFailed` | 81 |
+| `EvalCallbackTimeout` | 82 |
+| `InvalidEvalObservation` | 83 |
+| `EvalScriptFailed` | 84 |
 
 ### 阶段二：最终结果通道
 
-仅在阶段一 Go 后实施：
+仅在阶段一 fresh evidence Go 后实施：
 
-1. 删除 `WebviewWindow::url()` 轮询和对 native `Source` 的判定依赖。
-2. page-load finished 只负责打开查询门，不在 UI 线程等待。
-3. Rust 串行发起一次 eval 并等待该次 callback。只有 callback 已返回，且严格分类
-   为可重试中间态，才允许下一次查询，禁止堆积并发 eval callback。
-4. 每次查询都受单次 callback 超时和总时限约束。eval 立即返回 `Err` 是终态
-   `EvalDispatchFailed`；callback 在 250ms 内未到达是本进程终态
-   `EvalCallbackTimeout`，立即退出 `82`，不得再派发 eval。JSON 无效、字段无效或
-   表达式错误也都是立即终止的非 `73` 结果。
-5. 只有 page-load finished 已发生，结构化结果严格解析成功，
-   `documentReadyState` 为 `interactive` 或 `complete`，`probeState` 精确为
-   `acl-denied`，且 `hash` 精确为 `#acl-denied` 时，Rust 才执行
-   `std::process::exit(73)`；该阶段的分类名固定为 `ExactAclDenied`。
-6. `invoke-succeeded` 和 `invoke-other-error` 是立即终止的非 `73` 结果；
-   空状态和 `invoke-pending` 是可重试的中间观察，只能在总时限耗尽后分别分类为
-   `ProbeScriptNotStarted` 和 `InvokeTimeout`，不能视为成功。
+1. 删除全部 runtime `WebviewWindow::url()` 与 legacy 分类。
+2. 使用 `classify_final(observation)`，同样不接收 page-load 参数。
+3. 只有严格 observation 的 readyState、state、hash 与 evalError 同时满足条件时，
+   返回 `ExactAclDenied/73`。
+4. 保留 direct eval readiness loop、single callback 所有权和全部非 `73` 分类。
 
-## 诊断矩阵
-
-| 阶段 | 场景 | 可观察证据 | 分类 | 退出码 |
-|---|---|---|---|---:|
-| 两阶段 | WebView 页面未完成加载 | 总时限内未收到目标窗口的 `PageLoadEvent::Finished` | `PageLoadTimeout` | `74` |
-| 两阶段 | 页面已加载但 probe JS 未执行 | finished 已发生；eval 结构有效但 `probeState` 为空直到总时限 | `ProbeScriptNotStarted` | `75` |
-| 两阶段 | invoke 尚未结束 | `probeState == invoke-pending` 直到总时限 | `InvokeTimeout` | `76` |
-| 两阶段 | invoke 成功 | `probeState == invoke-succeeded` | `InvokeUnexpectedlyAllowed` | `77` |
-| 两阶段 | 其他 invoke 错误 | `probeState == invoke-other-error` | `InvokeOtherError` | `78` |
-| 阶段一 | 两通道匹配 | eval 为精确 ACL；native URL fragment 也精确为 `acl-denied` | `LegacyUrlChannelMatched` | `73` |
-| 阶段一 | JS 已设置状态但旧 Rust 通道未观察 | eval 为精确 ACL；native URL 无 fragment 或 fragment 不同 | `LegacyUrlChannelMiss` | `79` |
-| 阶段一 | Rust URL 查询自身失败 | eval 已观察精确 ACL；随后 `WebviewWindow::url()` 返回 `Err` | `LegacyUrlQueryFailed` | `80` |
-| 阶段二 | 精确 ACL 拒绝 | page-load finished；严格 eval 为精确 ACL；不查询 native URL | `ExactAclDenied` | `73` |
-| 两阶段 | Rust eval 派发失败 | `eval_with_callback` 立即返回 `Err` | `EvalDispatchFailed` | `81` |
-| 两阶段 | eval callback 未返回 | 单次 callback 超时；不再派发 eval | `EvalCallbackTimeout` | `82` |
-| 两阶段 | eval 返回空值、无效 JSON 或未知字段 | 严格反序列化失败 | `InvalidEvalObservation` | `83` |
-| 两阶段 | eval 表达式内部异常 | 表达式自行捕获并返回固定错误结构 | `EvalScriptFailed` | `84` |
-
-所有诊断输出只包含上述固定分类、计数和退出码，不包含 URL、路径、用户数据、原始
-JavaScript 错误或 ACL 错误文本。
-
-## Rust 分类边界
-
-DOM callback 的原始字符串先由一个共享、无副作用的 Rust parser 处理。结构使用
-`deny_unknown_fields`，字段只允许：
-
-- `documentReadyState`: `loading`、`interactive` 或 `complete`。
-- `probeState`: `null`、`invoke-pending`、`invoke-succeeded`、`acl-denied` 或
-  `invoke-other-error`。
-- `hash`: 字符串；只有精确 `#acl-denied` 有成功含义。
-- `evalError`: `null` 或固定值 `script-failed`，用于表达式内部异常；出现该值时其他
-  字段不得触发成功。
-
-parser 之后必须使用两个互不混用隐式条件的 phase-specific classifier：
-
-- `classify_diagnostic(page_load_finished, observation, legacy_url_result)` 只属于阶段一。
-  只有严格 eval 为精确 ACL 且 legacy URL fragment 精确为 `acl-denied` 时返回
-  `LegacyUrlChannelMatched/73`；legacy miss 和 `Err` 分别返回 `79` 与 `80`。
-- `classify_final(page_load_finished, observation)` 只属于阶段二，不接收 legacy URL
-  输入。只有严格 DOM eval 条件成立时返回 `ExactAclDenied/73`。
-
-parser 和两个 classifier 都不访问 WebView、进程、文件系统或时钟，允许纯 Rust
-单元测试穷举。以下输入在两个 classifier 中都必须为非 `73`：
-
-- JSON `null`、空字符串、其他字符串和数组。
-- 缺字段、额外字段、未知枚举值和无效 JSON。
-- hash 大小写、前后空白、URL 编码或额外 fragment 不同。
-- 只有 hash 正确但 `probeState` 不为 `acl-denied`。
-- 只有状态正确但 hash 不为 `#acl-denied`。
-- `documentReadyState == loading`，即使状态和 hash 正确。
-- `evalError` 非空。
-- eval API 返回错误或 callback 超时。
-
-此外，阶段一必须测试 eval 精确 ACL 加 legacy URL 匹配、漏报和查询失败分别只产生
-`73`、`79` 和 `80`；阶段二必须证明不存在 legacy URL 输入或分类分支。
-
-## 时序与所有权
-
-- 只处理 label 为 `security-probe` 的 page-load finished 事件。
-- page-load handler 只发送内部信号，不执行 sleep、eval 等待或进程退出。
-- 一个 worker 独占诊断状态机、总时限和进程退出决策。
-- 每次 eval callback 绑定本次请求序号。callback 返回后，该请求先标记为已完成再
-  分类；只有已完成请求返回空状态或 `invoke-pending` 时，才可等待 50ms 后派发下一个
-  请求。晚到或重复 callback 丢弃，不能覆盖更新的观察。
-- 从窗口 build 成功开始使用一个 10 秒 monotonic 总 deadline；page-load 等待和
-  所有 eval 尝试共同消耗该 deadline。每次 callback 最多等待 250ms；超时立即以
-  `82` 终止进程，不再派发请求，因此同时最多一个 eval 在途。只有 callback 已返回
-  可重试中间态时才使用 50ms 间隔。外层 PowerShell 保持 15 秒硬超时。
-- 所有失败路径最终退出非 `73`；不得因 worker panic 或 channel disconnect 误出
-  `73`。
+两个阶段的 runtime 都禁止 `on_page_load`、`PageLoadEvent`、page-load channel、
+sender guard 和 `page_load_finished` 谓词。
 
 ## 验证门禁
 
-### 纯逻辑门禁
+### 纯逻辑与所有权
 
-- Rust parser、`classify_diagnostic` 和 `classify_final` 分别覆盖自己的矩阵，禁止用
-  一个含隐式 phase 条件的 classifier 同时承担两个阶段。
-- 阶段一只有 page-load finished、严格 eval 精确 ACL 且 native URL fragment 精确
-  匹配时返回 `LegacyUrlChannelMatched/73`。eval 相同但 URL 漏报或查询失败必须返回
-  `79` 或 `80`。
-- 阶段二只有 page-load finished 已发生，严格结构中的 `documentReadyState` 为
-  `interactive` 或 `complete`、`probeState == acl-denied`、
-  `hash == #acl-denied` 且 `evalError == null` 时返回 `ExactAclDenied/73`，并且不接收
-  legacy URL 输入。
-- 相同结构在 page-load finished 未发生时，两个 classifier 都不得映射 `73`。
-- `null`、其他字符串、无效 JSON、未知字段、eval error 和 callback timeout 全部
-  不映射 `73`。
-- callback timeout 测试必须断言结果为终态 `82`，且 dispatch 计数保持 `1`；不得
-  因请求序号过滤而派发第二个 eval。
+- 严格 parser 覆盖 null、非对象、缺/多字段、未知枚举与无效 JSON。
+- readiness classifier 覆盖 loading/null/pending/success/other/exact ACL/不一致组合。
+- 启动期 dispatch `Err` 在首个 callback 前可重试；总 deadline 后固定为 `81`。
+- 首个 callback 后的 dispatch `Err` 立即为 `81`。
+- callback timeout 固定为终态 `82`，dispatch count 保持 `1`。
+- dispatch 推进测试时钟后，callback wait 必须使用 post-dispatch remaining。
+- retry delay 也必须受 remaining 限制；deadline 后不得再 dispatch。
+- source gate 禁止
+  `on_page_load`、`PageLoadEvent`、page-load sender/receiver/guard 与
+  `page_load_finished`。
+- 不得用 lint suppression 隐藏阶段接口或 dead code。
 
-### 安全回归
+### 安全与范围
 
-- `hostname.exe` 负例仍必须失败。
-- 配置白名单与全部恶意 fixture 继续通过现有门禁。
-- 不新增 command、capability、override、依赖或结果文件。
+- `hostname.exe` 负例精确认证退出码 `1`、got-`0` 文本且无成功标记。
+- 配置白名单和全部恶意 fixture 继续通过。
 - production build 不包含探针页面、前端模块或 Rust 探针代码。
+- 实现只允许修改 `src/security-probe.ts` 与
+  `src-tauri/src/security_probe.rs`；tracked 与 untracked 都纳入断言。
+- 不新增 command、capability、配置、依赖、脚本协议或结果文件。
 
-### 阶段一诊断证据
+### 阶段一 fresh 证据
 
-- 构建 fresh 诊断产物，记录构建开始 UTC、产物 UTC 和 SHA-256。
-- 不进行预热；直接记录新产物首次运行的原始退出码和固定分类。
-- 对同一未变化 SHA-256 的产物继续运行至少两次，累计至少 3 次。
-- 三次中的每次都必须发生 page-load finished，且 eval 严格观察到
-  `documentReadyState` 为 `interactive` 或 `complete`、`probeState == acl-denied`、
-  `hash == #acl-denied` 与 `evalError == null`；阶段一 classifier 再根据 legacy URL
-  对照分别返回 `73`、`79` 或 `80`。
-- 每次结果都只能为 `73`、`79` 或 `80`。任一次为 `74` 至 `78`、`81` 至 `84`、
-  超时或哈希变化，阶段一立即 No-Go，不追加运行稀释失败。
-- 逐次报告退出码与分类；若 `73`、`79`、`80` 在三次间变化，明确记录为旧通道
-  不稳定证据。三次均为 `73` 只证明 eval 候选可行，不能声称定位旧通道根因。
-- 该诊断门禁不调用或放宽安全 smoke oracle；`test-security-probe.ps1` 始终只接受
-  `73`。
+1. 构建一个全新诊断产物，记录 build UTC、artifact UTC 与 SHA-256。
+2. 不预热，直接运行该 SHA 的第一次 raw 诊断。
+3. 同一未变化 SHA 累计运行 3 次；每次只能返回 `73`、`79` 或 `80`。
+4. 任一次 `74-78`、`81-84`、超时、hash/app-data/profile/process 变化立即 No-Go，
+   不追加运行稀释失败。
+5. 逐次记录 raw 退出码与固定分类；现有安全 smoke 仍只接受 `73`。
 
-### 阶段二冷启动与重复性
+### 阶段二 cold smoke
 
-- 构建 fresh feature-only 产物，记录构建开始 UTC、产物 UTC 和 SHA-256。
-- 不进行预热；该新产物的第一次 smoke 必须返回 `security probe ok`，内部退出码必须
-  精确为 `73`。
-- 对同一未变化 SHA-256 的产物继续运行至少两次，累计至少 3/3 通过。
-- 任一次非 `73`、超时或哈希变化都失败，不以追加重跑稀释结果。
-- 每次运行前后，正式 app-data 下 `settings.json*`、`validation-data.json*` 和
-  `open-session.json*` 的根存在性、文件集合、长度、SHA-256 与最后写入 ticks 均不变。
-- 每次结束后不存在 `uipilot` 探针进程，也不存在本轮创建后遗留的临时 WebView
-  profile。本设计不新增 `data_directory` 或临时 profile；门禁禁止出现以
-  `uipilot-security-probe-` 命名的新目录，且禁止扫描或删除任意用户 profile。
+- 构建新的 feature-only 产物，不预热的首次 smoke 必须内部退出 `73`。
+- 同一 SHA 连续至少 3/3 通过；任一次失败即 No-Go。
+- 每次前后正式 app-data 文件族不变，无探针进程或临时 profile 残留。
+
+## 方案退出条件
+
+若 direct eval 在窗口 build 后持续同步返回 `Err`、callback 无法在单次时限内返回，
+或 fresh 首次运行不能产生 `73/79/80`，则本候选 No-Go。不得重新引入
+`on_page_load`、低层 WebView2 handler 或 backchannel 作为实现期补丁；必须回到
+产品/架构决策，选择移除 runtime probe gate 或单独批准更高风险路线。
 
 ## 文件与交付顺序
 
-本次提交只新增本文档，不修改代码、脚本或既有计划。
+本次修订只修改本文档。失败 R1 worktree 的两文件 diff 保持 unstaged、未提交，仅作
+证据，不得 cherry-pick 或声明完成。
 
 书面设计获批后：
 
-1. 更新 Foundation Task 1A 实施计划，引用本文固定的退出码与状态机时限，并写明
-   准确文件范围和 RED/GREEN 命令。
-2. 计划复审 Go 后才允许按 TDD 实施阶段一诊断。
-3. 阶段一证据 Go 后才允许实施阶段二最终结果通道。
-4. 探针修复代码级 Go 后，才非破坏性集成批准提交回
-   `codex/foundation-task-4`。
-5. 从头运行 Task 4C completion gate。通过前不得提交当前 Task 4C Task 2，也不得
-   进入 Task 5。
+1. 只更新 Foundation Task 1A-R 实施计划，删除 page-load 合同并加入 direct-eval
+   readiness RED/GREEN 与 source gate。
+2. 计划书面 Go 后，从 clean approved baseline 建立新的实现工作点，重新执行 TDD；
+   不在失败 worktree 上叠加修复。
+3. 阶段一代码与 fresh evidence Go 后才允许阶段二。
+4. 探针修复代码级 Go 后，才允许非破坏性集成回 Task 4 分支并从头运行 Task 4C
+   completion gate。
 
 ## 非目标
 
-- 不修改 Task 4C 导出服务实现或合同。
+- 不修改失败 R1 源码、Task 4C 导出服务或当前实施计划。
 - 不接线 Task 5 command、UI、协议或生命周期。
 - 不实现 `/find`。
 - 不合并 main、不推送、不签名、不发布。
