@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-07-18
-- 状态：待书面复审
+- 状态：已批准，待实施计划复审
 - 基线：`6b2348e3694f4a8f45df97d84ccf6f1de3c6d516`
 - 分支：`codex/security-probe-reliability`
 - 影响范围：Foundation Task 1A 的 feature-only 安全探针与门禁

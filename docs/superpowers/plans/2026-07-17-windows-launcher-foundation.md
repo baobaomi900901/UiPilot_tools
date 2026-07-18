@@ -642,6 +642,844 @@ git add docs/superpowers/specs/2026-07-18-security-gate-hardening-design.md docs
 git commit -m "fix: close security gate bypasses"
 ```
 
+### Task 1A-R: Stabilize the Security Probe Result Channel
+
+**Status:** 设计已批准；本实施计划待书面复审。计划 Go 前不得修改实现。
+
+**Design:**
+`docs/superpowers/specs/2026-07-18-security-probe-result-channel-reliability-design.md`
+
+**Goal:** 用 page-load finished 加 `eval_with_callback` 建立可分类、冷启动稳定的
+feature-only ACL 探针结果通道，同时保持只有精确 ACL 拒绝可退出 `73`。
+
+**Architecture:** 分两个独立审核检查点执行。阶段一保留一次显式 legacy URL 对照，
+用 raw 退出码证明 DOM eval 候选可行；阶段二经审核授权后删除 runtime URL 查询，
+只以严格 DOM 观察映射 `73`。两个阶段共享严格 parser 和串行 callback loop，但使用
+不同的 phase-specific classifier。
+
+**Files:**
+
+- Modify and test: `src-tauri/src/security_probe.rs`
+- Modify: `src/security-probe.ts`
+- Read-only gate: `scripts/build-security-probe.ps1`
+- Read-only gate: `scripts/test-security-probe.ps1`
+- Read-only gate: `scripts/check-security-config.ps1`
+- Read-only gate: `scripts/test-security-config.ps1`
+
+**Exact implementation allowlist:**
+
+```text
+src/security-probe.ts
+src-tauri/src/security_probe.rs
+```
+
+No implementation commit may modify `Cargo.toml`, `package.json`, lockfiles, scripts,
+Tauri configuration, capability files, production modules, Task 4 files or any other path.
+The approved design and this plan are committed before the implementation baseline tag and are
+therefore not part of the implementation diff.
+
+**Interfaces:**
+
+The Rust implementation uses these exact private types and signatures. Equivalent naming or a
+single phase-switching classifier is not allowed because it would reopen the approved contract.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DocumentReadyState {
+    Loading,
+    Interactive,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProbeState {
+    InvokePending,
+    InvokeSucceeded,
+    AclDenied,
+    InvokeOtherError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvalError {
+    ScriptFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProbeObservation {
+    document_ready_state: DocumentReadyState,
+    probe_state: Option<ProbeState>,
+    hash: String,
+    eval_error: Option<EvalError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacyUrlResult {
+    Matched,
+    Missed,
+    QueryFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntermediateState {
+    ScriptNotStarted,
+    InvokePending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    LegacyUrlChannelMatched,
+    ExactAclDenied,
+    PageLoadTimeout,
+    ProbeScriptNotStarted,
+    InvokeTimeout,
+    InvokeUnexpectedlyAllowed,
+    InvokeOtherError,
+    LegacyUrlChannelMiss,
+    LegacyUrlQueryFailed,
+    EvalDispatchFailed,
+    EvalCallbackTimeout,
+    InvalidEvalObservation,
+    EvalScriptFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDecision {
+    Retry(IntermediateState),
+    Exit(ProbeOutcome),
+}
+
+fn parse_observation(raw: &str) -> Result<ProbeObservation, ProbeOutcome>;
+
+fn classify_diagnostic(
+    page_load_finished: bool,
+    observation: &ProbeObservation,
+    legacy_url_result: Option<LegacyUrlResult>,
+) -> ProbeDecision;
+
+fn classify_final(
+    page_load_finished: bool,
+    observation: &ProbeObservation,
+) -> ProbeDecision;
+
+fn exit_code(outcome: ProbeOutcome) -> i32;
+```
+
+`exit_code` maps `LegacyUrlChannelMatched` and `ExactAclDenied` to `73`; the remaining variants
+map in order to `74` through `84` exactly as the approved design. Phase one never calls
+`classify_final`; phase two runtime never calls `classify_diagnostic` or `WebviewWindow::url()`.
+After phase two, diagnostic-only classifier tests may remain under `#[cfg(test)]`, but no legacy
+URL code may compile into the feature-only runtime.
+
+The browser callback returns exactly this JSON object shape:
+
+```ts
+interface ProbeObservation {
+  documentReadyState: 'loading' | 'interactive' | 'complete'
+  probeState:
+    | 'invoke-pending'
+    | 'invoke-succeeded'
+    | 'acl-denied'
+    | 'invoke-other-error'
+    | null
+  hash: string
+  evalError: 'script-failed' | null
+}
+```
+
+**Global constraints for Task 1A-R:**
+
+- Do not add a command, capability, config override, dependency, result file, network path,
+  environment-variable protocol, nonce, `data_directory` or production code path.
+- `security-probe.ts` sets `window.location.hash = 'acl-denied'` only for the exact error
+  `Command load_settings not allowed by ACL`.
+- The page-load callback only signals a channel. It cannot wait, sleep, evaluate JavaScript or
+  exit the process.
+- One worker owns the 10-second monotonic deadline and process exit decision.
+- Each eval callback has a 250ms timeout. Timeout is terminal `82`; no second eval may dispatch.
+- A new eval may dispatch after 50ms only when the previous callback returned, was marked
+  completed, and classified as empty state or `invoke-pending`.
+- The outer PowerShell timeout remains 15 seconds. Only `std::process::exit` is used for the
+  feature-only probe's exact numeric exit.
+- No Vitest file or dependency is added. The TypeScript state transition is exercised by the
+  fresh native diagnostic; pure classification and callback ownership are Rust unit tests.
+
+#### Approval Baseline
+
+- [ ] **Step R0: After this plan receives Go, create the immutable execution baseline before RED**
+
+Run:
+
+```powershell
+$approved = git rev-parse HEAD
+git tag foundation-security-probe-reliability-approved-plan $approved
+if ((git rev-parse foundation-security-probe-reliability-approved-plan) -ne $approved) {
+  throw 'reliability approved-plan tag mismatch'
+}
+if (git status --porcelain) { throw 'worktree must be clean before RED' }
+```
+
+Expected: the lightweight tag points exactly to the approved plan commit and the worktree is
+clean. Do not move or recreate this tag later.
+
+#### Checkpoint R1: Diagnose the Existing Result Channel
+
+Checkpoint R1 may start only after plan Go and Step R0. It ends with a code-review decision.
+Checkpoint R2 remains forbidden until R1 evidence and code receive Go.
+
+- [ ] **Step R1.1: Write RED parser, diagnostic classifier and callback ownership tests**
+
+Add a `#[cfg(test)]` module to `src-tauri/src/security_probe.rs` with exact-value fixtures. The
+tests must include these names and assertions:
+
+```rust
+#[test]
+fn diagnostic_exact_acl_and_legacy_match_is_73() {
+    assert_eq!(
+        exit_code(classify_diagnostic_exact(LegacyUrlResult::Matched)),
+        73
+    );
+}
+
+#[test]
+fn diagnostic_exact_acl_and_legacy_miss_is_79() {
+    assert_eq!(
+        exit_code(classify_diagnostic_exact(LegacyUrlResult::Missed)),
+        79
+    );
+}
+
+#[test]
+fn diagnostic_exact_acl_and_legacy_error_is_80() {
+    assert_eq!(
+        exit_code(classify_diagnostic_exact(LegacyUrlResult::QueryFailed)),
+        80
+    );
+}
+
+#[test]
+fn parser_rejects_null_strings_arrays_invalid_json_and_unknown_fields() {
+    for raw in [
+        "null",
+        "\"acl-denied\"",
+        "[]",
+        "{",
+        r#"{"documentReadyState":"complete","probeState":"acl-denied","hash":"#acl-denied","evalError":null,"extra":true}"#,
+    ] {
+        assert_eq!(parse_observation(raw), Err(ProbeOutcome::InvalidEvalObservation));
+    }
+}
+
+#[test]
+fn callback_timeout_is_terminal_and_dispatches_once() {
+    let dispatches = std::sync::atomic::AtomicUsize::new(0);
+    let outcome = run_eval_loop_with(
+        test_timing(),
+        |_| {
+            dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        |observation| classify_diagnostic(true, observation, None),
+    );
+
+    assert_eq!(outcome, ProbeOutcome::EvalCallbackTimeout);
+    assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+fn exact_acl_observation() -> ProbeObservation {
+    ProbeObservation {
+        document_ready_state: DocumentReadyState::Complete,
+        probe_state: Some(ProbeState::AclDenied),
+        hash: "#acl-denied".into(),
+        eval_error: None,
+    }
+}
+
+fn classify_diagnostic_exact(legacy: LegacyUrlResult) -> ProbeOutcome {
+    match classify_diagnostic(true, &exact_acl_observation(), Some(legacy)) {
+        ProbeDecision::Exit(outcome) => outcome,
+        ProbeDecision::Retry(state) => panic!("exact ACL unexpectedly retried: {state:?}"),
+    }
+}
+
+fn test_timing() -> ProbeTiming {
+    ProbeTiming {
+        total_timeout: std::time::Duration::from_millis(10),
+        callback_timeout: std::time::Duration::from_millis(1),
+        retry_delay: std::time::Duration::from_millis(1),
+    }
+}
+```
+
+Use these test helpers in the same module and add table tests proving:
+
+1. page-load false is `PageLoadTimeout/74`;
+2. empty state and `invoke-pending` are retry values before the deadline, then become `75` and
+   `76` at the deadline;
+3. invoke success and other error are terminal `77` and `78`;
+4. `loading`, case/whitespace/encoded/extra hash variants, mismatched state, non-null
+   `evalError`, missing fields and extra fields never produce `73`, `79` or `80`;
+5. eval dispatch error is `81`, callback timeout is `82`, invalid payload is `83`, and caught
+   eval script error is `84`;
+6. a late callback after terminal timeout cannot change the returned outcome.
+
+- [ ] **Step R1.2: Run the focused RED test**
+
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --features test-instrumentation security_probe -- --nocapture
+```
+
+Expected: compile failure because `ProbeObservation`, `classify_diagnostic`,
+`run_eval_loop_with` and their helpers do not exist. A passing command means the RED test is not
+testing the new contract.
+
+- [ ] **Step R1.3: Add the feature-only frontend state machine**
+
+Replace `src/security-probe.ts` with:
+
+```ts
+import { invoke } from '@tauri-apps/api/core'
+
+type ProbeState =
+  | 'invoke-pending'
+  | 'invoke-succeeded'
+  | 'acl-denied'
+  | 'invoke-other-error'
+
+declare global {
+  interface Window {
+    __UIPILOT_SECURITY_PROBE_STATE__?: ProbeState
+  }
+}
+
+window.__UIPILOT_SECURITY_PROBE_STATE__ = 'invoke-pending'
+
+try {
+  void invoke('load_settings').then(
+    () => {
+      window.__UIPILOT_SECURITY_PROBE_STATE__ = 'invoke-succeeded'
+    },
+    (error: unknown) => {
+      if (String(error) === 'Command load_settings not allowed by ACL') {
+        window.__UIPILOT_SECURITY_PROBE_STATE__ = 'acl-denied'
+        window.location.hash = 'acl-denied'
+      } else {
+        window.__UIPILOT_SECURITY_PROBE_STATE__ = 'invoke-other-error'
+      }
+    },
+  )
+} catch {
+  window.__UIPILOT_SECURITY_PROBE_STATE__ = 'invoke-other-error'
+}
+```
+
+Do not store or log the raw error. No other branch may write `window.location.hash`.
+
+- [ ] **Step R1.4: Implement the strict parser and diagnostic classifier**
+
+In `src-tauri/src/security_probe.rs`, implement the exact interfaces above and this fixed eval
+expression:
+
+```rust
+const READ_OBSERVATION_SCRIPT: &str = r#"
+(() => {
+  try {
+    return {
+      documentReadyState: document.readyState,
+      probeState: window.__UIPILOT_SECURITY_PROBE_STATE__ ?? null,
+      hash: window.location.hash,
+      evalError: null
+    };
+  } catch (_) {
+    return {
+      documentReadyState: 'loading',
+      probeState: null,
+      hash: '',
+      evalError: 'script-failed'
+    };
+  }
+})()
+"#;
+```
+
+`parse_observation` calls only `serde_json::from_str` and maps every parse or schema error to
+`InvalidEvalObservation`. The common DOM predicate requires page-load finished,
+`Interactive | Complete`, `Some(AclDenied)`, exact `#acl-denied`, and no `eval_error`.
+
+`classify_diagnostic` applies these rules in order:
+
+```text
+page-load false                                      -> Exit(PageLoadTimeout)
+evalError == script-failed                           -> Exit(EvalScriptFailed)
+probeState == null                                   -> Retry(ScriptNotStarted)
+probeState == invoke-pending                         -> Retry(InvokePending)
+probeState == invoke-succeeded                       -> Exit(InvokeUnexpectedlyAllowed)
+probeState == invoke-other-error                     -> Exit(InvokeOtherError)
+strict ACL + legacy Matched                          -> Exit(LegacyUrlChannelMatched)
+strict ACL + legacy Missed                           -> Exit(LegacyUrlChannelMiss)
+strict ACL + legacy QueryFailed                      -> Exit(LegacyUrlQueryFailed)
+strict ACL + no legacy result, or non-strict ACL     -> Exit(InvalidEvalObservation)
+```
+
+`exit_code` is an exhaustive match. Do not use enum discriminants that duplicate `73`.
+
+- [ ] **Step R1.5: Implement page-load gating and the single-callback loop**
+
+Use `WebviewWindowBuilder::on_page_load` and `std::sync::mpsc::sync_channel(1)`. Only
+`PageLoadEvent::Finished` for label `security-probe` signals ready. The callback calls only
+`try_send(())`; full or disconnected channels are ignored, so duplicate events cannot block the
+UI thread.
+
+The worker uses `Instant`, `sync_channel(1)`, `recv_timeout`, and a private testable helper with
+this contract:
+
+```rust
+#[derive(Clone, Copy)]
+struct ProbeTiming {
+    total_timeout: std::time::Duration,
+    callback_timeout: std::time::Duration,
+    retry_delay: std::time::Duration,
+}
+
+fn run_eval_loop_with<D, C>(
+    timing: ProbeTiming,
+    dispatch: D,
+    classify: C,
+) -> ProbeOutcome
+where
+    D: FnMut(std::sync::mpsc::SyncSender<String>) -> Result<(), ()>,
+    C: FnMut(&ProbeObservation) -> ProbeDecision;
+```
+
+Production timing is exactly 10 seconds total, 250ms per callback and 50ms after a completed
+retry observation. `dispatch` calls `probe.eval_with_callback(READ_OBSERVATION_SCRIPT, ...)` and
+maps its immediate `Err` to `EvalDispatchFailed/81`. `recv_timeout` maps directly to terminal
+`EvalCallbackTimeout/82` and returns without another dispatch. A received callback completes the
+current request before parse/classify. Retry sleeps only after completion.
+
+The worker records `deadline = Instant::now() + Duration::from_secs(10)` immediately after the
+window build. It waits for page-load using only the current remaining duration; timeout or channel
+disconnect returns `PageLoadTimeout/74`. After page-load, pass
+`deadline.saturating_duration_since(Instant::now())` as `ProbeTiming.total_timeout` to
+`run_eval_loop_with`. Never start a second 10-second interval after page-load.
+
+In checkpoint R1, when the strict DOM predicate is present, query `probe.url()` exactly once:
+
+```rust
+let legacy = match probe.url() {
+    Ok(url) if url.fragment() == Some("acl-denied") => LegacyUrlResult::Matched,
+    Ok(_) => LegacyUrlResult::Missed,
+    Err(_) => LegacyUrlResult::QueryFailed,
+};
+```
+
+Never use `.ok()`. Pass `Some(legacy)` to `classify_diagnostic`; all non-exact observations pass
+`None`. The worker is the only caller of `std::process::exit(exit_code(outcome))`.
+
+- [ ] **Step R1.6: Run focused and Rust quality gates**
+
+Run:
+
+```powershell
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml --features test-instrumentation security_probe -- --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+$env:CARGO_INCREMENTAL = '0'
+cargo test --manifest-path src-tauri/Cargo.toml --all-features
+cargo check --manifest-path src-tauri/Cargo.toml --all-targets --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+Remove-Item Env:CARGO_INCREMENTAL
+```
+
+Expected: focused parser/classifier/loop tests pass; the full suite has no failures; check and
+Clippy exit `0`. The existing independent junction test may remain ignored.
+
+- [ ] **Step R1.7: Run production and security isolation gates before the fresh diagnostic build**
+
+Run:
+
+```powershell
+npm run build
+if (Test-Path dist/security-probe.html) { throw 'production frontend contains security probe' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+
+$negative = & powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/test-security-probe.ps1 `
+  -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1
+if ($LASTEXITCODE -eq 0) { throw "hostname.exe passed the security probe: $negative" }
+```
+
+Expected: production build and both security configuration gates pass; production output has no
+probe page; `hostname.exe` is internally asserted non-zero. Do not launch a probe executable in
+this step.
+
+- [ ] **Step R1.8: Build fresh and collect three raw diagnostic exit codes**
+
+Run this block once. It intentionally does not invoke `test-security-probe.ps1` for the probe
+because that script must reject diagnostic exits `79` and `80`.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$buildStarted = [DateTime]::UtcNow
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probeExe)) {
+  throw 'fresh diagnostic build failed'
+}
+
+$probe = Get-Item -LiteralPath $probeExe
+if ($probe.LastWriteTimeUtc -lt $buildStarted) { throw 'diagnostic artifact is stale' }
+$expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $probe.FullName).Hash
+$appDataDir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'com.uipilot.launcher'
+
+function Get-ProtectedSnapshot([string] $Root) {
+  $entries = @()
+  $exists = Test-Path -LiteralPath $Root -PathType Container
+  if ($exists) {
+    $entries = @(Get-ChildItem -LiteralPath $Root -Force -File | Where-Object {
+      $_.Name -like 'settings.json*' -or
+      $_.Name -like 'validation-data.json*' -or
+      $_.Name -like 'open-session.json*'
+    } | Sort-Object Name | ForEach-Object {
+      [pscustomobject]@{
+        Name = $_.Name
+        Length = $_.Length
+        Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash
+        LastWriteTicks = $_.LastWriteTimeUtc.Ticks
+      }
+    })
+  }
+  ConvertTo-Json -Compress -Depth 3 -InputObject ([pscustomobject]@{
+    RootExists = $exists
+    Entries = @($entries)
+  })
+}
+
+function Get-ProbeTempProfiles {
+  @(
+    Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Force -Directory |
+      Where-Object Name -Like 'uipilot-security-probe-*' |
+      Sort-Object FullName |
+      ForEach-Object FullName
+  ) -join "`n"
+}
+
+$profilesBefore = Get-ProbeTempProfiles
+$records = @()
+foreach ($run in 1..3) {
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe.FullName).Hash -ne $expectedHash) {
+    throw "diagnostic artifact hash changed before run $run"
+  }
+  $before = Get-ProtectedSnapshot $appDataDir
+  $process = Start-Process -FilePath $probe.FullName -PassThru -WindowStyle Hidden
+  try {
+    if (-not $process.WaitForExit(15000)) {
+      Stop-Process -Id $process.Id -Force
+      throw "diagnostic run $run timed out"
+    }
+    $code = $process.ExitCode
+  }
+  finally {
+    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+  }
+  $after = Get-ProtectedSnapshot $appDataDir
+  if ($before -cne $after) { throw "diagnostic run $run modified protected app-data" }
+  if ((Get-ProbeTempProfiles) -cne $profilesBefore) {
+    throw "diagnostic run $run left a temporary profile"
+  }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe.FullName).Hash -ne $expectedHash) {
+    throw "diagnostic artifact hash changed after run $run"
+  }
+  if ($code -notin 73, 79, 80) {
+    throw "diagnostic run $run returned disallowed raw exit $code"
+  }
+  $category = switch ($code) {
+    73 { 'LegacyUrlChannelMatched' }
+    79 { 'LegacyUrlChannelMiss' }
+    80 { 'LegacyUrlQueryFailed' }
+  }
+  $records += [pscustomobject]@{ Run = $run; ExitCode = $code; Category = $category }
+}
+
+[pscustomobject]@{
+  BuildStartedUtc = $buildStarted.ToString('o')
+  ArtifactUtc = $probe.LastWriteTimeUtc.ToString('o')
+  Sha256 = $expectedHash
+  Runs = $records
+} | ConvertTo-Json -Depth 4
+```
+
+Expected: the very first un-warmed run and the next two runs all return raw `73`, `79` or `80`
+against one SHA-256. Any other code, timeout, app-data change, profile change or hash change is R1
+No-Go. `73` alone does not prove the legacy root cause; variation involving `79` or `80` is direct
+legacy-channel instability evidence.
+
+- [ ] **Step R1.9: Enforce R1 scope, commit, and request code review**
+
+Run:
+
+```powershell
+$allowed = @('src/security-probe.ts', 'src-tauri/src/security_probe.rs')
+$changed = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$outside = @($changed | Where-Object { $_ -notin $allowed })
+if ($outside) { throw "R1 changed files outside allowlist: $($outside -join ', ')" }
+if (@($changed).Count -ne 2) { throw "R1 must change exactly two implementation files" }
+if (git diff --cached --name-only) { throw 'unexpected staged files before R1 staging' }
+git diff --check
+git add src/security-probe.ts src-tauri/src/security_probe.rs
+git diff --cached --check
+git commit -m "fix: diagnose security probe result delivery"
+git show --check --stat --oneline HEAD
+if (git status --porcelain) { throw 'R1 worktree is not clean' }
+```
+
+Send the R1 SHA, raw three-run record, fresh artifact UTC/SHA-256, full verification output,
+allowlist result and clean status for code review. Do not start R2 until the reviewer explicitly
+approves R1 evidence and code.
+
+#### Checkpoint R2: Replace the Legacy Runtime Channel
+
+Checkpoint R2 may start only after R1 Go. It ends with a second code-review decision and does not
+authorize integration into Task 4.
+
+- [ ] **Step R2.1: Write RED final-classifier tests**
+
+Add tests proving `classify_final` has no legacy input and follows the final predicate:
+
+```rust
+#[test]
+fn final_exact_acl_is_73_without_a_legacy_input() {
+    let observation = exact_acl_observation();
+    assert_eq!(
+        classify_final(true, &observation),
+        ProbeDecision::Exit(ProbeOutcome::ExactAclDenied)
+    );
+    assert_eq!(exit_code(ProbeOutcome::ExactAclDenied), 73);
+}
+
+#[test]
+fn final_interactive_exact_acl_is_also_73() {
+    let mut observation = exact_acl_observation();
+    observation.document_ready_state = DocumentReadyState::Interactive;
+    assert_eq!(
+        classify_final(true, &observation),
+        ProbeDecision::Exit(ProbeOutcome::ExactAclDenied)
+    );
+}
+
+#[test]
+fn final_requires_page_load_ready_state_exact_state_hash_and_no_eval_error() {
+    for (page_loaded, observation) in final_invalid_acl_cases() {
+        assert_ne!(
+            classify_final(page_loaded, &observation),
+            ProbeDecision::Exit(ProbeOutcome::ExactAclDenied)
+        );
+    }
+}
+
+fn final_invalid_acl_cases() -> Vec<(bool, ProbeObservation)> {
+    let exact = exact_acl_observation();
+    let mut cases = vec![(false, exact.clone())];
+
+    let mut loading = exact.clone();
+    loading.document_ready_state = DocumentReadyState::Loading;
+    cases.push((true, loading));
+
+    for hash in ["", "#ACL-DENIED", " #acl-denied", "%23acl-denied", "#acl-denied-extra"] {
+        let mut observation = exact.clone();
+        observation.hash = hash.into();
+        cases.push((true, observation));
+    }
+
+    for state in [
+        None,
+        Some(ProbeState::InvokePending),
+        Some(ProbeState::InvokeSucceeded),
+        Some(ProbeState::InvokeOtherError),
+    ] {
+        let mut observation = exact.clone();
+        observation.probe_state = state;
+        cases.push((true, observation));
+    }
+
+    let mut script_failed = exact;
+    script_failed.eval_error = Some(EvalError::ScriptFailed);
+    cases.push((true, script_failed));
+    cases
+}
+```
+
+The invalid table must include page-load false, `loading`, wrong/empty/encoded/case/whitespace hash,
+null/pending/success/other state, and non-null `evalError`.
+
+- [ ] **Step R2.2: Run the focused RED test**
+
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --features test-instrumentation final_ -- --nocapture
+```
+
+Expected: compile failure because R1 deliberately did not implement `classify_final`. A passing
+command means the phase checkpoint was crossed early.
+
+- [ ] **Step R2.3: Implement final classification and remove runtime URL access**
+
+Implement `classify_final(page_load_finished, observation)` with the exact phase-two predicate.
+Change the runtime loop classifier to `classify_final`; when it returns `ExactAclDenied`, exit
+`73` immediately. Delete all runtime calls to `probe.url()` and all runtime construction of
+`LegacyUrlResult`.
+
+Keep `classify_diagnostic`, `LegacyUrlResult`, and their evidence tests only under `#[cfg(test)]`.
+The non-test `test-instrumentation` build must contain no legacy URL query. Do not change the
+frontend state machine or timing established in R1.
+
+- [ ] **Step R2.4: Run focused, full Rust and source-boundary gates**
+
+Run:
+
+```powershell
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml --features test-instrumentation security_probe -- --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+$env:CARGO_INCREMENTAL = '0'
+cargo test --manifest-path src-tauri/Cargo.toml --all-features
+cargo check --manifest-path src-tauri/Cargo.toml --all-targets --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+Remove-Item Env:CARGO_INCREMENTAL
+
+$forbidden = rg -n "\.url\(\)|WebviewWindow::url|data_directory|uipilot-security-probe-" `
+  src-tauri/src/security_probe.rs
+if ($LASTEXITCODE -eq 0) { throw "final runtime keeps forbidden channel/profile code: $forbidden" }
+if ($LASTEXITCODE -ne 1) { throw 'forbidden-symbol scan failed' }
+```
+
+Expected: all tests/checks pass and the forbidden scan exits exactly `1` with no matches.
+
+- [ ] **Step R2.5: Run production, configuration, negative oracle and allowlist gates**
+
+Run:
+
+```powershell
+npm run build
+if (Test-Path dist/security-probe.html) { throw 'production frontend contains security probe' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+
+$negative = & powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/test-security-probe.ps1 `
+  -Executable "$env:SystemRoot\System32\hostname.exe" 2>&1
+if ($LASTEXITCODE -eq 0) { throw "hostname.exe passed the security probe: $negative" }
+
+$allowed = @('src/security-probe.ts', 'src-tauri/src/security_probe.rs')
+$changed = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$outside = @($changed | Where-Object { $_ -notin $allowed })
+if ($outside) { throw "reliability work changed files outside allowlist: $($outside -join ', ')" }
+if (@($changed).Count -ne 2) { throw 'reliability implementation allowlist is incomplete' }
+git diff --check
+```
+
+Expected: production and security gates pass, `hostname.exe` fails the oracle, and the cumulative
+implementation diff contains exactly the two approved source files.
+
+- [ ] **Step R2.6: Build a fresh final artifact and run the same SHA three times**
+
+This must be the first launch of this final artifact. Do not run a probe between build completion
+and the first loop iteration.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$buildStarted = [DateTime]::UtcNow
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probeExe)) {
+  throw 'fresh final probe build failed'
+}
+$probe = Get-Item -LiteralPath $probeExe
+if ($probe.LastWriteTimeUtc -lt $buildStarted) { throw 'final probe artifact is stale' }
+$expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $probe.FullName).Hash
+$profilesBefore = @(
+  Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Force -Directory |
+    Where-Object Name -Like 'uipilot-security-probe-*' |
+    Sort-Object FullName |
+    ForEach-Object FullName
+) -join "`n"
+
+foreach ($run in 1..3) {
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe.FullName).Hash -ne $expectedHash) {
+    throw "final probe hash changed before run $run"
+  }
+  $running = @(Get-Process -Name uipilot -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -eq $probe.FullName
+  })
+  if ($running) { throw "probe process exists before run $run" }
+  $output = & powershell -NoProfile -ExecutionPolicy Bypass `
+    -File scripts/test-security-probe.ps1 -Executable $probe.FullName
+  if ($LASTEXITCODE -ne 0 -or $output -notcontains 'security probe ok') {
+    throw "final smoke run $run failed: $output"
+  }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe.FullName).Hash -ne $expectedHash) {
+    throw "final probe hash changed after run $run"
+  }
+  $running = @(Get-Process -Name uipilot -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -eq $probe.FullName
+  })
+  if ($running) { throw "probe process remains after run $run" }
+  $profilesAfter = @(
+    Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Force -Directory |
+      Where-Object Name -Like 'uipilot-security-probe-*' |
+      Sort-Object FullName |
+      ForEach-Object FullName
+  ) -join "`n"
+  if ($profilesAfter -cne $profilesBefore) { throw "run $run left a temporary profile" }
+}
+
+[pscustomobject]@{
+  BuildStartedUtc = $buildStarted.ToString('o')
+  ArtifactUtc = $probe.LastWriteTimeUtc.ToString('o')
+  Sha256 = $expectedHash
+  SmokeRuns = 3
+} | ConvertTo-Json -Compress
+```
+
+Expected: the un-warmed first run and the next two runs all print `security probe ok`, all use one
+unchanged SHA-256, the script proves protected app-data unchanged each time, and no matching probe
+process or temporary profile remains.
+
+- [ ] **Step R2.7: Commit the final channel and request code review**
+
+Run:
+
+```powershell
+$allowed = @('src/security-probe.ts', 'src-tauri/src/security_probe.rs')
+$changed = @(git diff --name-only foundation-security-probe-reliability-approved-plan --)
+$outside = @($changed | Where-Object { $_ -notin $allowed })
+if ($outside) { throw "final reliability diff exceeds allowlist: $($outside -join ', ')" }
+if (@($changed).Count -ne 2) { throw 'final reliability diff must contain exactly two files' }
+git diff --check
+git add src-tauri/src/security_probe.rs
+git diff --cached --check
+git commit -m "fix: stabilize security probe result channel"
+git show --check --stat --oneline HEAD
+if (git status --porcelain) { throw 'R2 worktree is not clean' }
+```
+
+R2 should normally modify only the Rust file because the TypeScript state machine was committed
+in R1. Stage only the files actually changed in R2; never stage the whole source directory.
+
+Send both R1 and R2 SHAs, the phase-one raw diagnostic record, phase-two fresh 3/3 smoke record,
+artifact UTC/SHA-256 values, full default/all-features/security/production gates, cumulative
+allowlist result and clean worktree for code review. Do not integrate into Task 4 until the
+reviewer explicitly grants code-level Go.
+
 ---
 
 ## Task 2: Lock the Result Protocol Behind a Rust Registry
