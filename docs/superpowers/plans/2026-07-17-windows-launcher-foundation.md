@@ -21,6 +21,7 @@
 - TypeScript 不接收或回传快捷方式路径、可执行文件路径或任意动作 payload；动作只能通过当前 Rust 注册表中的 `requestId + resultId` 解析。
 - 所有隐藏路径都必须进入 Rust 的同一个 `clear_and_hide` 函数；前端没有直接隐藏窗口的 capability。
 - 生产应用根只能通过 `SHGetKnownFolderPath` 查询 `FOLDERID_Programs` 与 `FOLDERID_CommonPrograms`，固定使用 `KF_FLAG_DONT_VERIFY` 和 `hToken = NULL`；不接受环境变量、配置、命令行或前端路径。测试只能向内部扫描函数注入临时根。根 reparse point 是扫描级错误；任何 reparse 子项均跳过且不跟随。
+- 快捷方式和可执行文件的可信快照只驻留进程内并在启动时重建，不写入应用数据目录；磁盘只保存结构化设置、`appId -> use_count` 和验证计数。
 - 只保存日期级验证计数，不保存精确行为时间、查询词、应用名称、快捷方式、可执行文件或文件路径。
 - 每个非平凡分支先写一个会失败的最小测试，再实现并运行该任务列出的完整验证命令。
 - 任务若必须改变本节接口，先修改本计划并重新审核；不能让实现者自行补合同。
@@ -94,6 +95,8 @@ interface SettingsView {
 ```
 
 `load_settings` 返回 `SettingsView`；`save_settings` 只接受已存在 `appId` 对应的别名，不接受显示名称或路径作为键。
+
+整个进程只创建一个 Tauri 托管的 `Arc<AppCache>`。Task 3 启动线程、Task 4 设置服务和 Task 5 命令都使用该实例。`settings.json` 中的 `useCounts` 只含符合固定格式的 `appId` 和 `u64`；搜索时将别名和计数装饰到内存快照的克隆，绝不把设置文件中的数据提升为路径或动作。
 
 ### Validation export
 
@@ -880,13 +883,29 @@ impl AppCache {
     #[cfg(test)]
     fn from_apps(applications: Vec<Application>) -> Self;
     pub(crate) fn snapshot(&self) -> Vec<Application>;
+    pub(crate) fn contains(&self, app_id: &str) -> bool;
+    pub(crate) fn refresh(&self) -> Result<DiscoveryDiagnostics, DiscoveryError>;
     pub(crate) fn refresh_with<F>(&self, discover: F) -> Result<DiscoveryDiagnostics, DiscoveryError>
     where
         F: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError>;
 }
+
+pub(crate) fn start_initial_refresh(cache: Arc<AppCache>) -> io::Result<JoinHandle<()>>;
+
+#[cfg(test)]
+fn start_initial_refresh_with<F>(
+    cache: Arc<AppCache>,
+    discover: F,
+) -> io::Result<JoinHandle<()>>
+where
+    F: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError> + Send + 'static;
 ```
 
 A failed refresh leaves the last good vector untouched. The cache never reads or writes `application-cache.json` because a user-modifiable path cache cannot be a trusted launch source.
+
+`src-tauri/src/lib.rs` creates exactly one `Arc<AppCache>`, registers `Arc::clone(&app_cache)` with Tauri `manage`, and passes another clone to one named standard-library startup thread. The thread calls `AppCache::refresh`; its first failure leaves the new cache empty, while every later manual refresh failure preserves the last good snapshot. Task 4 and Task 5 must request `State<'_, Arc<AppCache>>`; they must not construct another `AppCache`.
+
+Until Task 5 consumes discovery, ranking and registry conversion, declare the module exactly as `#[cfg_attr(not(test), allow(dead_code))] mod apps;`. Task 5 removes this scoped attribute when it wires the commands; do not add crate-wide or dependency-wide warning suppression.
 
 - [ ] **Step 1: Write failing discovery, shortcut and identity tests**
 
@@ -903,6 +922,8 @@ fn known_folder_provider_uses_only_approved_ids_flags_and_null_token() {
     assert_eq!(roots[0].kind, RootKind::User);
     assert_eq!(roots[1].kind, RootKind::Common);
     assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, FOLDERID_Programs);
+    assert_eq!(calls[1].0, FOLDERID_CommonPrograms);
     assert!(calls.iter().all(|(_, flags, token)| *flags == KF_FLAG_DONT_VERIFY && token.is_none()));
 }
 
@@ -1048,7 +1069,7 @@ Initialize COM on the background scan thread. Create `IShellLinkW`, load through
 
 - [ ] **Step 4: Add and run the Windows junction boundary gate**
 
-Create `scripts/test-start-menu-boundary.ps1`. It creates one process-temp test root, a separate outside directory containing `Outside.lnk`, and a junction inside the injected root pointing outside. It sets only `UIPILOT_TEST_USER_ROOT`, `UIPILOT_TEST_COMMON_ROOT`, and `UIPILOT_TEST_OUTSIDE_SENTINEL`, then runs the ignored test-only case:
+Create `scripts/test-start-menu-boundary.ps1`. It creates one process-temp test root, a separate outside directory containing the uniquely named sentinel `Outside.lnk`, and a junction inside the injected root pointing outside. It sets only `UIPILOT_TEST_USER_ROOT`, `UIPILOT_TEST_COMMON_ROOT`, and `UIPILOT_TEST_OUTSIDE_SENTINEL`, then runs the ignored test-only case:
 
 ```powershell
 cargo test --manifest-path src-tauri/Cargo.toml `
@@ -1056,7 +1077,29 @@ cargo test --manifest-path src-tauri/Cargo.toml `
   -- --ignored --exact
 ```
 
-The Rust test reads those variables only under `#[cfg(test)]`, calls `discover_from_roots`, and asserts `Outside` is absent. In `finally`, resolve and verify both cleanup roots remain children of `[IO.Path]::GetTempPath()`, remove the junction itself with `Remove-Item -LiteralPath -Force`, then remove the two temp trees with native PowerShell `Remove-Item -Recurse -Force`. Production root discovery never reads these variables.
+The Rust test reads those variables only under `#[cfg(test)]` and calls `discover_from_roots` with an injected resolver closure. The closure compares only `path.file_name()` with the sentinel file name and immediately panics if it receives `Outside.lnk`; all other `.lnk` inputs return `ShortcutMetadata { executable: None }` without calling `IPersistFile`. After the scan, assert `snapshot.diagnostics.reparse_entries == 1` and that the sentinel was never observed. This proves the junction was rejected before descent or shortcut parsing; an invalid fake `.lnk` cannot create a false pass.
+
+```rust
+#[test]
+#[ignore = "run by scripts/test-start-menu-boundary.ps1"]
+fn junction_does_not_escape_injected_root() {
+    let roots = injected_roots_from_test_env();
+    let sentinel_name = injected_sentinel_from_test_env().file_name().unwrap().to_owned();
+    let sentinel_seen = Cell::new(false);
+    let snapshot = discover_from_roots(roots, |path| {
+        if path.file_name() == Some(sentinel_name.as_os_str()) {
+            sentinel_seen.set(true);
+            panic!("scanner reached the outside sentinel");
+        }
+        Ok(ShortcutMetadata { executable: None })
+    }).unwrap();
+
+    assert_eq!(snapshot.diagnostics.reparse_entries, 1);
+    assert!(!sentinel_seen.get());
+}
+```
+
+In `finally`, resolve and verify both cleanup roots remain children of `[IO.Path]::GetTempPath()`, remove the junction itself with `Remove-Item -LiteralPath -Force`, then remove the two temp trees with native PowerShell `Remove-Item -Recurse -Force`. Production root discovery never reads these variables.
 
 Run:
 
@@ -1085,6 +1128,24 @@ fn successful_refresh_replaces_snapshot_once() {
     let cache = AppCache::from_apps(vec![application("Old", 0)]);
     cache.refresh_with(|| Ok(snapshot([application("New", 0)]))).unwrap();
     assert_eq!(titles(&cache.snapshot()), ["New"]);
+}
+
+#[test]
+fn initial_background_refresh_populates_the_shared_instance() {
+    let managed = Arc::new(AppCache::new());
+    let command_state = Arc::clone(&managed);
+    let handle = start_initial_refresh_with(Arc::clone(&managed), || Ok(snapshot([application("First", 0)]))).unwrap();
+    handle.join().unwrap();
+    assert!(Arc::ptr_eq(&managed, &command_state));
+    assert_eq!(titles(&command_state.snapshot()), ["First"]);
+}
+
+#[test]
+fn failed_initial_refresh_leaves_shared_instance_empty() {
+    let managed = Arc::new(AppCache::new());
+    let handle = start_initial_refresh_with(Arc::clone(&managed), || Err(DiscoveryError::KnownFolderQuery)).unwrap();
+    handle.join().unwrap();
+    assert!(managed.snapshot().is_empty());
 }
 
 #[test]
@@ -1135,7 +1196,9 @@ Expected: non-zero exit because `AppCache` and ranking are not implemented.
 
 - [ ] **Step 7: Implement the process-memory cache and deterministic ranking**
 
-Implement `AppCache` with one `RwLock<Vec<Application>>`. `refresh_with` completes discovery before taking the write lock, then replaces the vector once; an error never takes the write lock or changes state. Do not create a database, disk cache, watcher, background runtime or generic cache abstraction.
+Implement `AppCache` with one `RwLock<Vec<Application>>`. `refresh` delegates to `refresh_with(discover)`. `refresh_with` completes discovery before taking the write lock, then replaces the vector once; an error never takes the write lock or changes state. Do not create a database, disk cache, watcher, async runtime or generic cache abstraction.
+
+In `src-tauri/src/lib.rs`, create the single `Arc<AppCache>` before building Tauri, register a clone with `.manage(...)`, and start the initial refresh from the existing `.setup(...)` closure after the security-probe setup branch. `start_initial_refresh_with` uses `std::thread::Builder::new().name("app-discovery")`, returns its `JoinHandle` for tests, and detaches it in production. The worker may retain only the shared `Arc`; it logs at most the fixed `DiscoveryError` category and never logs names, paths or HRESULT text.
 
 Implement the ranking contract from Step 5 with standard-library strings and iterators. Do not transliterate, correct spelling, infer semantics or add a dependency. `registry_entry` sets `ResultItem.result_id` to an empty placeholder for Task 2 to overwrite, uses the display name as `title`, sets `subtitle` and `icon` to `None`, and places `app_id`, shortcut and executable only in `ResultAction`.
 
@@ -1194,7 +1257,12 @@ Use a unique directory under `std::env::temp_dir()` and remove it at the end of 
 - Force-termination simulation leaves an unclean session but cannot claim a host crash.
 - Duplicate display names retain separate aliases through their distinct `appId` values.
 - Saving an alias for an unknown `appId` is rejected.
-- Clear resets all aggregates.
+- `useCounts` round-trips as `BTreeMap<String, u64>` without any application name or path.
+- A malformed `appId` key makes the current settings file invalid and triggers the existing backup/default recovery path.
+- A structurally valid count for an application absent from the current `AppCache` is retained on disk but ignored when decorating the current snapshot.
+- Incrementing `use_count` for an `appId` absent from the current `AppCache` is rejected without changing memory or disk.
+- A successful known-ID increment writes a sibling temporary file, calls `sync_all`, atomically replaces `settings.json`, then swaps the in-memory settings; write failure leaves both previous states unchanged.
+- Clear validation resets validation aggregates only and does not modify `useCounts` or aliases.
 - Export opens a native save dialog only after the user clicks Export and accepts no destination path from TypeScript.
 
 - [ ] **Step 2: Run tests and confirm failure**
@@ -1220,10 +1288,16 @@ pub(crate) struct Settings {
     pub(crate) autostart: bool,
     pub(crate) research_id: Option<String>,
     pub(crate) aliases: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub(crate) use_counts: BTreeMap<String, u64>,
 }
 ```
 
-The aliases map key is `appId`; validate it against the current application cache before saving. `load_settings` joins stored aliases with the current cache and returns the `SettingsView` contract, so same-name applications remain independently editable.
+Every alias and use-count key must match `^app-[0-9a-f]{64}$`; malformed keys invalidate that settings file. A structurally valid key may refer to a temporarily absent application, so loading retains it without treating it as a trusted path or current application.
+
+`SettingsStore` owns the loaded `Settings` and its application-data path. It is managed once by Tauri and exposes crate-private `decorate_applications(&mut [Application])` and `increment_use_count(app_id, &AppCache)` operations. Task 4 commands request `State<'_, Arc<AppCache>>` and the single managed `SettingsStore`; they never construct a cache. Decoration copies aliases and counts only onto matching IDs from the current process-memory snapshot; absent entries remain at empty aliases and count zero. `increment_use_count` first requires `AppCache::contains(app_id)`, uses `checked_add`, persists a cloned settings value through the existing atomic-write/backup protocol, and swaps in-memory settings only after replacement succeeds. It never accepts a path and never exposes `use_counts` to TypeScript.
+
+The aliases map key is `appId`; validate it against the current `AppCache` before saving changes from the settings UI. `load_settings` decorates a clone of that same cache snapshot and returns the `SettingsView` contract, so same-name applications remain independently editable while trusted paths stay Rust-only.
 
 Persist `VALIDATION_SCHEMA_VERSION` and the `BTreeMap<String, DailyCounts>` shape from the cross-task contract. Obtain the local date with `GetLocalTime`; do not store a timestamp. `crash_marker.rs` owns the open-session/fixed-category crash markers, top-level Rust unwind guard and Windows unhandled-exception filter. On startup, reconcile markers exactly as defined in `Validation export`, consume matched crash evidence once, then open the new session. Clean exit removes both current-session markers. `clear_validation_data` clears historical counts but preserves the currently open session marker. Do not record raw inputs, result titles, executable names, shortcut paths, panic text, addresses, stacks, or precise behavior times.
 
@@ -1318,7 +1392,11 @@ pub(crate) enum ExecuteOutcome {
 
 - [ ] **Step 4: Register narrow Tauri commands**
 
-`search_apps(query, invocationId, querySequence)` calls `begin_query` before doing cache/ranking work and finishes through `publish_if_latest`; it returns `null` for an old invocation, superseded query or hidden generation. It never calls an unconditional publish. `execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping and updates recent-use count only after a successful launch/activation request, then calls `clear_and_hide`; failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` refreshes only the two roots returned by the fixed Known Folder provider. Settings and validation commands call their Rust services.
+All Task 5 commands request the same `State<'_, Arc<AppCache>>` created in Task 3; no command constructs or replaces the owner. `search_apps(query, invocationId, querySequence)` calls `begin_query`, clones `AppCache::snapshot`, asks the single `SettingsStore` to decorate only that clone with aliases and `use_count`, ranks it, and finishes through `publish_if_latest`. It returns `null` for an old invocation, superseded query or hidden generation and never calls an unconditional publish.
+
+`execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping, and after a successful launch/activation request asks `SettingsStore::increment_use_count` to atomically persist the trusted action's `app_id`. A count-write failure must not execute the application a second time or alter the already determined launch/activation outcome; report only the fixed settings-persistence category and no ID or path. Then call `clear_and_hide`; system-action failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` calls `refresh` on that same `AppCache`; failure preserves the current snapshot, while success replaces it once with the two roots returned by the fixed Known Folder provider. Settings and validation commands call their Rust services.
+
+When these commands consume the application module, replace `#[cfg_attr(not(test), allow(dead_code))] mod apps;` with plain `mod apps;`. No warning suppression remains after Task 5.
 
 Register exactly the commands already declared in `build.rs`. Do not add a generic `run`, `open`, `readFile`, `writeFile`, or `request` command.
 
