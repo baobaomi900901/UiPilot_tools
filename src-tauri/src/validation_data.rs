@@ -11,6 +11,10 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use crate::atomic_file::{
     commit_with_backup, quarantine_invalid, read_optional, AtomicFileError, AtomicPaths,
 };
+use crate::session_marker::{
+    load_marker_for_reconcile, new_session_id, read_marker_for_clean, replace_session_marker,
+    SessionMarker,
+};
 
 pub(crate) const VALIDATION_SCHEMA_VERSION: u32 = 1;
 
@@ -151,6 +155,22 @@ impl ValidationStore {
         self.record_with(event, local_date, commit_with_backup)
     }
 
+    pub(crate) fn reconcile_and_open_session(&self) -> Result<(), ValidationError> {
+        self.reconcile_with(
+            new_session_id,
+            local_date,
+            load_marker_for_reconcile,
+            commit_with_backup,
+            replace_session_marker,
+        )
+    }
+
+    pub(crate) fn mark_clean_exit(&self) -> Result<(), ValidationError> {
+        self.mark_clean_exit_with(read_marker_for_clean, |path| {
+            fs::remove_file(path).map_err(|_| ValidationError::Storage)
+        })
+    }
+
     pub(crate) fn clear_daily_counts(&self) -> Result<(), ValidationError> {
         self.clear_with(commit_with_backup)
     }
@@ -202,6 +222,80 @@ impl ValidationStore {
             }
         }
         self.persist_with(&mut state, candidate, persist)
+    }
+
+    fn reconcile_with<I, D, L, P, R>(
+        &self,
+        id_provider: I,
+        date_provider: D,
+        load_marker: L,
+        persist: P,
+        replace_marker: R,
+    ) -> Result<(), ValidationError>
+    where
+        I: FnOnce() -> Result<String, ValidationError>,
+        D: FnOnce() -> Result<String, ValidationError>,
+        L: FnOnce(&Path) -> Result<Option<SessionMarker>, ValidationError>,
+        P: FnOnce(&AtomicPaths, Option<&[u8]>, &[u8]) -> Result<(), AtomicFileError>,
+        R: FnOnce(&Path, &SessionMarker) -> Result<(), ValidationError>,
+    {
+        let mut state = self.state.lock().expect("validation lock poisoned");
+        if state.current_session_id.is_some() {
+            return Err(ValidationError::SessionAlreadyOpen);
+        }
+
+        let stale_marker = load_marker(&self.paths.marker)?;
+        if let Some(marker) = stale_marker.as_ref() {
+            if state.value.last_reconciled_session_id.as_deref() != Some(&marker.session_id) {
+                let mut candidate = state.value.clone();
+                let counts = candidate
+                    .daily_counts
+                    .entry(marker.local_date.clone())
+                    .or_default();
+                counts.unclean_sessions = checked_increment(counts.unclean_sessions)?;
+                candidate.last_reconciled_session_id = Some(marker.session_id.clone());
+                self.persist_with(&mut state, candidate, persist)?;
+            }
+        }
+
+        let session_id = id_provider()?;
+        if !valid_session_id(&session_id) {
+            return Err(ValidationError::SessionRandom);
+        }
+        let date = date_provider()?;
+        if !valid_date(&date) {
+            return Err(ValidationError::InvalidDate);
+        }
+        let marker = SessionMarker {
+            schema_version: VALIDATION_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            local_date: date,
+        };
+        replace_marker(&self.paths.marker, &marker)?;
+        state.current_session_id = Some(session_id);
+        Ok(())
+    }
+
+    fn mark_clean_exit_with<R, D>(
+        &self,
+        read_marker: R,
+        delete_marker: D,
+    ) -> Result<(), ValidationError>
+    where
+        R: FnOnce(&Path) -> Result<SessionMarker, ValidationError>,
+        D: FnOnce(&Path) -> Result<(), ValidationError>,
+    {
+        let mut state = self.state.lock().expect("validation lock poisoned");
+        let Some(current_session_id) = state.current_session_id.as_deref() else {
+            return Ok(());
+        };
+        let marker = read_marker(&self.paths.marker)?;
+        if marker.session_id != current_session_id {
+            return Err(ValidationError::SessionOwnershipLost);
+        }
+        delete_marker(&self.paths.marker)?;
+        state.current_session_id = None;
+        Ok(())
     }
 
     fn clear_with<P>(&self, persist: P) -> Result<(), ValidationError>
@@ -262,7 +356,7 @@ fn valid_state(state: &ValidationState) -> bool {
             .unwrap_or(true)
 }
 
-fn valid_session_id(value: &str) -> bool {
+pub(crate) fn valid_session_id(value: &str) -> bool {
     value.len() == 40
         && value.starts_with("session-")
         && value[8..]
@@ -270,7 +364,7 @@ fn valid_session_id(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn valid_date(value: &str) -> bool {
+pub(crate) fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10
         || bytes[4] != b'-'
@@ -321,6 +415,22 @@ fn local_date() -> Result<String, ValidationError> {
 }
 
 #[cfg(test)]
+impl ValidationStore {
+    fn test_state(&self) -> (ValidationState, bool, Option<String>) {
+        let state = self.state.lock().expect("validation lock poisoned");
+        (
+            state.value.clone(),
+            state.current_is_valid,
+            state.current_session_id.clone(),
+        )
+    }
+
+    fn marker_path(&self) -> &Path {
+        &self.paths.marker
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::BTreeMap,
@@ -335,9 +445,11 @@ mod tests {
 
     use super::*;
     use crate::atomic_file::{commit_with_backup, AtomicFileError};
+    use crate::session_marker::{load_marker_for_reconcile, replace_session_marker};
 
     const SESSION_A: &str = "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SESSION_B: &str = "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SESSION_C: &str = "session-cccccccccccccccccccccccccccccccc";
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
@@ -427,6 +539,37 @@ mod tests {
             state.value.clone(),
             state.current_is_valid,
             state.current_session_id.clone(),
+        )
+    }
+
+    fn marker_bytes(session_id: &str, local_date: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": VALIDATION_SCHEMA_VERSION,
+            "sessionId": session_id,
+            "localDate": local_date,
+        }))
+        .unwrap()
+    }
+
+    fn write_marker(dir: &TestDir, session_id: &str, local_date: &str) {
+        fs::write(
+            dir.path().join("open-session.json"),
+            marker_bytes(session_id, local_date),
+        )
+        .unwrap();
+    }
+
+    fn reconcile_fixed(
+        store: &ValidationStore,
+        new_session_id: &str,
+        local_date: &str,
+    ) -> Result<(), ValidationError> {
+        store.reconcile_with(
+            || Ok(new_session_id.into()),
+            || Ok(local_date.into()),
+            load_marker_for_reconcile,
+            commit_with_backup,
+            replace_session_marker,
         )
     }
 
@@ -797,6 +940,242 @@ mod tests {
         assert_eq!(store.export_snapshot().schema_version, 1);
         assert_eq!(store.paths.data.current(), dir.current());
         assert_eq!(store.paths.marker, dir.path().join("open-session.json"));
+    }
+
+    #[test]
+    fn repeated_open_fails_without_touching_marker_or_state() {
+        let dir = TestDir::new("repeated-open");
+        let store = ValidationStore::load(dir.path()).unwrap();
+        store.reconcile_and_open_session().unwrap();
+        let before = store.test_state();
+        let marker_before = fs::read(store.marker_path()).unwrap();
+
+        assert_eq!(
+            store.reconcile_and_open_session(),
+            Err(ValidationError::SessionAlreadyOpen)
+        );
+        assert_eq!(store.test_state(), before);
+        assert_eq!(fs::read(store.marker_path()).unwrap(), marker_before);
+    }
+
+    #[test]
+    fn malformed_marker_is_quarantined_without_counting_unclean() {
+        let dir = TestDir::new("malformed-marker");
+        fs::write(dir.path().join("open-session.json"), b"not-json").unwrap();
+        let store = ValidationStore::load(dir.path()).unwrap();
+
+        reconcile_fixed(&store, SESSION_B, "2026-07-18").unwrap();
+
+        assert!(store.export_snapshot().daily_counts.is_empty());
+        assert_eq!(store.test_state().2.as_deref(), Some(SESSION_B));
+        assert!(fs::read_dir(dir.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("open-session.json.invalid-")));
+    }
+
+    #[test]
+    fn stale_marker_counts_once_and_sets_reconciled_id() {
+        let dir = TestDir::new("stale-marker");
+        write_marker(&dir, SESSION_A, "2026-07-17");
+        let store = ValidationStore::load(dir.path()).unwrap();
+
+        reconcile_fixed(&store, SESSION_B, "2026-07-18").unwrap();
+
+        assert_eq!(
+            store.export_snapshot().daily_counts["2026-07-17"].unclean_sessions,
+            1
+        );
+        let state = store.test_state();
+        assert_eq!(
+            state.0.last_reconciled_session_id.as_deref(),
+            Some(SESSION_A)
+        );
+        assert_eq!(state.2.as_deref(), Some(SESSION_B));
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.marker_path()).unwrap()).unwrap();
+        assert_eq!(marker["sessionId"], SESSION_B);
+    }
+
+    #[test]
+    fn already_reconciled_marker_is_not_counted_again() {
+        let dir = TestDir::new("already-reconciled");
+        write_state(
+            &dir.current(),
+            &state_with(BTreeMap::new(), Some(SESSION_A)),
+        );
+        write_marker(&dir, SESSION_A, "2026-07-17");
+        let store = ValidationStore::load(dir.path()).unwrap();
+
+        reconcile_fixed(&store, SESSION_B, "2026-07-18").unwrap();
+
+        assert!(store.export_snapshot().daily_counts.is_empty());
+        assert_eq!(store.test_state().2.as_deref(), Some(SESSION_B));
+    }
+
+    #[test]
+    fn failure_before_validation_persist_retries_unclean_once() {
+        let dir = TestDir::new("before-validation-persist");
+        write_marker(&dir, SESSION_A, "2026-07-17");
+        let store = ValidationStore::load(dir.path()).unwrap();
+        let before = store.test_state();
+
+        assert_eq!(
+            store.reconcile_with(
+                || Ok(SESSION_B.into()),
+                || Ok("2026-07-18".into()),
+                load_marker_for_reconcile,
+                |_paths, _previous, _candidate| Err(AtomicFileError::CurrentReplace),
+                |_path, _marker| panic!("marker replace must not run"),
+            ),
+            Err(ValidationError::Storage)
+        );
+        assert_eq!(store.test_state(), before);
+        assert_eq!(
+            fs::read(store.marker_path()).unwrap(),
+            marker_bytes(SESSION_A, "2026-07-17")
+        );
+
+        let retried = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&retried, SESSION_B, "2026-07-18").unwrap();
+        assert_eq!(
+            retried.export_snapshot().daily_counts["2026-07-17"].unclean_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn failure_after_validation_persist_does_not_count_stale_marker_twice() {
+        let dir = TestDir::new("after-validation-persist");
+        write_marker(&dir, SESSION_A, "2026-07-17");
+        let store = ValidationStore::load(dir.path()).unwrap();
+
+        assert_eq!(
+            store.reconcile_with(
+                || Ok(SESSION_B.into()),
+                || Ok("2026-07-18".into()),
+                load_marker_for_reconcile,
+                commit_with_backup,
+                |_path, _marker| Err(ValidationError::Storage),
+            ),
+            Err(ValidationError::Storage)
+        );
+        let persisted = store.test_state();
+        assert_eq!(
+            persisted.0.last_reconciled_session_id.as_deref(),
+            Some(SESSION_A)
+        );
+        assert_eq!(persisted.2, None);
+        assert_eq!(persisted.0.daily_counts["2026-07-17"].unclean_sessions, 1);
+        assert_eq!(
+            fs::read(store.marker_path()).unwrap(),
+            marker_bytes(SESSION_A, "2026-07-17")
+        );
+
+        let retried = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&retried, SESSION_B, "2026-07-18").unwrap();
+        assert_eq!(
+            retried.export_snapshot().daily_counts["2026-07-17"].unclean_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn force_termination_after_marker_replace_counts_next_open_once() {
+        let dir = TestDir::new("force-termination");
+        let first = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&first, SESSION_B, "2026-07-18").unwrap();
+        drop(first);
+
+        let next = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&next, SESSION_C, "2026-07-19").unwrap();
+
+        assert_eq!(
+            next.export_snapshot().daily_counts["2026-07-18"].unclean_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn clean_deletion_prevents_unclean_count_on_next_open() {
+        let dir = TestDir::new("clean-before-reopen");
+        let first = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&first, SESSION_B, "2026-07-18").unwrap();
+        first.mark_clean_exit().unwrap();
+        drop(first);
+
+        let next = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&next, SESSION_C, "2026-07-19").unwrap();
+
+        assert!(next.export_snapshot().daily_counts.is_empty());
+    }
+
+    #[test]
+    fn clear_with_open_session_preserves_marker_and_reconciled_id() {
+        let dir = TestDir::new("clear-open-session");
+        write_marker(&dir, SESSION_A, "2026-07-17");
+        let store = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&store, SESSION_B, "2026-07-18").unwrap();
+        let marker_before = fs::read(store.marker_path()).unwrap();
+
+        store.clear_daily_counts().unwrap();
+
+        let state = store.test_state();
+        assert!(state.0.daily_counts.is_empty());
+        assert_eq!(
+            state.0.last_reconciled_session_id.as_deref(),
+            Some(SESSION_A)
+        );
+        assert_eq!(state.2.as_deref(), Some(SESSION_B));
+        assert_eq!(fs::read(store.marker_path()).unwrap(), marker_before);
+    }
+
+    #[test]
+    fn matching_clean_exit_is_idempotent_and_stops_recording() {
+        let dir = TestDir::new("matching-clean");
+        let store = ValidationStore::load(dir.path()).unwrap();
+        reconcile_fixed(&store, SESSION_B, "2026-07-18").unwrap();
+
+        store.mark_clean_exit().unwrap();
+
+        assert!(!store.marker_path().exists());
+        assert_eq!(store.test_state().2, None);
+        assert_eq!(
+            record_on(&store, ValidationEvent::LauncherInvoked, "2026-07-18"),
+            Err(ValidationError::SessionNotOpen)
+        );
+        fs::write(store.marker_path(), b"damaged-after-clean").unwrap();
+        store.mark_clean_exit().unwrap();
+        assert_eq!(
+            fs::read(store.marker_path()).unwrap(),
+            b"damaged-after-clean"
+        );
+    }
+
+    #[test]
+    fn clean_exit_preserves_missing_damaged_or_mismatched_marker() {
+        for case in ["missing", "damaged", "mismatched"] {
+            let dir = TestDir::new(&format!("clean-{case}"));
+            let store = ValidationStore::load(dir.path()).unwrap();
+            reconcile_fixed(&store, SESSION_B, "2026-07-18").unwrap();
+            match case {
+                "missing" => fs::remove_file(store.marker_path()).unwrap(),
+                "damaged" => fs::write(store.marker_path(), b"not-json").unwrap(),
+                "mismatched" => {
+                    fs::write(store.marker_path(), marker_bytes(SESSION_C, "2026-07-18")).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let before = fs::read(store.marker_path()).ok();
+
+            assert_eq!(
+                store.mark_clean_exit(),
+                Err(ValidationError::SessionOwnershipLost)
+            );
+            assert_eq!(store.test_state().2.as_deref(), Some(SESSION_B));
+            assert_eq!(fs::read(store.marker_path()).ok(), before);
+        }
     }
 
     #[test]

@@ -15,6 +15,9 @@ mod model;
 mod result_registry;
 
 #[cfg_attr(not(test), allow(dead_code))]
+mod session_marker;
+
+#[cfg_attr(not(test), allow(dead_code))]
 mod settings;
 
 #[cfg_attr(not(test), allow(dead_code))]
