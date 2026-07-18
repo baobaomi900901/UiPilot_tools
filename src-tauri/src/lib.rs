@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 #[cfg_attr(not(test), allow(dead_code))]
+mod atomic_file;
+
+#[cfg_attr(not(test), allow(dead_code))]
 mod apps;
 // ponytail: Task 2 defines the protocol before Task 5 wires commands; remove these allows then.
 #[cfg_attr(not(test), allow(dead_code))]
