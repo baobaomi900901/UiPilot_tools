@@ -91,7 +91,7 @@ disconnect 延迟成完整 deadline timeout，不能消除该架构耦合。
 该结构同时承担 readiness 和 ACL 结果，不注册 `on_page_load`，不维护 page-load
 channel/guard，也不需要 `page_load_finished` 重复谓词。启动期
 `eval_with_callback` 的同步 `Err` 在没有任何 callback 前是可重试的 readiness
-中间态；callback timeout 仍是未知在途请求，必须终止，不能重试。
+中间态；若 callback 仍在途而总 deadline 到达，必须终止，不能重试。
 
 ### 方案 B：直接注册低层 WebView2 navigation event
 
@@ -147,16 +147,16 @@ Rust 使用 `deny_unknown_fields` 严格反序列化。JSON `null`、字符串�
    映射 `73`。
 3. 任一 callback 已成功返回后，后续 eval 同步 `Err` 立即终止为
    `EvalDispatchFailed/81`；不把已可工作的通道退化当作启动等待。
-4. dispatch 成功后重新从同一 deadline 计算剩余时间，再等待
-   `min(250ms, remaining)`。
-5. callback 在完整 250ms 内未返回是终态 `EvalCallbackTimeout/82`。请求可能仍在
-   WebView 中执行，因此不得派发第二次 eval。
-6. 若 callback wait 被总 deadline 截断时仍有成功 dispatch 的请求在途，结果为
-   `EvalCallbackTimeout/82`，并立即终止。只有所有启动期 dispatch 都同步返回 `Err`、
-   从未产生在途 callback 时，总 deadline 才返回 `EvalDispatchFailed/81`。
-7. callback 返回后先关闭本次请求，再 parse/classify。只有已完成 observation 被分类
+4. dispatch 成功后重新从同一 deadline 计算剩余时间。若已无剩余时间，立即终止为
+   `EvalCallbackTimeout/82`；否则只等待这一次 post-dispatch remaining，不设置独立的
+   callback timeout。
+5. callback 未在总 deadline 前返回时终止为 `EvalCallbackTimeout/82`。请求可能仍在
+   WebView 中执行，因此 callback 缺席期间 dispatch count 必须始终为 `1`，不得派发
+   第二次 eval。只有所有启动期 dispatch 都同步返回 `Err`、从未产生在途 callback 时，
+   总 deadline 才返回 `EvalDispatchFailed/81`。
+6. callback 返回后先关闭本次请求，再 parse/classify。只有已完成 observation 被分类
    为可重试中间态，才允许等待受 remaining 限制的 50ms 后发起下一次。
-8. 同时最多一个 eval callback 在途。晚到或重复 callback 不能覆盖已终止结果。
+7. 同时最多一个 eval callback 在途。晚到或重复 callback 不能覆盖已终止结果。
 
 总 deadline 不因 dispatch、callback 或 retry 重新开始。外层 PowerShell 继续使用
 15 秒硬超时。
@@ -166,8 +166,9 @@ Rust 使用 `deny_unknown_fields` 严格反序列化。JSON `null`、字符串�
 parser 后按以下互斥顺序分类：
 
 1. `evalError == script-failed` -> `EvalScriptFailed/84`
-2. `probeState == invoke-succeeded` -> `InvokeUnexpectedlyAllowed/77`
-3. `probeState == invoke-other-error` -> `InvokeOtherError/78`
+2. `probeState == invoke-succeeded` 且 hash 为空 ->
+   `InvokeUnexpectedlyAllowed/77`
+3. `probeState == invoke-other-error` 且 hash 为空 -> `InvokeOtherError/78`
 4. `probeState == null`、hash 为空且 `readyState == loading` ->
    retry `DocumentNotReady`
 5. `probeState == null`、hash 为空且 ready -> retry `ProbeScriptNotStarted`
@@ -177,8 +178,11 @@ parser 后按以下互斥顺序分类：
 8. `probeState == acl-denied` 且
    `readyState == interactive | complete`、`hash == #acl-denied`、
    `evalError == null` -> 精确 ACL observation
-9. 其他状态/hash/readiness 组合，包括 null/pending 携带非空 hash ->
-   `InvalidEvalObservation/83`
+9. 其他状态/hash/readiness 组合，包括 null、pending、invoke-succeeded 或
+   invoke-other-error 携带非空 hash -> `InvalidEvalObservation/83`
+
+`InvokeUnexpectedlyAllowed/77` 和 `InvokeOtherError/78` 不要求特定 readyState，但必须
+认证 hash 为空；任何非空 hash 都不能被这两个终态接受。
 
 总 deadline 到达时，最后一个已完成中间态固定映射：
 
@@ -248,7 +252,10 @@ sender guard 和 `page_load_finished` 谓词。
 - readiness classifier 覆盖 loading/null/pending/success/other/exact ACL/不一致组合。
 - 启动期 dispatch `Err` 在首个 callback 前可重试；总 deadline 后固定为 `81`。
 - 首个 callback 后的 dispatch `Err` 立即为 `81`。
-- callback timeout 固定为终态 `82`，dispatch count 保持 `1`。
+- 时序测试证明 dispatch 成功后只等待 post-dispatch remaining，不存在独立 callback
+  timeout，等待不越过总 deadline。
+- 时序测试证明 callback 未在总 deadline 前返回固定为终态 `82`，且等待期间 dispatch
+  count 始终为 `1`。
 - dispatch 推进测试时钟后，callback wait 必须使用 post-dispatch remaining。
 - retry delay 也必须受 remaining 限制；deadline 后不得再 dispatch。
 - source gate 禁止
@@ -282,7 +289,7 @@ sender guard 和 `page_load_finished` 谓词。
 
 ## 方案退出条件
 
-若 direct eval 在窗口 build 后持续同步返回 `Err`、callback 无法在单次时限内返回，
+若 direct eval 在窗口 build 后持续同步返回 `Err`、callback 无法在总 deadline 前返回，
 或 fresh 首次运行不能产生 `73/79/80`，则本候选 No-Go。不得重新引入
 `on_page_load`、低层 WebView2 handler 或 backchannel 作为实现期补丁；必须回到
 产品/架构决策，选择移除 runtime probe gate 或单独批准更高风险路线。
@@ -296,10 +303,15 @@ sender guard 和 `page_load_finished` 谓词。
 
 1. 只更新 Foundation Task 1A-R 实施计划，删除 page-load 合同并加入 direct-eval
    readiness RED/GREEN 与 source gate。
-2. 计划书面 Go 后，从 clean approved baseline 建立新的实现工作点，重新执行 TDD；
-   不在失败 worktree 上叠加修复。
-3. 阶段一代码与 fresh evidence Go 后才允许阶段二。
-4. 探针修复代码级 Go 后，才允许非破坏性集成回 Task 4 分支并从头运行 Task 4C
+2. direct-eval 实施计划书面 Go 后，创建新的 immutable lightweight tag
+   `foundation-security-probe-direct-eval-approved-plan`，精确指向获批计划提交。所有
+   direct-eval 实施范围门禁只以该新 tag 为基线。
+3. 旧 tag `foundation-security-probe-reliability-approved-plan` 固定保留在 `157ad89`，
+   仅作失败 page-load 方案的历史证据，不移动、不复用。
+4. 从新 approved-plan tag 建立 clean 实现工作点，重新执行 TDD；不在失败 worktree 上
+   叠加修复。
+5. 阶段一代码与 fresh evidence Go 后才允许阶段二。
+6. 探针修复代码级 Go 后，才允许非破坏性集成回 Task 4 分支并从头运行 Task 4C
    completion gate。
 
 ## 非目标
