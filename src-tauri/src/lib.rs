@@ -23,6 +23,9 @@ mod settings;
 #[cfg_attr(not(test), allow(dead_code))]
 mod validation_data;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod validation_export;
+
 #[cfg(feature = "test-instrumentation")]
 mod security_probe;
 
