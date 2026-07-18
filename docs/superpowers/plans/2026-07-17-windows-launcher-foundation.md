@@ -100,6 +100,8 @@ interface SettingsView {
 
 ### Validation export
 
+**Superseded Task 4 baseline:** The contract in this subsection is not executable. The frozen MVP-A specification removes confirmed-crash instrumentation and `hostCrashes`; the replacement contract is split across the pending Task 4A/4B/4C written designs linked under Task 4. This subsection must be replaced only after those designs are approved.
+
 ```rust
 const VALIDATION_SCHEMA_VERSION: u32 = 1;
 
@@ -1274,6 +1276,14 @@ git commit -m "feat: discover and rank Start Menu apps"
 ---
 
 ## Task 4: Persist Settings and Daily Validation Counts
+
+**Status:** No-Go for TDD. The section below is retained as the rejected baseline and must not be executed. Replace it only after the following three written designs are approved independently:
+
+- `docs/superpowers/specs/2026-07-18-task-4a-settings-persistence-design.md`
+- `docs/superpowers/specs/2026-07-18-task-4b-validation-store-design.md`
+- `docs/superpowers/specs/2026-07-18-task-4c-validation-export-service-design.md`
+
+No Task 5 command, action, activation or rescan wiring may be added while these designs are under review.
 
 **Files:**
 - Create: `src-tauri/src/settings.rs`

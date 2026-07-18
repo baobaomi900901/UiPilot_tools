@@ -51,9 +51,11 @@ MVP-A 不接入远程遥测。程序只在本地记录以下聚合计数：
 - 应用启动请求次数。
 - 应用激活 API 报告成功的次数。
 - 应用激活 API 明确拒绝的次数。
-- 宿主异常退出次数。
+- 上次会话未完成正常清理的次数（`uncleanSessions`，不等同于宿主崩溃）。
 
 本地计数不记录查询词、应用名称或文件路径。试用者每周主动导出本地聚合数据，并参加一次不超过 20 分钟的访谈。导出文件包含研究参与者 ID，因此属于可关联的假名化数据，不称为匿名数据。
+
+MVP-A 不安装 `SetUnhandledExceptionFilter`，不写确认崩溃 marker，也不在本地导出中包含 `hostCrashes`。宿主崩溃退出标准只使用 WER、Application Error、crash dump 或主持记录完成外部分类；`uncleanSessions` 只能提示需要分类，不能单独证明发生了宿主崩溃。
 
 “成功动作”仅指宿主明确接受的应用启动请求和窗口激活 API 报告成功。每日成功动作等于 `应用启动请求次数 + 应用激活成功次数`；它只验证纯应用启动/激活使用频率，不代表目标应用最终完成了用户任务。
 
@@ -254,13 +256,19 @@ CSP 是纵深防御，不能替代 Rust 侧命令权限和参数校验。
 
 - 普通设置、仅含 `appId -> use_count` 的最近使用次数和验证计数保存在系统应用数据目录。可信应用路径快照只驻留进程内，并在每次启动时通过开始菜单重新建立，不写入磁盘。
 - MVP-A 使用结构化本地文件，不引入数据库。
-- 写入采用临时文件加原子替换。
-- 配置损坏时回退到上一份有效配置。
+- `settings.json` 与 `validation-data.json` 分别由进程内唯一的 store 和单一互斥锁管理；每次变更都执行完整的读改写事务，不允许磁盘状态与内存状态互相覆盖。
+- 写入使用同目录临时文件、`sync_all` 和 Windows 原生同卷原子替换；只有替换成功后才交换内存值。上一份有效内容通过独立的原子 backup 更新保留。
+- 设置或验证数据损坏时先隔离当前文件，再回退到上一份有效 backup；只有 current 与 backup 都不存在或无效时才使用默认值。权限、磁盘或原子替换错误不得伪装成“文件不存在”。
+- `validation-data.json` 可以包含用于崩溃恢复幂等性的内部 `lastReconciledSessionId`，但该字段、当前 `sessionId` 和 marker 内容不得进入导出文件。
+- 当前会话 marker 只包含 schema version、opaque `sessionId` 和本地日期。旧 marker 与验证计数通过持久化的 session ID 实现 exactly-once 对账；清除验证计数不删除当前会话 marker 或幂等状态。
+
+Task 4 的详细持久化合同分别冻结在 `2026-07-18-task-4a-settings-persistence-design.md`、`2026-07-18-task-4b-validation-store-design.md` 和 `2026-07-18-task-4c-validation-export-service-design.md`。三份设计批准前不得进入 Task 4 TDD。
 
 ### 9.3 隐私
 
 - 程序不发送远程遥测。
 - 日志和验证计数不得记录查询词、应用名称、剪贴板内容或文件路径。
+- 日志和导出不得包含 `sessionId`、`lastReconciledSessionId`、临时文件名或隔离文件名。
 - 只有用户主动导出后，汇总文件才离开本机。
 - 试用开始前取得知情同意，说明采集字段、用途、关联方式和删除期限。
 - 产品负责人单独保管参与者身份与研究 ID 的映射。
