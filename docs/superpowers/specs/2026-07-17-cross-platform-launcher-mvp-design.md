@@ -183,7 +183,6 @@ type SearchResponse = {
 
 type ResultItem = {
   resultId: string
-  kind: 'application' | 'status'
   title: string
   subtitle?: string
   icon?: string

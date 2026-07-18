@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-07-18
-- 状态：待书面复审
+- 状态：已按评审修订，待书面复审
 - 影响范围：Foundation Task 2 可信结果注册表
 
 ## 目标
@@ -12,13 +12,18 @@
 
 ## 数据合同
 
-Rust `ResultKind` 只包含 `Application` 和 `Status`，通过 camelCase 序列化为 `application` 和 `status`。TypeScript 镜像类型固定为：
+当前 MVP 的结果全部是可执行应用，不定义 `ResultKind`，`ResultItem` 也没有 `kind` 字段。TypeScript 镜像类型固定为：
 
 ```ts
-export type ResultKind = 'application' | 'status'
+export interface ResultItem {
+  resultId: string
+  title: string
+  subtitle?: string
+  icon?: string
+}
 ```
 
-不保留 `file` 变体或文件搜索占位。`subtitle` 与 `icon` 为 `None` 时不写入 JSON，以匹配 TypeScript 可选字段。
+不保留 `status`、`file` 或其他未使用的结果类型。`subtitle` 与 `icon` 为 `None` 时不写入 JSON，以匹配 TypeScript 可选字段。
 
 `ResultAction` 不实现 `Serialize`。响应 JSON 只能包含 `requestId`、`items` 以及每项的展示字段，不能包含 `appId`、快捷方式、可执行文件或其他动作参数。
 
@@ -33,6 +38,8 @@ export type ResultKind = 'application' | 'status'
 - `hide_and_clear()`：递增 generation，设为 inactive，并清除 invocation、序号和当前结果。
 
 新查询一旦被接受，上一份映射立即失效，即使新查询尚未发布。无效序号或 invocation 不清空当前结果，因为该请求从未取得查询所有权。
+
+`publish_if_latest` 的 token 校验、ID 分配、动作映射构造和 `current` 替换必须在同一次 `Mutex<RegistryState>` 临界区内完成，中途不得释放锁。无效或过期 token 在分配任何 ID 前返回 `None`，不消耗原子计数器，也不修改任何注册表状态。这样 `on_show`、`begin_query` 或 `hide_and_clear` 不能插入检查与发布之间。
 
 ## 标识与错误
 
@@ -52,12 +59,13 @@ Rust 单元测试必须覆盖：
 6. 查询开始后隐藏，晚到结果不能重新发布。
 7. 新 show 后，旧 invocation 的 IPC 被拒绝且不清空新状态。
 8. 未知和过期 ID 返回固定错误，错误文本不泄露路径。
-9. JSON 字段为 camelCase，kind 仅为 `application` 或 `status`，空可选字段被省略。
+9. JSON 字段为 camelCase，不存在 `kind` 或动作字段，空可选字段被省略。
+10. 无效或过期 token 不消耗 ID、不替换 `current`，发布过程不能留下部分结果。
 
 Task 2 不新增 Vitest 文件；`src/protocol.ts` 只通过现有生产 TypeScript 构建验证。
 
 ## 非目标
 
 - 不实现应用扫描、搜索、执行、窗口生命周期或 UI 渲染。
-- 不实现文件搜索，不增加 `file` 类型、文件路径或文件动作。
+- 不实现状态项或文件搜索，不增加结果类型、文件路径或文件动作。
 - 不增加 UUID、数据库、缓存、异步运行时或新依赖。
