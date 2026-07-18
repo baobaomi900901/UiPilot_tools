@@ -20,7 +20,7 @@
 - 只允许一个本地 `main` WebView。生产构建不包含测试探针、远程页面、动态 HTML、任意网络、Shell、通用文件系统或通用进程能力。
 - TypeScript 不接收或回传快捷方式路径、可执行文件路径或任意动作 payload；动作只能通过当前 Rust 注册表中的 `requestId + resultId` 解析。
 - 所有隐藏路径都必须进入 Rust 的同一个 `clear_and_hide` 函数；前端没有直接隐藏窗口的 capability。
-- 应用扫描只允许两个开始菜单根，拒绝任何 symlink 或带 `FILE_ATTRIBUTE_REPARSE_POINT` 的目录后再递归。
+- 生产应用根只能通过 `SHGetKnownFolderPath` 查询 `FOLDERID_Programs` 与 `FOLDERID_CommonPrograms`，固定使用 `KF_FLAG_DONT_VERIFY` 和 `hToken = NULL`；不接受环境变量、配置、命令行或前端路径。测试只能向内部扫描函数注入临时根。根 reparse point 是扫描级错误；任何 reparse 子项均跳过且不跟随。
 - 只保存日期级验证计数，不保存精确行为时间、查询词、应用名称、快捷方式、可执行文件或文件路径。
 - 每个非平凡分支先写一个会失败的最小测试，再实现并运行该任务列出的完整验证命令。
 - 任务若必须改变本节接口，先修改本计划并重新审核；不能让实现者自行补合同。
@@ -75,7 +75,7 @@ fn clear_and_hide(window: &WebviewWindow, registry: &ResultRegistry) -> Result<(
 
 ### Application identity and settings
 
-`appId` 使用固定版本算法：对 `start-menu-v1\0 + rootKind + \0 + normalizedRelativeShortcutPath` 做 Windows CNG SHA-256，输出 `app-` 加小写十六进制。它在同一快捷方式的重复扫描间稳定、区分同名入口，且不暴露原始路径。应用移动后视为新入口。
+`appId` 使用固定版本算法：对 `start-menu-v1\0 + rootKind + \0 + normalizedRelativeShortcutPath` 的 UTF-8 字节做 Windows CNG SHA-256，输出 `app-` 加 64 位小写十六进制。`rootKind` 固定为 `user` 或 `common`；相对路径以反斜杠连接、保留 `.lnk` 并做 Unicode `to_lowercase`，不得使用有损编码。它在重复扫描和仅大小写重命名间稳定、区分同名入口且不暴露路径；非大小写重命名、改变相对目录或切换根才产生新 ID。
 
 ```ts
 interface AppAliasTarget {
@@ -792,111 +792,371 @@ git commit -m "feat: add trusted result registry"
 
 ## Task 3: Discover and Rank Start Menu Applications
 
+**Source Design:** `docs/superpowers/specs/2026-07-18-start-menu-application-discovery-design.md`
+
+**Status:** Awaiting plan review. Do not enter TDD until this Task 3 section is approved.
+
 **Files:**
 - Create: `src-tauri/src/apps/mod.rs`
 - Create: `src-tauri/src/apps/discovery.rs`
 - Create: `src-tauri/src/apps/rank.rs`
 - Create: `src-tauri/src/apps/shortcut.rs`
 - Create: `src-tauri/src/apps/cache.rs`
-- Create: `src-tauri/src/apps/icon.rs`
 - Modify: `src-tauri/Cargo.toml`
+- Modify: `src-tauri/Cargo.lock`
 - Modify: `src-tauri/src/lib.rs`
 - Create: `scripts/test-start-menu-boundary.ps1`
 
-- [ ] **Step 1: Write failing discovery and ranking tests**
+**Interfaces:**
 
-Cover these cases with fake Start Menu roots and a fake shortcut resolver:
-
-```rust
-#[test]
-fn scans_only_lnk_files_from_configured_roots() {}
-
-#[test]
-fn exact_prefix_contains_and_subsequence_are_ordered() {}
-
-#[test]
-fn aliases_participate_without_changing_display_name() {}
-
-#[test]
-fn recent_use_breaks_equal_score_ties() {}
-
-#[test]
-fn empty_query_returns_no_results() {}
-
-#[test]
-fn limits_results_to_twenty() {}
-
-#[test]
-fn cache_never_exposes_shortcut_or_executable_paths_in_result_items() {}
-
-#[test]
-fn icon_extraction_failure_uses_the_local_generic_icon() {}
-
-#[test]
-fn duplicate_display_names_have_distinct_stable_app_ids() {}
-
-#[test]
-fn aliases_are_bound_to_app_id_not_display_name() {}
-```
-
-The ranking fixture must include `企业微信`, `微信`, `Visual Studio Code`, and unrelated entries. Assert that `企业` and `微信` find the expected applications through exact/prefix/contains/subsequence rules only.
-
-`scripts/test-start-menu-boundary.ps1` must create a temporary allowed root, a separate outside directory containing a fake `.lnk`, and a directory junction inside the allowed root pointing outside. It runs the focused scanner test and proves the outside entry is absent. The script verifies both temporary paths are under the process temp directory before cleanup and removes them in `finally`.
-
-- [ ] **Step 2: Run the focused tests and confirm failure**
-
-Run: `cargo test --manifest-path src-tauri/Cargo.toml apps::`
-
-Expected: compile failure because the app modules do not exist.
-
-- [ ] **Step 3: Implement bounded Start Menu discovery**
-
-Scan only:
-
-```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs
-%ProgramData%\Microsoft\Windows\Start Menu\Programs
-```
-
-Use `std::fs::read_dir` recursion, skip inaccessible entries, accept only `.lnk`, and never scan arbitrary drives. Before descending into any directory, read Windows attributes and reject symlinks plus every directory carrying `FILE_ATTRIBUTE_REPARSE_POINT`; do not resolve the target to decide whether it looks safe. Represent the resolved record as:
+`apps/mod.rs` owns the Rust-only record and fixed error surface. Do not serialize `Application`, `DiscoveryError` or `DiscoveryDiagnostics` to the WebView.
 
 ```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootKind { User, Common }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StartMenuRoot {
+    pub(crate) kind: RootKind,
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Application {
     pub(crate) app_id: String,
     pub(crate) display_name: String,
     pub(crate) shortcut: PathBuf,
     pub(crate) executable: Option<PathBuf>,
-    pub(crate) icon_png_base64: Option<String>,
+    pub(crate) icon: Option<String>,
     pub(crate) aliases: Vec<String>,
     pub(crate) use_count: u64,
 }
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DiscoveryDiagnostics {
+    pub(crate) missing_roots: u64,
+    pub(crate) inaccessible_entries: u64,
+    pub(crate) reparse_entries: u64,
+    pub(crate) non_unicode_entries: u64,
+    pub(crate) invalid_shortcuts: u64,
+    pub(crate) unmapped_executables: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoverySnapshot {
+    pub(crate) applications: Vec<Application>,
+    pub(crate) diagnostics: DiscoveryDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiscoveryError {
+    KnownFolderQuery,
+    RootNotDirectory,
+    RootUnavailable,
+    RootReparsePoint,
+    ComUnavailable,
+    HashFailed,
+    DuplicateAppId,
+}
 ```
 
-Resolve `.lnk` metadata through `IShellLinkW` and `IPersistFile` from the `windows` crate. Failure to resolve an executable is allowed; the shortcut remains a valid launch entry and simply skips activation mapping.
+The fixed `Display` strings, in enum order, are `known folder query failed`, `start menu root is not a directory`, `start menu root is unavailable`, `start menu root is a reparse point`, `COM is unavailable`, `application identity hashing failed`, and `duplicate application identity`. No string includes an HRESULT or entry value. `Application.icon` is always `None` in MVP-A. `registry_entry(&Application)` creates a `ResultItem` with `icon: None` and a private `ResultAction::LaunchApplication`; no path or `app_id` enters the DTO.
 
-Generate `app_id` exactly as specified in `Application identity and settings` with Windows CNG SHA-256. Detect duplicate IDs during a scan and fail the rescan instead of merging entries. The app ID may enter `AppAliasTarget` and trusted Rust actions, but shortcut and executable paths never enter a frontend DTO.
+`apps/mod.rs` re-exports only these crate-private production functions to later tasks; their implementations stay in the named focused modules:
 
-- [ ] **Step 4: Cache application metadata and icons without widening frontend access**
+```rust
+pub(crate) fn discover() -> Result<DiscoverySnapshot, DiscoveryError>;
+pub(crate) fn registry_entry(app: &Application) -> (ResultItem, ResultAction);
+pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application>;
+```
 
-Write `application-cache.json` atomically in the application data directory and rebuild it on first launch or manual rescan. Extract a small PNG icon from the shell entry with `SHGetFileInfoW`, convert it through Windows Imaging Component, release every `HICON`, and store only base64 PNG bytes in the cache. Return `format!("data:image/png;base64,{encoded}")` or a bundled generic icon; never return an icon path, shortcut path, or executable path to TypeScript.
+Its private tests may call `known_folder_roots_with` and `discover_from_roots` with closures. These are test seams, not traits, configuration or Tauri commands. Root and child `io::Result<Metadata>` values pass through private `classify_root_metadata` and `classify_child_metadata` helpers so permission errors are deterministic unit-test inputs while production traversal uses the same branches.
 
-- [ ] **Step 5: Implement deterministic fuzzy scoring**
+`cache.rs` provides this process-memory surface backed by one `RwLock<Vec<Application>>`:
 
-Normalize with Unicode lowercase without transliteration. Score in this order: exact, prefix, substring, subsequence. Break ties by alias match, then descending `use_count`, then display name. Return no more than 20 items. Do not add a fuzzy-search dependency.
+```rust
+impl AppCache {
+    pub(crate) fn new() -> Self;
+    #[cfg(test)]
+    fn from_apps(applications: Vec<Application>) -> Self;
+    pub(crate) fn snapshot(&self) -> Vec<Application>;
+    pub(crate) fn refresh_with<F>(&self, discover: F) -> Result<DiscoveryDiagnostics, DiscoveryError>
+    where
+        F: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError>;
+}
+```
 
-- [ ] **Step 6: Run tests and clippy**
+A failed refresh leaves the last good vector untouched. The cache never reads or writes `application-cache.json` because a user-modifiable path cache cannot be a trusted launch source.
+
+- [ ] **Step 1: Write failing discovery, shortcut and identity tests**
+
+Create the modules and test helpers, declare them from `src-tauri/src/lib.rs`, then add focused tests with injected temporary roots and resolver closures. The assertions must cover the approved design directly:
+
+```rust
+#[test]
+fn known_folder_provider_uses_only_approved_ids_flags_and_null_token() {
+    let mut calls = Vec::new();
+    let roots = known_folder_roots_with(|id, flags, token| {
+        calls.push((*id, flags, token));
+        Ok(PathBuf::from(if *id == FOLDERID_Programs { r"C:\User" } else { r"C:\Common" }))
+    }).unwrap();
+    assert_eq!(roots[0].kind, RootKind::User);
+    assert_eq!(roots[1].kind, RootKind::Common);
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(_, flags, token)| *flags == KF_FLAG_DONT_VERIFY && token.is_none()));
+}
+
+#[test]
+fn known_folder_failure_is_a_fixed_scan_error() {
+    assert_eq!(
+        known_folder_roots_with(|_, _, _| Err(())).unwrap_err(),
+        DiscoveryError::KnownFolderQuery,
+    );
+}
+
+#[test]
+fn scans_only_regular_lnk_files_case_insensitively() {
+    let snapshot = scan_fixture(&["One.lnk", "Two.LNK", "ignore.exe", "ignore.txt"]);
+    assert_eq!(snapshot_titles(&snapshot), ["One", "Two"]);
+}
+
+#[test]
+fn missing_root_is_empty_but_bad_existing_root_fails() {
+    assert_eq!(discover_missing_fixture().unwrap().diagnostics.missing_roots, 1);
+    assert_eq!(discover_non_directory_fixture().unwrap_err(), DiscoveryError::RootNotDirectory);
+    assert_eq!(discover_unreadable_root_fixture().unwrap_err(), DiscoveryError::RootUnavailable);
+    assert_eq!(discover_reparse_root_fixture().unwrap_err(), DiscoveryError::RootReparsePoint);
+}
+
+#[test]
+fn child_reparse_and_inaccessible_entries_are_skipped() {
+    let snapshot = discover_child_error_fixture().unwrap();
+    assert_eq!(snapshot.diagnostics.reparse_entries, 2);
+    assert_eq!(snapshot.diagnostics.inaccessible_entries, 1);
+    assert!(!snapshot_titles(&snapshot).contains(&"Outside"));
+}
+
+#[test]
+fn non_unicode_relative_path_is_skipped_without_lossy_text() {
+    let snapshot = discover_non_unicode_fixture().unwrap();
+    assert_eq!(snapshot.diagnostics.non_unicode_entries, 1);
+    assert!(snapshot_titles(&snapshot).iter().all(|title| !title.contains('\u{fffd}')));
+}
+
+#[test]
+fn invalid_shortcut_is_skipped_without_aborting_scan() {
+    let snapshot = discover_with_one_invalid_shortcut().unwrap();
+    assert_eq!(snapshot.diagnostics.invalid_shortcuts, 1);
+    assert_eq!(snapshot_titles(&snapshot), ["Valid"]);
+}
+
+#[test]
+fn app_id_has_fixed_vectors_and_case_only_rename_stability() {
+    assert_eq!(
+        app_id(RootKind::User, "Tools\\WeChat.lnk").unwrap(),
+        "app-8fe952e53691106c491156368e5c9b70bd56a3fc0b2a43455a9a40c765d56f9f",
+    );
+    assert_eq!(
+        app_id(RootKind::Common, "tools\\wechat.lnk").unwrap(),
+        "app-567d9db3933c49330028523bda654c90a540288b10f56b10f6375cc6ddb1fae0",
+    );
+    assert_eq!(app_id(RootKind::User, "Tools\\WeChat.lnk"), app_id(RootKind::User, "tools\\wechat.LNK"));
+    assert_ne!(app_id(RootKind::User, "Tools\\WeChat.lnk"), app_id(RootKind::User, "Other\\WeChat.lnk"));
+}
+
+#[test]
+fn duplicate_ids_fail_without_merging() {
+    assert_eq!(discover_duplicate_id_fixture().unwrap_err(), DiscoveryError::DuplicateAppId);
+}
+
+#[test]
+fn target_and_absolute_root_do_not_change_app_id() {
+    let first = discovered_id(RootKind::User, r"C:\FirstRoot", "Tools\\App.lnk", Some(r"C:\One.exe"));
+    let second = discovered_id(RootKind::User, r"D:\OtherRoot", "Tools\\App.lnk", Some(r"D:\Two.exe"));
+    assert_eq!(first, second);
+}
+
+#[test]
+fn shortcut_loader_uses_raw_path_and_never_resolve() {
+    let calls = load_instrumented_shortcut();
+    assert_eq!(calls.get_path_flags, [SLGP_RAWPATH]);
+    assert_eq!(calls.resolve_count, 0);
+}
+
+#[test]
+fn unsafe_or_non_executable_raw_targets_have_no_mapping() {
+    for raw in [r"%LOCALAPPDATA%\App.exe", r"App.exe", r"\\server\App.exe", r"\\?\C:\App.exe", r"C:\App.cmd"] {
+        assert_eq!(validate_raw_executable(raw), None);
+    }
+}
+
+#[test]
+fn empty_error_and_invalid_utf16_raw_targets_have_no_mapping() {
+    assert_eq!(validate_get_path_result(Ok(None)), None);
+    assert_eq!(validate_get_path_result(Err(())), None);
+    assert_eq!(validate_raw_executable_wide(&[0xD800, 0]), None);
+}
+
+#[test]
+fn nonexistent_drive_absolute_exe_is_kept_without_io() {
+    assert_eq!(validate_raw_executable(r"Z:\missing\App.exe"), Some(PathBuf::from(r"Z:\missing\App.exe")));
+}
+
+#[test]
+fn result_and_diagnostics_do_not_expose_private_values() {
+    let (item, action) = registry_entry(&private_application());
+    assert_eq!(item.icon, None);
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(!json.contains("app-") && !json.contains(".lnk") && !json.contains(".exe"));
+    assert!(matches!(action, ResultAction::LaunchApplication { .. }));
+    assert_eq!(DiscoveryDiagnostics::default(), DiscoveryDiagnostics {
+        missing_roots: 0,
+        inaccessible_entries: 0,
+        reparse_entries: 0,
+        non_unicode_entries: 0,
+        invalid_shortcuts: 0,
+        unmapped_executables: 0,
+    });
+    assert_eq!(DiscoveryError::KnownFolderQuery.to_string(), "known folder query failed");
+    assert_eq!(DiscoveryError::DuplicateAppId.to_string(), "duplicate application identity");
+}
+```
+
+The helpers above are test code created in the named module; they are not production APIs. Tests that cannot create an unreadable Windows entry reliably use a closure returning the corresponding `io::ErrorKind`. Construct invalid Unicode with `OsStringExt::from_wide` containing an unpaired surrogate; never embed replacement text in the fixture.
+
+- [ ] **Step 2: Run the first focused test set and confirm failure**
 
 Run:
 
 ```powershell
 cargo test --manifest-path src-tauri/Cargo.toml apps::
-powershell -ExecutionPolicy Bypass -File scripts/test-start-menu-boundary.ps1
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
-Expected: all app tests pass; clippy exits 0.
+Expected: non-zero exit because the production discovery and shortcut functions do not exist yet. Do not weaken or ignore a test to obtain the red state.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 3: Implement the minimal bounded discovery and shortcut parser**
+
+Add a direct dependency on the already locked `windows = 0.61.3` with only the features needed here: `Win32_Foundation`, `Win32_Security_Cryptography`, `Win32_Storage_FileSystem`, `Win32_System_Com`, and `Win32_UI_Shell`. Do not add an icon, hash or fuzzy-search crate.
+
+Production root discovery calls `SHGetKnownFolderPath` exactly twice with `FOLDERID_Programs` and `FOLDERID_CommonPrograms`, `KF_FLAG_DONT_VERIFY`, and Rust `None` for the token (`hToken = NULL`). Convert the returned UTF-16 to `OsString` without loss and release every returned `PWSTR` with `CoTaskMemFree`. Any query failure returns `KnownFolderQuery`; there is no environment or config fallback.
+
+Use `std::fs::symlink_metadata`, `std::os::windows::fs::MetadataExt::file_attributes`, and `FILE_ATTRIBUTE_REPARSE_POINT` before every descent or file acceptance. A missing root increments `missing_roots`; an existing bad root returns its fixed hard error. Child metadata/read errors increment `inaccessible_entries`; every child reparse point increments `reparse_entries` and is skipped. Sort accepted relative paths before parsing. Only regular `.lnk` files are accepted with ASCII case-insensitive extension matching.
+
+Normalize an accepted relative path component-by-component with `OsStr::to_str`, join using `\\`, then call Unicode `to_lowercase`. Never call `to_string_lossy` or substitute invalid code points; skip a directory subtree or file whose relative path is not losslessly representable. Hash the exact UTF-8 preimage from the approved design with Windows CNG SHA-256, close all CNG handles on every branch, and fail the complete scan on CNG failure or duplicate ID.
+
+Initialize COM on the background scan thread. Create `IShellLinkW`, load through `IPersistFile`, and call only `GetPath(..., SLGP_RAWPATH)`. Never call `Resolve`, `canonicalize`, environment expansion, target metadata, icon APIs or target existence checks. `IPersistFile::Load` failure skips that item; COM/Shell Link creation failure aborts the scan. Accept an executable mapping only when the raw UTF-16 is lossless, contains no `%`, uses a drive-letter absolute path, is not UNC/verbatim/device namespace, and ends in `.exe` case-insensitively. Set `icon: None` for every application.
+
+- [ ] **Step 4: Add and run the Windows junction boundary gate**
+
+Create `scripts/test-start-menu-boundary.ps1`. It creates one process-temp test root, a separate outside directory containing `Outside.lnk`, and a junction inside the injected root pointing outside. It sets only `UIPILOT_TEST_USER_ROOT`, `UIPILOT_TEST_COMMON_ROOT`, and `UIPILOT_TEST_OUTSIDE_SENTINEL`, then runs the ignored test-only case:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml `
+  apps::discovery::tests::junction_does_not_escape_injected_root `
+  -- --ignored --exact
+```
+
+The Rust test reads those variables only under `#[cfg(test)]`, calls `discover_from_roots`, and asserts `Outside` is absent. In `finally`, resolve and verify both cleanup roots remain children of `[IO.Path]::GetTempPath()`, remove the junction itself with `Remove-Item -LiteralPath -Force`, then remove the two temp trees with native PowerShell `Remove-Item -Recurse -Force`. Production root discovery never reads these variables.
+
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml apps::discovery
+cargo test --manifest-path src-tauri/Cargo.toml apps::shortcut
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-start-menu-boundary.ps1
+```
+
+Expected: all discovery/shortcut tests pass and the boundary script exits 0.
+
+- [ ] **Step 5: Write failing cache and ranking tests**
+
+Add tests with an initial cached application so failure preservation is observable, plus deterministic ranking fixtures:
+
+```rust
+#[test]
+fn failed_refresh_preserves_last_good_snapshot() {
+    let cache = AppCache::from_apps(vec![application("Existing", 0)]);
+    assert_eq!(cache.refresh_with(|| Err(DiscoveryError::KnownFolderQuery)), Err(DiscoveryError::KnownFolderQuery));
+    assert_eq!(titles(&cache.snapshot()), ["Existing"]);
+}
+
+#[test]
+fn successful_refresh_replaces_snapshot_once() {
+    let cache = AppCache::from_apps(vec![application("Old", 0)]);
+    cache.refresh_with(|| Ok(snapshot([application("New", 0)]))).unwrap();
+    assert_eq!(titles(&cache.snapshot()), ["New"]);
+}
+
+#[test]
+fn exact_prefix_contains_and_subsequence_are_ordered() {
+    let apps = ranking_fixture(["企业微信", "微信", "Visual Studio Code", "Unrelated"]);
+    assert_eq!(titles(&rank(&apps, "微信")), ["微信", "企业微信"]);
+    assert_eq!(titles(&rank(&apps, "企业")), ["企业微信"]);
+    assert_eq!(titles(&rank(&apps, "vsc")), ["Visual Studio Code"]);
+}
+
+#[test]
+fn aliases_rank_without_changing_display_name() {
+    let apps = fixture_with_alias("Visual Studio Code", "code");
+    assert_eq!(titles(&rank(&apps, "code")), ["Visual Studio Code"]);
+}
+
+#[test]
+fn use_count_then_name_then_app_id_break_ties() {
+    assert_eq!(ids(&rank(&tie_fixture(), "app")), expected_tie_order());
+}
+
+#[test]
+fn empty_query_is_empty_and_results_are_limited_to_twenty() {
+    assert!(rank(&many_apps(25), "").is_empty());
+    assert_eq!(rank(&many_apps(25), "app").len(), 20);
+}
+
+#[test]
+fn duplicate_display_names_keep_distinct_ids_and_aliases() {
+    let apps = duplicate_name_fixture();
+    assert_ne!(apps[0].app_id, apps[1].app_id);
+    assert_ne!(apps[0].aliases, apps[1].aliases);
+}
+```
+
+Ranking uses the best exact, prefix, substring or character-subsequence match across display name and aliases after Unicode lowercase. For equal match class, prefer an alias match, then descending `use_count`, lowercase display name, and finally `app_id`. `rank` returns at most 20 cloned Rust records and no result for an empty query.
+
+- [ ] **Step 6: Run the second focused test set and confirm failure**
+
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml apps::cache
+cargo test --manifest-path src-tauri/Cargo.toml apps::rank
+```
+
+Expected: non-zero exit because `AppCache` and ranking are not implemented.
+
+- [ ] **Step 7: Implement the process-memory cache and deterministic ranking**
+
+Implement `AppCache` with one `RwLock<Vec<Application>>`. `refresh_with` completes discovery before taking the write lock, then replaces the vector once; an error never takes the write lock or changes state. Do not create a database, disk cache, watcher, background runtime or generic cache abstraction.
+
+Implement the ranking contract from Step 5 with standard-library strings and iterators. Do not transliterate, correct spelling, infer semantics or add a dependency. `registry_entry` sets `ResultItem.result_id` to an empty placeholder for Task 2 to overwrite, uses the display name as `title`, sets `subtitle` and `icon` to `None`, and places `app_id`, shortcut and executable only in `ResultAction`.
+
+- [ ] **Step 8: Run the complete Task 3 gate**
+
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml apps::
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-start-menu-boundary.ps1
+cargo check --manifest-path src-tauri/Cargo.toml --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+$forbidden = rg -n '%APPDATA%|%ProgramData%|SHGetFileInfo|Windows Imaging|application-cache\.json|\.Resolve\(' src-tauri/src/apps
+if ($LASTEXITCODE -eq 0) { $forbidden; throw 'Forbidden Task 3 implementation found' }
+if ($LASTEXITCODE -ne 1) { throw 'rg failed while checking forbidden Task 3 implementation' }
+git diff --check
+```
+
+Expected: every command exits 0; tests cover all 14 approved design cases plus ranking/cache behavior. The forbidden-pattern gate finds no environment-root, icon extraction, disk path cache or `Resolve` implementation. Production code contains no test-root environment variable access outside `#[cfg(test)]`.
+
+- [ ] **Step 9: Commit**
 
 ```powershell
 git add src-tauri scripts/test-start-menu-boundary.ps1
@@ -1058,7 +1318,7 @@ pub(crate) enum ExecuteOutcome {
 
 - [ ] **Step 4: Register narrow Tauri commands**
 
-`search_apps(query, invocationId, querySequence)` calls `begin_query` before doing cache/ranking work and finishes through `publish_if_latest`; it returns `null` for an old invocation, superseded query or hidden generation. It never calls an unconditional publish. `execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping and updates recent-use count only after a successful launch/activation request, then calls `clear_and_hide`; failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` refreshes only the two Start Menu roots. Settings and validation commands call their Rust services.
+`search_apps(query, invocationId, querySequence)` calls `begin_query` before doing cache/ranking work and finishes through `publish_if_latest`; it returns `null` for an old invocation, superseded query or hidden generation. It never calls an unconditional publish. `execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping and updates recent-use count only after a successful launch/activation request, then calls `clear_and_hide`; failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` refreshes only the two roots returned by the fixed Known Folder provider. Settings and validation commands call their Rust services.
 
 Register exactly the commands already declared in `build.rs`. Do not add a generic `run`, `open`, `readFile`, `writeFile`, or `request` command.
 
@@ -1301,7 +1561,7 @@ Confirm all statements are true before marking the plan complete:
 
 - There is one local-only WebView and one trusted action registry.
 - No command accepts a file path, executable path, URL, shell fragment, or arbitrary payload from TypeScript.
-- App discovery stays within the two Start Menu roots.
+- App discovery stays within `FOLDERID_Programs` and `FOLDERID_CommonPrograms` returned by the fixed Known Folder provider.
 - Activation ambiguity and refusal follow the frozen fallback policy.
 - The implementation introduces only launcher and application capabilities defined by this plan.
 - No translation, network, plugin, macOS, signing, or pilot code was introduced.
