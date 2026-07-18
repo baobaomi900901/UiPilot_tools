@@ -94,44 +94,29 @@ interface SettingsView {
 }
 ```
 
-`load_settings` 返回 `SettingsView`；`save_settings` 只接受已存在 `appId` 对应的别名，不接受显示名称或路径作为键。
+Task 5 后续提供的 `load_settings` 返回 `SettingsView`；`save_settings` 只接受已存在 `appId` 对应的别名，不接受显示名称或路径作为键。Task 4A 只实现 crate-private store，不创建这些 command 或前端类型。
 
 整个进程只创建一个 Tauri 托管的 `Arc<AppCache>`。Task 3 启动线程、Task 4 设置服务和 Task 5 命令都使用该实例。`settings.json` 中的 `useCounts` 只含符合固定格式的 `appId` 和 `u64`；搜索时将别名和计数装饰到内存快照的克隆，绝不把设置文件中的数据提升为路径或动作。
 
 ### Validation export
 
-**Superseded Task 4 baseline:** The contract in this subsection is not executable. The frozen MVP-A specification removes confirmed-crash instrumentation and `hostCrashes`; the replacement contract is split across the pending Task 4A/4B/4C written designs linked under Task 4. This subsection must be replaced only after those designs are approved.
+Task 4 持久化拆为三个顺序交付物；各自只执行已批准的独立计划：
 
-```rust
-const VALIDATION_SCHEMA_VERSION: u32 = 1;
+- `docs/superpowers/plans/2026-07-18-task-4a-settings-persistence.md`
+- `docs/superpowers/plans/2026-07-18-task-4b-validation-store.md`
+- `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md`
 
-#[derive(Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DailyCounts {
-    launcher_invocations: u64,
-    application_launch_requests: u64,
-    activation_successes: u64,
-    activation_refusals: u64,
-    unclean_sessions: u64,
-    host_crashes: u64,
-}
+`SettingsStore` 和 `ValidationStore` 各自只有一个进程所有者和一个事务 mutex；成功替换 current 后才交换内存并把 `current_is_valid` 设为 true。research ID 保持可选，但非空值只能是 1 到 64 个 ASCII 字母、数字、`-`、`_`；导出缺少 ID 时固定失败且不创建文件。
 
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ValidationExport {
-    schema_version: u32,
-    research_id: Option<String>,
-    daily_counts: BTreeMap<String, DailyCounts>,
-}
-```
+验证文件只包含 schema version、日期级 `DailyCounts` 和内部 `lastReconciledSessionId`。`DailyCounts` 固定包含 `launcherInvocations`、`applicationLaunchRequests`、`activationSuccesses`、`activationRefusals`、`uncleanSessions`；不存在 `hostCrashes`。MVP-A 不安装 `SetUnhandledExceptionFilter` 或 confirmed-crash marker。
 
 日期键固定为本地 `YYYY-MM-DD`，通过已使用的 `windows` crate 调用 `GetLocalTime` 获得，不增加日期依赖。活跃日由 `launcherInvocations > 0` 判定；该日成功动作等于 `applicationLaunchRequests + activationSuccesses`，只验证纯应用启动/激活使用频率。
 
 事件映射固定为：窗口唤起增加 `launcherInvocations`；`LaunchRequested` 增加 `applicationLaunchRequests`；`ActivationRequested` 增加 `activationSuccesses`；`ActivationRefusedLaunchRequested` 同时增加 `activationRefusals` 与 `applicationLaunchRequests`。失败动作不增加成功动作字段。
 
-启动时为当前进程写入只含 opaque `sessionId` 和本地日期的 open-session marker。下次启动发现 marker 时，只增加其日期的 `uncleanSessions`。只有同一 `sessionId` 还存在由最外层 `catch_unwind(AssertUnwindSafe(run))` 在 panic 逃出 `run()` 后写入的 marker，或 Windows `SetUnhandledExceptionFilter` 写入的固定类别 marker，才同时增加 `hostCrashes`；已捕获 panic 和普通工作线程 panic 不写 confirmed marker。marker 不记录 panic 文本、异常地址、堆栈、应用名或路径。最外层守卫写标记后 `resume_unwind`，Windows filter 写标记后继续系统默认异常处理。Task Manager 强制结束、断电、未收到结束消息的系统重启等只有 open marker，没有 crash marker，因此只属于 unclean。
+启动时先以持久化 `lastReconciledSessionId` 对账旧 open-session marker，再原子替换为新 marker并把同一 ID 保存到内存。重复 open 失败；`record` 在 session 未打开时失败；clean exit 只删除与本进程内存 ID 匹配的 marker。`uncleanSessions` 不能自动归类为宿主崩溃。
 
-正常清理路径固定为：托盘“退出”；Tauri `RunEvent::ExitRequested` 只 flush，真正的 `RunEvent::Exit` 才清除 marker；Windows `WM_QUERYENDSESSION` 只 flush，只有 `WM_ENDSESSION` 的 `wParam != 0` 才清除 marker（关机、注销、系统更新重启）。这样被取消的退出/关机不会被误记为 clean。主窗口 CloseRequested 仍只隐藏，不清理进程 session。研究报告不得把 `uncleanSessions` 自动提升为崩溃；存在尚未通过 WER/Application Error、crash dump 或主持记录完成分类的 unclean session 时，需求第 3.4 节的宿主崩溃 Go 条件只能标记为“证据不足”，不能判定通过。
+Task 4C 的 native chooser 返回字段私有的 `ExportDestination`。Task 5 后续 async command 只在 main UI thread 显示 dialog；cancel 在 worker 派发前返回，确认后才把 destination 交给 `spawn_blocking` 完成 snapshot、序列化、`sync_all` 和原子替换。Task 4C 不修改 `src/protocol.ts` 或 command registry。
 
 ### Security probe build
 
@@ -1277,153 +1262,15 @@ git commit -m "feat: discover and rank Start Menu apps"
 
 ## Task 4: Persist Settings and Daily Validation Counts
 
-**Status:** No-Go for TDD. The section below is retained as the rejected baseline and must not be executed. Replace it only after the following three written designs are approved independently:
+**Status:** No-Go for TDD until all three implementation plans below pass written review.
 
-- `docs/superpowers/specs/2026-07-18-task-4a-settings-persistence-design.md`
-- `docs/superpowers/specs/2026-07-18-task-4b-validation-store-design.md`
-- `docs/superpowers/specs/2026-07-18-task-4c-validation-export-service-design.md`
+- Task 4A: `docs/superpowers/plans/2026-07-18-task-4a-settings-persistence.md`
+- Task 4B: `docs/superpowers/plans/2026-07-18-task-4b-validation-store.md`
+- Task 4C: `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md`
 
-No Task 5 command, action, activation or rescan wiring may be added while these designs are under review.
+Execution order is fixed as 4A -> 4B -> 4C. Each plan has its own TDD, verification and commit gate. Approval or completion of one plan does not authorize the next unapproved plan.
 
-**Files:**
-- Create: `src-tauri/src/settings.rs`
-- Create: `src-tauri/src/validation_data.rs`
-- Create: `src-tauri/src/crash_marker.rs`
-- Modify: `src-tauri/src/lib.rs`
-- Modify: `src/protocol.ts`
-
-- [ ] **Step 1: Write failing persistence tests**
-
-Use a unique directory under `std::env::temp_dir()` and remove it at the end of each test. Prove:
-
-- Missing settings produce `Alt+Space`, autostart disabled, and empty aliases.
-- Save uses a sibling temporary file and atomic rename.
-- Invalid current JSON is quarantined with a `.invalid` suffix and the last valid `.backup` file is loaded.
-- Defaults are used only when neither the current nor backup file is valid.
-- Validation counters never contain query text, application names, or paths.
-- Two events on the same local date update one `DailyCounts`; the next date creates a second entry.
-- Export has `schemaVersion: 1`, optional `researchId`, and date-keyed `dailyCounts` with every field in the cross-task contract.
-- Three distinct active dates and per-day successful-action totals can be calculated from the exported structure.
-- A stale open-session marker without matching crash evidence increments `uncleanSessions` only.
-- A stale open-session marker plus a matching top-level Rust unwind or Windows unhandled-exception marker increments both `uncleanSessions` and `hostCrashes` exactly once.
-- A mismatched/stale crash marker cannot increment `hostCrashes`.
-- A caught panic or ordinary worker-thread panic does not create confirmed crash evidence.
-- `ExitRequested` and `WM_QUERYENDSESSION` alone retain the marker; tray exit, `RunEvent::Exit`, and `WM_ENDSESSION(wParam != 0)` remove it without incrementing either field.
-- Force-termination simulation leaves an unclean session but cannot claim a host crash.
-- Duplicate display names retain separate aliases through their distinct `appId` values.
-- Saving an alias for an unknown `appId` is rejected.
-- `useCounts` round-trips as `BTreeMap<String, u64>` without any application name or path.
-- A malformed `appId` key makes the current settings file invalid and triggers the existing backup/default recovery path.
-- A structurally valid count for an application absent from the current `AppCache` is retained on disk but ignored when decorating the current snapshot.
-- Incrementing `use_count` for an `appId` absent from the current `AppCache` is rejected without changing memory or disk.
-- A successful known-ID increment writes a sibling temporary file, calls `sync_all`, atomically replaces `settings.json`, then swaps the in-memory settings; write failure leaves both previous states unchanged.
-- Two concurrent increments for one known `appId` produce count 2 in both `SettingsStore` memory and `settings.json`; neither update can overwrite the other.
-- Clear validation resets validation aggregates only and does not modify `useCounts` or aliases.
-- Export opens a native save dialog only after the user clicks Export and accepts no destination path from TypeScript.
-
-- [ ] **Step 2: Run tests and confirm failure**
-
-Run:
-
-```powershell
-cargo test --manifest-path src-tauri/Cargo.toml settings
-cargo test --manifest-path src-tauri/Cargo.toml validation_data
-```
-
-Expected: compile failure because persistence modules do not exist.
-
-- [ ] **Step 3: Implement two structured JSON files**
-
-Store `settings.json` and `validation-data.json` under Tauri's application data directory. Persist through `create temp -> write -> sync_all -> preserve previous valid file as .backup -> rename`. Keep these settings only:
-
-```rust
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Settings {
-    pub(crate) hotkey: String,
-    pub(crate) autostart: bool,
-    pub(crate) research_id: Option<String>,
-    pub(crate) aliases: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub(crate) use_counts: BTreeMap<String, u64>,
-}
-
-pub(crate) struct SettingsStore {
-    path: PathBuf,
-    settings: Mutex<Settings>,
-}
-
-impl SettingsStore {
-    pub(crate) fn decorate_applications(&self, applications: &mut [Application]);
-    pub(crate) fn increment_use_count(
-        &self,
-        app_id: &str,
-        cache: &AppCache,
-    ) -> Result<(), SettingsError>;
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> Settings;
-}
-```
-
-Every alias and use-count key must match `^app-[0-9a-f]{64}$`; malformed keys invalidate that settings file. A structurally valid key may refer to a temporarily absent application, so loading retains it without treating it as a trusted path or current application.
-
-`SettingsStore` owns the loaded `Settings` and its application-data path. It is managed once by Tauri and exposes crate-private `decorate_applications(&mut [Application])` and `increment_use_count(app_id, &AppCache)` operations. Task 4 commands request `State<'_, Arc<AppCache>>` and the single managed `SettingsStore`; they never construct a cache. Decoration holds the settings mutex only while copying aliases and counts onto matching IDs from the current process-memory snapshot; absent entries remain at empty aliases and count zero.
-
-Every mutation, including alias saves and `increment_use_count`, acquires the one `Mutex<Settings>` exactly once. The guard remains held while reading the old value, validating against `AppCache`, constructing the candidate, writing and syncing the sibling temporary file, replacing `settings.json`, and assigning the candidate to the guarded in-memory value. No mutation releases and reacquires the mutex between those operations. Validation, `checked_add`, serialization or disk failure leaves the guarded value unchanged; the existing backup/replacement protocol preserves the previous valid disk value. It never accepts a path and never exposes `use_counts` to TypeScript.
-
-Add this concurrency regression test using a temporary settings directory and one known cached application:
-
-```rust
-#[test]
-fn concurrent_use_count_increments_are_not_lost() {
-    let cache = Arc::new(AppCache::from_apps(vec![application("Known", 0)]));
-    let app_id = cache.snapshot()[0].app_id.clone();
-    let settings_path = unique_test_settings_path();
-    let store = Arc::new(test_settings_store(settings_path.clone()));
-    let start = Arc::new(Barrier::new(3));
-
-    let workers: Vec<_> = (0..2).map(|_| {
-        let cache = Arc::clone(&cache);
-        let app_id = app_id.clone();
-        let store = Arc::clone(&store);
-        let start = Arc::clone(&start);
-        thread::spawn(move || {
-            start.wait();
-            store.increment_use_count(&app_id, &cache).unwrap();
-        })
-    }).collect();
-    start.wait();
-    for worker in workers { worker.join().unwrap(); }
-
-    assert_eq!(store.snapshot().use_counts[&app_id], 2);
-    assert_eq!(read_settings(&settings_path).use_counts[&app_id], 2);
-}
-```
-
-The aliases map key is `appId`; validate it against the current `AppCache` before saving changes from the settings UI. `load_settings` decorates a clone of that same cache snapshot and returns the `SettingsView` contract, so same-name applications remain independently editable while trusted paths stay Rust-only.
-
-Persist `VALIDATION_SCHEMA_VERSION` and the `BTreeMap<String, DailyCounts>` shape from the cross-task contract. Obtain the local date with `GetLocalTime`; do not store a timestamp. `crash_marker.rs` owns the open-session/fixed-category crash markers, top-level Rust unwind guard and Windows unhandled-exception filter. On startup, reconcile markers exactly as defined in `Validation export`, consume matched crash evidence once, then open the new session. Clean exit removes both current-session markers. `clear_validation_data` clears historical counts but preserves the currently open session marker. Do not record raw inputs, result titles, executable names, shortcut paths, panic text, addresses, stacks, or precise behavior times.
-
-Implement export with Windows `IFileSaveDialog` inside the zero-argument Rust command. Write the aggregate JSON only after the user confirms the native dialog; return only success/cancel/error status to TypeScript. Do not grant dialog or filesystem capabilities to the WebView.
-
-- [ ] **Step 4: Verify persistence behavior**
-
-Run:
-
-```powershell
-cargo test --manifest-path src-tauri/Cargo.toml settings
-cargo test --manifest-path src-tauri/Cargo.toml validation_data
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Expected: persistence tests and full Rust suite pass.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src src-tauri
-git commit -m "feat: persist settings and local validation counts"
-```
+No Task 5 command, action, activation, rescan or TypeScript wiring may be added while these implementation plans are under review or execution.
 
 ---
 
@@ -1465,6 +1312,8 @@ Test the exact policy:
 - Hiding during an in-flight query makes its publish return `null` and leaves the registry empty.
 - `hide_launcher` clears the registry before attempting to hide; if hide fails it returns an error and the registry remains cleared.
 - `rescan_apps` moves discovery to a blocking runtime worker, returns only after that worker finishes, and never initializes COM on the command thread.
+- `export_validation_data` runs the chooser on the main UI thread; cancel returns before any writer worker is spawned.
+- A confirmed export moves only `ExportDestination + cloned AppHandle` into `spawn_blocking`; snapshot, serialization, `sync_all` and replacement all run on that worker.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -1498,7 +1347,9 @@ pub(crate) enum ExecuteOutcome {
 
 All Task 5 commands request the same `State<'_, Arc<AppCache>>` created in Task 3; no command constructs or replaces the owner. `search_apps(query, invocationId, querySequence)` calls `begin_query`, clones `AppCache::snapshot`, asks the single `SettingsStore` to decorate only that clone with aliases and `use_count`, ranks it, and finishes through `publish_if_latest`. It returns `null` for an old invocation, superseded query or hidden generation and never calls an unconditional publish.
 
-`execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping, and after a successful launch/activation request asks `SettingsStore::increment_use_count` to atomically persist the trusted action's `app_id`. A count-write failure must not execute the application a second time or alter the already determined launch/activation outcome; report only the fixed settings-persistence category and no ID or path. Then call `clear_and_hide`; system-action failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` calls `refresh` on that same `AppCache`; failure preserves the current snapshot, while success replaces it once with the two roots returned by the fixed Known Folder provider. Settings and validation commands call their Rust services.
+`execute_result(requestId, resultId)` resolves only through the registry, updates the current date according to the fixed event mapping, and after a successful launch/activation request asks `SettingsStore::increment_use_count` to atomically persist the trusted action's `app_id`. A count-write failure must not execute the application a second time or alter the already determined launch/activation outcome; report only the fixed settings-persistence category and no ID or path. Then call `clear_and_hide`; system-action failures retain the window. `hide_launcher()` calls the same `clear_and_hide` function with no frontend-supplied target. `rescan_apps()` calls `refresh` on that same `AppCache`; failure preserves the current snapshot, while success replaces it once with the two roots returned by the fixed Known Folder provider. Other settings and validation commands call their crate-private Rust services.
+
+`export_validation_data` is a zero-argument async command. It uses Tauri's main-thread dispatcher to call `choose_export_destination(HWND)` and maps `None` to a Task 5-owned fixed `Cancelled` result without spawning the writer. For `Some(destination)`, it moves that value plus a cloned `AppHandle` into `tauri::async_runtime::spawn_blocking`; the closure obtains the managed `SettingsStore`/`ValidationStore` and calls `write_validation_export`. Success maps to Task 5-owned `Exported`. The command has no path/filename/payload input, and Task 7 adds the first matching TypeScript type.
 
 `rescan_apps` is fixed as an async Tauri command and has no alternate synchronous entry point:
 
@@ -1549,7 +1400,7 @@ git commit -m "feat: launch and activate trusted app results"
 - Create: `src-tauri/src/lifecycle.rs`
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src-tauri/src/settings.rs`
-- Modify: `src-tauri/src/crash_marker.rs`
+- Modify: `src-tauri/src/session_marker.rs`
 - Modify: `src-tauri/tauri.conf.json`
 
 - [ ] **Step 1: Write failing lifecycle state tests**
