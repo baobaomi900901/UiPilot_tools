@@ -23,6 +23,7 @@
 - 生产应用根只能通过 `SHGetKnownFolderPath` 查询 `FOLDERID_Programs` 与 `FOLDERID_CommonPrograms`，固定使用 `KF_FLAG_DONT_VERIFY` 和 `hToken = NULL`；不接受环境变量、配置、命令行或前端路径。测试只能向内部扫描函数注入临时根。根 reparse point 是扫描级错误；任何 reparse 子项均跳过且不跟随。
 - 快捷方式和可执行文件的可信快照只驻留进程内并在启动时重建，不写入应用数据目录；磁盘只保存结构化设置、`appId -> use_count` 和验证计数。
 - 只保存日期级验证计数，不保存精确行为时间、查询词、应用名称、快捷方式、可执行文件或文件路径。
+- `test-instrumentation` 构建不得查询或修改正式 identifier 的 app-data，不得 load/manage settings/validation store 或创建 session marker；安全探针 smoke 必须比较运行前后的受保护文件快照。
 - 每个非平凡分支先写一个会失败的最小测试，再实现并运行该任务列出的完整验证命令。
 - 任务若必须改变本节接口，先修改本计划并重新审核；不能让实现者自行补合同。
 
@@ -133,6 +134,8 @@ npm run tauri build -- --no-bundle --features test-instrumentation --config src-
 ```
 
 override config 把 `build.beforeBuildCommand` 固定为 `npm run build -- --mode security-probe`，因此同一次 Tauri 构建同时启用 Vite probe mode 和 Cargo `test-instrumentation` feature。脚本把 npm/Tauri 日志发送到 host，成功时 stdout 最后一行只输出探针可执行文件的绝对路径。任何测试或 smoke 都不得直接运行裸 `--features test-instrumentation` 构建。
+
+Task 4A 扩展 `test-security-probe.ps1`：probe 启动前后比较正式 app-data 下 `settings.json*`、`validation-data.json*`、`open-session.json*` 的名称、长度、SHA-256 和最后写入 ticks。任何 current/backup/temp/invalid 文件新增、删除或变化都使 smoke 失败。4A/4B 的 app-data 查询、store load/manage 和 session open 只能存在于 `#[cfg(not(feature = "test-instrumentation"))]` setup 分支。
 
 ### Capability allowlist
 

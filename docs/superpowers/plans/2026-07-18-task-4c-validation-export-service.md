@@ -21,6 +21,7 @@
 - 导出必须包含已验证 research ID；缺少 ID 返回 `MissingResearchId`，不取得 validation snapshot、不创建文件。
 - 错误和日志不包含目标路径、文件名、Shell display name、research ID、session ID 或临时文件名。
 - 每个非平凡分支先写失败测试，再写最小实现；每个任务单独提交。
+- 执行前必须验证 lightweight tag `foundation-task-4-approved-plan` 仍指向获批计划基线；不得移动或重建该 tag。
 
 ## Interfaces
 
@@ -59,12 +60,28 @@ pub(crate) fn write_validation_export(
 
 The tuple field remains module-private. Task 5 can move an `ExportDestination` from chooser to writer but cannot construct one.
 
+## Execution Baseline
+
+Before the first RED command, verify Tasks 4A/4B left the reviewed baseline tag intact:
+
+```powershell
+$baseline = git rev-parse --verify refs/tags/foundation-task-4-approved-plan
+if ($LASTEXITCODE -ne 0 -or -not $baseline) {
+  throw "approved plan baseline tag missing"
+}
+git merge-base --is-ancestor $baseline HEAD
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline is not an ancestor" }
+```
+
+Do not move or recreate the tag.
+
 ---
 
 ### Task 1: Implement the native destination capability
 
 **Files:**
 - Create: `src-tauri/src/validation_export.rs`
+- Modify: `src-tauri/Cargo.toml`
 - Modify: `src-tauri/src/lib.rs`
 - Test: `src-tauri/src/validation_export.rs`
 
@@ -116,6 +133,12 @@ Replace the test-only declaration with the scoped production declaration:
 ```rust
 #[cfg_attr(not(test), allow(dead_code))]
 mod validation_export;
+```
+
+Add the exact generated-API feature required by `IFileDialog::SetFileTypes` to the existing `windows` dependency; do not add another crate or unrelated Windows feature:
+
+```toml
+"Win32_UI_Shell_Common",
 ```
 
 Define fixed errors and the unforgeable value:
@@ -196,7 +219,9 @@ Map only `HRESULT_FROM_WIN32(ERROR_CANCELLED)` to `Ok(None)`. All other dialog/G
 
 ```powershell
 cargo test --manifest-path src-tauri/Cargo.toml validation_export
+cargo check --manifest-path src-tauri/Cargo.toml --all-features
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 ```
 
 Expected: dialog/path tests pass and Clippy exits 0.
@@ -204,7 +229,7 @@ Expected: dialog/path tests pass and Clippy exits 0.
 - [ ] **Step 6: Commit Task 1**
 
 ```powershell
-git add src-tauri/src/validation_export.rs src-tauri/src/lib.rs
+git add src-tauri/Cargo.toml src-tauri/src/validation_export.rs src-tauri/src/lib.rs
 git commit -m "feat: select a native validation export target"
 ```
 
@@ -297,15 +322,48 @@ No two store locks overlap: each store method returns an owned clone before the 
 
 ```powershell
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml --all-features
 cargo test --manifest-path src-tauri/Cargo.toml validation_export
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 npm run build
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0 -or -not $probeExe) { throw "security probe build failed" }
+& .\scripts\test-security-probe.ps1 -Executable $probeExe
+if ($LASTEXITCODE -ne 0) { throw "security probe smoke failed" }
+
+$baseline = git rev-parse --verify refs/tags/foundation-task-4-approved-plan
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline tag missing" }
+git merge-base --is-ancestor $baseline HEAD
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline is not an ancestor" }
+$allowed = @(
+  'scripts/test-security-probe.ps1',
+  'src-tauri/Cargo.toml',
+  'src-tauri/src/atomic_file.rs',
+  'src-tauri/src/lib.rs',
+  'src-tauri/src/session_marker.rs',
+  'src-tauri/src/settings.rs',
+  'src-tauri/src/validation_data.rs',
+  'src-tauri/src/validation_export.rs'
+)
+$changed = @(
+  git diff --name-only "$baseline..HEAD"
+  git diff --name-only
+  git diff --cached --name-only
+  git ls-files --others --exclude-standard
+) | Where-Object { $_ } | Sort-Object -Unique
+$unexpected = @($changed | Where-Object { $_ -notin $allowed })
+if ($unexpected.Count -ne 0) {
+  throw "Task 4C scope violation: $($unexpected -join ', ')"
+}
 git diff --check
 ```
 
-Expected: tests/build/checks exit 0. `git diff --name-only` contains only `validation_export.rs` and its scoped module declaration; no `src/protocol.ts`, command, capability, `generate_handler`, runtime dependency or Task 5 action file changes exist.
+Expected: default/all-features Rust gates, frontend build, security allowlist/negative fixtures, same-artifact probe smoke, executable baseline/worktree scope assertion and diff check exit 0. The allowed set includes only cumulative Task 4A/4B files plus `validation_export.rs`; no `src/protocol.ts`, command, capability, runtime dependency or Task 5 action file is allowed.
 
 - [ ] **Step 5: Commit Task 2**
 

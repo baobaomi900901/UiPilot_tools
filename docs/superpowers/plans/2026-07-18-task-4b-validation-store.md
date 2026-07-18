@@ -4,7 +4,7 @@
 
 **Goal:** 实现唯一 `ValidationStore`、日级并发计数、open-session marker 和 exactly-once 启动对账，只统计 `uncleanSessions`。
 
-**Architecture:** `validation_data.rs` 复用 Task 4A 原子文件 helper，以一个 `Mutex<ValidationStoreState>` 管理持久化来源和当前 session 身份；`session_marker.rs` 只处理随机 ID、marker 文件和严格所有权。Rust setup 在任何验证事件或未来 command 暴露前完成 load/reconcile/open。
+**Architecture:** `validation_data.rs` 复用 Task 4A 原子文件 helper，以一个 `Mutex<ValidationStoreState>` 管理持久化来源和当前 session 身份；`session_marker.rs` 只处理随机 ID、marker 文件和严格所有权。Rust setup 只在非 `test-instrumentation` 构建、任何验证事件或未来 command 暴露前完成 load/reconcile/open。
 
 **Tech Stack:** Rust 1.77.2、Tauri 2.11.3、Serde/serde_json、现有 `windows 0.61.3` 的 `GetLocalTime`、Windows CNG 和 `MoveFileExW`。
 
@@ -17,9 +17,11 @@
 - 前置产物是已批准并完成的 Task 4A；只复用其 `atomic_file.rs`，不复制原子写入协议。
 - 不新增 dependency，不创建 Tauri command，不修改 capability、`invoke_handler` 或 `src/protocol.ts`。
 - 不安装 `SetUnhandledExceptionFilter`，不使用 `catch_unwind` 生成证据，不创建 confirmed-crash marker，不保存或导出 `hostCrashes`。
+- `test-instrumentation` 构建不得查询 app-data path、加载/隔离验证文件、创建 marker、对账 session 或 manage `ValidationStore`；probe smoke 必须证明 settings/validation/marker 文件族全部不变。
 - 只保存 schema、日期级计数和内部 `lastReconciledSessionId`；不保存精确时间、查询、应用、路径或 session ID 到日志/导出。
 - `record`、clear、reconcile 和 clean exit 全部使用同一个 store mutex；不嵌套获取 `SettingsStore` 或 `AppCache` 锁。
 - 每个非平凡分支先写失败测试，再写最小实现；每个任务单独提交。
+- 执行前必须验证 lightweight tag `foundation-task-4-approved-plan` 仍指向获批计划基线；不得移动或重建该 tag。
 
 ## Interfaces
 
@@ -61,6 +63,21 @@ pub(crate) enum ValidationEvent {
     ActivationRefusedLaunchRequested,
 }
 ```
+
+## Execution Baseline
+
+Before the first RED command, verify Task 4A left the reviewed baseline tag intact:
+
+```powershell
+$baseline = git rev-parse --verify refs/tags/foundation-task-4-approved-plan
+if ($LASTEXITCODE -ne 0 -or -not $baseline) {
+  throw "approved plan baseline tag missing"
+}
+git merge-base --is-ancestor $baseline HEAD
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline is not an ancestor" }
+```
+
+Do not move or recreate the tag.
 
 ---
 
@@ -412,20 +429,28 @@ Expected: compile failure because the helper is absent.
 Add the production helper through the same path tested in RED:
 
 ```rust
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 fn load_and_open_validation_store(
-    app_data_dir: &Path,
-) -> Result<ValidationStore, ValidationError> {
-    let store = ValidationStore::load(app_data_dir)?;
+    app_data_dir: &std::path::Path,
+) -> Result<validation_data::ValidationStore, validation_data::ValidationError> {
+    let store = validation_data::ValidationStore::load(app_data_dir)?;
     store.reconcile_and_open_session()?;
     Ok(store)
 }
 ```
 
-After obtaining the same app-data directory used by Task 4A, load/open and manage exactly one store:
+Inside Task 4A 已有的 `#[cfg(not(feature = "test-instrumentation"))]` setup block, after settings management, load/open and manage exactly one validation store. No app-data query or store call may exist outside this block:
 
 ```rust
-let validation = load_and_open_validation_store(&app_data_dir)?;
-assert!(_app.manage(validation), "validation store already managed");
+#[cfg(not(feature = "test-instrumentation"))]
+{
+    let app_data_dir = _app.path().app_data_dir()?;
+    let settings = load_settings_store(&app_data_dir)?;
+    assert!(_app.manage(settings), "settings store already managed");
+
+    let validation = load_and_open_validation_store(&app_data_dir)?;
+    assert!(_app.manage(validation), "validation store already managed");
+}
 ```
 
 This must happen before any future command registration or visible launcher event can record data. Do not wire tray exit, `RunEvent`, `WM_ENDSESSION` or record calls; Task 6 and Task 5 own those integrations.
@@ -434,24 +459,56 @@ This must happen before any future command registration or visible launcher even
 
 ```powershell
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml --all-features
 cargo test --manifest-path src-tauri/Cargo.toml session_marker
 cargo test --manifest-path src-tauri/Cargo.toml validation_data
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 npm run build
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0 -or -not $probeExe) { throw "security probe build failed" }
+& .\scripts\test-security-probe.ps1 -Executable $probeExe
+if ($LASTEXITCODE -ne 0) { throw "security probe smoke failed" }
+
+$baseline = git rev-parse --verify refs/tags/foundation-task-4-approved-plan
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline tag missing" }
+git merge-base --is-ancestor $baseline HEAD
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline is not an ancestor" }
+$allowed = @(
+  'scripts/test-security-probe.ps1',
+  'src-tauri/Cargo.toml',
+  'src-tauri/src/atomic_file.rs',
+  'src-tauri/src/lib.rs',
+  'src-tauri/src/session_marker.rs',
+  'src-tauri/src/settings.rs',
+  'src-tauri/src/validation_data.rs'
+)
+$changed = @(
+  git diff --name-only "$baseline..HEAD"
+  git diff --name-only
+  git diff --cached --name-only
+  git ls-files --others --exclude-standard
+) | Where-Object { $_ } | Sort-Object -Unique
+$unexpected = @($changed | Where-Object { $_ -notin $allowed })
+if ($unexpected.Count -ne 0) {
+  throw "Task 4B scope violation: $($unexpected -join ', ')"
+}
 $forbidden = rg -n "SetUnhandledExceptionFilter|hostCrashes|host_crashes|confirmed-crash" src-tauri src
 if ($LASTEXITCODE -eq 0) { throw "forbidden crash instrumentation found`n$forbidden" }
 if ($LASTEXITCODE -ne 1) { throw "forbidden-symbol scan failed" }
 git diff --check
 ```
 
-Expected: tests/build/checks and the wrapped forbidden-symbol scan exit 0; no command, capability, `src/protocol.ts`, crash marker or Task 5 action file is added.
+Expected: default/all-features Rust gates, frontend build, security allowlist/negative fixtures, same-artifact probe smoke, baseline/worktree scope assertion, forbidden-symbol scan and diff check exit 0. Probe smoke proves no validation file or open-session marker is created/changed.
 
 - [ ] **Step 5: Commit Task 3**
 
 ```powershell
-git add src-tauri/Cargo.toml src-tauri/src
+git add src-tauri/src/lib.rs
 git commit -m "feat: open the validation session at startup"
 ```
 

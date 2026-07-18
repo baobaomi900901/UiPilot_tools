@@ -4,7 +4,7 @@
 
 **Goal:** 实现 Windows 原子文件协议、唯一 `SettingsStore`、应用别名和 `useCounts` 持久化，不注册任何 Tauri command。
 
-**Architecture:** `atomic_file.rs` 提供 crate-private 的同目录 temp、同步和原子替换函数；`settings.rs` 在一个 `Mutex<SettingsState>` 内完成完整读改写事务。Rust setup 只加载并托管一个 store，Task 5/6 后续复用它。
+**Architecture:** `atomic_file.rs` 提供 crate-private 的同目录 temp、同步和原子替换函数；`settings.rs` 在一个 `Mutex<SettingsState>` 内完成完整读改写事务。Rust setup 只在非 `test-instrumentation` 构建加载并托管一个 store，Task 5/6 后续复用它。
 
 **Tech Stack:** Rust 1.77.2、Tauri 2.11.3、Serde/serde_json、标准库文件 API、现有 `windows 0.61.3` 的 `MoveFileExW`。
 
@@ -17,9 +17,11 @@
 - 仅支持当前 Windows 11 x64 Foundation 范围；不新增 crate 或 npm dependency。
 - 不创建 Tauri command，不修改 capability、`invoke_handler` 或 `src/protocol.ts`。
 - 不应用 hotkey/autostart 副作用，不实现搜索、动作、隐藏、重扫或验证计数。
+- `test-instrumentation` 构建不得查询 app-data path、加载/隔离设置或 manage `SettingsStore`；安全探针前后 settings/validation/marker 文件集合、内容和元数据必须相同。
 - 所有磁盘路径由 Rust 从 Tauri application data directory 构造；前端不提供路径或文件名。
 - 错误和日志只包含固定类别，不包含路径、临时文件名、`appId`、research ID 或别名。
 - 每个非平凡分支先写失败测试，再写最小实现；每个任务单独提交。
+- 三份计划批准后、任何 TDD 命令前，执行者必须在批准计划提交上创建且不得移动 lightweight tag `foundation-task-4-approved-plan`；完成门禁以该 tag 到 HEAD 加工作区计算完整范围。
 
 ## Interfaces
 
@@ -78,6 +80,29 @@ impl SettingsStore {
     pub(crate) fn snapshot(&self) -> Settings;
 }
 ```
+
+## Execution Baseline
+
+After written approval and before the first RED command, pin the approved plan commit once:
+
+```powershell
+$approved = git rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw "cannot resolve approved plan commit" }
+$tagName = 'foundation-task-4-approved-plan'
+$tagExists = git tag --list $tagName
+if ($LASTEXITCODE -ne 0) { throw "could not inspect approved plan tag" }
+if ($tagExists) {
+  $existing = git rev-parse "refs/tags/$tagName"
+  if ($LASTEXITCODE -ne 0 -or $existing -ne $approved) {
+    throw "foundation-task-4-approved-plan already points elsewhere"
+  }
+} else {
+  git tag foundation-task-4-approved-plan $approved
+  if ($LASTEXITCODE -ne 0) { throw "could not create approved plan tag" }
+}
+```
+
+Do not move or recreate this tag during Tasks 4A/4B/4C. If an approved plan changes, stop execution and revise/re-review the baseline contract before continuing.
 
 ---
 
@@ -386,6 +411,7 @@ git commit -m "feat: persist launcher settings"
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs`
+- Modify: `scripts/test-security-probe.ps1`
 - Test: `src-tauri/src/lib.rs`
 
 **Interfaces:**
@@ -416,40 +442,130 @@ Expected: compile failure because the helper is absent.
 Add the production helper through the same path tested in RED:
 
 ```rust
-fn load_settings_store(app_data_dir: &Path) -> Result<SettingsStore, SettingsError> {
-    SettingsStore::load(app_data_dir)
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+fn load_settings_store(
+    app_data_dir: &std::path::Path,
+) -> Result<settings::SettingsStore, settings::SettingsError> {
+    settings::SettingsStore::load(app_data_dir)
 }
 ```
 
-Import `tauri::Manager`, query `app.path().app_data_dir()` inside setup, load one store, and manage it before later tasks can expose commands:
+Guard the `tauri::Manager` import with `#[cfg(not(feature = "test-instrumentation"))]`; use fully qualified paths in the helper as above so all-features non-test builds leave no helper-only imports. Query app-data, load and manage only inside the same production branch:
 
 ```rust
-let app_data_dir = _app.path().app_data_dir()?;
-let settings = load_settings_store(&app_data_dir)?;
-assert!(_app.manage(settings), "settings store already managed");
+#[cfg(not(feature = "test-instrumentation"))]
+{
+    let app_data_dir = _app.path().app_data_dir()?;
+    let settings = load_settings_store(&app_data_dir)?;
+    assert!(_app.manage(settings), "settings store already managed");
+}
 ```
 
 Keep the existing single `Arc<AppCache>` and initial refresh unchanged. Do not add `generate_handler`, a command function, `src/protocol.ts` edits or plugin calls. Keep only scoped `#[cfg_attr(not(test), allow(dead_code))]` annotations required until Task 5 consumes the interfaces; Task 5 must remove them.
+
+Extend the existing security-probe smoke rather than adding a second script. Add an optional app-data parameter whose default exactly follows the production identifier:
+
+```powershell
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory)]
+  [string] $Executable,
+
+  [string] $AppDataDir = (Join-Path `
+    [Environment]::GetFolderPath('ApplicationData') `
+    'com.uipilot.launcher')
+)
+```
+
+Before launching the supplied executable and after it exits 73, snapshot every file in that directory whose name matches `settings.json*`, `validation-data.json*` or `open-session.json*`. Each sorted entry contains only relative name, length, SHA-256 and `LastWriteTimeUtc.Ticks`; serialize the array with `ConvertTo-Json -Compress`. If before/after strings differ, throw `security probe modified protected app data`. This must catch new/deleted current, backup, temp and invalid siblings. Existing executable validation, timeout and exact exit-73 assertions remain unchanged.
+
+Add this exact helper and call `$before = Get-ProtectedAppDataSnapshot $AppDataDir` immediately before `Start-Process`:
+
+```powershell
+function Get-ProtectedAppDataSnapshot([string] $Root) {
+  $patterns = @(
+    'settings.json*',
+    'validation-data.json*',
+    'open-session.json*'
+  )
+  $entries = @()
+  if (Test-Path -LiteralPath $Root) {
+    $entries = @(
+      Get-ChildItem -LiteralPath $Root -File | Where-Object {
+        $name = $_.Name
+        @($patterns | Where-Object { $name -like $_ }).Count -ne 0
+      } | Sort-Object Name | ForEach-Object {
+        [pscustomobject]@{
+          Name = $_.Name
+          Length = $_.Length
+          Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+          LastWriteTicks = $_.LastWriteTimeUtc.Ticks
+        }
+      }
+    )
+  }
+  ConvertTo-Json -Compress -Depth 3 -InputObject @($entries)
+}
+
+```
+
+Insert `$before = Get-ProtectedAppDataSnapshot $AppDataDir` immediately before the existing `Start-Process`. At the end of its existing `finally`, after the conditional `Stop-Process`, add the comparison so timeout, wrong exit and success paths all verify app-data immutability:
+
+```powershell
+$after = Get-ProtectedAppDataSnapshot $AppDataDir
+if ($before -cne $after) {
+  throw 'security probe modified protected app data'
+}
+```
 
 - [ ] **Step 4: Run the Task 4A completion gate**
 
 ```powershell
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml --all-features
 cargo test --manifest-path src-tauri/Cargo.toml atomic_file
 cargo test --manifest-path src-tauri/Cargo.toml settings
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 npm run build
 powershell -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+$probeExe = & .\scripts\build-security-probe.ps1 | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0 -or -not $probeExe) { throw "security probe build failed" }
+& .\scripts\test-security-probe.ps1 -Executable $probeExe
+if ($LASTEXITCODE -ne 0) { throw "security probe smoke failed" }
+
+$baseline = git rev-parse --verify refs/tags/foundation-task-4-approved-plan
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline tag missing" }
+git merge-base --is-ancestor $baseline HEAD
+if ($LASTEXITCODE -ne 0) { throw "approved plan baseline is not an ancestor" }
+$allowed = @(
+  'scripts/test-security-probe.ps1',
+  'src-tauri/src/atomic_file.rs',
+  'src-tauri/src/lib.rs',
+  'src-tauri/src/settings.rs'
+)
+$changed = @(
+  git diff --name-only "$baseline..HEAD"
+  git diff --name-only
+  git diff --cached --name-only
+  git ls-files --others --exclude-standard
+) | Where-Object { $_ } | Sort-Object -Unique
+$unexpected = @($changed | Where-Object { $_ -notin $allowed })
+if ($unexpected.Count -ne 0) {
+  throw "Task 4A scope violation: $($unexpected -join ', ')"
+}
 git diff --check
 ```
 
-Expected: all Rust tests pass; formatting, Clippy, frontend production build, security check and diff check exit 0. `git diff --name-only` contains no capability, Tauri command, `src/protocol.ts` or Task 5 action file.
+Expected: all default/all-features Rust gates, frontend production build, security allowlist/negative fixtures, the exact probe artifact smoke, executable baseline/worktree scope assertion and diff check exit 0. Probe smoke proves settings, validation-data and marker families are unchanged.
 
 - [ ] **Step 5: Commit Task 3**
 
 ```powershell
-git add src-tauri/src/lib.rs
+git add scripts/test-security-probe.ps1 src-tauri/src/lib.rs
 git commit -m "feat: manage the settings store"
 ```
 
