@@ -1,3 +1,9 @@
+// ponytail: Task 2 defines the protocol before Task 5 wires commands; remove these allows then.
+#[cfg_attr(not(test), allow(dead_code))]
+mod model;
+#[cfg_attr(not(test), allow(dead_code))]
+mod result_registry;
+
 #[cfg(feature = "test-instrumentation")]
 mod security_probe;
 
