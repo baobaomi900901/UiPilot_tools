@@ -22,7 +22,6 @@ Task 4A 创建一个可由 Task 4B 和 Task 4C 复用的 crate-private 原子字
 src-tauri/src/atomic_file.rs
 src-tauri/src/settings.rs
 src-tauri/src/lib.rs
-src/protocol.ts
 ```
 
 Tauri application data directory 由 Rust 在 setup 阶段通过应用句柄获取。生产代码固定构造 `settings.json`、`settings.json.backup` 和同目录临时文件；TypeScript 不提供目录、文件名或完整路径。
@@ -64,6 +63,8 @@ pub(crate) struct SettingsStore {
 默认值固定为 `Alt+Space`、autostart 关闭、无 research ID、空 aliases 和空 `useCounts`。
 
 `SettingsUpdate` 永远不包含 `useCounts`。普通设置保存从锁内当前值克隆 candidate，只覆盖用户可编辑字段并保留全部 `useCounts`。因此前端 DTO 缺少计数字段不能清空最近使用次数。
+
+research ID 只允许 `None`，或长度为 1 到 64 字节且每个字节都是 ASCII 字母、数字、`-`、`_` 的字符串。不 trim、不转换大小写，也不接受空串、空白、非 ASCII 或超长值。current/backup 加载和 `SettingsUpdate` 使用同一个标准库验证函数：文件中的非法值使该文件整体无效并进入既有隔离/恢复流程；更新中的非法值使整个更新失败且内存、current、backup 均不改变。`research_id()` 因此只返回 `None` 或已验证的非空 ID。
 
 ## `appId` 与别名更新
 
@@ -163,8 +164,8 @@ Task 4A 进入 TDD 前，实施计划至少覆盖：
 5. 两个并发 use-count 增量最终得到 2，内存与 current 一致。
 6. backup/current 每个 I/O 阶段的失败注入及固定状态矩阵。
 7. 从 defaults 或 backup 恢复后的首次保存把 `current_is_valid` 设为 true；第二次保存生成包含首次保存值的 backup。
-8. TypeScript DTO 和序列化输出不包含 `useCounts`、路径或动作。
-9. 生产代码不注册命令、不修改 invoke handler，也不调用快捷键或 autostart 插件。
+8. research ID 的 1/64 字节边界、允许字符，以及空串、空白、非 ASCII、65 字节值在加载和更新路径上统一拒绝。
+9. Task 4A 不修改 `src/protocol.ts`；生产代码不注册命令、不修改 invoke handler，也不调用快捷键或 autostart 插件。
 
 ## 非目标与后续所有权
 
