@@ -653,6 +653,8 @@ git commit -m "fix: close security gate bypasses"
 
 ## Task 2: Lock the Result Protocol Behind a Rust Registry
 
+**Design:** `docs/superpowers/specs/2026-07-18-result-registry-contract-design.md`
+
 **Files:**
 - Create: `src-tauri/src/model.rs`
 - Create: `src-tauri/src/result_registry.rs`
@@ -663,13 +665,16 @@ git commit -m "fix: close security gate bypasses"
 
 Add tests that prove:
 
-1. Publishing the latest token assigns an opaque `requestId` and stable per-set `resultId` values.
-2. A valid `(requestId, resultId)` resolves to a Rust-owned action.
+1. Publishing the latest token replaces a caller-supplied fake `resultId`, assigns an opaque `requestId`, and assigns unique stable per-set `resultId` values.
+2. A valid `(requestId, resultId)` resolves to a Rust-owned action, while serialized JSON contains no action, application ID, shortcut or executable path.
 3. Query 1 begins, query 2 begins and publishes, then query 1 finishes: query 1 returns `None` and query 2 remains executable.
 4. Query 2 reaches Rust before query 1: `begin_query(1)` returns `None` and cannot do work or publish.
-5. A query begins, the window hides, then the query finishes: it cannot repopulate the registry.
-6. An old invocation's IPC reaches Rust after a new show: its matching sequence is rejected by `invocationId`.
-7. Unknown and stale IDs fail without exposing a path.
+5. A published result becomes stale immediately after the next valid `begin_query`, before the next result publishes.
+6. A query begins, the window hides, then the query finishes: it cannot repopulate the registry.
+7. An old invocation's IPC reaches Rust after a new show: its matching sequence is rejected by `invocationId` without clearing the new invocation's current result.
+8. Unknown and stale IDs return fixed `RegistryError` values whose display text contains no ID or path.
+9. Serialization uses `requestId` and `resultId`, has no `kind` or action field, and omits absent `subtitle` and `icon`.
+10. An invalid or stale token returns `None` before ID allocation, consumes no counter values, and cannot partially replace `current`.
 
 Use this public contract in the test:
 
@@ -713,6 +718,8 @@ impl ResultRegistry {
 }
 ```
 
+Construct `ResultRegistry` through `Default`. `begin_query` clears `current` only after active generation, invocation and strictly increasing sequence validation succeeds; rejected queries leave all state unchanged.
+
 - [ ] **Step 2: Run the Rust tests and confirm failure**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml result_registry`
@@ -735,23 +742,23 @@ pub(crate) struct SearchResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResultItem {
     pub(crate) result_id: String,
-    pub(crate) kind: ResultKind,
     pub(crate) title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subtitle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) icon: Option<String>,
 }
 ```
 
-The private `ResultAction` map must remain non-serializable. Convert the standard-library atomic counter to fixed-format opaque strings such as `req-0000000000000001` and `item-0000000000000001`; the identifiers may encode uniqueness but no business target. Do not add UUID, database, cache, or async-runtime dependencies.
+The private `ResultAction` map must remain non-serializable. `RegistryError` has only `StaleRequest` and `UnknownResult`, with fixed display text that includes no IDs or paths. Convert the standard-library atomic counter to fixed-format opaque strings using `req-{value:016x}` and `item-{value:016x}`; the identifiers may encode uniqueness but no business target.
+
+`publish_if_latest` must acquire `state` once and keep that same `Mutex` guard through token validation, ID allocation, action-map construction and `current` replacement. It validates before the first `next_id` operation. An invalid token returns `None` without allocating an ID or changing state. Do not add UUID, database, cache, async-runtime or test-hook dependencies.
 
 - [ ] **Step 4: Mirror only DTOs in TypeScript**
 
 ```ts
-export type ResultKind = 'application' | 'file' | 'status'
-
 export interface ResultItem {
   resultId: string
-  kind: ResultKind
   title: string
   subtitle?: string
   icon?: string
