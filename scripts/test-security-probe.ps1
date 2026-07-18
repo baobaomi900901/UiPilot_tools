@@ -17,9 +17,10 @@ function Get-ProtectedAppDataSnapshot([string] $Root) {
     'open-session.json*'
   )
   $entries = @()
-  if (Test-Path -LiteralPath $Root) {
+  $rootExists = Test-Path -LiteralPath $Root -PathType Container
+  if ($rootExists) {
     $entries = @(
-      Get-ChildItem -LiteralPath $Root -File | Where-Object {
+      Get-ChildItem -LiteralPath $Root -Force -File | Where-Object {
         $name = $_.Name
         @($patterns | Where-Object { $name -like $_ }).Count -ne 0
       } | Sort-Object Name | ForEach-Object {
@@ -32,7 +33,37 @@ function Get-ProtectedAppDataSnapshot([string] $Root) {
       }
     )
   }
-  ConvertTo-Json -Compress -Depth 3 -InputObject @($entries)
+  ConvertTo-Json -Compress -Depth 3 -InputObject ([pscustomobject]@{
+    RootExists = $rootExists
+    Entries = @($entries)
+  })
+}
+
+function Test-ProtectedAppDataSnapshot {
+  $root = Join-Path `
+    -Path ([IO.Path]::GetTempPath()) `
+    -ChildPath "uipilot-probe-snapshot-$PID-$([Guid]::NewGuid().ToString('N'))"
+  try {
+    $missing = Get-ProtectedAppDataSnapshot $root
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $created = Get-ProtectedAppDataSnapshot $root
+    if ($missing -ceq $created) {
+      throw 'protected app data snapshot does not record root existence'
+    }
+
+    $hidden = Join-Path -Path $root -ChildPath 'settings.json.hidden-test'
+    [IO.File]::WriteAllText($hidden, 'hidden')
+    [IO.File]::SetAttributes($hidden, [IO.FileAttributes]::Hidden)
+    $withHidden = Get-ProtectedAppDataSnapshot $root
+    if ($created -ceq $withHidden) {
+      throw 'protected app data snapshot does not record hidden files'
+    }
+  }
+  finally {
+    if ([IO.Directory]::Exists($root)) {
+      [IO.Directory]::Delete($root, $true)
+    }
+  }
 }
 
 $executableUri = $null
@@ -43,6 +74,7 @@ if (
   throw 'Executable must be an absolute path'
 }
 $resolvedExecutable = (Resolve-Path -LiteralPath $Executable).Path
+Test-ProtectedAppDataSnapshot
 $before = Get-ProtectedAppDataSnapshot $AppDataDir
 $process = Start-Process -FilePath $resolvedExecutable -PassThru -WindowStyle Hidden
 

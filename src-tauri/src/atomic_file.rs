@@ -91,12 +91,24 @@ pub(crate) fn replace_without_backup(
     destination: &Path,
     candidate: &[u8],
 ) -> Result<(), AtomicFileError> {
+    replace_without_backup_with(destination, candidate, write_synced, replace_file)
+}
+
+fn replace_without_backup_with<W, R>(
+    destination: &Path,
+    candidate: &[u8],
+    mut write_synced: W,
+    mut replace: R,
+) -> Result<(), AtomicFileError>
+where
+    W: FnMut(&Path, &[u8]) -> io::Result<()>,
+    R: FnMut(&Path, &Path, MOVE_FILE_FLAGS) -> io::Result<()>,
+{
     let candidate_temp = sibling_temp(destination, "temp");
     if write_synced(&candidate_temp, candidate).is_err() {
-        remove_temp(&candidate_temp);
         return Err(AtomicFileError::CandidateWrite);
     }
-    if replace_file(&candidate_temp, destination, replace_flags()).is_err() {
+    if replace(&candidate_temp, destination, replace_flags()).is_err() {
         remove_temp(&candidate_temp);
         return Err(AtomicFileError::CurrentReplace);
     }
@@ -116,7 +128,6 @@ where
 {
     let candidate_temp = sibling_temp(paths.current(), "temp");
     if write_synced(&candidate_temp, candidate).is_err() {
-        remove_temp(&candidate_temp);
         return Err(AtomicFileError::CandidateWrite);
     }
 
@@ -124,7 +135,6 @@ where
     if let (Some(previous), Some(backup_temp)) = (previous, backup_temp.as_deref()) {
         if write_synced(backup_temp, previous).is_err() {
             remove_temp(&candidate_temp);
-            remove_temp(backup_temp);
             return Err(AtomicFileError::BackupWrite);
         }
         if replace(backup_temp, paths.backup(), replace_flags()).is_err() {
@@ -158,10 +168,12 @@ fn sibling_temp(destination: &Path, label: &str) -> PathBuf {
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let result = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
-    Ok(())
+    if result.is_err() {
+        remove_temp(path);
+    }
+    result
 }
 
 fn replace_file(source: &Path, destination: &Path, flags: MOVE_FILE_FLAGS) -> io::Result<()> {
@@ -282,6 +294,32 @@ mod tests {
     }
 
     #[test]
+    fn candidate_create_new_collision_preserves_foreign_temp() {
+        let dir = TestDir::new("candidate-collision");
+        let paths = AtomicPaths::new(dir.path(), "settings.json");
+        let mut foreign_temp = None;
+
+        let error = commit_with(
+            &paths,
+            None,
+            b"candidate",
+            |path, bytes| {
+                fs::write(path, b"foreign-candidate")?;
+                foreign_temp = Some(path.to_path_buf());
+                write_synced(path, bytes)
+            },
+            |_source, _destination, _flags| panic!("replace must not run"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, AtomicFileError::CandidateWrite);
+        assert_eq!(
+            fs::read(foreign_temp.unwrap()).unwrap(),
+            b"foreign-candidate"
+        );
+    }
+
+    #[test]
     fn backup_temp_failure_preserves_disk_state() {
         let dir = TestDir::new("backup-write-failure");
         let paths = seeded_paths(&dir);
@@ -307,6 +345,41 @@ mod tests {
         assert_eq!(fs::read(paths.current()).unwrap(), b"old-current");
         assert_eq!(fs::read(paths.backup()).unwrap(), b"older-backup");
         assert_only_current_and_backup(&paths);
+    }
+
+    #[test]
+    fn backup_create_new_collision_preserves_foreign_temp() {
+        let dir = TestDir::new("backup-collision");
+        let paths = AtomicPaths::new(dir.path(), "settings.json");
+        let mut writes = 0;
+        let mut owned_candidate = None;
+        let mut foreign_backup = None;
+
+        let error = commit_with(
+            &paths,
+            Some(b"previous"),
+            b"candidate",
+            |path, bytes| {
+                writes += 1;
+                if writes == 1 {
+                    owned_candidate = Some(path.to_path_buf());
+                    write_synced(path, bytes)
+                } else {
+                    fs::write(path, b"foreign-backup")?;
+                    foreign_backup = Some(path.to_path_buf());
+                    write_synced(path, bytes)
+                }
+            },
+            |_source, _destination, _flags| panic!("replace must not run"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, AtomicFileError::BackupWrite);
+        assert!(!owned_candidate.unwrap().exists());
+        assert_eq!(
+            fs::read(foreign_backup.unwrap()).unwrap(),
+            b"foreign-backup"
+        );
     }
 
     #[test]
@@ -430,6 +503,32 @@ mod tests {
         assert_eq!(fs::read(paths.current()).unwrap(), b"new");
         assert!(!paths.backup().exists());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replace_without_backup_collision_preserves_foreign_temp() {
+        let dir = TestDir::new("replace-without-backup-collision");
+        let destination = dir.path().join("validation-data.json");
+        let mut foreign_temp = None;
+
+        let error = replace_without_backup_with(
+            &destination,
+            b"candidate",
+            |path, bytes| {
+                fs::write(path, b"foreign-replacement")?;
+                foreign_temp = Some(path.to_path_buf());
+                write_synced(path, bytes)
+            },
+            |_source, _destination, _flags| panic!("replace must not run"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, AtomicFileError::CandidateWrite);
+        assert_eq!(
+            fs::read(foreign_temp.unwrap()).unwrap(),
+            b"foreign-replacement"
+        );
+        assert!(!destination.exists());
     }
 
     #[test]
