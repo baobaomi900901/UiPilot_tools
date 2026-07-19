@@ -16,7 +16,9 @@ mod shortcut;
 mod windows_backend;
 
 pub(crate) use action::{execute_application, ApplicationActionOutcome};
-pub(crate) use cache::{start_initial_refresh, AppCache};
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+pub(crate) use cache::start_initial_refresh;
+pub(crate) use cache::AppCache;
 
 pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application> {
     rank::rank(applications, query)

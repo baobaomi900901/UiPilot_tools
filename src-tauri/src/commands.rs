@@ -858,14 +858,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_save_rejects_forged_or_unknown_ids_before_windows_seam() {
+    fn settings_save_rejects_forged_or_unknown_ids_without_state_change() {
         let dir = TestDir::new();
         let store = settings_store(&dir, Some("study_01"));
         let cache = AppCache::from_apps(settings_applications());
         let before = store.snapshot();
 
         for key in ["forged", APP_UNKNOWN] {
-            let windows_calls = Cell::new(0);
             let update = UserSettingsUpdate {
                 hotkey: "Alt+Space".into(),
                 autostart: false,
@@ -873,13 +872,10 @@ mod tests {
                 aliases: BTreeMap::from([(key.into(), vec!["bad".into()])]),
             };
             assert_eq!(
-                save_settings_core(update, &store, &cache).map(|()| {
-                    windows_calls.set(windows_calls.get() + 1);
-                }),
+                save_settings_core(update, &store, &cache),
                 Err(CommandError::settings_failed())
             );
             assert_eq!(store.snapshot(), before);
-            assert_eq!(windows_calls.get(), 0);
         }
     }
 

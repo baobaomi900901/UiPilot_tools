@@ -71,6 +71,10 @@ impl Default for ResultRegistry {
 }
 
 impl ResultRegistry {
+    #[cfg_attr(
+        all(not(test), not(feature = "test-instrumentation")),
+        allow(dead_code)
+    )]
     pub(crate) fn on_show(&self, invocation_id: String) {
         let mut state = self.state.lock().expect("result registry lock poisoned");
         state.generation = state

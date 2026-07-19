@@ -1,38 +1,37 @@
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 use std::sync::Arc;
 
-#[cfg(not(feature = "test-instrumentation"))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 use tauri::Manager;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod atomic_file;
 
-#[cfg(not(feature = "test-instrumentation"))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod commands;
 
-#[cfg_attr(
-    any(not(test), feature = "test-instrumentation"),
-    allow(dead_code, unused_imports)
-)]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod apps;
-// ponytail: Task 2 defines the protocol before Task 5 wires commands; remove these allows then.
-#[cfg_attr(not(test), allow(dead_code))]
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod model;
-#[cfg_attr(not(test), allow(dead_code))]
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod result_registry;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod session_marker;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod settings;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod validation_data;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod validation_export;
 
-#[cfg(feature = "test-instrumentation")]
+#[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -52,15 +51,17 @@ fn load_and_open_validation_store(
 }
 
 pub fn run() {
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
     let app_cache = Arc::new(apps::AppCache::new());
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::Builder::new().build())
-        .manage(Arc::clone(&app_cache));
+        .plugin(tauri_plugin_autostart::Builder::new().build());
 
-    #[cfg(not(feature = "test-instrumentation"))]
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
     let builder = builder
+        .manage(Arc::clone(&app_cache))
         .manage(result_registry::ResultRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
@@ -73,15 +74,15 @@ pub fn run() {
             commands::hide_launcher,
         ]);
 
-    #[cfg(feature = "test-instrumentation")]
+    #[cfg(all(not(test), feature = "test-instrumentation"))]
     let builder = builder.invoke_handler(tauri::generate_handler![security_probe::load_settings]);
 
     builder
         .setup(move |_app| {
-            #[cfg(feature = "test-instrumentation")]
+            #[cfg(all(not(test), feature = "test-instrumentation"))]
             security_probe::setup(_app)?;
 
-            #[cfg(not(feature = "test-instrumentation"))]
+            #[cfg(any(test, not(feature = "test-instrumentation")))]
             {
                 let app_data_dir = _app.path().app_data_dir()?;
                 let settings = load_settings_store(&app_data_dir)?;
@@ -89,9 +90,9 @@ pub fn run() {
 
                 let validation = load_and_open_validation_store(&app_data_dir)?;
                 assert!(_app.manage(validation), "validation store already managed");
-            }
 
-            let _ = apps::start_initial_refresh(Arc::clone(&app_cache))?;
+                let _ = apps::start_initial_refresh(Arc::clone(&app_cache))?;
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -174,17 +175,21 @@ mod tests {
     fn production_commands_are_exact_and_feature_handler_stays_probe_only() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let production_marker = [
-            "#[cfg(not(feature = ",
+            "#[cfg(any(test, not(feature = ",
             "\"test-instrumentation\"",
-            "))]\n    let builder = builder",
+            ")))]\n    let builder = builder",
         ]
         .concat();
         let production_start = source
             .find(&production_marker)
             .expect("production handler cfg is missing");
         let production = &source[production_start..];
-        let feature_marker =
-            ["\n\n    #[cfg(feature = ", "\"test-instrumentation\"", ")]"].concat();
+        let feature_marker = [
+            "\n\n    #[cfg(all(not(test), feature = ",
+            "\"test-instrumentation\"",
+            "))]",
+        ]
+        .concat();
         let production_end = production
             .find(&feature_marker)
             .expect("production handler block is not narrow");
@@ -211,13 +216,82 @@ mod tests {
         );
 
         let probe_handler = [
-            "#[cfg(feature = ",
+            "#[cfg(all(not(test), feature = ",
             "\"test-instrumentation\"",
-            ")]\n    let builder = builder.invoke_handler(tauri::generate_handler![",
+            "))]\n    let builder = builder.invoke_handler(tauri::generate_handler![",
             "security_probe::load_settings",
             "]);",
         ]
         .concat();
         assert!(source.contains(&probe_handler));
+        assert!(source.contains(
+            "#[cfg(all(not(test), feature = \"test-instrumentation\"))]\nmod security_probe;"
+        ));
+    }
+
+    #[test]
+    fn production_modules_use_only_exact_task6_item_lint_exceptions() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let product_cfg = "#[cfg(any(test, not(feature = \"test-instrumentation\")))]";
+        for module in [
+            "atomic_file",
+            "apps",
+            "commands",
+            "model",
+            "result_registry",
+            "session_marker",
+            "settings",
+            "validation_data",
+            "validation_export",
+        ] {
+            assert!(
+                source.contains(&format!("{product_cfg}\nmod {module};")),
+                "product module has the wrong cfg: {module}"
+            );
+        }
+
+        let allow_prefix = ["allow", "("].concat();
+        assert!(!source.contains(&allow_prefix));
+
+        let top_level_item_allow = [
+            "#[cfg_attr(\n    all(not(test), not(feature = \"test-instrumentation\")),\n    ",
+            "allow",
+            "(",
+            "dead_code",
+            ")\n)]",
+        ]
+        .concat();
+        let nested_item_allow = [
+            "#[cfg_attr(\n        all(not(test), not(feature = \"test-instrumentation\")),\n        ",
+            "allow",
+            "(",
+            "dead_code",
+            ")\n    )]",
+        ]
+        .concat();
+        let result_registry = include_str!("result_registry.rs").replace("\r\n", "\n");
+        let session_marker = include_str!("session_marker.rs").replace("\r\n", "\n");
+        let validation_data = include_str!("validation_data.rs").replace("\r\n", "\n");
+
+        assert!(
+            result_registry.contains(&format!("{nested_item_allow}\n    pub(crate) fn on_show"))
+        );
+        assert!(session_marker.contains(&format!(
+            "{top_level_item_allow}\npub(crate) fn read_marker_for_clean"
+        )));
+        for item in [
+            "    LauncherInvoked,",
+            "    SessionOwnershipLost,",
+            "    pub(crate) fn mark_clean_exit",
+            "    fn mark_clean_exit_with",
+        ] {
+            assert!(
+                validation_data.contains(&format!("{nested_item_allow}\n{item}")),
+                "missing exact Task 6 item lint exception: {item}"
+            );
+        }
+        assert_eq!(result_registry.matches(&nested_item_allow).count(), 1);
+        assert_eq!(session_marker.matches(&top_level_item_allow).count(), 1);
+        assert_eq!(validation_data.matches(&nested_item_allow).count(), 4);
     }
 }

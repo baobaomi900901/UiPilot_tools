@@ -46,6 +46,10 @@ pub(crate) fn load_marker_for_reconcile(
     }
 }
 
+#[cfg_attr(
+    all(not(test), not(feature = "test-instrumentation")),
+    allow(dead_code)
+)]
 pub(crate) fn read_marker_for_clean(path: &Path) -> Result<SessionMarker, ValidationError> {
     let bytes = read_optional(path)?.ok_or(ValidationError::SessionOwnershipLost)?;
     parse_marker(&bytes).ok_or(ValidationError::SessionOwnershipLost)
