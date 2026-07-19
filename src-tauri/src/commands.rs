@@ -6,9 +6,12 @@ use tauri::{State, WebviewWindow};
 use crate::{
     apps::{self, AppCache, Application},
     model::SearchResponse,
-    result_registry::ResultRegistry,
+    result_registry::{RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsStore, SettingsUpdate},
+    validation_data::{ValidationEvent, ValidationStore},
 };
+
+const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +29,15 @@ pub(crate) struct CommandError {
     message: &'static str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum ExecuteOutcome {
+    LaunchRequested,
+    ActivationRequested,
+    ActivationRefusedLaunchRequested { message: &'static str },
+}
+
 impl CommandError {
     fn invalid_caller() -> Self {
         Self {
@@ -38,6 +50,41 @@ impl CommandError {
         Self {
             code: "settingsFailed",
             message: "settings operation failed",
+        }
+    }
+
+    fn stale_request() -> Self {
+        Self {
+            code: "staleRequest",
+            message: "result request is stale",
+        }
+    }
+
+    fn unknown_result() -> Self {
+        Self {
+            code: "unknownResult",
+            message: "result is unknown",
+        }
+    }
+
+    fn application_entry_unavailable() -> Self {
+        Self {
+            code: "applicationEntryUnavailable",
+            message: "application entry is unavailable; rescan applications",
+        }
+    }
+
+    fn validation_failed() -> Self {
+        Self {
+            code: "validationFailed",
+            message: "validation data operation failed",
+        }
+    }
+
+    fn window_failed() -> Self {
+        Self {
+            code: "windowFailed",
+            message: "launcher window operation failed",
         }
     }
 }
@@ -154,9 +201,94 @@ fn save_settings_core(
         .map_err(|_| CommandError::settings_failed())
 }
 
+#[tauri::command]
+pub(crate) fn execute_result(
+    window: WebviewWindow,
+    registry: State<'_, ResultRegistry>,
+    validation: State<'_, ValidationStore>,
+    settings: State<'_, SettingsStore>,
+    cache: State<'_, Arc<AppCache>>,
+    request_id: String,
+    result_id: String,
+) -> Result<ExecuteOutcome, CommandError> {
+    require_main_window(&window)?;
+    execute_result_with(
+        (&request_id, &result_id),
+        |request_id, result_id| registry.resolve(request_id, result_id),
+        |action| apps::execute_application(action).map_err(|_| ()),
+        || registry.hide_and_clear(),
+        |event| validation.record(event).map_err(|_| ()),
+        |app_id| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
+        || window.hide().map_err(|_| ()),
+    )
+}
+
+fn execute_result_with<R, A, I, V, S, H>(
+    ids: (&str, &str),
+    resolve: R,
+    execute: A,
+    invalidate: I,
+    record: V,
+    increment: S,
+    hide: H,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
+    A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    I: FnOnce(),
+    V: FnOnce(ValidationEvent) -> Result<(), ()>,
+    S: FnOnce(&str) -> Result<(), ()>,
+    H: FnOnce() -> Result<(), ()>,
+{
+    let (request_id, result_id) = ids;
+    let action = resolve(request_id, result_id).map_err(|error| match error {
+        RegistryError::StaleRequest => CommandError::stale_request(),
+        RegistryError::UnknownResult => CommandError::unknown_result(),
+    })?;
+    let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
+    let app_id = match &action {
+        ResultAction::LaunchApplication { app_id, .. } => app_id.as_str(),
+    };
+    let (response, event) = outcome_parts(outcome);
+
+    invalidate();
+    let mut first_error = None;
+    if record(event).is_err() {
+        first_error = Some(CommandError::validation_failed());
+    }
+    if increment(app_id).is_err() && first_error.is_none() {
+        first_error = Some(CommandError::settings_failed());
+    }
+    if hide().is_err() && first_error.is_none() {
+        first_error = Some(CommandError::window_failed());
+    }
+
+    first_error.map_or(Ok(response), Err)
+}
+
+fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> (ExecuteOutcome, ValidationEvent) {
+    match outcome {
+        apps::ApplicationActionOutcome::LaunchRequested => (
+            ExecuteOutcome::LaunchRequested,
+            ValidationEvent::LaunchRequested,
+        ),
+        apps::ApplicationActionOutcome::ActivationRequested => (
+            ExecuteOutcome::ActivationRequested,
+            ValidationEvent::ActivationRequested,
+        ),
+        apps::ApplicationActionOutcome::ActivationRefusedLaunchRequested => (
+            ExecuteOutcome::ActivationRefusedLaunchRequested {
+                message: ACTIVATION_REFUSED_MESSAGE,
+            },
+            ValidationEvent::ActivationRefusedLaunchRequested,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Cell, RefCell},
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
@@ -164,13 +296,14 @@ mod tests {
     };
 
     use super::{
-        load_settings_core, require_main_label, save_settings_core, search_apps_with, CommandError,
-        UserSettings,
+        execute_result_with, load_settings_core, require_main_label, save_settings_core,
+        search_apps_with, CommandError, ExecuteOutcome, UserSettings,
     };
     use crate::{
-        apps::{AppCache, Application},
-        result_registry::ResultRegistry,
+        apps::{AppCache, Application, ApplicationActionOutcome},
+        result_registry::{RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore},
+        validation_data::ValidationEvent,
     };
 
     const APP_CURRENT: &str =
@@ -227,6 +360,14 @@ mod tests {
             icon: None,
             aliases: Vec::new(),
             use_count: 0,
+        }
+    }
+
+    fn trusted_action() -> ResultAction {
+        ResultAction::LaunchApplication {
+            app_id: APP_CURRENT.into(),
+            shortcut: PathBuf::from(r"C:\Private\Current.lnk"),
+            executable: Some(PathBuf::from(r"C:\Private\Current.exe")),
         }
     }
 
@@ -408,5 +549,197 @@ mod tests {
             );
             assert_eq!(store.snapshot(), before);
         }
+    }
+
+    #[test]
+    fn execute_stale_or_unknown_result_stops_before_all_side_effects() {
+        for registry_error in [RegistryError::StaleRequest, RegistryError::UnknownResult] {
+            let side_effects = Cell::new(0);
+            let result = execute_result_with(
+                ("request", "result"),
+                |request_id, result_id| {
+                    assert_eq!(request_id, "request");
+                    assert_eq!(result_id, "result");
+                    Err(registry_error)
+                },
+                |_| {
+                    side_effects.set(side_effects.get() + 1);
+                    unreachable!()
+                },
+                || side_effects.set(side_effects.get() + 1),
+                |_| {
+                    side_effects.set(side_effects.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    side_effects.set(side_effects.get() + 1);
+                    Ok(())
+                },
+                || {
+                    side_effects.set(side_effects.get() + 1);
+                    Ok(())
+                },
+            );
+
+            let expected = match registry_error {
+                RegistryError::StaleRequest => CommandError::stale_request(),
+                RegistryError::UnknownResult => CommandError::unknown_result(),
+            };
+            assert_eq!(result, Err(expected));
+            assert_eq!(side_effects.get(), 0);
+        }
+    }
+
+    #[test]
+    fn execute_success_invalidates_then_persists_and_hides_in_order() {
+        let cases = [
+            (
+                ApplicationActionOutcome::LaunchRequested,
+                ExecuteOutcome::LaunchRequested,
+                ValidationEvent::LaunchRequested,
+            ),
+            (
+                ApplicationActionOutcome::ActivationRequested,
+                ExecuteOutcome::ActivationRequested,
+                ValidationEvent::ActivationRequested,
+            ),
+            (
+                ApplicationActionOutcome::ActivationRefusedLaunchRequested,
+                ExecuteOutcome::ActivationRefusedLaunchRequested {
+                    message: "Windows 拒绝了前台切换，已发送启动请求",
+                },
+                ValidationEvent::ActivationRefusedLaunchRequested,
+            ),
+        ];
+
+        for (action_outcome, expected_outcome, expected_event) in cases {
+            let trace = RefCell::new(Vec::new());
+            let actual_event = Cell::new(None);
+            let result = execute_result_with(
+                ("request", "result"),
+                |_, _| {
+                    trace.borrow_mut().push("resolve");
+                    Ok(trusted_action())
+                },
+                |_| {
+                    trace.borrow_mut().push("system-action");
+                    Ok(action_outcome)
+                },
+                || trace.borrow_mut().push("registry-hide-and-clear"),
+                |event| {
+                    trace.borrow_mut().push("validation-record");
+                    actual_event.set(Some(event));
+                    Ok(())
+                },
+                |app_id| {
+                    trace.borrow_mut().push("settings-increment");
+                    assert_eq!(app_id, APP_CURRENT);
+                    Ok(())
+                },
+                || {
+                    trace.borrow_mut().push("window-hide");
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Ok(expected_outcome));
+            assert_eq!(actual_event.get(), Some(expected_event));
+            assert_eq!(
+                *trace.borrow(),
+                [
+                    "resolve",
+                    "system-action",
+                    "registry-hide-and-clear",
+                    "validation-record",
+                    "settings-increment",
+                    "window-hide",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn execute_returns_earliest_post_action_error_but_always_attempts_hide_once() {
+        let cases = [
+            (true, false, false, CommandError::validation_failed()),
+            (false, true, false, CommandError::settings_failed()),
+            (false, false, true, CommandError::window_failed()),
+            (true, true, true, CommandError::validation_failed()),
+            (false, true, true, CommandError::settings_failed()),
+        ];
+
+        for (validation_fails, settings_fails, hide_fails, expected) in cases {
+            let actions = Cell::new(0);
+            let invalidations = Cell::new(0);
+            let validations = Cell::new(0);
+            let increments = Cell::new(0);
+            let hides = Cell::new(0);
+            let result = execute_result_with(
+                ("request", "result"),
+                |_, _| Ok(trusted_action()),
+                |_| {
+                    actions.set(actions.get() + 1);
+                    Ok(ApplicationActionOutcome::LaunchRequested)
+                },
+                || invalidations.set(invalidations.get() + 1),
+                |_| {
+                    validations.set(validations.get() + 1);
+                    if validation_fails {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    increments.set(increments.get() + 1);
+                    if settings_fails {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    hides.set(hides.get() + 1);
+                    if hide_fails {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert_eq!(result, Err(expected));
+            assert_eq!(actions.get(), 1);
+            assert_eq!(invalidations.get(), 1);
+            assert_eq!(validations.get(), 1);
+            assert_eq!(increments.get(), 1);
+            assert_eq!(hides.get(), 1);
+        }
+    }
+
+    #[test]
+    fn execute_system_action_failure_preserves_registry_window_and_counts() {
+        let later_calls = Cell::new(0);
+        let result = execute_result_with(
+            ("request", "result"),
+            |_, _| Ok(trusted_action()),
+            |_| Err(()),
+            || later_calls.set(later_calls.get() + 1),
+            |_| {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(CommandError::application_entry_unavailable()));
+        assert_eq!(later_calls.get(), 0);
     }
 }
