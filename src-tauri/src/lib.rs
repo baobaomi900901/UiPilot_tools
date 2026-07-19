@@ -148,12 +148,31 @@ mod tests {
         let approved_task6 =
             "#[cfg_attr(all(not(test),not(feature=\"test-instrumentation\")),allow(dead_code))]";
         let test_only = "#[cfg_attr(test,allow(dead_code))]";
-        let unapproved = compact.replace(approved_task6, "").replace(test_only, "");
+        let enum_variant_names = "#[allow(clippy::enum_variant_names)]";
+        let unapproved = compact
+            .replace(approved_task6, "")
+            .replace(test_only, "")
+            .replace(enum_variant_names, "");
+        let has_directive = |keyword: &str| {
+            unapproved.match_indices(keyword).any(|(index, _)| {
+                let previous = unapproved[..index].chars().next_back();
+                let has_boundary = !matches!(
+                    previous,
+                    Some(character)
+                        if character.is_ascii_alphanumeric()
+                            || character == '_'
+                            || character == '.'
+                );
+                let next = unapproved[index + keyword.len()..].chars().next();
+                let has_next_boundary = !matches!(
+                    next,
+                    Some(character) if character.is_ascii_alphanumeric() || character == '_'
+                );
+                has_boundary && has_next_boundary
+            })
+        };
 
-        unapproved.contains("allow")
-            && (unapproved.contains("dead_code")
-                || unapproved.contains("unused")
-                || unapproved.contains("warnings"))
+        has_directive("allow") || has_directive("expect")
     }
 
     #[test]
@@ -252,6 +271,10 @@ mod tests {
             ["#![", "allow /*gap*/ (", "dead_code", ")]"].concat(),
             ["#![", "allow(", "unused", ")]"].concat(),
             ["#![", "allow(", "warnings", ")]"].concat(),
+            ["#[", "allow(", "clippy::all", ")] enum Broad {}"].concat(),
+            ["#[", "allow(", "nonstandard_style", ")] struct Broad;"].concat(),
+            ["#[", "expect(", "dead_code", ")] fn expected() {}"].concat(),
+            "macro_rules! linted { ($level:ident, $lint:ident, $item:item) => { #[$level($lint)] $item }; } linted!(allow, dead_code, fn unused() {});".into(),
             ["#![cfg_attr(not(test), ", "allow(", "unused_imports", "))]"].concat(),
             ["#[", "allow(", "dead_code", ")] mod nested;"].concat(),
             ["#[", "allow(", "dead_code", ")] fn unapproved() {}"].concat(),
@@ -330,13 +353,16 @@ mod tests {
         let result_registry = include_str!("result_registry.rs").replace("\r\n", "\n");
         let session_marker = include_str!("session_marker.rs").replace("\r\n", "\n");
         let validation_data = include_str!("validation_data.rs").replace("\r\n", "\n");
+        let commands = include_str!("commands.rs").replace("\r\n", "\n");
+        let action = include_str!("apps/action.rs").replace("\r\n", "\n");
+        let cache = include_str!("apps/cache.rs").replace("\r\n", "\n");
         let product_sources = [
             ("lib.rs", production_root),
             ("atomic_file.rs", include_str!("atomic_file.rs")),
-            ("commands.rs", include_str!("commands.rs")),
+            ("commands.rs", commands.as_str()),
             ("apps/mod.rs", include_str!("apps/mod.rs")),
-            ("apps/action.rs", include_str!("apps/action.rs")),
-            ("apps/cache.rs", include_str!("apps/cache.rs")),
+            ("apps/action.rs", action.as_str()),
+            ("apps/cache.rs", cache.as_str()),
             ("apps/discovery.rs", include_str!("apps/discovery.rs")),
             ("apps/rank.rs", include_str!("apps/rank.rs")),
             ("apps/shortcut.rs", include_str!("apps/shortcut.rs")),
@@ -366,6 +392,31 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(task6_exception_count, 6);
+
+        let enum_variant_allow = "#[allow(clippy::enum_variant_names)]";
+        assert_eq!(
+            product_sources
+                .iter()
+                .map(|(_, product_source)| product_source.matches(enum_variant_allow).count())
+                .sum::<usize>(),
+            2
+        );
+        assert!(commands.contains(&format!(
+            "{enum_variant_allow}\npub(crate) enum ExecuteOutcome"
+        )));
+        assert!(action.contains(&format!(
+            "{enum_variant_allow}\npub(crate) enum ApplicationActionOutcome"
+        )));
+
+        let test_only_allow = "#[cfg_attr(test, allow(dead_code))]";
+        assert_eq!(
+            product_sources
+                .iter()
+                .map(|(_, product_source)| product_source.matches(test_only_allow).count())
+                .sum::<usize>(),
+            1
+        );
+        assert!(cache.contains(&format!("{test_only_allow}\n    pub(crate) fn refresh")));
 
         assert!(
             result_registry.contains(&format!("{nested_item_allow}\n    pub(crate) fn on_show"))
