@@ -199,8 +199,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       </header>
       {!settings ? (
         <div className="settings-loading">
-          {snapshot.status ? null : <Spin size="small" />}
-          <Button onClick={() => void core.reloadSettings()}>重新加载设置</Button>
+          {snapshot.status ? <Button onClick={() => void core.reloadSettings()}>重新加载设置</Button> : <Spin size="small" />}
         </div>
       ) : (
         <Form component="div" layout="vertical" className="settings-form">

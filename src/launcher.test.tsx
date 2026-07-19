@@ -947,6 +947,33 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('shows only loading during startup hydration and enables retry after failure', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const initial = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(initial.promise).mockResolvedValueOnce(settingsFixture)
+    const core = createLauncherCore(fake.client)
+    const start = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+    fake.emit(shown('settings-loading', 'settings'))
+    const mounted = await mountLauncherView(core)
+    const retryButton = () =>
+      [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.includes('重新加载设置'))
+
+    expect(mounted.host.querySelector('.ant-spin-spinning')).toBeTruthy()
+    expect(retryButton()).toBeUndefined()
+
+    initial.reject({ code: 'settingsFailed', message: 'private' })
+    await act(async () => start)
+    expect(mounted.host.querySelector('.ant-spin-spinning')).toBeNull()
+    expect(retryButton()).toBeTruthy()
+
+    await act(async () => retryButton()!.click())
+    await vi.waitFor(() => expect(core.getSnapshot().settings).toBeDefined())
+    expect(fake.client.loadSettings).toHaveBeenCalledTimes(2)
+    await mounted.unmount()
+  })
+
   it('unbinds the native input before retiring its control and reports ready once', async () => {
     installMatchMedia(false)
     const cleanup: string[] = []
