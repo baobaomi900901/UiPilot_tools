@@ -6,7 +6,13 @@ use tauri::Manager;
 #[cfg_attr(not(test), allow(dead_code))]
 mod atomic_file;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(not(feature = "test-instrumentation"))]
+mod commands;
+
+#[cfg_attr(
+    any(not(test), feature = "test-instrumentation"),
+    allow(dead_code, unused_imports)
+)]
 mod apps;
 // ponytail: Task 2 defines the protocol before Task 5 wires commands; remove these allows then.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -52,6 +58,20 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .manage(Arc::clone(&app_cache));
+
+    #[cfg(not(feature = "test-instrumentation"))]
+    let builder = builder
+        .manage(result_registry::ResultRegistry::default())
+        .invoke_handler(tauri::generate_handler![
+            commands::search_apps,
+            commands::execute_result,
+            commands::load_settings,
+            commands::save_settings,
+            commands::rescan_apps,
+            commands::export_validation_data,
+            commands::clear_validation_data,
+            commands::hide_launcher,
+        ]);
 
     #[cfg(feature = "test-instrumentation")]
     let builder = builder.invoke_handler(tauri::generate_handler![security_probe::load_settings]);
@@ -148,5 +168,56 @@ mod tests {
         let _store = load_and_open_validation_store(dir.path()).unwrap();
 
         assert!(dir.path().join("open-session.json").exists());
+    }
+
+    #[test]
+    fn production_commands_are_exact_and_feature_handler_stays_probe_only() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production_marker = [
+            "#[cfg(not(feature = ",
+            "\"test-instrumentation\"",
+            "))]\n    let builder = builder",
+        ]
+        .concat();
+        let production_start = source
+            .find(&production_marker)
+            .expect("production handler cfg is missing");
+        let production = &source[production_start..];
+        let feature_marker =
+            ["\n\n    #[cfg(feature = ", "\"test-instrumentation\"", ")]"].concat();
+        let production_end = production
+            .find(&feature_marker)
+            .expect("production handler block is not narrow");
+        let production = &production[..production_end];
+
+        assert_eq!(production.matches("commands::").count(), 8);
+        for command in [
+            "search_apps",
+            "execute_result",
+            "load_settings",
+            "save_settings",
+            "rescan_apps",
+            "export_validation_data",
+            "clear_validation_data",
+            "hide_launcher",
+        ] {
+            assert!(production.contains(&format!("commands::{command}")));
+        }
+        assert_eq!(
+            production
+                .matches("manage(result_registry::ResultRegistry::default())")
+                .count(),
+            1
+        );
+
+        let probe_handler = [
+            "#[cfg(feature = ",
+            "\"test-instrumentation\"",
+            ")]\n    let builder = builder.invoke_handler(tauri::generate_handler![",
+            "security_probe::load_settings",
+            "]);",
+        ]
+        .concat();
+        assert!(source.contains(&probe_handler));
     }
 }
