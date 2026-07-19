@@ -131,6 +131,34 @@ impl ModalState {
         }
     }
 
+    fn claim_export(&mut self) -> Result<bool, FocusDecision> {
+        match self {
+            Self::Normal => {
+                *self = Self::Open;
+                Ok(false)
+            }
+            Self::Open => Err(FocusDecision::Suppress),
+            Self::AwaitingFocusRestore => {
+                *self = Self::Open;
+                Ok(true)
+            }
+        }
+    }
+
+    fn resolve_export_focus(&mut self, focused: Result<bool, ()>) -> Result<(), FocusDecision> {
+        match focused {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                *self = Self::Normal;
+                Err(FocusDecision::ClearAndHide)
+            }
+            Err(()) => {
+                *self = Self::Normal;
+                Err(FocusDecision::ReportWindowFailureAndHide)
+            }
+        }
+    }
+
     fn on_focus<F>(&mut self, focused: bool, query_focus: F) -> FocusDecision
     where
         F: FnOnce() -> Result<bool, ()>,
@@ -395,10 +423,18 @@ impl LifecycleCoordinator {
     where
         F: FnOnce() -> Result<bool, ()>,
     {
-        self.modal
+        let query_required = self
+            .modal
             .lock()
             .expect("modal lock poisoned")
-            .begin_export(query_focus)?;
+            .claim_export()?;
+        if query_required {
+            let focused = query_focus();
+            self.modal
+                .lock()
+                .expect("modal lock poisoned")
+                .resolve_export_focus(focused)?;
+        }
         Ok(ModalGuard {
             coordinator: Arc::clone(self),
         })
@@ -416,10 +452,16 @@ impl LifecycleCoordinator {
         app: &AppHandle,
         target: ShowTarget,
     ) -> Result<ShowOutcome, LifecycleError> {
-        let window = app
-            .get_webview_window("main")
-            .ok_or(LifecycleError::WindowFailed)?;
-        let registry = app.state::<ResultRegistry>();
+        let Some((window, registry)) = self.show_main_with_resolver(|| {
+            let window = app
+                .get_webview_window("main")
+                .ok_or(LifecycleError::WindowFailed)?;
+            let registry = app.state::<ResultRegistry>();
+            Ok((window, registry))
+        })?
+        else {
+            return Ok(ShowOutcome::Ignored);
+        };
 
         let mut center = || window.center().map_err(|_| ());
         let mut always_on_top = || window.set_always_on_top(true).map_err(|_| ());
@@ -456,6 +498,16 @@ impl LifecycleCoordinator {
             record_launcher: &mut record_launcher,
         };
         self.show_main_core(target, &mut operations)
+    }
+
+    fn show_main_with_resolver<T, R>(&self, resolve: R) -> Result<Option<T>, LifecycleError>
+    where
+        R: FnOnce() -> Result<T, LifecycleError>,
+    {
+        if self.observe_exit() != ExitState::Running {
+            return Ok(None);
+        }
+        resolve().map(Some)
     }
 
     fn show_main_core(
@@ -845,6 +897,27 @@ mod tests {
         }));
         assert!(query.is_err());
         assert_eq!(state, ModalState::Normal);
+
+        let coordinator = coordinator_for_test();
+        let first = coordinator.begin_modal_export(|| Ok(true)).unwrap();
+        drop(first);
+        let recovered = coordinator
+            .begin_modal_export(|| {
+                let lock = coordinator
+                    .modal
+                    .try_lock()
+                    .expect("focus query must run without the modal lock");
+                drop(lock);
+                assert_eq!(
+                    coordinator
+                        .begin_modal_export(|| panic!("Open must not query focus"))
+                        .unwrap_err(),
+                    FocusDecision::Suppress
+                );
+                Ok(true)
+            })
+            .unwrap();
+        drop(recovered);
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1101,16 +1174,21 @@ mod tests {
                 .expect("exit gate lock poisoned")
                 .state = state;
             let probe = ShowProbe::default();
+            let resolutions = Cell::new(0);
             assert_eq!(
-                run_show_case(
-                    &coordinator,
-                    ShowTarget::Launcher,
-                    1,
-                    ShowFailure::None,
-                    &probe,
-                ),
-                Ok(ShowOutcome::Ignored)
+                coordinator.show_main_with_resolver(|| {
+                    resolutions.set(resolutions.get() + 1);
+                    run_show_case(
+                        &coordinator,
+                        ShowTarget::Launcher,
+                        1,
+                        ShowFailure::None,
+                        &probe,
+                    )
+                }),
+                Ok(None)
             );
+            assert_eq!(resolutions.get(), 0);
             assert!(probe.trace.borrow().is_empty());
             assert_eq!(coordinator.next_invocation.load(Ordering::Relaxed), 0);
         }
