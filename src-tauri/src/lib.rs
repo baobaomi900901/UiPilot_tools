@@ -31,7 +31,8 @@ mod validation_data;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod validation_export;
 
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod lifecycle;
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
@@ -334,8 +335,19 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("test module marker is missing");
+        let approved_lifecycle_module_attr = concat!(
+            "#[cfg_attr(not(test), allow(dead_code))]\n",
+            "#[cfg(any(test, not(feature = \"test-instrumentation\")))]\n",
+            "mod lifecycle;",
+        );
+        let temporary_lifecycle_module_attr_count =
+            source.matches(approved_lifecycle_module_attr).count();
+        let production_root_without_lifecycle_exception =
+            production_root.replacen(approved_lifecycle_module_attr, "", 1);
+        assert_eq!(temporary_lifecycle_module_attr_count, 1);
+        assert!(production_root.contains(approved_lifecycle_module_attr));
         let allow_prefix = ["allow", "("].concat();
-        assert!(!production_root.contains(&allow_prefix));
+        assert!(!production_root_without_lifecycle_exception.contains(&allow_prefix));
 
         let top_level_item_allow = [
             "#[cfg_attr(\n    all(not(test), not(feature = \"test-instrumentation\")),\n    ",
@@ -360,7 +372,10 @@ mod tests {
         let action = include_str!("apps/action.rs").replace("\r\n", "\n");
         let cache = include_str!("apps/cache.rs").replace("\r\n", "\n");
         let product_sources = [
-            ("lib.rs", production_root),
+            (
+                "lib.rs",
+                production_root_without_lifecycle_exception.as_str(),
+            ),
             ("atomic_file.rs", include_str!("atomic_file.rs")),
             ("commands.rs", commands.as_str()),
             ("apps/mod.rs", include_str!("apps/mod.rs")),

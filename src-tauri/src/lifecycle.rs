@@ -1,12 +1,53 @@
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
     time::Instant,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShowTarget {
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::{
+    commands::clear_and_hide,
+    result_registry::ResultRegistry,
+    validation_data::{ValidationEvent, ValidationStore},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ShowTarget {
     Launcher,
     Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum LifecycleNotice {
+    SettingsFailed,
+    ValidationFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherShown {
+    invocation_id: String,
+    target: ShowTarget,
+    notice: Option<LifecycleNotice>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LifecycleError {
+    MainThreadDispatchFailed,
+    WindowFailed,
+    InvocationExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShowOutcome {
+    Shown,
+    Ignored,
 }
 
 #[derive(Debug, Default)]
@@ -53,7 +94,7 @@ enum ModalState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FocusDecision {
+pub(crate) enum FocusDecision {
     Suppress,
     ClearAndHide,
     ReportWindowFailureAndHide,
@@ -189,21 +230,51 @@ enum ReservationError {
 
 #[derive(Debug)]
 pub(crate) struct LifecycleCoordinator {
+    next_invocation: AtomicU64,
     readiness: Mutex<Readiness>,
     modal: Mutex<ModalState>,
     exit_gate: Mutex<ExitGate>,
     critical_changed: Condvar,
+    pending_notice: Mutex<Option<LifecycleNotice>>,
 }
 
 impl Default for LifecycleCoordinator {
     fn default() -> Self {
         Self {
+            next_invocation: AtomicU64::new(0),
             readiness: Mutex::new(Readiness::default()),
             modal: Mutex::new(ModalState::Normal),
             exit_gate: Mutex::new(ExitGate::default()),
             critical_changed: Condvar::new(),
+            pending_notice: Mutex::new(None),
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ModalGuard {
+    coordinator: Arc<LifecycleCoordinator>,
+}
+
+impl Drop for ModalGuard {
+    fn drop(&mut self) {
+        self.coordinator
+            .modal
+            .lock()
+            .expect("modal lock poisoned")
+            .finish_export();
+    }
+}
+
+struct ShowMainClosures<'a> {
+    center: &'a mut dyn FnMut() -> Result<(), ()>,
+    always_on_top: &'a mut dyn FnMut() -> Result<(), ()>,
+    show: &'a mut dyn FnMut() -> Result<(), ()>,
+    focus: &'a mut dyn FnMut() -> Result<(), ()>,
+    registry_on_show: &'a mut dyn FnMut(String),
+    emit: &'a mut dyn FnMut(&LauncherShown) -> Result<(), ()>,
+    clear_and_hide: &'a mut dyn FnMut(),
+    record_launcher: &'a mut dyn FnMut(CriticalReservation),
 }
 
 #[derive(Debug)]
@@ -235,6 +306,242 @@ impl Drop for CriticalReservation {
 }
 
 impl LifecycleCoordinator {
+    pub(crate) fn request_show(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        target: ShowTarget,
+    ) -> Result<(), LifecycleError> {
+        let dispatcher = app.clone();
+        let app_for_show = app.clone();
+        self.request_show_with(target, move |coordinator, target| {
+            dispatcher
+                .run_on_main_thread(move || {
+                    coordinator.handle_request_main(&app_for_show, target);
+                })
+                .map_err(|_| ())
+        })
+    }
+
+    pub(crate) fn mark_setup_ready(
+        self: &Arc<Self>,
+        app: &AppHandle,
+    ) -> Result<(), LifecycleError> {
+        self.mark_setup_ready_with(|target| self.show_main(app, target))
+    }
+
+    pub(crate) fn mark_frontend_ready(
+        self: &Arc<Self>,
+        app: &AppHandle,
+    ) -> Result<(), LifecycleError> {
+        self.mark_frontend_ready_with(|target| self.show_main(app, target))
+    }
+
+    fn request_show_with<D>(
+        self: &Arc<Self>,
+        target: ShowTarget,
+        dispatch: D,
+    ) -> Result<(), LifecycleError>
+    where
+        D: FnOnce(Arc<Self>, ShowTarget) -> Result<(), ()>,
+    {
+        dispatch(Arc::clone(self), target).map_err(|_| LifecycleError::MainThreadDispatchFailed)
+    }
+
+    fn handle_request_main(self: &Arc<Self>, app: &AppHandle, target: ShowTarget) {
+        let target = self
+            .readiness
+            .lock()
+            .expect("readiness lock poisoned")
+            .request(target);
+        if let Some(target) = target {
+            let _ = self.show_main(app, target);
+        }
+    }
+
+    fn mark_setup_ready_with<S>(&self, show: S) -> Result<(), LifecycleError>
+    where
+        S: FnOnce(ShowTarget) -> Result<ShowOutcome, LifecycleError>,
+    {
+        let target = self
+            .readiness
+            .lock()
+            .expect("readiness lock poisoned")
+            .mark_setup_ready();
+        if let Some(target) = target {
+            show(target)?;
+        }
+        Ok(())
+    }
+
+    fn mark_frontend_ready_with<S>(&self, show: S) -> Result<(), LifecycleError>
+    where
+        S: FnOnce(ShowTarget) -> Result<ShowOutcome, LifecycleError>,
+    {
+        let target = self
+            .readiness
+            .lock()
+            .expect("readiness lock poisoned")
+            .mark_frontend_ready();
+        if let Some(target) = target {
+            show(target)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_modal_export<F>(
+        self: &Arc<Self>,
+        query_focus: F,
+    ) -> Result<ModalGuard, FocusDecision>
+    where
+        F: FnOnce() -> Result<bool, ()>,
+    {
+        self.modal
+            .lock()
+            .expect("modal lock poisoned")
+            .begin_export(query_focus)?;
+        Ok(ModalGuard {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn on_successful_show(&self) {
+        self.modal
+            .lock()
+            .expect("modal lock poisoned")
+            .on_successful_show();
+    }
+
+    fn show_main(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        target: ShowTarget,
+    ) -> Result<ShowOutcome, LifecycleError> {
+        let window = app
+            .get_webview_window("main")
+            .ok_or(LifecycleError::WindowFailed)?;
+        let registry = app.state::<ResultRegistry>();
+
+        let mut center = || window.center().map_err(|_| ());
+        let mut always_on_top = || window.set_always_on_top(true).map_err(|_| ());
+        let mut show = || window.show().map_err(|_| ());
+        let mut focus = || window.set_focus().map_err(|_| ());
+        let mut registry_on_show = |invocation_id| registry.on_show(invocation_id);
+        let mut emit =
+            |payload: &LauncherShown| window.emit("launcher://shown", payload).map_err(|_| ());
+        let mut clear_window = || {
+            let _ = clear_and_hide(&registry, &window);
+        };
+        let app_for_record = app.clone();
+        let coordinator_for_record = Arc::clone(self);
+        let mut record_launcher = move |reservation| {
+            let app = app_for_record.clone();
+            let coordinator = Arc::clone(&coordinator_for_record);
+            drop(tauri::async_runtime::spawn_blocking(move || {
+                let _reservation = reservation;
+                let result = app
+                    .state::<ValidationStore>()
+                    .record(ValidationEvent::LauncherInvoked)
+                    .map_err(|_| ());
+                coordinator.finish_launcher_record(result);
+            }));
+        };
+        let mut operations = ShowMainClosures {
+            center: &mut center,
+            always_on_top: &mut always_on_top,
+            show: &mut show,
+            focus: &mut focus,
+            registry_on_show: &mut registry_on_show,
+            emit: &mut emit,
+            clear_and_hide: &mut clear_window,
+            record_launcher: &mut record_launcher,
+        };
+        self.show_main_core(target, &mut operations)
+    }
+
+    fn show_main_core(
+        self: &Arc<Self>,
+        target: ShowTarget,
+        operations: &mut ShowMainClosures<'_>,
+    ) -> Result<ShowOutcome, LifecycleError> {
+        if self.observe_exit() != ExitState::Running {
+            return Ok(ShowOutcome::Ignored);
+        }
+
+        let previous = self
+            .next_invocation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| LifecycleError::InvocationExhausted)?;
+        let invocation_id = format!("invocation-{}", previous + 1);
+
+        let _ = (operations.center)();
+        for operation in [
+            &mut operations.always_on_top,
+            &mut operations.show,
+            &mut operations.focus,
+        ] {
+            if operation().is_err() {
+                (operations.clear_and_hide)();
+                return Err(LifecycleError::WindowFailed);
+            }
+        }
+
+        (operations.registry_on_show)(invocation_id.clone());
+        let notice = *self
+            .pending_notice
+            .lock()
+            .expect("pending notice lock poisoned");
+        let payload = LauncherShown {
+            invocation_id,
+            target,
+            notice,
+        };
+        if (operations.emit)(&payload).is_err() {
+            (operations.clear_and_hide)();
+            return Err(LifecycleError::WindowFailed);
+        }
+        self.consume_notice(notice);
+        self.on_successful_show();
+
+        if target == ShowTarget::Launcher {
+            match self.reserve_critical() {
+                Ok(reservation) => (operations.record_launcher)(reservation),
+                Err(_) => self.set_notice_once(LifecycleNotice::ValidationFailed),
+            }
+        }
+        Ok(ShowOutcome::Shown)
+    }
+
+    fn finish_launcher_record(&self, result: Result<(), ()>) {
+        if result.is_err() {
+            self.set_notice_once(LifecycleNotice::ValidationFailed);
+        }
+    }
+
+    fn set_notice_once(&self, notice: LifecycleNotice) {
+        let mut pending = self
+            .pending_notice
+            .lock()
+            .expect("pending notice lock poisoned");
+        if pending.is_none() {
+            *pending = Some(notice);
+        }
+    }
+
+    fn consume_notice(&self, notice: Option<LifecycleNotice>) {
+        let Some(notice) = notice else {
+            return;
+        };
+        let mut pending = self
+            .pending_notice
+            .lock()
+            .expect("pending notice lock poisoned");
+        if *pending == Some(notice) {
+            *pending = None;
+        }
+    }
+
     fn reserve_critical(self: &Arc<Self>) -> Result<CriticalReservation, ReservationError> {
         let mut gate = self.exit_gate.lock().expect("exit gate lock poisoned");
         if gate.state != ExitState::Running {
@@ -356,14 +663,20 @@ impl LifecycleCoordinator {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::Cell,
+        cell::{Cell, RefCell},
         panic::{catch_unwind, AssertUnwindSafe},
-        sync::{Arc, Barrier},
+        sync::{atomic::Ordering, Arc, Barrier},
         thread,
         time::{Duration, Instant},
     };
 
     use super::*;
+    use crate::result_registry::ResultRegistry;
+
+    const _: fn(&Arc<LifecycleCoordinator>, &AppHandle, ShowTarget) -> Result<(), LifecycleError> =
+        LifecycleCoordinator::request_show;
+    const _: fn(&Arc<LifecycleCoordinator>, &AppHandle) -> Result<(), LifecycleError> =
+        LifecycleCoordinator::mark_setup_ready;
 
     #[derive(Clone, Copy)]
     enum ReadyOrder {
@@ -532,6 +845,380 @@ mod tests {
         }));
         assert!(query.is_err());
         assert_eq!(state, ModalState::Normal);
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ShowFailure {
+        None,
+        Center,
+        AlwaysOnTop,
+        Show,
+        Focus,
+        Emit,
+        Record,
+        PanicRecord,
+    }
+
+    #[derive(Default)]
+    struct ShowProbe {
+        trace: RefCell<Vec<String>>,
+        payloads: RefCell<Vec<LauncherShown>>,
+        clears: Cell<usize>,
+        records: Cell<usize>,
+    }
+
+    fn run_show_case(
+        coordinator: &Arc<LifecycleCoordinator>,
+        target: ShowTarget,
+        index: u64,
+        failure: ShowFailure,
+        probe: &ShowProbe,
+    ) -> Result<ShowOutcome, LifecycleError> {
+        let mut center = || {
+            probe.trace.borrow_mut().push(format!("invocation-{index}"));
+            probe.trace.borrow_mut().push(format!("center-{index}"));
+            (failure != ShowFailure::Center).then_some(()).ok_or(())
+        };
+        let mut always_on_top = || {
+            probe
+                .trace
+                .borrow_mut()
+                .push(format!("always-on-top-{index}"));
+            (failure != ShowFailure::AlwaysOnTop)
+                .then_some(())
+                .ok_or(())
+        };
+        let mut show = || {
+            probe.trace.borrow_mut().push(format!("show-{index}"));
+            (failure != ShowFailure::Show).then_some(()).ok_or(())
+        };
+        let mut focus = || {
+            probe.trace.borrow_mut().push(format!("focus-{index}"));
+            (failure != ShowFailure::Focus).then_some(()).ok_or(())
+        };
+        let mut registry_on_show = |invocation_id: String| {
+            assert_eq!(invocation_id, format!("invocation-{index}"));
+            probe
+                .trace
+                .borrow_mut()
+                .push(format!("registry-on-show-{index}"));
+        };
+        let mut emit = |payload: &LauncherShown| {
+            probe.trace.borrow_mut().push(format!("emit-{index}"));
+            probe.payloads.borrow_mut().push(payload.clone());
+            (failure != ShowFailure::Emit).then_some(()).ok_or(())
+        };
+        let mut clear_and_hide = || {
+            probe.clears.set(probe.clears.get() + 1);
+            probe.trace.borrow_mut().push(format!("clear-{index}"));
+        };
+        let coordinator_for_record = Arc::clone(coordinator);
+        let mut record_launcher = move |_reservation: CriticalReservation| {
+            probe.records.set(probe.records.get() + 1);
+            probe
+                .trace
+                .borrow_mut()
+                .push(format!("reserve-launcher-record-{index}"));
+            match failure {
+                ShowFailure::Record => coordinator_for_record.finish_launcher_record(Err(())),
+                ShowFailure::PanicRecord => panic!("launcher record panic sentinel"),
+                _ => coordinator_for_record.finish_launcher_record(Ok(())),
+            }
+        };
+        let mut operations = ShowMainClosures {
+            center: &mut center,
+            always_on_top: &mut always_on_top,
+            show: &mut show,
+            focus: &mut focus,
+            registry_on_show: &mut registry_on_show,
+            emit: &mut emit,
+            clear_and_hide: &mut clear_and_hide,
+            record_launcher: &mut record_launcher,
+        };
+        coordinator.show_main_core(target, &mut operations)
+    }
+
+    #[test]
+    fn show_serializes_two_ready_requests_in_registry_event_order() {
+        let coordinator = coordinator_for_test();
+        coordinator
+            .mark_setup_ready_with(|_| panic!("setup ready must not synthesize show"))
+            .unwrap();
+        coordinator
+            .mark_frontend_ready_with(|_| panic!("frontend ready must not synthesize show"))
+            .unwrap();
+        let probe = ShowProbe::default();
+
+        for index in 1..=2 {
+            coordinator
+                .request_show_with(ShowTarget::Launcher, |coordinator, target| {
+                    probe.trace.borrow_mut().push(format!("dispatch-{index}"));
+                    let target = coordinator
+                        .readiness
+                        .lock()
+                        .expect("readiness lock poisoned")
+                        .request(target);
+                    if let Some(target) = target {
+                        run_show_case(&coordinator, target, index, ShowFailure::None, &probe)
+                            .map_err(|_| ())?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            *probe.trace.borrow(),
+            [
+                "dispatch-1",
+                "invocation-1",
+                "center-1",
+                "always-on-top-1",
+                "show-1",
+                "focus-1",
+                "registry-on-show-1",
+                "emit-1",
+                "reserve-launcher-record-1",
+                "dispatch-2",
+                "invocation-2",
+                "center-2",
+                "always-on-top-2",
+                "show-2",
+                "focus-2",
+                "registry-on-show-2",
+                "emit-2",
+                "reserve-launcher-record-2",
+            ]
+        );
+        assert_eq!(probe.records.get(), 2);
+        assert_eq!(probe.clears.get(), 0);
+        assert_eq!(probe.payloads.borrow().len(), 2);
+        assert_eq!(exit_snapshot(&coordinator).1, 0);
+    }
+
+    #[test]
+    fn show_dispatch_failure_has_zero_side_effects() {
+        let coordinator = coordinator_for_test();
+        let dispatched = Cell::new(0);
+        assert_eq!(
+            coordinator.request_show_with(ShowTarget::Launcher, |_, _| {
+                dispatched.set(dispatched.get() + 1);
+                Err(())
+            }),
+            Err(LifecycleError::MainThreadDispatchFailed)
+        );
+        assert_eq!(dispatched.get(), 1);
+        assert_eq!(coordinator.next_invocation.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            coordinator
+                .readiness
+                .lock()
+                .expect("readiness lock poisoned")
+                .pending_target,
+            None
+        );
+        assert_eq!(exit_snapshot(&coordinator).1, 0);
+    }
+
+    #[test]
+    fn show_window_and_emit_failures_clear_once_while_center_continues() {
+        for failure in [
+            ShowFailure::AlwaysOnTop,
+            ShowFailure::Show,
+            ShowFailure::Focus,
+            ShowFailure::Emit,
+        ] {
+            let coordinator = coordinator_for_test();
+            let probe = ShowProbe::default();
+            assert_eq!(
+                run_show_case(&coordinator, ShowTarget::Launcher, 1, failure, &probe,),
+                Err(LifecycleError::WindowFailed)
+            );
+            assert_eq!(probe.clears.get(), 1);
+            assert_eq!(probe.records.get(), 0);
+            assert_eq!(exit_snapshot(&coordinator).1, 0);
+        }
+
+        let coordinator = coordinator_for_test();
+        let probe = ShowProbe::default();
+        assert_eq!(
+            run_show_case(
+                &coordinator,
+                ShowTarget::Launcher,
+                1,
+                ShowFailure::Center,
+                &probe,
+            ),
+            Ok(ShowOutcome::Shown)
+        );
+        assert_eq!(probe.clears.get(), 0);
+        assert_eq!(probe.records.get(), 1);
+
+        let registry = ResultRegistry::default();
+        registry.on_show("old".into());
+        assert!(registry.begin_query("old", 1).is_some());
+        let hides = Cell::new(0);
+        let mut center = || Ok(());
+        let mut always_on_top = || Ok(());
+        let mut show = || Ok(());
+        let mut focus = || Err(());
+        let mut registry_on_show = |id| registry.on_show(id);
+        let mut emit = |_: &LauncherShown| Ok(());
+        let mut clear_and_hide = || {
+            registry.hide_and_clear();
+            hides.set(hides.get() + 1);
+        };
+        let mut record_launcher = |_: CriticalReservation| {};
+        let mut operations = ShowMainClosures {
+            center: &mut center,
+            always_on_top: &mut always_on_top,
+            show: &mut show,
+            focus: &mut focus,
+            registry_on_show: &mut registry_on_show,
+            emit: &mut emit,
+            clear_and_hide: &mut clear_and_hide,
+            record_launcher: &mut record_launcher,
+        };
+        assert_eq!(
+            coordinator_for_test().show_main_core(ShowTarget::Launcher, &mut operations),
+            Err(LifecycleError::WindowFailed)
+        );
+        assert_eq!(hides.get(), 1);
+        assert!(registry.begin_query("old", 2).is_none());
+    }
+
+    #[test]
+    fn show_non_running_state_is_ignored_before_invocation() {
+        for state in [
+            ExitState::Cleaning,
+            ExitState::Clean,
+            ExitState::SystemEnding,
+        ] {
+            let coordinator = coordinator_for_test();
+            coordinator
+                .exit_gate
+                .lock()
+                .expect("exit gate lock poisoned")
+                .state = state;
+            let probe = ShowProbe::default();
+            assert_eq!(
+                run_show_case(
+                    &coordinator,
+                    ShowTarget::Launcher,
+                    1,
+                    ShowFailure::None,
+                    &probe,
+                ),
+                Ok(ShowOutcome::Ignored)
+            );
+            assert!(probe.trace.borrow().is_empty());
+            assert_eq!(coordinator.next_invocation.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn show_target_notice_and_record_failures_keep_first_pending_notice() {
+        let coordinator = coordinator_for_test();
+        coordinator.set_notice_once(LifecycleNotice::SettingsFailed);
+        let probe = ShowProbe::default();
+        assert_eq!(
+            run_show_case(
+                &coordinator,
+                ShowTarget::Settings,
+                1,
+                ShowFailure::None,
+                &probe,
+            ),
+            Ok(ShowOutcome::Shown)
+        );
+        assert_eq!(probe.records.get(), 0);
+        assert_eq!(
+            probe.payloads.borrow()[0].notice,
+            Some(LifecycleNotice::SettingsFailed)
+        );
+        assert_eq!(*coordinator.pending_notice.lock().unwrap(), None);
+
+        coordinator.set_notice_once(LifecycleNotice::SettingsFailed);
+        assert_eq!(
+            run_show_case(
+                &coordinator,
+                ShowTarget::Settings,
+                2,
+                ShowFailure::Emit,
+                &probe,
+            ),
+            Err(LifecycleError::WindowFailed)
+        );
+        coordinator.set_notice_once(LifecycleNotice::ValidationFailed);
+        assert_eq!(
+            *coordinator.pending_notice.lock().unwrap(),
+            Some(LifecycleNotice::SettingsFailed)
+        );
+
+        *coordinator.pending_notice.lock().unwrap() = None;
+        assert_eq!(
+            run_show_case(
+                &coordinator,
+                ShowTarget::Launcher,
+                3,
+                ShowFailure::Record,
+                &probe,
+            ),
+            Ok(ShowOutcome::Shown)
+        );
+        assert_eq!(
+            *coordinator.pending_notice.lock().unwrap(),
+            Some(LifecycleNotice::ValidationFailed)
+        );
+
+        let panicking = coordinator_for_test();
+        let panic_probe = ShowProbe::default();
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = run_show_case(
+                &panicking,
+                ShowTarget::Launcher,
+                1,
+                ShowFailure::PanicRecord,
+                &panic_probe,
+            );
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(exit_snapshot(&panicking).1, 0);
+    }
+
+    #[test]
+    fn show_invocation_overflow_and_payload_serialization_are_fixed() {
+        let coordinator = coordinator_for_test();
+        coordinator
+            .next_invocation
+            .store(u64::MAX, Ordering::Relaxed);
+        let probe = ShowProbe::default();
+        assert_eq!(
+            run_show_case(
+                &coordinator,
+                ShowTarget::Launcher,
+                1,
+                ShowFailure::None,
+                &probe,
+            ),
+            Err(LifecycleError::InvocationExhausted)
+        );
+        assert!(probe.trace.borrow().is_empty());
+        assert_eq!(exit_snapshot(&coordinator).1, 0);
+
+        for (target, expected) in [
+            (ShowTarget::Launcher, "launcher"),
+            (ShowTarget::Settings, "settings"),
+        ] {
+            let value = serde_json::to_value(LauncherShown {
+                invocation_id: "invocation-1".into(),
+                target,
+                notice: Some(LifecycleNotice::ValidationFailed),
+            })
+            .unwrap();
+            assert_eq!(value["target"], expected);
+            assert_eq!(value["notice"], "validationFailed");
+        }
     }
 
     fn coordinator_for_test() -> Arc<LifecycleCoordinator> {

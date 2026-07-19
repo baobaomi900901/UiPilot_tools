@@ -5,6 +5,7 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
     apps::{self, AppCache, Application},
+    lifecycle::{FocusDecision, LifecycleCoordinator},
     model::SearchResponse,
     result_registry::{RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsStore, SettingsUpdate},
@@ -208,11 +209,29 @@ where
 #[tauri::command]
 pub(crate) fn load_settings(
     window: WebviewWindow,
+    app: AppHandle,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
     settings: State<'_, SettingsStore>,
     cache: State<'_, Arc<AppCache>>,
 ) -> Result<SettingsView, CommandError> {
     require_main_window(&window)?;
-    Ok(load_settings_core(&settings, &cache))
+    load_settings_ready_with(
+        || {
+            coordinator
+                .mark_frontend_ready(&app)
+                .map_err(|_| CommandError::window_failed())
+        },
+        || load_settings_core(&settings, &cache),
+    )
+}
+
+fn load_settings_ready_with<R, L, T>(mark_ready: R, load: L) -> Result<T, CommandError>
+where
+    R: FnOnce() -> Result<(), CommandError>,
+    L: FnOnce() -> T,
+{
+    mark_ready()?;
+    Ok(load())
 }
 
 fn load_settings_core(settings: &SettingsStore, cache: &AppCache) -> SettingsView {
@@ -383,10 +402,19 @@ fn map_rescan_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandEr
 pub(crate) async fn export_validation_data(
     window: WebviewWindow,
     app: AppHandle,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
+    registry: State<'_, ResultRegistry>,
 ) -> Result<ExportOutcome, CommandError> {
     require_main_window(&window)?;
+    let coordinator = Arc::clone(coordinator.inner());
+    let modal_guard = begin_modal_export_with(
+        &coordinator,
+        || window.is_focused().map_err(|_| ()),
+        || clear_and_hide(&registry, &window),
+    )?;
     let chooser_window = window.clone();
-    export_validation_data_with(
+    export_validation_data_guarded_with(
+        modal_guard,
         || choose_export_on_main(chooser_window),
         move |destination| {
             let app = app.clone();
@@ -398,6 +426,30 @@ pub(crate) async fn export_validation_data(
         },
     )
     .await
+}
+
+fn begin_modal_export_with<Q, H>(
+    coordinator: &Arc<LifecycleCoordinator>,
+    query_focus: Q,
+    clear_and_hide: H,
+) -> Result<crate::lifecycle::ModalGuard, CommandError>
+where
+    Q: FnOnce() -> Result<bool, ()>,
+    H: FnOnce() -> Result<(), CommandError>,
+{
+    match coordinator.begin_modal_export(query_focus) {
+        Ok(guard) => Ok(guard),
+        Err(FocusDecision::Suppress) => Err(CommandError::export_failed()),
+        Err(FocusDecision::ClearAndHide) => {
+            let _ = clear_and_hide();
+            Err(CommandError::export_failed())
+        }
+        Err(FocusDecision::ReportWindowFailureAndHide) => {
+            let _window_error = CommandError::window_failed();
+            let _ = clear_and_hide();
+            Err(CommandError::export_failed())
+        }
+    }
 }
 
 async fn choose_export_on_main(
@@ -422,6 +474,7 @@ async fn choose_export_on_main(
         .ok_or_else(CommandError::main_thread_dispatch_failed)?
 }
 
+#[cfg(test)]
 async fn export_validation_data_with<D, C, CF, W, WF>(
     choose: C,
     write: W,
@@ -432,7 +485,23 @@ where
     W: FnOnce(D) -> WF,
     WF: Future<Output = Result<(), CommandError>>,
 {
-    let Some(destination) = choose().await? else {
+    export_validation_data_guarded_with((), choose, write).await
+}
+
+async fn export_validation_data_guarded_with<G, D, C, CF, W, WF>(
+    guard: G,
+    choose: C,
+    write: W,
+) -> Result<ExportOutcome, CommandError>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<Option<D>, CommandError>>,
+    W: FnOnce(D) -> WF,
+    WF: Future<Output = Result<(), CommandError>>,
+{
+    let destination = choose().await;
+    drop(guard);
+    let Some(destination) = destination? else {
         return Ok(ExportOutcome::Cancelled);
     };
     write(destination).await?;
@@ -508,6 +577,7 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
+        rc::Rc,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc,
@@ -516,14 +586,16 @@ mod tests {
     };
 
     use super::{
-        clear_and_hide_with, clear_validation_data_with, execute_result_with,
-        export_validation_data_with, load_settings_core, map_export_worker_result,
-        map_rescan_result, require_main_label, rescan_apps_with, save_settings_core,
-        search_apps_with, spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome,
-        ExportOutcome, SettingsView, UserSettingsUpdate,
+        begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
+        execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
+        load_settings_core, load_settings_ready_with, map_export_worker_result, map_rescan_result,
+        require_main_label, rescan_apps_with, save_settings_core, search_apps_with,
+        spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome,
+        SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome},
+        lifecycle::LifecycleCoordinator,
         result_registry::{RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore},
         validation_data::ValidationEvent,
@@ -877,6 +949,312 @@ mod tests {
             );
             assert_eq!(store.snapshot(), before);
         }
+    }
+
+    #[test]
+    fn readiness_load_settings_guards_then_marks_ready_before_store_reads() {
+        for (label, expected) in [
+            ("secondary", Err(CommandError::invalid_caller())),
+            ("main", Ok(17)),
+        ] {
+            let trace = RefCell::new(Vec::new());
+            let result = require_main_label(label).and_then(|()| {
+                trace.borrow_mut().push("caller-guard");
+                load_settings_ready_with(
+                    || {
+                        trace.borrow_mut().push("frontend-ready");
+                        Ok(())
+                    },
+                    || {
+                        trace.borrow_mut().push("settings-snapshot");
+                        trace.borrow_mut().push("cache-snapshot");
+                        17
+                    },
+                )
+            });
+
+            assert_eq!(result, expected);
+            if label == "main" {
+                assert_eq!(
+                    *trace.borrow(),
+                    [
+                        "caller-guard",
+                        "frontend-ready",
+                        "settings-snapshot",
+                        "cache-snapshot"
+                    ]
+                );
+            } else {
+                assert!(trace.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn readiness_load_settings_keeps_hidden_startup_and_drains_early_target_once() {
+        let trace = RefCell::new(Vec::new());
+        let shows = Cell::new(0);
+        let pending = Cell::new(false);
+        let mark_frontend_ready = || {
+            trace.borrow_mut().push("frontend-ready");
+            if pending.replace(false) {
+                shows.set(shows.get() + 1);
+                trace.borrow_mut().push("show-pending");
+            }
+            Ok(())
+        };
+
+        assert_eq!(
+            load_settings_ready_with(mark_frontend_ready, || {
+                trace.borrow_mut().push("stores");
+                1
+            }),
+            Ok(1)
+        );
+        assert_eq!(*trace.borrow(), ["frontend-ready", "stores"]);
+        assert_eq!(shows.get(), 0);
+
+        trace.borrow_mut().clear();
+        pending.set(true);
+        for expected in [2, 3] {
+            assert_eq!(
+                load_settings_ready_with(
+                    || {
+                        trace.borrow_mut().push("frontend-ready");
+                        if pending.replace(false) {
+                            shows.set(shows.get() + 1);
+                            trace.borrow_mut().push("show-pending");
+                        }
+                        Ok(())
+                    },
+                    || {
+                        trace.borrow_mut().push("stores");
+                        expected
+                    },
+                ),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            *trace.borrow(),
+            [
+                "frontend-ready",
+                "show-pending",
+                "stores",
+                "frontend-ready",
+                "stores"
+            ]
+        );
+        assert_eq!(shows.get(), 1);
+    }
+
+    #[test]
+    fn modal_export_rejects_concurrent_and_drops_guard_after_chooser() {
+        let coordinator = Arc::new(LifecycleCoordinator::default());
+        let queries = Cell::new(0);
+        let clears = Cell::new(0);
+        let guard = begin_modal_export_with(
+            &coordinator,
+            || {
+                queries.set(queries.get() + 1);
+                Ok(true)
+            },
+            || {
+                clears.set(clears.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            begin_modal_export_with(
+                &coordinator,
+                || {
+                    queries.set(queries.get() + 1);
+                    Ok(true)
+                },
+                || {
+                    clears.set(clears.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err(),
+            CommandError::export_failed()
+        );
+        assert_eq!(queries.get(), 0);
+        assert_eq!(clears.get(), 0);
+
+        assert_eq!(
+            tauri::async_runtime::block_on(export_validation_data_guarded_with(
+                guard,
+                || async { Ok(None::<usize>) },
+                |_| async { panic!("cancel must skip writer") },
+            )),
+            Ok(ExportOutcome::Cancelled)
+        );
+        let recovered = begin_modal_export_with(
+            &coordinator,
+            || {
+                queries.set(queries.get() + 1);
+                Ok(true)
+            },
+            || {
+                clears.set(clears.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(queries.get(), 1);
+        drop(recovered);
+    }
+
+    #[test]
+    fn modal_export_recovery_classifies_queued_and_real_focus_loss() {
+        let coordinator = Arc::new(LifecycleCoordinator::default());
+        let first = begin_modal_export_with(&coordinator, || Ok(true), || Ok(())).unwrap();
+        drop(first);
+
+        let queries = Cell::new(0);
+        let clears = Cell::new(0);
+        let queued = begin_modal_export_with(
+            &coordinator,
+            || {
+                queries.set(queries.get() + 1);
+                Ok(true)
+            },
+            || {
+                clears.set(clears.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(queries.get(), 1);
+        assert_eq!(clears.get(), 0);
+        drop(queued);
+
+        assert_eq!(
+            begin_modal_export_with(
+                &coordinator,
+                || {
+                    queries.set(queries.get() + 1);
+                    Ok(false)
+                },
+                || {
+                    clears.set(clears.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err(),
+            CommandError::export_failed()
+        );
+        assert_eq!(queries.get(), 2);
+        assert_eq!(clears.get(), 1);
+        let after_real_loss = begin_modal_export_with(
+            &coordinator,
+            || panic!("Normal must not query focus"),
+            || panic!("Normal must not clear"),
+        )
+        .unwrap();
+        drop(after_real_loss);
+    }
+
+    #[test]
+    fn modal_export_query_error_and_successful_show_restore_normal() {
+        let coordinator = Arc::new(LifecycleCoordinator::default());
+        let first = begin_modal_export_with(&coordinator, || Ok(true), || Ok(())).unwrap();
+        drop(first);
+        let clears = Cell::new(0);
+        assert_eq!(
+            begin_modal_export_with(
+                &coordinator,
+                || Err(()),
+                || {
+                    clears.set(clears.get() + 1);
+                    Err(CommandError::window_failed())
+                },
+            )
+            .unwrap_err(),
+            CommandError::export_failed()
+        );
+        assert_eq!(clears.get(), 1);
+        let after_error = begin_modal_export_with(
+            &coordinator,
+            || panic!("Normal must not query focus"),
+            || panic!("Normal must not clear"),
+        )
+        .unwrap();
+        drop(after_error);
+
+        coordinator.on_successful_show();
+        let after_show = begin_modal_export_with(
+            &coordinator,
+            || panic!("successful show must restore Normal"),
+            || panic!("successful show must not clear"),
+        )
+        .unwrap();
+        drop(after_show);
+    }
+
+    #[test]
+    fn modal_export_preserves_cancel_dispatch_writer_and_join_failures() {
+        struct DropProbe(Rc<Cell<bool>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        for error in [
+            CommandError::main_thread_dispatch_failed(),
+            CommandError::main_thread_dispatch_failed(),
+        ] {
+            let dropped = Rc::new(Cell::new(false));
+            let expected = error.clone();
+            assert_eq!(
+                tauri::async_runtime::block_on(export_validation_data_guarded_with(
+                    DropProbe(Rc::clone(&dropped)),
+                    || async { Err::<Option<usize>, _>(error.clone()) },
+                    |_| async { panic!("failed chooser must skip writer") },
+                )),
+                Err(expected)
+            );
+            assert!(dropped.get());
+        }
+
+        for error in [
+            CommandError::export_failed(),
+            CommandError::export_worker_failed(),
+        ] {
+            let dropped = Rc::new(Cell::new(false));
+            let writer_dropped = Rc::clone(&dropped);
+            let writer_error = error.clone();
+            assert_eq!(
+                tauri::async_runtime::block_on(export_validation_data_guarded_with(
+                    DropProbe(Rc::clone(&dropped)),
+                    || async { Ok(Some(7_usize)) },
+                    move |destination| async move {
+                        assert!(writer_dropped.get());
+                        assert_eq!(destination, 7);
+                        Err(writer_error)
+                    },
+                )),
+                Err(error)
+            );
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let writer_dropped = Rc::clone(&dropped);
+        assert_eq!(
+            tauri::async_runtime::block_on(export_validation_data_guarded_with(
+                DropProbe(Rc::clone(&dropped)),
+                || async { Ok(Some(9_usize)) },
+                move |destination| async move {
+                    assert!(writer_dropped.get());
+                    assert_eq!(destination, 9);
+                    Ok(())
+                },
+            )),
+            Ok(ExportOutcome::Exported)
+        );
     }
 
     #[test]
