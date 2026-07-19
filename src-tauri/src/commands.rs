@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use tauri::{State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
     apps::{self, AppCache, Application},
@@ -9,6 +9,7 @@ use crate::{
     result_registry::{RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
+    validation_export::{choose_export_destination, write_validation_export, ExportDestination},
 };
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
@@ -36,6 +37,13 @@ pub(crate) enum ExecuteOutcome {
     LaunchRequested,
     ActivationRequested,
     ActivationRefusedLaunchRequested { message: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub(crate) enum ExportOutcome {
+    Cancelled,
+    Exported,
 }
 
 impl CommandError {
@@ -85,6 +93,41 @@ impl CommandError {
         Self {
             code: "windowFailed",
             message: "launcher window operation failed",
+        }
+    }
+
+    fn scan_failed() -> Self {
+        Self {
+            code: "scanFailed",
+            message: "application scan failed",
+        }
+    }
+
+    fn scan_worker_failed() -> Self {
+        Self {
+            code: "scanWorkerFailed",
+            message: "application scan worker failed",
+        }
+    }
+
+    fn main_thread_dispatch_failed() -> Self {
+        Self {
+            code: "mainThreadDispatchFailed",
+            message: "main thread dispatch failed",
+        }
+    }
+
+    fn export_failed() -> Self {
+        Self {
+            code: "exportFailed",
+            message: "validation export failed",
+        }
+    }
+
+    fn export_worker_failed() -> Self {
+        Self {
+            code: "exportWorkerFailed",
+            message: "validation export worker failed",
         }
     }
 }
@@ -285,6 +328,149 @@ fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> (ExecuteOutcome, Va
     }
 }
 
+#[tauri::command]
+pub(crate) async fn rescan_apps(
+    window: WebviewWindow,
+    cache: State<'_, Arc<AppCache>>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let cache = Arc::clone(cache.inner());
+    rescan_apps_with(move || cache.refresh().map(|_| ()).map_err(|_| ())).await
+}
+
+async fn rescan_apps_with<W>(worker: W) -> Result<(), CommandError>
+where
+    W: FnOnce() -> Result<(), ()> + Send + 'static,
+{
+    let result = tauri::async_runtime::spawn_blocking(worker)
+        .await
+        .map_err(|_| ());
+    map_rescan_result(result)
+}
+
+fn map_rescan_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(())) => Err(CommandError::scan_failed()),
+        Err(()) => Err(CommandError::scan_worker_failed()),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn export_validation_data(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<ExportOutcome, CommandError> {
+    require_main_window(&window)?;
+    let chooser_window = window.clone();
+    export_validation_data_with(
+        || choose_export_on_main(chooser_window),
+        move |destination| {
+            let app = app.clone();
+            spawn_export_worker(move || {
+                let settings = app.state::<SettingsStore>();
+                let validation = app.state::<ValidationStore>();
+                write_validation_export(destination, &settings, &validation).map_err(|_| ())
+            })
+        },
+    )
+    .await
+}
+
+async fn choose_export_on_main(
+    window: WebviewWindow,
+) -> Result<Option<ExportDestination>, CommandError> {
+    let (sender, mut receiver) = tauri::async_runtime::channel(1);
+    let chooser_window = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let result = chooser_window
+                .hwnd()
+                .map_err(|_| CommandError::export_failed())
+                .and_then(|hwnd| {
+                    choose_export_destination(hwnd).map_err(|_| CommandError::export_failed())
+                });
+            let _ = sender.blocking_send(result);
+        })
+        .map_err(|_| CommandError::main_thread_dispatch_failed())?;
+    receiver
+        .recv()
+        .await
+        .ok_or_else(CommandError::main_thread_dispatch_failed)?
+}
+
+async fn export_validation_data_with<D, C, CF, W, WF>(
+    choose: C,
+    write: W,
+) -> Result<ExportOutcome, CommandError>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<Option<D>, CommandError>>,
+    W: FnOnce(D) -> WF,
+    WF: Future<Output = Result<(), CommandError>>,
+{
+    let Some(destination) = choose().await? else {
+        return Ok(ExportOutcome::Cancelled);
+    };
+    write(destination).await?;
+    Ok(ExportOutcome::Exported)
+}
+
+async fn spawn_export_worker<W>(writer: W) -> Result<(), CommandError>
+where
+    W: FnOnce() -> Result<(), ()> + Send + 'static,
+{
+    let result = tauri::async_runtime::spawn_blocking(writer)
+        .await
+        .map_err(|_| ());
+    map_export_worker_result(result)
+}
+
+fn map_export_worker_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(())) => Err(CommandError::export_failed()),
+        Err(()) => Err(CommandError::export_worker_failed()),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn clear_validation_data(
+    window: WebviewWindow,
+    validation: State<'_, ValidationStore>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    clear_validation_data_with(|| validation.clear_daily_counts().map_err(|_| ()))
+}
+
+fn clear_validation_data_with<C>(clear: C) -> Result<(), CommandError>
+where
+    C: FnOnce() -> Result<(), ()>,
+{
+    clear().map_err(|_| CommandError::validation_failed())
+}
+
+#[tauri::command]
+pub(crate) fn hide_launcher(
+    window: WebviewWindow,
+    registry: State<'_, ResultRegistry>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    hide_launcher_with(
+        || registry.hide_and_clear(),
+        || window.hide().map_err(|_| ()),
+    )
+}
+
+fn hide_launcher_with<I, H>(invalidate: I, hide: H) -> Result<(), CommandError>
+where
+    I: FnOnce(),
+    H: FnOnce() -> Result<(), ()>,
+{
+    invalidate();
+    hide().map_err(|_| CommandError::window_failed())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -292,12 +478,18 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        },
+        thread,
     };
 
     use super::{
-        execute_result_with, load_settings_core, require_main_label, save_settings_core,
-        search_apps_with, CommandError, ExecuteOutcome, UserSettings,
+        clear_validation_data_with, execute_result_with, export_validation_data_with,
+        hide_launcher_with, load_settings_core, map_export_worker_result, map_rescan_result,
+        require_main_label, rescan_apps_with, save_settings_core, search_apps_with,
+        spawn_export_worker, CommandError, ExecuteOutcome, ExportOutcome, UserSettings,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome},
@@ -741,5 +933,108 @@ mod tests {
 
         assert_eq!(result, Err(CommandError::application_entry_unavailable()));
         assert_eq!(later_calls.get(), 0);
+    }
+
+    #[test]
+    fn maintenance_rescan_uses_blocking_worker_and_maps_both_failure_layers() {
+        let caller = thread::current().id();
+        let worker = tauri::async_runtime::block_on(rescan_apps_with(move || {
+            assert_ne!(thread::current().id(), caller);
+            Ok(())
+        }));
+        assert_eq!(worker, Ok(()));
+        assert_eq!(
+            map_rescan_result(Ok(Err(()))),
+            Err(CommandError::scan_failed())
+        );
+        assert_eq!(
+            map_rescan_result(Err(())),
+            Err(CommandError::scan_worker_failed())
+        );
+    }
+
+    #[test]
+    fn maintenance_export_cancel_skips_writer_and_confirm_writes_in_worker() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let cancel_writes = Arc::clone(&writes);
+        let cancelled = tauri::async_runtime::block_on(export_validation_data_with(
+            || async { Ok(None::<usize>) },
+            move |_| {
+                cancel_writes.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            },
+        ));
+        assert_eq!(cancelled, Ok(ExportOutcome::Cancelled));
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+
+        let caller = thread::current().id();
+        let confirmed_writes = Arc::clone(&writes);
+        let exported = tauri::async_runtime::block_on(export_validation_data_with(
+            || async { Ok(Some(17_usize)) },
+            move |destination| {
+                spawn_export_worker(move || {
+                    assert_eq!(destination, 17);
+                    assert_ne!(thread::current().id(), caller);
+                    confirmed_writes.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+            },
+        ));
+        assert_eq!(exported, Ok(ExportOutcome::Exported));
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            map_export_worker_result(Ok(Err(()))),
+            Err(CommandError::export_failed())
+        );
+        assert_eq!(
+            map_export_worker_result(Err(())),
+            Err(CommandError::export_worker_failed())
+        );
+    }
+
+    #[test]
+    fn maintenance_hide_clears_before_hide_and_clear_maps_validation_error() {
+        let trace = RefCell::new(Vec::new());
+        let result = hide_launcher_with(
+            || trace.borrow_mut().push("clear"),
+            || {
+                trace.borrow_mut().push("hide");
+                Err(())
+            },
+        );
+        assert_eq!(result, Err(CommandError::window_failed()));
+        assert_eq!(*trace.borrow(), ["clear", "hide"]);
+
+        assert_eq!(clear_validation_data_with(|| Ok(())), Ok(()));
+        assert_eq!(
+            clear_validation_data_with(|| Err(())),
+            Err(CommandError::validation_failed())
+        );
+    }
+
+    #[test]
+    fn maintenance_all_eight_wrappers_guard_before_their_first_body_statement() {
+        let source = include_str!("commands.rs");
+        for command in [
+            "search_apps",
+            "execute_result",
+            "load_settings",
+            "save_settings",
+            "rescan_apps",
+            "export_validation_data",
+            "clear_validation_data",
+            "hide_launcher",
+        ] {
+            let start = source
+                .find(&format!("fn {command}("))
+                .unwrap_or_else(|| panic!("missing command wrapper: {command}"));
+            let body = &source[start..];
+            let first_statement = body[body.find('{').unwrap() + 1..].trim_start();
+            assert!(
+                first_statement.starts_with("require_main_window(&window)?;"),
+                "{command} must guard before state access or side effects"
+            );
+        }
     }
 }
