@@ -1,6 +1,9 @@
+// @vitest-environment jsdom
+
 import { describe, expect, it, vi } from 'vitest'
 
 import { createLauncherCore } from './launcher-core'
+import { bindNativeTextInput } from './native-input'
 import {
   parseLauncherShown,
   type ExecuteOutcome,
@@ -299,5 +302,160 @@ describe('execute and hide ownership', () => {
     await expect(hide.promise).rejects.toBeDefined()
     await vi.waitFor(() => expect(core.getSnapshot().hidePending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({ view: 'launcher', invocationId: 'hide', status: '窗口操作失败。' })
+  })
+})
+
+describe('IME ownership', () => {
+  it.each([
+    ['input-before-end', true],
+    ['end-before-input', false],
+  ])('finalizes %s exactly once', async (_name, inputFirst) => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('ime'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'compositionStart', control, value: '' })
+    core.text({ kind: 'compositionUpdate', control, value: '计' })
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '计', querySequence: 0 })
+    expect(client.searchApps).not.toHaveBeenCalled()
+    if (inputFirst) core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
+    core.text({ kind: 'compositionEnd', control, value: '计算器' })
+    if (!inputFirst) {
+      await Promise.resolve()
+      core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
+    }
+    expect(client.searchApps).toHaveBeenCalledOnce()
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'ime', querySequence: 1 })
+    expect(core.getSnapshot()).toMatchObject({ query: '计算器', queryControlValue: '计算器', querySequence: 1 })
+  })
+
+  it('commits an empty final value with zero Rust calls', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('empty-ime'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'compositionStart', control, value: '' })
+    core.text({ kind: 'compositionUpdate', control, value: '中' })
+    core.text({ kind: 'compositionEnd', control, value: '' })
+    expect(client.searchApps).not.toHaveBeenCalled()
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 1, searchPending: false })
+  })
+
+  it('permanently retires the pre-composition search even when draft text returns', async () => {
+    const { core, client, emit } = await startedCore()
+    const old = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(old.promise)
+    emit(shown('retire-search'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: 'old', inputType: 'insertText' })
+    core.text({ kind: 'compositionStart', control, value: 'old' })
+    expect(core.getSnapshot()).toMatchObject({ query: 'old', queryControlValue: 'old', querySequence: 1, searchPending: false, results: [] })
+    core.text({ kind: 'compositionUpdate', control, value: '新' })
+    core.text({ kind: 'compositionUpdate', control, value: 'old' })
+    const returned = core.getSnapshot()
+    old.resolve({ requestId: 'retired', items: [{ resultId: 'retired', title: 'Retired' }] })
+    await old.promise
+    await Promise.resolve()
+    expect(core.getSnapshot()).toBe(returned)
+    expect(core.getSnapshot().results).toEqual([])
+  })
+
+  it('lets only the new shown auto-search commit across a late old end and input', async () => {
+    const { core, client, emit } = await startedCore()
+    const old = deferred<SearchResponse | null>()
+    const current = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    emit(shown('old-invocation'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' })
+    core.text({ kind: 'compositionStart', control, value: 'calc' })
+    core.text({ kind: 'compositionUpdate', control, value: '计算' })
+    emit(shown('new-invocation'))
+    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: 'calc', querySequence: 1, searchPending: true })
+    core.text({ kind: 'compositionEnd', control, value: '计算器' })
+    core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
+    expect(client.searchApps).toHaveBeenCalledTimes(2)
+    old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old' }] })
+    current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New' }] })
+    await Promise.all([old.promise, current.promise])
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['New'])
+  })
+
+  it('suppresses one associated composition input but treats later ordinary input as a new edit', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('marker'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'compositionStart', control, value: '' })
+    core.text({ kind: 'compositionEnd', control, value: '中文' })
+    await Promise.resolve()
+    core.text({ kind: 'compositionInput', control, value: '中文', inputType: 'insertCompositionText' })
+    expect(client.searchApps).toHaveBeenCalledTimes(1)
+    core.text({ kind: 'ordinaryInput', control, value: '中文', inputType: 'insertFromPaste' })
+    expect(client.searchApps).toHaveBeenCalledTimes(2)
+    expect(core.getSnapshot().querySequence).toBe(2)
+  })
+
+  it('does not indefinitely suppress a same-value ordinary retry when no post-end input arrives', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('retry'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'compositionStart', control, value: '' })
+    core.text({ kind: 'compositionEnd', control, value: 'same' })
+    core.text({ kind: 'ordinaryInput', control, value: 'same', inputType: 'insertText' })
+    expect(client.searchApps).toHaveBeenCalledTimes(2)
+    expect(core.getSnapshot().querySequence).toBe(2)
+  })
+
+  it('retires active, suppression, and stale ownership idempotently', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('retire-control'))
+    const control = core.getSnapshot().queryControl
+    const listener = vi.fn()
+    core.subscribe(listener)
+
+    core.text({ kind: 'compositionStart', control, value: '' })
+    listener.mockClear()
+    core.retireControl(control)
+    core.retireControl(control)
+    const retiredActive = core.getSnapshot()
+    core.text({ kind: 'compositionEnd', control, value: 'late' })
+    core.text({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' })
+    expect(core.getSnapshot()).toBe(retiredActive)
+    expect(listener).not.toHaveBeenCalled()
+    expect(client.searchApps).not.toHaveBeenCalled()
+
+    core.text({ kind: 'compositionStart', control, value: '' })
+    core.text({ kind: 'compositionEnd', control, value: 'done' })
+    core.retireControl(control)
+    const retiredMarker = core.getSnapshot()
+    core.text({ kind: 'compositionInput', control, value: 'done', inputType: 'insertCompositionText' })
+    expect(core.getSnapshot()).toBe(retiredMarker)
+
+    core.text({ kind: 'compositionStart', control, value: 'done' })
+    emit(shown('replacement'))
+    core.retireControl(control)
+    const retiredTombstone = core.getSnapshot()
+    core.text({ kind: 'compositionEnd', control, value: 'stale' })
+    core.text({ kind: 'compositionInput', control, value: 'stale', inputType: 'insertCompositionText' })
+    expect(core.getSnapshot()).toBe(retiredTombstone)
+  })
+})
+
+describe('native trust', () => {
+  it('emits nothing for untrusted raw DOM events and unbinds idempotently', () => {
+    const input = document.createElement('input')
+    const emit = vi.fn()
+    const unbind = bindNativeTextInput(input, 7, emit)
+    input.value = '中'
+    input.dispatchEvent(new CompositionEvent('compositionstart', { data: '', bubbles: true }))
+    input.dispatchEvent(new CompositionEvent('compositionupdate', { data: '中', bubbles: true }))
+    input.dispatchEvent(new InputEvent('input', { inputType: 'insertCompositionText', data: '中', bubbles: true }))
+    input.dispatchEvent(new CompositionEvent('compositionend', { data: '中', bubbles: true }))
+    input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: 'x', bubbles: true }))
+    expect(emit).not.toHaveBeenCalled()
+
+    unbind()
+    unbind()
+    input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: 'x', bubbles: true }))
+    expect(emit).not.toHaveBeenCalled()
   })
 })

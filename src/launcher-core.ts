@@ -45,6 +45,17 @@ interface Model {
   status: string
 }
 
+interface CompositionOwner {
+  control: ControlKey
+  viewEpoch: number
+  invocationId?: string
+  generation: number
+}
+
+interface FinalizationOwner extends CompositionOwner {
+  value?: string
+}
+
 const ERROR_TEXT: Record<CommandErrorCode, string> = {
   invalidCaller: '操作不可用，请重试。',
   staleRequest: '搜索结果已过期，请重新搜索。',
@@ -123,6 +134,10 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   let hideToken = 0
   let resultKey = 1
   let activationNoticePending = false
+  let compositionGeneration = 0
+  let composition: CompositionOwner | undefined
+  let suppression: FinalizationOwner | undefined
+  let tombstone: FinalizationOwner | undefined
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -230,6 +245,9 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    tombstone = composition ? { ...composition } : undefined
+    composition = undefined
+    suppression = undefined
     model.viewEpoch += 1
     model.invocationId = event.invocationId
     model.view = event.target
@@ -256,11 +274,93 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   }
 
   function text(record: ClassifiedTextRecord): void {
-    if (destroyed || record.kind !== 'ordinaryInput' || record.control !== model.queryControl) return
-    applyEdit(record.value)
+    if (destroyed || record.control !== model.queryControl) return
+    if (record.kind === 'ordinaryInput') {
+      composition = undefined
+      suppression = undefined
+      tombstone = undefined
+      applyEdit(record.value)
+      return
+    }
+    if (record.kind === 'compositionStart') {
+      const visibleMutation =
+        model.queryControlValue !== record.value ||
+        model.searchPending ||
+        model.requestId !== undefined ||
+        model.results.length > 0 ||
+        model.selectedIndex !== -1 ||
+        model.status !== ''
+      compositionGeneration += 1
+      composition = {
+        control: record.control,
+        viewEpoch: model.viewEpoch,
+        invocationId: model.invocationId,
+        generation: compositionGeneration,
+      }
+      suppression = undefined
+      tombstone = undefined
+      searchToken = ++token
+      model.searchPending = false
+      model.queryControlValue = record.value
+      model.status = ''
+      clearResults()
+      publish(visibleMutation)
+      return
+    }
+    if (record.kind === 'compositionUpdate' || record.kind === 'compositionInput') {
+      if (ownsComposition(composition, record.control)) {
+        const changed = model.queryControlValue !== record.value
+        model.queryControlValue = record.value
+        publish(changed)
+        return
+      }
+      if (
+        record.kind === 'compositionInput' &&
+        suppression?.control === record.control &&
+        suppression.generation === compositionGeneration &&
+        suppression.value === record.value
+      ) {
+        suppression = undefined
+        return
+      }
+      if (record.kind === 'compositionInput' && tombstone?.control === record.control && tombstone.value === record.value) {
+        tombstone = undefined
+        const changed = model.queryControlValue !== model.query
+        model.queryControlValue = model.query
+        publish(changed)
+      }
+      return
+    }
+    if (ownsComposition(composition, record.control)) {
+      const owner = composition
+      composition = undefined
+      suppression = { ...owner, value: record.value }
+      applyEdit(record.value)
+      return
+    }
+    if (tombstone?.control === record.control) {
+      tombstone.value = record.value
+      const changed = model.queryControlValue !== model.query
+      model.queryControlValue = model.query
+      publish(changed)
+    }
   }
 
-  function retireControl(_control: ControlKey): void {}
+  function ownsComposition(owner: CompositionOwner | undefined, control: ControlKey): owner is CompositionOwner {
+    return (
+      owner !== undefined &&
+      owner.control === control &&
+      owner.viewEpoch === model.viewEpoch &&
+      owner.invocationId === model.invocationId &&
+      owner.generation === compositionGeneration
+    )
+  }
+
+  function retireControl(control: ControlKey): void {
+    if (composition?.control === control) composition = undefined
+    if (suppression?.control === control) suppression = undefined
+    if (tombstone?.control === control) tombstone = undefined
+  }
 
   function executeSelection(): void {
     if (model.view !== 'launcher' || model.executePending || !model.requestId) return
