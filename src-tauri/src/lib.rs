@@ -140,6 +140,42 @@ mod tests {
         }
     }
 
+    fn has_forbidden_module_lint_suppression(source: &str) -> bool {
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let mut remaining = compact.as_str();
+
+        while let Some(start) = remaining.find('#') {
+            let candidate = &remaining[start..];
+            let is_inner = candidate.starts_with("#![");
+            if !is_inner && !candidate.starts_with("#[") {
+                remaining = &candidate[1..];
+                continue;
+            }
+            let Some(end) = candidate.find(']') else {
+                break;
+            };
+            let attribute = &candidate[..=end];
+            let following_item = candidate[end + 1..]
+                .split(['{', ';'])
+                .next()
+                .unwrap_or_default();
+            let applies_to_module = is_inner
+                || following_item.starts_with("mod")
+                || (following_item.starts_with("pub") && following_item.contains("mod"));
+            let suppresses_lint =
+                attribute.contains("allow(dead_code") || attribute.contains("allow(unused_imports");
+            if applies_to_module && suppresses_lint {
+                return true;
+            }
+            remaining = &candidate[end + 1..];
+        }
+
+        false
+    }
+
     #[test]
     fn load_settings_store_uses_the_same_persisted_path_on_reload() {
         let dir = TestDir::new();
@@ -230,6 +266,33 @@ mod tests {
     }
 
     #[test]
+    fn lint_oracle_rejects_module_level_suppressions() {
+        for fixture in [
+            ["#![", "allow(", "dead_code", ")]"].concat(),
+            ["#![cfg_attr(not(test), ", "allow(", "unused_imports", "))]"].concat(),
+            ["#[", "allow(", "dead_code", ")] mod nested;"].concat(),
+            [
+                "#[cfg_attr(not(test), ",
+                "allow(",
+                "unused_imports",
+                "))] pub(crate) mod nested;",
+            ]
+            .concat(),
+        ] {
+            assert!(has_forbidden_module_lint_suppression(&fixture));
+        }
+
+        let approved_item = [
+            "#[cfg_attr(all(not(test), not(feature = \"test-instrumentation\")), ",
+            "allow(",
+            "dead_code",
+            "))] fn reserved_for_task6() {}",
+        ]
+        .concat();
+        assert!(!has_forbidden_module_lint_suppression(&approved_item));
+    }
+
+    #[test]
     fn production_modules_use_only_exact_task6_item_lint_exceptions() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let product_cfg = "#[cfg(any(test, not(feature = \"test-instrumentation\")))]";
@@ -250,8 +313,12 @@ mod tests {
             );
         }
 
+        let production_root = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
         let allow_prefix = ["allow", "("].concat();
-        assert!(!source.contains(&allow_prefix));
+        assert!(!production_root.contains(&allow_prefix));
 
         let top_level_item_allow = [
             "#[cfg_attr(\n    all(not(test), not(feature = \"test-instrumentation\")),\n    ",
@@ -272,6 +339,42 @@ mod tests {
         let result_registry = include_str!("result_registry.rs").replace("\r\n", "\n");
         let session_marker = include_str!("session_marker.rs").replace("\r\n", "\n");
         let validation_data = include_str!("validation_data.rs").replace("\r\n", "\n");
+        let product_sources = [
+            ("lib.rs", production_root),
+            ("atomic_file.rs", include_str!("atomic_file.rs")),
+            ("commands.rs", include_str!("commands.rs")),
+            ("apps/mod.rs", include_str!("apps/mod.rs")),
+            ("apps/action.rs", include_str!("apps/action.rs")),
+            ("apps/cache.rs", include_str!("apps/cache.rs")),
+            ("apps/discovery.rs", include_str!("apps/discovery.rs")),
+            ("apps/rank.rs", include_str!("apps/rank.rs")),
+            ("apps/shortcut.rs", include_str!("apps/shortcut.rs")),
+            (
+                "apps/windows_backend.rs",
+                include_str!("apps/windows_backend.rs"),
+            ),
+            ("model.rs", include_str!("model.rs")),
+            ("result_registry.rs", result_registry.as_str()),
+            ("session_marker.rs", session_marker.as_str()),
+            ("settings.rs", include_str!("settings.rs")),
+            ("validation_data.rs", validation_data.as_str()),
+            ("validation_export.rs", include_str!("validation_export.rs")),
+        ];
+
+        for (name, product_source) in product_sources {
+            assert!(
+                !has_forbidden_module_lint_suppression(product_source),
+                "module-level lint suppression is forbidden: {name}"
+            );
+        }
+        let task6_exception_count = product_sources
+            .iter()
+            .map(|(_, product_source)| {
+                product_source.matches(&top_level_item_allow).count()
+                    + product_source.matches(&nested_item_allow).count()
+            })
+            .sum::<usize>();
+        assert_eq!(task6_exception_count, 6);
 
         assert!(
             result_registry.contains(&format!("{nested_item_allow}\n    pub(crate) fn on_show"))
