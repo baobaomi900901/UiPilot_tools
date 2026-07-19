@@ -1148,6 +1148,17 @@ unsafe fn reclaim_subclass_context<T>(raw: usize) {
     drop(unsafe { Box::from_raw(raw as *mut T) });
 }
 
+unsafe fn remove_subclass_context_with<T, R>(raw: usize, remove: R) -> bool
+where
+    R: FnOnce() -> bool,
+{
+    let removed = remove();
+    if removed {
+        unsafe { reclaim_subclass_context::<T>(raw) };
+    }
+    removed
+}
+
 unsafe extern "system" fn session_subclass_proc(
     hwnd: HWND,
     message: u32,
@@ -1167,9 +1178,11 @@ unsafe extern "system" fn session_subclass_proc(
         },
         || {
             let _ = unsafe {
-                RemoveWindowSubclass(hwnd, Some(session_subclass_proc), SESSION_SUBCLASS_ID)
+                remove_subclass_context_with::<AppHandle, _>(context, || {
+                    RemoveWindowSubclass(hwnd, Some(session_subclass_proc), SESSION_SUBCLASS_ID)
+                        .as_bool()
+                })
             };
-            unsafe { reclaim_subclass_context::<AppHandle>(context) };
         },
     ))
 }
@@ -3283,7 +3296,7 @@ mod tests {
                 || panic!("destroy must not clean the marker"),
                 || {
                     remove_calls.set(remove_calls.get() + 1);
-                    unsafe { reclaim_subclass_context::<DropProbe>(raw) };
+                    assert!(unsafe { remove_subclass_context_with::<DropProbe, _>(raw, || true) });
                 },
             ),
             79
@@ -3291,6 +3304,37 @@ mod tests {
         assert_eq!(remove_calls.get(), 1);
         assert_eq!(default_calls.get(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let retained_raw =
+            install_subclass_context_with(DropProbe(Arc::clone(&retained_drops)), |_| true)
+                .unwrap();
+        let remove_calls = Cell::new(0);
+        let default_calls = Cell::new(0);
+        assert_eq!(
+            handle_session_message_with(
+                WM_NCDESTROY,
+                0,
+                || {
+                    default_calls.set(default_calls.get() + 1);
+                    assert_eq!(retained_drops.load(Ordering::Relaxed), 0);
+                    83
+                },
+                || panic!("destroy must not clean the marker"),
+                || {
+                    remove_calls.set(remove_calls.get() + 1);
+                    assert!(!unsafe {
+                        remove_subclass_context_with::<DropProbe, _>(retained_raw, || false)
+                    });
+                },
+            ),
+            83
+        );
+        assert_eq!(remove_calls.get(), 1);
+        assert_eq!(default_calls.get(), 1);
+        assert_eq!(retained_drops.load(Ordering::Relaxed), 0);
+        unsafe { reclaim_subclass_context::<DropProbe>(retained_raw) };
+        assert_eq!(retained_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
