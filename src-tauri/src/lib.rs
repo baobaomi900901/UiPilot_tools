@@ -140,17 +140,19 @@ mod tests {
         }
     }
 
-    fn has_forbidden_module_lint_suppression(source: &str) -> bool {
+    fn has_forbidden_production_lint_suppression(source: &str) -> bool {
         let compact = source
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
+        let approved_task6 =
+            "#[cfg_attr(all(not(test),not(feature=\"test-instrumentation\")),allow(dead_code))]";
+        let test_only = "#[cfg_attr(test,allow(dead_code))]";
         let mut remaining = compact.as_str();
 
         while let Some(start) = remaining.find('#') {
             let candidate = &remaining[start..];
-            let is_inner = candidate.starts_with("#![");
-            if !is_inner && !candidate.starts_with("#[") {
+            if !candidate.starts_with("#![") && !candidate.starts_with("#[") {
                 remaining = &candidate[1..];
                 continue;
             }
@@ -158,16 +160,9 @@ mod tests {
                 break;
             };
             let attribute = &candidate[..=end];
-            let following_item = candidate[end + 1..]
-                .split(['{', ';'])
-                .next()
-                .unwrap_or_default();
-            let applies_to_module = is_inner
-                || following_item.starts_with("mod")
-                || (following_item.starts_with("pub") && following_item.contains("mod"));
-            let suppresses_lint =
-                attribute.contains("allow(dead_code") || attribute.contains("allow(unused_imports");
-            if applies_to_module && suppresses_lint {
+            let suppresses_lint = attribute.contains("allow(")
+                && (attribute.contains("dead_code") || attribute.contains("unused_imports"));
+            if suppresses_lint && attribute != approved_task6 && attribute != test_only {
                 return true;
             }
             remaining = &candidate[end + 1..];
@@ -266,11 +261,19 @@ mod tests {
     }
 
     #[test]
-    fn lint_oracle_rejects_module_level_suppressions() {
+    fn lint_oracle_rejects_unapproved_production_suppressions() {
         for fixture in [
             ["#![", "allow(", "dead_code", ")]"].concat(),
             ["#![cfg_attr(not(test), ", "allow(", "unused_imports", "))]"].concat(),
             ["#[", "allow(", "dead_code", ")] mod nested;"].concat(),
+            ["#[", "allow(", "dead_code", ")] fn unapproved() {}"].concat(),
+            [
+                "#[",
+                "allow(",
+                "dead_code",
+                ")] #[doc = \"x\"] mod nested {}",
+            ]
+            .concat(),
             [
                 "#[cfg_attr(not(test), ",
                 "allow(",
@@ -279,7 +282,7 @@ mod tests {
             ]
             .concat(),
         ] {
-            assert!(has_forbidden_module_lint_suppression(&fixture));
+            assert!(has_forbidden_production_lint_suppression(&fixture));
         }
 
         let approved_item = [
@@ -289,7 +292,7 @@ mod tests {
             "))] fn reserved_for_task6() {}",
         ]
         .concat();
-        assert!(!has_forbidden_module_lint_suppression(&approved_item));
+        assert!(!has_forbidden_production_lint_suppression(&approved_item));
     }
 
     #[test]
@@ -363,8 +366,8 @@ mod tests {
 
         for (name, product_source) in product_sources {
             assert!(
-                !has_forbidden_module_lint_suppression(product_source),
-                "module-level lint suppression is forbidden: {name}"
+                !has_forbidden_production_lint_suppression(product_source),
+                "unapproved production lint suppression is forbidden: {name}"
             );
         }
         let task6_exception_count = product_sources
