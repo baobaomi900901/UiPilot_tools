@@ -101,30 +101,6 @@ pub(crate) enum FocusDecision {
 }
 
 impl ModalState {
-    fn begin_export<F>(&mut self, query_focus: F) -> Result<(), FocusDecision>
-    where
-        F: FnOnce() -> Result<bool, ()>,
-    {
-        match self {
-            Self::Normal => {
-                *self = Self::Open;
-                Ok(())
-            }
-            Self::Open => Err(FocusDecision::Suppress),
-            Self::AwaitingFocusRestore => {
-                *self = Self::Normal;
-                match query_focus() {
-                    Ok(true) => {
-                        *self = Self::Open;
-                        Ok(())
-                    }
-                    Ok(false) => Err(FocusDecision::ClearAndHide),
-                    Err(()) => Err(FocusDecision::ReportWindowFailureAndHide),
-                }
-            }
-        }
-    }
-
     fn finish_export(&mut self) {
         if *self == Self::Open {
             *self = Self::AwaitingFocusRestore;
@@ -284,6 +260,36 @@ pub(crate) struct ModalGuard {
     coordinator: Arc<LifecycleCoordinator>,
 }
 
+struct ModalRecoveryClaim {
+    coordinator: Arc<LifecycleCoordinator>,
+    committed: bool,
+}
+
+impl ModalRecoveryClaim {
+    fn new(coordinator: &Arc<LifecycleCoordinator>) -> Self {
+        Self {
+            coordinator: Arc::clone(coordinator),
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ModalRecoveryClaim {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut modal = self.coordinator.modal.lock().expect("modal lock poisoned");
+        if *modal == ModalState::Open {
+            *modal = ModalState::Normal;
+        }
+    }
+}
+
 impl Drop for ModalGuard {
     fn drop(&mut self) {
         self.coordinator
@@ -429,11 +435,13 @@ impl LifecycleCoordinator {
             .expect("modal lock poisoned")
             .claim_export()?;
         if query_required {
+            let rollback = ModalRecoveryClaim::new(self);
             let focused = query_focus();
             self.modal
                 .lock()
                 .expect("modal lock poisoned")
                 .resolve_export_focus(focused)?;
+            rollback.commit();
         }
         Ok(ModalGuard {
             coordinator: Arc::clone(self),
@@ -452,13 +460,16 @@ impl LifecycleCoordinator {
         app: &AppHandle,
         target: ShowTarget,
     ) -> Result<ShowOutcome, LifecycleError> {
-        let Some((window, registry)) = self.show_main_with_resolver(|| {
-            let window = app
-                .get_webview_window("main")
-                .ok_or(LifecycleError::WindowFailed)?;
-            let registry = app.state::<ResultRegistry>();
-            Ok((window, registry))
-        })?
+        let Some((window, registry)) = self.show_main_with_resolver(
+            || self.observe_exit(),
+            || {
+                let window = app
+                    .get_webview_window("main")
+                    .ok_or(LifecycleError::WindowFailed)?;
+                let registry = app.state::<ResultRegistry>();
+                Ok((window, registry))
+            },
+        )?
         else {
             return Ok(ShowOutcome::Ignored);
         };
@@ -500,11 +511,16 @@ impl LifecycleCoordinator {
         self.show_main_core(target, &mut operations)
     }
 
-    fn show_main_with_resolver<T, R>(&self, resolve: R) -> Result<Option<T>, LifecycleError>
+    fn show_main_with_resolver<T, O, R>(
+        &self,
+        observe_exit: O,
+        resolve: R,
+    ) -> Result<Option<T>, LifecycleError>
     where
+        O: FnOnce() -> ExitState,
         R: FnOnce() -> Result<T, LifecycleError>,
     {
-        if self.observe_exit() != ExitState::Running {
+        if observe_exit() != ExitState::Running {
             return Ok(None);
         }
         resolve().map(Some)
@@ -515,10 +531,6 @@ impl LifecycleCoordinator {
         target: ShowTarget,
         operations: &mut ShowMainClosures<'_>,
     ) -> Result<ShowOutcome, LifecycleError> {
-        if self.observe_exit() != ExitState::Running {
-            return Ok(ShowOutcome::Ignored);
-        }
-
         let previous = self
             .next_invocation
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -805,25 +817,11 @@ mod tests {
 
     #[test]
     fn modal_normal_and_open_export_paths_allow_only_one_chooser() {
-        let queries = Cell::new(0);
         let mut state = ModalState::Normal;
-        assert_eq!(
-            state.begin_export(|| {
-                queries.set(queries.get() + 1);
-                Ok(true)
-            }),
-            Ok(())
-        );
+        assert_eq!(state.claim_export(), Ok(false));
         assert_eq!(state, ModalState::Open);
-        assert_eq!(
-            state.begin_export(|| {
-                queries.set(queries.get() + 1);
-                Ok(true)
-            }),
-            Err(FocusDecision::Suppress)
-        );
+        assert_eq!(state.claim_export(), Err(FocusDecision::Suppress));
         assert_eq!(state, ModalState::Open);
-        assert_eq!(queries.get(), 0);
     }
 
     #[test]
@@ -867,7 +865,8 @@ mod tests {
     #[test]
     fn modal_retry_and_successful_show_cannot_leave_awaiting_stuck() {
         let mut focused = ModalState::AwaitingFocusRestore;
-        assert_eq!(focused.begin_export(|| Ok(true)), Ok(()));
+        assert_eq!(focused.claim_export(), Ok(true));
+        assert_eq!(focused.resolve_export_focus(Ok(true)), Ok(()));
         assert_eq!(focused, ModalState::Open);
 
         for (focus_result, expected) in [
@@ -875,12 +874,10 @@ mod tests {
             (Err(()), FocusDecision::ReportWindowFailureAndHide),
         ] {
             let mut state = ModalState::AwaitingFocusRestore;
-            assert_eq!(state.begin_export(|| focus_result), Err(expected));
+            assert_eq!(state.claim_export(), Ok(true));
+            assert_eq!(state.resolve_export_focus(focus_result), Err(expected));
             assert_eq!(state, ModalState::Normal);
-            assert_eq!(
-                state.begin_export(|| panic!("Normal must not query focus")),
-                Ok(())
-            );
+            assert_eq!(state.claim_export(), Ok(false));
             assert_eq!(state, ModalState::Open);
         }
 
@@ -890,13 +887,6 @@ mod tests {
         state = ModalState::Open;
         state.on_successful_show();
         assert_eq!(state, ModalState::Open);
-
-        let mut state = ModalState::AwaitingFocusRestore;
-        let query = catch_unwind(AssertUnwindSafe(|| {
-            let _ = state.begin_export(|| panic!("retry focus query sentinel"));
-        }));
-        assert!(query.is_err());
-        assert_eq!(state, ModalState::Normal);
 
         let coordinator = coordinator_for_test();
         let first = coordinator.begin_modal_export(|| Ok(true)).unwrap();
@@ -918,6 +908,15 @@ mod tests {
             })
             .unwrap();
         drop(recovered);
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = coordinator.begin_modal_export(|| panic!("live focus query sentinel"));
+        }));
+        assert!(panic_result.is_err());
+        let after_panic = coordinator
+            .begin_modal_export(|| panic!("rollback must restore Normal"))
+            .unwrap();
+        drop(after_panic);
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1175,9 +1174,49 @@ mod tests {
                 .state = state;
             let probe = ShowProbe::default();
             let resolutions = Cell::new(0);
+            let observations = Cell::new(0);
             assert_eq!(
-                coordinator.show_main_with_resolver(|| {
+                coordinator.show_main_with_resolver(
+                    || {
+                        observations.set(observations.get() + 1);
+                        coordinator.observe_exit()
+                    },
+                    || {
+                        resolutions.set(resolutions.get() + 1);
+                        run_show_case(
+                            &coordinator,
+                            ShowTarget::Launcher,
+                            1,
+                            ShowFailure::None,
+                            &probe,
+                        )
+                    },
+                ),
+                Ok(None)
+            );
+            assert_eq!(observations.get(), 1);
+            assert_eq!(resolutions.get(), 0);
+            assert!(probe.trace.borrow().is_empty());
+            assert_eq!(coordinator.next_invocation.load(Ordering::Relaxed), 0);
+        }
+
+        let coordinator = coordinator_for_test();
+        let probe = ShowProbe::default();
+        let observations = Cell::new(0);
+        let resolutions = Cell::new(0);
+        assert_eq!(
+            coordinator.show_main_with_resolver(
+                || {
+                    observations.set(observations.get() + 1);
+                    coordinator.observe_exit()
+                },
+                || {
                     resolutions.set(resolutions.get() + 1);
+                    coordinator
+                        .exit_gate
+                        .lock()
+                        .expect("exit gate lock poisoned")
+                        .state = ExitState::Cleaning;
                     run_show_case(
                         &coordinator,
                         ShowTarget::Launcher,
@@ -1185,13 +1224,12 @@ mod tests {
                         ShowFailure::None,
                         &probe,
                     )
-                }),
-                Ok(None)
-            );
-            assert_eq!(resolutions.get(), 0);
-            assert!(probe.trace.borrow().is_empty());
-            assert_eq!(coordinator.next_invocation.load(Ordering::Relaxed), 0);
-        }
+                },
+            ),
+            Ok(Some(ShowOutcome::Shown))
+        );
+        assert_eq!(observations.get(), 1);
+        assert_eq!(resolutions.get(), 1);
     }
 
     #[test]
@@ -1452,7 +1490,7 @@ mod tests {
         }
         {
             let mut modal = coordinator.modal.lock().expect("modal lock poisoned");
-            assert_eq!(modal.begin_export(|| Ok(true)), Ok(()));
+            assert_eq!(modal.claim_export(), Ok(false));
             modal.finish_export();
             modal.on_successful_show();
         }
