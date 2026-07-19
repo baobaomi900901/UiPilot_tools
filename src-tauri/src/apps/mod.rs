@@ -8,12 +8,14 @@ use windows::Win32::Security::Cryptography::{
     BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
 };
 
+mod action;
 mod cache;
 mod discovery;
 mod rank;
 mod shortcut;
 mod windows_backend;
 
+pub(crate) use action::{execute_application, ApplicationActionOutcome};
 pub(crate) use cache::{start_initial_refresh, AppCache};
 
 pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application> {
