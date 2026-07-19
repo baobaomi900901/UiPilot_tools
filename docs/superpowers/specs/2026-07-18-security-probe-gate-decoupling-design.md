@@ -19,10 +19,13 @@
 3. production 构建仍不包含 probe 页面或 probe 代码；
 4. 任务报告明确标记 runtime probe 为未解决的 release blocker，而不是通过或忽略。
 
-runtime positive probe 继续作为 main 推送、签名安装包、公开试用和发布的硬闸门。
+runtime positive probe 继续作为签名安装包、公开试用、公开演示、下载和发布的硬闸门。
 在探针通道经独立设计修复并通过 cold evidence 前，不得进行这些动作；唯一例外是用户在
 收到具体风险说明后，对精确 commit/artifact 作出显式 security waiver。当前没有 waiver，
 也不授权删除探针。
+
+普通 Git 源代码推送不等同发布，不属于 `ReleaseSecurityBlocked` 的语义。它仍受当前协作
+流程约束：未经用户明确授权不得推送；这项操作授权不能解释为 runtime security waiver。
 
 开放的发布阻断编号固定为 `SEC-RUNTIME-PROBE-001`。所有后续 Task、Foundation 和
 MVP-A 状态报告都必须携带该编号，直到技术修复或精确 waiver 正式关闭它。
@@ -55,9 +58,10 @@ dispatch seam 无法证明该 runtime 语义。
 ## 目标
 
 1. 允许不触碰安全信任输入的 Foundation 任务继续完成和接受代码复审。
-2. 用可执行、失败闭合的 Git 范围门禁证明任务没有改变 trust inputs。
+2. 用 Task 4C 计划内一次性、失败闭合的 Git/.NET 范围门禁证明任务没有改变 trust
+   inputs。
 3. 保留精确静态配置检查和恶意 fixtures 作为每个解耦任务的必跑门禁。
-4. 保持 runtime probe 对 main 推送、签名、公开试用和发布的硬阻断。
+4. 保持 runtime probe 对签名、公开试用、公开演示、下载和发布的硬阻断。
 5. 为 Task 4C 定义唯一恢复路径，不带入两个失败 worktree 的代码。
 6. 对任何安全相关变更自动取消解耦资格并要求独立安全复审。
 
@@ -67,7 +71,7 @@ dispatch seam 无法证明该 runtime 语义。
   通道。
 - 不删除 runtime probe、feature、脚本、页面、配置或 capability。
 - 不把静态门禁声明为 runtime ACL 的等价证明。
-- 不批准 Task 5+、`/find`、main 合并/推送、签名或发布。
+- 不批准 Task 5+、`/find`、签名、外部试用或发布；源代码推送仍需用户单独授权。
 - 不清理、提交或复用两个失败实现 worktree。
 
 ## 方案比较
@@ -75,12 +79,12 @@ dispatch seam 无法证明该 runtime 语义。
 ### 方案 A：按 trust inputs 零变化解耦任务门禁
 
 采用。安全无关任务可以得到 `TaskCodeGo`，但 runtime probe 保持
-`ReleaseSecurityBlocked`。任务必须从获批 trust baseline 计算 committed、index、
-worktree 和 untracked 的完整变化集；任一 trust-input 路径出现即失败闭合。
+`ReleaseSecurityBlocked`。任务必须从获批 trust baseline 计算 committed、index、worktree、
+untracked 和 ignored trust 候选的完整变化集；任一 trust-input 路径出现即失败闭合。
 
 优点：保留发布保证，同时避免一个 test-instrumentation 通道阻塞纯持久化、导出等本地
-业务代码。代价：需要冻结 trust-input manifest、实现结构化 diff checker，并在每个任务
-报告中维护双状态。
+业务代码。代价：需要冻结 trust-input manifest，并在 Task 4C 计划中写清一次性范围门禁
+和双状态报告。
 
 ### 方案 B：删除 runtime probe，只保留静态门禁
 
@@ -102,7 +106,7 @@ handler 和 command/event/file backchannel。它们都会新增生命周期、�
 |---|---|---|
 | `TaskCodeGo` | 任务功能、质量门禁通过，且 trust inputs 零变化 | 本地任务提交、代码复审、获批后的本地非破坏性集成 |
 | `TaskSecurityReviewRequired` | 任务触碰任一 trust input 或 diff oracle 不可认证 | 停止任务合并，进入独立安全设计/复审 |
-| `ReleaseSecurityBlocked` | runtime positive probe 未通过或证据已过期 | 禁止 main 推送、签名、公开试用和发布 |
+| `ReleaseSecurityBlocked` | runtime positive probe 未通过或证据已过期 | 禁止签名、公开试用、公开演示、下载和发布 |
 | `ReleaseSecurityGo` | 精确发布候选通过另行批准的 cold runtime evidence | 仍需发布计划和用户授权，不能自动发布 |
 
 `TaskCodeGo + ReleaseSecurityBlocked` 是方案 A 的正常状态，不是矛盾。报告必须同时显示
@@ -122,7 +126,6 @@ untracked 的所有后代。当前冻结集合至少包括：
 | Tauri config/override | `src-tauri/` 根下匹配 `tauri*.conf.json`、`tauri*.conf.json5` 或 `tauri*.conf.toml` 的所有文件 |
 | Static security oracle | `scripts/check-security-config.ps1`, `scripts/test-security-config.ps1` |
 | Runtime probe build/test | `scripts/build-security-probe.ps1`, `scripts/test-security-probe.ps1` |
-| Trust diff oracle | 后续获批的 `scripts/check-security-trust-inputs.ps1`, `scripts/test-security-trust-inputs.ps1` |
 | Probe frontend | `security-probe.html`, `src/security-probe.ts` |
 | Probe/runtime wiring | `src-tauri/src/security_probe.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/main.rs` |
 | Rust feature/dependencies | `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/build.rs` |
@@ -137,53 +140,52 @@ untracked 的所有后代。当前冻结集合至少包括：
 - 新注册的 Tauri command 所在源文件必须在独立安全复审中加入 manifest。当前已注册的
   feature-only command 源由 `security_probe.rs` 覆盖；未来只改实现文件但不改 `lib.rs`
   不能绕过该规则；
-- manifest、checker 或 fixture 自身是 trust inputs，不能由使用解耦门禁的任务修改。
+- manifest 只能经独立安全设计/复审修改；普通任务不能缩小或排除路径。
 
 路径集合是下限。安全复审可以扩大集合，但普通任务不得缩小或排除路径。
 
-### 结构化 diff oracle
+### Task 4C 一次性范围门禁
 
-书面设计获批后，先独立实现并代码复审
-`check-security-trust-inputs.ps1` 及恶意 fixtures，再允许 Task 4C 使用。checker 必须：
+Task 4C 是当前唯一消费者，不新增通用 checker、manifest classifier 或 fixture 框架。获批
+实施计划必须内联一段 PowerShell 门禁，直接使用现有 Git 和 .NET API，并固定以下合同：
 
-1. 接收一个不可变 trust baseline tag；验证 tag 存在、解析为预期 commit，且为当前 HEAD
-   祖先；
-2. 用 `git diff --no-renames` 计算 baseline 到 HEAD、index 和 worktree 的 tracked 变化，
-   并合并 `git ls-files --others --exclude-standard` 的 untracked 路径；
-3. 独立通过 .NET 文件系统 API 枚举 manifest 的目录规则和根级 glob，包含 Git ignored
-   文件；把当前 trust inventory 与 baseline 的 `git ls-tree` inventory 比较。每项包含
-   规范路径、类型和经 Git clean filter 计算的 blob ID，不能只比较文件名。新增 ignored
-   capability/config/lockfile、内容变化、删除文件、普通文件变为 reparse point，或无法
-   读取元数据都必须失败；不得依赖 `.gitignore`、stat cache、assume-unchanged 或
-   skip-worktree 判断安全路径是否变化；
-4. 排序去重后先验证每个路径只含批准的安全字符；引号、控制字符、绝对路径、`.`/`..`
-   段、反斜杠或无法无损解析的输出使整个门禁失败，不尝试猜测；
-5. 对删除和重命名保留旧路径。使用 `--no-renames`，确保从 trust 集合移出表现为旧路径
-   删除加新路径新增；
-6. 对每个变化路径运行同一 manifest classifier；命中一个即以非零退出，并列出相对路径；
-7. 只有 Git 变化集和文件系统 inventory 都证明 trust 命中数严格为零时输出固定成功
-   标记；空变化集也可成功；
-8. 不接受前端、环境变量或调用方提供的排除规则，不支持 `--force`、skip 或 waiver 参数。
+1. 创建 immutable lightweight tag，精确指向
+   `6b2348e3694f4a8f45df97d84ccf6f1de3c6d516`；门禁验证 tag 解析为该 SHA，且该 SHA 是
+   当前 `HEAD` 的祖先。若计划复审决定使用另一个 SHA，必须在计划中同时替换 tag、预期
+   SHA 和理由，不能从环境变量读取；
+2. 通过 `System.Diagnostics.Process` 以参数数组调用 Git，取得二进制 stdout，并严格按
+   NUL 分隔解析路径。分别收集 baseline 到 `HEAD`、index 和 worktree 的 tracked 变化；
+   精确命令形态分别为 `git diff --no-renames --name-status -z <baseline> HEAD --`、
+   `git diff --cached --no-renames --name-status -z HEAD --` 和
+   `git diff --no-renames --name-status -z --`，保留删除和移出 trust 集合前的旧路径；
+3. `git ls-files --others --exclude-standard -z` 收集全部非 ignored untracked 路径并纳入最终
+   变化集。另以 frozen manifest 的固定 literal/glob pathspec 运行
+   `git ls-files --others --ignored --exclude-standard -z -- <trust-pathspecs>`，只检查 ignored
+   trust 候选，避免枚举 `target` 等无关构建目录；返回任一路径即失败，不读取或哈希内容；
+4. 严格解析 `git ls-files -v -z`。任一 trust 路径带 assume-unchanged 或 skip-worktree
+   标记即失败；命令失败、未知状态字符或输出无法严格解码同样失败；
+5. 用 .NET `File.GetAttributes` 检查已存在的 trust 根、trust 文件和候选路径。任一命中
+   `ReparsePoint`、元数据读取失败，或 trust 根从普通目录变为其他类型即失败；
+6. Git 原始路径必须用严格 UTF-8 解码，规范为 `/` 后按 ordinal ignore-case 匹配 manifest；
+   NUL 记录结构错误、绝对路径、`.`/`..` 段、反斜杠或控制字符都失败闭合；
+7. 合并 tracked 变化和非 ignored untracked 路径，排序、去重后的完整变化集必须精确等于
+   `src-tauri/src/validation_export.rs`；ignored trust 候选集必须为空。路径缺失、出现第二
+   项、trust 命中或 Git/.NET 命令不可运行均返回非零；
+8. 门禁不接收排除规则、`--force`、skip 或 waiver 参数。命令文本和预期成功标记直接写入
+   获批 Task 4C 计划，由代码复审对实际执行证据逐项核对。
 
-checker 不能自证清白。每个任务的获批计划必须先用 Git 原生命令验证当前 checker 和
-fixture 文件的 blob ID 与 baseline 中对应 blob ID 精确相同，且无 staged/worktree
-变化；只有这个最小 bootstrap 通过后才执行 worktree 中的 checker。静态配置脚本也在
-trust checker 通过后运行。调用顺序不得反转。
-
-fixtures 至少证明：tracked 修改、staged 修改、已提交修改、删除、rename 出目录、大小写
-变更、untracked 文件、嵌套 capability 的 JSON/JSON5/TOML、新 config override、新 lockfile、
-被 `.gitignore` 隐藏的 trust 文件、reparse point、Git path-control 修改、checker 自修改和
-不安全路径编码全部被拒绝；普通 `validation_export.rs` 变化被接受。
-
-单纯在任务命令中写一组 `git diff --name-only` 不足以建立此安全边界；checker 与 fixtures
-代码级 Go 是 Task 4C 解冻的前置交付物。
+这里不计算 worktree 内容的 Git clean-filter blob。tracked trust 内容变化由 baseline、
+index 和 worktree diff 直接检测，并通过拒绝 assume-unchanged/skip-worktree 关闭 stat
+旁路；untracked、ignored 和 reparse 候选只按存在性与类型失败。若第二个真实任务需要重复
+同一门禁，再单独评审是否抽取脚本，Task 4C 不预付这项抽象成本。
 
 ## 解耦任务门禁
 
-一个任务只有在下面全部通过时才能得到 `TaskCodeGo`：
+当前只有 Task 4C 可以使用该解耦合同。它只有在下面全部通过时才能得到 `TaskCodeGo`：
 
 1. 任务计划已经批准，并声明精确功能文件 allowlist；
-2. trust diff checker 对该任务的 immutable trust baseline 输出固定成功标记；
+2. 计划内一次性范围门禁验证 immutable baseline、完整变化集和 trust inputs，并输出固定
+   成功标记；
 3. `scripts/check-security-config.ps1` 退出 `0` 并输出 `security config ok`；
 4. `scripts/test-security-config.ps1` 退出 `0` 并输出
    `security config regression tests ok`；
@@ -194,11 +196,11 @@ fixtures 至少证明：tracked 修改、staged 修改、已提交修改、删�
 
 以下任一情况直接得到 `TaskSecurityReviewRequired`，不能用人工口头确认继续：
 
-- trust diff checker 不可运行、输出不可解析、baseline 不匹配或不是祖先；
+- 一次性范围门禁不可运行、输出不可解析、baseline 不匹配或不是祖先；
 - 任一 trust input 变化；
-- 静态 checker 或任一恶意 fixture 失败；
+- 现有静态 checker 或任一现有恶意 fixture 失败；
 - production 构建包含 probe 页面；
-- 任务需要修改 manifest/checker 来让自己通过。
+- 任务需要修改 manifest 或内联门禁来让自己通过。
 
 runtime positive probe 在解耦任务 completion gate 中记录为已知 release blocker，不运行
 预热/重试来制造任务成功。它也不能被替换为 hostname 负例；负例只认证测试脚本的失败
@@ -213,14 +215,12 @@ Task 4C 当前分支 `codex/foundation-task-4` 固定在
 Task 4C 只可按以下顺序恢复：
 
 1. 本设计书面 Go；
-2. 更新门禁解耦实施计划，计划 Go 后实现 trust diff checker/fixtures；
-3. checker/fixtures 代码级 Go；
-4. 将获批门禁提交非破坏性集成到 Task 4 分支，精确暂存相关文件，不触碰现有
-   `validation_export.rs` diff；
-5. 在集成后的 clean trust inputs 上创建新的 immutable Task 4C trust baseline tag；
-6. 从头运行 Task 4C completion gate、trust 零变化门禁、静态安全门禁和 production
+2. 更新 Task 4C 实施计划，内联一次性 Git/.NET 范围门禁、精确 SHA/tag 和执行命令；
+3. 计划书面 Go 后，在不修改现有 `validation_export.rs` diff 的前提下创建 immutable
+   Task 4C trust baseline tag；
+4. 从头运行 Task 4C completion gate、trust 零变化门禁、静态安全门禁和 production
    隔离门禁；
-7. Task 4C 代码级 Go 后只允许本地任务提交和获批的本地非破坏性集成。
+5. Task 4C 代码级 Go 后只允许本地任务提交和获批的本地非破坏性集成。
 
 任何一步触碰 trust input、无法保全现有 Task 4C diff，或要求清理两个失败 probe
 worktree，立即停止并重新复审。Task 4C 完成不等于 Foundation 完成，更不等于 MVP-A
@@ -230,10 +230,12 @@ worktree，立即停止并重新复审。Task 4C 完成不等于 Foundation 完�
 
 以下动作继续禁止：
 
-- 向 `origin/main` 推送或把 Foundation 工作合入可发布主线；
 - 构建或分发签名安装包；
 - 启动 12 人试用、公开下载、公开演示构建或任何外部发布；
 - 声明 security gate、Foundation 或 MVP-A release ready。
+
+源代码提交、合并或推送不由本安全状态自动禁止或授权。它们继续遵守各任务的代码复审和
+用户操作授权；即使用户授权普通 source push，也不改变 `ReleaseSecurityBlocked`。
 
 解除 `ReleaseSecurityBlocked` 需要二选一：
 
@@ -254,16 +256,18 @@ waiver 只处理 runtime probe 风险，不自动授权 Git push、签名或发�
 - `D:\code\UiPilot_tools\.worktrees\security-probe-reliability`：page-load 失败 R1；
 - `D:\code\UiPilot_tools\.worktrees\security-probe-direct-eval`：direct-eval fresh `82` R1。
 
-不得 cherry-pick、部分复制或把其单元测试通过结果声明为 runtime 证据。设计和 checker
-实现都从获批 tag 的 clean worktree 开始。
+不得 cherry-pick、部分复制或把其单元测试通过结果声明为 runtime 证据。Task 4C 不从这
+两个 worktree 复制任何代码。
 
 ## 交付顺序
 
 1. 本次只新增本文档并送书面复审。
-2. 设计 Go 后只更新门禁解耦实施计划；计划复审前不修改脚本或 Task 4。
-3. 计划 Go 后在新 worktree 中 TDD 实现 trust checker/fixtures，并做代码级复审。
-4. 门禁代码 Go 后才允许制定 Task 4C 保全式集成步骤和创建 trust baseline tag。
-5. Task 4C 完成后仍保持 `ReleaseSecurityBlocked`，不得进入 Task 5+ 或发布流程，除非另有
+2. 设计 Go 后只更新 Task 4C 实施计划，写入一次性内联门禁；计划复审前不修改脚本、代码
+   或 Task 4 工作区。
+3. 计划 Go 后创建获批 baseline tag，并从头运行 Task 4C completion gate；不新增通用门禁
+   代码或 fixtures。
+4. Task 4C 代码级 Go 后仍保持 `ReleaseSecurityBlocked`，不得进入 Task 5+ 或发布流程，
+   除非另有
    明确授权。
 
 ## 验收矩阵
@@ -272,7 +276,7 @@ waiver 只处理 runtime probe 风险，不自动授权 Git push、签名或发�
 |---|---|---|
 | 只改 `validation_export.rs`，trust/static/quality 全绿 | `TaskCodeGo` | `ReleaseSecurityBlocked` |
 | 修改 capability/config/security script/probe wiring | `TaskSecurityReviewRequired` | `ReleaseSecurityBlocked` |
-| checker baseline 不匹配或漏算 untracked | Fail closed | `ReleaseSecurityBlocked` |
+| 内联门禁 baseline 不匹配或漏算 tracked/untracked/ignored | Fail closed | `ReleaseSecurityBlocked` |
 | 静态配置或恶意 fixture 失败 | Fail closed | `ReleaseSecurityBlocked` |
 | runtime probe 仍为 74/82 | 不反向否决已隔离的 TaskCodeGo | `ReleaseSecurityBlocked` |
 | 新 probe cold evidence 对精确候选通过 | 仍需任务各自 Go | 可申请 `ReleaseSecurityGo` 复审 |
@@ -281,4 +285,4 @@ waiver 只处理 runtime probe 风险，不自动授权 Git push、签名或发�
 ## 完成边界
 
 本文档获批只表示可以编写门禁解耦实施计划。它不解冻 Task 4C，不授权修改安全脚本，
-不批准任何失败 probe 代码，也不允许 main 推送、签名、试用或发布。
+不批准任何失败 probe 代码，也不允许签名、试用或发布；源代码推送仍需用户单独授权。
