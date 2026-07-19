@@ -76,10 +76,14 @@ coordinator performs exactly these non-destructive preparation steps:
 1. Create immutable lightweight tag `foundation-task-4c-trust-baseline` at
    `6b2348e3694f4a8f45df97d84ccf6f1de3c6d516`. If the tag already exists, it must resolve to that
    SHA; never move or recreate it.
-2. Integrate the approved plan's exact single-file commit into `codex/foundation-task-4`. Before and
+2. Create immutable lightweight evidence tag `foundation-task-4c-gate-plan` at the final docs commit
+   named by the written plan-Go message. Record that exact commit SHA; never move or recreate the tag.
+3. Integrate the exact commit named by `foundation-task-4c-gate-plan` into
+   `codex/foundation-task-4`. Before and
    after integration, `src-tauri/src/validation_export.rs` must remain the only unstaged code diff;
-   the integrated commit must change only this plan file.
-3. The resulting Task 4C `HEAD` must have baseline SHA `6b2348e...` as its direct parent, and its
+   the integrated commit must change only this plan file, and its plan-file blob must equal the blob
+   stored by the evidence tag.
+4. The resulting Task 4C `HEAD` must have baseline SHA `6b2348e...` as its direct parent, and its
    commit diff must contain only
    `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md`.
 
@@ -338,8 +342,10 @@ $GateWorkingDirectory = [IO.Path]::GetFullPath(
 )
 $BaselineSha = '6b2348e3694f4a8f45df97d84ccf6f1de3c6d516'
 $ApprovedPlanSha = 'c1e4d9c649d4710113206f630fc9d594ae8d2b7e'
+$GatePlanTag = 'foundation-task-4c-gate-plan'
 $PlanPath = 'docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md'
 $ExportPath = 'src-tauri/src/validation_export.rs'
+$GatePlanEvidenceSha = $null
 $TrustPathspecArguments = @(
   'src-tauri/capabilities/'
   'src-tauri/permissions/'
@@ -539,7 +545,7 @@ function Get-GitText {
   $trimmed
 }
 
-function Get-NameStatusPaths {
+function Get-NameStatusEntries {
   param(
     [string] $Arguments,
     [string] $Purpose
@@ -555,7 +561,27 @@ function Get-NameStatusPaths {
     if ($tokens[$index] -cnotmatch '^[AMDTUXB]$') {
       throw "Unexpected diff status for $Purpose"
     }
-    Assert-GitPath $tokens[$index + 1]
+    $path = Assert-GitPath $tokens[$index + 1]
+    [pscustomobject]@{
+      Status = $tokens[$index]
+      Path = $path
+    }
+  }
+}
+
+function Assert-SingleModifiedEntry {
+  param(
+    [object[]] $Entries,
+    [string] $ExpectedPath,
+    [string] $Purpose
+  )
+
+  if (
+    $Entries.Count -ne 1 -or
+    $Entries[0].Status -cne 'M' -or
+    -not [StringComparer]::Ordinal.Equals($Entries[0].Path, $ExpectedPath)
+  ) {
+    throw "$Purpose must contain exactly one M entry for $ExpectedPath"
   }
 }
 
@@ -692,6 +718,20 @@ function Assert-Task4CScope {
   )
   Require-GitSuccess $approvedPlanAncestor 'Foundation Task 4 plan ancestry'
 
+  $gatePlanSha = Get-GitText (
+    'rev-parse --verify refs/tags/foundation-task-4c-gate-plan^{}'
+  ) 'Task 4C gate-plan evidence tag'
+  $gatePlanBlob = Get-GitText (
+    'rev-parse refs/tags/foundation-task-4c-gate-plan:docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md'
+  ) 'approved gate-plan blob'
+  $headPlanBlob = Get-GitText (
+    'rev-parse HEAD:docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md'
+  ) 'integrated gate-plan blob'
+  if (-not [StringComparer]::Ordinal.Equals($gatePlanBlob, $headPlanBlob)) {
+    throw 'Integrated Task 4C plan content differs from the approved evidence tag'
+  }
+  $script:GatePlanEvidenceSha = $gatePlanSha
+
   $parentSha = Get-GitText 'rev-parse HEAD^' 'Task 4C plan parent'
   if (-not [StringComparer]::Ordinal.Equals($parentSha, $BaselineSha)) {
     throw 'Task 4C plan commit is not directly based on the approved baseline'
@@ -701,15 +741,15 @@ function Assert-Task4CScope {
   ) 'integrated plan commit')
   Assert-ExactPaths $planCommitPaths @($PlanPath) 'integrated plan commit'
 
-  $restrictedCommitted = @(Get-NameStatusPaths (
+  $restrictedCommitted = @(Get-NameStatusEntries (
     'diff --no-renames --name-status -z 6b2348e3694f4a8f45df97d84ccf6f1de3c6d516 HEAD -- ' +
     $TrustPathspecArguments
   ) 'committed trust diff')
-  $restrictedIndex = @(Get-NameStatusPaths (
+  $restrictedIndex = @(Get-NameStatusEntries (
     'diff --cached --no-renames --name-status -z HEAD -- ' +
     $TrustPathspecArguments
   ) 'index trust diff')
-  $restrictedWorktree = @(Get-NameStatusPaths (
+  $restrictedWorktree = @(Get-NameStatusEntries (
     'diff --no-renames --name-status -z -- ' +
     $TrustPathspecArguments
   ) 'worktree trust diff')
@@ -717,13 +757,13 @@ function Assert-Task4CScope {
     throw 'Task 4C changed a frozen trust input'
   }
 
-  $fullCommitted = @(Get-NameStatusPaths (
+  $fullCommitted = @(Get-NameStatusEntries (
     'diff --no-renames --name-status -z 6b2348e3694f4a8f45df97d84ccf6f1de3c6d516 HEAD --'
   ) 'committed task diff')
-  $fullIndex = @(Get-NameStatusPaths (
+  $fullIndex = @(Get-NameStatusEntries (
     'diff --cached --no-renames --name-status -z HEAD --'
   ) 'index task diff')
-  $fullWorktree = @(Get-NameStatusPaths (
+  $fullWorktree = @(Get-NameStatusEntries (
     'diff --no-renames --name-status -z --'
   ) 'worktree task diff')
   $untracked = @(Get-LsFilesPaths (
@@ -738,6 +778,14 @@ function Assert-Task4CScope {
   ) 'ignored trust paths')
   if ($untrackedTrust.Count -ne 0 -or $ignoredTrust.Count -ne 0) {
     throw 'Task 4C contains an untracked or ignored trust input'
+  }
+  Assert-SingleModifiedEntry $fullCommitted $PlanPath 'committed task layer'
+  if ($fullIndex.Count -ne 0) {
+    throw 'Task 4C index must be empty'
+  }
+  Assert-SingleModifiedEntry $fullWorktree $ExportPath 'worktree task layer'
+  if ($untracked.Count -ne 0) {
+    throw 'Task 4C must not contain untracked paths'
   }
 
   Assert-NoTrustIndexFlags (
@@ -759,13 +807,8 @@ function Assert-Task4CScope {
   foreach ($candidate in @($trackedTrust + $untracked + $ignoredTrust)) {
     Assert-NoReparseComponents $candidate $true $false
   }
-
-  Assert-ExactPaths @(
-    $fullCommitted + $fullIndex + $fullWorktree + $untracked
-  ) @(
-    $PlanPath
-    $ExportPath
-  ) 'Task 4C complete change set'
+  Assert-NoReparseComponents $PlanPath $true $false
+  Assert-NoReparseComponents $ExportPath $true $false
 }
 
 # Authenticate scope before executing repository-owned scripts or build wiring.
@@ -825,13 +868,16 @@ Require-GitSuccess $diffCheck 'final diff check'
 
 Write-Output 'TaskCodeGo candidate: Task 4C gates passed'
 Write-Output 'ReleaseSecurityBlocked: SEC-RUNTIME-PROBE-001'
+Write-Output "GatePlanEvidence: $GatePlanTag=$GatePlanEvidenceSha"
 ```
 
-Expected: every native command's raw exit code is checked; the immutable baseline, plan-only HEAD,
-restricted trust view, complete two-path view, index flags, ignored/untracked candidates and every
-reparse component pass before and after repository-owned commands. Rust, static security fixtures and
-the production build pass, production contains no probe page, and the fixed final output reports both
-TaskCodeGo candidate and ReleaseSecurityBlocked: SEC-RUNTIME-PROBE-001. The runtime positive probe is
+Expected: every native command's raw exit code is checked; the immutable baseline, approved plan
+evidence tag/blob, plan-only HEAD, restricted trust view, index flags, ignored candidates and every
+reparse component pass before and after repository-owned commands. The committed layer is exactly one
+M entry for the plan, the index is empty, the worktree layer is exactly one M entry for the export, and
+nonignored untracked is empty. Rust, static security fixtures and the production build pass, production
+contains no probe page, and the fixed final output reports TaskCodeGo candidate,
+ReleaseSecurityBlocked: SEC-RUNTIME-PROBE-001 and the evidence-tag SHA. The runtime positive probe is
 not run and is not claimed as passing. No src/protocol.ts, command, capability, dependency or Task 5
 action file is allowed.
 
