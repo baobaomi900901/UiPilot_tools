@@ -14,9 +14,29 @@ use crate::{
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UserSettings {
+pub(crate) struct AppAliasTarget {
+    app_id: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SettingsView {
+    hotkey: String,
+    autostart: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    research_id: Option<String>,
+    applications: Vec<AppAliasTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserSettingsUpdate {
     hotkey: String,
     autostart: bool,
     research_id: Option<String>,
@@ -190,35 +210,42 @@ pub(crate) fn load_settings(
     window: WebviewWindow,
     settings: State<'_, SettingsStore>,
     cache: State<'_, Arc<AppCache>>,
-) -> Result<UserSettings, CommandError> {
+) -> Result<SettingsView, CommandError> {
     require_main_window(&window)?;
     Ok(load_settings_core(&settings, &cache))
 }
 
-fn load_settings_core(settings: &SettingsStore, cache: &AppCache) -> UserSettings {
+fn load_settings_core(settings: &SettingsStore, cache: &AppCache) -> SettingsView {
     let settings = settings.snapshot();
-    let applications = cache.snapshot();
-    let aliases = settings
-        .aliases
+    let applications = cache
+        .snapshot()
         .into_iter()
-        .filter(|(app_id, _)| {
-            applications
-                .iter()
-                .any(|application| application.app_id == *app_id)
+        .map(|application| {
+            let aliases = settings
+                .aliases
+                .get(&application.app_id)
+                .cloned()
+                .unwrap_or_default();
+            AppAliasTarget {
+                app_id: application.app_id,
+                display_name: application.display_name,
+                icon: application.icon,
+                aliases,
+            }
         })
         .collect();
-    UserSettings {
+    SettingsView {
         hotkey: settings.hotkey,
         autostart: settings.autostart,
         research_id: settings.research_id,
-        aliases,
+        applications,
     }
 }
 
 #[tauri::command]
 pub(crate) fn save_settings(
     window: WebviewWindow,
-    settings: UserSettings,
+    settings: UserSettingsUpdate,
     settings_store: State<'_, SettingsStore>,
     cache: State<'_, Arc<AppCache>>,
 ) -> Result<(), CommandError> {
@@ -227,7 +254,7 @@ pub(crate) fn save_settings(
 }
 
 fn save_settings_core(
-    settings: UserSettings,
+    settings: UserSettingsUpdate,
     store: &SettingsStore,
     cache: &AppCache,
 ) -> Result<(), CommandError> {
@@ -489,7 +516,8 @@ mod tests {
         clear_validation_data_with, execute_result_with, export_validation_data_with,
         hide_launcher_with, load_settings_core, map_export_worker_result, map_rescan_result,
         require_main_label, rescan_apps_with, save_settings_core, search_apps_with,
-        spawn_export_worker, CommandError, ExecuteOutcome, ExportOutcome, UserSettings,
+        spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome,
+        SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome},
@@ -500,9 +528,14 @@ mod tests {
 
     const APP_CURRENT: &str =
         "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const APP_ABSENT: &str = "app-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const APP_UNKNOWN: &str =
+    const APP_EMPTY: &str = "app-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const APP_DUPLICATE_A: &str =
         "app-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const APP_DUPLICATE_B: &str =
+        "app-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const APP_ABSENT: &str = "app-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const APP_UNKNOWN: &str =
+        "app-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
@@ -543,16 +576,36 @@ mod tests {
         }
     }
 
-    fn current_application() -> Application {
-        Application {
-            app_id: APP_CURRENT.into(),
-            display_name: "Current".into(),
-            shortcut: PathBuf::from(r"C:\Private\Current.lnk"),
-            executable: None,
-            icon: None,
-            aliases: Vec::new(),
-            use_count: 0,
-        }
+    fn settings_applications() -> Vec<Application> {
+        vec![
+            Application {
+                app_id: APP_EMPTY.into(),
+                display_name: "Empty App".into(),
+                shortcut: PathBuf::from(r"C:\Private\Empty.lnk"),
+                executable: Some(PathBuf::from(r"C:\Private\Empty.exe")),
+                icon: None,
+                aliases: vec!["cache alias must not leak".into()],
+                use_count: 17,
+            },
+            Application {
+                app_id: APP_DUPLICATE_A.into(),
+                display_name: "Duplicate App".into(),
+                shortcut: PathBuf::from(r"C:\Private\DuplicateA.lnk"),
+                executable: Some(PathBuf::from(r"C:\Private\DuplicateA.exe")),
+                icon: Some("icon-a".into()),
+                aliases: Vec::new(),
+                use_count: 23,
+            },
+            Application {
+                app_id: APP_DUPLICATE_B.into(),
+                display_name: "Duplicate App".into(),
+                shortcut: PathBuf::from(r"C:\Private\DuplicateB.lnk"),
+                executable: None,
+                icon: None,
+                aliases: Vec::new(),
+                use_count: 31,
+            },
+        ]
     }
 
     fn trusted_action() -> ResultAction {
@@ -563,16 +616,16 @@ mod tests {
         }
     }
 
-    fn settings_store(dir: &TestDir) -> SettingsStore {
+    fn settings_store(dir: &TestDir, research_id: Option<&str>) -> SettingsStore {
         let settings = Settings {
             hotkey: "Alt+Space".into(),
             autostart: false,
-            research_id: Some("study_01".into()),
+            research_id: research_id.map(str::to_owned),
             aliases: BTreeMap::from([
-                (APP_CURRENT.into(), vec!["current alias".into()]),
+                (APP_DUPLICATE_A.into(), vec!["seed alias".into()]),
                 (APP_ABSENT.into(), vec!["absent alias".into()]),
             ]),
-            use_counts: BTreeMap::from([(APP_CURRENT.into(), 9)]),
+            use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
         };
         fs::write(
             dir.path().join("settings.json"),
@@ -699,47 +752,131 @@ mod tests {
     }
 
     #[test]
-    fn settings_load_save_roundtrip_projects_current_alias_and_preserves_absent_data() {
+    fn settings_load_projects_all_current_applications_in_cache_order() {
         let dir = TestDir::new();
-        let store = settings_store(&dir);
-        let cache = AppCache::from_apps(vec![current_application()]);
+        let store = settings_store(&dir, Some("study_01"));
+        let cache = AppCache::from_apps(settings_applications());
 
         let loaded = load_settings_core(&store, &cache);
         assert_eq!(
-            loaded.aliases,
-            BTreeMap::from([(APP_CURRENT.into(), vec!["current alias".into()])])
+            loaded,
+            SettingsView {
+                hotkey: "Alt+Space".into(),
+                autostart: false,
+                research_id: Some("study_01".into()),
+                applications: vec![
+                    AppAliasTarget {
+                        app_id: APP_EMPTY.into(),
+                        display_name: "Empty App".into(),
+                        icon: None,
+                        aliases: Vec::new(),
+                    },
+                    AppAliasTarget {
+                        app_id: APP_DUPLICATE_A.into(),
+                        display_name: "Duplicate App".into(),
+                        icon: Some("icon-a".into()),
+                        aliases: vec!["seed alias".into()],
+                    },
+                    AppAliasTarget {
+                        app_id: APP_DUPLICATE_B.into(),
+                        display_name: "Duplicate App".into(),
+                        icon: None,
+                        aliases: Vec::new(),
+                    },
+                ],
+            }
         );
-        assert!(!serde_json::to_string(&loaded)
-            .unwrap()
-            .contains("useCounts"));
 
-        save_settings_core(loaded, &store, &cache).unwrap();
-
-        let final_settings = store.snapshot();
-        assert_eq!(final_settings.aliases[APP_CURRENT], ["current alias"]);
-        assert_eq!(final_settings.aliases[APP_ABSENT], ["absent alias"]);
-        assert_eq!(final_settings.use_counts[APP_CURRENT], 9);
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert!(json.contains(r#""researchId":"study_01""#));
+        assert!(!json.contains(APP_ABSENT));
+        for private in ["shortcut", "executable", "path", "useCounts"] {
+            assert!(!json.contains(private), "settings view exposed {private}");
+        }
+        assert!(!json.contains(r#""researchId":null"#));
     }
 
     #[test]
-    fn settings_save_rejects_forged_or_unknown_ids_without_mutation() {
+    fn settings_research_id_json_contract_distinguishes_view_and_update() {
         let dir = TestDir::new();
-        let store = settings_store(&dir);
-        let cache = AppCache::from_apps(vec![current_application()]);
+        let store = settings_store(&dir, None);
+        let cache = AppCache::from_apps(settings_applications());
+        let view_json = serde_json::to_value(load_settings_core(&store, &cache)).unwrap();
+
+        assert!(!view_json.as_object().unwrap().contains_key("researchId"));
+
+        for input in [
+            serde_json::json!({
+                "hotkey": "Alt+Space",
+                "autostart": false,
+                "aliases": {}
+            }),
+            serde_json::json!({
+                "hotkey": "Alt+Space",
+                "autostart": false,
+                "researchId": null,
+                "aliases": {}
+            }),
+        ] {
+            let update: UserSettingsUpdate = serde_json::from_value(input).unwrap();
+            assert_eq!(update.research_id, None);
+        }
+    }
+
+    #[test]
+    fn settings_task7_update_preserves_absent_alias_and_all_use_counts() {
+        let dir = TestDir::new();
+        let store = settings_store(&dir, Some("study_01"));
+        let cache = AppCache::from_apps(settings_applications());
+        let before = store.snapshot();
+        let loaded = load_settings_core(&store, &cache);
+        let aliases = loaded
+            .applications
+            .into_iter()
+            .map(|application| (application.app_id, application.aliases))
+            .collect();
+
+        save_settings_core(
+            UserSettingsUpdate {
+                hotkey: loaded.hotkey,
+                autostart: loaded.autostart,
+                research_id: loaded.research_id,
+                aliases,
+            },
+            &store,
+            &cache,
+        )
+        .unwrap();
+
+        let final_settings = store.snapshot();
+        assert_eq!(final_settings.aliases[APP_DUPLICATE_A], ["seed alias"]);
+        assert_eq!(final_settings.aliases[APP_ABSENT], ["absent alias"]);
+        assert_eq!(final_settings.use_counts, before.use_counts);
+    }
+
+    #[test]
+    fn settings_save_rejects_forged_or_unknown_ids_before_windows_seam() {
+        let dir = TestDir::new();
+        let store = settings_store(&dir, Some("study_01"));
+        let cache = AppCache::from_apps(settings_applications());
         let before = store.snapshot();
 
         for key in ["forged", APP_UNKNOWN] {
-            let update = UserSettings {
+            let windows_calls = Cell::new(0);
+            let update = UserSettingsUpdate {
                 hotkey: "Alt+Space".into(),
                 autostart: false,
                 research_id: Some("study_01".into()),
                 aliases: BTreeMap::from([(key.into(), vec!["bad".into()])]),
             };
             assert_eq!(
-                save_settings_core(update, &store, &cache),
+                save_settings_core(update, &store, &cache).map(|()| {
+                    windows_calls.set(windows_calls.get() + 1);
+                }),
                 Err(CommandError::settings_failed())
             );
             assert_eq!(store.snapshot(), before);
+            assert_eq!(windows_calls.get(), 0);
         }
     }
 
