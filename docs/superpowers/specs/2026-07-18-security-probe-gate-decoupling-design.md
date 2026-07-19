@@ -149,33 +149,41 @@ untracked 的所有后代。当前冻结集合至少包括：
 Task 4C 是当前唯一消费者，不新增通用 checker、manifest classifier 或 fixture 框架。获批
 实施计划必须内联一段 PowerShell 门禁，直接使用现有 Git 和 .NET API，并固定以下合同：
 
-1. 创建 immutable lightweight tag，精确指向
+1. 创建 immutable lightweight tag `foundation-task-4c-trust-baseline`，精确指向
    `6b2348e3694f4a8f45df97d84ccf6f1de3c6d516`；门禁验证 tag 解析为该 SHA，且该 SHA 是
-   当前 `HEAD` 的祖先。若计划复审决定使用另一个 SHA，必须在计划中同时替换 tag、预期
-   SHA 和理由，不能从环境变量读取；
-2. 通过 `System.Diagnostics.Process` 以参数数组调用 Git，取得二进制 stdout，并严格按
-   NUL 分隔解析路径。分别收集 baseline 到 `HEAD`、index 和 worktree 的 tracked 变化；
-   精确命令形态分别为 `git diff --no-renames --name-status -z <baseline> HEAD --`、
-   `git diff --cached --no-renames --name-status -z HEAD --` 和
-   `git diff --no-renames --name-status -z --`，保留删除和移出 trust 集合前的旧路径；
-3. `git ls-files --others --exclude-standard -z` 收集全部非 ignored untracked 路径并纳入最终
+   当前 `HEAD` 的祖先。tag 名和 SHA 硬编码在获批计划中，不能替换或从环境变量读取；
+2. 兼容仓库当前 Windows PowerShell 5.1/.NET Framework 环境：用
+   `System.Diagnostics.ProcessStartInfo`，`FileName` 设为 `Get-Command git.exe` 解析并验证
+   得到的绝对应用路径，`Arguments` 设为获批计划逐字冻结、完全硬编码且不接收外部输入的
+   Windows 参数字符串，`RedirectStandardOutput = true`；从 `StandardOutput.BaseStream`
+   读取二进制 stdout，并严格按 NUL 分隔解析。不得使用该环境不存在的 `ArgumentList`，
+   也不新增 PowerShell 7 依赖；
+3. 对同一 baseline、`HEAD`、index 和 worktree 分别计算两个视图。trust 视图的三次
+   `git diff --no-renames --name-status -z` 只传入获批计划硬编码的 frozen trust pathspec，
+   合并结果必须为空；完整任务视图的三次 diff 不传 pathspec，保留删除和重命名前旧路径，
+   用于最后的精确 allowlist 断言；
+4. `git ls-files --others --exclude-standard -z` 收集全部非 ignored untracked 路径并纳入最终
    变化集。另以 frozen manifest 的固定 literal/glob pathspec 运行
    `git ls-files --others --ignored --exclude-standard -z -- <trust-pathspecs>`，只检查 ignored
    trust 候选，避免枚举 `target` 等无关构建目录；返回任一路径即失败，不读取或哈希内容；
-4. 严格解析 `git ls-files -v -z`。任一 trust 路径带 assume-unchanged 或 skip-worktree
+5. 严格解析 `git ls-files -v -z`。任一 trust 路径带 assume-unchanged 或 skip-worktree
    标记即失败；命令失败、未知状态字符或输出无法严格解码同样失败；
-5. 用 .NET `File.GetAttributes` 检查已存在的 trust 根、trust 文件和候选路径。任一命中
-   `ReparsePoint`、元数据读取失败，或 trust 根从普通目录变为其他类型即失败；
-6. Git 原始路径必须用严格 UTF-8 解码，规范为 `/` 后按 ordinal ignore-case 匹配 manifest；
+6. 先认证 `git rev-parse --show-toplevel` 得到的 worktree 根与当前工作目录一致。再从该根
+   开始，到每个现存 trust 根、trust 文件、ignored/untracked candidate 为止，对每一级现存
+   路径组件逐项调用 .NET `File.GetAttributes`；任一父目录或最终组件命中 `ReparsePoint`、
+   类型不符、组件越出认证根或元数据读取失败都失败闭合；
+7. Git 原始路径必须用严格 UTF-8 解码，规范为 `/` 后按 ordinal ignore-case 匹配 manifest；
    NUL 记录结构错误、绝对路径、`.`/`..` 段、反斜杠或控制字符都失败闭合；
-7. 合并 tracked 变化和非 ignored untracked 路径，排序、去重后的完整变化集必须精确等于
-   `src-tauri/src/validation_export.rs`；ignored trust 候选集必须为空。路径缺失、出现第二
-   项、trust 命中或 Git/.NET 命令不可运行均返回非零；
-8. 门禁不接收排除规则、`--force`、skip 或 waiver 参数。命令文本和预期成功标记直接写入
+8. 合并完整任务视图的 tracked 变化和非 ignored untracked 路径，排序、去重后的完整变化集
+   必须精确等于两项：
+   `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md` 和
+   `src-tauri/src/validation_export.rs`；trust 视图和 ignored trust 候选集必须为空。路径
+   缺失、出现第三项、trust 命中或 Git/.NET 命令不可运行均返回非零；
+9. 门禁不接收排除规则、`--force`、skip 或 waiver 参数。命令文本和预期成功标记直接写入
    获批 Task 4C 计划，由代码复审对实际执行证据逐项核对。
 
-这里不计算 worktree 内容的 Git clean-filter blob。tracked trust 内容变化由 baseline、
-index 和 worktree diff 直接检测，并通过拒绝 assume-unchanged/skip-worktree 关闭 stat
+这里不计算 worktree 内容的 Git clean-filter blob。tracked trust 内容变化由三个 restricted
+trust diff 直接检测，并通过拒绝 assume-unchanged/skip-worktree 关闭 stat
 旁路；untracked、ignored 和 reparse 候选只按存在性与类型失败。若第二个真实任务需要重复
 同一门禁，再单独评审是否抽取脚本，Task 4C 不预付这项抽象成本。
 
@@ -215,12 +223,16 @@ Task 4C 当前分支 `codex/foundation-task-4` 固定在
 Task 4C 只可按以下顺序恢复：
 
 1. 本设计书面 Go；
-2. 更新 Task 4C 实施计划，内联一次性 Git/.NET 范围门禁、精确 SHA/tag 和执行命令；
-3. 计划书面 Go 后，在不修改现有 `validation_export.rs` diff 的前提下创建 immutable
-   Task 4C trust baseline tag；
-4. 从头运行 Task 4C completion gate、trust 零变化门禁、静态安全门禁和 production
-   隔离门禁；
-5. Task 4C 代码级 Go 后只允许本地任务提交和获批的本地非破坏性集成。
+2. 在独立文档分支更新
+   `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md`，内联一次性
+   Git/.NET 范围门禁、精确 SHA/tag、PowerShell 5.1 命令和两个允许路径，再做书面复审；
+3. 计划书面 Go 后，先创建 `foundation-task-4c-trust-baseline` 并验证它精确指向
+   `6b2348e3694f4a8f45df97d84ccf6f1de3c6d516`；
+4. 把获批计划的精确单文件提交非破坏性集成进 `codex/foundation-task-4`，提交前后都验证
+   现有 `validation_export.rs` 仍为唯一未暂存代码 diff，且计划文件是该次集成唯一提交项；
+5. 从头运行 Task 4C completion gate、restricted trust 零变化门禁、两文件完整 allowlist、
+   静态安全门禁和 production 隔离门禁；
+6. Task 4C 代码级 Go 后只允许本地任务提交和获批的本地非破坏性集成。
 
 任何一步触碰 trust input、无法保全现有 Task 4C diff，或要求清理两个失败 probe
 worktree，立即停止并重新复审。Task 4C 完成不等于 Foundation 完成，更不等于 MVP-A
@@ -262,10 +274,10 @@ waiver 只处理 runtime probe 风险，不自动授权 Git push、签名或发�
 ## 交付顺序
 
 1. 本次只新增本文档并送书面复审。
-2. 设计 Go 后只更新 Task 4C 实施计划，写入一次性内联门禁；计划复审前不修改脚本、代码
-   或 Task 4 工作区。
-3. 计划 Go 后创建获批 baseline tag，并从头运行 Task 4C completion gate；不新增通用门禁
-   代码或 fixtures。
+2. 设计 Go 后只在独立文档分支更新 Task 4C 实施计划，写入一次性内联门禁；计划复审前不
+   修改脚本、代码或 Task 4 工作区。
+3. 计划 Go 后创建获批 baseline tag，再把获批计划的精确单文件提交集成进 Task 4 分支，
+   保全未暂存代码，然后从头运行 Task 4C completion gate；不新增通用门禁代码或 fixtures。
 4. Task 4C 代码级 Go 后仍保持 `ReleaseSecurityBlocked`，不得进入 Task 5+ 或发布流程，
    除非另有
    明确授权。
@@ -274,7 +286,7 @@ waiver 只处理 runtime probe 风险，不自动授权 Git push、签名或发�
 
 | 场景 | Task gate | Release gate |
 |---|---|---|
-| 只改 `validation_export.rs`，trust/static/quality 全绿 | `TaskCodeGo` | `ReleaseSecurityBlocked` |
+| 只改获批 Task 4C 计划和 `validation_export.rs`，trust/static/quality 全绿 | `TaskCodeGo` | `ReleaseSecurityBlocked` |
 | 修改 capability/config/security script/probe wiring | `TaskSecurityReviewRequired` | `ReleaseSecurityBlocked` |
 | 内联门禁 baseline 不匹配或漏算 tracked/untracked/ignored | Fail closed | `ReleaseSecurityBlocked` |
 | 静态配置或恶意 fixture 失败 | Fail closed | `ReleaseSecurityBlocked` |
