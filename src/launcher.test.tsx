@@ -942,6 +942,33 @@ describe('React view and accessibility', () => {
     bind.mockRestore()
   })
 
+  it('keeps the native binding and active composition owner across ordinary publishes', async () => {
+    installMatchMedia(false)
+    const unbind = vi.fn()
+    const bind = vi.spyOn(nativeInput, 'bindNativeTextInput').mockReturnValue(unbind)
+    const { core, client, emit } = await startedCore()
+    emit(shown('stable-binding'))
+    const retire = vi.spyOn(core, 'retireControl')
+    const control = core.getSnapshot().queryControl
+    const mounted = await mountLauncherView(core)
+
+    await act(async () => {
+      core.text({ kind: 'compositionStart', control, value: '' })
+      core.text({ kind: 'compositionUpdate', control, value: '计' })
+    })
+
+    expect(bind).toHaveBeenCalledOnce()
+    expect(unbind).not.toHaveBeenCalled()
+    expect(retire).not.toHaveBeenCalled()
+    await act(async () => core.text({ kind: 'compositionEnd', control, value: '计算器' }))
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'stable-binding', querySequence: 1 })
+
+    await mounted.unmount()
+    expect(unbind).toHaveBeenCalledOnce()
+    expect(retire).toHaveBeenCalledOnce()
+    bind.mockRestore()
+  })
+
   it('unbinds and retires old settings controls before a form replacement', async () => {
     installMatchMedia(false)
     const cleanup: string[] = []

@@ -90,6 +90,10 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     ready.current = true
     onReady('failed')
   }, [onReady])
+  const reportQueryBound = useCallback(() => {
+    queryRef.current = document.getElementById(`launcher-query-${snapshot.queryControl}`) as HTMLInputElement | null
+    reportReady()
+  }, [reportReady, snapshot.queryControl])
 
   useLayoutEffect(() => {
     if (!snapshot.invocationId) return
@@ -151,10 +155,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
         }
         onKeyDown={queryKeyDown}
-        onBound={() => {
-          queryRef.current = document.getElementById(`launcher-query-${snapshot.queryControl}`) as HTMLInputElement | null
-          reportReady()
-        }}
+        onBound={reportQueryBound}
         onBindingFailed={reportFailed}
       />
       <Spin spinning={snapshot.searchPending} size="small">
