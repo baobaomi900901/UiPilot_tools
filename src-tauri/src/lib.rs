@@ -148,27 +148,12 @@ mod tests {
         let approved_task6 =
             "#[cfg_attr(all(not(test),not(feature=\"test-instrumentation\")),allow(dead_code))]";
         let test_only = "#[cfg_attr(test,allow(dead_code))]";
-        let mut remaining = compact.as_str();
+        let unapproved = compact.replace(approved_task6, "").replace(test_only, "");
 
-        while let Some(start) = remaining.find('#') {
-            let candidate = &remaining[start..];
-            if !candidate.starts_with("#![") && !candidate.starts_with("#[") {
-                remaining = &candidate[1..];
-                continue;
-            }
-            let Some(end) = candidate.find(']') else {
-                break;
-            };
-            let attribute = &candidate[..=end];
-            let suppresses_lint = attribute.contains("allow(")
-                && (attribute.contains("dead_code") || attribute.contains("unused_imports"));
-            if suppresses_lint && attribute != approved_task6 && attribute != test_only {
-                return true;
-            }
-            remaining = &candidate[end + 1..];
-        }
-
-        false
+        unapproved.contains("allow")
+            && (unapproved.contains("dead_code")
+                || unapproved.contains("unused")
+                || unapproved.contains("warnings"))
     }
 
     #[test]
@@ -264,6 +249,9 @@ mod tests {
     fn lint_oracle_rejects_unapproved_production_suppressions() {
         for fixture in [
             ["#![", "allow(", "dead_code", ")]"].concat(),
+            ["#![", "allow /*gap*/ (", "dead_code", ")]"].concat(),
+            ["#![", "allow(", "unused", ")]"].concat(),
+            ["#![", "allow(", "warnings", ")]"].concat(),
             ["#![cfg_attr(not(test), ", "allow(", "unused_imports", "))]"].concat(),
             ["#[", "allow(", "dead_code", ")] mod nested;"].concat(),
             ["#[", "allow(", "dead_code", ")] fn unapproved() {}"].concat(),
