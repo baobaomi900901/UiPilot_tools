@@ -106,6 +106,13 @@ fn validate_user_settings_against(
 }
 
 impl SettingsStore {
+    pub(crate) fn validate_user_settings(
+        update: &SettingsUpdate,
+        cache: &AppCache,
+    ) -> Result<(), SettingsError> {
+        validate_user_settings_against(update, &cache.snapshot())
+    }
+
     pub(crate) fn load(app_data_dir: &Path) -> Result<Self, SettingsError> {
         fs::create_dir_all(app_data_dir).map_err(|_| SettingsError::Storage)?;
         let paths = AtomicPaths::new(app_data_dir, "settings.json");

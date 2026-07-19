@@ -8,10 +8,13 @@ use std::{
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
 use crate::{
     commands::clear_and_hide,
     result_registry::ResultRegistry,
+    settings::{Settings, SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
 };
 
@@ -82,6 +85,104 @@ impl Readiness {
             self.pending_target.take()
         } else {
             None
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeSettings<T = Shortcut> {
+    registered: Vec<T>,
+}
+
+impl<T> Default for RuntimeSettings<T> {
+    fn default() -> Self {
+        Self {
+            registered: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeSettingsChange<T> {
+    persisted: T,
+    requested: T,
+    autostart: bool,
+}
+
+impl<T> RuntimeSettings<T>
+where
+    T: Copy + Eq,
+{
+    fn apply_transaction<R, U, A, C, P>(
+        &mut self,
+        change: RuntimeSettingsChange<T>,
+        mut register: R,
+        mut unregister: U,
+        read_autostart: A,
+        mut change_autostart: C,
+        persist: P,
+    ) -> Result<(), ()>
+    where
+        R: FnMut(T) -> Result<(), ()>,
+        U: FnMut(T) -> Result<(), ()>,
+        A: FnOnce() -> Result<bool, ()>,
+        C: FnMut(bool) -> Result<(), ()>,
+        P: FnOnce() -> Result<(), ()>,
+    {
+        let mut index = 0;
+        while index < self.registered.len() {
+            let shortcut = self.registered[index];
+            if shortcut == change.persisted {
+                index += 1;
+            } else {
+                unregister(shortcut)?;
+                self.registered.remove(index);
+            }
+        }
+
+        let owned_new = if self.registered.contains(&change.requested) {
+            false
+        } else {
+            register(change.requested)?;
+            self.registered.push(change.requested);
+            true
+        };
+
+        let previous_autostart = match read_autostart() {
+            Ok(enabled) => enabled,
+            Err(()) => {
+                self.rollback_registration(change.requested, owned_new, &mut unregister);
+                return Err(());
+            }
+        };
+        let changed_autostart = previous_autostart != change.autostart;
+        if changed_autostart && change_autostart(change.autostart).is_err() {
+            self.rollback_registration(change.requested, owned_new, &mut unregister);
+            return Err(());
+        }
+
+        if persist().is_err() {
+            if changed_autostart {
+                let _ = change_autostart(previous_autostart);
+            }
+            self.rollback_registration(change.requested, owned_new, &mut unregister);
+            return Err(());
+        }
+
+        if change.requested != change.persisted {
+            unregister(change.persisted)?;
+            self.registered
+                .retain(|shortcut| *shortcut != change.persisted);
+        }
+        Ok(())
+    }
+
+    fn rollback_registration<U>(&mut self, shortcut: T, owned: bool, unregister: &mut U)
+    where
+        U: FnMut(T) -> Result<(), ()>,
+    {
+        if owned && unregister(shortcut).is_ok() {
+            self.registered.retain(|registered| *registered != shortcut);
         }
     }
 }
@@ -227,7 +328,7 @@ impl Default for ExitGate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReservationError {
+pub(crate) enum ReservationError {
     NotRunning,
     Overflow,
 }
@@ -240,6 +341,7 @@ pub(crate) struct LifecycleCoordinator {
     exit_gate: Mutex<ExitGate>,
     critical_changed: Condvar,
     pending_notice: Mutex<Option<LifecycleNotice>>,
+    runtime_settings: Mutex<RuntimeSettings>,
 }
 
 impl Default for LifecycleCoordinator {
@@ -251,6 +353,7 @@ impl Default for LifecycleCoordinator {
             exit_gate: Mutex::new(ExitGate::default()),
             critical_changed: Condvar::new(),
             pending_notice: Mutex::new(None),
+            runtime_settings: Mutex::new(RuntimeSettings::default()),
         }
     }
 }
@@ -312,7 +415,7 @@ struct ShowMainClosures<'a> {
 }
 
 #[derive(Debug)]
-struct CriticalReservation {
+pub(crate) struct CriticalReservation {
     coordinator: Arc<LifecycleCoordinator>,
     released: bool,
 }
@@ -340,6 +443,102 @@ impl Drop for CriticalReservation {
 }
 
 impl LifecycleCoordinator {
+    pub(crate) fn save_settings_transaction(
+        &self,
+        app: &AppHandle,
+        settings: &SettingsStore,
+        cache: &crate::apps::AppCache,
+        shortcut: Shortcut,
+        update: SettingsUpdate,
+    ) -> Result<(), ()> {
+        let mut runtime = self
+            .runtime_settings
+            .lock()
+            .expect("runtime settings lock poisoned");
+        let persisted = settings.snapshot();
+        let persisted_shortcut = persisted.hotkey.parse::<Shortcut>().map_err(|_| ())?;
+        let global_shortcut = app.global_shortcut();
+        let autostart = app.autolaunch();
+        runtime.apply_transaction(
+            RuntimeSettingsChange {
+                persisted: persisted_shortcut,
+                requested: shortcut,
+                autostart: update.autostart,
+            },
+            |shortcut| global_shortcut.register(shortcut).map_err(|_| ()),
+            |shortcut| global_shortcut.unregister(shortcut).map_err(|_| ()),
+            || autostart.is_enabled().map_err(|_| ()),
+            |enabled| {
+                if enabled {
+                    autostart.enable()
+                } else {
+                    autostart.disable()
+                }
+                .map_err(|_| ())
+            },
+            || settings.update_user_settings(update, cache).map_err(|_| ()),
+        )
+    }
+
+    pub(crate) fn reconcile_runtime_settings(
+        &self,
+        app: &AppHandle,
+        settings: &Settings,
+    ) -> Result<(), ()> {
+        let global_shortcut = app.global_shortcut();
+        let autostart = app.autolaunch();
+        self.reconcile_runtime_settings_with(
+            &settings.hotkey,
+            settings.autostart,
+            |value| value.parse::<Shortcut>().map_err(|_| ()),
+            |shortcut| global_shortcut.register(shortcut).map_err(|_| ()),
+            || autostart.is_enabled().map_err(|_| ()),
+            |enabled| {
+                if enabled {
+                    autostart.enable()
+                } else {
+                    autostart.disable()
+                }
+                .map_err(|_| ())
+            },
+        )
+    }
+
+    fn reconcile_runtime_settings_with<P, R, A, C>(
+        &self,
+        hotkey: &str,
+        expected_autostart: bool,
+        parse: P,
+        register: R,
+        read_autostart: A,
+        change_autostart: C,
+    ) -> Result<(), ()>
+    where
+        P: FnOnce(&str) -> Result<Shortcut, ()>,
+        R: FnOnce(Shortcut) -> Result<(), ()>,
+        A: FnOnce() -> Result<bool, ()>,
+        C: FnOnce(bool) -> Result<(), ()>,
+    {
+        let result = (|| {
+            let shortcut = parse(hotkey)?;
+            register(shortcut)?;
+            self.runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .registered
+                .push(shortcut);
+            let actual_autostart = read_autostart()?;
+            if actual_autostart != expected_autostart {
+                change_autostart(expected_autostart)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.set_notice_once(LifecycleNotice::SettingsFailed);
+        }
+        result
+    }
+
     pub(crate) fn request_show(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -606,7 +805,9 @@ impl LifecycleCoordinator {
         }
     }
 
-    fn reserve_critical(self: &Arc<Self>) -> Result<CriticalReservation, ReservationError> {
+    pub(crate) fn reserve_critical(
+        self: &Arc<Self>,
+    ) -> Result<CriticalReservation, ReservationError> {
         let mut gate = self.exit_gate.lock().expect("exit gate lock poisoned");
         if gate.state != ExitState::Running {
             return Err(ReservationError::NotRunning);
@@ -729,18 +930,24 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         panic::{catch_unwind, AssertUnwindSafe},
-        sync::{atomic::Ordering, Arc, Barrier},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        },
         thread,
         time::{Duration, Instant},
     };
 
     use super::*;
-    use crate::result_registry::ResultRegistry;
+    use crate::{commands::save_settings_worker_with, result_registry::ResultRegistry};
+    use tauri_plugin_global_shortcut::Shortcut;
 
     const _: fn(&Arc<LifecycleCoordinator>, &AppHandle, ShowTarget) -> Result<(), LifecycleError> =
         LifecycleCoordinator::request_show;
     const _: fn(&Arc<LifecycleCoordinator>, &AppHandle) -> Result<(), LifecycleError> =
         LifecycleCoordinator::mark_setup_ready;
+    const _: fn(&LifecycleCoordinator, &AppHandle, &Settings) -> Result<(), ()> =
+        LifecycleCoordinator::reconcile_runtime_settings;
 
     #[derive(Clone, Copy)]
     enum ReadyOrder {
@@ -1781,5 +1988,680 @@ mod tests {
             CleanDecision::ObserveOnly
         );
         assert_eq!(system.observe_exit(), ExitState::SystemEnding);
+    }
+
+    struct RuntimeProbe {
+        trace: RefCell<Vec<String>>,
+        autostart: Cell<Result<bool, ()>>,
+        register_failure: Cell<Option<&'static str>>,
+        unregister_failures: RefCell<Vec<&'static str>>,
+        autostart_failure_on_call: Cell<Option<usize>>,
+        autostart_calls: Cell<usize>,
+        persist_failure: Cell<bool>,
+        persist_calls: Cell<usize>,
+    }
+
+    impl Default for RuntimeProbe {
+        fn default() -> Self {
+            Self {
+                trace: RefCell::new(Vec::new()),
+                autostart: Cell::new(Ok(false)),
+                register_failure: Cell::new(None),
+                unregister_failures: RefCell::new(Vec::new()),
+                autostart_failure_on_call: Cell::new(None),
+                autostart_calls: Cell::new(0),
+                persist_failure: Cell::new(false),
+                persist_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl RuntimeProbe {
+        fn register(&self, shortcut: &'static str) -> Result<(), ()> {
+            self.trace.borrow_mut().push(format!("register-{shortcut}"));
+            (self.register_failure.get() != Some(shortcut))
+                .then_some(())
+                .ok_or(())
+        }
+
+        fn unregister(&self, shortcut: &'static str) -> Result<(), ()> {
+            self.trace
+                .borrow_mut()
+                .push(format!("unregister-{shortcut}"));
+            (!self.unregister_failures.borrow().contains(&shortcut))
+                .then_some(())
+                .ok_or(())
+        }
+
+        fn read_autostart(&self) -> Result<bool, ()> {
+            self.trace.borrow_mut().push("read-autostart".into());
+            self.autostart.get()
+        }
+
+        fn change_autostart(&self, enabled: bool) -> Result<(), ()> {
+            let call = self.autostart_calls.get() + 1;
+            self.autostart_calls.set(call);
+            self.trace.borrow_mut().push(format!("autostart-{enabled}"));
+            if self.autostart_failure_on_call.get() == Some(call) {
+                return Err(());
+            }
+            self.autostart.set(Ok(enabled));
+            Ok(())
+        }
+
+        fn persist(&self) -> Result<(), ()> {
+            self.persist_calls.set(self.persist_calls.get() + 1);
+            self.trace.borrow_mut().push("persist".into());
+            (!self.persist_failure.get()).then_some(()).ok_or(())
+        }
+    }
+
+    fn apply_runtime_change(
+        state: &mut RuntimeSettings<&'static str>,
+        change: RuntimeSettingsChange<&'static str>,
+        probe: &RuntimeProbe,
+    ) -> Result<(), ()> {
+        state.apply_transaction(
+            change,
+            |shortcut| probe.register(shortcut),
+            |shortcut| probe.unregister(shortcut),
+            || probe.read_autostart(),
+            |enabled| probe.change_autostart(enabled),
+            || probe.persist(),
+        )
+    }
+
+    #[test]
+    fn runtime_settings_enforces_two_registration_ceiling() {
+        let mut state = RuntimeSettings {
+            registered: vec!["A"],
+        };
+        let first = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            unregister_failures: RefCell::new(vec!["A"]),
+            ..RuntimeProbe::default()
+        };
+
+        assert_eq!(
+            apply_runtime_change(
+                &mut state,
+                RuntimeSettingsChange {
+                    persisted: "A",
+                    requested: "B",
+                    autostart: false,
+                },
+                &first,
+            ),
+            Err(())
+        );
+        assert_eq!(state.registered, ["A", "B"]);
+        assert_eq!(first.persist_calls.get(), 1);
+
+        let second = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            unregister_failures: RefCell::new(vec!["A"]),
+            ..RuntimeProbe::default()
+        };
+        assert_eq!(
+            apply_runtime_change(
+                &mut state,
+                RuntimeSettingsChange {
+                    persisted: "B",
+                    requested: "C",
+                    autostart: false,
+                },
+                &second,
+            ),
+            Err(())
+        );
+        assert_eq!(state.registered, ["A", "B"]);
+        assert_eq!(second.persist_calls.get(), 0);
+        assert_eq!(
+            *second.trace.borrow(),
+            ["unregister-A"],
+            "stale cleanup must precede every new side effect"
+        );
+    }
+
+    #[test]
+    fn runtime_settings_cleans_stale_before_registering_next_shortcut() {
+        let mut state = RuntimeSettings {
+            registered: vec!["A", "B"],
+        };
+        let probe = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            ..RuntimeProbe::default()
+        };
+
+        assert_eq!(
+            apply_runtime_change(
+                &mut state,
+                RuntimeSettingsChange {
+                    persisted: "B",
+                    requested: "C",
+                    autostart: false,
+                },
+                &probe,
+            ),
+            Ok(())
+        );
+        assert_eq!(state.registered, ["C"]);
+        assert_eq!(
+            *probe.trace.borrow(),
+            [
+                "unregister-A",
+                "register-C",
+                "read-autostart",
+                "persist",
+                "unregister-B",
+            ]
+        );
+
+        let conflict = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            register_failure: Cell::new(Some("B")),
+            ..RuntimeProbe::default()
+        };
+        let mut state = RuntimeSettings {
+            registered: vec!["A"],
+        };
+        assert_eq!(
+            apply_runtime_change(
+                &mut state,
+                RuntimeSettingsChange {
+                    persisted: "A",
+                    requested: "B",
+                    autostart: false,
+                },
+                &conflict,
+            ),
+            Err(())
+        );
+        assert_eq!(state.registered, ["A"]);
+        assert_eq!(*conflict.trace.borrow(), ["register-B"]);
+    }
+
+    #[test]
+    fn runtime_settings_orders_autostart_and_persistence_without_redundant_changes() {
+        let mut unchanged = RuntimeSettings {
+            registered: vec!["A"],
+        };
+        let unchanged_probe = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            ..RuntimeProbe::default()
+        };
+        assert_eq!(
+            apply_runtime_change(
+                &mut unchanged,
+                RuntimeSettingsChange {
+                    persisted: "A",
+                    requested: "A",
+                    autostart: false,
+                },
+                &unchanged_probe,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            *unchanged_probe.trace.borrow(),
+            ["read-autostart", "persist"]
+        );
+
+        let mut changed = RuntimeSettings {
+            registered: vec!["A"],
+        };
+        let changed_probe = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            ..RuntimeProbe::default()
+        };
+        assert_eq!(
+            apply_runtime_change(
+                &mut changed,
+                RuntimeSettingsChange {
+                    persisted: "A",
+                    requested: "B",
+                    autostart: true,
+                },
+                &changed_probe,
+            ),
+            Ok(())
+        );
+        assert_eq!(changed.registered, ["B"]);
+        assert_eq!(
+            *changed_probe.trace.borrow(),
+            [
+                "register-B",
+                "read-autostart",
+                "autostart-true",
+                "persist",
+                "unregister-A",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_settings_rolls_back_only_owned_changes_after_persist_failure() {
+        let mut state = RuntimeSettings {
+            registered: vec!["A"],
+        };
+        let probe = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            persist_failure: Cell::new(true),
+            ..RuntimeProbe::default()
+        };
+        assert_eq!(
+            apply_runtime_change(
+                &mut state,
+                RuntimeSettingsChange {
+                    persisted: "A",
+                    requested: "B",
+                    autostart: true,
+                },
+                &probe,
+            ),
+            Err(())
+        );
+        assert_eq!(state.registered, ["A"]);
+        assert_eq!(probe.autostart.get(), Ok(false));
+        assert_eq!(
+            *probe.trace.borrow(),
+            [
+                "register-B",
+                "read-autostart",
+                "autostart-true",
+                "persist",
+                "autostart-false",
+                "unregister-B",
+            ]
+        );
+
+        for (rollback_autostart_fails, rollback_unregister_fails) in
+            [(true, false), (false, true), (true, true)]
+        {
+            let mut state = RuntimeSettings {
+                registered: vec!["A"],
+            };
+            let probe = RuntimeProbe {
+                autostart: Cell::new(Ok(false)),
+                unregister_failures: RefCell::new(
+                    rollback_unregister_fails
+                        .then_some("B")
+                        .into_iter()
+                        .collect(),
+                ),
+                autostart_failure_on_call: Cell::new(rollback_autostart_fails.then_some(2)),
+                persist_failure: Cell::new(true),
+                ..RuntimeProbe::default()
+            };
+            assert_eq!(
+                apply_runtime_change(
+                    &mut state,
+                    RuntimeSettingsChange {
+                        persisted: "A",
+                        requested: "B",
+                        autostart: true,
+                    },
+                    &probe,
+                ),
+                Err(())
+            );
+            assert!(state.registered.len() <= 2);
+            assert!(state.registered.contains(&"A"));
+            assert_eq!(state.registered.contains(&"B"), rollback_unregister_fails);
+        }
+    }
+
+    #[test]
+    fn runtime_settings_autostart_failures_skip_persist_and_remove_owned_registration() {
+        for (read_result, change_failure) in [(Err(()), None), (Ok(false), Some(1))] {
+            let mut state = RuntimeSettings {
+                registered: vec!["A"],
+            };
+            let probe = RuntimeProbe {
+                autostart: Cell::new(read_result),
+                autostart_failure_on_call: Cell::new(change_failure),
+                ..RuntimeProbe::default()
+            };
+            assert_eq!(
+                apply_runtime_change(
+                    &mut state,
+                    RuntimeSettingsChange {
+                        persisted: "A",
+                        requested: "B",
+                        autostart: true,
+                    },
+                    &probe,
+                ),
+                Err(())
+            );
+            assert_eq!(state.registered, ["A"]);
+            assert_eq!(probe.persist_calls.get(), 0);
+            assert_eq!(probe.trace.borrow().last().unwrap(), "unregister-B");
+        }
+    }
+
+    #[test]
+    fn runtime_settings_startup_reconciles_persisted_values_or_sets_first_notice() {
+        let coordinator = coordinator_for_test();
+        let shortcut: Shortcut = "Alt+Space".parse().unwrap();
+        let trace = RefCell::new(Vec::new());
+        coordinator
+            .reconcile_runtime_settings_with(
+                "Alt+Space",
+                true,
+                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |registered| {
+                    assert_eq!(registered, shortcut);
+                    trace.borrow_mut().push("register");
+                    Ok(())
+                },
+                || {
+                    trace.borrow_mut().push("read-autostart");
+                    Ok(false)
+                },
+                |enabled| {
+                    assert!(enabled);
+                    trace.borrow_mut().push("autostart-true");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .registered,
+            [shortcut]
+        );
+        assert_eq!(
+            *trace.borrow(),
+            ["register", "read-autostart", "autostart-true"]
+        );
+        assert_eq!(*coordinator.pending_notice.lock().unwrap(), None);
+
+        let matching = coordinator_for_test();
+        let matching_registers = Cell::new(0);
+        let matching_reads = Cell::new(0);
+        let matching_changes = Cell::new(0);
+        matching
+            .reconcile_runtime_settings_with(
+                "Alt+Space",
+                false,
+                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |registered| {
+                    assert_eq!(registered, shortcut);
+                    matching_registers.set(matching_registers.get() + 1);
+                    Ok(())
+                },
+                || {
+                    matching_reads.set(matching_reads.get() + 1);
+                    Ok(false)
+                },
+                |_| {
+                    matching_changes.set(matching_changes.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(matching_registers.get(), 1);
+        assert_eq!(matching_reads.get(), 1);
+        assert_eq!(matching_changes.get(), 0);
+        assert_eq!(
+            matching
+                .runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .registered,
+            [shortcut]
+        );
+
+        for register_fails in [false, true] {
+            let coordinator = coordinator_for_test();
+            let result = coordinator.reconcile_runtime_settings_with(
+                if register_fails {
+                    "Alt+Space"
+                } else {
+                    "not a shortcut"
+                },
+                false,
+                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |_| if register_fails { Err(()) } else { Ok(()) },
+                || panic!("failed shortcut setup must skip autostart read"),
+                |_| panic!("failed shortcut setup must skip autostart change"),
+            );
+            assert_eq!(result, Err(()));
+            assert!(coordinator
+                .runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .registered
+                .is_empty());
+            assert_eq!(
+                *coordinator.pending_notice.lock().unwrap(),
+                Some(LifecycleNotice::SettingsFailed)
+            );
+        }
+
+        let read_failure = coordinator_for_test();
+        read_failure.set_notice_once(LifecycleNotice::ValidationFailed);
+        let read_failure_registers = Cell::new(0);
+        let read_failure_changes = Cell::new(0);
+        assert_eq!(
+            read_failure.reconcile_runtime_settings_with(
+                "Alt+Space",
+                false,
+                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |registered| {
+                    assert_eq!(registered, shortcut);
+                    read_failure_registers.set(read_failure_registers.get() + 1);
+                    Ok(())
+                },
+                || Err(()),
+                |_| {
+                    read_failure_changes.set(read_failure_changes.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(())
+        );
+        assert_eq!(read_failure_registers.get(), 1);
+        assert_eq!(read_failure_changes.get(), 0);
+        assert_eq!(
+            read_failure
+                .runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .registered,
+            [shortcut]
+        );
+        assert_eq!(
+            *read_failure.pending_notice.lock().unwrap(),
+            Some(LifecycleNotice::ValidationFailed),
+            "startup SettingsFailed must not overwrite the first notice"
+        );
+
+        let change_failure = coordinator_for_test();
+        let change_failure_registers = Cell::new(0);
+        let change_calls = Cell::new(0);
+        assert_eq!(
+            change_failure.reconcile_runtime_settings_with(
+                "Alt+Space",
+                true,
+                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |registered| {
+                    assert_eq!(registered, shortcut);
+                    change_failure_registers.set(change_failure_registers.get() + 1);
+                    Ok(())
+                },
+                || Ok(false),
+                |_| {
+                    change_calls.set(change_calls.get() + 1);
+                    Err(())
+                },
+            ),
+            Err(())
+        );
+        assert_eq!(change_failure_registers.get(), 1);
+        assert_eq!(change_calls.get(), 1);
+        assert_eq!(
+            change_failure
+                .runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .registered,
+            [shortcut]
+        );
+        assert_eq!(
+            *change_failure.pending_notice.lock().unwrap(),
+            Some(LifecycleNotice::SettingsFailed)
+        );
+    }
+
+    #[test]
+    fn save_blocks_clean_at_every_runtime_transaction_phase() {
+        #[derive(Default)]
+        struct RejectedSaveCounts {
+            dispatch: AtomicUsize,
+            register: AtomicUsize,
+            unregister: AtomicUsize,
+            autostart: AtomicUsize,
+            persist: AtomicUsize,
+            store: AtomicUsize,
+        }
+
+        impl RejectedSaveCounts {
+            fn assert_zero(&self) {
+                assert_eq!(self.dispatch.load(Ordering::Relaxed), 0);
+                assert_eq!(self.register.load(Ordering::Relaxed), 0);
+                assert_eq!(self.unregister.load(Ordering::Relaxed), 0);
+                assert_eq!(self.autostart.load(Ordering::Relaxed), 0);
+                assert_eq!(self.persist.load(Ordering::Relaxed), 0);
+                assert_eq!(self.store.load(Ordering::Relaxed), 0);
+            }
+        }
+
+        fn assert_clean_blocked(coordinator: &LifecycleCoordinator) {
+            assert_eq!(exit_snapshot(coordinator).1, 1);
+            let deadline = Instant::now();
+            assert_eq!(
+                coordinator.begin_tray_clean(deadline),
+                CleanDecision::Wait { deadline }
+            );
+            assert_eq!(
+                coordinator.begin_system_end(deadline + Duration::from_secs(1)),
+                CleanDecision::Wait { deadline }
+            );
+            assert_eq!(
+                coordinator.advance_clean(deadline),
+                CleanDecision::ObserveOnly
+            );
+            assert!(matches!(
+                exit_snapshot(coordinator),
+                (
+                    ExitState::SystemEnding,
+                    1,
+                    CleanAttempt::Finished(CleanResult::TimedOut)
+                )
+            ));
+        }
+
+        for phase in [
+            "stale-cleanup",
+            "register",
+            "autostart",
+            "persist",
+            "autostart-rollback",
+            "rollback-unregister",
+        ] {
+            let coordinator = coordinator_for_test();
+            let reserve_coordinator = Arc::clone(&coordinator);
+            let worker_coordinator = Arc::clone(&coordinator);
+            let mut state = RuntimeSettings {
+                registered: if phase == "stale-cleanup" {
+                    vec!["stale", "A"]
+                } else {
+                    vec!["A"]
+                },
+            };
+            let autostart_calls = Cell::new(0);
+            let persist_fails = matches!(phase, "autostart-rollback" | "rollback-unregister");
+            let result = tauri::async_runtime::block_on(save_settings_worker_with(
+                move || reserve_coordinator.reserve_critical().map_err(|_| ()),
+                move |reservation| {
+                    let _reservation = reservation;
+                    state.apply_transaction(
+                        RuntimeSettingsChange {
+                            persisted: "A",
+                            requested: "B",
+                            autostart: true,
+                        },
+                        |_| {
+                            if phase == "register" {
+                                assert_clean_blocked(&worker_coordinator);
+                            }
+                            Ok(())
+                        },
+                        |shortcut| {
+                            if (phase == "stale-cleanup" && shortcut == "stale")
+                                || (phase == "rollback-unregister" && shortcut == "B")
+                            {
+                                assert_clean_blocked(&worker_coordinator);
+                            }
+                            Ok(())
+                        },
+                        || Ok(false),
+                        |_| {
+                            let call = autostart_calls.get() + 1;
+                            autostart_calls.set(call);
+                            if (phase == "autostart" && call == 1)
+                                || (phase == "autostart-rollback" && call == 2)
+                            {
+                                assert_clean_blocked(&worker_coordinator);
+                            }
+                            Ok(())
+                        },
+                        || {
+                            if phase == "persist" {
+                                assert_clean_blocked(&worker_coordinator);
+                            }
+                            if persist_fails {
+                                Err(())
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                },
+            ));
+            assert_eq!(result.is_err(), persist_fails);
+        }
+
+        for state in [ExitState::Cleaning, ExitState::SystemEnding] {
+            let coordinator = coordinator_for_test();
+            coordinator
+                .exit_gate
+                .lock()
+                .expect("exit gate lock poisoned")
+                .state = state;
+            let reserve_coordinator = Arc::clone(&coordinator);
+            let counts = Arc::new(RejectedSaveCounts::default());
+            let worker_counts = Arc::clone(&counts);
+            let result = tauri::async_runtime::block_on(save_settings_worker_with(
+                move || reserve_coordinator.reserve_critical().map_err(|_| ()),
+                move |_reservation| {
+                    worker_counts.dispatch.fetch_add(1, Ordering::Relaxed);
+                    worker_counts.register.fetch_add(1, Ordering::Relaxed);
+                    worker_counts.unregister.fetch_add(1, Ordering::Relaxed);
+                    worker_counts.autostart.fetch_add(1, Ordering::Relaxed);
+                    worker_counts.persist.fetch_add(1, Ordering::Relaxed);
+                    worker_counts.store.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            ));
+            assert!(result.is_err());
+            counts.assert_zero();
+            assert_eq!(exit_snapshot(&coordinator).1, 0);
+        }
     }
 }

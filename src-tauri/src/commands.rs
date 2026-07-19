@@ -2,13 +2,14 @@ use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri_plugin_global_shortcut::Shortcut;
 
 use crate::{
     apps::{self, AppCache, Application},
-    lifecycle::{FocusDecision, LifecycleCoordinator},
+    lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
     result_registry::{RegistryError, ResultAction, ResultRegistry},
-    settings::{SettingsStore, SettingsUpdate},
+    settings::{SettingsError, SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
     validation_export::{choose_export_destination, write_validation_export, ExportDestination},
 };
@@ -153,6 +154,18 @@ impl CommandError {
     }
 }
 
+impl From<SettingsError> for CommandError {
+    fn from(_: SettingsError) -> Self {
+        Self::settings_failed()
+    }
+}
+
+impl From<ReservationError> for CommandError {
+    fn from(_: ReservationError) -> Self {
+        Self::settings_failed()
+    }
+}
+
 fn require_main_label(label: &str) -> Result<(), CommandError> {
     (label == "main")
         .then_some(())
@@ -261,17 +274,112 @@ fn load_settings_core(settings: &SettingsStore, cache: &AppCache) -> SettingsVie
     }
 }
 
-#[tauri::command]
-pub(crate) fn save_settings(
-    window: WebviewWindow,
-    settings: UserSettingsUpdate,
-    settings_store: State<'_, SettingsStore>,
-    cache: State<'_, Arc<AppCache>>,
-) -> Result<(), CommandError> {
-    require_main_window(&window)?;
-    save_settings_core(settings, &settings_store, &cache)
+#[derive(Clone, Copy)]
+struct SaveSettingsCache<'a>(&'a AppCache);
+
+impl<'a> SaveSettingsCache<'a> {
+    fn inner(self) -> &'a AppCache {
+        self.0
+    }
 }
 
+fn prepare_settings_save(
+    settings: UserSettingsUpdate,
+    cache: SaveSettingsCache<'_>,
+) -> Result<(Shortcut, SettingsUpdate), CommandError> {
+    let shortcut = settings
+        .hotkey
+        .parse::<Shortcut>()
+        .map_err(|_| CommandError::settings_failed())?;
+    let update = SettingsUpdate {
+        hotkey: settings.hotkey,
+        autostart: settings.autostart,
+        research_id: settings.research_id,
+        aliases: settings.aliases,
+    };
+    SettingsStore::validate_user_settings(&update, cache.inner())?;
+    Ok((shortcut, update))
+}
+
+async fn save_settings_with<R, E, W>(
+    settings: UserSettingsUpdate,
+    _settings_store: &SettingsStore,
+    cache: SaveSettingsCache<'_>,
+    reserve: R,
+    worker: W,
+) -> Result<(), CommandError>
+where
+    R: FnOnce() -> Result<CriticalReservation, E>,
+    W: FnOnce(CriticalReservation, Shortcut, SettingsUpdate) -> Result<(), ()> + Send + 'static,
+{
+    let (shortcut, update) = prepare_settings_save(settings, cache)?;
+    save_settings_worker_with(reserve, move |reservation| {
+        worker(reservation, shortcut, update)
+    })
+    .await
+}
+
+pub(crate) async fn save_settings_worker_with<R, E, W>(
+    reserve: R,
+    worker: W,
+) -> Result<(), CommandError>
+where
+    R: FnOnce() -> Result<CriticalReservation, E>,
+    W: FnOnce(CriticalReservation) -> Result<(), ()> + Send + 'static,
+{
+    let reservation = reserve().map_err(|_| CommandError::settings_failed())?;
+    let result = tauri::async_runtime::spawn_blocking(move || worker(reservation))
+        .await
+        .map_err(|_| ());
+    map_save_worker_result(result)
+}
+
+fn map_save_worker_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(())) | Err(()) => Err(CommandError::settings_failed()),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn save_settings(
+    window: tauri::WebviewWindow,
+    settings: UserSettingsUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+    settings_store: tauri::State<'_, SettingsStore>,
+    cache: tauri::State<'_, std::sync::Arc<AppCache>>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    save_settings_with(
+        settings,
+        settings_store.inner(),
+        SaveSettingsCache(cache.inner()),
+        || {
+            let reservation = coordinator.reserve_critical()?;
+            Ok::<_, ReservationError>(reservation)
+        },
+        {
+            let app_for_worker = app.clone();
+            let coordinator_for_worker = Arc::clone(coordinator.inner());
+            move |reservation, shortcut, update| {
+                let _reservation = reservation;
+                let settings = app_for_worker.state::<SettingsStore>();
+                let cache = app_for_worker.state::<Arc<AppCache>>();
+                coordinator_for_worker.save_settings_transaction(
+                    &app_for_worker,
+                    &settings,
+                    cache.inner(),
+                    shortcut,
+                    update,
+                )
+            }
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
 fn save_settings_core(
     settings: UserSettingsUpdate,
     store: &SettingsStore,
@@ -589,17 +697,19 @@ mod tests {
         begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
         execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
         load_settings_core, load_settings_ready_with, map_export_worker_result, map_rescan_result,
-        require_main_label, rescan_apps_with, save_settings_core, search_apps_with,
+        map_save_worker_result, prepare_settings_save, require_main_label, rescan_apps_with,
+        save_settings_core, save_settings_with, save_settings_worker_with, search_apps_with,
         spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome,
-        SettingsView, UserSettingsUpdate,
+        SaveSettingsCache, SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome},
         lifecycle::LifecycleCoordinator,
         result_registry::{RegistryError, ResultAction, ResultRegistry},
-        settings::{Settings, SettingsStore},
+        settings::{Settings, SettingsStore, SettingsUpdate},
         validation_data::ValidationEvent,
     };
+    use tauri_plugin_global_shortcut::Shortcut;
 
     const APP_CURRENT: &str =
         "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1595,5 +1705,276 @@ mod tests {
                 "{command} must guard before state access or side effects"
             );
         }
+    }
+
+    fn user_settings(
+        hotkey: &str,
+        research_id: Option<&str>,
+        aliases: &[(&str, &[&str])],
+    ) -> UserSettingsUpdate {
+        UserSettingsUpdate {
+            hotkey: hotkey.into(),
+            autostart: false,
+            research_id: research_id.map(str::to_owned),
+            aliases: aliases
+                .iter()
+                .map(|(app_id, aliases)| {
+                    (
+                        (*app_id).into(),
+                        aliases.iter().map(|alias| (*alias).into()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[derive(Default)]
+    struct SaveSideEffectCounts {
+        reservation: AtomicUsize,
+        dispatch: AtomicUsize,
+        register: AtomicUsize,
+        unregister: AtomicUsize,
+        autostart: AtomicUsize,
+        persist: AtomicUsize,
+        store: AtomicUsize,
+    }
+
+    impl SaveSideEffectCounts {
+        fn assert_zero(&self) {
+            assert_eq!(self.reservation.load(Ordering::Relaxed), 0);
+            assert_eq!(self.dispatch.load(Ordering::Relaxed), 0);
+            assert_eq!(self.register.load(Ordering::Relaxed), 0);
+            assert_eq!(self.unregister.load(Ordering::Relaxed), 0);
+            assert_eq!(self.autostart.load(Ordering::Relaxed), 0);
+            assert_eq!(self.persist.load(Ordering::Relaxed), 0);
+            assert_eq!(self.store.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn save_settings_preflight_rejects_invalid_input_before_worker_dispatch() {
+        let dir = TestDir::new();
+        let settings_store = settings_store(&dir, Some("study_01"));
+        let cache = AppCache::from_apps(settings_applications());
+        for settings in [
+            user_settings("not a shortcut", None, &[]),
+            user_settings("Alt+Space", Some(" "), &[]),
+            user_settings("Alt+Space", None, &[("app-BAD", &["bad"])]),
+            user_settings("Alt+Space", None, &[(APP_UNKNOWN, &["unknown"])]),
+        ] {
+            let coordinator = Arc::new(LifecycleCoordinator::default());
+            let counts = Arc::new(SaveSideEffectCounts::default());
+            let reserve_counts = Arc::clone(&counts);
+            let reserve_coordinator = Arc::clone(&coordinator);
+            let worker_counts = Arc::clone(&counts);
+            assert_eq!(
+                tauri::async_runtime::block_on(save_settings_with(
+                    settings,
+                    &settings_store,
+                    SaveSettingsCache(&cache),
+                    move || {
+                        reserve_counts.reservation.fetch_add(1, Ordering::Relaxed);
+                        reserve_coordinator.reserve_critical().map_err(|_| ())
+                    },
+                    move |_, _, _| {
+                        worker_counts.dispatch.fetch_add(1, Ordering::Relaxed);
+                        worker_counts.register.fetch_add(1, Ordering::Relaxed);
+                        worker_counts.unregister.fetch_add(1, Ordering::Relaxed);
+                        worker_counts.autostart.fetch_add(1, Ordering::Relaxed);
+                        worker_counts.persist.fetch_add(1, Ordering::Relaxed);
+                        worker_counts.store.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    },
+                )),
+                Err(CommandError::settings_failed())
+            );
+            counts.assert_zero();
+        }
+
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let production = source.split(&marker).next().unwrap();
+        let start = production
+            .find("pub(crate) async fn save_settings(")
+            .unwrap();
+        let body = &production[start..];
+        let after_open = body[body.find('{').unwrap() + 1..].trim_start();
+        assert!(after_open.starts_with("require_main_window(&window)?;\n    save_settings_with("));
+    }
+
+    #[test]
+    fn save_settings_preflight_accepts_valid_input_without_persisting() {
+        let dir = TestDir::new();
+        let store = settings_store(&dir, Some("study_01"));
+        let cache = AppCache::from_apps(settings_applications());
+        let before_memory = store.snapshot();
+        let before_disk = fs::read(dir.path().join("settings.json")).unwrap();
+
+        let (shortcut, update) = prepare_settings_save(
+            user_settings(
+                "Control+Space",
+                Some("study_02"),
+                &[(APP_EMPTY, &["alias"])],
+            ),
+            SaveSettingsCache(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(shortcut.to_string(), "control+Space");
+        assert_eq!(update.hotkey, "Control+Space");
+        assert_eq!(update.research_id.as_deref(), Some("study_02"));
+        assert_eq!(update.aliases[APP_EMPTY], ["alias"]);
+        assert_eq!(store.snapshot(), before_memory);
+        assert_eq!(
+            fs::read(dir.path().join("settings.json")).unwrap(),
+            before_disk
+        );
+    }
+
+    #[test]
+    fn save_settings_maps_worker_and_join_failures_to_fixed_error() {
+        assert_eq!(map_save_worker_result(Ok(Ok(()))), Ok(()));
+        assert_eq!(
+            map_save_worker_result(Ok(Err(()))),
+            Err(CommandError::settings_failed())
+        );
+        assert_eq!(
+            map_save_worker_result(Err(())),
+            Err(CommandError::settings_failed())
+        );
+    }
+
+    #[test]
+    fn save_settings_worker_state_uses_managed_singletons() {
+        struct ManagedState {
+            store: SettingsStore,
+            cache: Arc<AppCache>,
+        }
+
+        let dir = TestDir::new();
+        let cache = Arc::new(AppCache::from_apps(settings_applications()));
+        let coordinator = Arc::new(LifecycleCoordinator::default());
+        let managed = Arc::new(ManagedState {
+            store: settings_store(&dir, Some("study_01")),
+            cache: Arc::clone(&cache),
+        });
+        let expected_store = &managed.store as *const SettingsStore as usize;
+        let shortcut: Shortcut = "Alt+Space".parse().unwrap();
+        let update = SettingsUpdate {
+            hotkey: "Alt+Space".into(),
+            autostart: false,
+            research_id: Some("study_02".into()),
+            aliases: BTreeMap::new(),
+        };
+        let caller = thread::current().id();
+        let expected_cache = Arc::clone(&cache);
+        let expected_coordinator = Arc::clone(&coordinator);
+        let reserve_coordinator = Arc::clone(&coordinator);
+        let worker_managed = Arc::clone(&managed);
+        let worker_coordinator = Arc::clone(&coordinator);
+
+        let result = tauri::async_runtime::block_on(save_settings_worker_with(
+            move || reserve_coordinator.reserve_critical().map_err(|_| ()),
+            move |reservation| {
+                let _reservation = reservation;
+                assert_ne!(thread::current().id(), caller);
+                assert_eq!(
+                    &worker_managed.store as *const SettingsStore as usize,
+                    expected_store
+                );
+                assert!(Arc::ptr_eq(&worker_managed.cache, &expected_cache));
+                assert!(Arc::ptr_eq(&worker_coordinator, &expected_coordinator));
+                assert_eq!(shortcut.to_string(), "alt+Space");
+                assert_eq!(update.hotkey, "Alt+Space");
+                Ok(())
+            },
+        ));
+
+        assert_eq!(result, Ok(()));
+
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let production = source.split(&marker).next().unwrap();
+        let command_start = production
+            .find("pub(crate) async fn save_settings(")
+            .unwrap();
+        let command_end = production[command_start..]
+            .find("#[cfg(test)]\nfn save_settings_core")
+            .map(|offset| command_start + offset)
+            .unwrap();
+        let command = &production[command_start..command_end];
+        for state_lookup in [
+            "app_for_worker.state::<SettingsStore>()",
+            "app_for_worker.state::<Arc<AppCache>>()",
+        ] {
+            assert_eq!(command.matches(state_lookup).count(), 1);
+        }
+        assert_eq!(
+            command.matches("Arc::clone(coordinator.inner())").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn command_contract_preserves_settings_argument() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let test_marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        assert_eq!(source.matches(&test_marker).count(), 1);
+        let production = source.split(&test_marker).next().unwrap();
+        let expected = [
+            "#[tauri::command]\n",
+            "pub(crate) async fn save_",
+            "settings(\n",
+            "    window: tauri::WebviewWindow,\n",
+            "    settings: UserSettingsUpdate,\n",
+            "    app: tauri::AppHandle,\n",
+            "    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,\n",
+            "    settings_store: tauri::State<'_, SettingsStore>,\n",
+            "    cache: tauri::State<'_, std::sync::Arc<AppCache>>,\n",
+            ") -> Result<(), CommandError> {\n",
+        ]
+        .concat();
+        let forbidden = ["input", ": UserSettingsUpdate"].concat();
+
+        assert_eq!(production.matches(&expected).count(), 1);
+        assert!(!production.contains(&forbidden));
+        let command = &production[production.find(&expected).unwrap()..];
+        let first_statement = command[command.find('{').unwrap() + 1..].trim_start();
+        assert!(first_statement.starts_with("require_main_window(&window)?;"));
+    }
+
+    #[test]
+    fn settings_validator_wrapper_is_production_consumed() {
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let settings_source = include_str!("settings.rs").replace("\r\n", "\n");
+        let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
+        assert_eq!(settings_source.matches(&marker).count(), 1);
+        assert_eq!(commands_source.matches(&marker).count(), 1);
+        let settings_production = settings_source.split(&marker).next().unwrap();
+        let commands_production = commands_source.split(&marker).next().unwrap();
+        let wrapper = [
+            "pub(crate) fn validate_user_",
+            "settings(\n",
+            "        update: &SettingsUpdate,\n",
+            "        cache: &AppCache,\n",
+            "    ) -> Result<(), SettingsError> {\n",
+            "        validate_user_settings_against(update, &cache.snapshot())\n",
+            "    }",
+        ]
+        .concat();
+        let preflight = [
+            "SettingsStore::validate_user_",
+            "settings(&update, cache.inner())?;",
+        ]
+        .concat();
+        let reservation = ["coordinator.reserve_", "critical()?;"].concat();
+
+        assert_eq!(settings_production.matches(&wrapper).count(), 1);
+        assert_eq!(commands_production.matches(&preflight).count(), 1);
+        assert_eq!(commands_production.matches(&reservation).count(), 1);
+        assert!(
+            commands_production.find(&preflight).unwrap()
+                < commands_production.find(&reservation).unwrap()
+        );
     }
 }
