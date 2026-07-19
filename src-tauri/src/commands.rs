@@ -292,7 +292,7 @@ fn prepare_settings_save(
         .parse::<Shortcut>()
         .map_err(|_| CommandError::settings_failed())?;
     let update = SettingsUpdate {
-        hotkey: settings.hotkey,
+        hotkey: shortcut.to_string(),
         autostart: settings.autostart,
         research_id: settings.research_id,
         aliases: settings.aliases,
@@ -1821,7 +1821,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(shortcut.to_string(), "control+Space");
-        assert_eq!(update.hotkey, "Control+Space");
+        assert_eq!(update.hotkey, "control+Space");
         assert_eq!(update.research_id.as_deref(), Some("study_02"));
         assert_eq!(update.aliases[APP_EMPTY], ["alias"]);
         assert_eq!(store.snapshot(), before_memory);

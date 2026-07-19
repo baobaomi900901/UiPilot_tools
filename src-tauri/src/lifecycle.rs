@@ -169,7 +169,7 @@ where
             return Err(());
         }
 
-        if change.requested != change.persisted {
+        if change.requested != change.persisted && self.registered.contains(&change.persisted) {
             unregister(change.persisted)?;
             self.registered
                 .retain(|shortcut| *shortcut != change.persisted);
@@ -2179,6 +2179,30 @@ mod tests {
         );
         assert_eq!(state.registered, ["A"]);
         assert_eq!(*conflict.trace.borrow(), ["register-B"]);
+
+        let recovery = RuntimeProbe {
+            autostart: Cell::new(Ok(false)),
+            unregister_failures: RefCell::new(vec!["A"]),
+            ..RuntimeProbe::default()
+        };
+        let mut state = RuntimeSettings::default();
+        assert_eq!(
+            apply_runtime_change(
+                &mut state,
+                RuntimeSettingsChange {
+                    persisted: "A",
+                    requested: "B",
+                    autostart: false,
+                },
+                &recovery,
+            ),
+            Ok(())
+        );
+        assert_eq!(state.registered, ["B"]);
+        assert_eq!(
+            *recovery.trace.borrow(),
+            ["register-B", "read-autostart", "persist"]
+        );
     }
 
     #[test]
