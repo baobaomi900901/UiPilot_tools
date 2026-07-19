@@ -286,29 +286,26 @@ pub(crate) fn execute_result(
         (&request_id, &result_id),
         |request_id, result_id| registry.resolve(request_id, result_id),
         |action| apps::execute_application(action).map_err(|_| ()),
-        || registry.hide_and_clear(),
+        || clear_and_hide(&registry, &window),
         |event| validation.record(event).map_err(|_| ()),
         |app_id| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
-        || window.hide().map_err(|_| ()),
     )
 }
 
-fn execute_result_with<R, A, I, V, S, H>(
+fn execute_result_with<R, A, H, V, S>(
     ids: (&str, &str),
     resolve: R,
     execute: A,
-    invalidate: I,
+    clear_and_hide: H,
     record: V,
     increment: S,
-    hide: H,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
-    I: FnOnce(),
+    H: FnOnce() -> Result<(), CommandError>,
     V: FnOnce(ValidationEvent) -> Result<(), ()>,
     S: FnOnce(&str) -> Result<(), ()>,
-    H: FnOnce() -> Result<(), ()>,
 {
     let (request_id, result_id) = ids;
     let action = resolve(request_id, result_id).map_err(|error| match error {
@@ -321,19 +318,18 @@ where
     };
     let (response, event) = outcome_parts(outcome);
 
-    invalidate();
-    let mut first_error = None;
-    if record(event).is_err() {
-        first_error = Some(CommandError::validation_failed());
-    }
-    if increment(app_id).is_err() && first_error.is_none() {
-        first_error = Some(CommandError::settings_failed());
-    }
-    if hide().is_err() && first_error.is_none() {
-        first_error = Some(CommandError::window_failed());
-    }
+    let window_error = clear_and_hide().err();
+    let validation_error = record(event)
+        .err()
+        .map(|_| CommandError::validation_failed());
+    let settings_error = increment(app_id)
+        .err()
+        .map(|_| CommandError::settings_failed());
 
-    first_error.map_or(Ok(response), Err)
+    validation_error
+        .or(settings_error)
+        .or(window_error)
+        .map_or(Ok(response), Err)
 }
 
 fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> (ExecuteOutcome, ValidationEvent) {
@@ -483,18 +479,25 @@ pub(crate) fn hide_launcher(
     registry: State<'_, ResultRegistry>,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    hide_launcher_with(
+    clear_and_hide(&registry, &window)
+}
+
+pub(crate) fn clear_and_hide(
+    registry: &ResultRegistry,
+    window: &WebviewWindow,
+) -> Result<(), CommandError> {
+    clear_and_hide_with(
         || registry.hide_and_clear(),
         || window.hide().map_err(|_| ()),
     )
 }
 
-fn hide_launcher_with<I, H>(invalidate: I, hide: H) -> Result<(), CommandError>
+fn clear_and_hide_with<C, H>(clear: C, hide: H) -> Result<(), CommandError>
 where
-    I: FnOnce(),
+    C: FnOnce(),
     H: FnOnce() -> Result<(), ()>,
 {
-    invalidate();
+    clear();
     hide().map_err(|_| CommandError::window_failed())
 }
 
@@ -513,11 +516,11 @@ mod tests {
     };
 
     use super::{
-        clear_validation_data_with, execute_result_with, export_validation_data_with,
-        hide_launcher_with, load_settings_core, map_export_worker_result, map_rescan_result,
-        require_main_label, rescan_apps_with, save_settings_core, search_apps_with,
-        spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome,
-        SettingsView, UserSettingsUpdate,
+        clear_and_hide_with, clear_validation_data_with, execute_result_with,
+        export_validation_data_with, load_settings_core, map_export_worker_result,
+        map_rescan_result, require_main_label, rescan_apps_with, save_settings_core,
+        search_apps_with, spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome,
+        ExportOutcome, SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome},
@@ -895,16 +898,15 @@ mod tests {
                     side_effects.set(side_effects.get() + 1);
                     unreachable!()
                 },
-                || side_effects.set(side_effects.get() + 1),
-                |_| {
-                    side_effects.set(side_effects.get() + 1);
-                    Ok(())
-                },
-                |_| {
-                    side_effects.set(side_effects.get() + 1);
-                    Ok(())
-                },
                 || {
+                    side_effects.set(side_effects.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    side_effects.set(side_effects.get() + 1);
+                    Ok(())
+                },
+                |_| {
                     side_effects.set(side_effects.get() + 1);
                     Ok(())
                 },
@@ -920,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_success_invalidates_then_persists_and_hides_in_order() {
+    fn execute_success_clears_and_hides_before_persistence_in_order() {
         let cases = [
             (
                 ApplicationActionOutcome::LaunchRequested,
@@ -954,7 +956,11 @@ mod tests {
                     trace.borrow_mut().push("system-action");
                     Ok(action_outcome)
                 },
-                || trace.borrow_mut().push("registry-hide-and-clear"),
+                || {
+                    trace.borrow_mut().push("registry-hide-and-clear");
+                    trace.borrow_mut().push("window-hide");
+                    Ok(())
+                },
                 |event| {
                     trace.borrow_mut().push("validation-record");
                     actual_event.set(Some(event));
@@ -963,10 +969,6 @@ mod tests {
                 |app_id| {
                     trace.borrow_mut().push("settings-increment");
                     assert_eq!(app_id, APP_CURRENT);
-                    Ok(())
-                },
-                || {
-                    trace.borrow_mut().push("window-hide");
                     Ok(())
                 },
             );
@@ -979,27 +981,29 @@ mod tests {
                     "resolve",
                     "system-action",
                     "registry-hide-and-clear",
+                    "window-hide",
                     "validation-record",
                     "settings-increment",
-                    "window-hide",
                 ]
             );
         }
     }
 
     #[test]
-    fn execute_returns_earliest_post_action_error_but_always_attempts_hide_once() {
+    fn execute_uses_fixed_post_action_error_priority_and_runs_every_step_once() {
         let cases = [
             (true, false, false, CommandError::validation_failed()),
             (false, true, false, CommandError::settings_failed()),
             (false, false, true, CommandError::window_failed()),
-            (true, true, true, CommandError::validation_failed()),
+            (true, true, false, CommandError::validation_failed()),
+            (true, false, true, CommandError::validation_failed()),
             (false, true, true, CommandError::settings_failed()),
+            (true, true, true, CommandError::validation_failed()),
         ];
 
         for (validation_fails, settings_fails, hide_fails, expected) in cases {
             let actions = Cell::new(0);
-            let invalidations = Cell::new(0);
+            let helpers = Cell::new(0);
             let validations = Cell::new(0);
             let increments = Cell::new(0);
             let hides = Cell::new(0);
@@ -1010,7 +1014,15 @@ mod tests {
                     actions.set(actions.get() + 1);
                     Ok(ApplicationActionOutcome::LaunchRequested)
                 },
-                || invalidations.set(invalidations.get() + 1),
+                || {
+                    helpers.set(helpers.get() + 1);
+                    hides.set(hides.get() + 1);
+                    if hide_fails {
+                        Err(CommandError::window_failed())
+                    } else {
+                        Ok(())
+                    }
+                },
                 |_| {
                     validations.set(validations.get() + 1);
                     if validation_fails {
@@ -1027,19 +1039,11 @@ mod tests {
                         Ok(())
                     }
                 },
-                || {
-                    hides.set(hides.get() + 1);
-                    if hide_fails {
-                        Err(())
-                    } else {
-                        Ok(())
-                    }
-                },
             );
 
             assert_eq!(result, Err(expected));
             assert_eq!(actions.get(), 1);
-            assert_eq!(invalidations.get(), 1);
+            assert_eq!(helpers.get(), 1);
             assert_eq!(validations.get(), 1);
             assert_eq!(increments.get(), 1);
             assert_eq!(hides.get(), 1);
@@ -1053,16 +1057,15 @@ mod tests {
             ("request", "result"),
             |_, _| Ok(trusted_action()),
             |_| Err(()),
-            || later_calls.set(later_calls.get() + 1),
-            |_| {
-                later_calls.set(later_calls.get() + 1);
-                Ok(())
-            },
-            |_| {
-                later_calls.set(later_calls.get() + 1);
-                Ok(())
-            },
             || {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
                 later_calls.set(later_calls.get() + 1);
                 Ok(())
             },
@@ -1131,23 +1134,68 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_hide_clears_before_hide_and_clear_maps_validation_error() {
+    fn maintenance_shared_clear_and_hide_runs_once_in_registry_first_order() {
         let trace = RefCell::new(Vec::new());
-        let result = hide_launcher_with(
-            || trace.borrow_mut().push("clear"),
+        let clears = Cell::new(0);
+        let hides = Cell::new(0);
+        let result = clear_and_hide_with(
             || {
+                clears.set(clears.get() + 1);
+                trace.borrow_mut().push("clear");
+            },
+            || {
+                hides.set(hides.get() + 1);
                 trace.borrow_mut().push("hide");
                 Err(())
             },
         );
         assert_eq!(result, Err(CommandError::window_failed()));
         assert_eq!(*trace.borrow(), ["clear", "hide"]);
+        assert_eq!(clears.get(), 1);
+        assert_eq!(hides.get(), 1);
 
         assert_eq!(clear_validation_data_with(|| Ok(())), Ok(()));
         assert_eq!(
             clear_validation_data_with(|| Err(())),
             Err(CommandError::validation_failed())
         );
+    }
+
+    #[test]
+    fn shared_clear_and_hide_simulated_show_failure_invalidates_active_mapping() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invocation".into());
+        let response = search_apps_with(
+            &registry,
+            "app",
+            "invocation",
+            1,
+            || vec![application(1)],
+            |_| {},
+        )
+        .unwrap();
+        let result_id = &response.items[0].result_id;
+        assert!(registry.resolve(&response.request_id, result_id).is_ok());
+
+        assert_eq!(
+            clear_and_hide_with(|| registry.hide_and_clear(), || Err(())),
+            Err(CommandError::window_failed())
+        );
+        assert_eq!(
+            registry.resolve(&response.request_id, result_id),
+            Err(RegistryError::StaleRequest)
+        );
+        assert!(registry.begin_query("invocation", 2).is_none());
+    }
+
+    #[test]
+    fn maintenance_hide_launcher_uses_only_shared_clear_and_hide_after_guard() {
+        let source = include_str!("commands.rs");
+        let start = source.find("fn hide_launcher(").unwrap();
+        let body = &source[start..source[start..].find("\n}\n").unwrap() + start + 3];
+        assert!(body.contains("clear_and_hide(&registry, &window)"));
+        assert!(!body.contains("registry.hide_and_clear"));
+        assert!(!body.contains("window.hide()"));
     }
 
     #[test]
