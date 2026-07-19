@@ -3,13 +3,20 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    UI::{
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        WindowsAndMessaging::{WM_ENDSESSION, WM_NCDESTROY, WM_QUERYENDSESSION},
+    },
+};
 
 use crate::{
     commands::clear_and_hide,
@@ -23,6 +30,24 @@ use crate::{
 pub(crate) enum ShowTarget {
     Launcher,
     Settings,
+}
+
+pub(crate) const TRAY_OPEN_SETTINGS: &str = "uipilot.tray.open-settings";
+pub(crate) const TRAY_QUIT: &str = "uipilot.tray.quit";
+const SESSION_SUBCLASS_ID: usize = 0x5550_494c;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrayAction {
+    Show(ShowTarget),
+    Quit,
+}
+
+pub(crate) fn tray_action(id: &str) -> Option<TrayAction> {
+    match id {
+        TRAY_OPEN_SETTINGS => Some(TrayAction::Show(ShowTarget::Settings)),
+        TRAY_QUIT => Some(TrayAction::Quit),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -45,6 +70,7 @@ pub(crate) enum LifecycleError {
     MainThreadDispatchFailed,
     WindowFailed,
     InvocationExhausted,
+    SessionHookFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -907,6 +933,157 @@ impl LifecycleCoordinator {
         decision
     }
 
+    fn run_clean_attempt_with<W, M>(
+        &self,
+        mut decision: CleanDecision,
+        mut wait: W,
+        marker: M,
+    ) -> CleanDecision
+    where
+        W: FnMut(Instant) -> Instant,
+        M: FnOnce() -> CleanResult,
+    {
+        let mut marker = Some(marker);
+        loop {
+            decision = match decision {
+                CleanDecision::Wait { deadline } => self.advance_clean(wait(deadline)),
+                CleanDecision::CallMarker => {
+                    return self.complete_clean(marker.take().expect("marker called once")());
+                }
+                decision => return decision,
+            };
+        }
+    }
+
+    fn run_tray_quit_with<W, M, E, S>(
+        &self,
+        decision: CleanDecision,
+        wait: W,
+        marker: M,
+        exit: E,
+        show: S,
+    ) -> CleanDecision
+    where
+        W: FnMut(Instant) -> Instant,
+        M: FnOnce() -> CleanResult,
+        E: FnOnce(),
+        S: FnOnce(ShowTarget),
+    {
+        let decision = self.run_clean_attempt_with(decision, wait, marker);
+        match decision {
+            CleanDecision::Exit => exit(),
+            CleanDecision::ReturnRunning => {
+                self.set_notice_once(LifecycleNotice::ValidationFailed);
+                show(ShowTarget::Settings);
+            }
+            _ => {}
+        }
+        decision
+    }
+
+    fn run_system_end_with<W, M>(&self, deadline: Instant, wait: W, marker: M) -> CleanDecision
+    where
+        W: FnMut(Instant) -> Instant,
+        M: FnOnce() -> CleanResult,
+    {
+        let decision = self.begin_system_end(deadline);
+        self.run_clean_attempt_with(decision, wait, marker)
+    }
+
+    fn wait_for_clean_change(&self, deadline: Instant) -> Instant {
+        let gate = self.exit_gate.lock().expect("exit gate lock poisoned");
+        let now = Instant::now();
+        if now >= deadline {
+            return now;
+        }
+        let _ = self
+            .critical_changed
+            .wait_timeout_while(
+                gate,
+                deadline.saturating_duration_since(now),
+                |gate| match gate.clean_attempt {
+                    CleanAttempt::Waiting { .. } => gate.in_flight_critical != 0,
+                    CleanAttempt::Calling { .. } => true,
+                    CleanAttempt::Idle | CleanAttempt::Finished(_) => false,
+                },
+            )
+            .expect("exit gate lock poisoned");
+        Instant::now()
+    }
+
+    pub(crate) fn request_tray_quit(self: &Arc<Self>, app: &AppHandle) {
+        let decision = self.begin_tray_clean(Instant::now() + Duration::from_secs(1));
+        if decision == CleanDecision::ObserveOnly {
+            return;
+        }
+
+        let coordinator = Arc::clone(self);
+        let app = app.clone();
+        drop(tauri::async_runtime::spawn_blocking(move || {
+            let marker_app = app.clone();
+            let exit_dispatcher = app.clone();
+            let exit_app = app.clone();
+            let show_app = app.clone();
+            let show_coordinator = Arc::clone(&coordinator);
+            coordinator.run_tray_quit_with(
+                decision,
+                |deadline| coordinator.wait_for_clean_change(deadline),
+                || {
+                    if marker_app
+                        .state::<ValidationStore>()
+                        .mark_clean_exit()
+                        .is_ok()
+                    {
+                        CleanResult::Succeeded
+                    } else {
+                        CleanResult::Failed
+                    }
+                },
+                move || {
+                    let app = exit_app.clone();
+                    let _ = exit_dispatcher.run_on_main_thread(move || app.exit(0));
+                },
+                move |target| {
+                    let _ = show_coordinator.request_show(&show_app, target);
+                },
+            );
+        }));
+    }
+
+    fn run_system_end(&self, app: &AppHandle) {
+        let marker_app = app.clone();
+        self.run_system_end_with(
+            Instant::now() + Duration::from_secs(1),
+            |deadline| self.wait_for_clean_change(deadline),
+            || {
+                if marker_app
+                    .state::<ValidationStore>()
+                    .mark_clean_exit()
+                    .is_ok()
+                {
+                    CleanResult::Succeeded
+                } else {
+                    CleanResult::Failed
+                }
+            },
+        );
+    }
+
+    pub(crate) fn should_prevent_exit(&self) -> bool {
+        matches!(
+            self.observe_exit(),
+            ExitState::Running | ExitState::Cleaning
+        )
+    }
+
+    pub(crate) fn should_prevent_close(&self) -> bool {
+        self.should_prevent_exit()
+    }
+
+    pub(crate) fn observe_run_exit(&self) {
+        let _ = self.observe_exit();
+    }
+
     fn observe_exit(&self) -> ExitState {
         self.exit_gate
             .lock()
@@ -923,6 +1100,98 @@ impl LifecycleCoordinator {
             CleanDecision::Wait { deadline }
         }
     }
+}
+
+fn handle_session_message_with<D, C, R>(
+    message: u32,
+    wparam: usize,
+    mut default: D,
+    clean: C,
+    destroy: R,
+) -> isize
+where
+    D: FnMut() -> isize,
+    C: FnOnce(),
+    R: FnOnce(),
+{
+    match message {
+        WM_QUERYENDSESSION => default(),
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                clean();
+            }
+            let _ = default();
+            0
+        }
+        WM_NCDESTROY => {
+            destroy();
+            default()
+        }
+        _ => default(),
+    }
+}
+
+fn install_subclass_context_with<T, I>(context: T, install: I) -> Result<usize, ()>
+where
+    I: FnOnce(usize) -> bool,
+{
+    let raw = Box::into_raw(Box::new(context)) as usize;
+    if install(raw) {
+        Ok(raw)
+    } else {
+        unsafe { reclaim_subclass_context::<T>(raw) };
+        Err(())
+    }
+}
+
+unsafe fn reclaim_subclass_context<T>(raw: usize) {
+    drop(unsafe { Box::from_raw(raw as *mut T) });
+}
+
+unsafe extern "system" fn session_subclass_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    context: usize,
+) -> LRESULT {
+    let app = unsafe { (&*(context as *const AppHandle)).clone() };
+    LRESULT(handle_session_message_with(
+        message,
+        wparam.0,
+        || unsafe { DefSubclassProc(hwnd, message, wparam, lparam).0 },
+        || {
+            app.state::<Arc<LifecycleCoordinator>>()
+                .run_system_end(&app);
+        },
+        || {
+            let _ = unsafe {
+                RemoveWindowSubclass(hwnd, Some(session_subclass_proc), SESSION_SUBCLASS_ID)
+            };
+            unsafe { reclaim_subclass_context::<AppHandle>(context) };
+        },
+    ))
+}
+
+pub(crate) fn install_session_end_hook(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<(), LifecycleError> {
+    let hwnd = window
+        .hwnd()
+        .map_err(|_| LifecycleError::SessionHookFailed)?;
+    install_subclass_context_with(app.clone(), |context| unsafe {
+        SetWindowSubclass(
+            hwnd,
+            Some(session_subclass_proc),
+            SESSION_SUBCLASS_ID,
+            context,
+        )
+        .as_bool()
+    })
+    .map(|_| ())
+    .map_err(|_| LifecycleError::SessionHookFailed)
 }
 
 #[cfg(test)]
@@ -946,6 +1215,7 @@ mod tests {
         LifecycleCoordinator::request_show;
     const _: fn(&Arc<LifecycleCoordinator>, &AppHandle) -> Result<(), LifecycleError> =
         LifecycleCoordinator::mark_setup_ready;
+    const _: fn(&Arc<LifecycleCoordinator>, &AppHandle) = LifecycleCoordinator::request_tray_quit;
     const _: fn(&LifecycleCoordinator, &AppHandle, &Settings) -> Result<(), ()> =
         LifecycleCoordinator::reconcile_runtime_settings;
 
@@ -2687,5 +2957,363 @@ mod tests {
             counts.assert_zero();
             assert_eq!(exit_snapshot(&coordinator).1, 0);
         }
+    }
+
+    #[test]
+    fn tray_accepts_only_exact_namespaced_ids() {
+        assert_eq!(
+            tray_action(TRAY_OPEN_SETTINGS),
+            Some(TrayAction::Show(ShowTarget::Settings))
+        );
+        assert_eq!(tray_action(TRAY_QUIT), Some(TrayAction::Quit));
+        for rejected in [
+            "open-settings",
+            "quit",
+            "uipilot.tray.open",
+            "UIPILOT.TRAY.QUIT",
+            "uipilot.tray.quit ",
+            "",
+        ] {
+            assert_eq!(tray_action(rejected), None);
+        }
+    }
+
+    #[test]
+    fn tray_quit_starts_one_attempt_and_exits_only_after_marker_success() {
+        let coordinator = coordinator_for_test();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = coordinator.begin_tray_clean(deadline);
+        assert_eq!(first, CleanDecision::CallMarker);
+        let repeated = coordinator.begin_tray_clean(deadline);
+        assert_eq!(repeated, CleanDecision::ObserveOnly);
+
+        let marker_calls = Cell::new(0);
+        let exit_calls = Cell::new(0);
+        let show_calls = Cell::new(0);
+        assert_eq!(
+            coordinator.run_tray_quit_with(
+                repeated,
+                |_| panic!("repeated quit must not wait"),
+                || {
+                    marker_calls.set(marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                },
+                || exit_calls.set(exit_calls.get() + 1),
+                |_| show_calls.set(show_calls.get() + 1),
+            ),
+            CleanDecision::ObserveOnly
+        );
+        assert_eq!(marker_calls.get(), 0);
+
+        assert_eq!(
+            coordinator.run_tray_quit_with(
+                first,
+                |_| panic!("immediate marker call must not wait"),
+                || {
+                    marker_calls.set(marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                },
+                || exit_calls.set(exit_calls.get() + 1),
+                |_| show_calls.set(show_calls.get() + 1),
+            ),
+            CleanDecision::Exit
+        );
+        assert_eq!(marker_calls.get(), 1);
+        assert_eq!(exit_calls.get(), 1);
+        assert_eq!(show_calls.get(), 0);
+        assert_eq!(exit_snapshot(&coordinator).0, ExitState::Clean);
+    }
+
+    #[test]
+    fn tray_worker_handles_timeout_failure_and_system_takeover_without_extra_ui() {
+        let timed_out = coordinator_for_test();
+        let reservation = timed_out.reserve_critical().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let initial = timed_out.begin_tray_clean(deadline);
+        let marker_calls = Cell::new(0);
+        let exit_calls = Cell::new(0);
+        let shown = RefCell::new(Vec::new());
+        assert_eq!(
+            timed_out.run_tray_quit_with(
+                initial,
+                |_| deadline,
+                || {
+                    marker_calls.set(marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                },
+                || exit_calls.set(exit_calls.get() + 1),
+                |target| shown.borrow_mut().push(target),
+            ),
+            CleanDecision::ReturnRunning
+        );
+        assert_eq!(marker_calls.get(), 0);
+        assert_eq!(exit_calls.get(), 0);
+        assert_eq!(*shown.borrow(), [ShowTarget::Settings]);
+        assert_eq!(
+            *timed_out.pending_notice.lock().unwrap(),
+            Some(LifecycleNotice::ValidationFailed)
+        );
+        assert_eq!(exit_snapshot(&timed_out).0, ExitState::Running);
+        drop(reservation);
+
+        let failed = coordinator_for_test();
+        let shown = Cell::new(0);
+        assert_eq!(
+            failed.run_tray_quit_with(
+                failed.begin_tray_clean(deadline),
+                |_| panic!("immediate marker call must not wait"),
+                || CleanResult::Failed,
+                || panic!("failed cleanup must not exit"),
+                |_| shown.set(shown.get() + 1),
+            ),
+            CleanDecision::ReturnRunning
+        );
+        assert_eq!(shown.get(), 1);
+        assert_eq!(exit_snapshot(&failed).0, ExitState::Running);
+
+        let shared = coordinator_for_test();
+        let tray = shared.begin_tray_clean(deadline);
+        assert_eq!(tray, CleanDecision::CallMarker);
+        assert_eq!(
+            shared.begin_system_end(deadline),
+            CleanDecision::Wait { deadline }
+        );
+        let marker_calls = Cell::new(0);
+        assert_eq!(
+            shared.run_tray_quit_with(
+                tray,
+                |_| panic!("tray owns the marker call"),
+                || {
+                    marker_calls.set(marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                },
+                || panic!("SystemEnding must not request app exit"),
+                |_| panic!("SystemEnding must not show UI"),
+            ),
+            CleanDecision::ObserveOnly
+        );
+        assert_eq!(marker_calls.get(), 1);
+        assert_eq!(exit_snapshot(&shared).0, ExitState::SystemEnding);
+    }
+
+    #[test]
+    fn session_messages_query_false_and_other_continue_default_chain_once() {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_QUERYENDSESSION};
+
+        for (message, wparam, expected) in [
+            (WM_QUERYENDSESSION, 1, 71),
+            (WM_ENDSESSION, 0, 0),
+            (0x0400, 0, 73),
+        ] {
+            let default_calls = Cell::new(0);
+            let clean_calls = Cell::new(0);
+            let destroy_calls = Cell::new(0);
+            let result = handle_session_message_with(
+                message,
+                wparam,
+                || {
+                    default_calls.set(default_calls.get() + 1);
+                    if message == WM_QUERYENDSESSION {
+                        71
+                    } else {
+                        73
+                    }
+                },
+                || clean_calls.set(clean_calls.get() + 1),
+                || destroy_calls.set(destroy_calls.get() + 1),
+            );
+            assert_eq!(result, expected);
+            assert_eq!(default_calls.get(), 1);
+            assert_eq!(clean_calls.get(), 0);
+            assert_eq!(destroy_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn session_messages_true_runs_one_system_attempt_and_never_repeats_success() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_ENDSESSION;
+
+        let coordinator = coordinator_for_test();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let marker_calls = Cell::new(0);
+        let default_calls = Cell::new(0);
+        assert_eq!(
+            handle_session_message_with(
+                WM_ENDSESSION,
+                1,
+                || {
+                    default_calls.set(default_calls.get() + 1);
+                    77
+                },
+                || {
+                    assert_eq!(
+                        coordinator.run_system_end_with(
+                            deadline,
+                            |_| panic!("fresh system cleanup must call marker immediately"),
+                            || {
+                                marker_calls.set(marker_calls.get() + 1);
+                                CleanResult::Succeeded
+                            },
+                        ),
+                        CleanDecision::ObserveOnly
+                    );
+                },
+                || panic!("WM_ENDSESSION must not destroy the subclass"),
+            ),
+            0
+        );
+        assert_eq!(marker_calls.get(), 1);
+        assert_eq!(default_calls.get(), 1);
+        assert!(matches!(
+            exit_snapshot(&coordinator),
+            (
+                ExitState::SystemEnding,
+                0,
+                CleanAttempt::Finished(CleanResult::Succeeded)
+            )
+        ));
+
+        assert_eq!(
+            coordinator.run_system_end_with(
+                deadline,
+                |_| panic!("finished success must not wait"),
+                || {
+                    marker_calls.set(marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                },
+            ),
+            CleanDecision::ObserveOnly
+        );
+        assert_eq!(marker_calls.get(), 1);
+
+        for first_result in [CleanResult::Failed, CleanResult::TimedOut] {
+            let coordinator = coordinator_for_test();
+            let reservation = (first_result == CleanResult::TimedOut)
+                .then(|| coordinator.reserve_critical().unwrap());
+            let tray = coordinator.begin_tray_clean(deadline);
+            let first_marker_calls = Cell::new(0);
+            let first = if first_result == CleanResult::TimedOut {
+                coordinator.run_tray_quit_with(
+                    tray,
+                    |_| deadline,
+                    || {
+                        first_marker_calls.set(first_marker_calls.get() + 1);
+                        CleanResult::Succeeded
+                    },
+                    || panic!("timed out tray attempt must not exit"),
+                    |_| {},
+                )
+            } else {
+                complete_requested_clean(&coordinator, tray, || {
+                    first_marker_calls.set(first_marker_calls.get() + 1);
+                    first_result
+                })
+            };
+            assert_eq!(first, CleanDecision::ReturnRunning);
+            drop(reservation);
+            let system_marker_calls = Cell::new(0);
+            assert_eq!(
+                coordinator.run_system_end_with(
+                    deadline,
+                    |_| panic!("fresh system attempt must call marker immediately"),
+                    || {
+                        system_marker_calls.set(system_marker_calls.get() + 1);
+                        CleanResult::Succeeded
+                    },
+                ),
+                CleanDecision::ObserveOnly
+            );
+            assert_eq!(system_marker_calls.get(), 1);
+            assert_eq!(
+                first_marker_calls.get() + system_marker_calls.get(),
+                if first_result == CleanResult::Failed {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn session_messages_exit_and_close_decisions_are_fail_closed() {
+        let coordinator = coordinator_for_test();
+        for (state, prevent) in [
+            (ExitState::Running, true),
+            (ExitState::Cleaning, true),
+            (ExitState::Clean, false),
+            (ExitState::SystemEnding, false),
+        ] {
+            coordinator.exit_gate.lock().unwrap().state = state;
+            assert_eq!(coordinator.should_prevent_exit(), prevent);
+            assert_eq!(coordinator.should_prevent_close(), prevent);
+            coordinator.observe_run_exit();
+        }
+    }
+
+    #[test]
+    fn subclass_ownership_reclaims_context_once_on_install_failure_and_destroy() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
+
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let failed_drops = Arc::new(AtomicUsize::new(0));
+        assert!(
+            install_subclass_context_with(DropProbe(Arc::clone(&failed_drops)), |_| false).is_err()
+        );
+        assert_eq!(failed_drops.load(Ordering::Relaxed), 1);
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let raw = install_subclass_context_with(DropProbe(Arc::clone(&drops)), |_| true).unwrap();
+        let remove_calls = Cell::new(0);
+        let default_calls = Cell::new(0);
+        assert_eq!(
+            handle_session_message_with(
+                WM_NCDESTROY,
+                0,
+                || {
+                    default_calls.set(default_calls.get() + 1);
+                    79
+                },
+                || panic!("destroy must not clean the marker"),
+                || {
+                    remove_calls.set(remove_calls.get() + 1);
+                    unsafe { reclaim_subclass_context::<DropProbe>(raw) };
+                },
+            ),
+            79
+        );
+        assert_eq!(remove_calls.get(), 1);
+        assert_eq!(default_calls.get(), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn subclass_ownership_uses_generated_windows_abi_and_app_handle_only() {
+        use windows::Win32::UI::Shell::SUBCLASSPROC;
+
+        const _: SUBCLASSPROC = Some(session_subclass_proc);
+        const _: fn(&AppHandle, &tauri::WebviewWindow) -> Result<(), LifecycleError> =
+            install_session_end_hook;
+
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let production = source.split(&marker).next().unwrap();
+        for generated_api in [
+            "SetWindowSubclass",
+            "RemoveWindowSubclass",
+            "DefSubclassProc",
+        ] {
+            assert!(production.contains(generated_api));
+        }
+        assert!(production.contains("install_subclass_context_with(app.clone()"));
+        assert!(!production.contains("windows_link::link!"));
+        assert!(!production.contains("#[link("));
+        assert!(!production.contains("struct SessionHookContext"));
     }
 }
