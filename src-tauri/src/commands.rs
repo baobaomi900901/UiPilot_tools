@@ -1186,7 +1186,7 @@ mod tests {
 
     #[test]
     fn maintenance_hide_launcher_uses_only_shared_clear_and_hide_after_guard() {
-        let source = include_str!("commands.rs");
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
         let start = source.find("fn hide_launcher(").unwrap();
         let body = &source[start..source[start..].find("\n}\n").unwrap() + start + 3];
         assert!(body.contains("clear_and_hide(&registry, &window)"));
