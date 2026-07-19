@@ -31,6 +31,9 @@ mod validation_data;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod validation_export;
 
+#[cfg(test)]
+mod lifecycle;
+
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
 
