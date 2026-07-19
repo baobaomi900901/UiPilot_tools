@@ -12,6 +12,7 @@ mod cache;
 mod discovery;
 mod rank;
 mod shortcut;
+mod windows_backend;
 
 pub(crate) use cache::{start_initial_refresh, AppCache};
 
