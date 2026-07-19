@@ -262,26 +262,34 @@ impl ModalState {
         }
     }
 
+    #[cfg(test)]
     fn on_focus<F>(&mut self, focused: bool, query_focus: F) -> FocusDecision
     where
         F: FnOnce() -> Result<bool, ()>,
     {
+        if let Some(decision) = self.begin_focus(focused) {
+            return decision;
+        }
+        match query_focus() {
+            Ok(true) => FocusDecision::Suppress,
+            Ok(false) => FocusDecision::ClearAndHide,
+            Err(()) => FocusDecision::ReportWindowFailureAndHide,
+        }
+    }
+
+    fn begin_focus(&mut self, focused: bool) -> Option<FocusDecision> {
         match (*self, focused) {
-            (Self::Open, _) => FocusDecision::Suppress,
+            (Self::Open, _) => Some(FocusDecision::Suppress),
             (Self::AwaitingFocusRestore, true) => {
                 *self = Self::Normal;
-                FocusDecision::Suppress
+                Some(FocusDecision::Suppress)
             }
             (Self::AwaitingFocusRestore, false) => {
                 *self = Self::Normal;
-                match query_focus() {
-                    Ok(true) => FocusDecision::Suppress,
-                    Ok(false) => FocusDecision::ClearAndHide,
-                    Err(()) => FocusDecision::ReportWindowFailureAndHide,
-                }
+                None
             }
-            (Self::Normal, true) => FocusDecision::Suppress,
-            (Self::Normal, false) => FocusDecision::ClearAndHide,
+            (Self::Normal, true) => Some(FocusDecision::Suppress),
+            (Self::Normal, false) => Some(FocusDecision::ClearAndHide),
         }
     }
 
@@ -671,6 +679,38 @@ impl LifecycleCoordinator {
         Ok(ModalGuard {
             coordinator: Arc::clone(self),
         })
+    }
+
+    pub(crate) fn handle_focus_event_with<Q, H>(
+        &self,
+        focused: bool,
+        query_focus: Q,
+        mut clear_and_hide: H,
+    ) -> Result<(), LifecycleError>
+    where
+        Q: FnOnce() -> Result<bool, ()>,
+        H: FnMut() -> Result<(), ()>,
+    {
+        let decision = self
+            .modal
+            .lock()
+            .expect("modal lock poisoned")
+            .begin_focus(focused);
+        let decision = decision.unwrap_or_else(|| match query_focus() {
+            Ok(true) => FocusDecision::Suppress,
+            Ok(false) => FocusDecision::ClearAndHide,
+            Err(()) => FocusDecision::ReportWindowFailureAndHide,
+        });
+        match decision {
+            FocusDecision::Suppress => Ok(()),
+            FocusDecision::ClearAndHide => {
+                clear_and_hide().map_err(|_| LifecycleError::WindowFailed)
+            }
+            FocusDecision::ReportWindowFailureAndHide => {
+                let _ = clear_and_hide();
+                Err(LifecycleError::WindowFailed)
+            }
+        }
     }
 
     pub(crate) fn on_successful_show(&self) {
@@ -2970,6 +3010,100 @@ mod tests {
             counts.assert_zero();
             assert_eq!(exit_snapshot(&coordinator).1, 0);
         }
+    }
+
+    #[test]
+    fn production_callbacks_focus_query_and_hide_seams_are_lock_free() {
+        let coordinator = coordinator_for_test();
+        let clear_calls = Cell::new(0);
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("Normal focus loss must not query focus"),
+                || {
+                    assert!(coordinator.modal.try_lock().is_ok());
+                    clear_calls.set(clear_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(clear_calls.get(), 1);
+
+        let guard = coordinator.begin_modal_export(|| Ok(true)).unwrap();
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("Open must not query focus"),
+                || panic!("Open must suppress hide"),
+            )
+            .unwrap();
+        assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Open);
+        drop(guard);
+    }
+
+    #[test]
+    fn production_callbacks_focus_awaiting_resolves_every_query_result() {
+        for (focus_result, expected, expected_clears) in [
+            (Ok(true), Ok(()), 0),
+            (Ok(false), Ok(()), 1),
+            (Err(()), Err(LifecycleError::WindowFailed), 1),
+        ] {
+            let coordinator = coordinator_for_test();
+            drop(coordinator.begin_modal_export(|| Ok(true)).unwrap());
+            let clear_calls = Cell::new(0);
+            assert_eq!(
+                coordinator.handle_focus_event_with(
+                    false,
+                    || {
+                        assert!(coordinator.modal.try_lock().is_ok());
+                        focus_result
+                    },
+                    || {
+                        assert!(coordinator.modal.try_lock().is_ok());
+                        clear_calls.set(clear_calls.get() + 1);
+                        Ok(())
+                    },
+                ),
+                expected
+            );
+            assert_eq!(clear_calls.get(), expected_clears);
+            assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Normal);
+        }
+    }
+
+    #[test]
+    fn production_callbacks_focus_repeated_events_never_leave_awaiting() {
+        let coordinator = coordinator_for_test();
+        drop(coordinator.begin_modal_export(|| Ok(true)).unwrap());
+        coordinator
+            .handle_focus_event_with(false, || Ok(true), || panic!("still focused"))
+            .unwrap();
+        assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Normal);
+
+        let clear_calls = Cell::new(0);
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("late Normal focus loss must not query"),
+                || {
+                    clear_calls.set(clear_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(clear_calls.get(), 1);
+
+        let second = coordinator.begin_modal_export(|| panic!("Normal retry must not query"));
+        assert!(second.is_ok());
+        drop(second);
+        coordinator
+            .handle_focus_event_with(
+                true,
+                || panic!("Focused(true) must not query"),
+                || panic!("Focused(true) must not hide"),
+            )
+            .unwrap();
+        assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Normal);
     }
 
     #[test]

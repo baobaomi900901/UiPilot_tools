@@ -5,6 +5,9 @@ use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+use lifecycle::ShowTarget;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod atomic_file;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -31,7 +34,6 @@ mod validation_data;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod validation_export;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod lifecycle;
 
@@ -54,18 +56,131 @@ fn load_and_open_validation_store(
     Ok(store)
 }
 
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+fn lifecycle_setup_error() -> std::io::Error {
+    std::io::Error::other("lifecycle setup failed")
+}
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+fn setup_production_lifecycle(
+    app: &mut tauri::App,
+    app_cache: &Arc<apps::AppCache>,
+    coordinator: &Arc<lifecycle::LifecycleCoordinator>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app_data_dir = app.path().app_data_dir()?;
+    let settings = load_settings_store(&app_data_dir)?;
+    let persisted_settings = settings.snapshot();
+    if !app.manage(settings) {
+        return Err(lifecycle_setup_error().into());
+    }
+
+    let validation = load_and_open_validation_store(&app_data_dir)?;
+    if !app.manage(validation) {
+        return Err(lifecycle_setup_error().into());
+    }
+
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(lifecycle_setup_error)?;
+    let event_app = app.handle().clone();
+    let event_window = window.clone();
+    let event_coordinator = Arc::clone(coordinator);
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(focused) => {
+            let registry = event_app.state::<result_registry::ResultRegistry>();
+            let _ = event_coordinator.handle_focus_event_with(
+                *focused,
+                || event_window.is_focused().map_err(|_| ()),
+                || commands::clear_and_hide(&registry, &event_window).map_err(|_| ()),
+            );
+        }
+        tauri::WindowEvent::CloseRequested { api, .. }
+            if event_coordinator.should_prevent_close() =>
+        {
+            api.prevent_close();
+            let registry = event_app.state::<result_registry::ResultRegistry>();
+            let _ = commands::clear_and_hide(&registry, &event_window);
+        }
+        _ => {}
+    });
+
+    let open_settings = tauri::menu::MenuItem::with_id(
+        app,
+        lifecycle::TRAY_OPEN_SETTINGS,
+        "打开设置",
+        true,
+        None::<&str>,
+    )
+    .map_err(|_| lifecycle_setup_error())?;
+    let quit =
+        tauri::menu::MenuItem::with_id(app, lifecycle::TRAY_QUIT, "退出", true, None::<&str>)
+            .map_err(|_| lifecycle_setup_error())?;
+    let menu = tauri::menu::Menu::with_items(app, &[&open_settings, &quit])
+        .map_err(|_| lifecycle_setup_error())?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(lifecycle_setup_error)?;
+    let tray_coordinator = Arc::clone(coordinator);
+    tauri::tray::TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .on_menu_event(
+            move |app, event| match lifecycle::tray_action(event.id().as_ref()) {
+                Some(lifecycle::TrayAction::Show(ShowTarget::Settings)) => {
+                    let _ = tray_coordinator.request_show(app, ShowTarget::Settings);
+                }
+                Some(lifecycle::TrayAction::Quit) => tray_coordinator.request_tray_quit(app),
+                _ => {}
+            },
+        )
+        .build(app)
+        .map_err(|_| lifecycle_setup_error())?;
+
+    lifecycle::install_session_end_hook(app.handle(), &window)
+        .map_err(|_| lifecycle_setup_error())?;
+    let _ = coordinator.reconcile_runtime_settings(app.handle(), &persisted_settings);
+    let _ = apps::start_initial_refresh(Arc::clone(app_cache))?;
+    coordinator
+        .mark_setup_ready(app.handle())
+        .map_err(|_| lifecycle_setup_error())?;
+    Ok(())
+}
+
 pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let app_cache = Arc::new(apps::AppCache::new());
 
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::Builder::new().build());
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());
+
+    let builder = tauri::Builder::default();
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let single_instance_coordinator = Arc::clone(&coordinator);
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let shortcut_coordinator = Arc::clone(&coordinator);
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let builder = builder
+        .plugin(tauri_plugin_single_instance::init(
+            move |app, _args, _cwd| {
+                let _ = single_instance_coordinator.request_show(app, ShowTarget::Launcher);
+            },
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, _shortcut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let _ = shortcut_coordinator.request_show(app, ShowTarget::Launcher);
+                    }
+                })
+                .build(),
+        )
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .manage(Arc::clone(&app_cache))
+        .manage(Arc::clone(&coordinator))
         .manage(result_registry::ResultRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
@@ -81,26 +196,31 @@ pub fn run() {
     #[cfg(all(not(test), feature = "test-instrumentation"))]
     let builder = builder.invoke_handler(tauri::generate_handler![security_probe::load_settings]);
 
-    builder
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let run_coordinator = Arc::clone(&coordinator);
+
+    let app = builder
         .setup(move |_app| {
             #[cfg(all(not(test), feature = "test-instrumentation"))]
             security_probe::setup(_app)?;
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
-            {
-                let app_data_dir = _app.path().app_data_dir()?;
-                let settings = load_settings_store(&app_data_dir)?;
-                assert!(_app.manage(settings), "settings store already managed");
-
-                let validation = load_and_open_validation_store(&app_data_dir)?;
-                assert!(_app.manage(validation), "validation store already managed");
-
-                let _ = apps::start_initial_refresh(Arc::clone(&app_cache))?;
-            }
+            setup_production_lifecycle(_app, &app_cache, &coordinator)?;
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running Tauri application");
+
+    app.run(move |_app, _event| {
+        #[cfg(any(test, not(feature = "test-instrumentation")))]
+        match _event {
+            tauri::RunEvent::ExitRequested { api, .. } if run_coordinator.should_prevent_exit() => {
+                api.prevent_exit();
+            }
+            tauri::RunEvent::Exit => run_coordinator.observe_run_exit(),
+            _ => {}
+        }
+    });
 }
 
 #[cfg(test)]
@@ -149,12 +269,9 @@ mod tests {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
-        let approved_task6 =
-            "#[cfg_attr(all(not(test),not(feature=\"test-instrumentation\")),allow(dead_code))]";
         let test_only = "#[cfg_attr(test,allow(dead_code))]";
         let enum_variant_names = "#[allow(clippy::enum_variant_names)]";
         let unapproved = compact
-            .replace(approved_task6, "")
             .replace(test_only, "")
             .replace(enum_variant_names, "");
         let has_directive = |keyword: &str| {
@@ -269,6 +386,95 @@ mod tests {
     }
 
     #[test]
+    fn production_lifecycle_wires_one_coordinator_and_exact_event_sources() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        assert_eq!(
+            production
+                .matches(".manage(Arc::clone(&coordinator))")
+                .count(),
+            1
+        );
+        for fragment in [
+            "let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());",
+            "tauri_plugin_single_instance::init(",
+            "move |app, _args, _cwd|",
+            "tauri_plugin_global_shortcut::Builder::new()",
+            "tauri_plugin_global_shortcut::ShortcutState::Pressed",
+            "setup_production_lifecycle(_app, &app_cache, &coordinator)?;",
+            "lifecycle::install_session_end_hook",
+            "tauri::tray::TrayIconBuilder::new()",
+            "tauri::WindowEvent::Focused(focused)",
+            "handle_focus_event_with(",
+            "*focused,",
+            "tauri::WindowEvent::CloseRequested",
+            "tauri::RunEvent::ExitRequested",
+            "tauri::RunEvent::Exit",
+        ] {
+            assert!(
+                production.contains(fragment),
+                "missing production wiring: {fragment}"
+            );
+        }
+        assert_eq!(production.matches(".mark_setup_ready(").count(), 1);
+        assert_eq!(
+            production
+                .matches("request_show(app, ShowTarget::Launcher)")
+                .count(),
+            2
+        );
+        assert_eq!(
+            production
+                .matches("request_show(app, ShowTarget::Settings)")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn feature_only_lifecycle_keeps_every_production_plugin_behind_the_product_cfg() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let run = source
+            .split("pub fn run() {")
+            .nth(1)
+            .and_then(|tail| tail.split("#[cfg(test)]\nmod tests").next())
+            .expect("run source markers are missing");
+        let production_marker = concat!(
+            "#[cfg(any(test, not(feature = \"test-instrumentation\")))]\n",
+            "    let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());",
+        );
+        let production_start = run
+            .find(production_marker)
+            .expect("production lifecycle cfg is missing");
+        let common = &run[..production_start];
+        for forbidden in [
+            "tauri_plugin_single_instance",
+            "tauri_plugin_global_shortcut",
+            "tauri_plugin_autostart",
+            "setup_production_lifecycle",
+            "launcher://shown",
+        ] {
+            assert!(
+                !common.contains(forbidden),
+                "feature-only common builder contains {forbidden}"
+            );
+        }
+        assert!(run.contains(concat!(
+            "#[cfg(all(not(test), feature = \"test-instrumentation\"))]\n",
+            "    let builder = builder.invoke_handler(tauri::generate_handler![",
+            "security_probe::load_settings",
+            "]);",
+        )));
+        assert!(run.contains(concat!(
+            "#[cfg(all(not(test), feature = \"test-instrumentation\"))]\n",
+            "            security_probe::setup(_app)?;",
+        )));
+    }
+
+    #[test]
     fn lint_oracle_rejects_unapproved_production_suppressions() {
         for fixture in [
             ["#![", "allow(", "dead_code", ")]"].concat(),
@@ -307,11 +513,11 @@ mod tests {
             "))] fn reserved_for_task6() {}",
         ]
         .concat();
-        assert!(!has_forbidden_production_lint_suppression(&approved_item));
+        assert!(has_forbidden_production_lint_suppression(&approved_item));
     }
 
     #[test]
-    fn production_modules_use_only_exact_task6_item_lint_exceptions() {
+    fn production_modules_have_no_task6_lint_exceptions() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let product_cfg = "#[cfg(any(test, not(feature = \"test-instrumentation\")))]";
         for module in [
@@ -324,6 +530,7 @@ mod tests {
             "settings",
             "validation_data",
             "validation_export",
+            "lifecycle",
         ] {
             assert!(
                 source.contains(&format!("{product_cfg}\nmod {module};")),
@@ -335,47 +542,14 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("test module marker is missing");
-        let approved_lifecycle_module_attr = concat!(
-            "#[cfg_attr(not(test), allow(dead_code))]\n",
-            "#[cfg(any(test, not(feature = \"test-instrumentation\")))]\n",
-            "mod lifecycle;",
-        );
-        let temporary_lifecycle_module_attr_count =
-            source.matches(approved_lifecycle_module_attr).count();
-        let production_root_without_lifecycle_exception =
-            production_root.replacen(approved_lifecycle_module_attr, "", 1);
-        assert_eq!(temporary_lifecycle_module_attr_count, 1);
-        assert!(production_root.contains(approved_lifecycle_module_attr));
         let allow_prefix = ["allow", "("].concat();
-        assert!(!production_root_without_lifecycle_exception.contains(&allow_prefix));
+        assert!(!production_root.contains(&allow_prefix));
 
-        let top_level_item_allow = [
-            "#[cfg_attr(\n    all(not(test), not(feature = \"test-instrumentation\")),\n    ",
-            "allow",
-            "(",
-            "dead_code",
-            ")\n)]",
-        ]
-        .concat();
-        let nested_item_allow = [
-            "#[cfg_attr(\n        all(not(test), not(feature = \"test-instrumentation\")),\n        ",
-            "allow",
-            "(",
-            "dead_code",
-            ")\n    )]",
-        ]
-        .concat();
-        let result_registry = include_str!("result_registry.rs").replace("\r\n", "\n");
-        let session_marker = include_str!("session_marker.rs").replace("\r\n", "\n");
-        let validation_data = include_str!("validation_data.rs").replace("\r\n", "\n");
         let commands = include_str!("commands.rs").replace("\r\n", "\n");
         let action = include_str!("apps/action.rs").replace("\r\n", "\n");
         let cache = include_str!("apps/cache.rs").replace("\r\n", "\n");
         let product_sources = [
-            (
-                "lib.rs",
-                production_root_without_lifecycle_exception.as_str(),
-            ),
+            ("lib.rs", production_root),
             ("atomic_file.rs", include_str!("atomic_file.rs")),
             ("commands.rs", commands.as_str()),
             ("apps/mod.rs", include_str!("apps/mod.rs")),
@@ -388,11 +562,12 @@ mod tests {
                 "apps/windows_backend.rs",
                 include_str!("apps/windows_backend.rs"),
             ),
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
             ("model.rs", include_str!("model.rs")),
-            ("result_registry.rs", result_registry.as_str()),
-            ("session_marker.rs", session_marker.as_str()),
+            ("result_registry.rs", include_str!("result_registry.rs")),
+            ("session_marker.rs", include_str!("session_marker.rs")),
             ("settings.rs", include_str!("settings.rs")),
-            ("validation_data.rs", validation_data.as_str()),
+            ("validation_data.rs", include_str!("validation_data.rs")),
             ("validation_export.rs", include_str!("validation_export.rs")),
         ];
 
@@ -402,14 +577,6 @@ mod tests {
                 "unapproved production lint suppression is forbidden: {name}"
             );
         }
-        let task6_exception_count = product_sources
-            .iter()
-            .map(|(_, product_source)| {
-                product_source.matches(&top_level_item_allow).count()
-                    + product_source.matches(&nested_item_allow).count()
-            })
-            .sum::<usize>();
-        assert_eq!(task6_exception_count, 6);
 
         let enum_variant_allow = "#[allow(clippy::enum_variant_names)]";
         assert_eq!(
@@ -435,26 +602,5 @@ mod tests {
             1
         );
         assert!(cache.contains(&format!("{test_only_allow}\n    pub(crate) fn refresh")));
-
-        assert!(
-            result_registry.contains(&format!("{nested_item_allow}\n    pub(crate) fn on_show"))
-        );
-        assert!(session_marker.contains(&format!(
-            "{top_level_item_allow}\npub(crate) fn read_marker_for_clean"
-        )));
-        for item in [
-            "    LauncherInvoked,",
-            "    SessionOwnershipLost,",
-            "    pub(crate) fn mark_clean_exit",
-            "    fn mark_clean_exit_with",
-        ] {
-            assert!(
-                validation_data.contains(&format!("{nested_item_allow}\n{item}")),
-                "missing exact Task 6 item lint exception: {item}"
-            );
-        }
-        assert_eq!(result_registry.matches(&nested_item_allow).count(), 1);
-        assert_eq!(session_marker.matches(&top_level_item_allow).count(), 1);
-        assert_eq!(validation_data.matches(&nested_item_allow).count(), 4);
     }
 }
