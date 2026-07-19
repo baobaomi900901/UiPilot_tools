@@ -236,6 +236,33 @@ describe('startup ownership', () => {
     await start
   })
 
+  it('blocks reload while startup hydration owns settings and permits retry after failure', async () => {
+    const fake = fakeClient()
+    const initial = deferred<SettingsView>()
+    const retry = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(initial.promise).mockReturnValueOnce(retry.promise)
+    const core = createLauncherCore(fake.client)
+    const start = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+    fake.emit(shown('startup-settings', 'settings'))
+
+    const blockedReload = core.reloadSettings()
+    await Promise.resolve()
+    expect(fake.client.loadSettings).toHaveBeenCalledOnce()
+    await blockedReload
+
+    initial.reject({ code: 'settingsFailed', message: 'private' })
+    await start
+    expect(core.getSnapshot().status).toBe('设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。')
+
+    const allowedRetry = core.reloadSettings()
+    expect(fake.client.loadSettings).toHaveBeenCalledTimes(2)
+    retry.resolve({ ...settingsFixture, autostart: true })
+    await allowedRetry
+    expect(core.getSnapshot().settings?.autostart).toBe(true)
+    expect(core.getSnapshot().status).toBe('')
+  })
+
   it('does not load after listener failure and exposes only fixed local text', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.listenShown).mockRejectedValueOnce(new Error('secret listener failure'))

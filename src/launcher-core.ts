@@ -195,6 +195,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   let snapshot = projectSnapshot(model)
   let destroyed = false
   let started = false
+  let startupSettingsPending = false
   let unlisten: (() => void) | undefined
   let token = 0
   let searchToken = 0
@@ -625,6 +626,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   }
 
   async function reloadSettings(): Promise<void> {
+    if (startupSettingsPending) return
     const operation = startSettingsOperation('load')
     if (!operation) return
     await finishSettingsLoad(operation)
@@ -826,6 +828,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       return
     }
     unlisten = registered
+    startupSettingsPending = true
     try {
       const settings = await client.loadSettings()
       if (!destroyed) {
@@ -838,6 +841,8 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
         model.status = model.settingsLoadError
         publish(true)
       }
+    } finally {
+      startupSettingsPending = false
     }
   }
 
