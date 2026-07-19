@@ -93,6 +93,28 @@ export interface ViewResult {
   subtitle?: string
 }
 
+export interface AliasControlView {
+  key: ControlKey
+  value: string
+}
+
+export interface ApplicationAliasView {
+  key: ControlKey
+  displayName: string
+  aliases: readonly AliasControlView[]
+}
+
+export interface SettingsSnapshot {
+  hotkey: AliasControlView
+  researchId: AliasControlView
+  autostart: boolean
+  applications: readonly ApplicationAliasView[]
+  readOnly: boolean
+  operation?: 'load' | 'save' | 'rescan' | 'export' | 'clear'
+  clearConfirmation: boolean
+  needsReload: boolean
+}
+
 export interface LauncherSnapshot {
   view: 'launcher' | 'settings'
   viewEpoch: number
@@ -108,6 +130,7 @@ export interface LauncherSnapshot {
   hidePending: boolean
   shownNotice?: string
   status: string
+  settings?: SettingsSnapshot
 }
 
 const shownKeys = ['invocationId', 'notice', 'target']

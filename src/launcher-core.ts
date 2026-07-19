@@ -7,6 +7,8 @@ import {
   type LauncherClient,
   type LauncherSnapshot,
   type ResultItem,
+  type SettingsView,
+  type UserSettingsUpdate,
   type ViewResult,
 } from './protocol'
 
@@ -20,6 +22,16 @@ export interface LauncherCore {
   readonly retireControl: (control: ControlKey) => void
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
   readonly requestHide: () => Promise<void>
+  readonly setAutostart: (checked: boolean) => void
+  readonly addAlias: (application: ControlKey) => void
+  readonly removeAlias: (application: ControlKey, alias: ControlKey) => void
+  readonly saveSettings: () => Promise<void>
+  readonly reloadSettings: () => Promise<void>
+  readonly rescanApps: () => Promise<void>
+  readonly exportValidation: () => Promise<void>
+  readonly beginClearValidation: () => void
+  readonly cancelClearValidation: () => void
+  readonly confirmClearValidation: () => Promise<void>
   readonly destroy: () => void
 }
 
@@ -43,6 +55,10 @@ interface Model {
   hidePending: boolean
   shownNotice?: string
   status: string
+  settings?: PrivateSettings
+  settingsOperation?: SettingsOperationKind
+  settingsNeedsReload: boolean
+  clearConfirmation: boolean
 }
 
 interface CompositionOwner {
@@ -54,6 +70,34 @@ interface CompositionOwner {
 
 interface FinalizationOwner extends CompositionOwner {
   value?: string
+}
+
+interface TextControl {
+  key: ControlKey
+  value: string
+  draft: string
+}
+
+interface PrivateApplication {
+  key: ControlKey
+  displayName: string
+  aliases: TextControl[]
+}
+
+interface PrivateSettings {
+  hotkey: TextControl
+  researchId: TextControl
+  autostart: boolean
+  applications: PrivateApplication[]
+}
+
+type SettingsOperationKind = 'load' | 'save' | 'rescan' | 'export' | 'clear'
+
+interface SettingsOperation {
+  token: number
+  kind: SettingsOperationKind
+  viewEpoch: number
+  view: 'launcher' | 'settings'
 }
 
 const ERROR_TEXT: Record<CommandErrorCode, string> = {
@@ -90,6 +134,26 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
     model.results.map(({ key, title, subtitle }) => Object.freeze(subtitle === undefined ? { key, title } : { key, title, subtitle })),
   )
+  const settings = model.settings
+    ? Object.freeze({
+        hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
+        researchId: Object.freeze({ key: model.settings.researchId.key, value: model.settings.researchId.draft }),
+        autostart: model.settings.autostart,
+        applications: Object.freeze(
+          model.settings.applications.map((application) =>
+            Object.freeze({
+              key: application.key,
+              displayName: application.displayName,
+              aliases: Object.freeze(application.aliases.map((alias) => Object.freeze({ key: alias.key, value: alias.draft }))),
+            }),
+          ),
+        ),
+        readOnly: model.settingsNeedsReload,
+        ...(model.settingsOperation === undefined ? {} : { operation: model.settingsOperation }),
+        clearConfirmation: model.clearConfirmation,
+        needsReload: model.settingsNeedsReload,
+      })
+    : undefined
   return Object.freeze({
     view: model.view,
     viewEpoch: model.viewEpoch,
@@ -105,6 +169,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     hidePending: model.hidePending,
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
     status: model.status,
+    ...(settings === undefined ? {} : { settings }),
   })
 }
 
@@ -122,6 +187,8 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     executePending: false,
     hidePending: false,
     status: '',
+    settingsNeedsReload: false,
+    clearConfirmation: false,
   }
   const listeners = new Set<() => void>()
   let snapshot = projectSnapshot(model)
@@ -133,11 +200,14 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   let executeToken = 0
   let hideToken = 0
   let resultKey = 1
+  let controlKey = 2
   let activationNoticePending = false
   let compositionGeneration = 0
   let composition: CompositionOwner | undefined
   let suppression: FinalizationOwner | undefined
   let tombstone: FinalizationOwner | undefined
+  let settingsOperation: SettingsOperation | undefined
+  const appIds = new Map<ControlKey, string>()
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -154,6 +224,95 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       active = false
       listeners.delete(listener)
     }
+  }
+
+  function newTextControl(value: string): TextControl {
+    return { key: controlKey++, value, draft: value }
+  }
+
+  function settingsControls(settings: PrivateSettings): TextControl[] {
+    return [settings.hotkey, settings.researchId, ...settings.applications.flatMap((application) => application.aliases)]
+  }
+
+  function replaceSettings(view: SettingsView): void {
+    if (model.settings) {
+      for (const control of settingsControls(model.settings)) retireControl(control.key)
+    }
+    appIds.clear()
+    const totals = new Map<string, number>()
+    for (const application of view.applications) totals.set(application.displayName, (totals.get(application.displayName) ?? 0) + 1)
+    const seen = new Map<string, number>()
+    const applications = view.applications.map((application) => {
+      const key = controlKey++
+      appIds.set(key, application.appId)
+      const ordinal = (seen.get(application.displayName) ?? 0) + 1
+      seen.set(application.displayName, ordinal)
+      return {
+        key,
+        displayName: totals.get(application.displayName) === 1 ? application.displayName : `${application.displayName} (${ordinal})`,
+        aliases: (application.aliases.length ? application.aliases : ['']).map(newTextControl),
+      }
+    })
+    model.settings = {
+      hotkey: newTextControl(view.hotkey),
+      researchId: newTextControl(view.researchId ?? ''),
+      autostart: view.autostart,
+      applications,
+    }
+    model.settingsNeedsReload = false
+    model.clearConfirmation = false
+  }
+
+  function findTextControl(control: ControlKey): TextControl | undefined {
+    if (!model.settings) return undefined
+    if (model.settings.hotkey.key === control) return model.settings.hotkey
+    if (model.settings.researchId.key === control) return model.settings.researchId
+    for (const application of model.settings.applications) {
+      const alias = application.aliases.find((candidate) => candidate.key === control)
+      if (alias) return alias
+    }
+    return undefined
+  }
+
+  function getControlDraft(control: ControlKey): string | undefined {
+    if (control === model.queryControl) return model.queryControlValue
+    return findTextControl(control)?.draft
+  }
+
+  function setControlDraft(control: ControlKey, value: string): boolean {
+    if (control === model.queryControl) {
+      const changed = model.queryControlValue !== value
+      model.queryControlValue = value
+      return changed
+    }
+    const field = findTextControl(control)
+    if (!field) return false
+    const changed = field.draft !== value
+    field.draft = value
+    return changed
+  }
+
+  function restoreControl(control: ControlKey): boolean {
+    if (control === model.queryControl) return setControlDraft(control, model.query)
+    const field = findTextControl(control)
+    return field ? setControlDraft(control, field.value) : false
+  }
+
+  function commitControl(control: ControlKey, value: string): void {
+    if (control === model.queryControl) {
+      applyEdit(value)
+      return
+    }
+    const field = findTextControl(control)
+    if (!field || model.settingsNeedsReload || settingsOperation) return
+    const changed = field.value !== value || field.draft !== value
+    field.value = value
+    field.draft = value
+    publish(changed)
+  }
+
+  function settingsEditable(): boolean {
+    return model.settings !== undefined && !model.settingsNeedsReload && settingsOperation === undefined
   }
 
   function clearResults(): void {
@@ -245,6 +404,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    if (composition) restoreControl(composition.control)
     tombstone = composition ? { ...composition } : undefined
     composition = undefined
     suppression = undefined
@@ -274,22 +434,26 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   }
 
   function text(record: ClassifiedTextRecord): void {
-    if (destroyed || record.control !== model.queryControl) return
+    if (destroyed) return
+    const queryControl = record.control === model.queryControl
+    if (!queryControl && !findTextControl(record.control)) return
+    if (!queryControl && !settingsEditable()) return
     if (record.kind === 'ordinaryInput') {
       composition = undefined
       suppression = undefined
       tombstone = undefined
-      applyEdit(record.value)
+      commitControl(record.control, record.value)
       return
     }
     if (record.kind === 'compositionStart') {
       const visibleMutation =
-        model.queryControlValue !== record.value ||
-        model.searchPending ||
-        model.requestId !== undefined ||
-        model.results.length > 0 ||
-        model.selectedIndex !== -1 ||
-        model.status !== ''
+        getControlDraft(record.control) !== record.value ||
+        (queryControl &&
+          (model.searchPending ||
+            model.requestId !== undefined ||
+            model.results.length > 0 ||
+            model.selectedIndex !== -1 ||
+            model.status !== ''))
       compositionGeneration += 1
       composition = {
         control: record.control,
@@ -299,19 +463,19 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       }
       suppression = undefined
       tombstone = undefined
-      searchToken = ++token
-      model.searchPending = false
-      model.queryControlValue = record.value
-      model.status = ''
-      clearResults()
+      setControlDraft(record.control, record.value)
+      if (queryControl) {
+        searchToken = ++token
+        model.searchPending = false
+        model.status = ''
+        clearResults()
+      }
       publish(visibleMutation)
       return
     }
     if (record.kind === 'compositionUpdate' || record.kind === 'compositionInput') {
       if (ownsComposition(composition, record.control)) {
-        const changed = model.queryControlValue !== record.value
-        model.queryControlValue = record.value
-        publish(changed)
+        publish(setControlDraft(record.control, record.value))
         return
       }
       if (
@@ -325,9 +489,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       }
       if (record.kind === 'compositionInput' && tombstone?.control === record.control && tombstone.value === record.value) {
         tombstone = undefined
-        const changed = model.queryControlValue !== model.query
-        model.queryControlValue = model.query
-        publish(changed)
+        publish(restoreControl(record.control))
       }
       return
     }
@@ -335,14 +497,12 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       const owner = composition
       composition = undefined
       suppression = { ...owner, value: record.value }
-      applyEdit(record.value)
+      commitControl(record.control, record.value)
       return
     }
     if (tombstone?.control === record.control) {
       tombstone.value = record.value
-      const changed = model.queryControlValue !== model.query
-      model.queryControlValue = model.query
-      publish(changed)
+      publish(restoreControl(record.control))
     }
   }
 
@@ -360,6 +520,202 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     if (composition?.control === control) composition = undefined
     if (suppression?.control === control) suppression = undefined
     if (tombstone?.control === control) tombstone = undefined
+  }
+
+  function setAutostart(checked: boolean): void {
+    if (!settingsEditable() || model.settings!.autostart === checked) return
+    model.settings!.autostart = checked
+    publish(true)
+  }
+
+  function addAlias(application: ControlKey): void {
+    if (!settingsEditable()) return
+    const target = model.settings!.applications.find((candidate) => candidate.key === application)
+    if (!target) return
+    target.aliases.push(newTextControl(''))
+    publish(true)
+  }
+
+  function removeAlias(application: ControlKey, alias: ControlKey): void {
+    if (!settingsEditable()) return
+    const target = model.settings!.applications.find((candidate) => candidate.key === application)
+    const index = target?.aliases.findIndex((candidate) => candidate.key === alias) ?? -1
+    if (!target || index < 0) return
+    retireControl(alias)
+    target.aliases.splice(index, 1)
+    if (!target.aliases.length) target.aliases.push(newTextControl(''))
+    publish(true)
+  }
+
+  function startSettingsOperation(kind: SettingsOperationKind): SettingsOperation | undefined {
+    if (destroyed || settingsOperation || (kind !== 'load' && !model.settings)) return undefined
+    const operation = { token: ++token, kind, viewEpoch: model.viewEpoch, view: model.view }
+    settingsOperation = operation
+    model.settingsOperation = kind
+    model.clearConfirmation = false
+    model.shownNotice = undefined
+    model.status = ''
+    publish(true)
+    return operation
+  }
+
+  function ownsSettingsOperation(operation: SettingsOperation): boolean {
+    return !destroyed && settingsOperation?.token === operation.token
+  }
+
+  function ownsSettingsView(operation: SettingsOperation): boolean {
+    return ownsSettingsOperation(operation) && operation.viewEpoch === model.viewEpoch && operation.view === model.view
+  }
+
+  function releaseSettingsOperation(operation: SettingsOperation): void {
+    if (settingsOperation?.token !== operation.token) return
+    settingsOperation = undefined
+    model.settingsOperation = undefined
+  }
+
+  function settingsUpdate(): UserSettingsUpdate {
+    const settings = model.settings!
+    const aliases: Record<string, string[]> = {}
+    for (const application of settings.applications) {
+      const appId = appIds.get(application.key)
+      if (!appId) continue
+      aliases[appId] = application.aliases.map((alias) => alias.value).filter((value) => value !== '')
+    }
+    return {
+      hotkey: settings.hotkey.value,
+      autostart: settings.autostart,
+      ...(settings.researchId.value === '' ? {} : { researchId: settings.researchId.value }),
+      aliases,
+    }
+  }
+
+  async function finishSettingsLoad(operation: SettingsOperation): Promise<void> {
+    try {
+      const view = await client.loadSettings()
+      if (!ownsSettingsOperation(operation)) return
+      if (!ownsSettingsView(operation)) {
+        releaseSettingsOperation(operation)
+        publish(true)
+        return
+      }
+      replaceSettings(view)
+      releaseSettingsOperation(operation)
+      model.status = ''
+      publish(true)
+    } catch (error) {
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) model.status = errorText(error)
+      publish(true)
+    }
+  }
+
+  async function reloadSettings(): Promise<void> {
+    const operation = startSettingsOperation('load')
+    if (!operation) return
+    await finishSettingsLoad(operation)
+  }
+
+  async function reloadAfterMutation(operation: SettingsOperation): Promise<void> {
+    if (!ownsSettingsOperation(operation)) return
+    if (!ownsSettingsView(operation)) {
+      model.settingsNeedsReload = true
+      releaseSettingsOperation(operation)
+      publish(true)
+      return
+    }
+    model.settingsNeedsReload = true
+    publish(true)
+    await finishSettingsLoad(operation)
+  }
+
+  async function saveSettings(): Promise<void> {
+    if (!settingsEditable()) return
+    const update = settingsUpdate()
+    const operation = startSettingsOperation('save')
+    if (!operation) return
+    try {
+      await client.saveSettings({ settings: update })
+    } catch (error) {
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      model.settingsNeedsReload = true
+      releaseSettingsOperation(operation)
+      if (current) model.status = errorText(error)
+      publish(true)
+      return
+    }
+    await reloadAfterMutation(operation)
+  }
+
+  async function rescanApps(): Promise<void> {
+    if (!settingsEditable()) return
+    const operation = startSettingsOperation('rescan')
+    if (!operation) return
+    try {
+      await client.rescanApps()
+    } catch (error) {
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) model.status = errorText(error)
+      publish(true)
+      return
+    }
+    await reloadAfterMutation(operation)
+  }
+
+  async function exportValidation(): Promise<void> {
+    const operation = startSettingsOperation('export')
+    if (!operation) return
+    try {
+      const outcome = await client.exportValidationData()
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) model.status = outcome.status === 'exported' ? '验证数据已导出。' : ''
+      publish(true)
+    } catch (error) {
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) model.status = errorText(error)
+      publish(true)
+    }
+  }
+
+  function beginClearValidation(): void {
+    if (!model.settings || settingsOperation || model.clearConfirmation) return
+    model.clearConfirmation = true
+    model.status = ''
+    publish(true)
+  }
+
+  function cancelClearValidation(): void {
+    if (!model.clearConfirmation || settingsOperation) return
+    model.clearConfirmation = false
+    publish(true)
+  }
+
+  async function confirmClearValidation(): Promise<void> {
+    if (!model.clearConfirmation) return
+    const operation = startSettingsOperation('clear')
+    if (!operation) return
+    try {
+      await client.clearValidationData()
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) model.status = '验证数据已清除。'
+      publish(true)
+    } catch (error) {
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) model.status = errorText(error)
+      publish(true)
+    }
   }
 
   function executeSelection(): void {
@@ -455,7 +811,11 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     }
     unlisten = registered
     try {
-      await client.loadSettings()
+      const settings = await client.loadSettings()
+      if (!destroyed) {
+        replaceSettings(settings)
+        publish(true)
+      }
     } catch (error) {
       if (!destroyed) {
         model.status = errorText(error)
@@ -470,6 +830,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
+    settingsOperation = undefined
     unlisten?.()
     unlisten = undefined
     listeners.clear()
@@ -485,6 +846,16 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     retireControl,
     keyDown,
     requestHide,
+    setAutostart,
+    addAlias,
+    removeAlias,
+    saveSettings,
+    reloadSettings,
+    rescanApps,
+    exportValidation,
+    beginClearValidation,
+    cancelClearValidation,
+    confirmClearValidation,
     destroy,
   }
 }
