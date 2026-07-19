@@ -202,7 +202,6 @@ impl SettingsStore {
             .clone()
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Settings {
         self.state
             .lock()
