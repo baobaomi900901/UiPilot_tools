@@ -58,6 +58,7 @@ interface Model {
   settings?: PrivateSettings
   settingsOperation?: SettingsOperationKind
   settingsNeedsReload: boolean
+  settingsLoadError?: string
   clearConfirmation: boolean
 }
 
@@ -260,6 +261,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       applications,
     }
     model.settingsNeedsReload = false
+    model.settingsLoadError = undefined
     model.clearConfirmation = false
   }
 
@@ -305,9 +307,10 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     }
     const field = findTextControl(control)
     if (!field || model.settingsNeedsReload || settingsOperation) return
-    const changed = field.value !== value || field.draft !== value
+    const changed = field.value !== value || field.draft !== value || model.shownNotice !== undefined
     field.value = value
     field.draft = value
+    model.shownNotice = undefined
     publish(changed)
   }
 
@@ -422,6 +425,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     model.status = ''
     clearResults()
     model.shownNotice = event.notice === null ? undefined : NOTICE_TEXT[event.notice]
+    if (event.target === 'settings' && event.notice === null && model.settingsLoadError) model.status = model.settingsLoadError
     if (event.target === 'launcher' && event.notice === null && activationNoticePending) {
       activationNoticePending = false
       model.shownNotice = REFUSED_NOTICE
@@ -448,6 +452,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     if (record.kind === 'compositionStart') {
       const visibleMutation =
         getControlDraft(record.control) !== record.value ||
+        model.shownNotice !== undefined ||
         (queryControl &&
           (model.searchPending ||
             model.requestId !== undefined ||
@@ -463,6 +468,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       }
       suppression = undefined
       tombstone = undefined
+      model.shownNotice = undefined
       setControlDraft(record.control, record.value)
       if (queryControl) {
         searchToken = ++token
@@ -525,6 +531,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   function setAutostart(checked: boolean): void {
     if (!settingsEditable() || model.settings!.autostart === checked) return
     model.settings!.autostart = checked
+    model.shownNotice = undefined
     publish(true)
   }
 
@@ -533,6 +540,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     const target = model.settings!.applications.find((candidate) => candidate.key === application)
     if (!target) return
     target.aliases.push(newTextControl(''))
+    model.shownNotice = undefined
     publish(true)
   }
 
@@ -544,6 +552,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     retireControl(alias)
     target.aliases.splice(index, 1)
     if (!target.aliases.length) target.aliases.push(newTextControl(''))
+    model.shownNotice = undefined
     publish(true)
   }
 
@@ -590,6 +599,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   }
 
   async function finishSettingsLoad(operation: SettingsOperation): Promise<void> {
+    model.settingsLoadError = undefined
     try {
       const view = await client.loadSettings()
       if (!ownsSettingsOperation(operation)) return
@@ -606,7 +616,10 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       if (!ownsSettingsOperation(operation)) return
       const current = ownsSettingsView(operation)
       releaseSettingsOperation(operation)
-      if (current) model.status = errorText(error)
+      if (current) {
+        model.settingsLoadError = errorText(error)
+        model.status = model.settingsLoadError
+      }
       publish(true)
     }
   }
@@ -660,6 +673,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       const current = ownsSettingsView(operation)
       releaseSettingsOperation(operation)
       if (current) model.status = errorText(error)
+      else model.settingsNeedsReload = true
       publish(true)
       return
     }
@@ -688,6 +702,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   function beginClearValidation(): void {
     if (!model.settings || settingsOperation || model.clearConfirmation) return
     model.clearConfirmation = true
+    model.shownNotice = undefined
     model.status = ''
     publish(true)
   }
@@ -695,6 +710,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   function cancelClearValidation(): void {
     if (!model.clearConfirmation || settingsOperation) return
     model.clearConfirmation = false
+    model.shownNotice = undefined
     publish(true)
   }
 
@@ -818,7 +834,8 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       }
     } catch (error) {
       if (!destroyed) {
-        model.status = errorText(error)
+        model.settingsLoadError = errorText(error)
+        model.status = model.settingsLoadError
         publish(true)
       }
     }

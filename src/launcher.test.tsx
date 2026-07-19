@@ -708,6 +708,27 @@ describe('settings ownership', () => {
     expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
   })
 
+  it('also makes a stale rejected rescan require reload', async () => {
+    const { core, client, emit } = await settingsCore()
+    const rescan = deferred<void>()
+    vi.mocked(client.rescanApps).mockReturnValueOnce(rescan.promise)
+    const pending = core.rescanApps()
+    emit(shown('stale-rescan-error', 'settings'))
+    rescan.reject({ code: 'scanFailed', message: 'raw' })
+    await pending
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
+    expect(core.getSnapshot().status).toBe('')
+  })
+
+  it('clears a shown notice on a settings text edit', async () => {
+    const { core, emit } = await settingsCore()
+    emit(shown('settings-notice', 'settings', 'validationFailed'))
+    expect(core.getSnapshot().shownNotice).toBe('本地验证数据操作失败。')
+    const hotkey = core.getSnapshot().settings!.hotkey
+    core.text({ kind: 'ordinaryInput', control: hotkey.key, value: 'Ctrl+Space', inputType: 'insertText' })
+    expect(core.getSnapshot().shownNotice).toBeUndefined()
+  })
+
   it('keeps rescan failure editable but fails closed when its reload fails', async () => {
     const { core, client } = await settingsCore()
     vi.mocked(client.rescanApps).mockRejectedValueOnce({ code: 'scanFailed', message: 'raw' })
@@ -881,6 +902,21 @@ describe('React view and accessibility', () => {
     await act(async () => close.click())
     expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
     expect(core.getSnapshot().view).toBe('settings')
+    await mounted.unmount()
+  })
+
+  it('shows fixed settings load failure and retry without a permanent spinner', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'raw backend' })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('settings-failure', 'settings'))
+    const mounted = await mountLauncherView(core)
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('设置未能确认完成')
+    expect(mounted.host.querySelector('.ant-spin-spinning')).toBeNull()
+    expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent?.includes('重新加载设置'))).toBe(true)
+    expect(mounted.host.textContent).not.toContain('raw backend')
     await mounted.unmount()
   })
 
