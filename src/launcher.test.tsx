@@ -1,11 +1,18 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from 'vitest'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
+import { theme } from 'antd'
 
 import { createLauncherCore } from './launcher-core'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherCoreSource from './launcher-core.ts?raw'
 import { bindNativeTextInput } from './native-input'
+import * as nativeInput from './native-input'
+import { LauncherView } from './launcher-view'
+// @ts-expect-error Vite supplies the raw source module in Vitest.
+import launcherViewSource from './launcher-view.tsx?raw'
 import {
   parseLauncherShown,
   type ExecuteOutcome,
@@ -15,6 +22,22 @@ import {
   type SearchResponse,
   type SettingsView,
 } from './protocol'
+
+const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
+
+vi.mock('antd', async () => {
+  const actual = await vi.importActual<typeof import('antd')>('antd')
+  const React = await import('react')
+  return {
+    ...actual,
+    ConfigProvider: (props: React.ComponentProps<typeof actual.ConfigProvider>) => {
+      configCapture.values.push(props.theme)
+      return React.createElement(actual.ConfigProvider, props)
+    },
+  }
+});
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -70,6 +93,63 @@ function fakeClient() {
 
 function shown(invocationId: string, target: 'launcher' | 'settings' = 'launcher', notice: LauncherShown['notice'] = null) {
   return { invocationId, target, notice }
+}
+
+function installMatchMedia(initial: boolean) {
+  let matches = initial
+  let listener: ((event: MediaQueryListEvent) => void) | undefined
+  const add = vi.fn((_type: 'change', next: (event: MediaQueryListEvent) => void) => {
+    listener = next
+  })
+  const remove = vi.fn((_type: 'change', removed: (event: MediaQueryListEvent) => void) => {
+    if (listener === removed) listener = undefined
+  })
+  const media = '(prefers-color-scheme: dark)'
+  const primary = {
+    get matches() {
+      return matches
+    },
+    media,
+    addEventListener: add,
+    removeEventListener: remove,
+  } as unknown as MediaQueryList
+  let calls = 0
+  const matchMedia = vi.fn((query: string) => {
+    calls += 1
+    if (calls === 1) return primary
+    return {
+      matches: initial,
+      media: query,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as MediaQueryList
+  })
+  Object.defineProperty(window, 'matchMedia', { configurable: true, value: matchMedia })
+  return {
+    add,
+    remove,
+    matchMedia,
+    emit(next: boolean) {
+      matches = next
+      listener?.({ matches, media } as MediaQueryListEvent)
+    },
+  }
+}
+
+async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
+  const host = document.createElement('div')
+  document.body.append(host)
+  const root = createRoot(host)
+  const onReady = vi.fn()
+  await act(async () => root.render(<LauncherView core={core} onReady={onReady} />))
+  return {
+    host,
+    onReady,
+    async unmount() {
+      await act(async () => root.unmount())
+      host.remove()
+    },
+  }
 }
 
 async function startedCore() {
@@ -684,5 +764,193 @@ describe('execute and hide continuation', () => {
     emit(shown('eligible'))
     expect(core.getSnapshot().shownNotice).toBe('Windows 拒绝了前台切换，已发送启动请求')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('raw backend')
+  })
+})
+
+describe('React view and accessibility', () => {
+  it('uses the exact AntD light/dark algorithms and removes the media listener', async () => {
+    configCapture.values.length = 0
+    const scheme = installMatchMedia(false)
+    const { core } = await startedCore()
+    const mounted = await mountLauncherView(core)
+    expect(scheme.matchMedia).toHaveBeenCalledWith('(prefers-color-scheme: dark)')
+    let config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown; token?: { motion?: boolean } }
+    expect(config.algorithm).toBe(theme.defaultAlgorithm)
+    expect(config.token?.motion).toBe(false)
+    await act(async () => scheme.emit(true))
+    config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown; token?: { motion?: boolean } }
+    expect(config.algorithm).toBe(theme.darkAlgorithm)
+    await mounted.unmount()
+    expect(scheme.remove).toHaveBeenCalledTimes(1)
+    expect(scheme.remove.mock.calls[0]).toEqual(['change', scheme.add.mock.calls[0]![1]])
+  })
+
+  it('selects the dark algorithm on an initially dark host', async () => {
+    configCapture.values.length = 0
+    installMatchMedia(true)
+    const { core } = await startedCore()
+    const mounted = await mountLauncherView(core)
+    const config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown; token?: { motion?: boolean } }
+    expect(config.algorithm).toBe(theme.darkAlgorithm)
+    expect(config.token?.motion).toBe(false)
+    await mounted.unmount()
+  })
+
+  it('renders local combobox/listbox ownership and keeps the active option visible', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'private-request',
+      items: [
+        { resultId: 'private-one', title: '<b>literal</b>' },
+        { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value' },
+      ],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const scroll = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scroll })
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('view')))
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    expect(input).toBeTruthy()
+    expect(input.disabled).toBe(false)
+    expect(input.getAttribute('aria-autocomplete')).toBe('list')
+    expect(input.getAttribute('aria-controls')).toBe('launcher-results')
+    expect(document.activeElement).toBe(input)
+
+    await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'app', inputType: 'insertText' }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    expect(mounted.host.querySelector('[role="listbox"]')?.id).toBe('launcher-results')
+    expect(input.getAttribute('aria-expanded')).toBe('true')
+    expect(options[0]!.getAttribute('aria-selected')).toBe('true')
+    expect(options[0]!.textContent).toContain('<b>literal</b>')
+    expect(options[0]!.querySelector('b')).toBeNull()
+    expect(mounted.host.innerHTML).not.toContain('private-request')
+    expect(mounted.host.innerHTML).not.toContain('private-one')
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('2 个结果')
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    expect(document.activeElement).toBe(input)
+    expect(input.getAttribute('aria-activedescendant')).toBe(options[1]!.id)
+    expect(scroll).toHaveBeenCalledWith({ block: 'nearest' })
+    await mounted.unmount()
+  })
+
+  it('keeps empty startup quiet, announces no results, and gives composing Escape to IME', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({ requestId: 'empty', items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    expect(input.disabled).toBe(true)
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('')
+    await act(async () => fake.emit(shown('empty-results')))
+    expect(input.disabled).toBe(false)
+    await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'missing', inputType: 'insertText' }))
+    await vi.waitFor(() => expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('未找到应用'))
+    await act(async () =>
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, isComposing: true })),
+    )
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+    await mounted.unmount()
+  })
+
+  it('renders the settings projection without app IDs and closes only through the core hide owner', async () => {
+    installMatchMedia(true)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-view', 'settings')))
+    const heading = mounted.host.querySelector<HTMLElement>('h1')!
+    expect(heading.textContent).toBe('设置')
+    expect(document.activeElement).toBe(heading)
+    expect(mounted.host.textContent).toContain('同名应用 (1)')
+    expect(mounted.host.textContent).toContain('同名应用 (2)')
+    expect(mounted.host.innerHTML).not.toContain('private-app-id')
+    expect(mounted.host.querySelector('input[maxlength="64"][pattern="[A-Za-z0-9_-]{1,64}"]')).toBeTruthy()
+    const close = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
+    expect(close.getAttribute('aria-label')).toBe('关闭')
+    await act(async () => close.click())
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+    expect(core.getSnapshot().view).toBe('settings')
+    await mounted.unmount()
+  })
+
+  it('unbinds the native input before retiring its control and reports ready once', async () => {
+    installMatchMedia(false)
+    const cleanup: string[] = []
+    const bind = vi.spyOn(nativeInput, 'bindNativeTextInput').mockImplementation((_input, control) => () => {
+      cleanup.push('native-unbind')
+    })
+    const { core } = await startedCore()
+    const originalRetire = core.retireControl
+    vi.spyOn(core, 'retireControl').mockImplementation((control) => {
+      cleanup.push(`retire:${control}`)
+      originalRetire(control)
+    })
+    const control = core.getSnapshot().queryControl
+    const mounted = await mountLauncherView(core)
+    expect(mounted.onReady).toHaveBeenCalledOnce()
+    expect(mounted.onReady).toHaveBeenCalledWith('ready')
+    await mounted.unmount()
+    expect(cleanup).toEqual(['native-unbind', `retire:${control}`])
+    expect(bind).toHaveBeenCalledOnce()
+    bind.mockRestore()
+  })
+
+  it('unbinds and retires old settings controls before a form replacement', async () => {
+    installMatchMedia(false)
+    const cleanup: string[] = []
+    const bind = vi.spyOn(nativeInput, 'bindNativeTextInput').mockImplementation((_input, control) => () => {
+      cleanup.push(`native-unbind:${control}`)
+    })
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    const core = createLauncherCore(fake.client)
+    const originalRetire = core.retireControl
+    vi.spyOn(core, 'retireControl').mockImplementation((control) => {
+      cleanup.push(`retire:${control}`)
+      originalRetire(control)
+    })
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('replacement-view', 'settings')))
+    const oldHotkey = core.getSnapshot().settings!.hotkey.key
+    cleanup.length = 0
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    await act(async () => core.reloadSettings())
+    const unbindIndex = cleanup.indexOf(`native-unbind:${oldHotkey}`)
+    const retireIndex = cleanup.indexOf(`retire:${oldHotkey}`)
+    expect(unbindIndex).toBeGreaterThanOrEqual(0)
+    expect(retireIndex).toBeGreaterThan(unbindIndex)
+    await mounted.unmount()
+    bind.mockRestore()
+  })
+
+  it('keeps the React/AntD source boundary exact', () => {
+    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Alert', 'Spin', 'theme']) {
+      expect(launcherViewSource).toContain(required)
+    }
+    for (const forbidden of [
+      '@tauri-apps/api',
+      '@ant-design/icons',
+      'AutoComplete',
+      'Select',
+      'Card',
+      'Modal',
+      'Popconfirm',
+      'dangerouslySetInnerHTML',
+      'appId',
+    ]) {
+      expect(launcherViewSource).not.toContain(forbidden)
+    }
   })
 })
