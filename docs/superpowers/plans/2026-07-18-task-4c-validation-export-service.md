@@ -78,14 +78,24 @@ coordinator performs exactly these non-destructive preparation steps:
    SHA; never move or recreate it.
 2. Create immutable lightweight evidence tag `foundation-task-4c-gate-plan` at the final docs commit
    named by the written plan-Go message. Record that exact commit SHA; never move or recreate the tag.
-3. Integrate the exact commit named by `foundation-task-4c-gate-plan` into
-   `codex/foundation-task-4`. Before and
-   after integration, `src-tauri/src/validation_export.rs` must remain the only unstaged code diff;
-   the integrated commit must change only this plan file, and its plan-file blob must equal the blob
-   stored by the evidence tag.
-4. The resulting Task 4C `HEAD` must have baseline SHA `6b2348e...` as its direct parent, and its
+3. In `codex/foundation-task-4`, first verify `HEAD` is exactly `6b2348e...`, the index is empty,
+   `PlanPath` has no staged or worktree modification, and `src-tauri/src/validation_export.rs` is the
+   only unstaged path. Only after those checks, restore the final approved plan blob into the index and
+   worktree with this exact command; do not cherry-pick the docs commit:
+
+   ```powershell
+   git restore --source refs/tags/foundation-task-4c-gate-plan --staged --worktree -- docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md
+   if ($LASTEXITCODE -ne 0) { throw 'approved plan blob restore failed' }
+   ```
+
+4. After restore, verify the staged set is exactly `PlanPath`, the unstaged set is exactly
+   `src-tauri/src/validation_export.rs`, and the staged PlanPath blob equals the PlanPath blob at
+   `foundation-task-4c-gate-plan`. Create one new plan-only commit on the Task 4 branch; do not claim
+   it has the same commit identity as the docs evidence commit.
+5. The resulting Task 4C `HEAD` must have baseline SHA `6b2348e...` as its direct parent, and its
    commit diff must contain only
-   `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md`.
+   `docs/superpowers/plans/2026-07-18-task-4c-validation-export-service.md`. After commit, the index
+   is empty and `src-tauri/src/validation_export.rs` remains the only unstaged path.
 
 No tag creation or plan integration occurs before this plan receives written Go. The completion gate
 below authenticates the prepared state again rather than trusting the preparation report.
