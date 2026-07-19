@@ -277,10 +277,6 @@ impl LifecycleCoordinator {
     fn advance_clean(&self, now: Instant) -> CleanDecision {
         let mut gate = self.exit_gate.lock().expect("exit gate lock poisoned");
         match gate.clean_attempt {
-            CleanAttempt::Waiting { owner, deadline } if gate.in_flight_critical == 0 => {
-                gate.clean_attempt = CleanAttempt::Calling { owner, deadline };
-                CleanDecision::CallMarker
-            }
             CleanAttempt::Waiting { owner, deadline } if now >= deadline => {
                 let decision = if owner == CleanOwner::Tray && gate.state == ExitState::Cleaning {
                     gate.state = ExitState::Running;
@@ -293,6 +289,10 @@ impl LifecycleCoordinator {
                 drop(gate);
                 self.critical_changed.notify_all();
                 decision
+            }
+            CleanAttempt::Waiting { owner, deadline } if gate.in_flight_critical == 0 => {
+                gate.clean_attempt = CleanAttempt::Calling { owner, deadline };
+                CleanDecision::CallMarker
             }
             CleanAttempt::Waiting { deadline, .. } => CleanDecision::Wait { deadline },
             CleanAttempt::Calling { deadline, .. } if now < deadline => {
@@ -865,6 +865,28 @@ mod tests {
         );
         drop(tray_reservation);
 
+        let late_marker_calls = Cell::new(0);
+        let released_tray = coordinator_for_test();
+        let released_tray_reservation = released_tray.reserve_critical().unwrap();
+        let released_tray_deadline = Instant::now();
+        assert_eq!(
+            released_tray.begin_tray_clean(released_tray_deadline),
+            CleanDecision::Wait {
+                deadline: released_tray_deadline
+            }
+        );
+        drop(released_tray_reservation);
+        let released_tray_decision = released_tray.advance_clean(released_tray_deadline);
+        if released_tray_decision == CleanDecision::CallMarker {
+            late_marker_calls.set(late_marker_calls.get() + 1);
+        }
+        assert_eq!(released_tray_decision, CleanDecision::ReturnRunning);
+        assert_eq!(late_marker_calls.get(), 0);
+        assert_eq!(
+            exit_snapshot(&released_tray),
+            (ExitState::Running, 0, CleanAttempt::Idle)
+        );
+
         let shared = coordinator_for_test();
         let shared_reservation = shared.reserve_critical().unwrap();
         let shared_deadline = Instant::now() + Duration::from_secs(1);
@@ -893,6 +915,37 @@ mod tests {
             )
         );
         drop(shared_reservation);
+
+        let released_shared = coordinator_for_test();
+        let released_shared_reservation = released_shared.reserve_critical().unwrap();
+        let released_shared_deadline = Instant::now();
+        assert_eq!(
+            released_shared.begin_tray_clean(released_shared_deadline),
+            CleanDecision::Wait {
+                deadline: released_shared_deadline
+            }
+        );
+        assert_eq!(
+            released_shared.begin_system_end(released_shared_deadline + Duration::from_secs(1)),
+            CleanDecision::Wait {
+                deadline: released_shared_deadline
+            }
+        );
+        drop(released_shared_reservation);
+        let released_shared_decision = released_shared.advance_clean(released_shared_deadline);
+        if released_shared_decision == CleanDecision::CallMarker {
+            late_marker_calls.set(late_marker_calls.get() + 1);
+        }
+        assert_eq!(released_shared_decision, CleanDecision::ObserveOnly);
+        assert_eq!(late_marker_calls.get(), 0);
+        assert_eq!(
+            exit_snapshot(&released_shared),
+            (
+                ExitState::SystemEnding,
+                0,
+                CleanAttempt::Finished(CleanResult::TimedOut)
+            )
+        );
 
         let system = coordinator_for_test();
         let system_reservation = system.reserve_critical().unwrap();
