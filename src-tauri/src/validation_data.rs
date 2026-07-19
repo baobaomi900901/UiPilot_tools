@@ -61,10 +61,6 @@ pub(crate) struct ValidationCountsSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationEvent {
-    #[cfg_attr(
-        all(not(test), not(feature = "test-instrumentation")),
-        allow(dead_code)
-    )]
     LauncherInvoked,
     LaunchRequested,
     ActivationRequested,
@@ -79,10 +75,6 @@ pub(crate) enum ValidationError {
     CounterOverflow,
     SessionNotOpen,
     SessionAlreadyOpen,
-    #[cfg_attr(
-        all(not(test), not(feature = "test-instrumentation")),
-        allow(dead_code)
-    )]
     SessionOwnershipLost,
     SessionRandom,
 }
@@ -173,10 +165,6 @@ impl ValidationStore {
         )
     }
 
-    #[cfg_attr(
-        all(not(test), not(feature = "test-instrumentation")),
-        allow(dead_code)
-    )]
     pub(crate) fn mark_clean_exit(&self) -> Result<(), ValidationError> {
         self.mark_clean_exit_with(read_marker_for_clean, |path| {
             fs::remove_file(path).map_err(|_| ValidationError::Storage)
@@ -288,10 +276,6 @@ impl ValidationStore {
         Ok(())
     }
 
-    #[cfg_attr(
-        all(not(test), not(feature = "test-instrumentation")),
-        allow(dead_code)
-    )]
     fn mark_clean_exit_with<R, D>(
         &self,
         read_marker: R,

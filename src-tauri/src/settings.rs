@@ -83,7 +83,36 @@ impl From<AtomicFileError> for SettingsError {
     }
 }
 
+fn validate_user_settings_against(
+    update: &SettingsUpdate,
+    applications: &[Application],
+) -> Result<(), SettingsError> {
+    if update
+        .research_id
+        .as_deref()
+        .is_some_and(|value| !valid_research_id(value))
+        || update.aliases.keys().any(|app_id| !valid_app_id(app_id))
+    {
+        return Err(SettingsError::InvalidUpdate);
+    }
+    if update
+        .aliases
+        .keys()
+        .any(|app_id| !applications.iter().any(|app| app.app_id == *app_id))
+    {
+        return Err(SettingsError::UnknownApplication);
+    }
+    Ok(())
+}
+
 impl SettingsStore {
+    pub(crate) fn validate_user_settings(
+        update: &SettingsUpdate,
+        cache: &AppCache,
+    ) -> Result<(), SettingsError> {
+        validate_user_settings_against(update, &cache.snapshot())
+    }
+
     pub(crate) fn load(app_data_dir: &Path) -> Result<Self, SettingsError> {
         fs::create_dir_all(app_data_dir).map_err(|_| SettingsError::Storage)?;
         let paths = AtomicPaths::new(app_data_dir, "settings.json");
@@ -139,24 +168,9 @@ impl SettingsStore {
         update: SettingsUpdate,
         cache: &AppCache,
     ) -> Result<(), SettingsError> {
-        let mut state = self.state.lock().expect("settings lock poisoned");
-        if update
-            .research_id
-            .as_deref()
-            .is_some_and(|value| !valid_research_id(value))
-            || update.aliases.keys().any(|app_id| !valid_app_id(app_id))
-        {
-            return Err(SettingsError::InvalidUpdate);
-        }
-
         let applications = cache.snapshot();
-        if update
-            .aliases
-            .keys()
-            .any(|app_id| !applications.iter().any(|app| app.app_id == *app_id))
-        {
-            return Err(SettingsError::UnknownApplication);
-        }
+        validate_user_settings_against(&update, &applications)?;
+        let mut state = self.state.lock().expect("settings lock poisoned");
 
         let mut candidate = state.value.clone();
         candidate.hotkey = update.hotkey;
@@ -514,6 +528,73 @@ mod tests {
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
         assert_eq!(value.research_id.as_deref(), Some("study_01"));
+    }
+
+    #[test]
+    fn validate_user_settings_accepts_valid_input_without_changing_memory_or_disk() {
+        let dir = TestDir::new("preflight-no-write");
+        let persisted = Settings {
+            research_id: Some("study_01".into()),
+            ..Settings::default()
+        };
+        write_settings(&dir.current(), &persisted);
+        let current_bytes = fs::read(dir.current()).unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let cache = cache(&[(APP_A, "App")]);
+        let before = store.snapshot();
+        let update = update(Some("study_02"), &[(APP_A, &["alias"])]);
+
+        validate_user_settings_against(&update, &cache.snapshot()).unwrap();
+
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
+    }
+
+    #[test]
+    fn preflight_and_final_validation_reject_the_same_invalid_updates() {
+        let dir = TestDir::new("preflight-final-validation");
+        let persisted = Settings {
+            research_id: Some("study_01".into()),
+            ..Settings::default()
+        };
+        write_settings(&dir.current(), &persisted);
+        let current_bytes = fs::read(dir.current()).unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let cache = cache(&[(APP_A, "App")]);
+
+        for (preflight, final_update, expected) in [
+            (
+                update(Some(" "), &[]),
+                update(Some(" "), &[]),
+                SettingsError::InvalidUpdate,
+            ),
+            (
+                update(Some(&"A".repeat(65)), &[]),
+                update(Some(&"A".repeat(65)), &[]),
+                SettingsError::InvalidUpdate,
+            ),
+            (
+                update(None, &[("app-BAD", &["bad"])]),
+                update(None, &[("app-BAD", &["bad"])]),
+                SettingsError::InvalidUpdate,
+            ),
+            (
+                update(None, &[(APP_ABSENT, &["absent"])]),
+                update(None, &[(APP_ABSENT, &["absent"])]),
+                SettingsError::UnknownApplication,
+            ),
+        ] {
+            assert_eq!(
+                validate_user_settings_against(&preflight, &cache.snapshot()),
+                Err(expected)
+            );
+            assert_eq!(
+                store.update_user_settings(final_update, &cache),
+                Err(expected)
+            );
+            assert_eq!(store.snapshot(), persisted);
+            assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
+        }
     }
 
     #[test]
