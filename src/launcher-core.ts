@@ -23,6 +23,7 @@ export interface LauncherCore {
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
   readonly requestHide: () => Promise<void>
   readonly setAutostart: (checked: boolean) => void
+  readonly setHotkeyCanonical: (value: string) => void
   readonly addAlias: (application: ControlKey) => void
   readonly removeAlias: (application: ControlKey, alias: ControlKey) => void
   readonly saveSettings: () => Promise<void>
@@ -516,6 +517,17 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     publish(true)
   }
 
+  function setHotkeyCanonical(value: string): void {
+    if (!settingsEditable() || !model.settings) return
+    const field = model.settings.hotkey
+    const hadNotice = model.shownNotice !== undefined
+    const changed = setControlDraft(field.key, value)
+    const valueChanged = field.value !== value
+    if (valueChanged) field.value = value
+    model.shownNotice = undefined
+    publish(changed || valueChanged || hadNotice)
+  }
+
   function addAlias(application: ControlKey): void {
     if (!settingsEditable()) return
     const target = model.settings!.applications.find((candidate) => candidate.key === application)
@@ -860,6 +872,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     keyDown,
     requestHide,
     setAutostart,
+    setHotkeyCanonical,
     addAlias,
     removeAlias,
     saveSettings,

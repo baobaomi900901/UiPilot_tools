@@ -24,6 +24,11 @@ import {
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
 import type { ControlKey } from './protocol'
+import {
+  formatHotkeyDisplay,
+  reduceHotkeyRecorder,
+  type RecorderState,
+} from './hotkey-recorder'
 
 export interface LauncherViewProps {
   core: LauncherCore
@@ -63,6 +68,73 @@ function BoundInput({ core, control, value, onBound, onBindingFailed, ...props }
 
 function composing(event: ReactKeyboardEvent): boolean {
   return event.nativeEvent.isComposing
+}
+
+interface HotkeyRecorderInputProps {
+  core: LauncherCore
+  value: string
+  disabled?: boolean
+  id?: string
+  name?: string
+}
+
+function HotkeyRecorderInput({ core, value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
+  const [recorderState, setRecorderState] = useState<RecorderState>(() => ({ status: 'idle', baseline: value }))
+
+  useEffect(() => {
+    setRecorderState((current) =>
+      current.status === 'recording' ? current : { status: 'idle', baseline: value, pendingTap: undefined },
+    )
+  }, [value])
+
+  const display =
+    recorderState.status === 'recording' ? '按下快捷键…' : formatHotkeyDisplay(value)
+
+  const startRecording = useCallback(() => {
+    if (disabled) return
+    setRecorderState((current) => reduceHotkeyRecorder(current, { type: 'start', baseline: value }).state)
+  }, [disabled, value])
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    event.preventDefault()
+    if (event.key === 'Escape') {
+      setRecorderState((current) => reduceHotkeyRecorder(current, { type: 'cancel' }).state)
+      return
+    }
+    setRecorderState((current) => {
+      const result = reduceHotkeyRecorder(current, {
+        type: 'keydown',
+        key: event.key,
+        code: event.code,
+        ctrl: event.ctrlKey,
+        alt: event.altKey,
+        shift: event.shiftKey,
+        meta: event.metaKey,
+        repeat: event.repeat,
+        nowMs: Date.now(),
+      })
+      if (result.commit) core.setHotkeyCanonical(result.commit)
+      return result.state
+    })
+  }
+
+  const handleBlur = () => {
+    setRecorderState((current) => reduceHotkeyRecorder(current, { type: 'blur' }).state)
+  }
+
+  return (
+    <Input
+      readOnly
+      value={display}
+      id={id}
+      name={name}
+      disabled={disabled}
+      onFocus={startRecording}
+      onClick={startRecording}
+      onKeyDown={handleKeyDown}
+      onBlur={handleBlur}
+    />
+  )
 }
 
 export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.Element {
@@ -204,14 +276,12 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       ) : (
         <Form component="div" layout="vertical" className="settings-form">
           <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
-            <BoundInput
+            <HotkeyRecorderInput
               core={core}
-              control={settings.hotkey.key}
               value={settings.hotkey.value}
               id={`settings-hotkey-${settings.hotkey.key}`}
               name={`settings-hotkey-${settings.hotkey.key}`}
               disabled={locked}
-              onKeyDown={settingsKeyDown}
             />
           </Form.Item>
           <Form.Item label="Research ID" htmlFor={`settings-research-${settings.researchId.key}`}>

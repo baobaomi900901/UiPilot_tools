@@ -862,7 +862,7 @@ describe('settings ownership', () => {
   it('saves exact hotkey, autostart, research ID, and ordered aliases', async () => {
     const { core, client } = await settingsCore()
     const settings = core.getSnapshot().settings!
-    core.text({ kind: 'ordinaryInput', control: settings.hotkey.key, value: 'Ctrl+Space', inputType: 'insertText' })
+    core.setHotkeyCanonical('Ctrl+Space')
     core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
     core.setAutostart(true)
     const second = settings.applications[1]!
@@ -924,14 +924,14 @@ describe('settings ownership', () => {
       original.researchId.key,
       ...original.applications.flatMap((application) => [application.key, ...application.aliases.map((alias) => alias.key)]),
     ]
-    core.text({ kind: 'compositionStart', control: original.hotkey.key })
-    core.text({ kind: 'compositionInput', control: original.hotkey.key, value: 'uncommitted', inputType: 'insertCompositionText' })
+    core.text({ kind: 'compositionStart', control: original.researchId.key })
+    core.text({ kind: 'compositionInput', control: original.researchId.key, value: 'uncommitted', inputType: 'insertCompositionText' })
     vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
     await core.reloadSettings()
     const replacement = core.getSnapshot().settings!
     const replacedSnapshot = core.getSnapshot()
-    core.text({ kind: 'compositionBoundary', control: original.hotkey.key })
-    core.text({ kind: 'compositionInput', control: original.hotkey.key, value: 'late', inputType: 'insertCompositionText' })
+    core.text({ kind: 'compositionBoundary', control: original.researchId.key })
+    core.text({ kind: 'compositionInput', control: original.researchId.key, value: 'late', inputType: 'insertCompositionText' })
     expect(core.getSnapshot()).toBe(replacedSnapshot)
     const newKeys = [
       replacement.hotkey.key,
@@ -999,9 +999,28 @@ describe('settings ownership', () => {
     const { core, emit } = await settingsCore()
     emit(shown('settings-notice', 'settings', 'validationFailed'))
     expect(core.getSnapshot().shownNotice).toBe('本地验证数据操作失败。')
-    const hotkey = core.getSnapshot().settings!.hotkey
-    core.text({ kind: 'ordinaryInput', control: hotkey.key, value: 'Ctrl+Space', inputType: 'insertText' })
+    core.setHotkeyCanonical('Ctrl+Space')
     expect(core.getSnapshot().shownNotice).toBeUndefined()
+  })
+
+  it('records hotkey via canonical setter without saving', async () => {
+    const { core, client } = await settingsCore()
+    core.setHotkeyCanonical('DoubleCtrl')
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl')
+    expect(client.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('save persists DoubleCtrl through save_settings payload', async () => {
+    const { core, client } = await settingsCore()
+    core.setHotkeyCanonical('DoubleCtrl')
+    await core.saveSettings()
+    expect(client.saveSettings).toHaveBeenCalledWith({
+      settings: {
+        hotkey: 'DoubleCtrl',
+        autostart: false,
+        aliases: { 'private-app-id-a': ['alpha'], 'private-app-id-b': [] },
+      },
+    })
   })
 
   it('keeps rescan failure editable but fails closed when its reload fails', async () => {
@@ -1291,12 +1310,12 @@ describe('React view and accessibility', () => {
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('replacement-view', 'settings')))
-    const oldHotkey = core.getSnapshot().settings!.hotkey.key
+    const oldResearchId = core.getSnapshot().settings!.researchId.key
     cleanup.length = 0
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     await act(async () => core.reloadSettings())
-    const unbindIndex = cleanup.indexOf(`native-unbind:${oldHotkey}`)
-    const retireIndex = cleanup.indexOf(`retire:${oldHotkey}`)
+    const unbindIndex = cleanup.indexOf(`native-unbind:${oldResearchId}`)
+    const retireIndex = cleanup.indexOf(`retire:${oldResearchId}`)
     expect(unbindIndex).toBeGreaterThanOrEqual(0)
     expect(retireIndex).toBeGreaterThan(unbindIndex)
     await mounted.unmount()
