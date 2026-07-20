@@ -1461,6 +1461,67 @@ describe('real adapter and startup', () => {
     }
   })
 
+  it('destroys a started core when a later fatal render installs the fixed fallback', async () => {
+    resetAdapterDocument()
+    const privateError = 'private post-start render sentinel'
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const unlisten = vi.fn()
+    let shownHandler: ((event: { payload: unknown }) => void) | undefined
+    let mountedCore: ReturnType<typeof createLauncherCore> | undefined
+    let throwFatal = false
+    vi.doMock('./launcher-view', async () => {
+      const React = await vi.importActual<typeof import('react')>('react')
+      return {
+        LauncherView: ({ core, onReady }: { core: ReturnType<typeof createLauncherCore>; onReady: (result: 'ready') => void }) => {
+          mountedCore = core
+          const snapshot = React.useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
+          React.useLayoutEffect(() => onReady('ready'), [onReady])
+          if (throwFatal) throw new Error(privateError)
+          return React.createElement('div', null, snapshot.status)
+        },
+      }
+    })
+    tauriCapture.listen.mockImplementation(async (_event, handler) => {
+      shownHandler = handler as (event: { payload: unknown }) => void
+      return unlisten
+    })
+    tauriCapture.invoke.mockImplementation((command) =>
+      Promise.resolve(command === 'load_settings' ? emptySettings : command === 'search_apps' ? null : undefined),
+    )
+    try {
+      await act(async () => {
+        await import('./main')
+      })
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+      await act(async () => shownHandler?.({ payload: shown('post-start-fatal') }))
+      await act(async () => {
+        const core = mountedCore!
+        core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
+      })
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('search_apps', expect.any(Object)))
+      const searchCalls = tauriCapture.invoke.mock.calls.filter(([command]) => command === 'search_apps').length
+
+      throwFatal = true
+      mountedCore!.failInitialization()
+      await vi.waitFor(() => expect(unlisten).toHaveBeenCalledOnce())
+      await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
+      expect(document.body.textContent).not.toContain(privateError)
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
+
+      shownHandler?.({ payload: shown('after-fatal') })
+      await Promise.resolve()
+      expect(tauriCapture.invoke.mock.calls.filter(([command]) => command === 'search_apps')).toHaveLength(searchCalls)
+      await pagehide()
+      await pagehide()
+      expect(unlisten).toHaveBeenCalledOnce()
+    } finally {
+      await pagehide()
+      vi.doUnmock('./launcher-view')
+      vi.resetModules()
+      consoleError.mockRestore()
+    }
+  })
+
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
     const unlisten = vi.fn()

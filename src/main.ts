@@ -39,9 +39,13 @@ const onReady = (result: 'ready' | 'failed') => {
   readySettled = true
   settleReady(result)
 }
+let mountFailed = false
 const failMount = () => {
+  if (mountFailed) return
+  mountFailed = true
   onReady('failed')
   core.failInitialization()
+  core.destroy()
   const status = document.createElement('div')
   status.className = 'status-region'
   status.setAttribute('role', 'status')
