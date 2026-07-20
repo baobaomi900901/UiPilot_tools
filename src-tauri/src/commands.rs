@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
-use tauri_plugin_global_shortcut::Shortcut;
 
 use crate::{
     apps::{self, AppCache, Application},
+    hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
     result_registry::{RegistryError, ResultAction, ResultRegistry},
@@ -286,19 +286,16 @@ impl<'a> SaveSettingsCache<'a> {
 fn prepare_settings_save(
     settings: UserSettingsUpdate,
     cache: SaveSettingsCache<'_>,
-) -> Result<(Shortcut, SettingsUpdate), CommandError> {
-    let shortcut = settings
-        .hotkey
-        .parse::<Shortcut>()
-        .map_err(|_| CommandError::settings_failed())?;
+) -> Result<(HotkeyKind, SettingsUpdate), CommandError> {
+    let kind = HotkeyKind::parse(&settings.hotkey).map_err(|_| CommandError::settings_failed())?;
     let update = SettingsUpdate {
-        hotkey: shortcut.to_string(),
+        hotkey: kind.canonical(),
         autostart: settings.autostart,
         research_id: settings.research_id,
         aliases: settings.aliases,
     };
     SettingsStore::validate_user_settings(&update, cache.inner())?;
-    Ok((shortcut, update))
+    Ok((kind, update))
 }
 
 async fn save_settings_with<R, E, W>(
@@ -310,11 +307,11 @@ async fn save_settings_with<R, E, W>(
 ) -> Result<(), CommandError>
 where
     R: FnOnce() -> Result<CriticalReservation, E>,
-    W: FnOnce(CriticalReservation, Shortcut, SettingsUpdate) -> Result<(), ()> + Send + 'static,
+    W: FnOnce(CriticalReservation, HotkeyKind, SettingsUpdate) -> Result<(), ()> + Send + 'static,
 {
-    let (shortcut, update) = prepare_settings_save(settings, cache)?;
+    let (kind, update) = prepare_settings_save(settings, cache)?;
     save_settings_worker_with(reserve, move |reservation| {
-        worker(reservation, shortcut, update)
+        worker(reservation, kind, update)
     })
     .await
 }
@@ -362,10 +359,13 @@ pub(crate) async fn save_settings(
         {
             let app_for_worker = app.clone();
             let coordinator_for_worker = Arc::clone(coordinator.inner());
-            move |reservation, shortcut, update| {
+            move |reservation, kind, update| {
                 let _reservation = reservation;
                 let settings = app_for_worker.state::<SettingsStore>();
                 let cache = app_for_worker.state::<Arc<AppCache>>();
+                let HotkeyKind::Chord(shortcut) = kind else {
+                    return Err(());
+                };
                 coordinator_for_worker.save_settings_transaction(
                     &app_for_worker,
                     &settings,
@@ -704,6 +704,7 @@ mod tests {
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome},
+        hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
         result_registry::{RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore, SettingsUpdate},
@@ -1758,6 +1759,7 @@ mod tests {
         let cache = AppCache::from_apps(settings_applications());
         for settings in [
             user_settings("not a shortcut", None, &[]),
+            user_settings("doublectrl", None, &[]),
             user_settings("Alt+Space", Some(" "), &[]),
             user_settings("Alt+Space", None, &[("app-BAD", &["bad"])]),
             user_settings("Alt+Space", None, &[(APP_UNKNOWN, &["unknown"])]),
@@ -1810,7 +1812,7 @@ mod tests {
         let before_memory = store.snapshot();
         let before_disk = fs::read(dir.path().join("settings.json")).unwrap();
 
-        let (shortcut, update) = prepare_settings_save(
+        let (kind, update) = prepare_settings_save(
             user_settings(
                 "Control+Space",
                 Some("study_02"),
@@ -1820,7 +1822,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(shortcut.to_string(), "control+Space");
+        match &kind {
+            HotkeyKind::Chord(shortcut) => {
+                assert_eq!(shortcut.to_string(), "control+Space");
+            }
+            _ => panic!("expected chord"),
+        }
         assert_eq!(update.hotkey, "control+Space");
         assert_eq!(update.research_id.as_deref(), Some("study_02"));
         assert_eq!(update.aliases[APP_EMPTY], ["alias"]);
@@ -1829,6 +1836,21 @@ mod tests {
             fs::read(dir.path().join("settings.json")).unwrap(),
             before_disk
         );
+    }
+
+    #[test]
+    fn save_settings_preflight_accepts_double_tap_without_shortcut_parse() {
+        let dir = TestDir::new();
+        let settings_store = settings_store(&dir, Some("study_01"));
+        let cache = AppCache::from_apps(settings_applications());
+        let (kind, update) = prepare_settings_save(
+            user_settings("DoubleCtrl", None, &[]),
+            SaveSettingsCache(&cache),
+        )
+        .unwrap();
+        assert_eq!(kind, HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl));
+        assert_eq!(update.hotkey, "DoubleCtrl");
+        let _ = settings_store;
     }
 
     #[test]
