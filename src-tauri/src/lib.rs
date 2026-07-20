@@ -38,6 +38,9 @@ mod validation_export;
 mod hotkey;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod double_tap;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod lifecycle;
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
