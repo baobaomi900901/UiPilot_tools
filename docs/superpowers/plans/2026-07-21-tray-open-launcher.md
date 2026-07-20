@@ -150,15 +150,13 @@ assert!(production.contains("lifecycle::TRAY_OPEN_SETTINGS"));
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Find and run the wiring test:
+Run:
 
 ```powershell
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --list
+cargo test --manifest-path src-tauri/Cargo.toml production_lifecycle_wires_one_coordinator_and_exact_event_sources -- --nocapture
 ```
 
-Pick the test that contains the `request_show(app, ShowTarget::Launcher)` count assert, then run it with `--nocapture`.
-
-Expected: FAIL — missing `TRAY_OPEN_LAUNCHER` / `打开主界面` / `Show(target)` fragments (and/or the removed Settings literal assert still present if you only added new asserts without removing the old one yet — finish Step 1 fully before this run).
+Expected: FAIL — missing `TRAY_OPEN_LAUNCHER` / `打开主界面` / `Show(target)` fragments (finish Step 1 fully — including removing the old Settings literal count — before this run).
 
 - [ ] **Step 3: Minimal implementation**
 

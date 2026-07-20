@@ -50,8 +50,7 @@ src-tauri/src/lib.rs         # 菜单项组装顺序；Show 分支统一按 targ
 ## 测试
 
 - 扩展 `tray_accepts_only_exact_namespaced_ids`：断言 `TRAY_OPEN_LAUNCHER` → `Show(Launcher)`；继续拒绝近似 / 大小写 / 尾空格 ID
-- 更新 `lib.rs` 中生产接线断言：`request_show(app, ShowTarget::Launcher)` 出现次数从 2（单实例 + 快捷键）变为 3（再加托盘）
-- 若存在托盘菜单文案 / ID 的源码片段断言，同步加入「打开主界面」与 `uipilot.tray.open-launcher`
+- 更新 `lib.rs` 中生产接线断言：单实例 + 快捷键的字面量 `request_show(app, ShowTarget::Launcher)` 仍为 2；托盘通过通用 `Show(target)` → `request_show(app, target)` 片段覆盖，并断言「打开主界面」与 `uipilot.tray.open-launcher`
 
 ## 非目标
 
