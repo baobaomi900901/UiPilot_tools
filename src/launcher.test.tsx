@@ -8,6 +8,8 @@ import { theme } from 'antd'
 import { createLauncherCore } from './launcher-core'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherCoreSource from './launcher-core.ts?raw'
+// @ts-expect-error Vite supplies the raw source module in Vitest.
+import mainSource from './main.ts?raw'
 import { bindNativeTextInput } from './native-input'
 import * as nativeInput from './native-input'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
@@ -30,6 +32,10 @@ import {
 import protocolSource from './protocol.ts?raw'
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
+const tauriCapture = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }))
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: tauriCapture.invoke }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: tauriCapture.listen }))
 
 vi.mock('antd', async () => {
   const actual = await vi.importActual<typeof import('antd')>('antd')
@@ -1314,5 +1320,160 @@ describe('React view and accessibility', () => {
     ]) {
       expect(launcherViewSource).not.toContain(forbidden)
     }
+  })
+})
+
+describe('real adapter and startup', () => {
+  function resetAdapterDocument() {
+    vi.resetModules()
+    document.body.innerHTML = '<main id="app"></main>'
+    installMatchMedia(false)
+    tauriCapture.invoke.mockReset()
+    tauriCapture.listen.mockReset()
+  }
+
+  async function pagehide() {
+    await act(async () => window.dispatchEvent(new Event('pagehide')))
+  }
+
+  it('mounts and resolves the shown listener before loading, then uses the exact invoke table', async () => {
+    resetAdapterDocument()
+    const registration = deferred<() => void>()
+    const load = deferred<SettingsView>()
+    const unlisten = vi.fn()
+    const order: string[] = []
+    let shownHandler: ((event: { payload: unknown }) => void) | undefined
+    tauriCapture.listen.mockImplementation((event, handler) => {
+      expect(document.querySelector('[role="combobox"]')).toBeInstanceOf(HTMLInputElement)
+      order.push(String(event))
+      shownHandler = handler as (event: { payload: unknown }) => void
+      return registration.promise
+    })
+    tauriCapture.invoke.mockImplementation((command) => {
+      order.push(String(command))
+      return command === 'load_settings' ? load.promise : Promise.resolve(undefined)
+    })
+
+    let main!: { client: LauncherClient }
+    await act(async () => {
+      main = (await import('./main')) as unknown as { client: LauncherClient }
+    })
+    await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://shown', expect.any(Function)))
+    expect(tauriCapture.invoke).not.toHaveBeenCalled()
+    registration.resolve(unlisten)
+    await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+    expect(order.slice(0, 2)).toEqual(['launcher://shown', 'load_settings'])
+
+    await act(async () => shownHandler?.({ payload: shown('during-adapter-load', 'settings') }))
+    expect(document.querySelector('.settings-view h1')?.textContent).toBe('设置')
+    await act(async () => {
+      load.resolve(emptySettings)
+      await load.promise
+    })
+
+    tauriCapture.invoke.mockClear()
+    const update = { hotkey: 'Alt+Space', autostart: false, aliases: {} }
+    await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
+    await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
+    await main.client.loadSettings()
+    await main.client.saveSettings({ settings: update })
+    await main.client.rescanApps()
+    await main.client.exportValidationData()
+    await main.client.clearValidationData()
+    await main.client.hideLauncher()
+    const invokeRows = [
+      ['search_apps', [{ query: 'calc', invocationId: 'inv-1', querySequence: 1 }]],
+      ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
+      ['load_settings', []],
+      ['save_settings', [{ settings: update }]],
+      ['rescan_apps', []],
+      ['export_validation_data', []],
+      ['clear_validation_data', []],
+      ['hide_launcher', []],
+    ] as const
+    expect(tauriCapture.invoke.mock.calls.map(([command, ...args]) => [command, args])).toEqual(invokeRows)
+    await pagehide()
+  })
+
+  it('fails locally and never listens or loads when native input binding fails', async () => {
+    resetAdapterDocument()
+    const originalAdd = HTMLInputElement.prototype.addEventListener
+    HTMLInputElement.prototype.addEventListener = function (
+      this: HTMLInputElement,
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) {
+      if (type === 'compositionstart') throw new Error('private native binding failure')
+      return originalAdd.call(this, type, listener, options)
+    } as typeof originalAdd
+    try {
+      await act(async () => {
+        await import('./main')
+      })
+      await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
+      expect(document.body.textContent).not.toContain('private')
+      expect(tauriCapture.listen).not.toHaveBeenCalled()
+      expect(tauriCapture.invoke).not.toHaveBeenCalled()
+    } finally {
+      HTMLInputElement.prototype.addEventListener = originalAdd
+      await pagehide()
+    }
+  })
+
+  it('keeps listener failures local and makes zero load calls', async () => {
+    resetAdapterDocument()
+    tauriCapture.listen.mockRejectedValueOnce(new Error('private listener failure'))
+    await act(async () => {
+      await import('./main')
+    })
+    await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
+    expect(document.body.textContent).not.toContain('private')
+    expect(tauriCapture.invoke).not.toHaveBeenCalled()
+    await pagehide()
+  })
+
+  it('tears down once and keeps the production adapter source narrow', async () => {
+    resetAdapterDocument()
+    const unlisten = vi.fn()
+    tauriCapture.listen.mockResolvedValueOnce(unlisten)
+    tauriCapture.invoke.mockImplementation((command) =>
+      Promise.resolve(command === 'load_settings' ? emptySettings : undefined),
+    )
+    await act(async () => {
+      await import('./main')
+    })
+    await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+    const remove = vi.spyOn(HTMLInputElement.prototype, 'removeEventListener')
+    await pagehide()
+    const removed = remove.mock.calls.length
+    expect(unlisten).toHaveBeenCalledOnce()
+    expect(remove.mock.calls.map(([event]) => event)).toEqual(
+      expect.arrayContaining(['compositionstart', 'input', 'compositionend']),
+    )
+    expect(document.querySelector('#app')?.childElementCount).toBe(0)
+    await pagehide()
+    expect(unlisten).toHaveBeenCalledOnce()
+    expect(remove).toHaveBeenCalledTimes(removed)
+    remove.mockRestore()
+
+    for (const command of [
+      'search_apps',
+      'execute_result',
+      'load_settings',
+      'save_settings',
+      'rescan_apps',
+      'export_validation_data',
+      'clear_validation_data',
+      'hide_launcher',
+    ]) {
+      expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
+    }
+    expect(mainSource.match(/['"]launcher:\/\/shown['"]/g)).toHaveLength(1)
+    expect(mainSource).not.toMatch(/@tauri-apps\/api\/(?:window|webviewWindow)/)
+    expect(mainSource).not.toContain('.hide(')
+    expect(mainSource).not.toMatch(/\b(?:path|pid|hwnd|appId)\b/i)
+    expect(mainSource.indexOf('core.destroy()')).toBeLessThan(mainSource.indexOf('root.unmount()'))
+    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(1)
   })
 })
