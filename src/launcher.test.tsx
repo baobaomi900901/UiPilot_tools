@@ -713,9 +713,40 @@ describe('R3 correlated composition boundary', () => {
     expect(core.getSnapshot()).toBe(restored)
     expect(listener).not.toHaveBeenCalled()
 
+    vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'old-empty', items: [] })
+    emit(shown('idempotent-rerun', 'launcher', 'validationFailed'))
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot()).toMatchObject({
+      query: 'calc',
+      querySequence: 1,
+      results: [],
+      selectedIndex: -1,
+      shownNotice: '本地验证数据操作失败。',
+    })
+
+    const rerun = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(rerun.promise)
+    const searchCalls = vi.mocked(client.searchApps).mock.calls.length
     core.keyDown('Enter', false)
-    expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'idempotent', querySequence: 2 })
+    expect(core.getSnapshot()).toMatchObject({
+      query: 'calc',
+      querySequence: 2,
+      results: [],
+      selectedIndex: -1,
+      searchPending: true,
+      status: '',
+    })
+    expect(core.getSnapshot().shownNotice).toBeUndefined()
+    expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
+    expect(client.searchApps).toHaveBeenLastCalledWith({ query: 'calc', invocationId: 'idempotent-rerun', querySequence: 2 })
+    expect(client.executeResult).not.toHaveBeenCalled()
+
+    core.keyDown('Enter', false)
+    expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
+    expect(client.executeResult).not.toHaveBeenCalled()
+    rerun.resolve(null)
+    await rerun.promise
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
 
     vi.mocked(client.searchApps).mockClear()
     listener.mockClear()

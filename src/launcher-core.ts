@@ -785,10 +785,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
         model.query !== '' &&
         model.queryControlValue === model.query
       ) {
-        model.querySequence += 1
-        model.status = ''
-        beginSearch()
-        publish(true)
+        applyEdit(model.query)
         return
       }
       executeSelection()
