@@ -104,6 +104,14 @@ fn setup_production_lifecycle(
         _ => {}
     });
 
+    let show_launcher = tauri::menu::MenuItem::with_id(
+        app,
+        lifecycle::TRAY_SHOW_LAUNCHER,
+        "显示主界面",
+        true,
+        None::<&str>,
+    )
+    .map_err(|_| lifecycle_setup_error())?;
     let open_settings = tauri::menu::MenuItem::with_id(
         app,
         lifecycle::TRAY_OPEN_SETTINGS,
@@ -115,7 +123,7 @@ fn setup_production_lifecycle(
     let quit =
         tauri::menu::MenuItem::with_id(app, lifecycle::TRAY_QUIT, "退出", true, None::<&str>)
             .map_err(|_| lifecycle_setup_error())?;
-    let menu = tauri::menu::Menu::with_items(app, &[&open_settings, &quit])
+    let menu = tauri::menu::Menu::with_items(app, &[&show_launcher, &open_settings, &quit])
         .map_err(|_| lifecycle_setup_error())?;
     let icon = app
         .default_window_icon()
@@ -127,8 +135,8 @@ fn setup_production_lifecycle(
         .menu(&menu)
         .on_menu_event(
             move |app, event| match lifecycle::tray_action(event.id().as_ref()) {
-                Some(lifecycle::TrayAction::Show(ShowTarget::Settings)) => {
-                    let _ = tray_coordinator.request_show(app, ShowTarget::Settings);
+                Some(lifecycle::TrayAction::Show(target)) => {
+                    let _ = tray_coordinator.request_show(app, target);
                 }
                 Some(lifecycle::TrayAction::Quit) => tray_coordinator.request_tray_quit(app),
                 _ => {}
@@ -422,6 +430,34 @@ mod tests {
         assert_eq!(production.matches(".mark_setup_ready(").count(), 1);
         assert_eq!(
             production
+                .matches("tauri::menu::MenuItem::with_id(")
+                .count(),
+            3
+        );
+        let show_launcher = production
+            .find("lifecycle::TRAY_SHOW_LAUNCHER,\n        \"显示主界面\",")
+            .expect("show-launcher tray item is missing");
+        let open_settings = production
+            .find("lifecycle::TRAY_OPEN_SETTINGS,\n        \"打开设置\",")
+            .expect("open-settings tray item is missing");
+        let quit = production
+            .find("lifecycle::TRAY_QUIT, \"退出\"")
+            .expect("quit tray item is missing");
+        assert!(show_launcher < open_settings && open_settings < quit);
+        assert_eq!(
+            production
+                .matches("Some(lifecycle::TrayAction::Show(target))")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches("tray_coordinator.request_show(app, target)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
                 .matches("request_show(app, ShowTarget::Launcher)")
                 .count(),
             2
@@ -429,6 +465,16 @@ mod tests {
         assert_eq!(
             production
                 .matches("request_show(app, ShowTarget::Settings)")
+                .count(),
+            0
+        );
+        assert_eq!(
+            production.matches("lifecycle::TRAY_OPEN_SETTINGS").count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches("Some(lifecycle::TrayAction::Quit)")
                 .count(),
             1
         );

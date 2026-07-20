@@ -32,6 +32,7 @@ pub(crate) enum ShowTarget {
     Settings,
 }
 
+pub(crate) const TRAY_SHOW_LAUNCHER: &str = "uipilot.tray.show-launcher";
 pub(crate) const TRAY_OPEN_SETTINGS: &str = "uipilot.tray.open-settings";
 pub(crate) const TRAY_QUIT: &str = "uipilot.tray.quit";
 const SESSION_SUBCLASS_ID: usize = 0x5550_494c;
@@ -44,6 +45,7 @@ pub(crate) enum TrayAction {
 
 pub(crate) fn tray_action(id: &str) -> Option<TrayAction> {
     match id {
+        TRAY_SHOW_LAUNCHER => Some(TrayAction::Show(ShowTarget::Launcher)),
         TRAY_OPEN_SETTINGS => Some(TrayAction::Show(ShowTarget::Settings)),
         TRAY_QUIT => Some(TrayAction::Quit),
         _ => None,
@@ -3109,6 +3111,10 @@ mod tests {
     #[test]
     fn tray_accepts_only_exact_namespaced_ids() {
         assert_eq!(
+            tray_action("uipilot.tray.show-launcher"),
+            Some(TrayAction::Show(ShowTarget::Launcher))
+        );
+        assert_eq!(
             tray_action(TRAY_OPEN_SETTINGS),
             Some(TrayAction::Show(ShowTarget::Settings))
         );
@@ -3117,6 +3123,9 @@ mod tests {
             "open-settings",
             "quit",
             "uipilot.tray.open",
+            "uipilot.tray.show",
+            "UIPILOT.TRAY.SHOW-LAUNCHER",
+            "uipilot.tray.show-launcher ",
             "UIPILOT.TRAY.QUIT",
             "uipilot.tray.quit ",
             "",
