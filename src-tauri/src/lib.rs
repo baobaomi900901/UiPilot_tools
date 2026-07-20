@@ -104,6 +104,14 @@ fn setup_production_lifecycle(
         _ => {}
     });
 
+    let open_launcher = tauri::menu::MenuItem::with_id(
+        app,
+        lifecycle::TRAY_OPEN_LAUNCHER,
+        "打开主界面",
+        true,
+        None::<&str>,
+    )
+    .map_err(|_| lifecycle_setup_error())?;
     let open_settings = tauri::menu::MenuItem::with_id(
         app,
         lifecycle::TRAY_OPEN_SETTINGS,
@@ -115,7 +123,7 @@ fn setup_production_lifecycle(
     let quit =
         tauri::menu::MenuItem::with_id(app, lifecycle::TRAY_QUIT, "退出", true, None::<&str>)
             .map_err(|_| lifecycle_setup_error())?;
-    let menu = tauri::menu::Menu::with_items(app, &[&open_settings, &quit])
+    let menu = tauri::menu::Menu::with_items(app, &[&open_launcher, &open_settings, &quit])
         .map_err(|_| lifecycle_setup_error())?;
     let icon = app
         .default_window_icon()
@@ -127,8 +135,8 @@ fn setup_production_lifecycle(
         .menu(&menu)
         .on_menu_event(
             move |app, event| match lifecycle::tray_action(event.id().as_ref()) {
-                Some(lifecycle::TrayAction::Show(ShowTarget::Settings)) => {
-                    let _ = tray_coordinator.request_show(app, ShowTarget::Settings);
+                Some(lifecycle::TrayAction::Show(target)) => {
+                    let _ = tray_coordinator.request_show(app, target);
                 }
                 Some(lifecycle::TrayAction::Quit) => tray_coordinator.request_tray_quit(app),
                 _ => {}
@@ -426,12 +434,11 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            production
-                .matches("request_show(app, ShowTarget::Settings)")
-                .count(),
-            1
-        );
+        assert!(production.contains("lifecycle::TRAY_OPEN_LAUNCHER"));
+        assert!(production.contains("打开主界面"));
+        assert!(production.contains("Some(lifecycle::TrayAction::Show(target))"));
+        assert!(production.contains("tray_coordinator.request_show(app, target)"));
+        assert!(production.contains("lifecycle::TRAY_OPEN_SETTINGS"));
     }
 
     #[test]
