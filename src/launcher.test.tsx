@@ -10,11 +10,15 @@ import { createLauncherCore } from './launcher-core'
 import launcherCoreSource from './launcher-core.ts?raw'
 import { bindNativeTextInput } from './native-input'
 import * as nativeInput from './native-input'
+// @ts-expect-error Vite supplies the raw source module in Vitest.
+import nativeInputSource from './native-input.ts?raw'
 import { LauncherView } from './launcher-view'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherViewSource from './launcher-view.tsx?raw'
 import {
   parseLauncherShown,
+  type ClassifiedTextRecord,
+  type ControlKey,
   type ExecuteOutcome,
   type ExportOutcome,
   type LauncherClient,
@@ -22,6 +26,8 @@ import {
   type SearchResponse,
   type SettingsView,
 } from './protocol'
+// @ts-expect-error Vite supplies the raw source module in Vitest.
+import protocolSource from './protocol.ts?raw'
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
 
@@ -157,6 +163,25 @@ async function startedCore() {
   const core = createLauncherCore(fake.client)
   await core.start()
   return { core, ...fake }
+}
+
+async function startedSettingsCore() {
+  const fake = fakeClient()
+  vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+  const core = createLauncherCore(fake.client)
+  await core.start()
+  fake.emit(shown('settings-r3', 'settings'))
+  return { core, ...fake }
+}
+
+type R3TextRecord =
+  | { kind: 'compositionStart'; control: ControlKey }
+  | { kind: 'compositionInput'; control: ControlKey; value: string; inputType: string }
+  | { kind: 'ordinaryInput'; control: ControlKey; value: string; inputType: string }
+  | { kind: 'compositionBoundary'; control: ControlKey }
+
+function r3(record: R3TextRecord): ClassifiedTextRecord {
+  return record
 }
 
 describe('protocol and cached store', () => {
@@ -424,39 +449,6 @@ describe('execute and hide ownership', () => {
 })
 
 describe('IME ownership', () => {
-  it.each([
-    ['input-before-end', true],
-    ['end-before-input', false],
-  ])('finalizes %s exactly once', async (_name, inputFirst) => {
-    const { core, client, emit } = await startedCore()
-    emit(shown('ime'))
-    const control = core.getSnapshot().queryControl
-    core.text({ kind: 'compositionStart', control, value: '' })
-    core.text({ kind: 'compositionUpdate', control, value: '计' })
-    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '计', querySequence: 0 })
-    expect(client.searchApps).not.toHaveBeenCalled()
-    if (inputFirst) core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
-    core.text({ kind: 'compositionEnd', control, value: '计算器' })
-    if (!inputFirst) {
-      await Promise.resolve()
-      core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
-    }
-    expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'ime', querySequence: 1 })
-    expect(core.getSnapshot()).toMatchObject({ query: '计算器', queryControlValue: '计算器', querySequence: 1 })
-  })
-
-  it('commits an empty final value with zero Rust calls', async () => {
-    const { core, client, emit } = await startedCore()
-    emit(shown('empty-ime'))
-    const control = core.getSnapshot().queryControl
-    core.text({ kind: 'compositionStart', control, value: '' })
-    core.text({ kind: 'compositionUpdate', control, value: '中' })
-    core.text({ kind: 'compositionEnd', control, value: '' })
-    expect(client.searchApps).not.toHaveBeenCalled()
-    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 1, searchPending: false })
-  })
-
   it('permanently retires the pre-composition search even when draft text returns', async () => {
     const { core, client, emit } = await startedCore()
     const old = deferred<SearchResponse | null>()
@@ -464,10 +456,10 @@ describe('IME ownership', () => {
     emit(shown('retire-search'))
     const control = core.getSnapshot().queryControl
     core.text({ kind: 'ordinaryInput', control, value: 'old', inputType: 'insertText' })
-    core.text({ kind: 'compositionStart', control, value: 'old' })
+    core.text({ kind: 'compositionStart', control })
     expect(core.getSnapshot()).toMatchObject({ query: 'old', queryControlValue: 'old', querySequence: 1, searchPending: false, results: [] })
-    core.text({ kind: 'compositionUpdate', control, value: '新' })
-    core.text({ kind: 'compositionUpdate', control, value: 'old' })
+    core.text({ kind: 'compositionInput', control, value: '新', inputType: 'insertCompositionText' })
+    core.text({ kind: 'compositionInput', control, value: 'old', inputType: 'insertCompositionText' })
     const returned = core.getSnapshot()
     old.resolve({ requestId: 'retired', items: [{ resultId: 'retired', title: 'Retired' }] })
     await old.promise
@@ -476,7 +468,7 @@ describe('IME ownership', () => {
     expect(core.getSnapshot().results).toEqual([])
   })
 
-  it('lets only the new shown auto-search commit across a late old end and input', async () => {
+  it('lets only the new shown auto-search commit across late old composition records', async () => {
     const { core, client, emit } = await startedCore()
     const old = deferred<SearchResponse | null>()
     const current = deferred<SearchResponse | null>()
@@ -484,11 +476,11 @@ describe('IME ownership', () => {
     emit(shown('old-invocation'))
     const control = core.getSnapshot().queryControl
     core.text({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' })
-    core.text({ kind: 'compositionStart', control, value: 'calc' })
-    core.text({ kind: 'compositionUpdate', control, value: '计算' })
+    core.text({ kind: 'compositionStart', control })
+    core.text({ kind: 'compositionInput', control, value: '计算', inputType: 'insertCompositionText' })
     emit(shown('new-invocation'))
     expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: 'calc', querySequence: 1, searchPending: true })
-    core.text({ kind: 'compositionEnd', control, value: '计算器' })
+    core.text({ kind: 'compositionBoundary', control })
     core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
     expect(client.searchApps).toHaveBeenCalledTimes(2)
     old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old' }] })
@@ -498,63 +490,282 @@ describe('IME ownership', () => {
     expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['New'])
   })
 
-  it('suppresses one associated composition input but treats later ordinary input as a new edit', async () => {
+  it('keeps an exact empty commit state-idempotent', async () => {
     const { core, client, emit } = await startedCore()
-    emit(shown('marker'))
+    emit(shown('empty-ime'))
     const control = core.getSnapshot().queryControl
-    core.text({ kind: 'compositionStart', control, value: '' })
-    core.text({ kind: 'compositionEnd', control, value: '中文' })
-    await Promise.resolve()
-    core.text({ kind: 'compositionInput', control, value: '中文', inputType: 'insertCompositionText' })
-    expect(client.searchApps).toHaveBeenCalledTimes(1)
-    core.text({ kind: 'ordinaryInput', control, value: '中文', inputType: 'insertFromPaste' })
-    expect(client.searchApps).toHaveBeenCalledTimes(2)
-    expect(core.getSnapshot().querySequence).toBe(2)
+    core.text({ kind: 'compositionStart', control })
+    const started = core.getSnapshot()
+    core.text({ kind: 'compositionBoundary', control })
+    expect(core.getSnapshot()).toBe(started)
+    expect(client.searchApps).not.toHaveBeenCalled()
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 0, searchPending: false })
   })
 
-  it('does not indefinitely suppress a same-value ordinary retry when no post-end input arrives', async () => {
-    const { core, client, emit } = await startedCore()
-    emit(shown('retry'))
-    const control = core.getSnapshot().queryControl
-    core.text({ kind: 'compositionStart', control, value: '' })
-    core.text({ kind: 'compositionEnd', control, value: 'same' })
-    core.text({ kind: 'ordinaryInput', control, value: 'same', inputType: 'insertText' })
-    expect(client.searchApps).toHaveBeenCalledTimes(2)
-    expect(core.getSnapshot().querySequence).toBe(2)
-  })
-
-  it('retires active, suppression, and stale ownership idempotently', async () => {
+  it('retires active ownership and its visible draft idempotently', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('retire-control'))
     const control = core.getSnapshot().queryControl
+    core.text({ kind: 'compositionStart', control })
+    core.text({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' })
+    core.retireControl(control)
+    const retired = core.getSnapshot()
+    core.retireControl(control)
+    core.text({ kind: 'compositionBoundary', control })
+    core.text({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' })
+    expect(core.getSnapshot()).toBe(retired)
+    expect(core.getSnapshot().queryControlValue).toBe('')
+    expect(client.searchApps).not.toHaveBeenCalled()
+  })
+})
+
+describe('R3 correlated composition boundary', () => {
+  it('commits a launcher draft at a no-tail boundary exactly once', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('r3-launcher'))
+    const control = core.getSnapshot().queryControl
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    vi.mocked(client.searchApps).mockClear()
+
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
+    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: '\u6d4b\u8bd5', querySequence: 1 })
+    expect(client.searchApps).not.toHaveBeenCalled()
+
+    const boundary = r3({ kind: 'compositionBoundary', control })
+    expect(Object.keys(boundary).sort()).toEqual(['control', 'kind'])
+    core.text(boundary)
+    expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenCalledOnce()
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '\u6d4b\u8bd5', invocationId: 'r3-launcher', querySequence: 2 })
+
+    const committed = core.getSnapshot()
+    core.text(r3({ kind: 'ordinaryInput', control, value: '\u6d4b\u8bd5', inputType: 'insertText' }))
+    core.text(boundary)
+    expect(core.getSnapshot()).toBe(committed)
+    expect(client.searchApps).toHaveBeenCalledOnce()
+  })
+
+  it('commits a settings draft locally and makes its same-value tail a no-op', async () => {
+    const { core, client } = await startedSettingsCore()
+    const control = core.getSnapshot().settings!.applications[0]!.aliases[0]!.key
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
     const listener = vi.fn()
     core.subscribe(listener)
 
-    core.text({ kind: 'compositionStart', control, value: '' })
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(listener).toHaveBeenCalledOnce()
+    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('\u6d4b\u8bd5')
+    expect(client.searchApps).not.toHaveBeenCalled()
+    expect(client.saveSettings).not.toHaveBeenCalled()
+
+    const committed = core.getSnapshot()
     listener.mockClear()
-    core.retireControl(control)
-    core.retireControl(control)
-    const retiredActive = core.getSnapshot()
-    core.text({ kind: 'compositionEnd', control, value: 'late' })
-    core.text({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' })
-    expect(core.getSnapshot()).toBe(retiredActive)
+    core.text(r3({ kind: 'ordinaryInput', control, value: '\u6d4b\u8bd5', inputType: 'insertText' }))
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(core.getSnapshot()).toBe(committed)
     expect(listener).not.toHaveBeenCalled()
+
+    core.text(r3({ kind: 'ordinaryInput', control, value: '\u4e0d\u540c', inputType: 'insertReplacementText' }))
+    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('\u4e0d\u540c')
+    expect(listener).toHaveBeenCalledOnce()
+    expect(client.searchApps).not.toHaveBeenCalled()
+    expect(client.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('commits settings ordinary-before-end and cancel paths once with zero Rust calls', async () => {
+    const { core, client } = await startedSettingsCore()
+    const control = core.getSnapshot().settings!.applications[0]!.aliases[0]!.key
+    const listener = vi.fn()
+    core.subscribe(listener)
+
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: 'candidate', inputType: 'insertCompositionText' }))
+    core.keyDown('Escape', true)
+    const beforeCancel = core.getSnapshot()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'alph', inputType: 'deleteContentBackward' }))
+    const cancelled = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(cancelled).not.toBe(beforeCancel)
+    expect(core.getSnapshot()).toBe(cancelled)
+    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('alph')
+
+    listener.mockClear()
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: 'ordinary-first', inputType: 'insertCompositionText' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'ordinary-first', inputType: 'insertText' }))
+    const ordinary = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(core.getSnapshot()).toBe(ordinary)
+    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('ordinary-first')
+    expect(client.searchApps).not.toHaveBeenCalled()
+    expect(client.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('lets ordinary input commit before a later zero-effect boundary', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('ordinary-first'))
+    const control = core.getSnapshot().queryControl
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: '\u8ba1\u7b97\u5668', inputType: 'insertCompositionText' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '\u8ba1\u7b97\u5668', inputType: 'insertText' }))
+    expect(client.searchApps).toHaveBeenCalledOnce()
+    const committed = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(core.getSnapshot()).toBe(committed)
+    expect(client.searchApps).toHaveBeenCalledOnce()
+  })
+
+  it('keeps composing keydown inert and commits a cancel delete once', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('cancel'))
+    const control = core.getSnapshot().queryControl
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    vi.mocked(client.searchApps).mockClear()
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: 'calculate', inputType: 'insertCompositionText' }))
+    const composing = core.getSnapshot()
+    core.keyDown('Escape', true)
+    expect(core.getSnapshot()).toBe(composing)
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'cal', inputType: 'deleteContentBackward' }))
+    expect(client.searchApps).toHaveBeenCalledOnce()
+    expect(client.searchApps).toHaveBeenCalledWith({ query: 'cal', invocationId: 'cancel', querySequence: 2 })
+    const cancelled = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(core.getSnapshot()).toBe(cancelled)
+
+    core.keyDown('Escape', false)
+    await vi.waitFor(() => expect(client.hideLauncher).toHaveBeenCalledOnce())
+  })
+
+  it('rejects no-owner, wrong-control, stale, retired, and removed boundaries', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('ownership'))
+    const control = core.getSnapshot().queryControl
+    const initial = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    core.text(r3({ kind: 'compositionBoundary', control: control + 1000 }))
+    expect(core.getSnapshot()).toBe(initial)
+
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: 'draft', inputType: 'insertCompositionText' }))
+    emit(shown('replacement'))
+    expect(core.getSnapshot().queryControlValue).toBe(core.getSnapshot().query)
+    const replaced = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(core.getSnapshot()).toBe(replaced)
+
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' }))
+    core.retireControl(control)
+    core.retireControl(control)
+    expect(core.getSnapshot().queryControlValue).toBe(core.getSnapshot().query)
+    const retired = core.getSnapshot()
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' }))
+    expect(core.getSnapshot()).toBe(retired)
     expect(client.searchApps).not.toHaveBeenCalled()
 
-    core.text({ kind: 'compositionStart', control, value: '' })
-    core.text({ kind: 'compositionEnd', control, value: 'done' })
-    core.retireControl(control)
-    const retiredMarker = core.getSnapshot()
-    core.text({ kind: 'compositionInput', control, value: 'done', inputType: 'insertCompositionText' })
-    expect(core.getSnapshot()).toBe(retiredMarker)
+    const settings = await startedSettingsCore()
+    const application = settings.core.getSnapshot().settings!.applications[0]!
+    const alias = application.aliases[0]!
+    settings.core.text(r3({ kind: 'compositionStart', control: alias.key }))
+    settings.core.text(r3({ kind: 'compositionInput', control: alias.key, value: 'removed', inputType: 'insertCompositionText' }))
+    settings.core.removeAlias(application.key, alias.key)
+    const removed = settings.core.getSnapshot()
+    settings.core.text(r3({ kind: 'compositionBoundary', control: alias.key }))
+    expect(settings.core.getSnapshot()).toBe(removed)
+  })
 
-    core.text({ kind: 'compositionStart', control, value: 'done' })
-    emit(shown('replacement'))
-    core.retireControl(control)
-    const retiredTombstone = core.getSnapshot()
-    core.text({ kind: 'compositionEnd', control, value: 'stale' })
-    core.text({ kind: 'compositionInput', control, value: 'stale', inputType: 'insertCompositionText' })
-    expect(core.getSnapshot()).toBe(retiredTombstone)
+  it('commits only the stored trusted draft, never a boundary sentinel', async () => {
+    const { core, emit } = await startedCore()
+    emit(shown('sentinel'))
+    const control = core.getSnapshot().queryControl
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
+    const domOnlySentinel = 'script-sentinel'
+    expect(domOnlySentinel).not.toBe('\u6d4b\u8bd5')
+    core.text(r3({ kind: 'compositionBoundary', control }))
+    expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5' })
+  })
+
+  it('restores an unfinished draft once and keeps exact-value edits idempotent', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('idempotent'))
+    const control = core.getSnapshot().queryControl
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    vi.mocked(client.searchApps).mockClear()
+    core.text(r3({ kind: 'compositionStart', control }))
+    core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
+    const listener = vi.fn()
+    core.subscribe(listener)
+
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    expect(listener).toHaveBeenCalledOnce()
+    expect(client.searchApps).not.toHaveBeenCalled()
+    const restored = core.getSnapshot()
+    listener.mockClear()
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertFromPaste' }))
+    expect(core.getSnapshot()).toBe(restored)
+    expect(listener).not.toHaveBeenCalled()
+
+    core.keyDown('Enter', false)
+    expect(client.searchApps).toHaveBeenCalledOnce()
+    expect(client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'idempotent', querySequence: 2 })
+
+    vi.mocked(client.searchApps).mockClear()
+    listener.mockClear()
+    core.text(r3({ kind: 'ordinaryInput', control, value: 'other', inputType: 'insertText' }))
+    expect(client.searchApps).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it('freezes the four-record protocol and the correlated native end source', () => {
+    for (const required of ['compositionStart', 'compositionInput', 'ordinaryInput', 'compositionBoundary']) {
+      expect(protocolSource).toContain(required)
+    }
+    for (const forbidden of ['compositionUpdate', 'compositionEnd']) expect(protocolSource).not.toContain(forbidden)
+
+    // @ts-expect-error A boundary must never carry text.
+    const withValue: ClassifiedTextRecord = { kind: 'compositionBoundary', control: 1, value: 'forbidden' }
+    // @ts-expect-error A boundary must never carry CompositionEvent data.
+    const withData: ClassifiedTextRecord = { kind: 'compositionBoundary', control: 1, data: 'forbidden' }
+    // @ts-expect-error A boundary must never carry input metadata.
+    const withInputType: ClassifiedTextRecord = { kind: 'compositionBoundary', control: 1, inputType: 'insertText' }
+    expect([withValue, withData, withInputType]).toHaveLength(3)
+
+    const endStart = nativeInputSource.indexOf('const onEnd')
+    const inputStart = nativeInputSource.indexOf('const onInput', endStart)
+    const endBody = nativeInputSource.slice(endStart, inputStart)
+    expect(endStart).toBeGreaterThanOrEqual(0)
+    expect(inputStart).toBeGreaterThan(endStart)
+    expect(endBody.indexOf('compositionActive')).toBeGreaterThanOrEqual(0)
+    expect(endBody.indexOf('compositionActive = false')).toBeGreaterThan(endBody.indexOf('compositionActive'))
+    expect(endBody.indexOf("kind: 'compositionBoundary'")).toBeGreaterThan(endBody.indexOf('compositionActive = false'))
+    expect(endBody).not.toContain('.data')
+    expect(endBody).not.toContain('.value')
+    expect(nativeInputSource.match(/input\.addEventListener\(/g)).toHaveLength(3)
+    expect(nativeInputSource.match(/input\.removeEventListener\(/g)).toHaveLength(3)
+  })
+
+  it('keeps untrusted, no-start, wrong-target, and post-unbind DOM events inert', () => {
+    const input = document.createElement('input')
+    const other = document.createElement('input')
+    const emit = vi.fn()
+    const unbind = bindNativeTextInput(input, 91, emit)
+    input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: '\u6d4b' }))
+    input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'sentinel' }))
+    other.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'sentinel' }))
+    expect(emit).not.toHaveBeenCalled()
+    unbind()
+    unbind()
+    input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'sentinel' }))
+    expect(emit).not.toHaveBeenCalled()
   })
 })
 
@@ -646,16 +857,15 @@ describe('settings ownership', () => {
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
 
-  it.each(['active', 'suppression', 'tombstone'] as const)('retires removed %s ownership before deletion', async (owner) => {
-    const { core, emit } = await settingsCore()
+  it('retires removed active ownership before deletion', async () => {
+    const { core } = await settingsCore()
     const application = core.getSnapshot().settings!.applications[0]!
     const alias = application.aliases[0]!
-    core.text({ kind: 'compositionStart', control: alias.key, value: alias.value })
-    if (owner === 'suppression') core.text({ kind: 'compositionEnd', control: alias.key, value: 'finished' })
-    if (owner === 'tombstone') emit(shown('replacement-event', 'settings'))
+    core.text({ kind: 'compositionStart', control: alias.key })
+    core.text({ kind: 'compositionInput', control: alias.key, value: 'unfinished', inputType: 'insertCompositionText' })
     core.removeAlias(application.key, alias.key)
     const removed = core.getSnapshot()
-    core.text({ kind: 'compositionEnd', control: alias.key, value: 'late' })
+    core.text({ kind: 'compositionBoundary', control: alias.key })
     core.text({ kind: 'compositionInput', control: alias.key, value: 'late', inputType: 'insertCompositionText' })
     expect(core.getSnapshot()).toBe(removed)
   })
@@ -666,9 +876,10 @@ describe('settings ownership', () => {
     const firstApplication = original.applications[0]!
     const removed = firstApplication.aliases[0]!
     const unrelated = original.applications[1]!.aliases[0]!
-    core.text({ kind: 'compositionStart', control: unrelated.key, value: '' })
+    core.text({ kind: 'compositionStart', control: unrelated.key })
+    core.text({ kind: 'compositionInput', control: unrelated.key, value: 'owned', inputType: 'insertCompositionText' })
     core.removeAlias(firstApplication.key, removed.key)
-    core.text({ kind: 'compositionEnd', control: unrelated.key, value: 'owned' })
+    core.text({ kind: 'compositionBoundary', control: unrelated.key })
     expect(core.getSnapshot().settings!.applications[1]!.aliases[0]!.value).toBe('owned')
 
     const oldKeys = [
@@ -676,13 +887,13 @@ describe('settings ownership', () => {
       original.researchId.key,
       ...original.applications.flatMap((application) => [application.key, ...application.aliases.map((alias) => alias.key)]),
     ]
-    core.text({ kind: 'compositionStart', control: original.hotkey.key, value: original.hotkey.value })
-    core.text({ kind: 'compositionUpdate', control: original.hotkey.key, value: 'uncommitted' })
+    core.text({ kind: 'compositionStart', control: original.hotkey.key })
+    core.text({ kind: 'compositionInput', control: original.hotkey.key, value: 'uncommitted', inputType: 'insertCompositionText' })
     vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
     await core.reloadSettings()
     const replacement = core.getSnapshot().settings!
     const replacedSnapshot = core.getSnapshot()
-    core.text({ kind: 'compositionEnd', control: original.hotkey.key, value: 'late' })
+    core.text({ kind: 'compositionBoundary', control: original.hotkey.key })
     core.text({ kind: 'compositionInput', control: original.hotkey.key, value: 'late', inputType: 'insertCompositionText' })
     expect(core.getSnapshot()).toBe(replacedSnapshot)
     const newKeys = [
@@ -1007,14 +1218,17 @@ describe('React view and accessibility', () => {
     const mounted = await mountLauncherView(core)
 
     await act(async () => {
-      core.text({ kind: 'compositionStart', control, value: '' })
-      core.text({ kind: 'compositionUpdate', control, value: '计' })
+      core.text({ kind: 'compositionStart', control })
+      core.text({ kind: 'compositionInput', control, value: '计', inputType: 'insertCompositionText' })
     })
 
     expect(bind).toHaveBeenCalledOnce()
     expect(unbind).not.toHaveBeenCalled()
     expect(retire).not.toHaveBeenCalled()
-    await act(async () => core.text({ kind: 'compositionEnd', control, value: '计算器' }))
+    await act(async () => {
+      core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
+      core.text({ kind: 'compositionBoundary', control })
+    })
     expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'stable-binding', querySequence: 1 })
 
     await mounted.unmount()

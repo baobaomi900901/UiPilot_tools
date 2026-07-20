@@ -5,34 +5,38 @@ export function bindNativeTextInput(
   control: ControlKey,
   emit: (record: ClassifiedTextRecord) => void,
 ): () => void {
-  const composition = (kind: 'compositionStart' | 'compositionUpdate' | 'compositionEnd') => (event: Event) => {
+  let compositionActive = false
+  const onStart = (event: Event) => {
     if (!event.isTrusted || !(event instanceof CompositionEvent) || event.target !== input) return
-    emit({ kind, control, value: input.value })
+    compositionActive = true
+    emit({ kind: 'compositionStart', control })
   }
-  const onStart = composition('compositionStart')
-  const onUpdate = composition('compositionUpdate')
-  const onEnd = composition('compositionEnd')
+  const onEnd = (event: Event) => {
+    if (!(event instanceof CompositionEvent) || event.target !== input || !compositionActive) return
+    compositionActive = false
+    emit({ kind: 'compositionBoundary', control })
+  }
   const onInput = (event: Event) => {
     if (!event.isTrusted || !(event instanceof InputEvent) || event.target !== input) return
-    if (event.inputType === 'insertCompositionText') {
-      emit({ kind: 'compositionInput', control, value: input.value, inputType: 'insertCompositionText' })
-    } else {
-      emit({ kind: 'ordinaryInput', control, value: input.value, inputType: event.inputType })
+    if (event.isComposing) {
+      if (compositionActive) emit({ kind: 'compositionInput', control, value: input.value, inputType: event.inputType })
+      return
     }
+    compositionActive = false
+    emit({ kind: 'ordinaryInput', control, value: input.value, inputType: event.inputType })
   }
 
   input.addEventListener('compositionstart', onStart)
-  input.addEventListener('compositionupdate', onUpdate)
-  input.addEventListener('compositionend', onEnd)
   input.addEventListener('input', onInput)
+  input.addEventListener('compositionend', onEnd)
 
-  let active = true
+  let bound = true
   return () => {
-    if (!active) return
-    active = false
+    if (!bound) return
+    bound = false
+    compositionActive = false
     input.removeEventListener('compositionstart', onStart)
-    input.removeEventListener('compositionupdate', onUpdate)
-    input.removeEventListener('compositionend', onEnd)
     input.removeEventListener('input', onInput)
+    input.removeEventListener('compositionend', onEnd)
   }
 }

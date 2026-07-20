@@ -67,10 +67,7 @@ interface CompositionOwner {
   viewEpoch: number
   invocationId?: string
   generation: number
-}
-
-interface FinalizationOwner extends CompositionOwner {
-  value?: string
+  lastTrustedDraft: string
 }
 
 interface TextControl {
@@ -206,8 +203,6 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   let activationNoticePending = false
   let compositionGeneration = 0
   let composition: CompositionOwner | undefined
-  let suppression: FinalizationOwner | undefined
-  let tombstone: FinalizationOwner | undefined
   let settingsOperation: SettingsOperation | undefined
   const appIds = new Map<ControlKey, string>()
 
@@ -303,16 +298,24 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
 
   function commitControl(control: ControlKey, value: string): void {
     if (control === model.queryControl) {
+      const visibleChanged = setControlDraft(control, value)
+      if (model.query === value) {
+        publish(visibleChanged)
+        return
+      }
       applyEdit(value)
       return
     }
     const field = findTextControl(control)
     if (!field || model.settingsNeedsReload || settingsOperation) return
-    const changed = field.value !== value || field.draft !== value || model.shownNotice !== undefined
+    const visibleChanged = setControlDraft(control, value)
+    if (field.value === value) {
+      publish(visibleChanged)
+      return
+    }
     field.value = value
-    field.draft = value
     model.shownNotice = undefined
-    publish(changed)
+    publish(true)
   }
 
   function settingsEditable(): boolean {
@@ -409,9 +412,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     const event = parseLauncherShown(payload)
     if (!event) return
     if (composition) restoreControl(composition.control)
-    tombstone = composition ? { ...composition } : undefined
     composition = undefined
-    suppression = undefined
     model.viewEpoch += 1
     model.invocationId = event.invocationId
     model.view = event.target
@@ -444,15 +445,14 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     if (!queryControl && !findTextControl(record.control)) return
     if (!queryControl && !settingsEditable()) return
     if (record.kind === 'ordinaryInput') {
-      composition = undefined
-      suppression = undefined
-      tombstone = undefined
+      if (ownsComposition(composition, record.control)) composition = undefined
       commitControl(record.control, record.value)
       return
     }
     if (record.kind === 'compositionStart') {
+      const restored = composition ? restoreControl(composition.control) : false
       const visibleMutation =
-        getControlDraft(record.control) !== record.value ||
+        restored ||
         model.shownNotice !== undefined ||
         (queryControl &&
           (model.searchPending ||
@@ -466,11 +466,9 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
         viewEpoch: model.viewEpoch,
         invocationId: model.invocationId,
         generation: compositionGeneration,
+        lastTrustedDraft: getControlDraft(record.control) ?? '',
       }
-      suppression = undefined
-      tombstone = undefined
       model.shownNotice = undefined
-      setControlDraft(record.control, record.value)
       if (queryControl) {
         searchToken = ++token
         model.searchPending = false
@@ -480,36 +478,17 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       publish(visibleMutation)
       return
     }
-    if (record.kind === 'compositionUpdate' || record.kind === 'compositionInput') {
+    if (record.kind === 'compositionInput') {
       if (ownsComposition(composition, record.control)) {
+        composition.lastTrustedDraft = record.value
         publish(setControlDraft(record.control, record.value))
-        return
-      }
-      if (
-        record.kind === 'compositionInput' &&
-        suppression?.control === record.control &&
-        suppression.generation === compositionGeneration &&
-        suppression.value === record.value
-      ) {
-        suppression = undefined
-        return
-      }
-      if (record.kind === 'compositionInput' && tombstone?.control === record.control && tombstone.value === record.value) {
-        tombstone = undefined
-        publish(restoreControl(record.control))
       }
       return
     }
     if (ownsComposition(composition, record.control)) {
-      const owner = composition
+      const value = composition.lastTrustedDraft
       composition = undefined
-      suppression = { ...owner, value: record.value }
-      commitControl(record.control, record.value)
-      return
-    }
-    if (tombstone?.control === record.control) {
-      tombstone.value = record.value
-      publish(restoreControl(record.control))
+      commitControl(record.control, value)
     }
   }
 
@@ -524,9 +503,10 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   }
 
   function retireControl(control: ControlKey): void {
-    if (composition?.control === control) composition = undefined
-    if (suppression?.control === control) suppression = undefined
-    if (tombstone?.control === control) tombstone = undefined
+    if (composition?.control !== control) return
+    const restored = restoreControl(control)
+    composition = undefined
+    publish(restored)
   }
 
   function setAutostart(checked: boolean): void {
@@ -797,6 +777,20 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       return
     }
     if (key === 'Enter') {
+      if (
+        model.view === 'launcher' &&
+        !model.searchPending &&
+        !model.executePending &&
+        !model.results.length &&
+        model.query !== '' &&
+        model.queryControlValue === model.query
+      ) {
+        model.querySequence += 1
+        model.status = ''
+        beginSearch()
+        publish(true)
+        return
+      }
       executeSelection()
       return
     }

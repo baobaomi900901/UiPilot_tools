@@ -69,11 +69,10 @@ export interface LauncherShown {
 export type ControlKey = number
 
 export type ClassifiedTextRecord =
-  | { kind: 'compositionStart'; control: ControlKey; value: string }
-  | { kind: 'compositionUpdate'; control: ControlKey; value: string }
-  | { kind: 'compositionInput'; control: ControlKey; value: string; inputType: 'insertCompositionText' }
-  | { kind: 'compositionEnd'; control: ControlKey; value: string }
+  | { kind: 'compositionStart'; control: ControlKey }
+  | { kind: 'compositionInput'; control: ControlKey; value: string; inputType: string }
   | { kind: 'ordinaryInput'; control: ControlKey; value: string; inputType: string }
+  | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
