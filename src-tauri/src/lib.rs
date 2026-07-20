@@ -41,6 +41,9 @@ mod hotkey;
 mod double_tap;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod hotkey_hook;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod lifecycle;
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
@@ -231,7 +234,10 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { api, .. } if run_coordinator.should_prevent_exit() => {
                 api.prevent_exit();
             }
-            tauri::RunEvent::Exit => run_coordinator.observe_run_exit(),
+            tauri::RunEvent::Exit => {
+                run_coordinator.uninstall_hook_if_any();
+                run_coordinator.observe_run_exit();
+            }
             _ => {}
         }
     });
@@ -427,6 +433,7 @@ mod tests {
             "tauri::WindowEvent::CloseRequested",
             "tauri::RunEvent::ExitRequested",
             "tauri::RunEvent::Exit",
+            "uninstall_hook_if_any",
         ] {
             assert!(
                 production.contains(fragment),
@@ -543,6 +550,9 @@ mod tests {
             "settings",
             "validation_data",
             "validation_export",
+            "hotkey",
+            "double_tap",
+            "hotkey_hook",
             "lifecycle",
         ] {
             assert!(
@@ -575,6 +585,9 @@ mod tests {
                 "apps/windows_backend.rs",
                 include_str!("apps/windows_backend.rs"),
             ),
+            ("hotkey.rs", include_str!("hotkey.rs")),
+            ("double_tap.rs", include_str!("double_tap.rs")),
+            ("hotkey_hook.rs", include_str!("hotkey_hook.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),

@@ -20,6 +20,8 @@ use windows::Win32::{
 
 use crate::{
     commands::clear_and_hide,
+    hotkey::{DoubleTapModifier, HotkeyKind},
+    hotkey_hook::HotkeyHook,
     result_registry::ResultRegistry,
     settings::{Settings, SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
@@ -120,12 +122,21 @@ impl Readiness {
 #[derive(Debug)]
 struct RuntimeSettings<T = Shortcut> {
     registered: Vec<T>,
+    installed_hook: Option<DoubleTapModifier>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HotkeyBindingChange {
+    persisted: HotkeyKind,
+    requested: HotkeyKind,
+    autostart: bool,
 }
 
 impl<T> Default for RuntimeSettings<T> {
     fn default() -> Self {
         Self {
             registered: Vec::new(),
+            installed_hook: None,
         }
     }
 }
@@ -211,6 +222,109 @@ where
     {
         if owned && unregister(shortcut).is_ok() {
             self.registered.retain(|registered| *registered != shortcut);
+        }
+    }
+}
+
+impl RuntimeSettings {
+    fn apply_hotkey_binding<R, U, IH, UH, A, C, P>(
+        &mut self,
+        change: HotkeyBindingChange,
+        mut register_shortcut: R,
+        mut unregister_shortcut: U,
+        mut install_hook: IH,
+        mut uninstall_hook: UH,
+        read_autostart: A,
+        mut change_autostart: C,
+        persist: P,
+    ) -> Result<(), ()>
+    where
+        R: FnMut(Shortcut) -> Result<(), ()>,
+        U: FnMut(Shortcut) -> Result<(), ()>,
+        IH: FnMut(DoubleTapModifier) -> Result<(), ()>,
+        UH: FnMut() -> Result<(), ()>,
+        A: FnOnce() -> Result<bool, ()>,
+        C: FnMut(bool) -> Result<(), ()>,
+        P: FnOnce() -> Result<(), ()>,
+    {
+        match change.requested {
+            HotkeyKind::DoubleTap(modifier) => {
+                let mut index = 0;
+                while index < self.registered.len() {
+                    let shortcut = self.registered[index];
+                    unregister_shortcut(shortcut)?;
+                    self.registered.remove(index);
+                }
+
+                let owned_new_hook = if self.installed_hook == Some(modifier) {
+                    false
+                } else {
+                    if self.installed_hook.is_some() {
+                        uninstall_hook()?;
+                        self.installed_hook = None;
+                    }
+                    install_hook(modifier)?;
+                    self.installed_hook = Some(modifier);
+                    true
+                };
+
+                let previous_autostart = match read_autostart() {
+                    Ok(enabled) => enabled,
+                    Err(()) => {
+                        self.rollback_hook(modifier, owned_new_hook, &mut uninstall_hook);
+                        return Err(());
+                    }
+                };
+                let changed_autostart = previous_autostart != change.autostart;
+                if changed_autostart && change_autostart(change.autostart).is_err() {
+                    self.rollback_hook(modifier, owned_new_hook, &mut uninstall_hook);
+                    return Err(());
+                }
+
+                if persist().is_err() {
+                    if changed_autostart {
+                        let _ = change_autostart(previous_autostart);
+                    }
+                    self.rollback_hook(modifier, owned_new_hook, &mut uninstall_hook);
+                    return Err(());
+                }
+
+                Ok(())
+            }
+            HotkeyKind::Chord(requested) => {
+                if self.installed_hook.take().is_some() {
+                    uninstall_hook()?;
+                }
+
+                let persisted = match change.persisted {
+                    HotkeyKind::Chord(shortcut) => shortcut,
+                    HotkeyKind::DoubleTap(_) => requested,
+                };
+
+                self.apply_transaction(
+                    RuntimeSettingsChange {
+                        persisted,
+                        requested,
+                        autostart: change.autostart,
+                    },
+                    |shortcut| register_shortcut(shortcut),
+                    |shortcut| unregister_shortcut(shortcut),
+                    read_autostart,
+                    change_autostart,
+                    persist,
+                )
+            }
+        }
+    }
+
+    fn rollback_hook<UH>(&mut self, modifier: DoubleTapModifier, owned: bool, uninstall_hook: &mut UH)
+    where
+        UH: FnMut() -> Result<(), ()>,
+    {
+        if owned && uninstall_hook().is_ok() {
+            if self.installed_hook == Some(modifier) {
+                self.installed_hook = None;
+            }
         }
     }
 }
@@ -378,6 +492,7 @@ pub(crate) struct LifecycleCoordinator {
     critical_changed: Condvar,
     pending_notice: Mutex<Option<LifecycleNotice>>,
     runtime_settings: Mutex<RuntimeSettings>,
+    hotkey_hook: Mutex<Option<HotkeyHook>>,
 }
 
 impl Default for LifecycleCoordinator {
@@ -390,6 +505,7 @@ impl Default for LifecycleCoordinator {
             critical_changed: Condvar::new(),
             pending_notice: Mutex::new(None),
             runtime_settings: Mutex::new(RuntimeSettings::default()),
+            hotkey_hook: Mutex::new(None),
         }
     }
 }
@@ -480,29 +596,26 @@ impl Drop for CriticalReservation {
 
 impl LifecycleCoordinator {
     pub(crate) fn save_settings_transaction(
-        &self,
+        self: &Arc<Self>,
         app: &AppHandle,
         settings: &SettingsStore,
         cache: &crate::apps::AppCache,
-        shortcut: Shortcut,
+        kind: HotkeyKind,
         update: SettingsUpdate,
     ) -> Result<(), ()> {
-        let mut runtime = self
-            .runtime_settings
-            .lock()
-            .expect("runtime settings lock poisoned");
         let persisted = settings.snapshot();
-        let persisted_shortcut = persisted.hotkey.parse::<Shortcut>().map_err(|_| ())?;
+        let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
         let global_shortcut = app.global_shortcut();
         let autostart = app.autolaunch();
-        runtime.apply_transaction(
-            RuntimeSettingsChange {
-                persisted: persisted_shortcut,
-                requested: shortcut,
-                autostart: update.autostart,
-            },
+        let coordinator = Arc::clone(self);
+        self.apply_hotkey_settings_transaction(
+            persisted_kind,
+            kind,
+            update.autostart,
             |shortcut| global_shortcut.register(shortcut).map_err(|_| ()),
             |shortcut| global_shortcut.unregister(shortcut).map_err(|_| ()),
+            move |modifier| self.install_production_hook(app, &coordinator, modifier),
+            || self.uninstall_production_hook(),
             || autostart.is_enabled().map_err(|_| ()),
             |enabled| {
                 if enabled {
@@ -516,18 +629,104 @@ impl LifecycleCoordinator {
         )
     }
 
-    pub(crate) fn reconcile_runtime_settings(
+    fn install_production_hook(
         &self,
+        app: &AppHandle,
+        coordinator: &Arc<LifecycleCoordinator>,
+        modifier: DoubleTapModifier,
+    ) -> Result<(), ()> {
+        self.uninstall_production_hook()?;
+        let app_for_callback = app.clone();
+        let coordinator = Arc::clone(coordinator);
+        let on_match = Arc::new(move || {
+            let _ = coordinator.request_show(&app_for_callback, ShowTarget::Launcher);
+        });
+        let hook = HotkeyHook::install(app, modifier, on_match)?;
+        *self.hotkey_hook.lock().map_err(|_| ())? = Some(hook);
+        Ok(())
+    }
+
+    fn uninstall_production_hook(&self) -> Result<(), ()> {
+        if let Ok(mut hook) = self.hotkey_hook.lock() {
+            if let Some(installed) = hook.take() {
+                installed.uninstall();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn uninstall_hook_if_any(&self) {
+        let _ = self.uninstall_production_hook();
+        if let Ok(mut runtime) = self.runtime_settings.lock() {
+            runtime.installed_hook = None;
+        }
+    }
+
+    fn apply_hotkey_settings_transaction<R, U, IH, UH, A, C, P>(
+        &self,
+        persisted: HotkeyKind,
+        requested: HotkeyKind,
+        autostart: bool,
+        register_shortcut: R,
+        unregister_shortcut: U,
+        install_hook: IH,
+        uninstall_hook: UH,
+        read_autostart: A,
+        change_autostart: C,
+        persist: P,
+    ) -> Result<(), ()>
+    where
+        R: FnMut(Shortcut) -> Result<(), ()>,
+        U: FnMut(Shortcut) -> Result<(), ()>,
+        IH: FnMut(DoubleTapModifier) -> Result<(), ()>,
+        UH: FnMut() -> Result<(), ()>,
+        A: FnOnce() -> Result<bool, ()>,
+        C: FnMut(bool) -> Result<(), ()>,
+        P: FnOnce() -> Result<(), ()>,
+    {
+        let mut runtime = self
+            .runtime_settings
+            .lock()
+            .expect("runtime settings lock poisoned");
+        runtime.apply_hotkey_binding(
+            HotkeyBindingChange {
+                persisted,
+                requested,
+                autostart,
+            },
+            register_shortcut,
+            unregister_shortcut,
+            install_hook,
+            uninstall_hook,
+            read_autostart,
+            change_autostart,
+            persist,
+        )
+    }
+
+    pub(crate) fn reconcile_runtime_settings(
+        self: &Arc<Self>,
         app: &AppHandle,
         settings: &Settings,
     ) -> Result<(), ()> {
         let global_shortcut = app.global_shortcut();
         let autostart = app.autolaunch();
+        let coordinator = Arc::clone(self);
         self.reconcile_runtime_settings_with(
             &settings.hotkey,
             settings.autostart,
-            |value| value.parse::<Shortcut>().map_err(|_| ()),
+            |value| HotkeyKind::parse(value),
             |shortcut| global_shortcut.register(shortcut).map_err(|_| ()),
+            move |modifier| {
+                let app_for_callback = app.clone();
+                let coordinator = Arc::clone(&coordinator);
+                let on_match = Arc::new(move || {
+                    let _ = coordinator.request_show(&app_for_callback, ShowTarget::Launcher);
+                });
+                let hook = HotkeyHook::install(app, modifier, on_match)?;
+                *self.hotkey_hook.lock().map_err(|_| ())? = Some(hook);
+                Ok(())
+            },
             || autostart.is_enabled().map_err(|_| ()),
             |enabled| {
                 if enabled {
@@ -540,29 +739,42 @@ impl LifecycleCoordinator {
         )
     }
 
-    fn reconcile_runtime_settings_with<P, R, A, C>(
+    pub(crate) fn reconcile_runtime_settings_with<P, R, IH, A, C>(
         &self,
         hotkey: &str,
         expected_autostart: bool,
         parse: P,
-        register: R,
+        register_shortcut: R,
+        install_hook: IH,
         read_autostart: A,
         change_autostart: C,
     ) -> Result<(), ()>
     where
-        P: FnOnce(&str) -> Result<Shortcut, ()>,
+        P: FnOnce(&str) -> Result<HotkeyKind, ()>,
         R: FnOnce(Shortcut) -> Result<(), ()>,
+        IH: FnOnce(DoubleTapModifier) -> Result<(), ()>,
         A: FnOnce() -> Result<bool, ()>,
         C: FnOnce(bool) -> Result<(), ()>,
     {
         let result = (|| {
-            let shortcut = parse(hotkey)?;
-            register(shortcut)?;
-            self.runtime_settings
-                .lock()
-                .expect("runtime settings lock poisoned")
-                .registered
-                .push(shortcut);
+            let kind = parse(hotkey)?;
+            match kind {
+                HotkeyKind::DoubleTap(modifier) => {
+                    install_hook(modifier)?;
+                    self.runtime_settings
+                        .lock()
+                        .expect("runtime settings lock poisoned")
+                        .installed_hook = Some(modifier);
+                }
+                HotkeyKind::Chord(shortcut) => {
+                    register_shortcut(shortcut)?;
+                    self.runtime_settings
+                        .lock()
+                        .expect("runtime settings lock poisoned")
+                        .registered
+                        .push(shortcut);
+                }
+            }
             let actual_autostart = read_autostart()?;
             if actual_autostart != expected_autostart {
                 change_autostart(expected_autostart)?;
@@ -1071,6 +1283,9 @@ impl LifecycleCoordinator {
                 decision,
                 |deadline| coordinator.wait_for_clean_change(deadline),
                 || {
+                    marker_app
+                        .state::<Arc<LifecycleCoordinator>>()
+                        .uninstall_hook_if_any();
                     if marker_app
                         .state::<ValidationStore>()
                         .mark_clean_exit()
@@ -1098,6 +1313,9 @@ impl LifecycleCoordinator {
             Instant::now() + Duration::from_secs(1),
             |deadline| self.wait_for_clean_change(deadline),
             || {
+                marker_app
+                    .state::<Arc<LifecycleCoordinator>>()
+                    .uninstall_hook_if_any();
                 if marker_app
                     .state::<ValidationStore>()
                     .mark_clean_exit()
@@ -1215,6 +1433,7 @@ unsafe extern "system" fn session_subclass_proc(
         wparam.0,
         || unsafe { DefSubclassProc(hwnd, message, wparam, lparam).0 },
         || {
+            app.state::<Arc<LifecycleCoordinator>>().uninstall_hook_if_any();
             app.state::<Arc<LifecycleCoordinator>>()
                 .run_system_end(&app);
         },
@@ -1263,7 +1482,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{commands::save_settings_worker_with, result_registry::ResultRegistry};
+    use crate::{
+        commands::save_settings_worker_with,
+        hotkey::{DoubleTapModifier, HotkeyKind, DOUBLE_ALT, DOUBLE_CTRL},
+        result_registry::ResultRegistry,
+    };
     use tauri_plugin_global_shortcut::Shortcut;
 
     const _: fn(&Arc<LifecycleCoordinator>, &AppHandle, ShowTarget) -> Result<(), LifecycleError> =
@@ -1271,7 +1494,7 @@ mod tests {
     const _: fn(&Arc<LifecycleCoordinator>, &AppHandle) -> Result<(), LifecycleError> =
         LifecycleCoordinator::mark_setup_ready;
     const _: fn(&Arc<LifecycleCoordinator>, &AppHandle) = LifecycleCoordinator::request_tray_quit;
-    const _: fn(&LifecycleCoordinator, &AppHandle, &Settings) -> Result<(), ()> =
+    const _: fn(&Arc<LifecycleCoordinator>, &AppHandle, &Settings) -> Result<(), ()> =
         LifecycleCoordinator::reconcile_runtime_settings;
 
     #[derive(Clone, Copy)]
@@ -2400,6 +2623,7 @@ mod tests {
     fn runtime_settings_enforces_two_registration_ceiling() {
         let mut state = RuntimeSettings {
             registered: vec!["A"],
+            installed_hook: None,
         };
         let first = RuntimeProbe {
             autostart: Cell::new(Ok(false)),
@@ -2452,6 +2676,7 @@ mod tests {
     fn runtime_settings_cleans_stale_before_registering_next_shortcut() {
         let mut state = RuntimeSettings {
             registered: vec!["A", "B"],
+            installed_hook: None,
         };
         let probe = RuntimeProbe {
             autostart: Cell::new(Ok(false)),
@@ -2489,6 +2714,7 @@ mod tests {
         };
         let mut state = RuntimeSettings {
             registered: vec!["A"],
+            installed_hook: None,
         };
         assert_eq!(
             apply_runtime_change(
@@ -2534,6 +2760,7 @@ mod tests {
     fn runtime_settings_orders_autostart_and_persistence_without_redundant_changes() {
         let mut unchanged = RuntimeSettings {
             registered: vec!["A"],
+            installed_hook: None,
         };
         let unchanged_probe = RuntimeProbe {
             autostart: Cell::new(Ok(false)),
@@ -2558,6 +2785,7 @@ mod tests {
 
         let mut changed = RuntimeSettings {
             registered: vec!["A"],
+            installed_hook: None,
         };
         let changed_probe = RuntimeProbe {
             autostart: Cell::new(Ok(false)),
@@ -2592,6 +2820,7 @@ mod tests {
     fn runtime_settings_rolls_back_only_owned_changes_after_persist_failure() {
         let mut state = RuntimeSettings {
             registered: vec!["A"],
+            installed_hook: None,
         };
         let probe = RuntimeProbe {
             autostart: Cell::new(Ok(false)),
@@ -2629,6 +2858,7 @@ mod tests {
         {
             let mut state = RuntimeSettings {
                 registered: vec!["A"],
+                installed_hook: None,
             };
             let probe = RuntimeProbe {
                 autostart: Cell::new(Ok(false)),
@@ -2665,6 +2895,7 @@ mod tests {
         for (read_result, change_failure) in [(Err(()), None), (Ok(false), Some(1))] {
             let mut state = RuntimeSettings {
                 registered: vec!["A"],
+                installed_hook: None,
             };
             let probe = RuntimeProbe {
                 autostart: Cell::new(read_result),
@@ -2698,12 +2929,13 @@ mod tests {
             .reconcile_runtime_settings_with(
                 "Alt+Space",
                 true,
-                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |value| HotkeyKind::parse(value),
                 |registered| {
                     assert_eq!(registered, shortcut);
                     trace.borrow_mut().push("register");
                     Ok(())
                 },
+                |_| Ok(()),
                 || {
                     trace.borrow_mut().push("read-autostart");
                     Ok(false)
@@ -2737,12 +2969,13 @@ mod tests {
             .reconcile_runtime_settings_with(
                 "Alt+Space",
                 false,
-                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |value| HotkeyKind::parse(value),
                 |registered| {
                     assert_eq!(registered, shortcut);
                     matching_registers.set(matching_registers.get() + 1);
                     Ok(())
                 },
+                |_| Ok(()),
                 || {
                     matching_reads.set(matching_reads.get() + 1);
                     Ok(false)
@@ -2774,8 +3007,9 @@ mod tests {
                     "not a shortcut"
                 },
                 false,
-                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |value| HotkeyKind::parse(value),
                 |_| if register_fails { Err(()) } else { Ok(()) },
+                |_| Ok(()),
                 || panic!("failed shortcut setup must skip autostart read"),
                 |_| panic!("failed shortcut setup must skip autostart change"),
             );
@@ -2800,12 +3034,13 @@ mod tests {
             read_failure.reconcile_runtime_settings_with(
                 "Alt+Space",
                 false,
-                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |value| HotkeyKind::parse(value),
                 |registered| {
                     assert_eq!(registered, shortcut);
                     read_failure_registers.set(read_failure_registers.get() + 1);
                     Ok(())
                 },
+                |_| Ok(()),
                 || Err(()),
                 |_| {
                     read_failure_changes.set(read_failure_changes.get() + 1);
@@ -2837,12 +3072,13 @@ mod tests {
             change_failure.reconcile_runtime_settings_with(
                 "Alt+Space",
                 true,
-                |value| value.parse::<Shortcut>().map_err(|_| ()),
+                |value| HotkeyKind::parse(value),
                 |registered| {
                     assert_eq!(registered, shortcut);
                     change_failure_registers.set(change_failure_registers.get() + 1);
                     Ok(())
                 },
+                |_| Ok(()),
                 || Ok(false),
                 |_| {
                     change_calls.set(change_calls.get() + 1);
@@ -2932,6 +3168,7 @@ mod tests {
                 } else {
                     vec!["A"]
                 },
+                installed_hook: None,
             };
             let autostart_calls = Cell::new(0);
             let persist_fails = matches!(phase, "autostart-rollback" | "rollback-unregister");
@@ -3501,5 +3738,182 @@ mod tests {
         assert!(!production.contains("windows_link::link!"));
         assert!(!production.contains("#[link("));
         assert!(!production.contains("struct SessionHookContext"));
+    }
+
+    struct HotkeyBindingProbe {
+        trace: RefCell<Vec<String>>,
+        autostart: Cell<Result<bool, ()>>,
+        persist_failure: Cell<bool>,
+    }
+
+    impl Default for HotkeyBindingProbe {
+        fn default() -> Self {
+            Self {
+                trace: RefCell::new(Vec::new()),
+                autostart: Cell::new(Ok(false)),
+                persist_failure: Cell::new(false),
+            }
+        }
+    }
+
+    impl HotkeyBindingProbe {
+        fn register(&self, shortcut: Shortcut) -> Result<(), ()> {
+            self.trace
+                .borrow_mut()
+                .push(format!("register-{shortcut}"));
+            Ok(())
+        }
+
+        fn unregister(&self, shortcut: Shortcut) -> Result<(), ()> {
+            self.trace
+                .borrow_mut()
+                .push(format!("unregister-{shortcut}"));
+            Ok(())
+        }
+
+        fn install(&self, modifier: DoubleTapModifier) -> Result<(), ()> {
+            self.trace
+                .borrow_mut()
+                .push(format!("install-{modifier:?}"));
+            Ok(())
+        }
+
+        fn uninstall(&self) -> Result<(), ()> {
+            self.trace.borrow_mut().push("uninstall-hook".into());
+            Ok(())
+        }
+
+        fn read_autostart(&self) -> Result<bool, ()> {
+            self.trace.borrow_mut().push("read-autostart".into());
+            self.autostart.get()
+        }
+
+        fn change_autostart(&self, enabled: bool) -> Result<(), ()> {
+            self.trace
+                .borrow_mut()
+                .push(format!("autostart-{enabled}"));
+            self.autostart.set(Ok(enabled));
+            Ok(())
+        }
+
+        fn persist(&self) -> Result<(), ()> {
+            self.trace.borrow_mut().push("persist".into());
+            (!self.persist_failure.get()).then_some(()).ok_or(())
+        }
+    }
+
+    fn apply_hotkey_binding_with_probe(
+        state: &mut RuntimeSettings,
+        change: HotkeyBindingChange,
+        probe: &HotkeyBindingProbe,
+    ) -> Result<(), ()> {
+        state.apply_hotkey_binding(
+            change,
+            |shortcut| probe.register(shortcut),
+            |shortcut| probe.unregister(shortcut),
+            |modifier| probe.install(modifier),
+            || probe.uninstall(),
+            || probe.read_autostart(),
+            |enabled| probe.change_autostart(enabled),
+            || probe.persist(),
+        )
+    }
+
+    #[test]
+    fn switching_chord_to_double_tap_unregisters_shortcut_before_hook_install() {
+        let alt_space: Shortcut = "Alt+Space".parse().unwrap();
+        let mut runtime = RuntimeSettings {
+            registered: vec![alt_space],
+            installed_hook: None,
+        };
+        let probe = HotkeyBindingProbe::default();
+        apply_hotkey_binding_with_probe(
+            &mut runtime,
+            HotkeyBindingChange {
+                persisted: HotkeyKind::Chord(alt_space),
+                requested: HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl),
+                autostart: false,
+            },
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.trace.borrow(),
+            [
+                format!("unregister-{alt_space}"),
+                "install-Ctrl".into(),
+                "read-autostart".into(),
+                "persist".into(),
+            ]
+        );
+        assert!(runtime.registered.is_empty());
+        assert_eq!(runtime.installed_hook, Some(DoubleTapModifier::Ctrl));
+    }
+
+    #[test]
+    fn switching_double_tap_to_chord_uninstalls_hook_before_register() {
+        let ctrl_space: Shortcut = "Ctrl+Space".parse().unwrap();
+        let mut runtime = RuntimeSettings {
+            registered: Vec::new(),
+            installed_hook: Some(DoubleTapModifier::Alt),
+        };
+        let probe = HotkeyBindingProbe::default();
+        apply_hotkey_binding_with_probe(
+            &mut runtime,
+            HotkeyBindingChange {
+                persisted: HotkeyKind::DoubleTap(DoubleTapModifier::Alt),
+                requested: HotkeyKind::Chord(ctrl_space),
+                autostart: false,
+            },
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.trace.borrow(),
+            [
+                "uninstall-hook".into(),
+                format!("register-{ctrl_space}"),
+                "read-autostart".into(),
+                "persist".into(),
+            ]
+        );
+        assert_eq!(runtime.registered, [ctrl_space]);
+        assert_eq!(runtime.installed_hook, None);
+    }
+
+    #[test]
+    fn reconcile_double_alt_installs_hook_without_shortcut_register() {
+        let coordinator = coordinator_for_test();
+        let register_calls = Cell::new(0);
+        let install_calls = Cell::new(0);
+        coordinator
+            .reconcile_runtime_settings_with(
+                DOUBLE_ALT,
+                false,
+                |value| HotkeyKind::parse(value),
+                |_| {
+                    register_calls.set(register_calls.get() + 1);
+                    Ok(())
+                },
+                |modifier| {
+                    assert_eq!(modifier, DoubleTapModifier::Alt);
+                    install_calls.set(install_calls.get() + 1);
+                    Ok(())
+                },
+                || Ok(false),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(register_calls.get(), 0);
+        assert_eq!(install_calls.get(), 1);
+        assert_eq!(
+            coordinator
+                .runtime_settings
+                .lock()
+                .expect("runtime settings lock poisoned")
+                .installed_hook,
+            Some(DoubleTapModifier::Alt)
+        );
+        assert!(HotkeyKind::parse(DOUBLE_CTRL).is_ok());
     }
 }
