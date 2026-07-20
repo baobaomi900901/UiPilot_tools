@@ -29,7 +29,6 @@ const host = document.querySelector<HTMLElement>('#app')
 if (!host) throw new Error('Missing application root')
 
 const core = createLauncherCore(client)
-const root = createRoot(host)
 let settleReady!: (result: 'ready' | 'failed') => void
 const viewReady = new Promise<'ready' | 'failed'>((resolve) => {
   settleReady = resolve
@@ -40,6 +39,18 @@ const onReady = (result: 'ready' | 'failed') => {
   readySettled = true
   settleReady(result)
 }
+const failMount = () => {
+  onReady('failed')
+  core.failInitialization()
+  const status = document.createElement('div')
+  status.className = 'status-region'
+  status.setAttribute('role', 'status')
+  status.setAttribute('aria-live', 'polite')
+  status.setAttribute('aria-atomic', 'true')
+  status.textContent = core.getSnapshot().status
+  host.replaceChildren(status)
+}
+const root = createRoot(host, { onUncaughtError: failMount })
 
 let tornDown = false
 const teardown = () => {
@@ -54,7 +65,7 @@ window.addEventListener('pagehide', teardown)
 try {
   root.render(createElement(LauncherView, { core, onReady }))
 } catch {
-  onReady('failed')
+  failMount()
 }
 
 void (async () => {

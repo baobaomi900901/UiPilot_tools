@@ -1433,6 +1433,34 @@ describe('real adapter and startup', () => {
     await pagehide()
   })
 
+  it('shows only fixed local status when React reports a render-phase mount failure', async () => {
+    resetAdapterDocument()
+    const privateError = 'private render-phase sentinel'
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.doMock('./launcher-view', () => ({
+      LauncherView: () => {
+        throw new Error(privateError)
+      },
+    }))
+    try {
+      await import('./main')
+      await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
+      expect(document.body.textContent).not.toContain(privateError)
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
+      expect(tauriCapture.listen).not.toHaveBeenCalled()
+      expect(tauriCapture.invoke).not.toHaveBeenCalled()
+      await pagehide()
+      expect(document.querySelector('#app')?.childElementCount).toBe(0)
+      await pagehide()
+      expect(document.querySelector('#app')?.childElementCount).toBe(0)
+    } finally {
+      await pagehide()
+      vi.doUnmock('./launcher-view')
+      vi.resetModules()
+      consoleError.mockRestore()
+    }
+  })
+
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
     const unlisten = vi.fn()
