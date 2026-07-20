@@ -249,6 +249,7 @@ impl RuntimeSettings {
     {
         match change.requested {
             HotkeyKind::DoubleTap(modifier) => {
+                let previous_registered = self.registered.clone();
                 let mut index = 0;
                 while index < self.registered.len() {
                     let shortcut = self.registered[index];
@@ -263,7 +264,13 @@ impl RuntimeSettings {
                         uninstall_hook()?;
                         self.installed_hook = None;
                     }
-                    install_hook(modifier)?;
+                    if install_hook(modifier).is_err() {
+                        self.rollback_unregistered_shortcuts(
+                            &previous_registered,
+                            &mut register_shortcut,
+                        );
+                        return Err(());
+                    }
                     self.installed_hook = Some(modifier);
                     true
                 };
@@ -324,6 +331,17 @@ impl RuntimeSettings {
         if owned && uninstall_hook().is_ok() {
             if self.installed_hook == Some(modifier) {
                 self.installed_hook = None;
+            }
+        }
+    }
+
+    fn rollback_unregistered_shortcuts<R>(&mut self, previous: &[Shortcut], register: &mut R)
+    where
+        R: FnMut(Shortcut) -> Result<(), ()>,
+    {
+        for &shortcut in previous {
+            if register(shortcut).is_ok() {
+                self.registered.push(shortcut);
             }
         }
     }
@@ -3744,6 +3762,7 @@ mod tests {
         trace: RefCell<Vec<String>>,
         autostart: Cell<Result<bool, ()>>,
         persist_failure: Cell<bool>,
+        install_failure: Cell<bool>,
     }
 
     impl Default for HotkeyBindingProbe {
@@ -3752,6 +3771,7 @@ mod tests {
                 trace: RefCell::new(Vec::new()),
                 autostart: Cell::new(Ok(false)),
                 persist_failure: Cell::new(false),
+                install_failure: Cell::new(false),
             }
         }
     }
@@ -3775,6 +3795,9 @@ mod tests {
             self.trace
                 .borrow_mut()
                 .push(format!("install-{modifier:?}"));
+            if self.install_failure.get() {
+                return Err(());
+            }
             Ok(())
         }
 
@@ -3817,6 +3840,37 @@ mod tests {
             |enabled| probe.change_autostart(enabled),
             || probe.persist(),
         )
+    }
+
+    #[test]
+    fn double_tap_install_failure_restores_unregistered_shortcuts() {
+        let alt_space: Shortcut = "Alt+Space".parse().unwrap();
+        let mut runtime = RuntimeSettings {
+            registered: vec![alt_space],
+            installed_hook: None,
+        };
+        let probe = HotkeyBindingProbe::default();
+        probe.install_failure.set(true);
+        let result = apply_hotkey_binding_with_probe(
+            &mut runtime,
+            HotkeyBindingChange {
+                persisted: HotkeyKind::Chord(alt_space),
+                requested: HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl),
+                autostart: false,
+            },
+            &probe,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *probe.trace.borrow(),
+            [
+                format!("unregister-{alt_space}"),
+                "install-Ctrl".into(),
+                format!("register-{alt_space}"),
+            ]
+        );
+        assert_eq!(runtime.registered, [alt_space]);
+        assert_eq!(runtime.installed_hook, None);
     }
 
     #[test]

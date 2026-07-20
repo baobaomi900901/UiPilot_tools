@@ -96,10 +96,17 @@ impl HotkeyHook {
                 Foundation::HINSTANCE,
                 UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL},
             };
-            let handle = unsafe {
+            let handle = match unsafe {
                 SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), HINSTANCE::default(), 0)
-            }
-            .map_err(|_| ())?;
+            } {
+                Ok(handle) => handle,
+                Err(_) => {
+                    if let Ok(mut state) = hook_state().lock() {
+                        *state = None;
+                    }
+                    return Err(());
+                }
+            };
             Ok(Self { handle })
         }
     }
