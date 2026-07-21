@@ -124,9 +124,9 @@ impl HotkeyHook {
         {
             use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
             let handle = self.handle;
-            return self.uninstall_with(move || unsafe {
+            self.uninstall_with(move || unsafe {
                 UnhookWindowsHookEx(HHOOK(handle as *mut _)).map_err(|_| ())
-            });
+            })
         }
 
         #[cfg(any(test, feature = "test-instrumentation"))]

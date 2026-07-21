@@ -119,9 +119,9 @@ impl Readiness {
     }
 }
 
-#[derive(Clone, Debug)]
-struct RuntimeSettings<T = Shortcut> {
-    registered: Vec<T>,
+#[derive(Clone, Debug, Default)]
+struct RuntimeSettings {
+    registered: Vec<Shortcut>,
     installed_hook: Option<DoubleTapModifier>,
 }
 
@@ -130,153 +130,6 @@ struct HotkeyBindingChange {
     persisted: HotkeyKind,
     requested: HotkeyKind,
     autostart: bool,
-}
-
-impl<T> Default for RuntimeSettings<T> {
-    fn default() -> Self {
-        Self {
-            registered: Vec::new(),
-            installed_hook: None,
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RuntimeSettingsChange<T> {
-    persisted: T,
-    requested: T,
-    autostart: bool,
-}
-
-#[cfg(test)]
-impl<T> RuntimeSettings<T>
-where
-    T: Copy + Eq,
-{
-    fn apply_transaction<R, U, A, C, P>(
-        &mut self,
-        change: RuntimeSettingsChange<T>,
-        mut register: R,
-        mut unregister: U,
-        read_autostart: A,
-        mut change_autostart: C,
-        persist: P,
-    ) -> Result<(), ()>
-    where
-        R: FnMut(T) -> Result<(), ()>,
-        U: FnMut(T) -> Result<(), ()>,
-        A: FnOnce() -> Result<bool, ()>,
-        C: FnMut(bool) -> Result<(), ()>,
-        P: FnOnce() -> Result<(), ()>,
-    {
-        let before = self.registered.clone();
-        let mut previous_autostart = None;
-        let mut changed_autostart = false;
-        let result = (|| {
-            while self.registered.len() >= 2 && !self.registered.contains(&change.requested) {
-                let stale = self
-                    .registered
-                    .iter()
-                    .copied()
-                    .find(|registered| *registered != change.persisted)
-                    .ok_or(())?;
-                unregister(stale)?;
-                self.registered.retain(|registered| *registered != stale);
-            }
-
-            if !self.registered.contains(&change.requested) {
-                register(change.requested)?;
-                self.registered.push(change.requested);
-            }
-
-            for shortcut in self.registered.clone() {
-                if shortcut != change.requested {
-                    unregister(shortcut)?;
-                    self.registered.retain(|registered| *registered != shortcut);
-                }
-            }
-
-            let actual_autostart = read_autostart()?;
-            previous_autostart = Some(actual_autostart);
-            if actual_autostart != change.autostart {
-                change_autostart(change.autostart)?;
-                changed_autostart = true;
-            }
-            persist()
-        })();
-
-        if result.is_ok() {
-            return Ok(());
-        }
-
-        if changed_autostart {
-            let _ = change_autostart(previous_autostart.expect("changed autostart has old value"));
-        }
-        let _ = self.restore_registered_snapshot(&before, &mut register, &mut unregister);
-        Err(())
-    }
-
-    fn restore_registered_snapshot<R, U>(
-        &mut self,
-        before: &[T],
-        register: &mut R,
-        unregister: &mut U,
-    ) -> Result<(), ()>
-    where
-        R: FnMut(T) -> Result<(), ()>,
-        U: FnMut(T) -> Result<(), ()>,
-    {
-        let mut failed = false;
-        for shortcut in before {
-            while self.registered.len() >= 2 && !self.registered.contains(shortcut) {
-                let Some(extra) = self
-                    .registered
-                    .iter()
-                    .copied()
-                    .find(|registered| !before.contains(registered))
-                else {
-                    failed = true;
-                    break;
-                };
-                if unregister(extra).is_ok() {
-                    self.registered.retain(|registered| *registered != extra);
-                } else {
-                    failed = true;
-                    break;
-                }
-            }
-            if !self.registered.contains(shortcut) {
-                if register(*shortcut).is_ok() {
-                    self.registered.push(*shortcut);
-                } else {
-                    failed = true;
-                }
-            }
-        }
-
-        let previous_restored = before
-            .iter()
-            .all(|shortcut| self.registered.contains(shortcut));
-        if previous_restored {
-            for shortcut in self.registered.clone() {
-                if !before.contains(&shortcut) {
-                    if unregister(shortcut).is_ok() {
-                        self.registered.retain(|registered| *registered != shortcut);
-                    } else {
-                        failed = true;
-                    }
-                }
-            }
-        }
-
-        if !failed && self.registered.len() == before.len() && previous_restored {
-            self.registered = before.to_vec();
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
 }
 
 impl RuntimeSettings {
@@ -443,14 +296,12 @@ impl RuntimeSettings {
             .iter()
             .all(|shortcut| self.registered.contains(shortcut))
             && self.installed_hook == before.installed_hook;
-        if previous_restored {
-            for shortcut in self.registered.clone() {
-                if !before.registered.contains(&shortcut) {
-                    if unregister_shortcut(shortcut).is_ok() {
-                        self.registered.retain(|registered| *registered != shortcut);
-                    } else {
-                        failed = true;
-                    }
+        for shortcut in self.registered.clone() {
+            if !before.registered.contains(&shortcut) {
+                if unregister_shortcut(shortcut).is_ok() {
+                    self.registered.retain(|registered| *registered != shortcut);
+                } else {
+                    failed = true;
                 }
             }
         }
@@ -2894,396 +2745,6 @@ mod tests {
         assert_eq!(system.observe_exit(), ExitState::SystemEnding);
     }
 
-    struct RuntimeProbe {
-        trace: RefCell<Vec<String>>,
-        autostart: Cell<Result<bool, ()>>,
-        register_failure: Cell<Option<&'static str>>,
-        unregister_failures: RefCell<Vec<&'static str>>,
-        autostart_failure_on_call: Cell<Option<usize>>,
-        autostart_calls: Cell<usize>,
-        persist_failure: Cell<bool>,
-        persist_calls: Cell<usize>,
-    }
-
-    impl Default for RuntimeProbe {
-        fn default() -> Self {
-            Self {
-                trace: RefCell::new(Vec::new()),
-                autostart: Cell::new(Ok(false)),
-                register_failure: Cell::new(None),
-                unregister_failures: RefCell::new(Vec::new()),
-                autostart_failure_on_call: Cell::new(None),
-                autostart_calls: Cell::new(0),
-                persist_failure: Cell::new(false),
-                persist_calls: Cell::new(0),
-            }
-        }
-    }
-
-    impl RuntimeProbe {
-        fn register(&self, shortcut: &'static str) -> Result<(), ()> {
-            self.trace.borrow_mut().push(format!("register-{shortcut}"));
-            (self.register_failure.get() != Some(shortcut))
-                .then_some(())
-                .ok_or(())
-        }
-
-        fn unregister(&self, shortcut: &'static str) -> Result<(), ()> {
-            self.trace
-                .borrow_mut()
-                .push(format!("unregister-{shortcut}"));
-            (!self.unregister_failures.borrow().contains(&shortcut))
-                .then_some(())
-                .ok_or(())
-        }
-
-        fn read_autostart(&self) -> Result<bool, ()> {
-            self.trace.borrow_mut().push("read-autostart".into());
-            self.autostart.get()
-        }
-
-        fn change_autostart(&self, enabled: bool) -> Result<(), ()> {
-            let call = self.autostart_calls.get() + 1;
-            self.autostart_calls.set(call);
-            self.trace.borrow_mut().push(format!("autostart-{enabled}"));
-            if self.autostart_failure_on_call.get() == Some(call) {
-                return Err(());
-            }
-            self.autostart.set(Ok(enabled));
-            Ok(())
-        }
-
-        fn persist(&self) -> Result<(), ()> {
-            self.persist_calls.set(self.persist_calls.get() + 1);
-            self.trace.borrow_mut().push("persist".into());
-            (!self.persist_failure.get()).then_some(()).ok_or(())
-        }
-    }
-
-    fn apply_runtime_change(
-        state: &mut RuntimeSettings<&'static str>,
-        change: RuntimeSettingsChange<&'static str>,
-        probe: &RuntimeProbe,
-    ) -> Result<(), ()> {
-        state.apply_transaction(
-            change,
-            |shortcut| probe.register(shortcut),
-            |shortcut| probe.unregister(shortcut),
-            || probe.read_autostart(),
-            |enabled| probe.change_autostart(enabled),
-            || probe.persist(),
-        )
-    }
-
-    #[test]
-    fn runtime_settings_enforces_two_registration_ceiling() {
-        let mut state = RuntimeSettings {
-            registered: vec!["A"],
-            installed_hook: None,
-        };
-        let first = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            unregister_failures: RefCell::new(vec!["A"]),
-            ..RuntimeProbe::default()
-        };
-
-        assert_eq!(
-            apply_runtime_change(
-                &mut state,
-                RuntimeSettingsChange {
-                    persisted: "A",
-                    requested: "B",
-                    autostart: false,
-                },
-                &first,
-            ),
-            Err(())
-        );
-        assert_eq!(state.registered, ["A"]);
-        assert_eq!(first.persist_calls.get(), 0);
-        assert_eq!(
-            *first.trace.borrow(),
-            ["register-B", "unregister-A", "unregister-B"]
-        );
-
-        state.registered = vec!["A", "B"];
-
-        let second = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            unregister_failures: RefCell::new(vec!["A"]),
-            ..RuntimeProbe::default()
-        };
-        assert_eq!(
-            apply_runtime_change(
-                &mut state,
-                RuntimeSettingsChange {
-                    persisted: "B",
-                    requested: "C",
-                    autostart: false,
-                },
-                &second,
-            ),
-            Err(())
-        );
-        assert_eq!(state.registered, ["A", "B"]);
-        assert_eq!(second.persist_calls.get(), 0);
-        assert_eq!(
-            *second.trace.borrow(),
-            ["unregister-A"],
-            "stale cleanup must precede every new side effect"
-        );
-    }
-
-    #[test]
-    fn runtime_settings_cleans_stale_before_registering_next_shortcut() {
-        let mut state = RuntimeSettings {
-            registered: vec!["A", "B"],
-            installed_hook: None,
-        };
-        let probe = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            ..RuntimeProbe::default()
-        };
-
-        assert_eq!(
-            apply_runtime_change(
-                &mut state,
-                RuntimeSettingsChange {
-                    persisted: "B",
-                    requested: "C",
-                    autostart: false,
-                },
-                &probe,
-            ),
-            Ok(())
-        );
-        assert_eq!(state.registered, ["C"]);
-        assert_eq!(
-            *probe.trace.borrow(),
-            [
-                "unregister-A",
-                "register-C",
-                "unregister-B",
-                "read-autostart",
-                "persist",
-            ]
-        );
-
-        let conflict = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            register_failure: Cell::new(Some("B")),
-            ..RuntimeProbe::default()
-        };
-        let mut state = RuntimeSettings {
-            registered: vec!["A"],
-            installed_hook: None,
-        };
-        assert_eq!(
-            apply_runtime_change(
-                &mut state,
-                RuntimeSettingsChange {
-                    persisted: "A",
-                    requested: "B",
-                    autostart: false,
-                },
-                &conflict,
-            ),
-            Err(())
-        );
-        assert_eq!(state.registered, ["A"]);
-        assert_eq!(*conflict.trace.borrow(), ["register-B"]);
-
-        let recovery = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            unregister_failures: RefCell::new(vec!["A"]),
-            ..RuntimeProbe::default()
-        };
-        let mut state = RuntimeSettings::default();
-        assert_eq!(
-            apply_runtime_change(
-                &mut state,
-                RuntimeSettingsChange {
-                    persisted: "A",
-                    requested: "B",
-                    autostart: false,
-                },
-                &recovery,
-            ),
-            Ok(())
-        );
-        assert_eq!(state.registered, ["B"]);
-        assert_eq!(
-            *recovery.trace.borrow(),
-            ["register-B", "read-autostart", "persist"]
-        );
-    }
-
-    #[test]
-    fn runtime_settings_orders_autostart_and_persistence_without_redundant_changes() {
-        let mut unchanged = RuntimeSettings {
-            registered: vec!["A"],
-            installed_hook: None,
-        };
-        let unchanged_probe = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            ..RuntimeProbe::default()
-        };
-        assert_eq!(
-            apply_runtime_change(
-                &mut unchanged,
-                RuntimeSettingsChange {
-                    persisted: "A",
-                    requested: "A",
-                    autostart: false,
-                },
-                &unchanged_probe,
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            *unchanged_probe.trace.borrow(),
-            ["read-autostart", "persist"]
-        );
-
-        let mut changed = RuntimeSettings {
-            registered: vec!["A"],
-            installed_hook: None,
-        };
-        let changed_probe = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            ..RuntimeProbe::default()
-        };
-        assert_eq!(
-            apply_runtime_change(
-                &mut changed,
-                RuntimeSettingsChange {
-                    persisted: "A",
-                    requested: "B",
-                    autostart: true,
-                },
-                &changed_probe,
-            ),
-            Ok(())
-        );
-        assert_eq!(changed.registered, ["B"]);
-        assert_eq!(
-            *changed_probe.trace.borrow(),
-            [
-                "register-B",
-                "unregister-A",
-                "read-autostart",
-                "autostart-true",
-                "persist",
-            ]
-        );
-    }
-
-    #[test]
-    fn runtime_settings_rolls_back_only_owned_changes_after_persist_failure() {
-        let mut state = RuntimeSettings {
-            registered: vec!["A"],
-            installed_hook: None,
-        };
-        let probe = RuntimeProbe {
-            autostart: Cell::new(Ok(false)),
-            persist_failure: Cell::new(true),
-            ..RuntimeProbe::default()
-        };
-        assert_eq!(
-            apply_runtime_change(
-                &mut state,
-                RuntimeSettingsChange {
-                    persisted: "A",
-                    requested: "B",
-                    autostart: true,
-                },
-                &probe,
-            ),
-            Err(())
-        );
-        assert_eq!(state.registered, ["A"]);
-        assert_eq!(probe.autostart.get(), Ok(false));
-        assert_eq!(
-            *probe.trace.borrow(),
-            [
-                "register-B",
-                "unregister-A",
-                "read-autostart",
-                "autostart-true",
-                "persist",
-                "autostart-false",
-                "register-A",
-                "unregister-B",
-            ]
-        );
-
-        for (rollback_autostart_fails, rollback_unregister_fails) in
-            [(true, false), (false, true), (true, true)]
-        {
-            let mut state = RuntimeSettings {
-                registered: vec!["A"],
-                installed_hook: None,
-            };
-            let probe = RuntimeProbe {
-                autostart: Cell::new(Ok(false)),
-                unregister_failures: RefCell::new(
-                    rollback_unregister_fails
-                        .then_some("B")
-                        .into_iter()
-                        .collect(),
-                ),
-                autostart_failure_on_call: Cell::new(rollback_autostart_fails.then_some(2)),
-                persist_failure: Cell::new(true),
-                ..RuntimeProbe::default()
-            };
-            assert_eq!(
-                apply_runtime_change(
-                    &mut state,
-                    RuntimeSettingsChange {
-                        persisted: "A",
-                        requested: "B",
-                        autostart: true,
-                    },
-                    &probe,
-                ),
-                Err(())
-            );
-            assert!(state.registered.len() <= 2);
-            assert!(state.registered.contains(&"A"));
-            assert_eq!(state.registered.contains(&"B"), rollback_unregister_fails);
-        }
-    }
-
-    #[test]
-    fn runtime_settings_autostart_failures_skip_persist_and_remove_owned_registration() {
-        for (read_result, change_failure) in [(Err(()), None), (Ok(false), Some(1))] {
-            let mut state = RuntimeSettings {
-                registered: vec!["A"],
-                installed_hook: None,
-            };
-            let probe = RuntimeProbe {
-                autostart: Cell::new(read_result),
-                autostart_failure_on_call: Cell::new(change_failure),
-                ..RuntimeProbe::default()
-            };
-            assert_eq!(
-                apply_runtime_change(
-                    &mut state,
-                    RuntimeSettingsChange {
-                        persisted: "A",
-                        requested: "B",
-                        autostart: true,
-                    },
-                    &probe,
-                ),
-                Err(())
-            );
-            assert_eq!(state.registered, ["A"]);
-            assert_eq!(probe.persist_calls.get(), 0);
-            assert_eq!(probe.trace.borrow().last().unwrap(), "unregister-B");
-        }
-    }
-
     #[test]
     fn runtime_settings_startup_reconciles_persisted_values_or_sets_first_notice() {
         let coordinator = coordinator_for_test();
@@ -3534,6 +2995,7 @@ mod tests {
         for phase in [
             "stale-cleanup",
             "register",
+            "unregister",
             "autostart",
             "persist",
             "autostart-rollback",
@@ -3542,11 +3004,14 @@ mod tests {
             let coordinator = coordinator_for_test();
             let reserve_coordinator = Arc::clone(&coordinator);
             let worker_coordinator = Arc::clone(&coordinator);
+            let stale: Shortcut = "Shift+Space".parse().unwrap();
+            let old: Shortcut = "Alt+Space".parse().unwrap();
+            let requested: Shortcut = "Ctrl+Space".parse().unwrap();
             let mut state = RuntimeSettings {
                 registered: if phase == "stale-cleanup" {
-                    vec!["stale", "A"]
+                    vec![stale, old]
                 } else {
-                    vec!["A"]
+                    vec![old]
                 },
                 installed_hook: None,
             };
@@ -3556,37 +3021,46 @@ mod tests {
                 move || reserve_coordinator.reserve_critical().map_err(|_| ()),
                 move |reservation| {
                     let _reservation = reservation;
-                    state.apply_transaction(
-                        RuntimeSettingsChange {
-                            persisted: "A",
-                            requested: "B",
+                    state.apply_hotkey_binding(
+                        HotkeyBindingChange {
+                            persisted: HotkeyKind::Chord(old),
+                            requested: HotkeyKind::Chord(requested),
                             autostart: true,
                         },
-                        |_| {
-                            if phase == "register" {
-                                assert_clean_blocked(&worker_coordinator);
-                            }
-                            Ok(())
-                        },
-                        |shortcut| {
-                            if (phase == "stale-cleanup" && shortcut == "stale")
-                                || (phase == "rollback-unregister" && shortcut == "B")
-                            {
-                                assert_clean_blocked(&worker_coordinator);
-                            }
-                            Ok(())
-                        },
-                        || Ok(false),
-                        |_| {
-                            let call = autostart_calls.get() + 1;
-                            autostart_calls.set(call);
-                            if (phase == "autostart" && call == 1)
-                                || (phase == "autostart-rollback" && call == 2)
-                            {
-                                assert_clean_blocked(&worker_coordinator);
-                            }
-                            Ok(())
-                        },
+                        (
+                            |_| {
+                                if phase == "register" {
+                                    assert_clean_blocked(&worker_coordinator);
+                                }
+                                Ok(())
+                            },
+                            |shortcut| {
+                                if (phase == "stale-cleanup" && shortcut == stale)
+                                    || (phase == "unregister" && shortcut == old)
+                                    || (phase == "rollback-unregister" && shortcut == requested)
+                                {
+                                    assert_clean_blocked(&worker_coordinator);
+                                }
+                                Ok(())
+                            },
+                        ),
+                        (
+                            |_| panic!("chord transaction must not install a hook"),
+                            || panic!("chord transaction must not uninstall a hook"),
+                        ),
+                        (
+                            || Ok(false),
+                            |_| {
+                                let call = autostart_calls.get() + 1;
+                                autostart_calls.set(call);
+                                if (phase == "autostart" && call == 1)
+                                    || (phase == "autostart-rollback" && call == 2)
+                                {
+                                    assert_clean_blocked(&worker_coordinator);
+                                }
+                                Ok(())
+                            },
+                        ),
                         || {
                             if phase == "persist" {
                                 assert_clean_blocked(&worker_coordinator);
@@ -4114,8 +3588,6 @@ mod tests {
     struct HotkeyBindingProbe {
         trace: RefCell<Vec<String>>,
         autostart: Cell<Result<bool, ()>>,
-        persist_failure: Cell<bool>,
-        install_failure: Cell<bool>,
         failures: Vec<(String, usize)>,
         actual_registered: RefCell<Vec<Shortcut>>,
         actual_hook: Cell<Option<DoubleTapModifier>>,
@@ -4126,8 +3598,6 @@ mod tests {
             Self {
                 trace: RefCell::new(Vec::new()),
                 autostart: Cell::new(Ok(false)),
-                persist_failure: Cell::new(false),
-                install_failure: Cell::new(false),
                 failures: Vec::new(),
                 actual_registered: RefCell::new(Vec::new()),
                 actual_hook: Cell::new(None),
@@ -4177,9 +3647,6 @@ mod tests {
 
         fn install(&self, modifier: DoubleTapModifier) -> Result<(), ()> {
             self.record(format!("install-{modifier:?}"))?;
-            if self.install_failure.get() {
-                return Err(());
-            }
             self.actual_hook.set(Some(modifier));
             Ok(())
         }
@@ -4202,8 +3669,7 @@ mod tests {
         }
 
         fn persist(&self) -> Result<(), ()> {
-            self.record("persist".into())?;
-            (!self.persist_failure.get()).then_some(()).ok_or(())
+            self.record("persist".into())
         }
 
         fn assert_actual_matches(&self, runtime: &RuntimeSettings) {
@@ -4244,8 +3710,7 @@ mod tests {
             registered: vec![alt_space],
             installed_hook: None,
         };
-        let probe = HotkeyBindingProbe::default();
-        probe.install_failure.set(true);
+        let probe = HotkeyBindingProbe::from_runtime(&runtime, vec![("install-Ctrl".into(), 1)]);
         let result = apply_hotkey_binding_with_probe(
             &mut runtime,
             HotkeyBindingChange {
@@ -4467,6 +3932,75 @@ mod tests {
             .iter()
             .all(|operation| operation != "install-Ctrl"));
         assert_ne!(runtime.installed_hook, before.installed_hook);
+    }
+
+    #[test]
+    fn hotkey_transaction_removes_new_chord_when_old_hook_restore_fails() {
+        let requested: Shortcut = "Ctrl+Space".parse().unwrap();
+        let before = RuntimeSettings {
+            registered: Vec::new(),
+            installed_hook: Some(DoubleTapModifier::Ctrl),
+        };
+        let mut runtime = before.clone();
+        let probe = HotkeyBindingProbe::from_runtime(
+            &before,
+            vec![("persist".into(), 1), ("install-Ctrl".into(), 1)],
+        );
+
+        assert_eq!(
+            apply_hotkey_binding_with_probe(
+                &mut runtime,
+                HotkeyBindingChange {
+                    persisted: HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl),
+                    requested: HotkeyKind::Chord(requested),
+                    autostart: false,
+                },
+                &probe,
+            ),
+            Err(())
+        );
+        assert_eq!(runtime.registered, []);
+        assert_eq!(runtime.installed_hook, None);
+        assert_eq!(
+            probe.trace.borrow().last().unwrap(),
+            &format!("unregister-{requested}")
+        );
+        probe.assert_actual_matches(&runtime);
+    }
+
+    #[test]
+    fn hotkey_transaction_removes_new_chord_when_old_chord_restore_fails() {
+        let old: Shortcut = "Alt+Space".parse().unwrap();
+        let requested: Shortcut = "Ctrl+Space".parse().unwrap();
+        let before = RuntimeSettings {
+            registered: vec![old],
+            installed_hook: None,
+        };
+        let mut runtime = before.clone();
+        let probe = HotkeyBindingProbe::from_runtime(
+            &before,
+            vec![("persist".into(), 1), (format!("register-{old}"), 1)],
+        );
+
+        assert_eq!(
+            apply_hotkey_binding_with_probe(
+                &mut runtime,
+                HotkeyBindingChange {
+                    persisted: HotkeyKind::Chord(old),
+                    requested: HotkeyKind::Chord(requested),
+                    autostart: false,
+                },
+                &probe,
+            ),
+            Err(())
+        );
+        assert_eq!(runtime.registered, []);
+        assert_eq!(runtime.installed_hook, None);
+        assert_eq!(
+            probe.trace.borrow().last().unwrap(),
+            &format!("unregister-{requested}")
+        );
+        probe.assert_actual_matches(&runtime);
     }
 
     #[test]
