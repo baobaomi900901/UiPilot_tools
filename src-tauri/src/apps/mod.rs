@@ -12,6 +12,7 @@ mod action;
 mod appsfolder;
 mod cache;
 mod discovery;
+mod icon;
 mod rank;
 mod shortcut;
 mod windows_backend;

@@ -14,6 +14,7 @@ use windows::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ShortcutMetadata {
     pub(crate) executable: Option<PathBuf>,
+    pub(crate) icon: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,7 +24,9 @@ pub(crate) enum ShortcutError {
 }
 
 pub(crate) fn load_shortcut(path: &Path) -> Result<ShortcutMetadata, ShortcutError> {
-    load_shortcut_with(path, read_raw_shortcut_path)
+    let mut metadata = load_shortcut_with(path, read_raw_shortcut_path)?;
+    metadata.icon = super::icon::from_shortcut(path);
+    Ok(metadata)
 }
 
 fn load_shortcut_with<F>(path: &Path, read_raw_path: F) -> Result<ShortcutMetadata, ShortcutError>
@@ -33,7 +36,10 @@ where
     let executable = read_raw_path(path, SLGP_RAWPATH)?
         .as_deref()
         .and_then(validate_raw_executable_wide);
-    Ok(ShortcutMetadata { executable })
+    Ok(ShortcutMetadata {
+        executable,
+        icon: None,
+    })
 }
 
 fn validate_raw_executable_wide(raw: &[u16]) -> Option<PathBuf> {
@@ -163,6 +169,9 @@ mod tests {
             metadata.executable,
             Some(PathBuf::from(r"Z:\missing\NativeApp.exe"))
         );
+        assert!(metadata.icon.as_deref().is_some_and(|icon| {
+            icon.starts_with("data:image/png;base64,") && icon.len() <= 65_536
+        }));
         fs::remove_dir_all(shortcut.parent().unwrap()).unwrap();
     }
 
@@ -180,6 +189,7 @@ mod tests {
             metadata,
             ShortcutMetadata {
                 executable: Some(PathBuf::from(r"C:\Apps\App.exe")),
+                icon: None,
             }
         );
     }
@@ -222,6 +232,12 @@ mod tests {
         let missing = load_shortcut_with(Path::new(r"C:\Menu\NoTarget.lnk"), |_, _| Ok(None));
 
         assert_eq!(damaged, Err(ShortcutError::InvalidShortcut));
-        assert_eq!(missing, Ok(ShortcutMetadata { executable: None }));
+        assert_eq!(
+            missing,
+            Ok(ShortcutMetadata {
+                executable: None,
+                icon: None,
+            })
+        );
     }
 }

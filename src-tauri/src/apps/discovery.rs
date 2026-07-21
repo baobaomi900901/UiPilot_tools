@@ -302,7 +302,7 @@ where
                 shortcut: candidate.shortcut,
                 executable: metadata.executable,
             },
-            icon: None,
+            icon: metadata.icon,
             aliases: Vec::new(),
             use_count: 0,
         });
@@ -368,7 +368,7 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
                 }
                 .into(),
             ),
-            icon: None,
+            icon: application.icon.clone(),
         },
         ResultAction::LaunchApplication {
             app_id: application.app_id.clone(),
@@ -456,7 +456,10 @@ mod tests {
     }
 
     fn no_target(_: &Path) -> Result<ShortcutMetadata, ShortcutError> {
-        Ok(ShortcutMetadata { executable: None })
+        Ok(ShortcutMetadata {
+            executable: None,
+            icon: None,
+        })
     }
 
     fn titles(applications: &[Application]) -> Vec<&str> {
@@ -645,6 +648,7 @@ mod tests {
     fn desktop_and_packaged_snapshots_merge_without_name_deduplication() {
         let user = TempRoot::new("merged-user");
         let common = TempRoot::new("merged-common");
+        let safe_icon = "data:image/png;base64,iVBORw==".to_owned();
         fs::write(user.child("Settings.lnk"), []).unwrap();
         let packaged = DiscoverySnapshot {
             applications: vec![Application {
@@ -653,7 +657,7 @@ mod tests {
                 target: ApplicationLaunchTarget::PackagedApp {
                     aumid: "family!settings".into(),
                 },
-                icon: None,
+                icon: Some(safe_icon.clone()),
                 aliases: Vec::new(),
                 use_count: 0,
             }],
@@ -663,12 +667,23 @@ mod tests {
             },
         };
 
-        let merged = discover_with(roots(user.path(), common.path()), no_target, || {
-            Ok(packaged)
-        })
+        let merged = discover_with(
+            roots(user.path(), common.path()),
+            |_| {
+                Ok(ShortcutMetadata {
+                    executable: None,
+                    icon: Some(safe_icon.clone()),
+                })
+            },
+            || Ok(packaged),
+        )
         .unwrap();
 
         assert_eq!(titles(&merged.applications), ["Settings", "Settings"]);
+        assert!(merged
+            .applications
+            .iter()
+            .all(|application| application.icon.as_deref() == Some(safe_icon.as_str())));
         assert_eq!(merged.diagnostics.invalid_packaged_aumids, 3);
     }
 
@@ -697,12 +712,14 @@ mod tests {
         let first_snapshot = discover_from_roots(roots(first.path(), &missing_first), |_| {
             Ok(ShortcutMetadata {
                 executable: Some(PathBuf::from(r"C:\One.exe")),
+                icon: None,
             })
         })
         .unwrap();
         let second_snapshot = discover_from_roots(roots(second.path(), &missing_second), |_| {
             Ok(ShortcutMetadata {
                 executable: Some(PathBuf::from(r"D:\Two.exe")),
+                icon: None,
             })
         })
         .unwrap();
@@ -715,6 +732,7 @@ mod tests {
 
     #[test]
     fn registry_entry_keeps_private_values_out_of_the_dto() {
+        let safe_icon = "data:image/png;base64,iVBORw==".to_owned();
         let desktop = Application {
             app_id: "app-desktop-secret".into(),
             display_name: "Calculator".into(),
@@ -722,7 +740,7 @@ mod tests {
                 shortcut: PathBuf::from(r"C:\Private\Calculator.lnk"),
                 executable: Some(PathBuf::from(r"C:\Private\Calculator.exe")),
             },
-            icon: None,
+            icon: Some(safe_icon.clone()),
             aliases: Vec::new(),
             use_count: 0,
         };
@@ -741,8 +759,12 @@ mod tests {
         let (packaged_item, packaged_action) = crate::apps::registry_entry(&packaged);
 
         assert_eq!(desktop_item.subtitle.as_deref(), Some("应用程序"));
+        assert_eq!(desktop_item.icon.as_deref(), Some(safe_icon.as_str()));
         assert_eq!(packaged_item.subtitle.as_deref(), Some("打包的应用程序"));
         assert_eq!(packaged_item.icon, None);
+        let desktop_json = serde_json::to_string(&desktop_item).unwrap();
+        assert!(desktop_json.contains(safe_icon.as_str()));
+        assert!(!desktop_json.contains(r"C:\Private"));
         let json = serde_json::to_string(&packaged_item).unwrap();
         assert!(!json.contains("app-packaged-secret"));
         assert!(!json.contains("family!secret"));

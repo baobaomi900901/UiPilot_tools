@@ -23,6 +23,7 @@ use super::{
 struct RawPackagedEntry {
     display_name: Option<String>,
     aumid: Option<String>,
+    icon: Option<String>,
 }
 
 struct ShellString<F: FnOnce(*mut u16)> {
@@ -142,6 +143,7 @@ fn raw_entry(item: &IShellItem) -> RawPackagedEntry {
     RawPackagedEntry {
         display_name,
         aumid,
+        icon: super::icon::from_shell_item(item),
     }
 }
 
@@ -184,7 +186,7 @@ where
             diagnostics.invalid_packaged_aumids += 1;
             continue;
         };
-        candidates.push((aumid.to_lowercase(), display_name, aumid));
+        candidates.push((aumid.to_lowercase(), display_name, aumid, entry.icon));
     }
     candidates.sort_by(|left, right| {
         left.0
@@ -195,7 +197,7 @@ where
 
     let mut aumids = HashSet::with_capacity(candidates.len());
     let mut applications = Vec::with_capacity(candidates.len());
-    for (normalized_aumid, display_name, aumid) in candidates {
+    for (normalized_aumid, display_name, aumid, icon) in candidates {
         if !aumids.insert(normalized_aumid) {
             continue;
         }
@@ -203,7 +205,7 @@ where
             app_id: packaged_app_id(&aumid)?,
             display_name,
             target: ApplicationLaunchTarget::PackagedApp { aumid },
-            icon: None,
+            icon,
             aliases: Vec::new(),
             use_count: 0,
         });
@@ -234,6 +236,7 @@ mod tests {
         RawPackagedEntry {
             display_name: display_name.map(str::to_owned),
             aumid: aumid.map(str::to_owned),
+            icon: None,
         }
     }
 
@@ -286,6 +289,22 @@ mod tests {
             ApplicationLaunchTarget::PackagedApp { .. }
         )));
         assert_ne!(first.applications[0].app_id, first.applications[1].app_id);
+    }
+
+    #[test]
+    fn packaged_icon_survives_validation_and_deduplication() {
+        let safe_icon = "data:image/png;base64,iVBORw==".to_owned();
+        let snapshot = snapshot_from_raw(
+            [RawPackagedEntry {
+                display_name: Some("Calculator".into()),
+                aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+                icon: Some(safe_icon.clone()),
+            }],
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.applications[0].icon, Some(safe_icon));
     }
 
     #[test]
