@@ -119,21 +119,32 @@ impl HotkeyHook {
         }
     }
 
-    pub(crate) fn uninstall(self) {
-        self.uninstall_internal();
-    }
-
-    fn uninstall_internal(self) {
+    pub(crate) fn uninstall(self) -> Result<(), Self> {
         #[cfg(all(not(test), not(feature = "test-instrumentation")))]
         {
             use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
-            unsafe {
-                let _ = UnhookWindowsHookEx(HHOOK(self.handle as *mut _));
-            }
+            let handle = self.handle;
+            return self.uninstall_with(move || unsafe {
+                UnhookWindowsHookEx(HHOOK(handle as *mut _)).map_err(|_| ())
+            });
         }
-        if let Ok(mut state) = hook_state().lock() {
-            *state = None;
+
+        #[cfg(any(test, feature = "test-instrumentation"))]
+        self.uninstall_with(|| Ok(()))
+    }
+
+    fn uninstall_with<U>(self, unhook: U) -> Result<(), Self>
+    where
+        U: FnOnce() -> Result<(), ()>,
+    {
+        if unhook().is_err() {
+            return Err(self);
         }
+
+        *hook_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Ok(())
     }
 }
 
@@ -146,5 +157,17 @@ mod tests {
         assert_eq!(tap_key_from_vk(0xA2), TapKey::Ctrl);
         assert_eq!(tap_key_from_vk(0xA5), TapKey::Alt);
         assert_eq!(tap_key_from_vk(0x41), TapKey::Other);
+    }
+
+    #[test]
+    fn failed_uninstall_keeps_handle_and_callback_state_for_retry() {
+        *hook_state().lock().unwrap() = Some(HookState {});
+        let hook = HotkeyHook {};
+
+        let hook = hook.uninstall_with(|| Err(())).unwrap_err();
+        assert!(hook_state().lock().unwrap().is_some());
+
+        hook.uninstall_with(|| Ok(())).unwrap();
+        assert!(hook_state().lock().unwrap().is_none());
     }
 }

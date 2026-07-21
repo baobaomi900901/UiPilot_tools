@@ -119,7 +119,7 @@ impl Readiness {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RuntimeSettings<T = Shortcut> {
     registered: Vec<T>,
     installed_hook: Option<DoubleTapModifier>,
@@ -141,6 +141,7 @@ impl<T> Default for RuntimeSettings<T> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuntimeSettingsChange<T> {
     persisted: T,
@@ -148,6 +149,7 @@ struct RuntimeSettingsChange<T> {
     autostart: bool,
 }
 
+#[cfg(test)]
 impl<T> RuntimeSettings<T>
 where
     T: Copy + Eq,
@@ -168,60 +170,111 @@ where
         C: FnMut(bool) -> Result<(), ()>,
         P: FnOnce() -> Result<(), ()>,
     {
-        let mut index = 0;
-        while index < self.registered.len() {
-            let shortcut = self.registered[index];
-            if shortcut == change.persisted {
-                index += 1;
-            } else {
-                unregister(shortcut)?;
-                self.registered.remove(index);
+        let before = self.registered.clone();
+        let mut previous_autostart = None;
+        let mut changed_autostart = false;
+        let result = (|| {
+            while self.registered.len() >= 2 && !self.registered.contains(&change.requested) {
+                let stale = self
+                    .registered
+                    .iter()
+                    .copied()
+                    .find(|registered| *registered != change.persisted)
+                    .ok_or(())?;
+                unregister(stale)?;
+                self.registered.retain(|registered| *registered != stale);
             }
-        }
 
-        let owned_new = if self.registered.contains(&change.requested) {
-            false
-        } else {
-            register(change.requested)?;
-            self.registered.push(change.requested);
-            true
-        };
-
-        let previous_autostart = match read_autostart() {
-            Ok(enabled) => enabled,
-            Err(()) => {
-                self.rollback_registration(change.requested, owned_new, &mut unregister);
-                return Err(());
+            if !self.registered.contains(&change.requested) {
+                register(change.requested)?;
+                self.registered.push(change.requested);
             }
-        };
-        let changed_autostart = previous_autostart != change.autostart;
-        if changed_autostart && change_autostart(change.autostart).is_err() {
-            self.rollback_registration(change.requested, owned_new, &mut unregister);
-            return Err(());
-        }
 
-        if persist().is_err() {
-            if changed_autostart {
-                let _ = change_autostart(previous_autostart);
+            for shortcut in self.registered.clone() {
+                if shortcut != change.requested {
+                    unregister(shortcut)?;
+                    self.registered.retain(|registered| *registered != shortcut);
+                }
             }
-            self.rollback_registration(change.requested, owned_new, &mut unregister);
-            return Err(());
+
+            let actual_autostart = read_autostart()?;
+            previous_autostart = Some(actual_autostart);
+            if actual_autostart != change.autostart {
+                change_autostart(change.autostart)?;
+                changed_autostart = true;
+            }
+            persist()
+        })();
+
+        if result.is_ok() {
+            return Ok(());
         }
 
-        if change.requested != change.persisted && self.registered.contains(&change.persisted) {
-            unregister(change.persisted)?;
-            self.registered
-                .retain(|shortcut| *shortcut != change.persisted);
+        if changed_autostart {
+            let _ = change_autostart(previous_autostart.expect("changed autostart has old value"));
         }
-        Ok(())
+        let _ = self.restore_registered_snapshot(&before, &mut register, &mut unregister);
+        Err(())
     }
 
-    fn rollback_registration<U>(&mut self, shortcut: T, owned: bool, unregister: &mut U)
+    fn restore_registered_snapshot<R, U>(
+        &mut self,
+        before: &[T],
+        register: &mut R,
+        unregister: &mut U,
+    ) -> Result<(), ()>
     where
+        R: FnMut(T) -> Result<(), ()>,
         U: FnMut(T) -> Result<(), ()>,
     {
-        if owned && unregister(shortcut).is_ok() {
-            self.registered.retain(|registered| *registered != shortcut);
+        let mut failed = false;
+        for shortcut in before {
+            while self.registered.len() >= 2 && !self.registered.contains(shortcut) {
+                let Some(extra) = self
+                    .registered
+                    .iter()
+                    .copied()
+                    .find(|registered| !before.contains(registered))
+                else {
+                    failed = true;
+                    break;
+                };
+                if unregister(extra).is_ok() {
+                    self.registered.retain(|registered| *registered != extra);
+                } else {
+                    failed = true;
+                    break;
+                }
+            }
+            if !self.registered.contains(shortcut) {
+                if register(*shortcut).is_ok() {
+                    self.registered.push(*shortcut);
+                } else {
+                    failed = true;
+                }
+            }
+        }
+
+        let previous_restored = before
+            .iter()
+            .all(|shortcut| self.registered.contains(shortcut));
+        if previous_restored {
+            for shortcut in self.registered.clone() {
+                if !before.contains(&shortcut) {
+                    if unregister(shortcut).is_ok() {
+                        self.registered.retain(|registered| *registered != shortcut);
+                    } else {
+                        failed = true;
+                    }
+                }
+            }
+        }
+
+        if !failed && self.registered.len() == before.len() && previous_restored {
+            self.registered = before.to_vec();
+            Ok(())
+        } else {
+            Err(())
         }
     }
 }
@@ -247,102 +300,166 @@ impl RuntimeSettings {
         let (mut register_shortcut, mut unregister_shortcut) = shortcut_ops;
         let (mut install_hook, mut uninstall_hook) = hook_ops;
         let (read_autostart, mut change_autostart) = autostart_ops;
-        match change.requested {
-            HotkeyKind::DoubleTap(modifier) => {
-                let previous_registered = self.registered.clone();
-                while let Some(&shortcut) = self.registered.first() {
-                    unregister_shortcut(shortcut)?;
-                    self.registered.remove(0);
+        let before = self.clone();
+        let mut previous_autostart = None;
+        let mut changed_autostart = false;
+        let result = (|| {
+            match change.requested {
+                HotkeyKind::DoubleTap(modifier) => {
+                    if self.installed_hook != Some(modifier) {
+                        if self.installed_hook.is_some() {
+                            uninstall_hook()?;
+                            self.installed_hook = None;
+                        }
+                        install_hook(modifier)?;
+                        self.installed_hook = Some(modifier);
+                    }
+                    for shortcut in self.registered.clone() {
+                        unregister_shortcut(shortcut)?;
+                        self.registered.retain(|registered| *registered != shortcut);
+                    }
                 }
-
-                let owned_new_hook = if self.installed_hook == Some(modifier) {
-                    false
-                } else {
+                HotkeyKind::Chord(requested) => {
+                    let persisted = match change.persisted {
+                        HotkeyKind::Chord(shortcut) => shortcut,
+                        HotkeyKind::DoubleTap(_) => requested,
+                    };
+                    while self.registered.len() >= 2 && !self.registered.contains(&requested) {
+                        let stale = self
+                            .registered
+                            .iter()
+                            .copied()
+                            .find(|registered| *registered != persisted)
+                            .ok_or(())?;
+                        unregister_shortcut(stale)?;
+                        self.registered.retain(|registered| *registered != stale);
+                    }
+                    if !self.registered.contains(&requested) {
+                        register_shortcut(requested)?;
+                        self.registered.push(requested);
+                    }
                     if self.installed_hook.is_some() {
                         uninstall_hook()?;
                         self.installed_hook = None;
                     }
-                    if install_hook(modifier).is_err() {
-                        self.rollback_unregistered_shortcuts(
-                            &previous_registered,
-                            &mut register_shortcut,
-                        );
-                        return Err(());
+                    for shortcut in self.registered.clone() {
+                        if shortcut != requested {
+                            unregister_shortcut(shortcut)?;
+                            self.registered.retain(|registered| *registered != shortcut);
+                        }
                     }
-                    self.installed_hook = Some(modifier);
-                    true
-                };
-
-                let previous_autostart = match read_autostart() {
-                    Ok(enabled) => enabled,
-                    Err(()) => {
-                        self.rollback_hook(modifier, owned_new_hook, &mut uninstall_hook);
-                        return Err(());
-                    }
-                };
-                let changed_autostart = previous_autostart != change.autostart;
-                if changed_autostart && change_autostart(change.autostart).is_err() {
-                    self.rollback_hook(modifier, owned_new_hook, &mut uninstall_hook);
-                    return Err(());
                 }
-
-                if persist().is_err() {
-                    if changed_autostart {
-                        let _ = change_autostart(previous_autostart);
-                    }
-                    self.rollback_hook(modifier, owned_new_hook, &mut uninstall_hook);
-                    return Err(());
-                }
-
-                Ok(())
             }
-            HotkeyKind::Chord(requested) => {
-                if self.installed_hook.take().is_some() {
-                    uninstall_hook()?;
-                }
 
-                let persisted = match change.persisted {
-                    HotkeyKind::Chord(shortcut) => shortcut,
-                    HotkeyKind::DoubleTap(_) => requested,
-                };
-
-                self.apply_transaction(
-                    RuntimeSettingsChange {
-                        persisted,
-                        requested,
-                        autostart: change.autostart,
-                    },
-                    register_shortcut,
-                    unregister_shortcut,
-                    read_autostart,
-                    change_autostart,
-                    persist,
-                )
+            let actual_autostart = read_autostart()?;
+            previous_autostart = Some(actual_autostart);
+            if actual_autostart != change.autostart {
+                change_autostart(change.autostart)?;
+                changed_autostart = true;
             }
+            persist()
+        })();
+
+        if result.is_ok() {
+            return Ok(());
         }
+
+        if changed_autostart {
+            let _ = change_autostart(previous_autostart.expect("changed autostart has old value"));
+        }
+        let _ = self.restore_hotkey_snapshot(
+            &before,
+            &mut register_shortcut,
+            &mut unregister_shortcut,
+            &mut install_hook,
+            &mut uninstall_hook,
+        );
+        Err(())
     }
 
-    fn rollback_hook<UH>(
+    fn restore_hotkey_snapshot<R, U, IH, UH>(
         &mut self,
-        modifier: DoubleTapModifier,
-        owned: bool,
+        before: &Self,
+        register_shortcut: &mut R,
+        unregister_shortcut: &mut U,
+        install_hook: &mut IH,
         uninstall_hook: &mut UH,
-    ) where
-        UH: FnMut() -> Result<(), ()>,
-    {
-        if owned && uninstall_hook().is_ok() && self.installed_hook == Some(modifier) {
-            self.installed_hook = None;
-        }
-    }
-
-    fn rollback_unregistered_shortcuts<R>(&mut self, previous: &[Shortcut], register: &mut R)
+    ) -> Result<(), ()>
     where
         R: FnMut(Shortcut) -> Result<(), ()>,
+        U: FnMut(Shortcut) -> Result<(), ()>,
+        IH: FnMut(DoubleTapModifier) -> Result<(), ()>,
+        UH: FnMut() -> Result<(), ()>,
     {
-        for &shortcut in previous {
-            if register(shortcut).is_ok() {
-                self.registered.push(shortcut);
+        let mut failed = false;
+        for shortcut in &before.registered {
+            while self.registered.len() >= 2 && !self.registered.contains(shortcut) {
+                let Some(extra) = self
+                    .registered
+                    .iter()
+                    .copied()
+                    .find(|registered| !before.registered.contains(registered))
+                else {
+                    failed = true;
+                    break;
+                };
+                if unregister_shortcut(extra).is_ok() {
+                    self.registered.retain(|registered| *registered != extra);
+                } else {
+                    failed = true;
+                    break;
+                }
             }
+            if !self.registered.contains(shortcut) {
+                if register_shortcut(*shortcut).is_ok() {
+                    self.registered.push(*shortcut);
+                } else {
+                    failed = true;
+                }
+            }
+        }
+
+        if self.installed_hook != before.installed_hook {
+            if self.installed_hook.is_some() {
+                if uninstall_hook().is_ok() {
+                    self.installed_hook = None;
+                } else {
+                    failed = true;
+                }
+            }
+            if self.installed_hook.is_none() {
+                if let Some(modifier) = before.installed_hook {
+                    if install_hook(modifier).is_ok() {
+                        self.installed_hook = Some(modifier);
+                    } else {
+                        failed = true;
+                    }
+                }
+            }
+        }
+
+        let previous_restored = before
+            .registered
+            .iter()
+            .all(|shortcut| self.registered.contains(shortcut))
+            && self.installed_hook == before.installed_hook;
+        if previous_restored {
+            for shortcut in self.registered.clone() {
+                if !before.registered.contains(&shortcut) {
+                    if unregister_shortcut(shortcut).is_ok() {
+                        self.registered.retain(|registered| *registered != shortcut);
+                    } else {
+                        failed = true;
+                    }
+                }
+            }
+        }
+
+        if !failed && self.registered.len() == before.registered.len() && previous_restored {
+            self.registered = before.registered.clone();
+            Ok(())
+        } else {
+            Err(())
         }
     }
 }
@@ -584,6 +701,37 @@ struct ShowMainClosures<'a> {
     record_launcher: &'a mut dyn FnMut(CriticalReservation),
 }
 
+type MainThreadOperation = Box<dyn FnOnce() + Send>;
+
+fn dispatch_and_wait<D, O>(dispatch: D, operation: O) -> Result<(), ()>
+where
+    D: FnOnce(MainThreadOperation) -> Result<(), ()>,
+    O: FnOnce() -> Result<(), ()> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    dispatch(Box::new(move || {
+        let _ = sender.send(operation());
+    }))?;
+    receiver.recv().map_err(|_| ())?
+}
+
+fn uninstall_slot_with<T, U>(slot: &Mutex<Option<T>>, uninstall: U) -> Result<(), ()>
+where
+    U: FnOnce(T) -> Result<(), T>,
+{
+    let mut slot = slot.lock().map_err(|_| ())?;
+    let Some(installed) = slot.take() else {
+        return Ok(());
+    };
+    match uninstall(installed) {
+        Ok(()) => Ok(()),
+        Err(installed) => {
+            *slot = Some(installed);
+            Err(())
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CriticalReservation {
     coordinator: Arc<LifecycleCoordinator>,
@@ -625,7 +773,10 @@ impl LifecycleCoordinator {
         let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
         let global_shortcut = app.global_shortcut();
         let autostart = app.autolaunch();
-        let coordinator = Arc::clone(self);
+        let install_coordinator = Arc::clone(self);
+        let uninstall_coordinator = Arc::clone(self);
+        let install_app = app.clone();
+        let uninstall_app = app.clone();
         self.apply_hotkey_settings_transaction(
             HotkeyBindingChange {
                 persisted: persisted_kind,
@@ -637,8 +788,10 @@ impl LifecycleCoordinator {
                 |shortcut| global_shortcut.unregister(shortcut).map_err(|_| ()),
             ),
             (
-                move |modifier| self.install_production_hook(app, &coordinator, modifier),
-                || self.uninstall_production_hook(),
+                move |modifier| {
+                    install_coordinator.install_production_hook_on_main(&install_app, modifier)
+                },
+                move || uninstall_coordinator.uninstall_production_hook_on_main(&uninstall_app),
             ),
             (
                 || autostart.is_enabled().map_err(|_| ()),
@@ -652,6 +805,29 @@ impl LifecycleCoordinator {
                 },
             ),
             || settings.update_user_settings(update, cache).map_err(|_| ()),
+        )
+    }
+
+    fn install_production_hook_on_main(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        modifier: DoubleTapModifier,
+    ) -> Result<(), ()> {
+        let dispatcher = app.clone();
+        let app = app.clone();
+        let coordinator = Arc::clone(self);
+        dispatch_and_wait(
+            move |operation| dispatcher.run_on_main_thread(operation).map_err(|_| ()),
+            move || coordinator.install_production_hook(&app, &coordinator, modifier),
+        )
+    }
+
+    fn uninstall_production_hook_on_main(self: &Arc<Self>, app: &AppHandle) -> Result<(), ()> {
+        let dispatcher = app.clone();
+        let coordinator = Arc::clone(self);
+        dispatch_and_wait(
+            move |operation| dispatcher.run_on_main_thread(operation).map_err(|_| ()),
+            move || coordinator.uninstall_production_hook(),
         )
     }
 
@@ -673,19 +849,11 @@ impl LifecycleCoordinator {
     }
 
     fn uninstall_production_hook(&self) -> Result<(), ()> {
-        if let Ok(mut hook) = self.hotkey_hook.lock() {
-            if let Some(installed) = hook.take() {
-                installed.uninstall();
-            }
-        }
-        Ok(())
+        uninstall_slot_with(&self.hotkey_hook, HotkeyHook::uninstall)
     }
 
-    pub(crate) fn uninstall_hook_if_any(&self) {
+    pub(crate) fn uninstall_hook_for_exit(&self) {
         let _ = self.uninstall_production_hook();
-        if let Ok(mut runtime) = self.runtime_settings.lock() {
-            runtime.installed_hook = None;
-        }
     }
 
     fn apply_hotkey_settings_transaction<R, U, IH, UH, A, C, P>(
@@ -726,16 +894,7 @@ impl LifecycleCoordinator {
             (
                 HotkeyKind::parse,
                 |shortcut| global_shortcut.register(shortcut).map_err(|_| ()),
-                move |modifier| {
-                    let app_for_callback = app.clone();
-                    let coordinator = Arc::clone(&coordinator);
-                    let on_match = Arc::new(move || {
-                        let _ = coordinator.request_show(&app_for_callback, ShowTarget::Launcher);
-                    });
-                    let hook = HotkeyHook::install(app, modifier, on_match)?;
-                    *self.hotkey_hook.lock().map_err(|_| ())? = Some(hook);
-                    Ok(())
-                },
+                move |modifier| self.install_production_hook(app, &coordinator, modifier),
             ),
             (
                 || autostart.is_enabled().map_err(|_| ()),
@@ -1124,16 +1283,25 @@ impl LifecycleCoordinator {
         Self::start_waiting(&mut gate, CleanOwner::Tray, deadline)
     }
 
-    fn begin_system_end(&self, deadline: Instant) -> CleanDecision {
+    fn begin_system_end_nonblocking(&self, now: Instant) -> CleanDecision {
         let mut gate = self.exit_gate.lock().expect("exit gate lock poisoned");
         gate.state = ExitState::SystemEnding;
 
         match gate.clean_attempt {
-            CleanAttempt::Idle => Self::start_waiting(&mut gate, CleanOwner::System, deadline),
-            CleanAttempt::Waiting { deadline, .. } | CleanAttempt::Calling { deadline, .. } => {
-                CleanDecision::Wait { deadline }
+            CleanAttempt::Idle | CleanAttempt::Waiting { .. } if gate.in_flight_critical == 0 => {
+                gate.clean_attempt = CleanAttempt::Calling {
+                    owner: CleanOwner::System,
+                    deadline: now,
+                };
+                CleanDecision::CallMarker
             }
-            CleanAttempt::Finished(_) => CleanDecision::ObserveOnly,
+            CleanAttempt::Idle | CleanAttempt::Waiting { .. } => {
+                gate.clean_attempt = CleanAttempt::Finished(CleanResult::TimedOut);
+                drop(gate);
+                self.critical_changed.notify_all();
+                CleanDecision::ObserveOnly
+            }
+            CleanAttempt::Calling { .. } | CleanAttempt::Finished(_) => CleanDecision::ObserveOnly,
         }
     }
 
@@ -1246,13 +1414,14 @@ impl LifecycleCoordinator {
         decision
     }
 
-    fn run_system_end_with<W, M>(&self, deadline: Instant, wait: W, marker: M) -> CleanDecision
+    fn run_system_end_nonblocking_with<M>(&self, now: Instant, marker: M) -> CleanDecision
     where
-        W: FnMut(Instant) -> Instant,
         M: FnOnce() -> CleanResult,
     {
-        let decision = self.begin_system_end(deadline);
-        self.run_clean_attempt_with(decision, wait, marker)
+        match self.begin_system_end_nonblocking(now) {
+            CleanDecision::CallMarker => self.complete_clean(marker()),
+            decision => decision,
+        }
     }
 
     fn wait_for_clean_change(&self, deadline: Instant) -> Instant {
@@ -1288,15 +1457,13 @@ impl LifecycleCoordinator {
             let marker_app = app.clone();
             let exit_dispatcher = app.clone();
             let exit_app = app.clone();
+            let exit_coordinator = Arc::clone(&coordinator);
             let show_app = app.clone();
             let show_coordinator = Arc::clone(&coordinator);
             coordinator.run_tray_quit_with(
                 decision,
                 |deadline| coordinator.wait_for_clean_change(deadline),
                 || {
-                    marker_app
-                        .state::<Arc<LifecycleCoordinator>>()
-                        .uninstall_hook_if_any();
                     if marker_app
                         .state::<ValidationStore>()
                         .mark_clean_exit()
@@ -1308,6 +1475,7 @@ impl LifecycleCoordinator {
                     }
                 },
                 move || {
+                    exit_coordinator.uninstall_hook_for_exit();
                     let app = exit_app.clone();
                     let _ = exit_dispatcher.run_on_main_thread(move || app.exit(0));
                 },
@@ -1320,24 +1488,17 @@ impl LifecycleCoordinator {
 
     fn run_system_end(&self, app: &AppHandle) {
         let marker_app = app.clone();
-        self.run_system_end_with(
-            Instant::now() + Duration::from_secs(1),
-            |deadline| self.wait_for_clean_change(deadline),
-            || {
-                marker_app
-                    .state::<Arc<LifecycleCoordinator>>()
-                    .uninstall_hook_if_any();
-                if marker_app
-                    .state::<ValidationStore>()
-                    .mark_clean_exit()
-                    .is_ok()
-                {
-                    CleanResult::Succeeded
-                } else {
-                    CleanResult::Failed
-                }
-            },
-        );
+        self.run_system_end_nonblocking_with(Instant::now(), || {
+            if marker_app
+                .state::<ValidationStore>()
+                .mark_clean_exit()
+                .is_ok()
+            {
+                CleanResult::Succeeded
+            } else {
+                CleanResult::Failed
+            }
+        });
     }
 
     pub(crate) fn should_prevent_exit(&self) -> bool {
@@ -1445,8 +1606,6 @@ unsafe extern "system" fn session_subclass_proc(
         || unsafe { DefSubclassProc(hwnd, message, wparam, lparam).0 },
         || {
             app.state::<Arc<LifecycleCoordinator>>()
-                .uninstall_hook_if_any();
-            app.state::<Arc<LifecycleCoordinator>>()
                 .run_system_end(&app);
         },
         || {
@@ -1521,6 +1680,221 @@ mod tests {
             ReadyOrder::FrontendFirst => [state.mark_frontend_ready(), state.mark_setup_ready()],
         };
         results.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn dispatch_and_wait_returns_operation_result_from_dispatch_thread() {
+        let caller = thread::current().id();
+        let observed = Arc::new(Mutex::new(None));
+        let observed_for_operation = Arc::clone(&observed);
+
+        assert_eq!(
+            dispatch_and_wait(
+                |operation| {
+                    thread::spawn(operation).join().map_err(|_| ())?;
+                    Ok(())
+                },
+                move || {
+                    *observed_for_operation.lock().unwrap() = Some(thread::current().id());
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_ne!(*observed.lock().unwrap(), Some(caller));
+    }
+
+    #[test]
+    fn dispatch_and_wait_propagates_operation_failure() {
+        assert_eq!(
+            dispatch_and_wait(
+                |operation| {
+                    operation();
+                    Ok(())
+                },
+                || Err(()),
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn dispatch_and_wait_stops_on_dispatch_rejection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_operation = Arc::clone(&calls);
+
+        assert_eq!(
+            dispatch_and_wait(
+                |_| Err(()),
+                move || {
+                    calls_for_operation.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+            Err(())
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dispatch_and_wait_maps_dropped_operation_to_error() {
+        assert_eq!(
+            dispatch_and_wait(
+                |operation| {
+                    drop(operation);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn uninstall_slot_reinserts_failed_handle_and_retries() {
+        let slot = Mutex::new(Some("handle"));
+
+        assert_eq!(uninstall_slot_with(&slot, |handle| Err(handle)), Err(()));
+        assert_eq!(*slot.lock().unwrap(), Some("handle"));
+
+        assert_eq!(uninstall_slot_with(&slot, |_| Ok(())), Ok(()));
+        assert_eq!(*slot.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn system_end_returns_while_save_waits_for_main_thread() {
+        let coordinator = coordinator_for_test();
+        let worker_coordinator = Arc::clone(&coordinator);
+        let (operation_sender, operation_receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _reservation = worker_coordinator.reserve_critical().unwrap();
+            let _runtime = worker_coordinator.runtime_settings.lock().unwrap();
+            dispatch_and_wait(
+                move |operation| operation_sender.send(operation).map_err(|_| ()),
+                || Ok(()),
+            )
+        });
+        let operation = operation_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("save worker must reach the main-thread wait");
+
+        let system_coordinator = Arc::clone(&coordinator);
+        let marker_calls = Arc::new(AtomicUsize::new(0));
+        let system_marker_calls = Arc::clone(&marker_calls);
+        let (decision_sender, decision_receiver) = std::sync::mpsc::sync_channel(1);
+        let system = thread::spawn(move || {
+            let decision =
+                system_coordinator.run_system_end_nonblocking_with(Instant::now(), || {
+                    system_marker_calls.fetch_add(1, Ordering::Relaxed);
+                    CleanResult::Succeeded
+                });
+            decision_sender.send(decision).unwrap();
+        });
+
+        let decision_before_operation = decision_receiver.recv_timeout(Duration::from_secs(1));
+        operation();
+        assert_eq!(worker.join().unwrap(), Ok(()));
+        let decision = decision_before_operation
+            .or_else(|_| decision_receiver.recv_timeout(Duration::from_secs(1)));
+        system.join().unwrap();
+
+        assert_eq!(
+            decision.expect("system end must return before the main-thread operation runs"),
+            CleanDecision::ObserveOnly
+        );
+        assert_eq!(marker_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            exit_snapshot(&coordinator),
+            (
+                ExitState::SystemEnding,
+                0,
+                CleanAttempt::Finished(CleanResult::TimedOut)
+            )
+        );
+    }
+
+    #[test]
+    fn exit_uninstall_does_not_wait_for_runtime_settings_lock() {
+        let coordinator = coordinator_for_test();
+        let holder_coordinator = Arc::clone(&coordinator);
+        let (held_sender, held_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let holder = thread::spawn(move || {
+            let _runtime = holder_coordinator.runtime_settings.lock().unwrap();
+            held_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        held_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime settings lock must be held");
+
+        let exit_coordinator = Arc::clone(&coordinator);
+        let (done_sender, done_receiver) = std::sync::mpsc::sync_channel(1);
+        let uninstaller = thread::spawn(move || {
+            exit_coordinator.uninstall_hook_for_exit();
+            done_sender.send(()).unwrap();
+        });
+
+        let completed_while_locked = done_receiver.recv_timeout(Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+        holder.join().unwrap();
+        uninstaller.join().unwrap();
+        assert!(
+            completed_while_locked.is_ok(),
+            "exit uninstall must not acquire runtime_settings"
+        );
+    }
+
+    #[test]
+    fn production_wiring_uses_main_wrappers_only_for_dynamic_save() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let save = production
+            .split("pub(crate) fn save_settings_transaction")
+            .nth(1)
+            .and_then(|tail| tail.split("fn install_production_hook(").next())
+            .expect("save transaction source markers are missing");
+        assert!(save.contains("install_production_hook_on_main"));
+        assert!(save.contains("uninstall_production_hook_on_main"));
+
+        let reconcile = production
+            .split("pub(crate) fn reconcile_runtime_settings(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn reconcile_runtime_settings_with")
+                    .next()
+            })
+            .expect("reconcile source markers are missing");
+        assert!(reconcile.contains("install_production_hook("));
+        assert!(!reconcile.contains("install_production_hook_on_main"));
+
+        let tray = production
+            .split("pub(crate) fn request_tray_quit")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_system_end(").next())
+            .expect("tray quit source markers are missing");
+        let marker = tray.find("mark_clean_exit").unwrap();
+        let uninstall = tray.find("uninstall_hook_for_exit").unwrap();
+        assert!(marker < uninstall);
+        assert_eq!(tray.matches("uninstall_hook_for_exit").count(), 1);
+
+        let system_end = production
+            .split("fn run_system_end(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn should_prevent_exit").next())
+            .expect("system end source markers are missing");
+        assert!(system_end.contains("run_system_end_nonblocking_with"));
+        assert!(!system_end.contains("wait_for_clean_change"));
+        assert!(!system_end.contains("uninstall_hook_for_exit"));
+
+        let session_callback = production
+            .split("unsafe extern \"system\" fn session_subclass_proc")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn install_session_end_hook").next())
+            .expect("session callback source markers are missing");
+        assert!(session_callback.contains("run_system_end(&app)"));
+        assert!(!session_callback.contains("uninstall_hook_for_exit"));
+        assert!(!session_callback.contains("wait_for_clean_change"));
     }
 
     #[test]
@@ -2265,47 +2639,31 @@ mod tests {
     }
 
     #[test]
-    fn clean_attempt_system_shares_waiting_and_calling_tray_attempt() {
+    fn system_end_times_out_waiting_tray_without_waiting() {
         let coordinator = coordinator_for_test();
         let reservation = coordinator.reserve_critical().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let later_deadline = deadline + Duration::from_secs(5);
-        let mut trace = AttemptTrace::default();
-
-        let (tray_trace, tray) =
-            trace.begin(&coordinator, || coordinator.begin_tray_clean(deadline));
-        assert_eq!(tray, CleanDecision::Wait { deadline });
-        let system = coordinator.begin_system_end(later_deadline);
-        assert_eq!(system, CleanDecision::Wait { deadline });
-        assert_eq!(trace.observe(), tray_trace);
-        assert_eq!(exit_snapshot(&coordinator).0, ExitState::SystemEnding);
-
+        assert_eq!(
+            coordinator.begin_tray_clean(deadline),
+            CleanDecision::Wait { deadline }
+        );
+        assert_eq!(
+            coordinator.begin_system_end_nonblocking(Instant::now()),
+            CleanDecision::ObserveOnly
+        );
+        assert_eq!(
+            exit_snapshot(&coordinator),
+            (
+                ExitState::SystemEnding,
+                1,
+                CleanAttempt::Finished(CleanResult::TimedOut)
+            )
+        );
         drop(reservation);
         assert_eq!(
             coordinator.advance_clean(Instant::now()),
-            CleanDecision::CallMarker
+            CleanDecision::ObserveOnly
         );
-        assert!(matches!(
-            exit_snapshot(&coordinator).2,
-            CleanAttempt::Calling {
-                owner: CleanOwner::Tray,
-                deadline: stored
-            } if stored == deadline
-        ));
-        assert_eq!(
-            coordinator.begin_system_end(later_deadline),
-            CleanDecision::Wait { deadline }
-        );
-        assert_eq!(trace.observe(), tray_trace);
-
-        let marker_calls = Cell::new(0);
-        let completion = complete_requested_clean(&coordinator, CleanDecision::CallMarker, || {
-            marker_calls.set(marker_calls.get() + 1);
-            CleanResult::Succeeded
-        });
-        assert_eq!(completion, CleanDecision::ObserveOnly);
-        assert_eq!(marker_calls.get(), 1);
-        assert_eq!(exit_snapshot(&coordinator).0, ExitState::SystemEnding);
     }
 
     #[test]
@@ -2318,8 +2676,8 @@ mod tests {
                 CleanDecision::CallMarker
             );
             assert_eq!(
-                coordinator.begin_system_end(deadline + Duration::from_secs(1)),
-                CleanDecision::Wait { deadline }
+                coordinator.begin_system_end_nonblocking(Instant::now()),
+                CleanDecision::ObserveOnly
             );
             assert_eq!(
                 coordinator.complete_clean(result),
@@ -2349,7 +2707,7 @@ mod tests {
             CleanDecision::Exit
         );
         assert_eq!(
-            succeeded.begin_system_end(success_deadline + Duration::from_secs(1)),
+            succeeded.begin_system_end_nonblocking(Instant::now()),
             CleanDecision::ObserveOnly
         );
         assert_eq!(success_trace.observe(), tray_trace);
@@ -2369,7 +2727,7 @@ mod tests {
         );
         failed_trace.clear_if_idle(&failed);
         let (system_trace, system) = failed_trace.begin(&failed, || {
-            failed.begin_system_end(deadline + Duration::from_secs(1))
+            failed.begin_system_end_nonblocking(Instant::now())
         });
         assert_ne!(tray_trace, system_trace);
         assert_eq!(
@@ -2401,7 +2759,7 @@ mod tests {
         timeout_trace.clear_if_idle(&timed_out);
         drop(reservation);
         let (system_trace, system) = timeout_trace.begin(&timed_out, || {
-            timed_out.begin_system_end(timeout_deadline + Duration::from_secs(1))
+            timed_out.begin_system_end_nonblocking(Instant::now())
         });
         assert_ne!(tray_trace, system_trace);
         assert_eq!(
@@ -2467,13 +2825,7 @@ mod tests {
             }
         );
         assert_eq!(
-            shared.begin_system_end(shared_deadline + Duration::from_secs(1)),
-            CleanDecision::Wait {
-                deadline: shared_deadline
-            }
-        );
-        assert_eq!(
-            shared.advance_clean(shared_deadline),
+            shared.begin_system_end_nonblocking(Instant::now()),
             CleanDecision::ObserveOnly
         );
         assert_eq!(
@@ -2496,10 +2848,8 @@ mod tests {
             }
         );
         assert_eq!(
-            released_shared.begin_system_end(released_shared_deadline + Duration::from_secs(1)),
-            CleanDecision::Wait {
-                deadline: released_shared_deadline
-            }
+            released_shared.begin_system_end_nonblocking(Instant::now()),
+            CleanDecision::ObserveOnly
         );
         drop(released_shared_reservation);
         let released_shared_decision = released_shared.advance_clean(released_shared_deadline);
@@ -2521,13 +2871,7 @@ mod tests {
         let system_reservation = system.reserve_critical().unwrap();
         let system_deadline = Instant::now() + Duration::from_secs(1);
         assert_eq!(
-            system.begin_system_end(system_deadline),
-            CleanDecision::Wait {
-                deadline: system_deadline
-            }
-        );
-        assert_eq!(
-            system.advance_clean(system_deadline),
+            system.begin_system_end_nonblocking(system_deadline),
             CleanDecision::ObserveOnly
         );
         assert_eq!(
@@ -2655,8 +2999,14 @@ mod tests {
             ),
             Err(())
         );
-        assert_eq!(state.registered, ["A", "B"]);
-        assert_eq!(first.persist_calls.get(), 1);
+        assert_eq!(state.registered, ["A"]);
+        assert_eq!(first.persist_calls.get(), 0);
+        assert_eq!(
+            *first.trace.borrow(),
+            ["register-B", "unregister-A", "unregister-B"]
+        );
+
+        state.registered = vec!["A", "B"];
 
         let second = RuntimeProbe {
             autostart: Cell::new(Ok(false)),
@@ -2713,9 +3063,9 @@ mod tests {
             [
                 "unregister-A",
                 "register-C",
+                "unregister-B",
                 "read-autostart",
                 "persist",
-                "unregister-B",
             ]
         );
 
@@ -2820,10 +3170,10 @@ mod tests {
             *changed_probe.trace.borrow(),
             [
                 "register-B",
+                "unregister-A",
                 "read-autostart",
                 "autostart-true",
                 "persist",
-                "unregister-A",
             ]
         );
     }
@@ -2857,10 +3207,12 @@ mod tests {
             *probe.trace.borrow(),
             [
                 "register-B",
+                "unregister-A",
                 "read-autostart",
                 "autostart-true",
                 "persist",
                 "autostart-false",
+                "register-A",
                 "unregister-B",
             ]
         );
@@ -3166,11 +3518,7 @@ mod tests {
                 CleanDecision::Wait { deadline }
             );
             assert_eq!(
-                coordinator.begin_system_end(deadline + Duration::from_secs(1)),
-                CleanDecision::Wait { deadline }
-            );
-            assert_eq!(
-                coordinator.advance_clean(deadline),
+                coordinator.begin_system_end_nonblocking(Instant::now()),
                 CleanDecision::ObserveOnly
             );
             assert!(matches!(
@@ -3437,7 +3785,10 @@ mod tests {
                     marker_calls.set(marker_calls.get() + 1);
                     CleanResult::Succeeded
                 },
-                || exit_calls.set(exit_calls.get() + 1),
+                || {
+                    assert_eq!(exit_snapshot(&coordinator).0, ExitState::Clean);
+                    exit_calls.set(exit_calls.get() + 1);
+                },
                 |_| show_calls.set(show_calls.get() + 1),
             ),
             CleanDecision::Exit
@@ -3499,8 +3850,8 @@ mod tests {
         let tray = shared.begin_tray_clean(deadline);
         assert_eq!(tray, CleanDecision::CallMarker);
         assert_eq!(
-            shared.begin_system_end(deadline),
-            CleanDecision::Wait { deadline }
+            shared.begin_system_end_nonblocking(Instant::now()),
+            CleanDecision::ObserveOnly
         );
         let marker_calls = Cell::new(0);
         assert_eq!(
@@ -3571,14 +3922,10 @@ mod tests {
                 },
                 || {
                     assert_eq!(
-                        coordinator.run_system_end_with(
-                            deadline,
-                            |_| panic!("fresh system cleanup must call marker immediately"),
-                            || {
-                                marker_calls.set(marker_calls.get() + 1);
-                                CleanResult::Succeeded
-                            },
-                        ),
+                        coordinator.run_system_end_nonblocking_with(deadline, || {
+                            marker_calls.set(marker_calls.get() + 1);
+                            CleanResult::Succeeded
+                        }),
                         CleanDecision::ObserveOnly
                     );
                 },
@@ -3598,14 +3945,10 @@ mod tests {
         ));
 
         assert_eq!(
-            coordinator.run_system_end_with(
-                deadline,
-                |_| panic!("finished success must not wait"),
-                || {
-                    marker_calls.set(marker_calls.get() + 1);
-                    CleanResult::Succeeded
-                },
-            ),
+            coordinator.run_system_end_nonblocking_with(deadline, || {
+                marker_calls.set(marker_calls.get() + 1);
+                CleanResult::Succeeded
+            }),
             CleanDecision::ObserveOnly
         );
         assert_eq!(marker_calls.get(), 1);
@@ -3637,14 +3980,10 @@ mod tests {
             drop(reservation);
             let system_marker_calls = Cell::new(0);
             assert_eq!(
-                coordinator.run_system_end_with(
-                    deadline,
-                    |_| panic!("fresh system attempt must call marker immediately"),
-                    || {
-                        system_marker_calls.set(system_marker_calls.get() + 1);
-                        CleanResult::Succeeded
-                    },
-                ),
+                coordinator.run_system_end_nonblocking_with(deadline, || {
+                    system_marker_calls.set(system_marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                }),
                 CleanDecision::ObserveOnly
             );
             assert_eq!(system_marker_calls.get(), 1);
@@ -3777,6 +4116,9 @@ mod tests {
         autostart: Cell<Result<bool, ()>>,
         persist_failure: Cell<bool>,
         install_failure: Cell<bool>,
+        failures: Vec<(String, usize)>,
+        actual_registered: RefCell<Vec<Shortcut>>,
+        actual_hook: Cell<Option<DoubleTapModifier>>,
     }
 
     impl Default for HotkeyBindingProbe {
@@ -3786,52 +4128,87 @@ mod tests {
                 autostart: Cell::new(Ok(false)),
                 persist_failure: Cell::new(false),
                 install_failure: Cell::new(false),
+                failures: Vec::new(),
+                actual_registered: RefCell::new(Vec::new()),
+                actual_hook: Cell::new(None),
             }
         }
     }
 
     impl HotkeyBindingProbe {
+        fn from_runtime(runtime: &RuntimeSettings, failures: Vec<(String, usize)>) -> Self {
+            Self {
+                failures,
+                actual_registered: RefCell::new(runtime.registered.clone()),
+                actual_hook: Cell::new(runtime.installed_hook),
+                ..Self::default()
+            }
+        }
+
+        fn record(&self, operation: String) -> Result<(), ()> {
+            let call = self
+                .trace
+                .borrow()
+                .iter()
+                .filter(|recorded| **recorded == operation)
+                .count()
+                + 1;
+            self.trace.borrow_mut().push(operation.clone());
+            (!self.failures.contains(&(operation, call)))
+                .then_some(())
+                .ok_or(())
+        }
+
         fn register(&self, shortcut: Shortcut) -> Result<(), ()> {
-            self.trace.borrow_mut().push(format!("register-{shortcut}"));
-            Ok(())
-        }
-
-        fn unregister(&self, shortcut: Shortcut) -> Result<(), ()> {
-            self.trace
-                .borrow_mut()
-                .push(format!("unregister-{shortcut}"));
-            Ok(())
-        }
-
-        fn install(&self, modifier: DoubleTapModifier) -> Result<(), ()> {
-            self.trace
-                .borrow_mut()
-                .push(format!("install-{modifier:?}"));
-            if self.install_failure.get() {
-                return Err(());
+            self.record(format!("register-{shortcut}"))?;
+            if !self.actual_registered.borrow().contains(&shortcut) {
+                self.actual_registered.borrow_mut().push(shortcut);
             }
             Ok(())
         }
 
+        fn unregister(&self, shortcut: Shortcut) -> Result<(), ()> {
+            self.record(format!("unregister-{shortcut}"))?;
+            self.actual_registered
+                .borrow_mut()
+                .retain(|registered| *registered != shortcut);
+            Ok(())
+        }
+
+        fn install(&self, modifier: DoubleTapModifier) -> Result<(), ()> {
+            self.record(format!("install-{modifier:?}"))?;
+            if self.install_failure.get() {
+                return Err(());
+            }
+            self.actual_hook.set(Some(modifier));
+            Ok(())
+        }
+
         fn uninstall(&self) -> Result<(), ()> {
-            self.trace.borrow_mut().push("uninstall-hook".into());
+            self.record("uninstall-hook".into())?;
+            self.actual_hook.set(None);
             Ok(())
         }
 
         fn read_autostart(&self) -> Result<bool, ()> {
-            self.trace.borrow_mut().push("read-autostart".into());
+            self.record("read-autostart".into())?;
             self.autostart.get()
         }
 
         fn change_autostart(&self, enabled: bool) -> Result<(), ()> {
-            self.trace.borrow_mut().push(format!("autostart-{enabled}"));
+            self.record(format!("autostart-{enabled}"))?;
             self.autostart.set(Ok(enabled));
             Ok(())
         }
 
         fn persist(&self) -> Result<(), ()> {
-            self.trace.borrow_mut().push("persist".into());
+            self.record("persist".into())?;
             (!self.persist_failure.get()).then_some(()).ok_or(())
+        }
+
+        fn assert_actual_matches(&self, runtime: &RuntimeSettings) {
+            assert_eq!(*self.actual_registered.borrow(), runtime.registered);
+            assert_eq!(self.actual_hook.get(), runtime.installed_hook);
         }
     }
 
@@ -3855,8 +4232,13 @@ mod tests {
         )
     }
 
+    fn assert_runtime_matches(actual: &RuntimeSettings, expected: &RuntimeSettings) {
+        assert_eq!(actual.registered, expected.registered);
+        assert_eq!(actual.installed_hook, expected.installed_hook);
+    }
+
     #[test]
-    fn double_tap_install_failure_restores_unregistered_shortcuts() {
+    fn double_tap_install_failure_leaves_existing_shortcut_untouched() {
         let alt_space: Shortcut = "Alt+Space".parse().unwrap();
         let mut runtime = RuntimeSettings {
             registered: vec![alt_space],
@@ -3874,20 +4256,13 @@ mod tests {
             &probe,
         );
         assert!(result.is_err());
-        assert_eq!(
-            *probe.trace.borrow(),
-            [
-                format!("unregister-{alt_space}"),
-                "install-Ctrl".into(),
-                format!("register-{alt_space}"),
-            ]
-        );
+        assert_eq!(*probe.trace.borrow(), ["install-Ctrl"]);
         assert_eq!(runtime.registered, [alt_space]);
         assert_eq!(runtime.installed_hook, None);
     }
 
     #[test]
-    fn switching_chord_to_double_tap_unregisters_shortcut_before_hook_install() {
+    fn switching_chord_to_double_tap_installs_hook_before_unregistering_shortcut() {
         let alt_space: Shortcut = "Alt+Space".parse().unwrap();
         let mut runtime = RuntimeSettings {
             registered: vec![alt_space],
@@ -3907,8 +4282,8 @@ mod tests {
         assert_eq!(
             *probe.trace.borrow(),
             [
-                format!("unregister-{alt_space}"),
                 "install-Ctrl".into(),
+                format!("unregister-{alt_space}"),
                 "read-autostart".into(),
                 "persist".into(),
             ]
@@ -3918,7 +4293,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_double_tap_to_chord_uninstalls_hook_before_register() {
+    fn switching_double_tap_to_chord_registers_shortcut_before_uninstalling_hook() {
         let ctrl_space: Shortcut = "Ctrl+Space".parse().unwrap();
         let mut runtime = RuntimeSettings {
             registered: Vec::new(),
@@ -3938,14 +4313,190 @@ mod tests {
         assert_eq!(
             *probe.trace.borrow(),
             [
-                "uninstall-hook".into(),
                 format!("register-{ctrl_space}"),
+                "uninstall-hook".into(),
                 "read-autostart".into(),
                 "persist".into(),
             ]
         );
         assert_eq!(runtime.registered, [ctrl_space]);
         assert_eq!(runtime.installed_hook, None);
+    }
+
+    #[test]
+    fn hotkey_transaction_chord_to_double_tap_failures_restore_snapshot() {
+        let old: Shortcut = "Alt+Space".parse().unwrap();
+        for failures in [
+            vec![("install-Ctrl".into(), 1)],
+            vec![(format!("unregister-{old}"), 1)],
+            vec![("read-autostart".into(), 1)],
+            vec![("autostart-true".into(), 1)],
+            vec![("persist".into(), 1)],
+        ] {
+            let before = RuntimeSettings {
+                registered: vec![old],
+                installed_hook: None,
+            };
+            let mut runtime = RuntimeSettings {
+                registered: before.registered.clone(),
+                installed_hook: before.installed_hook,
+            };
+            let probe = HotkeyBindingProbe::from_runtime(&before, failures);
+
+            assert_eq!(
+                apply_hotkey_binding_with_probe(
+                    &mut runtime,
+                    HotkeyBindingChange {
+                        persisted: HotkeyKind::Chord(old),
+                        requested: HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl),
+                        autostart: true,
+                    },
+                    &probe,
+                ),
+                Err(())
+            );
+            assert_runtime_matches(&runtime, &before);
+            probe.assert_actual_matches(&before);
+        }
+    }
+
+    #[test]
+    fn hotkey_transaction_double_tap_to_chord_failures_restore_snapshot() {
+        let requested: Shortcut = "Ctrl+Space".parse().unwrap();
+        for failures in [
+            vec![(format!("register-{requested}"), 1)],
+            vec![("uninstall-hook".into(), 1)],
+            vec![("read-autostart".into(), 1)],
+            vec![("autostart-true".into(), 1)],
+            vec![("persist".into(), 1)],
+        ] {
+            let before = RuntimeSettings {
+                registered: Vec::new(),
+                installed_hook: Some(DoubleTapModifier::Alt),
+            };
+            let mut runtime = RuntimeSettings {
+                registered: before.registered.clone(),
+                installed_hook: before.installed_hook,
+            };
+            let probe = HotkeyBindingProbe::from_runtime(&before, failures);
+
+            assert_eq!(
+                apply_hotkey_binding_with_probe(
+                    &mut runtime,
+                    HotkeyBindingChange {
+                        persisted: HotkeyKind::DoubleTap(DoubleTapModifier::Alt),
+                        requested: HotkeyKind::Chord(requested),
+                        autostart: true,
+                    },
+                    &probe,
+                ),
+                Err(())
+            );
+            assert_runtime_matches(&runtime, &before);
+            probe.assert_actual_matches(&before);
+        }
+    }
+
+    #[test]
+    fn hotkey_transaction_modifier_failures_restore_snapshot() {
+        for failures in [
+            vec![("uninstall-hook".into(), 1)],
+            vec![("install-Alt".into(), 1)],
+            vec![("read-autostart".into(), 1)],
+            vec![("autostart-true".into(), 1)],
+            vec![("persist".into(), 1)],
+        ] {
+            let before = RuntimeSettings {
+                registered: Vec::new(),
+                installed_hook: Some(DoubleTapModifier::Ctrl),
+            };
+            let mut runtime = RuntimeSettings {
+                registered: before.registered.clone(),
+                installed_hook: before.installed_hook,
+            };
+            let probe = HotkeyBindingProbe::from_runtime(&before, failures);
+
+            assert_eq!(
+                apply_hotkey_binding_with_probe(
+                    &mut runtime,
+                    HotkeyBindingChange {
+                        persisted: HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl),
+                        requested: HotkeyKind::DoubleTap(DoubleTapModifier::Alt),
+                        autostart: true,
+                    },
+                    &probe,
+                ),
+                Err(())
+            );
+            assert_runtime_matches(&runtime, &before);
+            probe.assert_actual_matches(&before);
+        }
+    }
+
+    #[test]
+    fn hotkey_transaction_rollback_failure_keeps_observed_actual_state() {
+        let before = RuntimeSettings {
+            registered: Vec::new(),
+            installed_hook: Some(DoubleTapModifier::Ctrl),
+        };
+        let mut runtime = RuntimeSettings {
+            registered: before.registered.clone(),
+            installed_hook: before.installed_hook,
+        };
+        let probe = HotkeyBindingProbe::from_runtime(
+            &before,
+            vec![("install-Alt".into(), 1), ("install-Ctrl".into(), 1)],
+        );
+
+        assert_eq!(
+            apply_hotkey_binding_with_probe(
+                &mut runtime,
+                HotkeyBindingChange {
+                    persisted: HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl),
+                    requested: HotkeyKind::DoubleTap(DoubleTapModifier::Alt),
+                    autostart: false,
+                },
+                &probe,
+            ),
+            Err(())
+        );
+        probe.assert_actual_matches(&runtime);
+        assert!(!probe
+            .trace
+            .borrow()
+            .iter()
+            .all(|operation| operation != "install-Ctrl"));
+        assert_ne!(runtime.installed_hook, before.installed_hook);
+    }
+
+    #[test]
+    fn hotkey_transaction_persistence_is_last() {
+        let old: Shortcut = "Alt+Space".parse().unwrap();
+        let requested: Shortcut = "Ctrl+Space".parse().unwrap();
+        let before = RuntimeSettings {
+            registered: vec![old],
+            installed_hook: None,
+        };
+        let mut runtime = RuntimeSettings {
+            registered: before.registered.clone(),
+            installed_hook: before.installed_hook,
+        };
+        let probe = HotkeyBindingProbe::from_runtime(&before, Vec::new());
+
+        apply_hotkey_binding_with_probe(
+            &mut runtime,
+            HotkeyBindingChange {
+                persisted: HotkeyKind::Chord(old),
+                requested: HotkeyKind::Chord(requested),
+                autostart: false,
+            },
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(
+            probe.trace.borrow().last().map(String::as_str),
+            Some("persist")
+        );
     }
 
     #[test]

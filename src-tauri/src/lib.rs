@@ -235,7 +235,7 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
-                run_coordinator.uninstall_hook_if_any();
+                run_coordinator.uninstall_hook_for_exit();
                 run_coordinator.observe_run_exit();
             }
             _ => {}
@@ -433,7 +433,7 @@ mod tests {
             "tauri::WindowEvent::CloseRequested",
             "tauri::RunEvent::ExitRequested",
             "tauri::RunEvent::Exit",
-            "uninstall_hook_if_any",
+            "uninstall_hook_for_exit",
         ] {
             assert!(
                 production.contains(fragment),
