@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 
+// @ts-expect-error Vitest provides the Node standard library without project-wide Node types.
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -30,6 +33,8 @@ import {
 } from './protocol'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import protocolSource from './protocol.ts?raw'
+
+const stylesSource = readFileSync('src/styles.css', 'utf8')
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
 const tauriCapture = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }))
@@ -1109,6 +1114,12 @@ describe('React view and accessibility', () => {
     expect(config.algorithm).toBe(theme.darkAlgorithm)
     expect(config.token?.motion).toBe(false)
     await mounted.unmount()
+  })
+
+  it('passes the viewport height through AntD App to the launcher grid', () => {
+    expect(stylesSource).toMatch(/#app\s*>\s*\.ant-app\s*\{[^}]*height:\s*100%;/s)
+    expect(stylesSource).toMatch(/\.launcher-view\s*\{[^}]*grid-template-rows:\s*44px minmax\(0, 1fr\);/s)
+    expect(stylesSource).toMatch(/\.result-list\s*\{[^}]*overflow-y:\s*auto;/s)
   })
 
   it('renders local combobox/listbox ownership and keeps the active option visible', async () => {

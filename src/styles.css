@@ -18,6 +18,10 @@ body,
   overflow: hidden;
 }
 
+#app > .ant-app {
+  height: 100%;
+}
+
 button,
 input {
   font: inherit;
