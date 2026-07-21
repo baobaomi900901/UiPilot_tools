@@ -1229,13 +1229,14 @@ describe('React view and accessibility', () => {
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
     const firstIcon = 'data:image/png;base64,iVBORw=='
+    const siblingIcon = 'data:image/png;base64,QUJDRA=='
     const secondIcon = 'data:image/png;base64,iVBORw0K'
     vi.mocked(fake.client.searchApps)
       .mockResolvedValueOnce({
         requestId: 'first-icons',
         items: [
           { resultId: 'with-icon', title: 'With icon', icon: firstIcon },
-          { resultId: 'without-icon', title: 'Without icon' },
+          { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon },
         ],
       })
       .mockResolvedValueOnce({
@@ -1255,19 +1256,25 @@ describe('React view and accessibility', () => {
       const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
       const image = rows[0]!.querySelector<HTMLImageElement>('.result-icon-image')
       const fallback = rows[0]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const siblingImage = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const siblingFallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
       expect(image).toBeInstanceOf(HTMLImageElement)
       expect(fallback).toBeInstanceOf(HTMLElement)
+      expect(siblingImage).toBeInstanceOf(HTMLImageElement)
+      expect(siblingFallback).toBeInstanceOf(HTMLElement)
       expect(image!.alt).toBe('')
       expect(image!.getAttribute('aria-hidden')).toBe('true')
       expect(image!.draggable).toBe(false)
       expect(image!.hidden).toBe(false)
       expect(fallback!.hidden).toBe(true)
-      expect(rows[1]!.querySelector('.result-icon-image')).toBeNull()
-      expect(rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')?.hidden).toBe(false)
+      expect(siblingImage!.hidden).toBe(false)
+      expect(siblingFallback!.hidden).toBe(true)
 
       await act(async () => image!.dispatchEvent(new Event('error')))
       expect(image!.hidden).toBe(true)
       expect(fallback!.hidden).toBe(false)
+      expect(siblingImage!.hidden).toBe(false)
+      expect(siblingFallback!.hidden).toBe(true)
 
       await act(async () =>
         core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'new icon', inputType: 'insertText' }),
