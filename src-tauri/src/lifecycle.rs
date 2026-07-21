@@ -1605,7 +1605,7 @@ mod tests {
     fn uninstall_slot_reinserts_failed_handle_and_retries() {
         let slot = Mutex::new(Some("handle"));
 
-        assert_eq!(uninstall_slot_with(&slot, |handle| Err(handle)), Err(()));
+        assert_eq!(uninstall_slot_with(&slot, Err), Err(()));
         assert_eq!(*slot.lock().unwrap(), Some("handle"));
 
         assert_eq!(uninstall_slot_with(&slot, |_| Ok(())), Ok(()));
