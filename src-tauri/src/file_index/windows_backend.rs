@@ -12,9 +12,10 @@ use std::{
 use windows::Win32::{
     Globalization::CompareStringOrdinal,
     Storage::FileSystem::{
-        FILE_ACTION, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_SYSTEM, FILE_FULL_DIR_INFO,
+        FILE_ACTION, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
+        FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+        FILE_FULL_DIR_INFO,
     },
 };
 
@@ -28,10 +29,9 @@ use windows::{
             FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx,
             GetFinalPathNameByHandleW, GetLogicalDriveStringsW, GetTempPathW,
             GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
-            ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
-            FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-            FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+            ReadDirectoryChangesW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+            FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
             FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
             FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE,
             FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING, VOLUME_NAME_GUID,
@@ -47,7 +47,7 @@ use windows::{
     },
 };
 
-use super::{fold_name, IndexEntry, IndexedKind, VolumeIdentity};
+use super::{fold_name, IndexChangeBatch, IndexEntry, IndexedKind, VolumeIdentity};
 
 pub(super) const EVENT_CAPACITY: usize = 65_536;
 pub(super) const SCAN_BATCH_SIZE: usize = 512;
@@ -57,6 +57,7 @@ const ERROR_NO_MORE_FILES_CODE: u32 = 18;
 struct DirectoryStack(Vec<String>);
 
 impl DirectoryStack {
+    #[cfg(test)]
     fn root() -> Self {
         Self(vec![String::new()])
     }
@@ -125,6 +126,21 @@ fn open_pinned(
     relative_path: &str,
     expected_directory: Option<bool>,
 ) -> Result<(OwnedHandle, FILE_ATTRIBUTE_TAG_INFO), BackendError> {
+    open_pinned_with_policy(
+        volume,
+        relative_path,
+        expected_directory,
+        PinnedPathPolicy::Strict,
+    )
+}
+
+#[cfg(not(test))]
+fn open_pinned_with_policy(
+    volume: &FixedVolume,
+    relative_path: &str,
+    expected_directory: Option<bool>,
+    policy: PinnedPathPolicy,
+) -> Result<(OwnedHandle, FILE_ATTRIBUTE_TAG_INFO), BackendError> {
     let path = native_path(volume, relative_path);
     let wide = to_wide(path.to_str().ok_or(BackendError::InvalidData)?)?;
     let desired = if expected_directory == Some(true) {
@@ -161,12 +177,7 @@ fn open_pinned(
         )
     }
     .map_err(|_| BackendError::Platform)?;
-    let is_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-        || expected_directory.is_some_and(|expected| is_directory != expected)
-    {
-        return Err(BackendError::InvalidData);
-    }
+    validate_pinned_shape(tag.FileAttributes, expected_directory, policy)?;
     let mut final_path = vec![0u16; 32_768];
     let written = unsafe { GetFinalPathNameByHandleW(handle.0, &mut final_path, VOLUME_NAME_GUID) };
     let written = usize::try_from(written).map_err(|_| BackendError::Overflow)?;
@@ -688,10 +699,149 @@ fn validate_rename_pairs(events: &[StructuredEvent]) -> Result<(), BackendError>
     Ok(())
 }
 
-#[cfg(not(test))]
-pub(super) struct EventChanges {
-    pub(super) deleted_prefixes: Vec<String>,
-    pub(super) entries: Vec<IndexEntry>,
+struct EventBatchPlan {
+    deleted_prefixes: Vec<String>,
+    refresh_paths: Vec<String>,
+    volume_dirty: bool,
+}
+
+fn parse_event_batch(events: &[StructuredEvent]) -> Result<EventBatchPlan, BackendError> {
+    let mut changes = EventBatchPlan {
+        deleted_prefixes: Vec::new(),
+        refresh_paths: Vec::new(),
+        volume_dirty: false,
+    };
+    let mut renamed_from = None;
+    for event in events {
+        match event.action {
+            FILE_ACTION_RENAMED_OLD_NAME => {
+                if renamed_from.replace(event.relative_path.clone()).is_some() {
+                    changes.volume_dirty = true;
+                }
+            }
+            FILE_ACTION_RENAMED_NEW_NAME => {
+                let Some(old_path) = renamed_from.take() else {
+                    changes.volume_dirty = true;
+                    continue;
+                };
+                changes.deleted_prefixes.push(old_path);
+                changes.refresh_paths.push(event.relative_path.clone());
+            }
+            FILE_ACTION_REMOVED => {
+                if renamed_from.take().is_some() {
+                    changes.volume_dirty = true;
+                }
+                changes.deleted_prefixes.push(event.relative_path.clone());
+            }
+            FILE_ACTION_ADDED | FILE_ACTION_MODIFIED => {
+                if renamed_from.take().is_some() {
+                    changes.volume_dirty = true;
+                }
+                changes.refresh_paths.push(event.relative_path.clone());
+            }
+            _ => return Err(BackendError::InvalidData),
+        }
+    }
+    if renamed_from.is_some() {
+        changes.volume_dirty = true;
+    }
+    Ok(changes)
+}
+
+enum PathUpdate {
+    Delete,
+    File(IndexEntry),
+    Directory(IndexEntry),
+}
+
+#[derive(Clone, Copy)]
+enum PinnedPathPolicy {
+    Strict,
+    EventLeaf,
+}
+
+fn validate_pinned_shape(
+    attributes: u32,
+    expected_directory: Option<bool>,
+    policy: PinnedPathPolicy,
+) -> Result<(), BackendError> {
+    let is_directory = attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        && matches!(policy, PinnedPathPolicy::Strict))
+        || expected_directory.is_some_and(|expected| is_directory != expected)
+    {
+        return Err(BackendError::InvalidData);
+    }
+    Ok(())
+}
+
+fn materialize_event_batches_with<S, I, R, E>(
+    events: &[StructuredEvent],
+    mut stopped: S,
+    mut inspect: I,
+    mut rescan: R,
+    mut emit: E,
+) -> Result<(), BackendError>
+where
+    S: FnMut() -> bool,
+    I: FnMut(&str) -> Result<PathUpdate, BackendError>,
+    R: FnMut(
+        &str,
+        &mut dyn FnMut() -> bool,
+        &mut dyn FnMut(Vec<IndexEntry>) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError>,
+    E: FnMut(IndexChangeBatch) -> Result<(), BackendError>,
+{
+    if stopped() {
+        return Err(BackendError::Stopped);
+    }
+    let plan = parse_event_batch(events)?;
+    if plan.volume_dirty {
+        return Err(BackendError::Platform);
+    }
+    if !plan.deleted_prefixes.is_empty() {
+        if stopped() {
+            return Err(BackendError::Stopped);
+        }
+        emit(IndexChangeBatch {
+            deleted_prefixes: plan.deleted_prefixes,
+            entries: Vec::new(),
+        })?;
+    }
+    for path in plan.refresh_paths {
+        if stopped() {
+            return Err(BackendError::Stopped);
+        }
+        match inspect(&path)? {
+            PathUpdate::Delete => emit(IndexChangeBatch {
+                deleted_prefixes: vec![path],
+                entries: Vec::new(),
+            })?,
+            PathUpdate::File(entry) => emit(IndexChangeBatch {
+                deleted_prefixes: Vec::new(),
+                entries: vec![entry],
+            })?,
+            PathUpdate::Directory(entry) => {
+                emit(IndexChangeBatch {
+                    deleted_prefixes: vec![path.clone()],
+                    entries: vec![entry],
+                })?;
+                rescan(&path, &mut stopped, &mut |entries| {
+                    emit(IndexChangeBatch {
+                        deleted_prefixes: Vec::new(),
+                        entries,
+                    })
+                })?;
+                if stopped() {
+                    return Err(BackendError::Stopped);
+                }
+            }
+        }
+    }
+    if stopped() {
+        return Err(BackendError::Stopped);
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -699,61 +849,44 @@ pub(super) fn materialize_events(
     volume: &FixedVolume,
     events: &[StructuredEvent],
     exclusions: &[ExcludedPrefix],
-) -> Result<EventChanges, BackendError> {
+    stopped: impl FnMut() -> bool,
+    emit: impl FnMut(IndexChangeBatch) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
     reauthenticate_volume(volume)?;
-    let mut deleted_prefixes = Vec::new();
-    let mut entries = Vec::new();
-    for event in events {
-        match event.action {
-            FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME => {
-                deleted_prefixes.push(event.relative_path.clone());
-            }
-            FILE_ACTION_ADDED | FILE_ACTION_MODIFIED | FILE_ACTION_RENAMED_NEW_NAME => {
-                match classify_materialized_path(read_path_entries(
-                    volume,
-                    &event.relative_path,
-                    exclusions,
-                ))? {
-                    None => {
-                        deleted_prefixes.push(event.relative_path.clone());
-                    }
-                    Some(found) => entries.extend(found),
-                }
-            }
-            _ => return Err(BackendError::InvalidData),
-        }
-    }
-    Ok(EventChanges {
-        deleted_prefixes,
-        entries,
-    })
-}
-
-fn classify_materialized_path(
-    result: Result<Vec<IndexEntry>, BackendError>,
-) -> Result<Option<Vec<IndexEntry>>, BackendError> {
-    match result {
-        Ok(found) if found.is_empty() => Ok(None),
-        Ok(found) => Ok(Some(found)),
-        Err(BackendError::Missing) => Ok(None),
-        Err(error) => Err(error),
-    }
+    materialize_event_batches_with(
+        events,
+        stopped,
+        |relative_path| read_path_update(volume, relative_path, exclusions),
+        |relative_path, stopped, emit_entries| {
+            scan_subtree(volume, relative_path, exclusions, stopped, emit_entries)
+        },
+        emit,
+    )?;
+    reauthenticate_volume(volume)
 }
 
 #[cfg(not(test))]
-fn read_path_entries(
+fn read_path_update(
     volume: &FixedVolume,
     relative_path: &str,
     exclusions: &[ExcludedPrefix],
-) -> Result<Vec<IndexEntry>, BackendError> {
-    let (handle, tag) = open_pinned(volume, relative_path, None)?;
+) -> Result<PathUpdate, BackendError> {
+    if is_excluded(&volume.identity, relative_path, 0, exclusions) {
+        return Ok(PathUpdate::Delete);
+    }
+    let (handle, tag) =
+        match open_pinned_with_policy(volume, relative_path, None, PinnedPathPolicy::EventLeaf) {
+            Ok(opened) => opened,
+            Err(BackendError::Missing) => return Ok(PathUpdate::Delete),
+            Err(error) => return Err(error),
+        };
     if is_excluded(
         &volume.identity,
         relative_path,
         tag.FileAttributes,
         exclusions,
     ) {
-        return Ok(Vec::new());
+        return Ok(PathUpdate::Delete);
     }
     let name = Path::new(relative_path)
         .file_name()
@@ -800,12 +933,11 @@ fn read_path_entries(
             .transpose()?,
         modified_utc_ms: windows_time_to_unix_ms(basic.LastWriteTime)?,
     };
-    if !directory {
-        return Ok(vec![entry]);
-    }
-    // Task 5 owns bounded subtree calibration for directory events. Failing here marks the
-    // volume dirty instead of accumulating an unbounded subtree in memory.
-    Err(BackendError::Platform)
+    Ok(if directory {
+        PathUpdate::Directory(entry)
+    } else {
+        PathUpdate::File(entry)
+    })
 }
 
 #[cfg(not(test))]
@@ -1037,8 +1169,9 @@ fn scan_directories<F>(
 where
     F: FnMut(Vec<IndexEntry>) -> Result<(), BackendError>,
 {
-    scan_directories_with(
+    scan_directories_from_with(
         volume,
+        String::new(),
         exclusions,
         || stop.load(Ordering::Acquire),
         batcher,
@@ -1050,8 +1183,72 @@ where
     )
 }
 
+#[cfg(not(test))]
+fn scan_subtree(
+    volume: &FixedVolume,
+    relative_directory: &str,
+    exclusions: &[ExcludedPrefix],
+    stopped: &mut dyn FnMut() -> bool,
+    emit: &mut dyn FnMut(Vec<IndexEntry>) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    let mut batcher = ScanBatcher::new(emit);
+    let mut denied_prefixes = Vec::new();
+    scan_directories_from_with(
+        volume,
+        relative_directory.to_owned(),
+        exclusions,
+        &mut *stopped,
+        &mut batcher,
+        &mut denied_prefixes,
+        |relative_directory, visit| {
+            let (handle, _) = open_pinned(volume, relative_directory, Some(true))?;
+            enumerate_pinned_directory(&handle, visit)
+        },
+    )?;
+    if !denied_prefixes.is_empty() {
+        return Err(BackendError::Denied);
+    }
+    if stopped() {
+        return Err(BackendError::Stopped);
+    }
+    batcher.finish()?;
+    if stopped() {
+        return Err(BackendError::Stopped);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn scan_directories_with<F, S, O>(
     volume: &FixedVolume,
+    exclusions: &[ExcludedPrefix],
+    stopped: S,
+    batcher: &mut ScanBatcher<F>,
+    denied_prefixes: &mut Vec<String>,
+    enumerate: O,
+) -> Result<(), BackendError>
+where
+    F: FnMut(Vec<IndexEntry>) -> Result<(), BackendError>,
+    S: FnMut() -> bool,
+    O: FnMut(
+        &str,
+        &mut dyn FnMut(DirectoryRecord) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError>,
+{
+    scan_directories_from_with(
+        volume,
+        String::new(),
+        exclusions,
+        stopped,
+        batcher,
+        denied_prefixes,
+        enumerate,
+    )
+}
+
+fn scan_directories_from_with<F, S, O>(
+    volume: &FixedVolume,
+    relative_root: String,
     exclusions: &[ExcludedPrefix],
     mut stopped: S,
     batcher: &mut ScanBatcher<F>,
@@ -1066,7 +1263,7 @@ where
         &mut dyn FnMut(DirectoryRecord) -> Result<(), BackendError>,
     ) -> Result<(), BackendError>,
 {
-    let mut pending = DirectoryStack::root();
+    let mut pending = DirectoryStack(vec![relative_root]);
     while let Some(relative_directory) = pending.pop() {
         if stopped() {
             return Err(BackendError::Stopped);
@@ -1678,16 +1875,16 @@ mod tests {
     };
 
     use super::{
-        classify_category, classify_enumeration_error_for_test, classify_materialized_path,
-        classify_open_failure_for_test, collect_fixed_volumes_with, drive_relative_path,
-        excluded_prefix_for_resolved_path_with, filter_replay_events, is_excluded,
-        parse_directory_records, parse_notifications, path_is_same_or_descendant,
-        push_denied_prefix, reauthenticate_volume_with, run_scanner_batches_with, run_scanner_with,
-        scan_directories_with, shutdown_pending_io_with, watcher_cycle_with,
+        classify_category, classify_enumeration_error_for_test, classify_open_failure_for_test,
+        collect_fixed_volumes_with, drive_relative_path, excluded_prefix_for_resolved_path_with,
+        filter_replay_events, is_excluded, materialize_event_batches_with, parse_directory_records,
+        parse_event_batch, parse_notifications, path_is_same_or_descendant, push_denied_prefix,
+        reauthenticate_volume_with, run_scanner_batches_with, run_scanner_with,
+        scan_directories_with, shutdown_pending_io_with, validate_pinned_shape, watcher_cycle_with,
         windows_time_to_unix_ms, BackendError, CancelOutcome, CompletionOutcome, DirectoryRecord,
-        DirectoryStack, EnumerationStep, EventBuffer, ExcludedPrefix, FixedVolume, NativeEntry,
-        OpenFailure, RawVolume, ScanBatcher, StructuredEvent, WatchCompletion, DRIVE_FIXED_VALUE,
-        EVENT_CAPACITY,
+        DirectoryStack, EnumerationStep, EventBuffer, ExcludedPrefix, FixedVolume, IndexEntry,
+        IndexedKind, NativeEntry, OpenFailure, PathUpdate, PinnedPathPolicy, RawVolume,
+        ScanBatcher, StructuredEvent, WatchCompletion, DRIVE_FIXED_VALUE, EVENT_CAPACITY,
     };
 
     fn raw_volume(mount: &str, guid: &str, serial: u32, drive_type: u32) -> RawVolume {
@@ -1698,6 +1895,182 @@ mod tests {
             volume_serial: serial,
             filesystem_name: "ntfs".into(),
         }
+    }
+
+    #[test]
+    fn directory_events_update_or_remove_the_complete_subtree() {
+        let events = [
+            StructuredEvent::new(FILE_ACTION_RENAMED_OLD_NAME, r"old\tree"),
+            StructuredEvent::new(FILE_ACTION_RENAMED_NEW_NAME, r"new\tree"),
+        ];
+
+        let changes = parse_event_batch(&events).unwrap();
+
+        assert_eq!(changes.deleted_prefixes, [r"old\tree"]);
+        assert_eq!(changes.refresh_paths, [r"new\tree"]);
+        assert!(!changes.volume_dirty);
+
+        let entry = |path: String, kind| IndexEntry {
+            display_path: format!(r"C:\{path}"),
+            name: path.clone(),
+            folded_name: path.clone(),
+            relative_path: path,
+            kind,
+            category: "other".into(),
+            size_bytes: Some(1),
+            modified_utc_ms: 1,
+        };
+        let emitted = RefCell::new(Vec::new());
+        materialize_event_batches_with(
+            &events,
+            || false,
+            |path| {
+                Ok(PathUpdate::Directory(entry(
+                    path.into(),
+                    IndexedKind::Directory,
+                )))
+            },
+            |path, _, emit| {
+                let mut batcher = ScanBatcher::new(emit);
+                for index in 0..1025 {
+                    batcher.push(entry(
+                        format!(r"{path}\child-{index}.txt"),
+                        IndexedKind::File,
+                    ))?;
+                }
+                batcher.finish()
+            },
+            |batch| {
+                emitted.borrow_mut().push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let emitted = emitted.into_inner();
+        assert_eq!(emitted[0].deleted_prefixes, [r"old\tree"]);
+        assert_eq!(emitted[1].deleted_prefixes, [r"new\tree"]);
+        assert_eq!(emitted[1].entries.len(), 1);
+        assert!(emitted.iter().all(|batch| batch.entries.len() <= 512));
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|batch| batch.entries.len())
+                .sum::<usize>(),
+            1026
+        );
+
+        let uncertain = [StructuredEvent::new(FILE_ACTION_RENAMED_OLD_NAME, "orphan")];
+        assert!(materialize_event_batches_with(
+            &uncertain,
+            || false,
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+            |_| unreachable!(),
+        )
+        .is_err());
+
+        let added = [StructuredEvent::new(FILE_ACTION_ADDED, "fresh.txt")];
+        let files = RefCell::new(Vec::new());
+        materialize_event_batches_with(
+            &added,
+            || false,
+            |path| Ok(PathUpdate::File(entry(path.into(), IndexedKind::File))),
+            |_, _, _| unreachable!(),
+            |batch| {
+                files.borrow_mut().extend(batch.entries);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(files.borrow().len(), 1);
+        assert!(materialize_event_batches_with(
+            &added,
+            || false,
+            |_| Err(BackendError::Missing),
+            |_, _, _| unreachable!(),
+            |_| unreachable!(),
+        )
+        .is_err());
+        let deleted = RefCell::new(Vec::new());
+        materialize_event_batches_with(
+            &added,
+            || false,
+            |_| Ok(PathUpdate::Delete),
+            |_, _, _| unreachable!(),
+            |batch| {
+                deleted.borrow_mut().extend(batch.deleted_prefixes);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*deleted.borrow(), ["fresh.txt"]);
+
+        let stop = Cell::new(false);
+        let emitted_batches = Cell::new(0);
+        let stopped = materialize_event_batches_with(
+            &events,
+            || stop.get(),
+            |path| {
+                Ok(PathUpdate::Directory(entry(
+                    path.into(),
+                    IndexedKind::Directory,
+                )))
+            },
+            |path, stopped, emit| {
+                let mut batcher = ScanBatcher::new(|batch| {
+                    if stopped() {
+                        return Err(BackendError::Stopped);
+                    }
+                    emit(batch)
+                });
+                for index in 0..1025 {
+                    batcher.push(entry(
+                        format!(r"{path}\child-{index}.txt"),
+                        IndexedKind::File,
+                    ))?;
+                }
+                batcher.finish()
+            },
+            |_| {
+                let count = emitted_batches.get() + 1;
+                emitted_batches.set(count);
+                if count == 3 {
+                    stop.set(true);
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(stopped, Err(BackendError::Stopped)));
+
+        let final_stop = Cell::new(false);
+        let final_emits = Cell::new(0);
+        let stopped_after_partial_flush = materialize_event_batches_with(
+            &events,
+            || final_stop.get(),
+            |path| {
+                Ok(PathUpdate::Directory(entry(
+                    path.into(),
+                    IndexedKind::Directory,
+                )))
+            },
+            |path, _, emit| {
+                let mut batcher = ScanBatcher::new(emit);
+                batcher.push(entry(format!(r"{path}\only-child.txt"), IndexedKind::File))?;
+                batcher.finish()
+            },
+            |_| {
+                let count = final_emits.get() + 1;
+                final_emits.set(count);
+                if count == 2 {
+                    final_stop.set(true);
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            stopped_after_partial_flush,
+            Err(BackendError::Stopped)
+        ));
     }
 
     #[test]
@@ -1741,6 +2114,30 @@ mod tests {
             raw_volume("C:\\", r"\\?\Volume{REUSED}\", 70, DRIVE_FIXED_VALUE),
         )
         .is_err());
+    }
+
+    #[test]
+    fn event_leaf_reparse_is_deleted_while_scanner_policy_rejects_it() {
+        let attributes = FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0;
+        assert!(matches!(
+            validate_pinned_shape(attributes, None, PinnedPathPolicy::Strict),
+            Err(BackendError::InvalidData)
+        ));
+        assert!(validate_pinned_shape(attributes, None, PinnedPathPolicy::EventLeaf).is_ok());
+        let production = include_str!("windows_backend.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert_eq!(production.matches("PinnedPathPolicy::EventLeaf").count(), 1);
+        let read_path_update = production
+            .split("fn read_path_update(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(read_path_update.contains("open_pinned_with_policy"));
+        assert!(read_path_update.contains("PinnedPathPolicy::EventLeaf"));
     }
 
     #[test]
@@ -2134,12 +2531,6 @@ mod tests {
         malformed_record[4..8].copy_from_slice(&FILE_ACTION_ADDED.0.to_le_bytes());
         malformed_record[8..12].copy_from_slice(&8u32.to_le_bytes());
         assert!(parse_notifications(&malformed_record).is_err());
-        assert!(classify_materialized_path(Err(BackendError::Platform)).is_err());
-        assert!(classify_materialized_path(Err(BackendError::Denied)).is_err());
-        assert!(classify_materialized_path(Err(BackendError::Missing))
-            .unwrap()
-            .is_none());
-
         let order = RefCell::new(Vec::new());
         assert!(shutdown_pending_io_with(
             true,

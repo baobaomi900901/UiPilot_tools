@@ -47,13 +47,14 @@ mod tests {
             mpsc, Arc, Barrier, Mutex,
         },
         thread,
+        time::{Duration, Instant},
     };
 
     use super::{
         authenticate_app_data_root, begin_lazy_init_locked, fold_name, open_store,
         validate_index_path_shape, AdmissionError, FileCategory, FileIndex, FileIndexError,
         FileIndexStatus, FileSort, IndexState, LazyInitDecision, LifecycleMode, QuerySpec,
-        StoreError, FOLD_ALGORITHM_ID,
+        StoreError, VolumeRuntime, FOLD_ALGORITHM_ID,
     };
     use icu_casemap::CaseMapper;
     use rusqlite::Connection;
@@ -391,6 +392,38 @@ mod tests {
         let dir = TestDir::new();
         let open_calls = Cell::new(0);
         let query_calls = Cell::new(0);
+        let first_stop = Arc::new(AtomicBool::new(false));
+        let second_stop = Arc::new(AtomicBool::new(false));
+        let first_identity = volume();
+        let mut second_identity = volume();
+        second_identity.volume_serial = 43;
+        {
+            let mut workers = index.workers.lock().unwrap();
+            for (identity, owner, mount, stop) in [
+                (first_identity.clone(), 1, r"C:\", Arc::clone(&first_stop)),
+                (second_identity.clone(), 2, r"D:\", Arc::clone(&second_stop)),
+            ] {
+                workers.by_volume.insert(
+                    identity,
+                    super::WorkerRecord {
+                        owner,
+                        mount_point: PathBuf::from(mount),
+                        stop,
+                        generation: Arc::new(AtomicU64::new(1)),
+                        join: None,
+                        failed: false,
+                    },
+                );
+            }
+        }
+        {
+            let mut coordinator = index.coordinator.state.lock().unwrap();
+            coordinator.pending_root = Some(PathBuf::from(r"C:\app-data"));
+            coordinator.active_root = coordinator.pending_root.clone();
+            coordinator
+                .volumes
+                .insert(first_identity, super::VolumeRuntime::default());
+        }
         assert!(index
             .search_with(
                 dir.path(),
@@ -411,6 +444,15 @@ mod tests {
                 },
             )
             .is_err());
+        assert!(first_stop.load(Ordering::Acquire));
+        assert!(second_stop.load(Ordering::Acquire));
+        assert!(index.coordinator.stop.load(Ordering::Acquire));
+        {
+            let coordinator = index.coordinator.state.lock().unwrap();
+            assert!(coordinator.pending_root.is_none());
+            assert!(coordinator.active_root.is_none());
+            assert!(coordinator.volumes.is_empty());
+        }
         let second = index
             .search_with(
                 dir.path(),
@@ -424,6 +466,7 @@ mod tests {
         assert_eq!(second.status, FileIndexStatus::Unavailable);
         assert_eq!(open_calls.get(), 1);
         assert_eq!(query_calls.get(), 1);
+        assert!(!Arc::new(index).schedule_calibration());
 
         let observer = FileIndex::default();
         {
@@ -617,7 +660,7 @@ mod tests {
 
     #[test]
     fn coordinator_inventory_reconcile_quarantines_before_worker_start() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
         store
@@ -635,12 +678,41 @@ mod tests {
             identity: identity.clone(),
             mount_point: PathBuf::from(r"D:\"),
         };
-        assert_eq!(
-            index
-                .reconcile_calibration_inventory(0, std::slice::from_ref(&remounted))
-                .unwrap(),
-            Some(true)
-        );
+        let before_record = index
+            .state
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .index_revision_for_test();
+        {
+            let mut state = index.state.lock().unwrap();
+            assert!(index
+                .record_inventory_locked(&mut state, std::slice::from_ref(&remounted))
+                .unwrap());
+        }
+        let concurrent = Arc::clone(&index);
+        let concurrent_identity = identity.clone();
+        thread::spawn(move || {
+            let mut state = concurrent.state.lock().unwrap();
+            assert!(!state.authenticated_volumes.contains(&concurrent_identity));
+            let identities = state.authenticated_volumes.clone();
+            let snapshot = state
+                .store
+                .as_mut()
+                .unwrap()
+                .query_for_test(&query(), &identities)
+                .unwrap();
+            assert_eq!(snapshot.index_revision, before_record);
+            assert_eq!(snapshot.total, 0);
+        })
+        .join()
+        .unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            assert!(index.reconcile_inventory_locked(&mut state).unwrap());
+        }
         let state = index.state.lock().unwrap();
         assert!(state.quarantined_volumes.contains(&identity));
         assert!(state.authenticated_volumes.is_empty());
@@ -667,6 +739,273 @@ mod tests {
             None
         );
         assert!(index.state.lock().unwrap().authenticated_mounts.is_empty());
+    }
+
+    #[test]
+    fn repeated_inventory_does_not_authenticate_quarantined_volume() {
+        let index = FileIndex::default();
+        let ready = volume();
+        let mut pending_identity = volume();
+        pending_identity.volume_serial = 43;
+        let ready_volume = super::FixedVolume {
+            identity: ready.clone(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        let pending_volume = super::FixedVolume {
+            identity: pending_identity.clone(),
+            mount_point: PathBuf::from(r"D:\"),
+        };
+        let inventory = vec![ready_volume, pending_volume];
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .seed_committed_for_test(&ready, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_volumes = vec![ready.clone()];
+            state.authenticated_mounts = vec![(ready.clone(), r"C:\".into())];
+            index
+                .record_inventory_locked(&mut state, &inventory)
+                .unwrap();
+            index.reconcile_inventory_locked(&mut state).unwrap();
+            assert_eq!(state.authenticated_volumes, vec![ready.clone()]);
+            assert!(state.quarantined_volumes.contains(&pending_identity));
+        }
+        let before = {
+            let mut state = index.state.lock().unwrap();
+            let identities = state.authenticated_volumes.clone();
+            let result = state
+                .store
+                .as_mut()
+                .unwrap()
+                .query_for_test(&query(), &identities)
+                .unwrap();
+            (result.index_revision, result.status, result.total)
+        };
+
+        {
+            let mut state = index.state.lock().unwrap();
+            index
+                .record_inventory_locked(&mut state, &inventory)
+                .unwrap();
+            index.reconcile_inventory_locked(&mut state).unwrap();
+            assert_eq!(state.authenticated_volumes, vec![ready.clone()]);
+            assert!(state.quarantined_volumes.contains(&pending_identity));
+            let identities = state.authenticated_volumes.clone();
+            let result = state
+                .store
+                .as_mut()
+                .unwrap()
+                .query_for_test(&query(), &identities)
+                .unwrap();
+            assert_eq!((result.index_revision, result.status, result.total), before);
+        }
+    }
+
+    #[test]
+    fn brand_new_candidate_opens_provisionally_but_remount_stays_quarantined() {
+        fn install_worker(index: &FileIndex, volume: &super::FixedVolume) -> u64 {
+            let owner = match index.prepare_worker(volume).unwrap() {
+                super::WorkerPreparation::Start { owner } => owner,
+                super::WorkerPreparation::Existing => panic!("worker must be new"),
+            };
+            index.install_worker(
+                volume,
+                super::WorkerRecord {
+                    owner,
+                    mount_point: volume.mount_point.clone(),
+                    stop: Arc::new(AtomicBool::new(false)),
+                    generation: Arc::new(AtomicU64::new(0)),
+                    join: None,
+                    failed: false,
+                },
+            );
+            owner
+        }
+
+        let index = FileIndex::default();
+        let ready = volume();
+        let mut new_identity = volume();
+        new_identity.volume_serial = 43;
+        let new_volume = super::FixedVolume {
+            identity: new_identity.clone(),
+            mount_point: PathBuf::from(r"D:\"),
+        };
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .seed_committed_for_test(&ready, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_volumes = vec![ready.clone()];
+            state.authenticated_mounts = vec![
+                (ready.clone(), r"C:\".into()),
+                (new_identity.clone(), r"D:\".into()),
+            ];
+            state.quarantined_volumes.insert(new_identity.clone());
+        }
+        let owner = install_worker(&index, &new_volume);
+        let (generation, has_committed) = index.begin_worker_candidate(&new_volume, owner).unwrap();
+        assert!(!has_committed);
+        {
+            let mut state = index.state.lock().unwrap();
+            assert_eq!(state.index_revision_high_water, 1);
+            assert!(state.authenticated_volumes.contains(&new_identity));
+            assert!(!state.quarantined_volumes.contains(&new_identity));
+            let identities = state.authenticated_volumes.clone();
+            let revision = state
+                .store
+                .as_mut()
+                .unwrap()
+                .append_candidate_for_test_with_identities(
+                    &new_identity,
+                    generation,
+                    [candidate_entry("find-new.txt", generation)],
+                    &identities,
+                )
+                .unwrap();
+            state.index_revision_high_water = revision;
+            let visible = state
+                .store
+                .as_mut()
+                .unwrap()
+                .query_for_test(&query(), &identities)
+                .unwrap();
+            assert_eq!(visible.status, FileIndexStatus::Building);
+            assert_eq!(visible.total, 2);
+            assert_eq!(visible.index_revision, 2);
+        }
+        index.mark_fixed_volume_dirty(&new_volume).unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            let identities = state.authenticated_volumes.clone();
+            let visible = state
+                .store
+                .as_mut()
+                .unwrap()
+                .query_for_test(&query(), &identities)
+                .unwrap();
+            assert_eq!(visible.status, FileIndexStatus::Building);
+            assert_eq!(visible.total, 1);
+            assert_eq!(visible.index_revision, 3);
+        }
+
+        let first = FileIndex::default();
+        let first_owner = {
+            let mut state = first.state.lock().unwrap();
+            state.store = Some(Store::open_in_memory_for_test("identity-a").unwrap());
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_mounts = vec![(new_identity.clone(), r"D:\".into())];
+            state.quarantined_volumes.insert(new_identity.clone());
+            drop(state);
+            install_worker(&first, &new_volume)
+        };
+        first
+            .begin_worker_candidate(&new_volume, first_owner)
+            .unwrap();
+        assert_eq!(first.state.lock().unwrap().index_revision_high_water, 0);
+
+        let remount = FileIndex::default();
+        let mut remount_store = Store::open_in_memory_for_test("identity-a").unwrap();
+        remount_store
+            .seed_committed_for_test(&new_identity, [candidate_entry("find-old-mount.txt", 1)])
+            .unwrap();
+        {
+            let mut state = remount.state.lock().unwrap();
+            state.store = Some(remount_store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_mounts = vec![(new_identity.clone(), r"D:\".into())];
+            state.quarantined_volumes.insert(new_identity.clone());
+        }
+        let remount_owner = install_worker(&remount, &new_volume);
+        assert!(
+            remount
+                .begin_worker_candidate(&new_volume, remount_owner)
+                .unwrap()
+                .1
+        );
+        let state = remount.state.lock().unwrap();
+        assert!(!state.authenticated_volumes.contains(&new_identity));
+        assert!(state.quarantined_volumes.contains(&new_identity));
+    }
+
+    #[test]
+    fn successful_remount_commit_restores_visibility_in_same_gate() {
+        let index = FileIndex::default();
+        let identity = volume();
+        let remounted = super::FixedVolume {
+            identity: identity.clone(),
+            mount_point: PathBuf::from(r"D:\"),
+        };
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .seed_committed_for_test(&identity, [candidate_entry("find-old.txt", 1)])
+            .unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_mounts = vec![(identity.clone(), r"D:\".into())];
+            state.quarantined_volumes.insert(identity.clone());
+        }
+        let owner = match index.prepare_worker(&remounted).unwrap() {
+            super::WorkerPreparation::Start { owner } => owner,
+            super::WorkerPreparation::Existing => panic!("worker must start"),
+        };
+        let generation_owner = Arc::new(AtomicU64::new(0));
+        index.install_worker(
+            &remounted,
+            super::WorkerRecord {
+                owner,
+                mount_point: remounted.mount_point.clone(),
+                stop: Arc::new(AtomicBool::new(false)),
+                generation: Arc::clone(&generation_owner),
+                join: None,
+                failed: false,
+            },
+        );
+        let (generation, has_committed) = index.begin_worker_candidate(&remounted, owner).unwrap();
+        assert!(has_committed);
+        generation_owner.store(generation, Ordering::Release);
+        let mut current = candidate_entry("find-current.txt", generation);
+        current.display_path = r"D:\find-current.txt".into();
+
+        index
+            .commit_worker_candidate(
+                &remounted,
+                owner,
+                generation,
+                vec![super::IndexEntry::from(current)],
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let mut state = index.state.lock().unwrap();
+        assert_eq!(state.authenticated_volumes, vec![identity.clone()]);
+        assert!(!state.quarantined_volumes.contains(&identity));
+        assert_eq!(state.index_revision_high_water, 1);
+        let identities = state.authenticated_volumes.clone();
+        let visible = state
+            .store
+            .as_mut()
+            .unwrap()
+            .query_for_test(&query(), &identities)
+            .unwrap();
+        assert_eq!(visible.index_revision, 1);
+        assert_eq!(visible.status, FileIndexStatus::Ready);
+        assert_eq!(visible.total, 1);
+        assert_eq!(visible.entries[0].name, "find-current.txt");
+        assert_eq!(visible.entries[0].display_path, r"D:\find-current.txt");
     }
 
     #[test]
@@ -805,9 +1144,17 @@ mod tests {
             identity: identity.clone(),
             mount_point: PathBuf::from(r"D:\"),
         };
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(Store::open_in_memory_for_test("identity-a").unwrap());
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_mounts = vec![(identity.clone(), r"C:\".into())];
+        }
         let (started, old_owner) = install(&index, &c, &order);
         assert!(started);
         assert_eq!(install(&index, &c, &order), (false, old_owner));
+        index.state.lock().unwrap().authenticated_mounts = vec![(identity.clone(), r"D:\".into())];
         let (started, new_owner) = install(&index, &d, &order);
         assert!(started);
         assert_ne!(old_owner, new_owner);
@@ -819,27 +1166,22 @@ mod tests {
                 format!("start-{new_owner}"),
             ]
         );
-        assert!(!index.worker_is_current(&identity, old_owner, Some(7)));
-        assert!(index.worker_is_current(&identity, new_owner, Some(7)));
+        assert!(!index.worker_is_current(&c, old_owner, Some(7)));
+        assert!(index.worker_is_current(&d, new_owner, Some(7)));
 
-        index
-            .state
-            .lock()
-            .unwrap()
-            .quarantined_volumes
-            .insert(identity.clone());
-        assert!(index
-            .complete_volume_calibration(&identity, old_owner)
-            .is_err());
+        {
+            let mut state = index.state.lock().unwrap();
+            state.authenticated_mounts = vec![(identity.clone(), r"D:\".into())];
+            state.quarantined_volumes.insert(identity.clone());
+        }
+        assert!(index.complete_volume_calibration(&c, old_owner).is_err());
         assert!(index
             .state
             .lock()
             .unwrap()
             .quarantined_volumes
             .contains(&identity));
-        index
-            .complete_volume_calibration(&identity, new_owner)
-            .unwrap();
+        index.complete_volume_calibration(&d, new_owner).unwrap();
         assert!(!index
             .state
             .lock()
@@ -856,12 +1198,17 @@ mod tests {
         let (started, replacement_owner) = install(&index, &d, &order);
         assert!(started);
         assert_ne!(replacement_owner, new_owner);
-        assert!(index.worker_is_current(&identity, replacement_owner, Some(7)));
+        assert!(index.worker_is_current(&d, replacement_owner, Some(7)));
         let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
         store
             .seed_committed_for_test(&identity, [candidate_entry("find-kept.txt", 1)])
             .unwrap();
-        index.state.lock().unwrap().store = Some(store);
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+        }
         index.stop_detached_workers(&[]).unwrap();
         assert!(index.workers.lock().unwrap().by_volume.is_empty());
         assert!(index.begin_worker_candidate(&d, replacement_owner).is_err());
@@ -905,7 +1252,12 @@ mod tests {
                 [candidate_entry("find-uncommitted.txt", generation)],
             )
             .unwrap();
-        index.state.lock().unwrap().store = Some(store);
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+        }
 
         let owner = match index.prepare_worker(&fixed).unwrap() {
             super::WorkerPreparation::Start { owner } => owner,
@@ -946,6 +1298,87 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.name == "find-uncommitted.txt"));
+    }
+
+    #[test]
+    fn stale_remount_worker_failure_cleans_candidate_on_current_mount() {
+        let index = FileIndex::default();
+        let identity = volume();
+        let stale = super::FixedVolume {
+            identity: identity.clone(),
+            mount_point: PathBuf::from(r"D:\"),
+        };
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .seed_committed_for_test(&identity, [candidate_entry("find-stable.txt", 1)])
+            .unwrap();
+        let generation = store.begin_candidate_for_test(&identity, r"D:\").unwrap();
+        store
+            .append_candidate_for_test(
+                &identity,
+                generation,
+                [candidate_entry("find-stale.txt", generation)],
+            )
+            .unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_volumes = vec![identity.clone()];
+            state.authenticated_mounts = vec![(identity.clone(), r"D:\".into())];
+        }
+        let owner = match index.prepare_worker(&stale).unwrap() {
+            super::WorkerPreparation::Start { owner } => owner,
+            super::WorkerPreparation::Existing => panic!("worker must start"),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        index.install_worker(
+            &stale,
+            super::WorkerRecord {
+                owner,
+                mount_point: stale.mount_point.clone(),
+                stop: Arc::clone(&stop),
+                generation: Arc::new(AtomicU64::new(generation)),
+                join: None,
+                failed: false,
+            },
+        );
+        let current = super::FixedVolume {
+            identity: identity.clone(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        let before = {
+            let mut state = index.state.lock().unwrap();
+            index
+                .record_inventory_locked(&mut state, std::slice::from_ref(&current))
+                .unwrap();
+            assert!(stop.load(Ordering::Acquire));
+            index.reconcile_inventory_locked(&mut state).unwrap();
+            state.store.as_ref().unwrap().index_revision_for_test()
+        };
+
+        index.mark_fixed_volume_dirty(&stale).unwrap();
+        assert!(index.complete_volume_calibration(&stale, owner).is_err());
+
+        let mut state = index.state.lock().unwrap();
+        assert!(state.quarantined_volumes.contains(&identity));
+        let store = state.store.as_mut().unwrap();
+        assert_eq!(store.mount_point_for_test(&identity), r"C:\");
+        assert_eq!(store.generation_state_for_test(&identity).1, None);
+        assert!(store.candidate_rows_for_test(&identity).is_empty());
+        assert_eq!(store.index_revision_for_test(), before);
+        let visible = store
+            .query_for_test(&query(), std::slice::from_ref(&identity))
+            .unwrap();
+        assert!(visible
+            .entries
+            .iter()
+            .any(|entry| entry.name == "find-stable.txt"));
+        assert!(!visible
+            .entries
+            .iter()
+            .any(|entry| entry.name == "find-stale.txt"));
     }
 
     #[test]
@@ -1337,6 +1770,1012 @@ mod tests {
     }
 
     #[test]
+    fn revision_transitions_are_monotonic_and_checked() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let identity = volume();
+        store
+            .seed_committed_for_test(&identity, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+        let first = store
+            .mark_volume_dirty(&identity, r"C:\", std::slice::from_ref(&identity))
+            .unwrap();
+        assert_eq!(first, 1);
+        let unchanged = store
+            .mark_volume_dirty(&identity, r"C:\", std::slice::from_ref(&identity))
+            .unwrap();
+        assert_eq!(unchanged, first, "unchanged dirty state advanced revision");
+
+        let publication_generation = AtomicU64::new(7);
+        let mut state = IndexState {
+            store: Some(store),
+            mode: LifecycleMode::Active,
+            admission_open: true,
+            index_revision_high_water: u64::MAX,
+            ..IndexState::default()
+        };
+        assert_eq!(
+            state.advance_revision_locked(&publication_generation),
+            Err(AdmissionError::Unavailable)
+        );
+        assert_eq!(state.index_revision_high_water, u64::MAX);
+        assert_eq!(publication_generation.load(Ordering::Acquire), 8);
+        assert!(state.fatal_unavailable);
+        assert!(!state.admission_open);
+    }
+
+    #[test]
+    fn store_writer_revision_exhaustion_is_fatal_and_cancels_retry() {
+        let index = Arc::new(FileIndex::default());
+        let identity = volume();
+        let mut other_identity = volume();
+        other_identity.volume_serial = 43;
+        let fixed = super::FixedVolume {
+            identity: identity.clone(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        let current_stop = Arc::new(AtomicBool::new(false));
+        let other_stop = Arc::new(AtomicBool::new(false));
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .seed_committed_for_test(&identity, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+        store.set_index_revision_for_test(u64::MAX);
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.index_revision_high_water = u64::MAX;
+            state.authenticated_volumes = vec![identity.clone()];
+            state.authenticated_mounts = vec![(identity.clone(), r"C:\".into())];
+            state.authenticated_app_data_root = Some(PathBuf::from(r"C:\app-data"));
+        }
+        {
+            let mut coordinator = index.coordinator.state.lock().unwrap();
+            coordinator.pending_root = Some(PathBuf::from(r"C:\app-data"));
+            coordinator.active_root = coordinator.pending_root.clone();
+            coordinator.volumes.insert(
+                identity.clone(),
+                super::VolumeRuntime {
+                    calibration: super::Calibration::Pending {
+                        deadline: std::time::Instant::now(),
+                        runtime_epoch: 0,
+                    },
+                    consecutive_failures: 1,
+                },
+            );
+        }
+        {
+            let mut workers = index.workers.lock().unwrap();
+            workers.by_volume.insert(
+                identity.clone(),
+                super::WorkerRecord {
+                    owner: 1,
+                    mount_point: PathBuf::from(r"C:\"),
+                    stop: Arc::clone(&current_stop),
+                    generation: Arc::new(AtomicU64::new(1)),
+                    join: None,
+                    failed: false,
+                },
+            );
+            workers.by_volume.insert(
+                other_identity.clone(),
+                super::WorkerRecord {
+                    owner: 2,
+                    mount_point: PathBuf::from(r"D:\"),
+                    stop: Arc::clone(&other_stop),
+                    generation: Arc::new(AtomicU64::new(1)),
+                    join: None,
+                    failed: false,
+                },
+            );
+        }
+        let old_generation = index.publication_generation.load(Ordering::Acquire);
+
+        assert!(matches!(
+            index.mark_fixed_volume_dirty(&fixed),
+            Err(FileIndexError::Unavailable)
+        ));
+
+        let state = index.state.lock().unwrap();
+        assert!(state.fatal_unavailable);
+        assert!(!state.admission_open);
+        assert!(state.store.is_none());
+        assert!(state.authenticated_volumes.is_empty());
+        assert!(state.authenticated_mounts.is_empty());
+        assert_eq!(state.index_revision_high_water, u64::MAX);
+        drop(state);
+        assert!(!index.authorizes_publication(0, old_generation));
+        let coordinator = index.coordinator.state.lock().unwrap();
+        assert!(coordinator.pending_root.is_none());
+        assert!(coordinator.volumes.is_empty());
+        drop(coordinator);
+        assert!(current_stop.load(Ordering::Acquire));
+        assert!(other_stop.load(Ordering::Acquire));
+        assert!(!index.finish_volume_attempt(&identity, false, Instant::now(), 0, 0));
+        assert!(!index.schedule_calibration());
+        assert_eq!(index.workers.lock().unwrap().by_volume.len(), 2);
+    }
+
+    #[test]
+    fn fatal_before_schedule_linearization_cannot_restore_pending_work() {
+        let index = Arc::new(FileIndex::default());
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(Store::open_in_memory_for_test("identity-a").unwrap());
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_app_data_root = Some(PathBuf::from(r"C:\app-data"));
+        }
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_index = Arc::clone(&index);
+        let worker_reached = Arc::clone(&reached);
+        let worker_release = Arc::clone(&release);
+        let scheduled = thread::spawn(move || {
+            worker_index.mark_calibration_pending_with(PathBuf::from(r"C:\app-data"), || {
+                worker_reached.wait();
+                worker_release.wait();
+            })
+        });
+        reached.wait();
+        {
+            let mut state = index.state.lock().unwrap();
+            index.latch_process_fatal(&mut state);
+        }
+        release.wait();
+
+        assert_eq!(scheduled.join().unwrap(), (false, false));
+        let coordinator = index.coordinator.state.lock().unwrap();
+        assert!(coordinator.pending_root.is_none());
+        assert!(coordinator.volumes.is_empty());
+        assert_eq!(coordinator.wakes, 0);
+    }
+
+    #[test]
+    fn store_writer_revision_max_noop_does_not_latch() {
+        let index = FileIndex::default();
+        let identity = volume();
+        let fixed = super::FixedVolume {
+            identity: identity.clone(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .mark_volume_dirty(&identity, r"C:\", std::slice::from_ref(&identity))
+            .unwrap();
+        store.set_index_revision_for_test(u64::MAX);
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.index_revision_high_water = u64::MAX;
+            state.authenticated_volumes = vec![identity.clone()];
+            state.authenticated_mounts = vec![(identity, r"C:\".into())];
+        }
+
+        index.mark_fixed_volume_dirty(&fixed).unwrap();
+
+        let state = index.state.lock().unwrap();
+        assert!(!state.fatal_unavailable);
+        assert!(state.admission_open);
+        assert_eq!(state.index_revision_high_water, u64::MAX);
+        assert_eq!(
+            state.store.as_ref().unwrap().index_revision_for_test(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn ordinary_volume_transaction_failure_keeps_single_backoff_owner() {
+        let index = FileIndex::default();
+        let identity = volume();
+        let fixed = super::FixedVolume {
+            identity: identity.clone(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        store
+            .seed_committed_for_test(&identity, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+        store.fail_revision_updates_for_test();
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.authenticated_volumes = vec![identity.clone()];
+            state.authenticated_mounts = vec![(identity.clone(), r"C:\".into())];
+        }
+        let owner = match index.prepare_worker(&fixed).unwrap() {
+            super::WorkerPreparation::Start { owner } => owner,
+            super::WorkerPreparation::Existing => panic!("worker must start"),
+        };
+        index.install_worker(
+            &fixed,
+            super::WorkerRecord {
+                owner,
+                mount_point: fixed.mount_point.clone(),
+                stop: Arc::new(AtomicBool::new(false)),
+                generation: Arc::new(AtomicU64::new(1)),
+                join: None,
+                failed: false,
+            },
+        );
+
+        index.handle_worker_failure(&fixed, owner);
+
+        let state = index.state.lock().unwrap();
+        assert!(!state.fatal_unavailable);
+        assert!(state.admission_open);
+        assert!(state.store.is_some());
+        drop(state);
+        let coordinator = index.coordinator.state.lock().unwrap();
+        let runtime = coordinator.volumes.get(&identity).unwrap();
+        assert_eq!(runtime.consecutive_failures, 1);
+        assert!(matches!(
+            runtime.calibration,
+            super::Calibration::Pending {
+                runtime_epoch: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn status_only_candidate_retry_does_not_advance_revision() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let identity = volume();
+        store
+            .seed_committed_for_test(&identity, [candidate_entry("find-stable.txt", 1)])
+            .unwrap();
+        let dirty_revision = store
+            .mark_volume_dirty(&identity, r"C:\", std::slice::from_ref(&identity))
+            .unwrap();
+        assert_eq!(dirty_revision, 1);
+
+        store
+            .begin_candidate_for_test_with_identities(
+                &identity,
+                r"C:\",
+                std::slice::from_ref(&identity),
+            )
+            .unwrap();
+        assert_eq!(store.index_revision_for_test(), dirty_revision);
+    }
+
+    #[test]
+    fn multi_volume_status_only_dirty_does_not_advance_revision() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let ready = volume();
+        let mut building = volume();
+        building.volume_serial = 43;
+        store
+            .seed_committed_for_test(&ready, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+
+        let before = store.index_revision_for_test();
+        let identities = [ready.clone(), building.clone()];
+        assert_eq!(
+            store
+                .mark_volume_dirty(&building, r"D:\", &identities)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .mark_volume_dirty(&ready, r"C:\", &identities)
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn calibration_commit_revision_tracks_rows_or_aggregate_status_only() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let ready = volume();
+        let mut building = volume();
+        building.volume_serial = 43;
+        let stable = candidate_entry("find-stable.txt", 1);
+        store
+            .seed_committed_for_test(&ready, [stable.clone()])
+            .unwrap();
+        let identities = [ready.clone(), building.clone()];
+        store
+            .mark_volume_dirty(&building, r"D:\", &identities)
+            .unwrap();
+
+        let before_begin = store.index_revision_for_test();
+        let generation = store
+            .begin_candidate_for_test_with_identities(&ready, r"C:\", &identities)
+            .unwrap();
+        assert_eq!(store.index_revision_for_test(), before_begin);
+        store
+            .append_candidate_for_test_with_identities(&ready, generation, [stable], &identities)
+            .unwrap();
+        let before_equal_commit = store.index_revision_for_test();
+        assert_eq!(
+            store
+                .commit_candidate_for_test_with_identities(&ready, generation, &[], &identities,)
+                .unwrap(),
+            before_equal_commit
+        );
+
+        let before_begin = store.index_revision_for_test();
+        let generation = store
+            .begin_candidate_for_test_with_identities(&ready, r"C:\", &identities)
+            .unwrap();
+        assert_eq!(store.index_revision_for_test(), before_begin);
+        store
+            .append_candidate_for_test_with_identities(
+                &ready,
+                generation,
+                [candidate_entry("find-changed.txt", generation)],
+                &identities,
+            )
+            .unwrap();
+        let before_changed_commit = store.index_revision_for_test();
+        assert_eq!(
+            store
+                .commit_candidate_for_test_with_identities(&ready, generation, &[], &identities,)
+                .unwrap(),
+            before_changed_commit + 1
+        );
+    }
+
+    #[test]
+    fn inventory_reconcile_revision_tracks_authenticated_wire_changes() {
+        let mut hidden = Store::open_in_memory_for_test("identity-a").unwrap();
+        let empty = volume();
+        hidden
+            .mark_volume_dirty(&empty, r"C:\", std::slice::from_ref(&empty))
+            .unwrap();
+        let before_hidden_transition = hidden.index_revision_for_test();
+        let (_, hidden_revision, inventory_changed) = hidden
+            .reconcile_current_mounts(
+                &[(empty.clone(), r"D:\".into())],
+                std::slice::from_ref(&empty),
+                std::slice::from_ref(&empty),
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert!(inventory_changed);
+        assert_eq!(hidden_revision, before_hidden_transition);
+
+        let mut visible = Store::open_in_memory_for_test("identity-a").unwrap();
+        visible
+            .seed_committed_for_test(&empty, [candidate_entry("find-visible.txt", 1)])
+            .unwrap();
+        let before_detach = visible.index_revision_for_test();
+        let (_, detach_revision, inventory_changed) = visible
+            .reconcile_current_mounts(
+                &[],
+                std::slice::from_ref(&empty),
+                std::slice::from_ref(&empty),
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert!(inventory_changed);
+        assert_eq!(detach_revision, before_detach + 1);
+    }
+
+    #[test]
+    fn revision_status_count_and_items_share_one_linearization() {
+        let dir = TestDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let database = dir.path().join("linearization.sqlite3");
+        let identity = volume();
+        let mut reader = Store::open(&database, "identity-a").unwrap();
+        reader
+            .seed_committed_for_test(&identity, [candidate_entry("find-one.txt", 1)])
+            .unwrap();
+
+        let writer_database = database.clone();
+        let writer_identity = identity.clone();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut writer = Store::open(&writer_database, "identity-a").unwrap();
+            let transaction = writer.connection_for_test().transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE metadata SET index_revision='1' WHERE singleton=1",
+                    [],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE volumes SET scan_state='dirty' WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3",
+                    rusqlite::params![
+                        writer_identity.volume_guid_path,
+                        writer_identity.volume_serial,
+                        writer_identity.filesystem_name,
+                    ],
+                )
+                .unwrap();
+            let second = candidate_entry("find-two.txt", 1);
+            transaction
+                .execute(
+                    "INSERT INTO entries(volume_guid_path,volume_serial,filesystem_name,relative_path,display_path,name,folded_name,kind,category,size_bytes,modified_utc_ms,generation) VALUES(?1,?2,?3,?4,?5,?6,?7,'file',?8,?9,?10,'1')",
+                    rusqlite::params![
+                        writer_identity.volume_guid_path,
+                        writer_identity.volume_serial,
+                        writer_identity.filesystem_name,
+                        second.relative_path,
+                        second.display_path,
+                        second.name,
+                        second.folded_name,
+                        second.category,
+                        second.size_bytes.map(|value| value.to_string()),
+                        second.modified_utc_ms,
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        let before = reader
+            .query_with_hook_for_test(&query(), std::slice::from_ref(&identity), || {
+                start_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            })
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            (
+                before.index_revision,
+                before.status,
+                before.total,
+                before.entries.len()
+            ),
+            (0, FileIndexStatus::Ready, 1, 1)
+        );
+
+        let after = reader
+            .query_for_test(&query(), std::slice::from_ref(&identity))
+            .unwrap();
+        assert_eq!(
+            (
+                after.index_revision,
+                after.status,
+                after.total,
+                after.entries.len()
+            ),
+            (1, FileIndexStatus::Building, 2, 2)
+        );
+    }
+
+    #[test]
+    fn multi_volume_status_uses_the_frozen_priority() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let ready = volume();
+        let mut partial = volume();
+        partial.volume_serial = 43;
+        let mut building = volume();
+        building.volume_serial = 44;
+        store
+            .seed_committed_for_test(&ready, [candidate_entry("find-ready.txt", 1)])
+            .unwrap();
+        store
+            .seed_committed_for_test(&partial, [candidate_entry("find-partial.txt", 1)])
+            .unwrap();
+        let generation = store.begin_candidate_for_test(&partial, r"D:\").unwrap();
+        store
+            .commit_candidate_for_test(&partial, generation, &[""])
+            .unwrap();
+        let identities = [ready.clone(), partial.clone(), building.clone()];
+        store
+            .mark_volume_dirty(&building, r"E:\", &identities)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .query_for_test(&query(), &[ready.clone(), partial.clone(), building])
+                .unwrap()
+                .status,
+            FileIndexStatus::Building
+        );
+        assert_eq!(
+            store
+                .query_for_test(&query(), &[ready.clone(), partial])
+                .unwrap()
+                .status,
+            FileIndexStatus::Partial
+        );
+        assert_eq!(
+            store.query_for_test(&query(), &[ready]).unwrap().status,
+            FileIndexStatus::Ready
+        );
+    }
+
+    #[test]
+    fn calibration_backoff_is_bounded_single_owner_and_recovers() {
+        let origin = Instant::now();
+        let mut runtime = VolumeRuntime::default();
+        assert!(runtime.request(origin, 0));
+
+        for second in [0, 1, 3, 7, 15, 31, 63] {
+            let now = origin + Duration::from_secs(second);
+            assert!(runtime.start_if_due(now, 0));
+            assert!(!runtime.start_if_due(now, 0));
+            if second == 63 {
+                runtime.finish_success(0);
+            } else {
+                runtime.finish_failure(now, 0).unwrap();
+            }
+        }
+
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert!(runtime.request(origin + Duration::from_secs(63), 0));
+        assert!(runtime.start_if_due(origin + Duration::from_secs(63), 0));
+        runtime
+            .finish_failure(origin + Duration::from_secs(63), 0)
+            .unwrap();
+        runtime.cancel_pending();
+        assert!(runtime.request(origin + Duration::from_secs(63), 0));
+        assert!(!runtime.start_if_due(origin + Duration::from_secs(63), 0));
+        assert!(runtime.start_if_due(origin + Duration::from_secs(64), 0));
+    }
+
+    #[test]
+    fn one_physical_calibration_failure_is_counted_once() {
+        let origin = Instant::now();
+        let mut completed_worker_failure = VolumeRuntime::default();
+        completed_worker_failure.request(origin, 0);
+        assert!(completed_worker_failure.start_if_due(origin, 0));
+        let failures_before = completed_worker_failure.consecutive_failures;
+        completed_worker_failure.finish_failure(origin, 0).unwrap();
+        completed_worker_failure
+            .finish_start_attempt(false, origin, 0, failures_before)
+            .unwrap();
+        assert_eq!(completed_worker_failure.consecutive_failures, 1);
+        assert_eq!(
+            completed_worker_failure.calibration,
+            super::Calibration::Pending {
+                deadline: origin + Duration::from_secs(1),
+                runtime_epoch: 0,
+            }
+        );
+
+        let mut startup_failure = VolumeRuntime::default();
+        startup_failure.request(origin, 0);
+        assert!(startup_failure.start_if_due(origin, 0));
+        startup_failure
+            .finish_start_attempt(false, origin, 0, 0)
+            .unwrap();
+        assert_eq!(startup_failure.consecutive_failures, 1);
+
+        let mut inventory_pending = VolumeRuntime::default();
+        inventory_pending.request(origin, 0);
+        assert!(inventory_pending.start_if_due(origin, 0));
+        inventory_pending.request(origin + Duration::from_millis(1), 0);
+        inventory_pending
+            .finish_start_attempt(false, origin, 0, 0)
+            .unwrap();
+        assert_eq!(inventory_pending.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn live_and_candidate_replay_apply_identical_event_semantics() {
+        fn prepared_store() -> (Store, u64) {
+            let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+            store
+                .seed_committed_for_test(&volume(), [candidate_entry(r"tree\find-old.txt", 1)])
+                .unwrap();
+            let generation = store.begin_candidate_for_test(&volume(), r"C:\").unwrap();
+            store
+                .append_candidate_for_test(
+                    &volume(),
+                    generation,
+                    [candidate_entry(r"tree\find-old.txt", generation)],
+                )
+                .unwrap();
+            (store, generation)
+        }
+
+        let replacement = candidate_entry(r"tree\find-new.txt", 2);
+        let (mut live, live_generation) = prepared_store();
+        let before_live = live.index_revision_for_test();
+        let changed_revision = live
+            .apply_live_streaming(
+                &volume(),
+                live_generation,
+                std::slice::from_ref(&volume()),
+                |apply| {
+                    apply(super::IndexChangeBatch {
+                        deleted_prefixes: vec![r"tree".into()],
+                        entries: Vec::new(),
+                    })?;
+                    apply(super::IndexChangeBatch {
+                        deleted_prefixes: Vec::new(),
+                        entries: vec![super::IndexEntry::from(replacement.clone())],
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(changed_revision, before_live + 1);
+        let unchanged_revision = live
+            .apply_live_changes(
+                &volume(),
+                live_generation,
+                std::iter::empty::<&str>(),
+                [super::IndexEntry::from(replacement.clone())],
+            )
+            .unwrap();
+        assert_eq!(unchanged_revision, changed_revision);
+        live.commit_candidate(&volume(), live_generation, Vec::new(), &[], Vec::new(), &[])
+            .unwrap();
+
+        let (mut replay, replay_generation) = prepared_store();
+        replay
+            .commit_candidate(
+                &volume(),
+                replay_generation,
+                Vec::new(),
+                &[r"tree".into()],
+                vec![super::IndexEntry::from(replacement)],
+                &[],
+            )
+            .unwrap();
+
+        let live_names = live
+            .query_for_test(&query(), &[volume()])
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        let replay_names = replay
+            .query_for_test(&query(), &[volume()])
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(live_names, [r"tree\find-new.txt"]);
+        assert_eq!(replay_names, live_names);
+
+        let mut hidden = Store::open_in_memory_for_test("identity-a").unwrap();
+        hidden
+            .seed_committed_for_test(&volume(), [candidate_entry("find-visible.txt", 1)])
+            .unwrap();
+        let generation = hidden.begin_candidate_for_test(&volume(), r"C:\").unwrap();
+        let before_hidden_append = hidden.index_revision_for_test();
+        hidden
+            .append_candidate_for_test(
+                &volume(),
+                generation,
+                [candidate_entry("find-hidden.txt", generation)],
+            )
+            .unwrap();
+        assert_eq!(hidden.index_revision_for_test(), before_hidden_append);
+
+        let before_candidate_only = Store::open_in_memory_for_test("identity-a").unwrap();
+        let mut candidate_only = before_candidate_only;
+        let generation = candidate_only
+            .begin_candidate_for_test(&volume(), r"C:\")
+            .unwrap();
+        let before_visible_append = candidate_only.index_revision_for_test();
+        candidate_only
+            .append_candidate_for_test(
+                &volume(),
+                generation,
+                [candidate_entry("find-first-visible.txt", generation)],
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_only.index_revision_for_test(),
+            before_visible_append + 1
+        );
+        assert_eq!(
+            candidate_only
+                .append_candidate_for_test(
+                    &volume(),
+                    generation,
+                    [candidate_entry("find-first-visible.txt", generation)],
+                )
+                .unwrap(),
+            before_visible_append + 1
+        );
+
+        let mut quarantined_candidate = Store::open_in_memory_for_test("identity-a").unwrap();
+        let quarantined = volume();
+        let generation = quarantined_candidate
+            .begin_candidate_for_test(&quarantined, r"C:\")
+            .unwrap();
+        let before_quarantined_append = quarantined_candidate.index_revision_for_test();
+        assert_eq!(
+            quarantined_candidate
+                .append_candidate_for_test_with_identities(
+                    &quarantined,
+                    generation,
+                    [candidate_entry("find-quarantined.txt", generation)],
+                    &[],
+                )
+                .unwrap(),
+            before_quarantined_append
+        );
+        assert_eq!(
+            quarantined_candidate.candidate_rows_for_test(&quarantined),
+            ["find-quarantined.txt"]
+        );
+
+        let mut candidate_internal = Store::open_in_memory_for_test("identity-a").unwrap();
+        let same = candidate_entry("find-same.txt", 1);
+        candidate_internal
+            .seed_committed_for_test(&volume(), [same.clone()])
+            .unwrap();
+        let generation = candidate_internal
+            .begin_candidate_for_test(&volume(), r"C:\")
+            .unwrap();
+        let before_internal_only = candidate_internal.index_revision_for_test();
+        let revision = candidate_internal
+            .apply_live_changes(
+                &volume(),
+                generation,
+                std::iter::empty::<&str>(),
+                [super::IndexEntry::from(same)],
+            )
+            .unwrap();
+        assert_eq!(revision, before_internal_only);
+
+        let dir = TestDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let database = dir.path().join("live-stream.sqlite3");
+        let mut writer = Store::open(&database, "identity-a").unwrap();
+        writer
+            .seed_committed_for_test(&volume(), [candidate_entry("find-old.txt", 1)])
+            .unwrap();
+        let reader_database = database.clone();
+        let (read_tx, read_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            read_rx.recv().unwrap();
+            let mut reader = Store::open(&reader_database, "identity-a").unwrap();
+            let snapshot = reader.query_for_test(&query(), &[volume()]).unwrap();
+            done_tx.send(snapshot).unwrap();
+        });
+        let revision = writer
+            .apply_live_streaming(&volume(), 1, std::slice::from_ref(&volume()), |apply| {
+                apply(super::IndexChangeBatch {
+                    deleted_prefixes: vec!["find-old.txt".into()],
+                    entries: Vec::new(),
+                })?;
+                read_tx.send(()).unwrap();
+                let during = done_rx.recv().unwrap();
+                assert_eq!(during.index_revision, 0);
+                assert_eq!(during.total, 1);
+                assert_eq!(during.entries[0].name, "find-old.txt");
+                apply(super::IndexChangeBatch {
+                    deleted_prefixes: Vec::new(),
+                    entries: vec![super::IndexEntry::from(candidate_entry("find-new.txt", 1))],
+                })
+            })
+            .unwrap();
+        reader.join().unwrap();
+        assert_eq!(revision, 1);
+        let committed = writer.query_for_test(&query(), &[volume()]).unwrap();
+        assert_eq!(committed.index_revision, 1);
+        assert_eq!(committed.total, 1);
+        assert_eq!(committed.entries[0].name, "find-new.txt");
+
+        assert!(writer
+            .apply_live_streaming(&volume(), 1, std::slice::from_ref(&volume()), |apply| {
+                apply(super::IndexChangeBatch {
+                    deleted_prefixes: vec!["find-new.txt".into()],
+                    entries: Vec::new(),
+                })?;
+                Err(StoreError::InvalidData)
+            })
+            .is_err());
+        let rolled_back = writer.query_for_test(&query(), &[volume()]).unwrap();
+        assert_eq!(rolled_back.index_revision, 1);
+        assert_eq!(rolled_back.total, 1);
+        assert_eq!(rolled_back.entries[0].name, "find-new.txt");
+        assert_eq!(
+            writer
+                .apply_live_changes(
+                    &volume(),
+                    1,
+                    std::iter::empty::<&str>(),
+                    [super::IndexEntry::from(candidate_entry("find-new.txt", 1))],
+                )
+                .unwrap(),
+            1
+        );
+
+        let mut unchanged_tree = Store::open_in_memory_for_test("identity-a").unwrap();
+        let mut tree_entries = Vec::with_capacity(514);
+        let mut directory = candidate_entry("find-tree", 1);
+        directory.kind = super::IndexedKind::Directory;
+        directory.size_bytes = None;
+        tree_entries.push(directory);
+        tree_entries.extend(
+            (0..513).map(|index| candidate_entry(&format!(r"find-tree\find-{index}.txt"), 1)),
+        );
+        unchanged_tree
+            .seed_committed_for_test(&volume(), tree_entries.clone())
+            .unwrap();
+        let exact_plan = unchanged_tree.exact_live_visibility_plan_for_test(
+            &volume(),
+            1,
+            r"find-tree\find-0.txt",
+        );
+        assert!(exact_plan
+            .iter()
+            .any(|detail| detail.contains("SEARCH e USING INDEX sqlite_autoindex_entries_1")));
+        assert!(exact_plan.iter().all(|detail| !detail.contains("SCAN e")));
+        let before_tree = unchanged_tree
+            .query_for_test(&query(), &[volume()])
+            .unwrap();
+        let reinsert_same_tree = |store: &mut Store| {
+            store.apply_live_streaming(&volume(), 1, std::slice::from_ref(&volume()), |apply| {
+                apply(super::IndexChangeBatch {
+                    deleted_prefixes: vec!["find-tree".into()],
+                    entries: Vec::new(),
+                })?;
+                for batch in tree_entries.chunks(512) {
+                    apply(super::IndexChangeBatch {
+                        deleted_prefixes: Vec::new(),
+                        entries: batch.iter().cloned().map(super::IndexEntry::from).collect(),
+                    })?;
+                }
+                Ok(())
+            })
+        };
+        let unchanged_revision = reinsert_same_tree(&mut unchanged_tree).unwrap();
+        let after_tree = unchanged_tree
+            .query_for_test(&query(), &[volume()])
+            .unwrap();
+        assert_eq!(unchanged_revision, before_tree.index_revision);
+        assert_eq!(after_tree.index_revision, before_tree.index_revision);
+        assert_eq!(after_tree.total, before_tree.total);
+        assert_eq!(after_tree.entries, before_tree.entries);
+        assert_eq!(
+            reinsert_same_tree(&mut unchanged_tree).unwrap(),
+            before_tree.index_revision
+        );
+        let committed_revision = unchanged_tree.index_revision_for_test();
+        let committed_noop = unchanged_tree
+            .apply_committed_streaming(&volume(), 1, std::slice::from_ref(&volume()), |apply| {
+                apply(super::IndexChangeBatch {
+                    deleted_prefixes: vec!["find-tree".into()],
+                    entries: Vec::new(),
+                })?;
+                for batch in tree_entries.chunks(512) {
+                    apply(super::IndexChangeBatch {
+                        deleted_prefixes: Vec::new(),
+                        entries: batch.iter().cloned().map(super::IndexEntry::from).collect(),
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(committed_noop, committed_revision);
+        assert_eq!(
+            unchanged_tree
+                .apply_committed_changes_during_scan(
+                    &volume(),
+                    1,
+                    std::iter::empty::<&str>(),
+                    [super::IndexEntry::from(candidate_entry(
+                        "find-added.txt",
+                        1
+                    ))],
+                )
+                .unwrap(),
+            committed_revision + 1
+        );
+
+        let mut cancelled = Store::open_in_memory_for_test("identity-a").unwrap();
+        cancelled
+            .seed_committed_for_test(&volume(), [candidate_entry("find-stable.txt", 1)])
+            .unwrap();
+        let generation = cancelled
+            .begin_candidate_for_test(&volume(), r"C:\")
+            .unwrap();
+        let before_cancel = cancelled.index_revision_for_test();
+        assert!(cancelled
+            .commit_candidate_streaming(
+                &volume(),
+                generation,
+                Vec::new(),
+                &[],
+                (
+                    std::slice::from_ref(&volume()),
+                    std::slice::from_ref(&volume()),
+                ),
+                |apply| {
+                    apply(super::IndexChangeBatch {
+                        deleted_prefixes: Vec::new(),
+                        entries: (0..512)
+                            .map(|index| {
+                                super::IndexEntry::from(candidate_entry(
+                                    &format!("find-cancel-{index}.txt"),
+                                    generation,
+                                ))
+                            })
+                            .collect(),
+                    })?;
+                    Err(StoreError::InvalidData)
+                },
+            )
+            .is_err());
+        assert_eq!(cancelled.index_revision_for_test(), before_cancel);
+        let after_cancel = cancelled.query_for_test(&query(), &[volume()]).unwrap();
+        assert_eq!(after_cancel.total, 1);
+        assert_eq!(after_cancel.entries[0].name, "find-stable.txt");
+    }
+
+    #[test]
+    fn prefix_mutations_are_binary_and_preserve_case_siblings() {
+        fn case_entries() -> [TestEntry; 2] {
+            let mut upper = candidate_entry(r"Case\find-upper.txt", 1);
+            upper.display_path = r"C:\Case\find-upper.txt".into();
+            upper.name = "find-upper.txt".into();
+            upper.folded_name = fold_name(&upper.name);
+            let mut lower = candidate_entry(r"case\find-lower.txt", 1);
+            lower.display_path = r"C:\case\find-lower.txt".into();
+            lower.name = "find-lower.txt".into();
+            lower.folded_name = fold_name(&lower.name);
+            [upper, lower]
+        }
+
+        let identity = volume();
+        let mut deleted = Store::open_in_memory_for_test("identity-a").unwrap();
+        deleted
+            .seed_committed_for_test(&identity, case_entries())
+            .unwrap();
+        let revision = deleted
+            .apply_live_changes(
+                &identity,
+                1,
+                ["Case"],
+                std::iter::empty::<super::IndexEntry>(),
+            )
+            .unwrap();
+        let visible = deleted
+            .query_for_test(&query(), std::slice::from_ref(&identity))
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(visible.total, 1);
+        assert_eq!(visible.entries[0].name, "find-lower.txt");
+
+        let mut unchanged = Store::open_in_memory_for_test("identity-a").unwrap();
+        unchanged
+            .seed_committed_for_test(&identity, case_entries())
+            .unwrap();
+        let before = unchanged.index_revision_for_test();
+        let revision = unchanged
+            .apply_live_changes(
+                &identity,
+                1,
+                ["Case"],
+                [super::IndexEntry::from(case_entries()[0].clone())],
+            )
+            .unwrap();
+        assert_eq!(revision, before);
+
+        let mut denied = Store::open_in_memory_for_test("identity-a").unwrap();
+        denied
+            .seed_committed_for_test(&identity, case_entries())
+            .unwrap();
+        let generation = denied.begin_candidate_for_test(&identity, r"D:\").unwrap();
+        denied
+            .commit_candidate_for_test(&identity, generation, &["Case"])
+            .unwrap();
+        let visible = denied
+            .query_for_test(&query(), std::slice::from_ref(&identity))
+            .unwrap();
+        assert_eq!(visible.total, 1);
+        assert_eq!(visible.entries[0].name, "find-upper.txt");
+        assert_eq!(visible.entries[0].display_path, r"D:\Case\find-upper.txt");
+    }
+
+    #[test]
     fn scan_updates_existing_committed_rows_before_candidate_commit() {
         let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
         let volume = volume();
@@ -1485,7 +2924,11 @@ mod tests {
         }
 
         let mut reopened = Store::open(&database, "identity-a").unwrap();
-        reopened.recover_candidates_for_test().unwrap();
+        let before_hidden_recovery = reopened.index_revision_for_test();
+        assert_eq!(
+            reopened.recover_candidates_for_test().unwrap(),
+            Some(before_hidden_recovery)
+        );
         assert!(reopened.candidate_rows_for_test(&volume).is_empty());
         assert_eq!(reopened.generation_state_for_test(&volume).1, None);
         let visible = reopened
@@ -1493,6 +2936,37 @@ mod tests {
             .unwrap();
         assert_eq!(visible.entries.len(), 1);
         assert_eq!(visible.entries[0].name, "find-kept.txt");
+
+        let mut visible_candidate = Store::open_in_memory_for_test("identity-a").unwrap();
+        let generation = visible_candidate
+            .begin_candidate_for_test(&volume, r"C:\")
+            .unwrap();
+        visible_candidate
+            .append_candidate_for_test(
+                &volume,
+                generation,
+                [candidate_entry("find-provisional.txt", generation)],
+            )
+            .unwrap();
+        let before_visible_recovery = visible_candidate.index_revision_for_test();
+        assert_eq!(
+            visible_candidate.recover_candidates_for_test().unwrap(),
+            Some(before_visible_recovery + 1)
+        );
+        assert!(visible_candidate
+            .candidate_rows_for_test(&volume)
+            .is_empty());
+
+        let mut empty_candidate = Store::open_in_memory_for_test("identity-a").unwrap();
+        empty_candidate
+            .begin_candidate_for_test(&volume, r"C:\")
+            .unwrap();
+        let before_empty_recovery = empty_candidate.index_revision_for_test();
+        assert_eq!(
+            empty_candidate.recover_candidates_for_test().unwrap(),
+            Some(before_empty_recovery)
+        );
+        assert!(empty_candidate.candidate_rows_for_test(&volume).is_empty());
     }
 }
 
@@ -1684,6 +3158,7 @@ struct IndexState {
     inventory_observation: u64,
     authenticated_volumes: Vec<VolumeIdentity>,
     authenticated_mounts: Vec<(VolumeIdentity, String)>,
+    inventory_previous_authenticated: Option<Vec<VolumeIdentity>>,
     pending_inventory_transitions: HashSet<VolumeIdentity>,
     quarantined_volumes: HashSet<VolumeIdentity>,
     authenticated_app_data_root: Option<PathBuf>,
@@ -1703,6 +3178,7 @@ impl Default for IndexState {
             inventory_observation: 0,
             authenticated_volumes: Vec::new(),
             authenticated_mounts: Vec::new(),
+            inventory_previous_authenticated: None,
             pending_inventory_transitions: HashSet::new(),
             quarantined_volumes: HashSet::new(),
             authenticated_app_data_root: None,
@@ -1750,6 +3226,7 @@ impl IndexState {
         self.admission_open = false;
         self.authenticated_volumes.clear();
         self.authenticated_mounts.clear();
+        self.inventory_previous_authenticated = None;
         self.pending_inventory_transitions.clear();
         self.quarantined_volumes.clear();
         self.authenticated_app_data_root = None;
@@ -1880,13 +3357,153 @@ pub(crate) struct FileIndex {
     publication_generation: AtomicU64,
 }
 
+struct IndexChangeBatch {
+    deleted_prefixes: Vec<String>,
+    entries: Vec<IndexEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Calibration {
+    Idle,
+    Pending {
+        deadline: std::time::Instant,
+        runtime_epoch: u64,
+    },
+    Running {
+        runtime_epoch: u64,
+    },
+}
+
+struct VolumeRuntime {
+    calibration: Calibration,
+    consecutive_failures: u32,
+}
+
+impl Default for VolumeRuntime {
+    fn default() -> Self {
+        Self {
+            calibration: Calibration::Idle,
+            consecutive_failures: 0,
+        }
+    }
+}
+
+impl VolumeRuntime {
+    fn request(&mut self, now: std::time::Instant, runtime_epoch: u64) -> bool {
+        match self.calibration {
+            Calibration::Idle => {
+                self.calibration = Calibration::Pending {
+                    deadline: now + calibration_backoff(self.consecutive_failures),
+                    runtime_epoch,
+                };
+                true
+            }
+            Calibration::Pending {
+                runtime_epoch: pending_epoch,
+                ..
+            } if pending_epoch == runtime_epoch => false,
+            Calibration::Running {
+                runtime_epoch: running_epoch,
+            } if running_epoch == runtime_epoch => {
+                self.calibration = Calibration::Pending {
+                    deadline: now,
+                    runtime_epoch,
+                };
+                true
+            }
+            Calibration::Pending { .. } | Calibration::Running { .. } => {
+                self.calibration = Calibration::Pending {
+                    deadline: now,
+                    runtime_epoch,
+                };
+                true
+            }
+        }
+    }
+
+    fn start_if_due(&mut self, now: std::time::Instant, runtime_epoch: u64) -> bool {
+        match self.calibration {
+            Calibration::Pending {
+                deadline,
+                runtime_epoch: pending_epoch,
+            } if pending_epoch == runtime_epoch && deadline <= now => {
+                self.calibration = Calibration::Running { runtime_epoch };
+                true
+            }
+            Calibration::Idle | Calibration::Pending { .. } | Calibration::Running { .. } => false,
+        }
+    }
+
+    fn finish_success(&mut self, runtime_epoch: u64) {
+        if self.calibration == (Calibration::Running { runtime_epoch }) {
+            self.calibration = Calibration::Idle;
+            self.consecutive_failures = 0;
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        self.calibration = Calibration::Idle;
+    }
+
+    fn finish_failure(
+        &mut self,
+        now: std::time::Instant,
+        runtime_epoch: u64,
+    ) -> Result<(), FileIndexError> {
+        if !matches!(
+            self.calibration,
+            Calibration::Running { runtime_epoch: epoch }
+                | Calibration::Pending { runtime_epoch: epoch, .. }
+                if epoch == runtime_epoch
+        ) {
+            return Err(FileIndexError::Unavailable);
+        }
+        self.consecutive_failures = self
+            .consecutive_failures
+            .checked_add(1)
+            .ok_or(FileIndexError::Unavailable)?;
+        self.calibration = Calibration::Pending {
+            deadline: now + calibration_backoff(self.consecutive_failures),
+            runtime_epoch,
+        };
+        Ok(())
+    }
+
+    fn finish_start_attempt(
+        &mut self,
+        succeeded: bool,
+        now: std::time::Instant,
+        runtime_epoch: u64,
+        failures_before: u32,
+    ) -> Result<(), FileIndexError> {
+        if succeeded {
+            self.finish_success(runtime_epoch);
+            return Ok(());
+        }
+        if self.consecutive_failures == failures_before {
+            self.finish_failure(now, runtime_epoch)?;
+        }
+        Ok(())
+    }
+}
+
+fn calibration_backoff(consecutive_failures: u32) -> std::time::Duration {
+    if consecutive_failures == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    std::time::Duration::from_secs(1u64.checked_shl(exponent).unwrap_or(64).min(60))
+}
+
 #[derive(Default)]
 struct CoordinatorState {
     thread_started: bool,
     running: bool,
     calibrated: bool,
     pending_root: Option<PathBuf>,
+    active_root: Option<PathBuf>,
     wakes: u64,
+    volumes: HashMap<VolumeIdentity, VolumeRuntime>,
 }
 
 #[derive(Default)]
@@ -2026,10 +3643,8 @@ impl FileIndex {
             }
             let Some(owner) = workers.next_owner.checked_add(1) else {
                 drop(workers);
-                self.state
-                    .lock()
-                    .expect("file index lock poisoned")
-                    .latch_unavailable(&self.publication_generation);
+                let mut state = self.state.lock().expect("file index lock poisoned");
+                self.latch_process_fatal(&mut state);
                 return Err(FileIndexError::Unavailable);
             };
             let replaced = workers.by_volume.remove(&volume.identity);
@@ -2084,25 +3699,30 @@ impl FileIndex {
         Ok(())
     }
 
-    fn worker_is_current(
-        &self,
-        volume: &VolumeIdentity,
-        owner: u64,
-        generation: Option<u64>,
-    ) -> bool {
+    fn worker_is_current(&self, volume: &FixedVolume, owner: u64, generation: Option<u64>) -> bool {
         self.workers
             .lock()
             .expect("file index worker lock poisoned")
             .by_volume
-            .get(volume)
+            .get(&volume.identity)
             .is_some_and(|worker| {
                 worker.owner == owner
+                    && worker.mount_point == volume.mount_point
                     && !worker.failed
                     && !worker.stop.load(Ordering::Acquire)
                     && generation.is_none_or(|generation| {
                         worker.generation.load(Ordering::Acquire) == generation
                     })
             })
+    }
+
+    fn authenticated_mount_matches(state: &IndexState, volume: &FixedVolume) -> bool {
+        volume.mount_point.to_str().is_some_and(|mount| {
+            state
+                .authenticated_mounts
+                .iter()
+                .any(|(identity, current)| identity == &volume.identity && current == mount)
+        })
     }
 
     fn remove_worker_if_owner(&self, volume: &VolumeIdentity, owner: u64) -> Option<WorkerRecord> {
@@ -2137,25 +3757,72 @@ impl FileIndex {
         true
     }
 
+    fn clear_calibration_retries(&self) {
+        self.coordinator.stop.store(true, Ordering::Release);
+        let mut coordinator = self
+            .coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned");
+        coordinator.pending_root = None;
+        coordinator.active_root = None;
+        coordinator.calibrated = true;
+        coordinator.volumes.clear();
+        self.coordinator.signal.notify_one();
+    }
+
+    fn latch_process_fatal(&self, state: &mut IndexState) {
+        state.latch_unavailable(&self.publication_generation);
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            for worker in workers.by_volume.values_mut() {
+                worker.stop.store(true, Ordering::Release);
+            }
+        }
+        self.clear_calibration_retries();
+    }
+
+    fn finish_store_write<T>(
+        &self,
+        state: &mut IndexState,
+        result: Result<T, StoreError>,
+    ) -> Result<T, FileIndexError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(StoreError::RevisionExhausted) => {
+                self.latch_process_fatal(state);
+                Err(FileIndexError::Unavailable)
+            }
+            Err(_) => Err(FileIndexError::Unavailable),
+        }
+    }
+
     fn mark_fixed_volume_dirty(&self, volume: &FixedVolume) -> Result<(), FileIndexError> {
-        let mount = volume
+        let worker_mount = volume
             .mount_point
             .to_str()
             .ok_or(FileIndexError::Unavailable)?;
         let mut state = self.state.lock().expect("file index lock poisoned");
-        let Some(store) = state.store.as_mut() else {
-            return Ok(());
-        };
-        match store.mark_volume_dirty(&volume.identity, mount) {
-            Ok(revision) => {
-                state.index_revision_high_water = revision;
-                Ok(())
-            }
-            Err(_) => {
-                state.latch_unavailable(&self.publication_generation);
-                Err(FileIndexError::Unavailable)
-            }
+        if state.fatal_unavailable || !state.admission_open {
+            return Err(FileIndexError::Unavailable);
         }
+        let mount = state
+            .authenticated_mounts
+            .iter()
+            .find(|(identity, _)| identity == &volume.identity)
+            .map(|(_, mount)| mount.clone())
+            .unwrap_or_else(|| worker_mount.to_owned());
+        let identities = state.authenticated_volumes.clone();
+        let Some(store) = state.store.as_mut() else {
+            return Err(FileIndexError::Unavailable);
+        };
+        let result = store.mark_volume_dirty(&volume.identity, &mount, &identities);
+        let revision = self.finish_store_write(&mut state, result)?;
+        state.index_revision_high_water = revision;
+        Ok(())
     }
 
     fn finish_worker_start(
@@ -2188,19 +3855,75 @@ impl FileIndex {
         owner: u64,
     ) -> Result<(u64, bool), FileIndexError> {
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(&volume.identity, owner, None) {
+        if !self.worker_is_current(volume, owner, None)
+            || !Self::authenticated_mount_matches(&state, volume)
+        {
             return Err(FileIndexError::Unavailable);
+        }
+        let before_authenticated = state.authenticated_volumes.clone();
+        let mut provisional_authenticated = before_authenticated.clone();
+        if !provisional_authenticated.contains(&volume.identity) {
+            provisional_authenticated.push(volume.identity.clone());
         }
         let store = state.store.as_mut().ok_or(FileIndexError::Unavailable)?;
         let mount = volume
             .mount_point
             .to_str()
             .ok_or(FileIndexError::Unavailable)?;
-        let (generation, revision, has_committed) = store
-            .begin_candidate(&volume.identity, mount)
-            .map_err(|_| FileIndexError::Unavailable)?;
+        let result = store.begin_candidate(
+            &volume.identity,
+            mount,
+            &before_authenticated,
+            &provisional_authenticated,
+        );
+        let (generation, revision, has_committed) = self.finish_store_write(&mut state, result)?;
+        if !has_committed {
+            state.quarantined_volumes.remove(&volume.identity);
+            state.authenticated_volumes = provisional_authenticated;
+        }
         state.index_revision_high_water = revision;
         Ok((generation, has_committed))
+    }
+
+    fn commit_worker_candidate<F>(
+        &self,
+        volume: &FixedVolume,
+        owner: u64,
+        generation: u64,
+        final_entries: Vec<IndexEntry>,
+        denied_prefixes: &[String],
+        materialize_replay: F,
+    ) -> Result<u64, FileIndexError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(IndexChangeBatch) -> Result<(), StoreError>,
+        ) -> Result<(), StoreError>,
+    {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if !self.worker_is_current(volume, owner, Some(generation))
+            || !Self::authenticated_mount_matches(&state, volume)
+        {
+            return Err(FileIndexError::Unavailable);
+        }
+        let before_authenticated = state.authenticated_volumes.clone();
+        let mut after_authenticated = before_authenticated.clone();
+        if !after_authenticated.contains(&volume.identity) {
+            after_authenticated.push(volume.identity.clone());
+        }
+        let store = state.store.as_mut().ok_or(FileIndexError::Unavailable)?;
+        let result = store.commit_candidate_streaming(
+            &volume.identity,
+            generation,
+            final_entries,
+            denied_prefixes,
+            (&before_authenticated, &after_authenticated),
+            materialize_replay,
+        );
+        let revision = self.finish_store_write(&mut state, result)?;
+        state.index_revision_high_water = revision;
+        state.authenticated_volumes = after_authenticated;
+        state.quarantined_volumes.remove(&volume.identity);
+        Ok(revision)
     }
 
     pub(crate) fn search(
@@ -2232,10 +3955,8 @@ impl FileIndex {
         let volumes = match inventory() {
             Ok(volumes) => volumes,
             Err(error) => {
-                self.state
-                    .lock()
-                    .expect("file index lock poisoned")
-                    .latch_unavailable(&self.publication_generation);
+                let mut state = self.state.lock().expect("file index lock poisoned");
+                self.latch_process_fatal(&mut state);
                 return Err(error);
             }
         };
@@ -2274,12 +3995,12 @@ impl FileIndex {
         {
             Ok(mounts) => mounts,
             Err(error) => {
-                state.latch_unavailable(&self.publication_generation);
+                self.latch_process_fatal(state);
                 return Err(error);
             }
         };
         let Some(observation) = state.inventory_observation.checked_add(1) else {
-            state.latch_unavailable(&self.publication_generation);
+            self.latch_process_fatal(state);
             return Err(FileIndexError::Unavailable);
         };
         let previous = state
@@ -2294,14 +4015,33 @@ impl FileIndex {
             .filter(|identity| previous.get(*identity) != current.get(*identity))
             .cloned()
             .collect::<HashSet<_>>();
+        if !transitions.is_empty() && state.inventory_previous_authenticated.is_none() {
+            state.inventory_previous_authenticated = Some(state.authenticated_volumes.clone());
+        }
         state
             .pending_inventory_transitions
             .extend(transitions.iter().cloned());
-        state.quarantined_volumes.extend(transitions);
-        state.authenticated_volumes = volumes
-            .iter()
-            .map(|volume| volume.identity.clone())
-            .collect();
+        state
+            .quarantined_volumes
+            .extend(transitions.iter().cloned());
+        if !transitions.is_empty() {
+            let mut workers = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            for identity in &transitions {
+                if let Some(worker) = workers.by_volume.get_mut(identity) {
+                    worker.stop.store(true, Ordering::Release);
+                }
+            }
+        }
+        state
+            .authenticated_volumes
+            .retain(|identity| !transitions.contains(identity));
+        let quarantined = &state.quarantined_volumes;
+        state
+            .authenticated_volumes
+            .retain(|identity| !quarantined.contains(identity));
         state.authenticated_mounts = mounts;
         state.inventory_observation = observation;
         Ok(!state.pending_inventory_transitions.is_empty())
@@ -2309,28 +4049,30 @@ impl FileIndex {
 
     fn reconcile_inventory_locked(&self, state: &mut IndexState) -> Result<bool, FileIndexError> {
         let current_mounts = state.authenticated_mounts.clone();
+        let previous_authenticated = state
+            .inventory_previous_authenticated
+            .clone()
+            .unwrap_or_else(|| state.authenticated_volumes.clone());
         let transitions = state
             .pending_inventory_transitions
             .iter()
             .cloned()
             .collect::<Vec<_>>();
         let quarantined = state.quarantined_volumes.clone();
-        let reconciled = state
+        let result = state
             .store
             .as_mut()
             .ok_or(FileIndexError::Unavailable)
-            .and_then(|store| {
-                store
-                    .reconcile_current_mounts(&current_mounts, &transitions)
-                    .map_err(|_| FileIndexError::Unavailable)
-            });
-        let (identities, revision, changed) = match reconciled {
-            Ok(reconciled) => reconciled,
-            Err(error) => {
-                state.latch_unavailable(&self.publication_generation);
-                return Err(error);
-            }
-        };
+            .map(|store| {
+                store.reconcile_current_mounts(
+                    &current_mounts,
+                    &transitions,
+                    &previous_authenticated,
+                    &quarantined,
+                )
+            })?;
+        let (identities, revision, changed) = self.finish_store_write(state, result)?;
+        state.inventory_previous_authenticated = None;
         state.pending_inventory_transitions.clear();
         state.authenticated_volumes = identities
             .into_iter()
@@ -2383,13 +4125,19 @@ impl FileIndex {
             match state.mode {
                 LifecycleMode::Active if state.admission_open => None,
                 LifecycleMode::Active => return Err(FileIndexError::Unavailable),
-                _ => match begin_lazy_init_locked(
+                _ => match match begin_lazy_init_locked(
                     &mut state,
                     expected_runtime_epoch,
                     &self.publication_generation,
-                )
-                .map_err(|_| FileIndexError::Unavailable)?
-                {
+                ) {
+                    Ok(decision) => decision,
+                    Err(_) => {
+                        if state.fatal_unavailable {
+                            self.latch_process_fatal(&mut state);
+                        }
+                        return Err(FileIndexError::Unavailable);
+                    }
+                } {
                     LazyInitDecision::Start { owner } => Some(owner),
                     LazyInitDecision::ObserveBuilding => {
                         return Ok(empty_batch(
@@ -2423,12 +4171,9 @@ impl FileIndex {
                     state.authenticated_app_data_root = Some(authenticated_root);
                     if let Some(previous) = previous_revision {
                         state.index_revision_high_water = previous;
-                        if state
-                            .advance_revision_locked(&self.publication_generation)
-                            .map_err(|_| FileIndexError::Unavailable)?
-                            != revision
-                        {
-                            state.latch_unavailable(&self.publication_generation);
+                        let advanced = state.advance_revision_locked(&self.publication_generation);
+                        if advanced.is_err() || advanced.ok() != Some(revision) {
+                            self.latch_process_fatal(&mut state);
                             return Err(FileIndexError::Unavailable);
                         }
                     } else {
@@ -2439,7 +4184,7 @@ impl FileIndex {
                     state.admission_open = true;
                 }
                 Err(error) => {
-                    state.latch_unavailable(&self.publication_generation);
+                    self.latch_process_fatal(&mut state);
                     return Err(error);
                 }
             }
@@ -2459,7 +4204,7 @@ impl FileIndex {
         let result = match result {
             Ok(result) => result,
             Err(_) => {
-                state.latch_unavailable(&self.publication_generation);
+                self.latch_process_fatal(&mut state);
                 return Err(FileIndexError::Unavailable);
             }
         };
@@ -2542,29 +4287,42 @@ impl FileIndex {
     }
 
     fn mark_calibration_pending(&self, app_data_root: PathBuf) -> (bool, bool) {
+        self.mark_calibration_pending_with(app_data_root, || {})
+    }
+
+    fn mark_calibration_pending_with<F>(
+        &self,
+        app_data_root: PathBuf,
+        before_linearization: F,
+    ) -> (bool, bool)
+    where
+        F: FnOnce(),
+    {
+        before_linearization();
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if state.mode != LifecycleMode::Active
+            || state.fatal_unavailable
+            || !state.admission_open
+            || state.store.is_none()
         {
-            let state = self.state.lock().expect("file index lock poisoned");
-            if state.mode != LifecycleMode::Active
-                || state.fatal_unavailable
-                || !state.admission_open
-                || state.store.is_none()
-            {
-                return (false, false);
-            }
+            return (false, false);
         }
         let mut coordinator = self
             .coordinator
             .state
             .lock()
             .expect("file index coordinator lock poisoned");
+        if self.coordinator.stop.load(Ordering::Acquire) {
+            return (false, false);
+        }
+        coordinator.active_root = Some(app_data_root.clone());
         if coordinator.pending_root.is_some() || (coordinator.calibrated && !coordinator.running) {
             return (false, false);
         }
         let start_thread = !coordinator.thread_started;
         let Some(wakes) = coordinator.wakes.checked_add(1) else {
             drop(coordinator);
-            let mut state = self.state.lock().expect("file index lock poisoned");
-            state.latch_unavailable(&self.publication_generation);
+            self.latch_process_fatal(&mut state);
             return (false, false);
         };
         coordinator.thread_started = true;
@@ -2586,9 +4344,27 @@ impl FileIndex {
                     if coordinator.stop.load(Ordering::Acquire) {
                         return;
                     }
+                    let now = std::time::Instant::now();
+                    let deadline = state
+                        .volumes
+                        .values()
+                        .filter_map(|runtime| match runtime.calibration {
+                            Calibration::Pending { deadline, .. } => Some(deadline),
+                            Calibration::Idle | Calibration::Running { .. } => None,
+                        })
+                        .min();
+                    if deadline.is_some_and(|deadline| deadline <= now) {
+                        state.pending_root = state.active_root.clone();
+                        if state.pending_root.is_some() {
+                            break;
+                        }
+                    }
+                    let timeout = deadline
+                        .map(|deadline| deadline.saturating_duration_since(now))
+                        .unwrap_or(std::time::Duration::from_millis(250));
                     let waited = coordinator
                         .signal
-                        .wait_timeout(state, std::time::Duration::from_millis(250))
+                        .wait_timeout(state, timeout)
                         .expect("file index coordinator lock poisoned");
                     state = waited.0;
                     if coordinator.stop.load(Ordering::Acquire) || index.strong_count() == 0 {
@@ -2613,10 +4389,48 @@ impl FileIndex {
             .lock()
             .expect("file index coordinator lock poisoned");
         state.running = false;
-        state.calibrated = completed && state.pending_root.is_none();
+        let has_pending_volume = state
+            .volumes
+            .values()
+            .any(|runtime| matches!(runtime.calibration, Calibration::Pending { .. }));
+        state.calibrated = completed && state.pending_root.is_none() && !has_pending_volume;
         if state.pending_root.is_some() {
             coordinator.signal.notify_one();
         }
+    }
+
+    fn finish_volume_attempt(
+        &self,
+        identity: &VolumeIdentity,
+        succeeded: bool,
+        now: std::time::Instant,
+        runtime_epoch: u64,
+        failures_before: u32,
+    ) -> bool {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if state.fatal_unavailable || !state.admission_open || state.store.is_none() {
+            return false;
+        }
+        let mut coordinator = self
+            .coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned");
+        let Some(runtime) = coordinator.volumes.get_mut(identity) else {
+            return false;
+        };
+        if runtime
+            .finish_start_attempt(succeeded, now, runtime_epoch, failures_before)
+            .is_err()
+        {
+            drop(coordinator);
+            self.latch_process_fatal(&mut state);
+            return false;
+        }
+        if !succeeded {
+            self.coordinator.signal.notify_one();
+        }
+        true
     }
 
     #[cfg(not(test))]
@@ -2645,13 +4459,69 @@ impl FileIndex {
         if self.stop_detached_workers(&volumes).is_err() {
             return false;
         }
+        let runtime_epoch = self.runtime_epoch();
+        let now = std::time::Instant::now();
+        {
+            let mut coordinator = self
+                .coordinator
+                .state
+                .lock()
+                .expect("file index coordinator lock poisoned");
+            coordinator.active_root = Some(app_data_root.to_path_buf());
+            for volume in &volumes {
+                coordinator
+                    .volumes
+                    .entry(volume.identity.clone())
+                    .or_default()
+                    .request(now, runtime_epoch);
+            }
+            let current = volumes
+                .iter()
+                .map(|volume| volume.identity.clone())
+                .collect::<HashSet<_>>();
+            coordinator.volumes.retain(|identity, runtime| {
+                if current.contains(identity) {
+                    true
+                } else if runtime.consecutive_failures == 0 {
+                    false
+                } else {
+                    runtime.cancel_pending();
+                    true
+                }
+            });
+        }
         let mut completed = true;
         for volume in volumes {
-            if self
-                .start_volume_worker(volume.clone(), exclusions.clone())
-                .is_err()
-            {
+            let failures_before = {
+                let mut coordinator = self
+                    .coordinator
+                    .state
+                    .lock()
+                    .expect("file index coordinator lock poisoned");
+                coordinator
+                    .volumes
+                    .get_mut(&volume.identity)
+                    .and_then(|runtime| {
+                        runtime
+                            .start_if_due(now, runtime_epoch)
+                            .then_some(runtime.consecutive_failures)
+                    })
+            };
+            let Some(failures_before) = failures_before else {
+                continue;
+            };
+            let result = self.start_volume_worker(volume.clone(), exclusions.clone());
+            if result.is_err() {
                 completed = false;
+            }
+            if !self.finish_volume_attempt(
+                &volume.identity,
+                result.is_ok(),
+                std::time::Instant::now(),
+                runtime_epoch,
+                failures_before,
+            ) {
+                return false;
             }
         }
         completed
@@ -2670,15 +4540,7 @@ impl FileIndex {
             .and_then(|volumes| exclusions(&volumes).map(|excluded| (volumes, excluded)));
         if result.is_err() {
             let mut state = self.state.lock().expect("file index lock poisoned");
-            state.latch_unavailable(&self.publication_generation);
-            let mut coordinator = self
-                .coordinator
-                .state
-                .lock()
-                .expect("file index coordinator lock poisoned");
-            coordinator.pending_root = None;
-            coordinator.running = false;
-            coordinator.calibrated = true;
+            self.latch_process_fatal(&mut state);
         }
         result
     }
@@ -2707,7 +4569,7 @@ impl FileIndex {
             }
             let result = (|| {
                 let index = owner.upgrade().ok_or(FileIndexError::Unavailable)?;
-                if !index.worker_is_current(&worker_volume.identity, owner_id, None) {
+                if !index.worker_is_current(&worker_volume, owner_id, None) {
                     return Err(FileIndexError::Unavailable);
                 }
                 let mut watcher =
@@ -2720,7 +4582,7 @@ impl FileIndex {
                     &worker_stop,
                 )?;
                 worker_generation.store(generation, Ordering::Release);
-                index.complete_volume_calibration(&worker_volume.identity, owner_id)?;
+                index.complete_volume_calibration(&worker_volume, owner_id)?;
                 drop(index);
                 let _ = completed_sender.send(true);
                 loop {
@@ -2783,9 +4645,7 @@ impl FileIndex {
         owner: u64,
         worker_stop: &AtomicBool,
     ) -> Result<u64, FileIndexError> {
-        if worker_stop.load(Ordering::Acquire)
-            || !self.worker_is_current(&volume.identity, owner, None)
-        {
+        if worker_stop.load(Ordering::Acquire) || !self.worker_is_current(volume, owner, None) {
             return Err(FileIndexError::Unavailable);
         }
         let (generation, has_committed) = self.begin_worker_candidate(volume, owner)?;
@@ -2811,22 +4671,27 @@ impl FileIndex {
         let mut replay = EventBuffer::new();
         let mut final_batch = None;
         let scan = loop {
-            if worker_stop.load(Ordering::Acquire)
-                || !self.worker_is_current(&volume.identity, owner, None)
-            {
+            if worker_stop.load(Ordering::Acquire) || !self.worker_is_current(volume, owner, None) {
                 return Err(FileIndexError::Unavailable);
             }
             match scan_receiver.try_recv() {
                 Ok(ScanMessage::Batch(batch)) => {
                     if let Some(previous) = final_batch.replace(batch) {
                         let mut state = self.state.lock().expect("file index lock poisoned");
-                        if !self.worker_is_current(&volume.identity, owner, None) {
+                        if !self.worker_is_current(volume, owner, None)
+                            || !Self::authenticated_mount_matches(&state, volume)
+                        {
                             return Err(FileIndexError::Unavailable);
                         }
+                        let identities = state.authenticated_volumes.clone();
                         let store = state.store.as_mut().ok_or(FileIndexError::Unavailable)?;
-                        let revision = store
-                            .append_candidate(&volume.identity, generation, previous)
-                            .map_err(|_| FileIndexError::Unavailable)?;
+                        let result = store.append_candidate(
+                            &volume.identity,
+                            generation,
+                            previous,
+                            &identities,
+                        );
+                        let revision = self.finish_store_write(&mut state, result)?;
                         state.index_revision_high_water = revision;
                     }
                 }
@@ -2876,36 +4741,29 @@ impl FileIndex {
             .last_sequence()
             .map(|cutoff| replay.take_through(cutoff))
             .unwrap_or_default();
-        let replay = if replay.is_empty() {
-            windows_backend::EventChanges {
-                deleted_prefixes: Vec::new(),
-                entries: Vec::new(),
-            }
-        } else {
-            materialize_events(volume, &replay, exclusions)
-                .map_err(|_| FileIndexError::Unavailable)?
-        };
-        if worker_stop.load(Ordering::Acquire)
-            || !self.worker_is_current(&volume.identity, owner, None)
-        {
+        if worker_stop.load(Ordering::Acquire) || !self.worker_is_current(volume, owner, None) {
             return Err(FileIndexError::Unavailable);
         }
-        let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(&volume.identity, owner, None) {
-            return Err(FileIndexError::Unavailable);
-        }
-        let store = state.store.as_mut().ok_or(FileIndexError::Unavailable)?;
-        let revision = store
-            .commit_candidate(
-                &volume.identity,
-                generation,
-                final_batch.unwrap_or_default(),
-                &replay.deleted_prefixes,
-                replay.entries,
-                &scan.denied_prefixes,
-            )
-            .map_err(|_| FileIndexError::Unavailable)?;
-        state.index_revision_high_water = revision;
+        self.commit_worker_candidate(
+            volume,
+            owner,
+            generation,
+            final_batch.unwrap_or_default(),
+            &scan.denied_prefixes,
+            |apply| {
+                materialize_events(
+                    volume,
+                    &replay,
+                    exclusions,
+                    || {
+                        worker_stop.load(Ordering::Acquire)
+                            || !self.worker_is_current(volume, owner, None)
+                    },
+                    |batch| apply(batch).map_err(|_| BackendError::Platform),
+                )
+                .map_err(|_| StoreError::InvalidData)
+            },
+        )?;
         Ok(generation)
     }
 
@@ -2916,7 +4774,7 @@ impl FileIndex {
         replay: &mut EventBuffer,
         events: &[windows_backend::StructuredEvent],
     ) -> Result<(), FileIndexError> {
-        if !self.worker_is_current(&context.volume.identity, context.owner, None) {
+        if !self.worker_is_current(context.volume, context.owner, None) {
             return Err(FileIndexError::Unavailable);
         }
         let events =
@@ -2927,24 +4785,30 @@ impl FileIndex {
         if !context.has_committed {
             return Ok(());
         }
-        let changes = materialize_events(context.volume, &events, context.exclusions)
-            .map_err(|_| FileIndexError::Unavailable)?;
-        if changes.deleted_prefixes.is_empty() && changes.entries.is_empty() {
-            return Ok(());
-        }
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(&context.volume.identity, context.owner, None) {
+        if !self.worker_is_current(context.volume, context.owner, None)
+            || !Self::authenticated_mount_matches(&state, context.volume)
+        {
             return Err(FileIndexError::Unavailable);
         }
+        let identities = state.authenticated_volumes.clone();
         let store = state.store.as_mut().ok_or(FileIndexError::Unavailable)?;
-        let revision = store
-            .apply_committed_changes_during_scan(
-                &context.volume.identity,
-                context.generation,
-                changes.deleted_prefixes.iter().map(String::as_str),
-                changes.entries,
-            )
-            .map_err(|_| FileIndexError::Unavailable)?;
+        let result = store.apply_committed_streaming(
+            &context.volume.identity,
+            context.generation,
+            &identities,
+            |apply| {
+                materialize_events(
+                    context.volume,
+                    &events,
+                    context.exclusions,
+                    || !self.worker_is_current(context.volume, context.owner, None),
+                    |batch| apply(batch).map_err(|_| BackendError::Platform),
+                )
+                .map_err(|_| StoreError::InvalidData)
+            },
+        );
+        let revision = self.finish_store_write(&mut state, result)?;
         state.index_revision_high_water = revision;
         Ok(())
     }
@@ -2958,41 +4822,42 @@ impl FileIndex {
         owner: u64,
         events: &[windows_backend::StructuredEvent],
     ) -> Result<(), FileIndexError> {
-        if !self.worker_is_current(&volume.identity, owner, Some(generation)) {
+        if !self.worker_is_current(volume, owner, Some(generation)) {
             return Err(FileIndexError::Unavailable);
         }
         let events = filter_replay_events(&volume.identity, events, exclusions);
         if events.is_empty() {
             return Ok(());
         }
-        let changes = materialize_events(volume, &events, exclusions)
-            .map_err(|_| FileIndexError::Unavailable)?;
-        if changes.deleted_prefixes.is_empty() && changes.entries.is_empty() {
-            return Ok(());
-        }
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(&volume.identity, owner, Some(generation)) {
+        if !self.worker_is_current(volume, owner, Some(generation))
+            || !Self::authenticated_mount_matches(&state, volume)
+            || state.fatal_unavailable
+            || !state.admission_open
+        {
             return Err(FileIndexError::Unavailable);
         }
-        if state.fatal_unavailable || !state.admission_open {
-            return Err(FileIndexError::Unavailable);
-        }
+        let identities = state.authenticated_volumes.clone();
         let store = state.store.as_mut().ok_or(FileIndexError::Unavailable)?;
-        let revision = store
-            .apply_live_changes(
-                &volume.identity,
-                generation,
-                changes.deleted_prefixes.iter().map(String::as_str),
-                changes.entries,
-            )
-            .map_err(|_| FileIndexError::Unavailable)?;
+        let result =
+            store.apply_live_streaming(&volume.identity, generation, &identities, |apply| {
+                materialize_events(
+                    volume,
+                    &events,
+                    exclusions,
+                    || !self.worker_is_current(volume, owner, Some(generation)),
+                    |batch| apply(batch).map_err(|_| BackendError::Platform),
+                )
+                .map_err(|_| StoreError::InvalidData)
+            });
+        let revision = self.finish_store_write(&mut state, result)?;
         state.index_revision_high_water = revision;
         Ok(())
     }
 
     fn complete_volume_calibration(
         &self,
-        volume: &VolumeIdentity,
+        volume: &FixedVolume,
         owner: u64,
     ) -> Result<(), FileIndexError> {
         let generation = self
@@ -3000,9 +4865,12 @@ impl FileIndex {
             .lock()
             .expect("file index worker lock poisoned")
             .by_volume
-            .get(volume)
+            .get(&volume.identity)
             .filter(|worker| {
-                worker.owner == owner && !worker.failed && !worker.stop.load(Ordering::Acquire)
+                worker.owner == owner
+                    && worker.mount_point == volume.mount_point
+                    && !worker.failed
+                    && !worker.stop.load(Ordering::Acquire)
             })
             .map(|worker| worker.generation.load(Ordering::Acquire))
             .filter(|generation| *generation != 0)
@@ -3011,23 +4879,56 @@ impl FileIndex {
             return Err(FileIndexError::Unavailable);
         }
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(volume, owner, Some(generation)) {
+        if !self.worker_is_current(volume, owner, Some(generation))
+            || !Self::authenticated_mount_matches(&state, volume)
+        {
             return Err(FileIndexError::Unavailable);
         }
-        state.quarantined_volumes.remove(volume);
+        state.quarantined_volumes.remove(&volume.identity);
         Ok(())
     }
 
     fn handle_worker_failure(&self, volume: &FixedVolume, owner: u64) {
+        let completed_generation = self
+            .workers
+            .lock()
+            .expect("file index worker lock poisoned")
+            .by_volume
+            .get(&volume.identity)
+            .filter(|worker| worker.owner == owner)
+            .map(|worker| worker.generation.load(Ordering::Acquire))
+            .unwrap_or(0);
         if !self.mark_worker_stopped(&volume.identity, owner) {
             return;
         }
         let _ = self.mark_fixed_volume_dirty(volume);
-        self.coordinator
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if state.fatal_unavailable || !state.admission_open || state.store.is_none() {
+            return;
+        }
+        let mut coordinator = self
+            .coordinator
             .state
             .lock()
-            .expect("file index coordinator lock poisoned")
-            .calibrated = false;
+            .expect("file index coordinator lock poisoned");
+        coordinator.calibrated = false;
+        if completed_generation != 0 {
+            let runtime_epoch = self.runtime_epoch();
+            let runtime = coordinator
+                .volumes
+                .entry(volume.identity.clone())
+                .or_default();
+            runtime.calibration = Calibration::Running { runtime_epoch };
+            if runtime
+                .finish_failure(std::time::Instant::now(), runtime_epoch)
+                .is_err()
+            {
+                drop(coordinator);
+                self.latch_process_fatal(&mut state);
+                return;
+            }
+            self.coordinator.signal.notify_one();
+        }
     }
 
     #[cfg(test)]
