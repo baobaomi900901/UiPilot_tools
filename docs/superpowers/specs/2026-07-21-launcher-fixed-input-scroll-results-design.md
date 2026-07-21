@@ -49,14 +49,14 @@
 
 1. `html`、`body`、`#app` 继续拥有 WebView 可用高度并阻止页面级滚动。
 2. `#app > .ant-app` 取得 `#app` 的完整高度，使后代百分比高度有确定基准。
-3. `.launcher-surface` 继续限制在可用高度和现有 `420px` 上限内，并以 `minmax(0, 1fr) minmax(24px, auto)` 分配“当前视图”和“状态栏”。
+3. `.launcher-surface` 继续限制在可用高度和现有 `420px` 上限内，并以 `minmax(52px, 1fr) minmax(24px, auto)` 分配“当前视图”和“状态栏”。首轨的 `52px` 下限精确覆盖 `44px` 输入行与 `8px` 间距，即使结果轨缩至零也不允许状态栏侵入输入区域。
 4. 启动器视图内，`.launcher-view` 继续以 `44px minmax(0, 1fr)` 分配“搜索输入框”和“结果区域”，两行之间保留现有间距。
 
 因此三段最终表现为：
 
 - 顶部输入框：固定占用现有 `44px` 行，不参与滚动。
 - 中间结果区：取得扣除输入框、间距、状态栏和外层 padding 后的全部剩余高度。
-- 底部状态栏：位于 `.launcher-surface` 的独立末行，最小高度保持 `24px`；长文本允许换行并向上占用空间，但不进入结果滚动容器，也不覆盖输入框或结果。
+- 底部状态栏：位于 `.launcher-surface` 的独立末行，最小高度保持 `24px`、最大高度限制为 `72px`；长文本允许换行，超过上限的视觉内容由 `overflow: hidden` 裁切，不建立第二滚动区，也不覆盖输入框或结果。完整状态文本仍保留在 DOM 中并由现有 live region 宣告。
 
 这里的“固定”由 Grid 行所有权实现，不使用 `position: fixed`、绝对定位或硬编码视口坐标。
 
@@ -103,6 +103,7 @@
 - 滚动容器仍是已有 `listbox`，不增加新的可聚焦包装层或 Tab 停靠点。
 - `aria-activedescendant` 与 `aria-selected` 继续反映同一选中项；程序滚动不转移输入焦点。
 - `.status-region` 继续使用 `role="status"`、`aria-live="polite"` 和 `aria-atomic="true"`，且始终位于结果滚动区之外。
+- 状态文本超过 `72px` 时只裁切视觉呈现，不删除、缩写或改写 DOM 文本，因此辅助技术仍收到完整消息。
 - 长标题、副标题、状态文本、系统缩放和浏览器缩放不得造成三段重叠；中间结果区可以缩小并滚动。
 - 深色模式、强制颜色和现有可见焦点样式保持不变。
 
@@ -111,7 +112,7 @@
 预期实现只涉及：
 
 - `src/styles.css`：补齐 `.ant-app` 根高度链；只有测试证明现有 Spin 链不足时才调整同一文件中的既有高度选择器。
-- `src/launcher.test.tsx`：保留现有 `scrollIntoView({ block: 'nearest' })` 行为测试，并增加最小布局和滚动条视觉契约检查。
+- `src/launcher.test.tsx`：保留现有 `scrollIntoView({ block: 'nearest' })` 行为测试，并用真实挂载 DOM 的 computed styles 覆盖外层首轨下限、Spin 完整收缩链、状态边界、唯一滚动所有权和滚动条视觉契约。
 
 `src/launcher-view.tsx`、`src/launcher-core.ts`、协议文件、Rust 文件、依赖清单和窗口配置保持不变。
 
@@ -119,17 +120,19 @@
 
 自动验证：
 
-- 先用一个聚焦前端测试证明根高度链缺失，再做最小 CSS 修复使其通过。
+- 用挂载后的 React/AntD DOM 注入生产 CSS，检查 `.launcher-surface`、`.launcher-view`、两个 Spin 包装层、`.result-list` 与 `.status-region` 的最终声明值和滚动所有权。
 - 保持现有键盘选中、焦点、ARIA 和 `scrollIntoView({ block: 'nearest' })` 测试通过。
 - 运行完整 `npm.cmd test -- --run` 和 `npm.cmd run build`。
 - 用源码检查确认启动器只有 `.result-list` 拥有 `overflow-y: auto`，并确认没有新增 DOM、依赖、后端或协议变更。
-- 用聚焦测试确认滚动条宽度、默认可见和强制颜色回退均只作用于 `.result-list`，并确认不存在 hover 后才显示的分支。
+- 用聚焦测试确认透明轨道、`6px` 宽度、浅色/深色默认变量、默认可见滑块和强制颜色最终规则均只作用于 `.result-list`，并确认不存在 hover 后才显示的分支。
+
+jsdom 不执行真实布局和像素测量，因此自动测试只能证明 DOM 层级与 CSS cascade 契约。实现 gate 另用一次无持久化测试文件的真实 Chromium `720 x 210` 受限视口验证，注入生产 CSS 和与 React/AntD 输出一致的结构，确认输入、结果、状态矩形不重叠，状态视觉高度不超过 `72px`，且 launcher 只有结果列表可纵向滚动。该浏览器证据不替代用户在 Tauri/WebView2 中的人工验收。
 
 人工验证使用现有开发启动方式，在结果足以超过可视高度时确认：
 
 - 滚轮或拖动滚动条只移动结果行；输入框和状态栏不动。
 - 连续按上下方向键时选中项始终可见，滚动距离遵循 nearest 行为。
-- 加载中、无结果、错误状态和长状态文本不与输入框或结果重叠。
+- 加载中、无结果、错误状态和长状态文本不与输入框或结果重叠；极端长状态超过 `72px` 时视觉裁切但 live region 保留完整文本。
 - 100%、150% 和 200% 缩放下三段仍有明确边界，结果区在空间不足时滚动。
 
 ## 完成标准
