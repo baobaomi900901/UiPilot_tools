@@ -1,0 +1,2605 @@
+# `/find` Local File Search Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add the reviewed `/find` local file and folder search panel to the integrated keyboard-first launcher, backed by a lazy Windows metadata index that never reads file contents and that reuses the one launcher invocation, result registry, execution command, and hide lifecycle.
+
+**Architecture:** A single managed Rust `FileIndex` owns SQLite metadata, one coordinator, per-volume scanner/watcher state, publication/admission, corruption recovery, and secure indexed-path execution. `ResultRegistry` gains a narrow query domain and file action variant rather than a second registry. The existing Task 7 `LauncherCore` owns file-mode query, revision, refresh, selection, and preference state; the React/Ant Design view remains a thin snapshot renderer, and only `src/main.ts` talks to Tauri.
+
+**Tech Stack:** Rust/Cargo `1.96.1` with package `rust-version = "1.96.0"`; Tauri `2.11.3`; `windows 0.61.3`; `rusqlite 0.40.1`; bundled `libsqlite3-sys 0.38.1` / SQLite `3.53.2`; `icu_casemap 1.5.1`; `unicode-normalization 0.1.23`; the exact React 19 / Ant Design 6 / TypeScript / Vitest versions already approved and integrated by Foundation Task 7.
+
+## Global Constraints
+
+- R1 supersedes only the executable baseline and evidence names in the original Plan Go `ebe9e426ac9b99d87407407ced4a16fd7bd34ba4`; every product, dependency, trust, test, and delivery contract below remains unchanged unless this R1 amendment says otherwise.
+- The first Task 0 run is immutable failed evidence: Steps 1-5 passed on baseline `996a9bfb361df76d922de73c283adc7470012d39`, then Step 6 stopped because the production `cargo build` exposed the `HotkeyHook` `HHOOK` Send/Sync and `SetWindowsHookExW` signature failures. Preserve `codex/find-local-file-search`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search`, `foundation-find-approved-design`, `foundation-find-approved-plan`, and `foundation-find-implementation-baseline` exactly as that run left them. Never delete, move, reset, rebase, merge, cherry-pick, or reuse any of those refs or paths.
+- Baseline Corrective B0 Code Go and Integration Go are bound exactly to `5af0962a09ee0865ef519bb3a4930027a4593fe7`. R1 Task 0 must authenticate that commit as an ancestor of the then-current clean `main`; it may not substitute an unreviewed hotkey correction.
+- R1 uses only `codex/find-local-file-search-r1`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r1`, `foundation-find-approved-plan-r1`, and `foundation-find-implementation-baseline-r1`. Existing names are a hard stop and are never deleted or reused. `foundation-find-approved-design` remains the one design tag and must resolve exactly to Design Go `675e42ba705938fbf8188460b134a793b4be3d97`.
+- Written R1 Plan Go continues to use `UIPILOT_FIND_APPROVED_PLAN_COMMIT`, but its value must be the exact commit containing this R1 plan. After R1 Plan Go, the next execution round starts Task 0 at Step 1. Task 0 is preflight only and does not receive a separate Code Go; only its complete PASS may enter Task 1 RED. Any Task 0 failure creates no product commit and forbids Task 1.
+- Tasks 1-12 each produce exactly one detailed Chinese commit after their own RED, minimal GREEN, and prescribed verification pass. Every subject and body is Chinese; every body records target/root cause, exact implementation scope, RED/GREEN evidence, and the boundary that was not expanded. Immediately after each task commit, the development agent stops and requests that task's written Code Go; it never integrates `main`.
+- After a task's Code Go, the reviewer may integrate only when the primary `main` worktree is clean and its HEAD is exactly that task commit's parent. The only integration command is `git merge --ff-only <approved-feature-commit>`. The reviewer then reruns that task's prescribed full/integration gates on `main` and issues written Integration Go. Only that Integration Go permits the next task. Dirty, diverged, or non-fast-forward state is a hard stop; never substitute rebase, cherry-pick, an implicit merge commit, or a hidden baseline rewrite.
+- The development agent never controls or injects mouse or keyboard input during development, diagnosis, tests, evidence collection, or review. It does not move/click the pointer, simulate keys, paste from the clipboard, invoke UI automation input/click actions, or drive the real product through a browser automation surface. Headless unit/integration tests may call pure controller/state methods with inert typed fixtures; they may not synthesize OS/browser input into a real product process.
+- A checkpoint requiring real click, typing, navigation keys, IME, tray interaction, theme/forced-colors/Narrator changes, zoom, or a file chooser is `HITL Pending/No-Go` until the user performs one explicitly requested short operation group and reports completion/observations. The agent stops before each group, never infers or substitutes the action, and only after the reply reads fixed logs or state. Missing HITL evidence is never PASS.
+- Automated activity is limited to noninteractive commands, builds, headless unit/integration tests, static checks, and read-only process/window/log/state authentication. A minimal diagnostic seam may expose only fixed event categories, booleans, counts, phases, timings, and fixed error codes; it never exposes query text, content, file names, full paths, usernames, IDs, clipboard data, or raw event payloads, and adds no remote interface, permission, or input-control capability.
+- CDP evidence is read-only: the sole permitted call reads one approved aggregate object by value and cannot call a function that mutates product or DOM state. No CDP method may dispatch input. Any missing aggregate key or requested product mutation is No-Go.
+- Every Task 0-12 checkpoint report has three explicit sections: `Automated`, `HITL`, and `Not executed`. It reports every pending/manual group as pending or completed with the user's observation, and never promotes an unperformed row to PASS.
+
+```text
+R1_INPUT_AUTOMATION_DENYLIST_BEGIN
+SendKeys
+SendInput
+keybd_event
+mouse_event
+UIAutomation input or click
+Playwright product driving
+CDP Input.dispatch*
+clipboard paste triggering
+synthetic OS/browser input into the real product
+R1_INPUT_AUTOMATION_DENYLIST_END
+```
+- Design Go is bound to `675e42ba705938fbf8188460b134a793b4be3d97` and exact file `docs/superpowers/specs/2026-07-20-find-local-file-search-design.md`. Dependency/Rust-floor Go accepts the SQLite `3.53.2` versus `3.53.3` residual patch risk only under the exact freeze below.
+- This plan is not implementation authorization. Execution requires a written Plan Go naming this plan's exact 40-hex commit, an independently reviewed Task 7 Code Go, and a clean Task 7 integration on the then-current local `main`.
+- Current `main` at plan authoring is `a8626e72e97a5caa924333e6d6545efe9cd2e6d0` and does not contain Task 7 React/Ant Design production files. Do not implement `/find` from that commit.
+- `D:\code\UiPilot_tools\.worktrees\foundation-task-7` at plan authoring is dirty at `28f058be94d4fadb0b490b08f4bb5f99a77c08f0`. It is read-only historical interface evidence, not an approved baseline. Do not modify, clean, commit, merge, or base work on it.
+- Task 0 must use the `using-git-worktrees` skill and create a new implementation branch/worktree from the then-current clean `main`. Never implement in this design worktree, the Task 7 worktree, another feature worktree, or the primary `main` worktree.
+- At execution, authenticate the written Task 7 Code Go SHA as an ancestor of `main`, authenticate all expected Task 7 files and command/event interfaces, and rerun its baseline tests. Any drift from the interfaces named below stops execution and returns this plan to written review.
+- Keep Ponytail/YAGNI boundaries: no ORM, async runtime, migration framework, generic repository, generic scheduler, command registry, plugin API, second result registry, task registry, channel bus, file-content reader, thumbnailer, telemetry, or speculative USN Journal abstraction.
+- The only new Rust module tree is `src-tauri/src/file_index/`: `mod.rs` owns publication/admission, coordinator, lifecycle, recovery, and wire-facing state; `store.rs` owns schema, transactions, query, integrity, and the two raw SQLite collation registrations; `windows_backend.rs` owns Win32 volume identity, enumeration, watcher, pinning, and Shell calls. This is a responsibility split, not a framework: add no traits, repository layer, service locator, scheduler abstraction, or cross-module generic facade. Tests stay beside the owning code and use private local closure seams.
+- Freeze package metadata exactly:
+
+```toml
+[package]
+rust-version = "1.96.0"
+
+[dependencies]
+icu_casemap = { version = "=1.5.1", default-features = false, features = ["compiled_data"] }
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
+unicode-normalization = { version = "=0.1.23", default-features = false, features = ["std"] }
+```
+
+- Add root `rust-toolchain.toml` with exact content:
+
+```toml
+[toolchain]
+channel = "1.96.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+```
+
+- The resolved native identity is exactly `libsqlite3-sys 0.38.1`, bundled SQLite `3.53.2`, and `sqlite_source_id()` equal to `2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24`.
+- The Unicode algorithm ID is exactly `uipilot-unicode-15.1-full-fold-nfc-v1`. The only pipeline is NFC, ICU4X default full non-Turkic case fold, then NFC. Do not use lowercase, Turkic fold, NFKC, `icu_normalizer`, a handwritten table, or SQLite case conversion.
+- `ICU4X_DATA_DIR` must be absent from the process environment; an empty value is forbidden because `icu_casemap_data 1.5.1` build.rs treats presence as custom data. Reject it before Cargo runs. The build script performs no network access when the variable is absent.
+- Reject presence, including empty strings, of `LIBSQLITE3_SYS_USE_PKG_CONFIG`, `LIBSQLITE3_FLAGS`, `SQLITE_MAX_VARIABLE_NUMBER`, `SQLITE_MAX_EXPR_DEPTH`, and `SQLITE_MAX_COLUMN`. Require the MSVC C compiler selected by Cargo. Do not activate bindgen or require Clang.
+- After the approved crate archives are fetched and checksum-verified, every dependency build/test/check/Clippy command is `--locked --offline` with an isolated `CARGO_HOME`. No git dependency, custom amalgamation, vcpkg/system SQLite, SQLCipher, SQLite session/loadable-extension feature, ICU serde/datagen/blob provider, or extra locale/normalizer data is allowed.
+- Add exactly two direct `windows 0.61.3` feature trust inputs: `Win32_Globalization` for `CompareStringOrdinal` and `Win32_System_IO` for watcher cancellation/overlapped I/O. Do not rely on a Tauri/plugin transitive Windows feature.
+- The relevant dependency subtrees/inverse roots must remain exactly:
+  - `uipilot root dependency graph -> rusqlite/bundled -> rusqlite/modern_sqlite + libsqlite3-sys/bundled -> libsqlite3-sys/bundled_bindings + cc`;
+  - `uipilot root dependency graph -> icu_casemap/compiled_data -> icu_casemap_data + icu_properties/compiled_data -> icu_properties_data` plus the required ICU4X 1.5 provider/collections/locid chains reported by `cargo tree -e features`;
+  - `uipilot root dependency graph -> unicode-normalization/std`.
+  In these exact 0.40.1/0.38.1/ICU4X-1.5/0.1.23 subtrees, bindgen, SQLCipher, session, loadable extension, ICU serde/datagen/buffer/blob provider, `icu_normalizer` 1.x, and non-bundled SQLite source features must be absent. Baseline `icu_normalizer 2.2.0` and unrelated baseline serde features are explicitly outside this incremental rejection rule and remain byte/lock-identical.
+- The frozen candidate `src-tauri/Cargo.lock` SHA-256 is `49E9DB86F063353050BCD53C3127FBBD4BB43A3DABA4ED1293C2FFE482F62018`. It changes package blocks from 478 to 501: exactly 23 additions, zero removals, and zero existing registry version/checksum changes. Eleven existing registry package blocks may change only dependency-reference text to version-qualified names.
+- The 23 exact additions are listed in Appendix A. The 11 exact existing blocks are listed in Appendix B. Any other lock delta stops execution.
+- Before creating the implementation worktree, recheck crates.io and the official SQLite release record. If an official, crates.io-published, lockable `rusqlite`/`libsqlite3-sys` bundled combination provides SQLite `3.53.3` or newer while satisfying the approved Rust floor, stop and request a new Dependency Go. Never silently upgrade or substitute sources.
+- File search is built into UiPilot, not a plugin. Keep `ReleaseSecurityBlocked / SEC-RUNTIME-PROBE-001`; do not run, repair, relax, or delete the runtime positive probe or its evidence worktrees.
+- Existing Task 6/Task 7 behavior is frozen. Application search, application execution side effects/error priority, lifecycle readiness/show/modal/clean handling, settings aliases/hotkey/autostart, CSP, `withGlobalTauri`, and security probe behavior must remain green.
+- The Tauri trust delta is exact: add generated command permissions `allow-search-files` and `allow-set-file-preview-preference`, add only those two strings to `src-tauri/capabilities/main.json`, and add only those two exact expected strings to `scripts/check-security-config.ps1`. Do not add wildcard/scoped permissions or change any other checker logic. `scripts/test-security-config.ps1`, probe config/code, CSP, window config, and every other security input remain byte-identical; the existing malicious-fixture regression must pass against the narrowed updated allowlist.
+- Keep the caller guard as the first executable statement of every new command. Invalid callers and invalid file-query wire values must produce zero registry, `FileIndex`, SQLite, scanner, watcher, filesystem, settings, or window access.
+- Reuse the exact Task 7 `querySequence` and `invocationId`. Only `launcher://shown` resets sequence to zero. `/find`, including empty `/find`, checked-increments the current sequence and calls `search_files` after the file-index listener is installed.
+- Reuse one `ResultRegistry`, one action mapping, one `execute_result`, and one `clear_and_hide`. `OpenIndexedPath` never reaches application validation, use counts, or `AppCache`.
+- Full paths are sensitive local DTO data. They may appear only in the main WebView's file result/preview state. They must not enter logs, validation events/exports, markers, telemetry, network, test snapshots committed with machine paths, or error strings.
+- Scanner and watcher may enumerate names and read attributes, type, size, and modification time. They must never open result files for content. Always exclude the authenticated UiPilot app-data subtree and exact DB/WAL/SHM names before metadata or DB work.
+- Use fixed error/status strings and wire enums from the approved design. Never forward raw SQL, OS, Shell, path, or thrown messages to the WebView.
+- File-mode presentation text is exact and local: `building -> 索引正在建立或校准。`, `partial -> 部分位置无法访问。`, `rebuilding -> 索引正在重建。`, `unavailable/fileSearchWorkerFailed/searchUnavailable -> 搜索暂不可用。`, `invalidFileQuery -> 查询无效。`, preview persistence failure -> `无法保存文件预览设置。`, `fileNotFound -> 文件已不存在。`, and `fileOpenFailed -> 无法在资源管理器中打开。`. Empty ready results use `共 0 条结果`; do not reuse raw `CommandError.message`.
+- Keep commits append-only, task-scoped, and in the order below. Do not amend or rewrite a reviewed commit. A failed task remains uncommitted until its own GREEN and verification pass.
+
+### Exact implementation file ceiling
+
+Only these paths may differ from the implementation baseline after all tasks:
+
+```text
+.gitignore
+rust-toolchain.toml
+src-tauri/Cargo.toml
+src-tauri/Cargo.lock
+src-tauri/capabilities/main.json
+src-tauri/permissions/autogenerated/search_files.toml
+src-tauri/permissions/autogenerated/set_file_preview_preference.toml
+src-tauri/src/commands.rs
+src-tauri/src/file_index/mod.rs
+src-tauri/src/file_index/store.rs
+src-tauri/src/file_index/windows_backend.rs
+src-tauri/src/lib.rs
+src-tauri/src/lifecycle.rs
+src-tauri/src/result_registry.rs
+src-tauri/src/settings.rs
+src/launcher-core.ts
+src/launcher-view.tsx
+src/launcher.test.tsx
+src/main.ts
+src/protocol.ts
+src/styles.css
+docs/spikes/2026-07-20-find-local-file-search-evidence.md
+scripts/check-security-config.ps1
+scripts/test-find-evidence.ps1
+scripts/test-find-performance.ps1
+```
+
+`package.json`, `package-lock.json`, `tsconfig.json`, `index.html`, `vite.config.ts`, `src/native-input.ts`, `security-probe.html`, `src/security-probe.ts`, `scripts/test-security-config.ps1`, every other security script/config, Tauri config/CSP, every existing permission file, `src-tauri/build.rs`, and every path outside the ceiling remain byte-identical to the implementation baseline.
+
+### Required Cargo shell preamble
+
+Every PowerShell session used after Task 1 Step 3 must run this exact preamble before any Cargo command. It is execution-session state, not a repository script:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$forbidden = @('ICU4X_DATA_DIR','LIBSQLITE3_SYS_USE_PKG_CONFIG','LIBSQLITE3_FLAGS','SQLITE_MAX_VARIABLE_NUMBER','SQLITE_MAX_EXPR_DEPTH','SQLITE_MAX_COLUMN')
+$environment = [Environment]::GetEnvironmentVariables()
+foreach ($key in $forbidden) {
+  if ($environment.Contains($key)) { throw "forbidden dependency environment key present: $key" }
+}
+$env:CARGO_HOME = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+if (-not (Test-Path -LiteralPath $env:CARGO_HOME -PathType Container)) { throw 'approved isolated Cargo home is missing' }
+$rustVersion = (& rustc +1.96.1 --version)
+if ($LASTEXITCODE -ne 0 -or $rustVersion -notmatch '^rustc 1\.96\.1 ') { throw 'Rust 1.96.1 is not active' }
+$cargoVersion = (& cargo +1.96.1 --version)
+if ($LASTEXITCODE -ne 0 -or $cargoVersion -notmatch '^cargo 1\.96\.1 ') { throw 'Cargo 1.96.1 is not active' }
+```
+
+Every later `cargo` command shown without an explicit `+1.96.1` runs only after this preamble and the committed root toolchain file have both been authenticated. If the preamble cannot run, the task is Not Runnable; do not fall back to another Cargo home or toolchain.
+
+---
+
+### Task 0: Authenticate the approved inputs and create a fresh implementation worktree
+
+**Files:** No repository file changes.
+
+**Interfaces:**
+- Consumes: written R1 `/find` Plan Go, Design Go `675e42ba705938fbf8188460b134a793b4be3d97`, written Dependency/Rust-floor Go, B0 Code/Integration Go `5af0962a09ee0865ef519bb3a4930027a4593fe7`, written Task 7 Code Go, and a clean local `main` containing both approved integrations.
+- Produces: one isolated `codex/find-local-file-search-r1` worktree, immutable R1 evidence tags, and a recorded R1 implementation baseline SHA; no product diff.
+
+**Evidence split:** Automated: owner/ref/interface, dependency recheck, worktree, baseline build/test/Clippy/frontend/security, and clean-state gates. HITL: none. Not executed: product edits, Task 1, real product interaction, input automation, runtime positive probe, integration, or release.
+
+- [ ] **Step 1: Load the required execution skills and authenticate owner/worktree context.**
+
+Use `using-git-worktrees` before any branch or worktree operation, then use `executing-plans` or `subagent-driven-development` for Tasks 1-12. Run from `D:\code\UiPilot_tools`. Refuse a dubious-ownership bypass or `safe.directory` mutation. Require the primary main worktree, design worktree, and Task 7 evidence worktree to be distinct resolved paths.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$designCommit = '675e42ba705938fbf8188460b134a793b4be3d97'
+$historicalPlanCommit = 'ebe9e426ac9b99d87407407ced4a16fd7bd34ba4'
+$historicalBaseline = '996a9bfb361df76d922de73c283adc7470012d39'
+$baselineCorrective = '5af0962a09ee0865ef519bb3a4930027a4593fe7'
+$planCommit = $env:UIPILOT_FIND_APPROVED_PLAN_COMMIT
+$task7CodeGo = $env:UIPILOT_TASK7_CODE_GO_SHA
+if ($planCommit -notmatch '^[0-9a-f]{40}$') { throw 'missing written /find Plan Go commit' }
+if ($task7CodeGo -notmatch '^[0-9a-f]{40}$') { throw 'missing written Task 7 Code Go commit' }
+if ((git rev-parse --show-toplevel) -cne 'D:/code/UiPilot_tools') { throw 'wrong main root' }
+if ($LASTEXITCODE -ne 0) { throw 'main root authentication failed' }
+if ((git branch --show-current) -cne 'main') { throw 'main branch is not checked out' }
+if ($LASTEXITCODE -ne 0) { throw 'main branch authentication failed' }
+$mainStatus = @(git status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $mainStatus.Count -ne 0) { throw 'main must be clean' }
+$baseline = (git rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $baseline -notmatch '^[0-9a-f]{40}$') { throw 'invalid main baseline' }
+git merge-base --is-ancestor $baselineCorrective $baseline
+if ($LASTEXITCODE -ne 0) { throw 'B0 Code/Integration Go is not integrated in main' }
+git merge-base --is-ancestor $task7CodeGo $baseline
+if ($LASTEXITCODE -ne 0) { throw 'Task 7 Code Go is not integrated in main' }
+git cat-file -e "$designCommit`:docs/superpowers/specs/2026-07-20-find-local-file-search-design.md"
+if ($LASTEXITCODE -ne 0) { throw 'approved design blob is missing' }
+git cat-file -e "$planCommit`:docs/superpowers/plans/2026-07-20-find-local-file-search.md"
+if ($LASTEXITCODE -ne 0) { throw 'approved plan blob is missing' }
+$historicalEvidence = [ordered]@{
+  'foundation-find-approved-design' = $designCommit
+  'foundation-find-approved-plan' = $historicalPlanCommit
+  'foundation-find-implementation-baseline' = $historicalBaseline
+}
+foreach ($entry in $historicalEvidence.GetEnumerator()) {
+  git show-ref --verify --quiet "refs/tags/$($entry.Key)"
+  if ($LASTEXITCODE -ne 0) { throw "historical evidence tag is missing: $($entry.Key)" }
+  if ((git rev-parse "$($entry.Key)^{commit}").Trim() -cne $entry.Value) { throw "historical evidence tag moved: $($entry.Key)" }
+  if ($LASTEXITCODE -ne 0) { throw "historical evidence tag cannot be read: $($entry.Key)" }
+}
+$planSource = (git show "$planCommit`:docs/superpowers/plans/2026-07-20-find-local-file-search.md") -join "`n"
+if ($LASTEXITCODE -ne 0) { throw 'approved R1 plan source cannot be read' }
+$commitLines = @($planSource -split "`n" | Where-Object { $_.StartsWith('git commit -m "', [StringComparison]::Ordinal) })
+if ($commitLines.Count -ne 12) { throw 'R1 plan must contain exactly 12 task commit commands' }
+$powershellBodies = @([regex]::Matches($planSource, '(?ms)^```powershell\s*\r?\n(.*?)^```\s*$') | ForEach-Object { $_.Groups[1].Value })
+$powershellCommitLines = @(($powershellBodies -join "`n") -split "`n" | Where-Object { $_.StartsWith('git commit -m "', [StringComparison]::Ordinal) })
+if ($powershellCommitLines.Count -ne 12) { throw 'every task commit command must be inside an executable PowerShell fence' }
+$legacySubjects = @($commitLines | Where-Object { $_ -match '^git commit -m "(?:build|feat|test|docs): ' })
+if ($legacySubjects.Count -ne 0) { throw 'legacy English task commit subject remains' }
+foreach ($line in $commitLines) {
+  if ($line -notmatch '^git commit -m "[^"\r\n]*[一-龥][^"\r\n]*"(?: -m "[^"\r\n]+")+$') { throw "task commit command is not one executable Chinese subject/body line: $line" }
+  if ([regex]::Matches($line, ' -m "').Count -ne 5) { throw "task commit subject/body field count drifted: $line" }
+  foreach ($label in @('目标与根因：','实现范围：','RED/GREEN验证：','边界：')) {
+    if (-not $line.Contains($label)) { throw "task commit body label missing: $label" }
+  }
+}
+if ([regex]::Matches($planSource, '(?m)^Expected checkpoint: commit succeeds; stop and request Task (?:[1-9]|1[0-2]) Code Go\. ').Count -ne 12) {
+  throw 'per-task Code Go checkpoint count drifted'
+}
+foreach ($fragment in @(
+  ('The only integration command is `git merge --ff-only ' + '<approved-feature-commit>`.'),
+  ('The reviewer then reruns that task''s prescribed full/' + 'integration gates on `main` and issues written Integration Go.'),
+  ('the development agent stops and requests that task''s written Code Go; it never integrates ' + '`main`.'),
+  ('never substitute rebase, cherry-pick, an implicit merge commit, or a hidden baseline ' + 'rewrite.')
+)) {
+  if ([regex]::Matches($planSource, [regex]::Escape($fragment)).Count -ne 1) { throw "R1 delivery protocol fragment count drifted: $fragment" }
+}
+$denyMatch = [regex]::Match($planSource, '(?ms)^R1_INPUT_AUTOMATION_DENYLIST_BEGIN\r?\n.*?^R1_INPUT_AUTOMATION_DENYLIST_END$')
+if (-not $denyMatch.Success -or [regex]::Matches($planSource, '(?m)^R1_INPUT_AUTOMATION_DENYLIST_BEGIN$').Count -ne 1) {
+  throw 'input automation denylist is missing or duplicated'
+}
+$scannedPlan = $planSource.Remove($denyMatch.Index, $denyMatch.Length)
+$forbiddenInputTokens = @(
+  ('Send' + 'Keys'), ('Send' + 'Input'), ('keybd' + '_event'), ('mouse' + '_event'),
+  ('UI' + 'Automation'), ('Play' + 'wright'), ('Input' + '.dispatch'), ('fire' + 'Event'), ('user' + 'Event')
+)
+foreach ($token in $forbiddenInputTokens) {
+  if ($scannedPlan.IndexOf($token, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw "input automation token outside denylist: $token" }
+}
+if ([regex]::Matches($planSource, '(?m)^\*\*Evidence split:\*\* Automated:').Count -ne 13) { throw 'per-task evidence split count drifted' }
+$hitlCommandLines = @($planSource -split "`n" | Where-Object { $_.StartsWith('powershell -NoProfile', [StringComparison]::Ordinal) -and $_.Contains('-HitlPhase') })
+if (@($hitlCommandLines | Where-Object { $_.Contains('-HitlPhase Prepare') }).Count -ne 12 -or
+    @($hitlCommandLines | Where-Object { $_.Contains('-HitlPhase Read') }).Count -ne 12) {
+  throw 'HITL Prepare/Read command count drifted'
+}
+foreach ($fragment in @(
+  ('A checkpoint requiring real click, typing, navigation keys, IME, tray interaction, theme/forced-colors/Narrator changes, zoom, or a file chooser is `HITL ' + 'Pending/No-Go`'),
+  ('Missing HITL evidence is never ' + 'PASS.'),
+  ('CDP evidence is read-' + 'only:'),
+  ('No CDP method may dispatch ' + 'input.'),
+  ('Every Task 0-12 checkpoint report has three explicit sections: `Automated`, `HITL`, and `Not ' + 'executed`.')
+)) {
+  if ([regex]::Matches($planSource, [regex]::Escape($fragment)).Count -ne 1) { throw "input/HITL protocol fragment count drifted: $fragment" }
+}
+```
+
+Expected: every command exits 0; `main` is clean; B0 and the exact written Task 7 Code Go are ancestors; both reviewed document blobs exist; all three historical tags remain at their exact immutable evidence commits.
+
+- [ ] **Step 2: Enforce the Task 7 integration hard gate.**
+
+Require these paths on current `main`: `src/launcher-core.ts`, `src/launcher-view.tsx`, `src/launcher.test.tsx`, `src/native-input.ts`, `src/protocol.ts`, and a real React/Tauri `src/main.ts`. Parse committed sources as strict UTF-8 without BOM. Require `LauncherCore` to expose stable `getSnapshot`, `subscribe`, `shown`, `text`, `keyDown`, `requestHide`, and `destroy`; require `LauncherClient` to contain the eight Task 7 commands and `listenShown`; require the one `launcher://shown` event and exact Task 6 Rust commands. Reject the vanilla DOM `src/main.ts` and any dirty Task 7 worktree as a baseline.
+
+```powershell
+$required = @(
+  'src/launcher-core.ts','src/launcher-view.tsx','src/launcher.test.tsx',
+  'src/native-input.ts','src/protocol.ts','src/main.ts'
+)
+foreach ($path in $required) {
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing Task 7 path: $path" }
+}
+$mainSource = [IO.File]::ReadAllText((Resolve-Path 'src/main.ts'), [Text.UTF8Encoding]::new($false, $true))
+$protocol = [IO.File]::ReadAllText((Resolve-Path 'src/protocol.ts'), [Text.UTF8Encoding]::new($false, $true))
+$core = [IO.File]::ReadAllText((Resolve-Path 'src/launcher-core.ts'), [Text.UTF8Encoding]::new($false, $true))
+foreach ($fragment in @('createRoot','createLauncherCore','LauncherView','@tauri-apps/api/core','@tauri-apps/api/event')) {
+  if (-not $mainSource.Contains($fragment)) { throw "Task 7 main adapter drift: $fragment" }
+}
+foreach ($fragment in @('searchApps','executeResult','loadSettings','saveSettings','rescanApps','exportValidationData','clearValidationData','hideLauncher','listenShown')) {
+  if (-not $protocol.Contains($fragment)) { throw "Task 7 client drift: $fragment" }
+}
+foreach ($fragment in @('getSnapshot','subscribe','shown','text','keyDown','requestHide','destroy')) {
+  if (-not $core.Contains($fragment)) { throw "Task 7 core drift: $fragment" }
+}
+```
+
+Expected: PASS. Any interface mismatch is Plan No-Go; do not adapt the plan in product code.
+
+- [ ] **Step 3: Recheck the residual SQLite release decision before any repository mutation.**
+
+In a new directory under `%TEMP%`, query the crates.io API for non-yanked `rusqlite` and `libsqlite3-sys` releases newer than the freeze, download candidate `.crate` archives from crates.io, verify each archive against the API checksum, and inspect the official bundled `sqlite3.c` `SQLITE_VERSION`/`SQLITE_SOURCE_ID`. For every candidate with SQLite `3.53.3` or newer, use an isolated Cargo home and an exact temporary manifest to prove whether a published `rusqlite` can resolve it with `features=["bundled"]` under Rust `1.96.1`. Also check the official SQLite change log. Delete the temporary directory in `finally`.
+
+Run this exact read-only/disposable probe; it writes only below `%TEMP%`:
+
+```powershell
+$probeRoot = Join-Path ([IO.Path]::GetTempPath()) "uipilot-find-release-recheck-$([guid]::NewGuid().ToString('N'))"
+$probeCargo = Join-Path $probeRoot 'cargo-home'
+New-Item -ItemType Directory -Path $probeRoot,$probeCargo | Out-Null
+$oldCargoHome = $env:CARGO_HOME
+try {
+  $changesResponse = Invoke-WebRequest -UseBasicParsing -Uri 'https://www.sqlite.org/changes.html' -ErrorAction Stop
+  if ($changesResponse.StatusCode -ne 200 -or [string]::IsNullOrWhiteSpace($changesResponse.Content)) { throw 'official SQLite release query failed closed' }
+  $changes = $changesResponse.Content
+  if ($changes -notmatch '3\.53\.3') { throw 'official SQLite 3.53.3 release record is unavailable' }
+  $rusqliteApi = Invoke-RestMethod -Uri 'https://crates.io/api/v1/crates/rusqlite' -ErrorAction Stop
+  $sysApi = Invoke-RestMethod -Uri 'https://crates.io/api/v1/crates/libsqlite3-sys' -ErrorAction Stop
+  if ($null -eq $rusqliteApi.versions -or $null -eq $sysApi.versions) { throw 'crates.io release metadata is incomplete' }
+  $publishedSys = @($sysApi.versions | Where-Object { -not $_.yanked -and $_.num -notmatch '-' })
+  if (-not @($publishedSys | Where-Object { $_.num -ceq '0.38.1' -and $_.checksum }).Count) {
+    throw 'frozen libsqlite3-sys release/checksum is missing'
+  }
+  $candidates = @($rusqliteApi.versions | Where-Object {
+    -not $_.yanked -and $_.num -notmatch '-' -and ([version]$_.num -ge [version]'0.40.1')
+  } | Sort-Object { [version]$_.num })
+  if (-not @($candidates | Where-Object { $_.num -ceq '0.40.1' -and $_.checksum }).Count) {
+    throw 'frozen rusqlite release/checksum is missing'
+  }
+  $env:CARGO_HOME = $probeCargo
+  foreach ($candidate in $candidates) {
+    if (-not $candidate.checksum) { throw "rusqlite checksum is missing: $($candidate.num)" }
+    if ($candidate.rust_version -and ([version]$candidate.rust_version -gt [version]'1.96.0')) {
+      Write-Output "authenticated MSRV skip: rusqlite $($candidate.num) requires $($candidate.rust_version)"
+      continue
+    }
+    $case = Join-Path $probeRoot ("rusqlite-" + $candidate.num)
+    New-Item -ItemType Directory -Path (Join-Path $case 'src') | Out-Null
+    $manifest = @"
+[package]
+name = "uipilot_find_release_probe"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.96.0"
+[dependencies]
+rusqlite = { version = "=$($candidate.num)", default-features = false, features = ["bundled"] }
+"@
+    [IO.File]::WriteAllText((Join-Path $case 'Cargo.toml'), $manifest, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $case 'src/main.rs'), 'fn main() {}', [Text.UTF8Encoding]::new($false))
+    & cargo +1.96.1 generate-lockfile --manifest-path (Join-Path $case 'Cargo.toml')
+    if ($LASTEXITCODE -ne 0) { throw "candidate lock resolution failed closed: rusqlite $($candidate.num)" }
+    & cargo +1.96.1 fetch --manifest-path (Join-Path $case 'Cargo.toml') --locked
+    if ($LASTEXITCODE -ne 0) { throw "candidate archive/checksum fetch failed closed: rusqlite $($candidate.num)" }
+    $metadataJson = @(& cargo +1.96.1 metadata --manifest-path (Join-Path $case 'Cargo.toml') --locked --offline --format-version 1)
+    if ($LASTEXITCODE -ne 0 -or $metadataJson.Count -eq 0) { throw "candidate metadata failed closed: rusqlite $($candidate.num)" }
+    try { $metadata = ($metadataJson -join "`n") | ConvertFrom-Json } catch { throw "candidate metadata JSON failed closed: rusqlite $($candidate.num)" }
+    $tooNew = @($metadata.packages | Where-Object {
+      $_.rust_version -and ([version]$_.rust_version -gt [version]'1.96.0')
+    })
+    if ($tooNew.Count) {
+      Write-Output "authenticated transitive MSRV skip: rusqlite $($candidate.num) -> $(@($tooNew | ForEach-Object { "$($_.name)@$($_.version):$($_.rust_version)" }) -join ',')"
+      continue
+    }
+    $sys = @($metadata.packages | Where-Object { $_.name -ceq 'libsqlite3-sys' })
+    if ($sys.Count -ne 1) { throw "resolved sys package count drift for rusqlite $($candidate.num)" }
+    $sysRelease = @($publishedSys | Where-Object { $_.num -ceq $sys[0].version })
+    if ($sysRelease.Count -ne 1 -or -not $sysRelease[0].checksum) { throw 'resolved sys checksum is unauthenticated' }
+    $sysRoot = Split-Path -Parent $sys[0].manifest_path
+    $amalgamation = Join-Path $sysRoot 'sqlite3/sqlite3.c'
+    if (-not (Test-Path -LiteralPath $amalgamation -PathType Leaf)) { throw 'bundled amalgamation is missing' }
+    $header = [IO.File]::ReadAllText($amalgamation, [Text.UTF8Encoding]::new($false, $true))
+    $versionMatch = [regex]::Match($header, '(?m)^#define SQLITE_VERSION\s+"([0-9.]+)"$')
+    $sourceMatch = [regex]::Match($header, '(?m)^#define SQLITE_SOURCE_ID\s+"([^"]+)"$')
+    if (-not $versionMatch.Success -or -not $sourceMatch.Success) { throw 'cannot authenticate bundled SQLite identity' }
+    if ([version]$versionMatch.Groups[1].Value -ge [version]'3.53.3') {
+      $expectedVersion = $versionMatch.Groups[1].Value
+      $expectedSource = $sourceMatch.Groups[1].Value.Replace('"','\"')
+      $probeSource = @"
+use rusqlite::Connection;
+fn main() {
+    let db = Connection::open_in_memory().expect("open");
+    let identity: (String, String) = db
+        .query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("identity");
+    assert_eq!(identity.0, "$expectedVersion");
+    assert_eq!(identity.1, "$expectedSource");
+    println!("sqlite={} source={}", identity.0, identity.1);
+}
+"@
+      [IO.File]::WriteAllText((Join-Path $case 'src/main.rs'), $probeSource, [Text.UTF8Encoding]::new($false))
+      & cargo +1.96.1 check --manifest-path (Join-Path $case 'Cargo.toml') --locked --offline --target x86_64-pc-windows-msvc
+      if ($LASTEXITCODE -ne 0) { throw "potential SQLite 3.53.3+ candidate did not compile; Dependency recheck is Not Runnable: rusqlite $($candidate.num)" }
+      $identityOutput = @(& cargo +1.96.1 run --quiet --manifest-path (Join-Path $case 'Cargo.toml') --locked --offline --target x86_64-pc-windows-msvc)
+      if ($LASTEXITCODE -ne 0 -or ($identityOutput -join "`n") -cne "sqlite=$expectedVersion source=$($sourceMatch.Groups[1].Value)") { throw 'candidate runtime SQLite identity probe failed closed' }
+      throw "new Dependency Go required: rusqlite $($candidate.num), libsqlite3-sys $($sys[0].version), SQLite $($versionMatch.Groups[1].Value)"
+    }
+  }
+} finally {
+  if ($null -eq $oldCargoHome) { Remove-Item Env:CARGO_HOME -ErrorAction SilentlyContinue } else { $env:CARGO_HOME = $oldCargoHome }
+  if (Test-Path -LiteralPath $probeRoot) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }
+}
+```
+
+Expected: all official/API/checksum/solver/archive/metadata operations are authenticated. Only a documented candidate or transitive MSRV above 1.96.0, or an authenticated bundled SQLite below 3.53.3, may skip. Any network, registry, checksum, archive, JSON, solver, metadata, compiler, or runtime-identity failure is Dependency No-Go/Not Runnable. If a Windows-MSVC-compilable bundled SQLite `3.53.3+` candidate passes, stop and request new Dependency Go; do not create a worktree or edit a manifest.
+
+- [ ] **Step 4: Create the implementation worktree from current main.**
+
+Use the worktree skill's native isolation mechanism when available. If and only if no native mechanism exists, use this fallback after confirming `.worktrees` is ignored. Existing path/branch/tag names are a hard stop; never delete or reset them automatically.
+
+```powershell
+$implementation = 'D:\code\UiPilot_tools\.worktrees\find-local-file-search-r1'
+git check-ignore -q .worktrees
+if ($LASTEXITCODE -ne 0) { throw '.worktrees is not ignored' }
+if (Test-Path -LiteralPath $implementation) { throw 'implementation worktree already exists' }
+git show-ref --verify --quiet refs/heads/codex/find-local-file-search-r1
+if ($LASTEXITCODE -eq 0) { throw 'implementation branch already exists' }
+if ($LASTEXITCODE -ne 1) { throw 'implementation branch lookup failed' }
+git worktree add $implementation -b codex/find-local-file-search-r1 $baseline
+if ($LASTEXITCODE -ne 0) { throw 'worktree creation failed' }
+Set-Location $implementation
+if ((git rev-parse HEAD).Trim() -cne $baseline) { throw 'implementation baseline drifted' }
+if ((git branch --show-current) -cne 'codex/find-local-file-search-r1') { throw 'implementation branch drifted' }
+if (@(git status --porcelain=v1 --untracked-files=all).Count -ne 0) { throw 'new worktree is dirty' }
+```
+
+Expected: clean isolated worktree at the then-current main SHA.
+
+- [ ] **Step 5: Bind immutable evidence refs without moving existing refs.**
+
+Authenticate the immutable historical tags first. Create the two R1 lightweight tags only when absent; if either R1 name is already present, stop rather than moving or reusing it.
+
+```powershell
+$historicalTags = [ordered]@{
+  'foundation-find-approved-design' = $designCommit
+  'foundation-find-approved-plan' = $historicalPlanCommit
+  'foundation-find-implementation-baseline' = $historicalBaseline
+}
+foreach ($entry in $historicalTags.GetEnumerator()) {
+  git show-ref --verify --quiet "refs/tags/$($entry.Key)"
+  if ($LASTEXITCODE -ne 0) { throw "historical tag is missing: $($entry.Key)" }
+  if ((git rev-parse "$($entry.Key)^{commit}").Trim() -cne $entry.Value) { throw "historical tag moved: $($entry.Key)" }
+  if ($LASTEXITCODE -ne 0) { throw "historical tag cannot be read: $($entry.Key)" }
+}
+$r1Tags = [ordered]@{
+  'foundation-find-approved-plan-r1' = $planCommit
+  'foundation-find-implementation-baseline-r1' = $baseline
+}
+foreach ($entry in $r1Tags.GetEnumerator()) {
+  git show-ref --verify --quiet "refs/tags/$($entry.Key)"
+  if ($LASTEXITCODE -eq 0) { throw "R1 evidence tag already exists: $($entry.Key)" }
+  if ($LASTEXITCODE -ne 1) { throw "R1 tag lookup failed: $($entry.Key)" }
+  git tag $entry.Key $entry.Value
+  if ($LASTEXITCODE -ne 0) { throw "R1 tag create failed: $($entry.Key)" }
+}
+```
+
+- [ ] **Step 6: Run the clean integrated baseline gate.**
+
+```powershell
+npm.cmd test
+if ($LASTEXITCODE -ne 0) { throw 'baseline frontend tests failed' }
+npm.cmd run build
+if ($LASTEXITCODE -ne 0) { throw 'baseline frontend build failed' }
+cargo build --manifest-path src-tauri/Cargo.toml
+if ($LASTEXITCODE -ne 0) { throw 'baseline production Rust build failed' }
+cargo test --manifest-path src-tauri/Cargo.toml
+if ($LASTEXITCODE -ne 0) { throw 'baseline Rust tests failed' }
+cargo test --manifest-path src-tauri/Cargo.toml --all-features
+if ($LASTEXITCODE -ne 0) { throw 'baseline all-features tests failed' }
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+if ($LASTEXITCODE -ne 0) { throw 'baseline Clippy failed' }
+$oldIncremental = $env:CARGO_INCREMENTAL
+try {
+  $env:CARGO_INCREMENTAL = '0'
+  cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+  if ($LASTEXITCODE -ne 0) { throw 'baseline all-features Clippy failed' }
+} finally {
+  if ($null -eq $oldIncremental) { Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue } else { $env:CARGO_INCREMENTAL = $oldIncremental }
+}
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+if ($LASTEXITCODE -ne 0) { throw 'baseline security config failed' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+if ($LASTEXITCODE -ne 0) { throw 'baseline security regression failed' }
+$baselineStatus = @(git status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $baselineStatus.Count -ne 0) { throw 'baseline gate changed the implementation worktree' }
+```
+
+Expected: production Rust build, default/all-features Rust tests, default/all-features Clippy, frontend tests/build, and both security gates all exit 0 with nonzero Task 7 Vitest coverage; no product diff is created. On any failure, preserve the R1 worktree/tags as evidence, create no product commit, and do not enter Task 1. A complete PASS authorizes only Task 1 RED; after Task 1 GREEN is committed, stop and request written Task 1 Code Go.
+
+---
+
+### Task 1: Freeze the Rust toolchain, dependency graph, Unicode data, and bundled SQLite identity
+
+**Files:**
+- Create: `rust-toolchain.toml`
+- Modify: `src-tauri/Cargo.toml`
+- Modify: `src-tauri/Cargo.lock`
+- Create: `src-tauri/src/file_index/mod.rs`
+- Modify: `src-tauri/src/lib.rs`
+
+**Interfaces:**
+- Consumes: Dependency/Rust-floor Go and the immutable implementation baseline lockfile.
+- Produces: `fold_name`, `FOLD_ALGORITHM_ID`, exact dependency identity tests, and the approved offline dependency graph; no production FileIndex state yet.
+
+**Evidence split:** Automated: dependency RED, locked/offline identity build, Unicode/SQLite contract tests, Clippy, formatting, and lock/source oracles. HITL: none. Not executed: query, scanner, UI, real product interaction, input automation, or runtime probe.
+
+- [ ] **Step 1: Add the dependency identity RED tests before changing the manifest.**
+
+Create `src-tauri/src/file_index/mod.rs` with the exact production helper and tests below. In `src-tauri/src/lib.rs`, add only `#[cfg(test)] mod file_index;` so the RED compiles the test module without creating a non-test dead-code window.
+
+```rust
+use icu_casemap::CaseMapper;
+use unicode_normalization::UnicodeNormalization;
+
+pub(crate) const FOLD_ALGORITHM_ID: &str = "uipilot-unicode-15.1-full-fold-nfc-v1";
+
+pub(crate) fn fold_name(value: &str) -> String {
+    let first_nfc: String = value.nfc().collect();
+    let folded = CaseMapper::new().fold_string(&first_nfc);
+    folded.nfc().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fold_name, FOLD_ALGORITHM_ID};
+    use icu_casemap::CaseMapper;
+    use rusqlite::Connection;
+
+    #[test]
+    fn dependency_contract_unicode_15_1_and_full_fold() {
+        assert_eq!(FOLD_ALGORITHM_ID, "uipilot-unicode-15.1-full-fold-nfc-v1");
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (15, 1, 0));
+        for (input, expected) in [
+            ("UiPilot", "uipilot"),
+            ("Straße", "strasse"),
+            ("CAFE\u{301}", "café"),
+            ("Σ", "σ"),
+            ("σ", "σ"),
+            ("ς", "σ"),
+            ("İ", "i\u{307}"),
+            ("Ｕｉ", "ｕｉ"),
+        ] {
+            assert_eq!(fold_name(input), expected);
+        }
+        assert_ne!(fold_name("Ｕｉ"), "ui");
+        let mapper = CaseMapper::new();
+        assert_eq!(mapper.simple_fold('\u{1fd3}'), '\u{0390}');
+        assert_eq!(mapper.simple_fold('\u{1fe3}'), '\u{03b0}');
+        assert_eq!(mapper.simple_fold('\u{fb05}'), '\u{fb06}');
+    }
+
+    #[test]
+    fn dependency_contract_bundled_sqlite_identity_and_fts5() {
+        let connection = Connection::open_in_memory().unwrap();
+        let identity = connection
+            .query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        assert_eq!(identity.0, "3.53.2");
+        assert_eq!(identity.1, "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24");
+        assert_eq!(connection.query_row("SELECT sqlite_compileoption_used('ENABLE_FTS5')", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        connection.execute_batch("CREATE VIRTUAL TABLE names USING fts5(value, tokenize='trigram case_sensitive 1');").unwrap();
+    }
+}
+```
+
+- [ ] **Step 2: Run the RED and prove it fails only for missing approved dependencies.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml dependency_contract
+```
+
+Expected: exit 101 with unresolved imports for `icu_casemap`, `unicode_normalization`, and `rusqlite`; exactly two test functions are listed by source inspection, and the failure is not a syntax error or zero-test pass.
+
+- [ ] **Step 3: Apply the exact toolchain and manifest freeze, then generate the lockfile once.**
+
+Add `rust-toolchain.toml` and the three exact direct dependencies from Global Constraints. Add only `"Win32_Globalization"` and `"Win32_System_IO"` to the existing `windows` feature list; every other existing manifest line remains semantically unchanged. Use a fresh isolated Cargo home. Reject the six environment keys before fetching. Fetch once while online, then generate the lockfile offline; compilation evidence is deferred to Step 5.
+
+```powershell
+$forbidden = @('ICU4X_DATA_DIR','LIBSQLITE3_SYS_USE_PKG_CONFIG','LIBSQLITE3_FLAGS','SQLITE_MAX_VARIABLE_NUMBER','SQLITE_MAX_EXPR_DEPTH','SQLITE_MAX_COLUMN')
+$environment = [Environment]::GetEnvironmentVariables()
+foreach ($key in $forbidden) { if ($environment.Contains($key)) { throw "forbidden environment key present: $key" } }
+$cargoHome = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+if (Test-Path -LiteralPath $cargoHome) { throw 'isolated Cargo home already exists' }
+New-Item -ItemType Directory -Path $cargoHome | Out-Null
+$env:CARGO_HOME = $cargoHome
+$installed = @(& rustup toolchain list)
+if ($LASTEXITCODE -ne 0) { throw 'rustup toolchain inventory failed' }
+if (-not @($installed | Where-Object { $_ -match '^1\.96\.1-' }).Count) {
+  & rustup toolchain install 1.96.1 --profile minimal --component clippy rustfmt
+  if ($LASTEXITCODE -ne 0) { throw 'Rust 1.96.1 installation failed' }
+}
+rustc +1.96.1 --version
+if ($LASTEXITCODE -ne 0 -or $(& rustc +1.96.1 --version) -notmatch '^rustc 1\.96\.1 ') { throw 'Rust toolchain drift' }
+cargo +1.96.1 --version
+if ($LASTEXITCODE -ne 0 -or $(& cargo +1.96.1 --version) -notmatch '^cargo 1\.96\.1 ') { throw 'Cargo toolchain drift' }
+cargo +1.96.1 fetch --manifest-path src-tauri/Cargo.toml
+if ($LASTEXITCODE -ne 0) { throw 'approved crate fetch failed' }
+cargo +1.96.1 generate-lockfile --manifest-path src-tauri/Cargo.toml --offline
+if ($LASTEXITCODE -ne 0) { throw 'offline lock generation failed' }
+```
+
+Expected: toolchain authentication, one online crate fetch, and offline lock generation exit 0. This step makes no compiler/build-script claim.
+
+- [ ] **Step 4: Run the exact lock and feature graph oracles.**
+
+Compare baseline and candidate `Cargo.lock` package blocks. Require candidate SHA-256, 478 to 501 blocks, Appendix A additions, Appendix B text-only disambiguation blocks, no other existing block change, and no removal. Require the relevant feature chains and reject forbidden feature names.
+
+```powershell
+$lockHash = (Get-FileHash -Algorithm SHA256 src-tauri/Cargo.lock).Hash
+if ($lockHash -cne '49E9DB86F063353050BCD53C3127FBBD4BB43A3DABA4ED1293C2FFE482F62018') { throw 'candidate lock hash drift' }
+$baselineLock = git show foundation-find-implementation-baseline-r1:src-tauri/Cargo.lock
+if ($LASTEXITCODE -ne 0) { throw 'baseline lock read failed' }
+$candidateLock = [IO.File]::ReadAllText((Resolve-Path 'src-tauri/Cargo.lock'), [Text.UTF8Encoding]::new($false, $true))
+if ([regex]::Matches(($baselineLock -join "`n"), '(?m)^\[\[package\]\]$').Count -ne 478) { throw 'baseline package count drift' }
+if ([regex]::Matches($candidateLock, '(?m)^\[\[package\]\]$').Count -ne 501) { throw 'candidate package count drift' }
+$rusqliteSubtree = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -p 'rusqlite@0.40.1')
+if ($LASTEXITCODE -ne 0) { throw 'rusqlite feature subtree failed' }
+$rusqliteInverse = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -i 'rusqlite@0.40.1')
+if ($LASTEXITCODE -ne 0) { throw 'rusqlite inverse feature tree failed' }
+$sysSubtree = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -p 'libsqlite3-sys@0.38.1')
+if ($LASTEXITCODE -ne 0) { throw 'libsqlite3-sys feature subtree failed' }
+$sysInverse = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -i 'libsqlite3-sys@0.38.1')
+if ($LASTEXITCODE -ne 0) { throw 'libsqlite3-sys inverse feature tree failed' }
+$icuSubtree = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -p 'icu_casemap@1.5.1')
+if ($LASTEXITCODE -ne 0) { throw 'ICU4X 1.5 feature subtree failed' }
+$icuInverse = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -i 'icu_casemap@1.5.1')
+if ($LASTEXITCODE -ne 0) { throw 'ICU4X 1.5 inverse feature tree failed' }
+$unicodeSubtree = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -p 'unicode-normalization@0.1.23')
+if ($LASTEXITCODE -ne 0) { throw 'unicode-normalization feature subtree failed' }
+$unicodeInverse = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -e features -i 'unicode-normalization@0.1.23')
+if ($LASTEXITCODE -ne 0) { throw 'unicode-normalization inverse feature tree failed' }
+$relevantTree = @($rusqliteSubtree + $rusqliteInverse + $sysSubtree + $sysInverse + $icuSubtree + $icuInverse + $unicodeSubtree + $unicodeInverse) -join "`n"
+foreach ($required in @('rusqlite feature "bundled"','rusqlite feature "modern_sqlite"','libsqlite3-sys feature "bundled"','libsqlite3-sys feature "bundled_bindings"','icu_casemap feature "compiled_data"','icu_properties feature "compiled_data"','unicode-normalization feature "std"')) {
+  if (-not $relevantTree.Contains($required)) { throw "missing incremental feature: $required" }
+}
+foreach ($rejected in @('bindgen','sqlcipher','session','loadable_extension','serde','datagen','buffer_provider')) {
+  if ($relevantTree -match "feature `"$([regex]::Escape($rejected))`"") { throw "forbidden incremental feature: $rejected" }
+}
+if (($icuSubtree -join "`n") -match 'icu_normalizer') { throw 'ICU4X 1.5 subtree activated an unapproved normalizer' }
+$baselineNormalizer = @(& cargo +1.96.1 tree --manifest-path src-tauri/Cargo.toml --locked --offline -p 'icu_normalizer@2.2.0')
+if ($LASTEXITCODE -ne 0 -or -not (($baselineNormalizer -join "`n").Contains('icu_normalizer v2.2.0'))) { throw 'baseline ICU normalizer identity drifted' }
+$cargoToml = [IO.File]::ReadAllText((Resolve-Path 'src-tauri/Cargo.toml'), [Text.UTF8Encoding]::new($false, $true))
+foreach ($windowsFeature in @('Win32_Globalization','Win32_System_IO')) {
+  if ([regex]::Matches($cargoToml, '"' + [regex]::Escape($windowsFeature) + '"').Count -ne 1) { throw "Windows feature is not present exactly once: $windowsFeature" }
+}
+```
+
+Expected: exact frozen lock and feature graph. Run the exact Appendix C lock-block oracle and Appendix D source/license/build-target oracle. They compare package identity case-sensitively, print all 23 additions, accept only the root direct-dependency change plus the 11 permitted existing registry dependency-reference rewrites, and reject every other delta.
+
+- [ ] **Step 5: Run GREEN entirely offline.**
+
+```powershell
+$hostLine = (& rustc +1.96.1 -vV | Select-String '^host: ').Line
+if ($LASTEXITCODE -ne 0 -or $hostLine -cne 'host: x86_64-pc-windows-msvc') { throw 'MSVC Rust host is required' }
+$env:CC_ENABLE_DEBUG_OUTPUT = '1'
+try {
+  $buildOutput = @(& cargo +1.96.1 build --manifest-path src-tauri/Cargo.toml --locked --offline -vv 2>&1)
+  if ($LASTEXITCODE -ne 0) { throw 'offline dependency build failed' }
+} finally { Remove-Item Env:CC_ENABLE_DEBUG_OUTPUT -ErrorAction SilentlyContinue }
+if (-not (($buildOutput -join "`n") -match '(?i)(^|[\\/])cl\.exe([ `"]|$)')) { throw 'MSVC cl.exe evidence is missing' }
+if (-not (($buildOutput -join "`n") -match '(?i)libsqlite3-sys.*sqlite3\.c|sqlite3\.c.*libsqlite3-sys')) { throw 'bundled SQLite amalgamation compile evidence is missing' }
+if (($buildOutput -join "`n") -match '(?i)(^|[\\/])(clang|gcc)(\.exe)?([ `"]|$)') { throw 'unapproved C compiler detected' }
+cargo +1.96.1 test --manifest-path src-tauri/Cargo.toml --locked --offline dependency_contract
+cargo +1.96.1 clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+cargo +1.96.1 fmt --manifest-path src-tauri/Cargo.toml -- --check
+```
+
+Expected: the `-vv --offline` build proves `libsqlite3-sys` compiled its bundled `sqlite3.c` through MSVC `cl.exe`; exactly 2 dependency-contract tests pass; Clippy and formatting exit 0.
+
+- [ ] **Step 6: Commit the dependency/toolchain increment.**
+
+```powershell
+git add rust-toolchain.toml src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/file_index/mod.rs src-tauri/src/lib.rs
+git diff --cached --check
+git diff --cached --name-status
+git commit -m "构建：冻结本地文件搜索依赖与工具链" -m "目标与根因：为文件索引固定已获 Dependency Go 的 Rust、Unicode 与 bundled SQLite 身份，避免解析或工具链漂移。" -m "实现范围：仅新增根工具链文件、三个直接依赖与两项 Windows feature，并加入文件索引依赖身份测试入口。" -m "RED/GREEN验证：先记录缺少依赖与模块的 RED，再通过离线构建、精确锁图、Unicode 15.1、SQLite source id、Clippy 与格式门禁。" -m "边界：未实现查询、扫描或界面，未引入 ORM、异步运行时、系统 SQLite、bindgen 或额外安全权限。"
+```
+
+Expected staged set: exactly the five listed files; commit succeeds.
+
+Expected checkpoint: commit succeeds; stop and request Task 1 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 2 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 2: Extend the one ResultRegistry with file-domain ownership
+
+**Files:**
+- Modify: `src-tauri/src/result_registry.rs`
+- Modify: `src-tauri/src/file_index/mod.rs`
+
+**Interfaces:**
+- Consumes: existing `on_show`, global `querySequence`, current request/result mapping, and `hide_and_clear`.
+- Produces: `QueryDomain`, domain-bound `QueryToken`, narrow `invalidate_domain(File)`, generic private publication of application or file DTOs, and `ResultAction::OpenIndexedPath`; no second registry or ID allocator.
+
+**Evidence split:** Automated: ResultRegistry domain/overflow/stale RED/GREEN, focused/full Rust, Clippy, formatting, and source contracts. HITL: none. Not executed: SQLite, filesystem, Shell, UI, real product interaction, input automation, or runtime probe.
+
+- [ ] **Step 1: Write the shared-ownership RED tests.**
+
+Add tests under `result_registry::tests` named exactly:
+
+```text
+query_domains_share_one_invocation_sequence_and_mapping
+invalidating_file_domain_is_narrow_and_checked
+file_publication_allocates_ids_in_the_existing_registry
+domain_epoch_exhaustion_is_fail_closed_without_touching_application_state
+```
+
+The first test must show one `on_show("inv-1")`, application query sequence 1, file query sequence 2, application query sequence 3, and rejection of repeated/older sequences across domains. Each newer query clears the one current mapping. The second must show file token/mapping invalidation, Application mapping preservation, unchanged active invocation, and a new File query using the next global sequence. The third must publish two file drafts through the same allocator, resolve both `OpenIndexedPath` actions, then prove `hide_and_clear` makes both stale. The fourth forces the File domain epoch to `u64::MAX`, requires a returned exhaustion error and permanent File-domain rejection, and proves Application mapping plus active invocation remain unchanged until the caller deliberately invokes unified hide.
+
+- [ ] **Step 2: Run the RED.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline result_registry::tests::query_domains
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline result_registry::tests::invalidating_file_domain
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline result_registry::tests::file_publication
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline result_registry::tests::domain_epoch_exhaustion
+```
+
+Expected: exit 101 because `QueryDomain`, file invalidation, file action types, and the generalized publication seam do not exist; never zero tests.
+
+- [ ] **Step 3: Add the minimal domain/action data types.**
+
+In `file_index/mod.rs`, add only these cloneable private identity types; paths stay backend-only:
+
+```rust
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct VolumeIdentity {
+    pub(crate) guid_path: String,
+    pub(crate) serial: u32,
+    pub(crate) filesystem_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexedKind { File, Directory }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OpenIndexedPath {
+    pub(crate) runtime_epoch: u64,
+    pub(crate) volume_identity: VolumeIdentity,
+    pub(crate) row_id: i64,
+    pub(crate) relative_path: String,
+    pub(crate) kind: IndexedKind,
+}
+```
+
+In `result_registry.rs`, freeze:
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryDomain { Application, File }
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ResultAction {
+    LaunchApplication { app_id: String, shortcut: PathBuf, executable: Option<PathBuf> },
+    OpenIndexedPath(OpenIndexedPath),
+}
+```
+
+Add `domain` and a checked per-domain epoch to `QueryToken`, `domain` to the single `ResultSet`, and one file epoch plus `file_domain_exhausted: bool` to `RegistryState`. Change `begin_query` to exact signature and reject File when exhausted:
+
+```rust
+pub(crate) fn begin_query(
+    &self,
+    domain: QueryDomain,
+    invocation_id: &str,
+    query_sequence: u64,
+) -> Option<QueryToken>
+```
+
+Update only the existing application caller to pass `QueryDomain::Application`.
+
+- [ ] **Step 4: Generalize publication without a public abstraction.**
+
+Keep one private implementation that allocates the request ID and `(result_id, payload)` pairs while storing actions. Expose one crate-private generic function used by both DTO shapes:
+
+```rust
+pub(crate) fn publish_if_latest<T, R, A, F>(
+    &self,
+    token: QueryToken,
+    entries: Vec<(T, ResultAction)>,
+    authorize: A,
+    response: F,
+) -> Option<R>
+where
+    A: FnOnce() -> bool,
+    F: FnOnce(String, Vec<(String, T)>) -> R;
+```
+
+The function checks active invocation generation, global latest sequence, token domain, token domain epoch, and then `authorize()` in the same registry mutex before allocating or replacing anything. Application passes `|| true`. File publication passes a closure that performs only an Acquire load of FileIndex's atomic runtime-epoch mirror and compares the query's captured epoch; it never takes the FileIndex gate. This authorization check is the file-query publication linearization point: if it wins before a recovery transition, recovery later invalidates that mapping; if recovery's Release epoch update wins first, the query returns stale without allocating an action. Adapt application publication with a closure that reconstructs the existing `model::SearchResponse` byte shape; do not change its wire JSON.
+
+Implement exact narrow invalidation without panic:
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidateDomainError { EpochExhausted }
+
+pub(crate) fn invalidate_domain(
+    &self,
+    domain: QueryDomain,
+) -> Result<(), InvalidateDomainError> {
+    let mut state = self.state.lock().expect("result registry lock poisoned");
+    let Some(next) = state.domain_epoch(domain).checked_add(1) else {
+        if domain == QueryDomain::File { state.file_domain_exhausted = true; }
+        if state.current.as_ref().is_some_and(|current| current.domain == domain) {
+            state.current = None;
+        }
+        return Err(InvalidateDomainError::EpochExhausted);
+    };
+    state.set_domain_epoch(domain, next);
+    if state.current.as_ref().is_some_and(|current| current.domain == domain) {
+        state.current = None;
+    }
+    Ok(())
+}
+```
+
+Do not change `generation`, `active_invocation_id`, or `latest_query_sequence` here. Existing `on_show` and `hide_and_clear` still invalidate every domain through global generation. A FileIndex caller handles exhaustion only after the narrow call returns: take the FileIndex gate, set fatal latch and close admission, release the gate, then call the existing unified `clear_and_hide` once through the stored AppHandle/main window. Tests assert narrow invalidation preserves Application mapping/invocation before unified hide; unified hide then legitimately clears the whole launcher because the window is deliberately closed.
+
+- [ ] **Step 5: Run GREEN and all existing registry/application tests.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline result_registry::tests
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::search
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+```
+
+Expected: all new tests pass; application response JSON and stale semantics remain unchanged; all-features and Clippy exit 0.
+
+- [ ] **Step 6: Commit.**
+
+```powershell
+git add src-tauri/src/result_registry.rs src-tauri/src/file_index/mod.rs
+git diff --cached --check
+git commit -m "功能：复用启动器结果所有权支持文件查询" -m "目标与根因：文件结果必须共享现有 invocation、query sequence 与 ResultRegistry，避免第二套可绕过隐藏和失效规则的映射。" -m "实现范围：仅扩展结果域、文件动作和 checked invalidation，并保持应用域与统一 hide-and-clear 语义不变。" -m "RED/GREEN验证：先以域隔离、溢出和 stale publication 测试取得 RED，再通过精确 focused、全量 Rust、Clippy 与格式门禁。" -m "边界：未接入 SQLite、文件系统、Shell、命令、权限或前端，不清除应用结果映射和 invocation。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 2 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 3 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 3: Add the exact SQLite schema, ordinal query order, and guarded search command
+
+**Files:**
+- Create: `src-tauri/src/file_index/store.rs`
+- Modify: `src-tauri/src/file_index/mod.rs`
+- Modify: `src-tauri/src/commands.rs`
+- Modify: `src-tauri/src/lib.rs`
+- Modify: `src-tauri/capabilities/main.json`
+- Create: `src-tauri/permissions/autogenerated/search_files.toml`
+- Modify: `scripts/check-security-config.ps1`
+
+**Interfaces:**
+- Consumes: one shared registry token/publication, frozen Unicode helper, Tauri main caller guard, and the authenticated app-data root.
+- Produces: the minimal `FileIndex` publication state/gate/runtime-epoch mirror, strict `search_files`, `FileSearchResponse`, lazy empty/new DB, schema v1, indexed Windows ordinal ordering, same-snapshot count/items/status/revision, and one exact new permission. Tasks 4-7 consume this committed state rather than defining it retroactively.
+
+**Evidence split:** Automated: schema/query/lazy-init/NLS RED/GREEN, focused/full Rust, offline build, Clippy, formatting, security, and source contracts. HITL: none. Not executed: volume scan, watcher, file action, UI, real product interaction, input automation, or runtime probe.
+
+- [ ] **Step 1: Write schema/query/command RED tests.**
+
+Add exact Rust tests:
+
+```text
+file_index::store::tests::schema_v1_uses_wal_fts5_and_two_generations
+file_index::store::tests::short_and_trigram_queries_use_one_read_snapshot
+file_index::store::tests::ordinal_sort_matches_compare_string_ordinal
+file_index::store::tests::ordinal_sort_identity_change_reindexes_before_query
+file_index::store::tests::category_sort_count_and_limit_are_exact
+file_index::store::tests::empty_query_skips_instr_and_fts_but_returns_status_snapshot
+file_index::store::tests::open_caches_prior_integrity_metadata_before_marking_dirty
+file_index::tests::base_publication_state_linearizes_query_and_nls_reindex
+file_index::tests::base_runtime_epoch_authorizes_shared_publication
+file_index::tests::lazy_init_has_one_opening_owner_and_concurrent_building_snapshot
+commands::tests::file_query_rejects_wire_input_before_registry_or_index
+commands::tests::file_query_publishes_only_through_shared_registry
+commands::tests::empty_file_query_initializes_and_clears_the_file_mapping
+commands::tests::search_files_caller_guard_is_first_statement
+```
+
+Fixtures must cover all ten categories, file/directory rules, 0-scalar empty query, 1/2-scalar `instr`, 3+-scalar trigram, the seven Unicode design examples, 201 matching rows, ascending/descending modification time, equal-time case-insensitive name order, equal-name case-sensitive absolute display path order, concurrent writer after snapshot creation, and invalid byte/scalar/NUL/category/sort/invocation/sequence/folded limits. The invalid matrix must assert zero registry, `FileIndex`, SQLite, scanner, and watcher calls. The valid empty-query row must assert one `begin_query`, one lazy-init/status snapshot, zero `instr`/FTS statement, `total="0"`, empty items, and one shared publication that clears the previous File mapping. Base-state rows prove query snapshot and NLS reindex take the same publication mutex, checked revision overflow closes admission/sets fatal, and a Release-stored runtime epoch rejects an old File publication without touching Application state. The lazy row starts two queries at one barrier: exact decisions are one `Start { owner: 1 }` and one `ObserveBuilding`; the observer sees `admission_open=false` yet performs zero mutation/open/reservation/notification. Fatal, epoch mismatch, Active/WrongMode, and owner overflow return their exact errors. Stale/mismatched owner completion cannot activate or close another owner's DB. Task 7 extends the same test matrix with Pausing/Terminal rejection after those variants exist.
+
+- [ ] **Step 2: Run RED commands.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::store::tests
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::base_publication
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::base_runtime_epoch
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::lazy_init
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::file_query
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::search_files_caller_guard
+```
+
+Expected: exit 101 only because `store`, DTOs, query enums, `FileIndex`, and `search_files` are missing.
+
+- [ ] **Step 3: Create the exact private schema and minimum publication owner.**
+
+Use one SQL constant, no migration framework. Store every checked `u64` as canonical decimal `TEXT`; SQLite signed integers must not truncate it. `display_path` is a derived sensitive cache used only for DTO/order, never record identity. Its value is refreshed when the authenticated mount point changes.
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA application_id=1430868038;
+PRAGMA user_version=1;
+
+CREATE TABLE metadata (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  fold_algorithm_id TEXT NOT NULL,
+  ordinal_sort_identity TEXT NOT NULL,
+  index_revision TEXT NOT NULL,
+  clean_close INTEGER NOT NULL CHECK(clean_close IN (0,1)),
+  last_integrity_check_utc TEXT
+);
+CREATE TABLE volumes (
+  volume_guid_path TEXT NOT NULL,
+  volume_serial INTEGER NOT NULL,
+  filesystem_name TEXT NOT NULL,
+  mount_point TEXT NOT NULL,
+  committed_generation TEXT,
+  candidate_generation TEXT,
+  next_generation TEXT NOT NULL,
+  scan_state TEXT NOT NULL CHECK(scan_state IN ('idle','scanning','dirty','partial')),
+  PRIMARY KEY(volume_guid_path, volume_serial, filesystem_name)
+);
+CREATE TABLE entries (
+  row_id INTEGER PRIMARY KEY,
+  volume_guid_path TEXT NOT NULL,
+  volume_serial INTEGER NOT NULL,
+  filesystem_name TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  display_path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  folded_name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('file','directory')),
+  category TEXT NOT NULL,
+  size_bytes TEXT,
+  modified_utc_ms INTEGER NOT NULL,
+  generation TEXT NOT NULL,
+  UNIQUE(volume_guid_path, volume_serial, filesystem_name, relative_path)
+);
+CREATE TABLE candidate_entries (
+  row_id INTEGER PRIMARY KEY,
+  volume_guid_path TEXT NOT NULL,
+  volume_serial INTEGER NOT NULL,
+  filesystem_name TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  display_path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  folded_name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('file','directory')),
+  category TEXT NOT NULL,
+  size_bytes TEXT,
+  modified_utc_ms INTEGER NOT NULL,
+  generation TEXT NOT NULL,
+  UNIQUE(volume_guid_path, volume_serial, filesystem_name, relative_path)
+);
+CREATE VIRTUAL TABLE entry_names USING fts5(folded_name, content='entries', content_rowid='row_id', tokenize='trigram case_sensitive 1');
+CREATE VIRTUAL TABLE candidate_names USING fts5(folded_name, content='candidate_entries', content_rowid='row_id', tokenize='trigram case_sensitive 1');
+
+CREATE TRIGGER entries_ai AFTER INSERT ON entries BEGIN
+  INSERT INTO entry_names(rowid, folded_name) VALUES (new.row_id, new.folded_name);
+END;
+CREATE TRIGGER entries_ad AFTER DELETE ON entries BEGIN
+  INSERT INTO entry_names(entry_names, rowid, folded_name) VALUES ('delete', old.row_id, old.folded_name);
+END;
+CREATE TRIGGER entries_au AFTER UPDATE OF folded_name ON entries BEGIN
+  INSERT INTO entry_names(entry_names, rowid, folded_name) VALUES ('delete', old.row_id, old.folded_name);
+  INSERT INTO entry_names(rowid, folded_name) VALUES (new.row_id, new.folded_name);
+END;
+CREATE TRIGGER candidate_ai AFTER INSERT ON candidate_entries BEGIN
+  INSERT INTO candidate_names(rowid, folded_name) VALUES (new.row_id, new.folded_name);
+END;
+CREATE TRIGGER candidate_ad AFTER DELETE ON candidate_entries BEGIN
+  INSERT INTO candidate_names(candidate_names, rowid, folded_name) VALUES ('delete', old.row_id, old.folded_name);
+END;
+CREATE TRIGGER candidate_au AFTER UPDATE OF folded_name ON candidate_entries BEGIN
+  INSERT INTO candidate_names(candidate_names, rowid, folded_name) VALUES ('delete', old.row_id, old.folded_name);
+  INSERT INTO candidate_names(rowid, folded_name) VALUES (new.row_id, new.folded_name);
+END;
+
+CREATE INDEX entries_sort_desc ON entries(
+  modified_utc_ms DESC,
+  name COLLATE uipilot_name_ordinal_ci ASC,
+  display_path COLLATE uipilot_path_ordinal_cs ASC
+);
+CREATE INDEX entries_sort_asc ON entries(
+  modified_utc_ms ASC,
+  name COLLATE uipilot_name_ordinal_ci ASC,
+  display_path COLLATE uipilot_path_ordinal_cs ASC
+);
+CREATE INDEX entries_category_sort_desc ON entries(
+  category,
+  modified_utc_ms DESC,
+  name COLLATE uipilot_name_ordinal_ci ASC,
+  display_path COLLATE uipilot_path_ordinal_cs ASC
+);
+CREATE INDEX entries_category_sort_asc ON entries(
+  category,
+  modified_utc_ms ASC,
+  name COLLATE uipilot_name_ordinal_ci ASC,
+  display_path COLLATE uipilot_path_ordinal_cs ASC
+);
+```
+
+Create the same four sort indexes for `candidate_entries` with `candidate_` names. Queries always join/filter against the currently authenticated `VolumeIdentity` set before count/items; the derived `display_path` is updated in the same publication transaction when a mount point changes and is never used as persistent identity.
+
+In `file_index/mod.rs`, define the minimum state required by this task's query/NLS/revision paths:
+
+```rust
+enum Availability { Normal, Rebuilding, Unavailable }
+
+enum LifecycleMode {
+    Uninitialized,
+    Opening { owner: u64 },
+    Active,
+}
+
+enum LazyInitDecision {
+    Start { owner: u64 },
+    ObserveBuilding,
+}
+
+enum AdmissionError {
+    Unavailable,
+    EpochMismatch,
+    OwnerExhausted,
+    WrongMode,
+}
+
+struct IndexState {
+    mode: LifecycleMode,
+    lazy_owner_high_water: u64,
+    availability: Availability,
+    admission_open: bool,
+    fatal_unavailable: bool,
+    runtime_epoch: u64,
+    index_revision_high_water: u64,
+}
+
+pub(crate) struct FileIndex {
+    state: Mutex<IndexState>,
+    publication_runtime_epoch: AtomicU64,
+}
+```
+
+`state` is the one publication gate. `FileIndex::default()` always initializes `mode=Uninitialized`, `lazy_owner_high_water=0`, `runtime_epoch=0`, `publication_runtime_epoch=0`, and `index_revision_high_water=0`; runtime epoch is process-local and is never loaded from SQLite.
+
+Freeze the helper signature and branch order:
+
+```rust
+fn begin_lazy_init_locked(
+    state: &mut IndexState,
+    expected_runtime_epoch: u64,
+) -> Result<LazyInitDecision, AdmissionError>
+```
+
+First reject fatal unavailable or mismatched runtime epoch. For Uninitialized, checked-increment `lazy_owner_high_water`, store `Opening { owner }`, set `admission_open=false`, and return `Start { owner }`. For existing Opening with the same epoch, return `ObserveBuilding` with zero mutation, open, reservation, counter, or notification; ordinary `admission_open` is deliberately not consulted for this observer. Active returns `WrongMode` because it must use the normal query/DbWork path, not LazyInit. Owner overflow returns `OwnerExhausted` and uses the existing fatal path. Only matching `Start` owner completion may authenticate metadata, load `index_revision_high_water` from its canonical persisted value, install the opened connection, set Active/open admission, and notify waiters; matching failure clears its resources and returns to Uninitialized unless the DB error set fatal unavailable. Stale owner completion is zero-effect.
+
+A private `advance_revision_locked` requires the guard, uses `checked_add`, persists canonical decimal revision when a healthy DB is open, and returns the new value; overflow closes admission, sets fatal unavailable, and returns a handled error. Every runtime-epoch change requires the same guard and a Release store to `publication_runtime_epoch`. Task 3 uses these rules for lazy-init status, NLS reindex, query snapshot capture, and File publication authorization. It emits no watcher event yet.
+
+- [ ] **Step 4: Register indexed Windows ordinal collations without enabling rusqlite features.**
+
+Do not sort the result set in Rust and do not enable rusqlite `collation`/`functions`. In `store.rs`, use `rusqlite::ffi::sqlite3_create_collation_v2` against `Connection::handle()` to register two process-static callbacks on every connection:
+
+```text
+uipilot_name_ordinal_ci -> CompareStringOrdinal(left, right, TRUE)
+uipilot_path_ordinal_cs -> CompareStringOrdinal(left, right, FALSE)
+```
+
+The callback accepts only SQLite UTF-8 text, converts to bounded UTF-16 without panic, and maps `CSTR_LESS_THAN/CSTR_EQUAL/CSTR_GREATER_THAN` to `-1/0/1`. Give each connection two boxed private collation contexts through `pArg`; a context owns the fixed ignore-case flag and an atomic invalid-input bit, and its registered destructor reclaims it when SQLite closes. Reset/check the bit around each query so invalid UTF-8/overlong conversion fails the query without unwinding through FFI. Register before schema/index access. The two literal order clauses are `ORDER BY modified_utc_ms DESC, name COLLATE uipilot_name_ordinal_ci ASC, display_path COLLATE uipilot_path_ordinal_cs ASC LIMIT 200` and the same clause with `modified_utc_ms ASC`. The schema creates matching indexes, so ordering is SQLite-indexable under the frozen `bundled` feature. The ordinal test compares SQL order to direct `CompareStringOrdinal` for case, supplementary, composed/decomposed, and long-path rows; `EXPLAIN QUERY PLAN` must name the expected ascending/descending index rather than `USE TEMP B-TREE`.
+
+Persist the exact ordinal sort identity used to build those indexes: Windows major/minor/build from a private no-allocation `RtlGetVersion` FFI call plus `GetNLSVersionEx(COMPARE_STRING, LOCALE_NAME_INVARIANT, NLSVERSIONINFOEX)` fields `dwNLSVersion`, `dwDefinedVersion`, `dwEffectiveId`, and `guidCustomVersion`, serialized as one canonical ASCII metadata string. Read it before any sort index can be used. On mismatch, take Task 3's publication gate, close admission, expose building, run `REINDEX uipilot_name_ordinal_ci` and `REINDEX uipilot_path_ordinal_cs`, persist the new identity, and call `advance_revision_locked` in one transaction; only then reopen query admission. A failure uses the same gate to set fatal unavailable. This reuses current rows and does not rescan disk. The injected-identity test proves old indexes are never queried after an identity change and requires exactly two REINDEX statements before the next ordered query.
+
+- [ ] **Step 5: Implement exact query and DTO contracts.**
+
+In `file_index/mod.rs`, add private enums `FileCategory` and `FileSort`, strict parsers, and these wire types:
+
+```rust
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileSearchResponse {
+    request_id: String,
+    index_revision: String,
+    total: String,
+    status: FileIndexStatus,
+    items: Vec<FileResultItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileResultItem {
+    result_id: String,
+    name: String,
+    kind: FileResultKind,
+    size_bytes: Option<String>,
+    modified_utc: String,
+    full_path: String,
+}
+```
+
+`FileIndexStatus` serializes exactly `building|ready|partial|rebuilding|unavailable`; file kind serializes `file|folder`. Extend `CommandError` with exact local codes `invalidFileQuery`, `fileSearchWorkerFailed`, `searchUnavailable`, `fileNotFound`, and `fileOpenFailed`, each with a fixed non-path backend message; the frontend maps them to the approved local Chinese states. Validate raw query `<=1024` UTF-8 bytes, `<=255` Unicode scalars, no NUL, strict category/sort, nonempty invocation, and sequence >0 before registry/index. Fold afterward and reject folded values over 4096 bytes or 1024 scalars before calling `registry.begin_query(QueryDomain::File, &invocation_id, query_sequence)`.
+
+The serialized response keys are exactly `requestId`, `indexRevision`, `total`, `status`, and `items`; every item key set is exactly `resultId`, `name`, `kind`, `sizeBytes`, `modifiedUtc`, and `fullPath`. `indexRevision`, `total`, and non-null `sizeBytes` are canonical decimal strings.
+
+After validation, fold and call `begin_query(File)` for every query, including empty. For zero folded scalars, complete lazy init/availability/status/revision capture but prepare no `instr` or FTS statement; return `total="0"` and empty items through the same `publish_if_latest` so any previous File action mapping is atomically cleared. For one/two scalars use parameterized `instr(folded_name, ?1) > 0`; for three or more use a parameterized literal FTS5 trigram term produced by a private encoder that doubles FTS quotes and never concatenates raw WebView text. Count and first 200 rows execute in one read transaction after a metadata read fixes the snapshot. Format `modifiedUtc` from stored UTC milliseconds with SQLite `strftime('%Y-%m-%dT%H:%M:%fZ', modified_utc_ms / 1000.0, 'unixepoch')` and reject out-of-range/null output.
+
+Classify by the final extension with Windows ordinal case-insensitive comparison and this exact table: Excel `.xls/.xlsx/.xlsm/.xlsb/.csv`; Word `.doc/.docx/.docm/.rtf`; PPT `.ppt/.pptx/.pptm`; PDF `.pdf`; image `.bmp/.gif/.heic/.jpeg/.jpg/.png/.svg/.tif/.tiff/.webp`; video `.avi/.m4v/.mkv/.mov/.mp4/.webm/.wmv`; audio `.aac/.flac/.m4a/.mp3/.ogg/.wav/.wma`; archive `.7z/.bz2/.gz/.rar/.tar/.tgz/.zip`. Directories are private category `folder`; unknown extensions are private category `other`. Wire `all` omits category filtering, `folder` selects directories, and the other eight select only their exact file category.
+
+- [ ] **Step 6: Add the guarded command and minimal lazy database owner.**
+
+Change `lib.rs` from test-only to production `mod file_index;`, create exactly one `Arc<FileIndex>` managed state, and add `commands::search_files` to the production handler. `FileIndex::default()` contains only Task 3's state mutex/Condvar/atomics and opens nothing. The first valid query calls `begin_lazy_init_locked`; only `Start { owner }` authenticates app-data and opens/creates the DB. `ObserveBuilding` returns the fixed empty building snapshot with zero DB/reservation work. Matching Start completion installs the DB and returns empty `building` while no committed rows exist; it does not enumerate or start a watcher until Task 4. Active routes directly to the query path. Concurrent valid queries never call SQLite open.
+
+The command signature is exact and keeps category/sort as raw `String` until after caller guard:
+
+```rust
+#[tauri::command]
+pub(crate) async fn search_files(
+    window: WebviewWindow,
+    app: AppHandle,
+    registry: State<'_, ResultRegistry>,
+    file_index: State<'_, Arc<FileIndex>>,
+    query: String,
+    category: String,
+    sort: String,
+    invocation_id: String,
+    query_sequence: u64,
+) -> Result<Option<FileSearchResponse>, CommandError> {
+    require_main_window(&window)?;
+    // strict validation, shared begin_query, blocking query, shared publish
+}
+```
+
+Move blocking SQLite work through `tauri::async_runtime::spawn_blocking`; map join failure to fixed `fileSearchWorkerFailed`. Each accepted query captures FileIndex's current atomic runtime epoch with its store snapshot. The final shared registry publication uses Task 2's lock-free authorization closure to Acquire-compare that epoch while holding only the registry mutex. Do not hold the registry mutex while taking the FileIndex publication gate.
+
+- [ ] **Step 7: Apply the first exact Tauri permission/checker delta.**
+
+Run the Tauri command-permission generator through the existing build and require one generated `allow-search-files` permission naming only `search_files`. Add only `"allow-search-files"` to `main.json`. Add only `'allow-search-files'` to `$expectedPermissions` in `scripts/check-security-config.ps1`; change no checker logic/order beyond the sorted exact list. Do not add the preview permission yet.
+
+- [ ] **Step 8: Run GREEN and static security gates.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::store::tests
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::base_publication
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::base_runtime_epoch
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::lazy_init
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::file_query
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::search_files_caller_guard
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+```
+
+Expected: all named tests and full suites pass; both security scripts print their existing success text; capability contains exactly the former ten entries plus `allow-search-files`.
+
+- [ ] **Step 9: Commit.**
+
+```powershell
+git add src-tauri/src/file_index/store.rs src-tauri/src/file_index/mod.rs src-tauri/src/commands.rs src-tauri/src/lib.rs src-tauri/capabilities/main.json src-tauri/permissions/autogenerated/search_files.toml scripts/check-security-config.ps1
+git diff --cached --check
+git commit -m "功能：新增受保护的本地文件索引查询" -m "目标与根因：为合法文件查询提供同一 SQLite 快照中的总数与前二百项，同时阻断非法输入、过期查询和旧排序身份。" -m "实现范围：新增 schema、Unicode fold、两项 ordinal collation、惰性打开状态、search_files 命令及精确生成权限。" -m "RED/GREEN验证：先覆盖空查询、短查询、排序、快照一致性、调用方 guard 与 NLS 漂移 RED，再通过 focused、全量 Rust、安全脚本和 Clippy。" -m "边界：未实现磁盘扫描、watcher、文件执行或 UI，未增加通配权限、内容读取或未批准 SQLite feature。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 3 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 4 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 4: Build the lazy fixed-volume scan and lossless watcher handoff
+
+**Files:**
+- Create: `src-tauri/src/file_index/windows_backend.rs`
+- Modify: `src-tauri/src/file_index/mod.rs`
+- Modify: `src-tauri/src/file_index/store.rs`
+
+**Interfaces:**
+- Consumes: Task 3's publication gate, checked revision high-water/runtime-epoch mirror, authenticated app-data root, private schema/store, one lazy-init owner, and existing low-priority blocking-thread facilities.
+- Produces: authenticated `DRIVE_FIXED` volume inventory, candidate generation, recursive metadata scan, watcher sink/buffer-before-arm, committed-generation live double-write, cutoff replay, atomic candidate commit, and first queryable building results.
+
+**Evidence split:** Automated: deterministic volume/scanner/watcher/store seam RED/GREEN, focused/full Rust, Clippy, formatting, and security. HITL: none. Not executed: real product interaction, real Shell action, input automation, final Windows smoke, or runtime probe.
+
+- [ ] **Step 1: Write the scanner/volume/handoff RED tests.**
+
+Add exact test names beside the owning code:
+
+```text
+file_index::windows_backend::tests::fixed_volume_identity_is_guid_serial_and_filesystem
+file_index::windows_backend::tests::scanner_excludes_attributes_system_roots_temp_and_app_data
+file_index::windows_backend::tests::scanner_reads_metadata_without_file_content
+file_index::windows_backend::tests::watcher_sink_and_buffer_exist_before_first_arm
+file_index::windows_backend::tests::completed_user_buffer_is_parsed_before_rearm
+file_index::tests::coordinator_consumes_existing_active_lazy_open
+file_index::tests::first_candidate_is_queryable_and_commits_atomically
+file_index::tests::scan_updates_existing_committed_rows_before_candidate_commit
+file_index::tests::failed_candidate_is_cleared_without_a_third_generation
+file_index::tests::candidate_crash_recovery_preserves_only_committed_rows
+```
+
+Use a dedicated temporary tree and local function seams, not a repository/scanner trait. The fake native calls must inject: same volume mounted twice; drive-letter reuse with changed GUID/serial; hidden/system/reparse parent; Windows/temp/app-data roots; exact DB/WAL/SHM names; access denial; stop request; event at the instant arm returns; next-call event while the completed user buffer is being parsed; bytes=0; `ERROR_NOTIFY_ENUM_DIR`; malformed rename pair; and candidate transaction failure. A content-open seam must panic if called and remain at zero.
+
+- [ ] **Step 2: Run RED.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::coordinator_consumes_existing_active_lazy_open
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::first_candidate
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::scan_updates_existing_committed
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::failed_candidate
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::candidate_crash
+```
+
+Expected: exit 101 for missing Windows backend, generation state, and scan coordinator; never a fixture or zero-test failure.
+
+- [ ] **Step 3: Implement exact volume and exclusion primitives in `windows_backend.rs`.**
+
+Use `GetLogicalDriveStringsW` plus `GetDriveTypeW`; accept only `DRIVE_FIXED`. Resolve every mount with `GetVolumeNameForVolumeMountPointW` and `GetVolumeInformationW`. Normalize GUID path to uppercase GUID plus trailing backslash, filesystem to uppercase, serial to `u32`; choose the `CompareStringOrdinal(FALSE)` smallest mount point for duplicate identities. Reauthenticate on activation, query, scan, and execution.
+
+Resolve Windows/system/user temp roots through Windows/Tauri APIs, convert each to `(VolumeIdentity, relative prefix)`, and combine with the authenticated app-data root. `is_excluded` receives already-authenticated volume-relative metadata and rejects any ancestor or entry with Hidden, System, or ReparsePoint, all fixed system/temp roots, the full app-data subtree, and exact `file-index.sqlite3`, `file-index.sqlite3-wal`, and `file-index.sqlite3-shm` before store access.
+
+Enumerate with `FindFirstFileExW`/`FindNextFileW`; read only `WIN32_FIND_DATAW` name, attributes, type, size, and modification `FILETIME`. Never `CreateFileW` a result during scanning. Convert modification time to checked UTC milliseconds and reject ill-formed UTF-16/path conversion. Check a stop atomic between directory entries and batches. Set only the scanner thread to below-normal priority.
+
+- [ ] **Step 4: Implement the single-buffer watcher ownership exactly.**
+
+Open the authenticated root for recursive `ReadDirectoryChangesW` with one 64 KiB DWORD-aligned user buffer and overlapped completion. Before opening the handle, create:
+
+```rust
+struct EventBuffer {
+    next_sequence: u64,
+    events: VecDeque<SequencedEvent>,
+    overflowed: bool,
+}
+```
+
+The bound is exactly 65,536 structured events. Make the callback sink callable before the first arm. Confirm a pending first read before creating a candidate or enumerating. On completion, parse/copy the entire returned byte range into owned `SequencedEvent` values exactly once, then re-arm using the same user buffer. Do not re-arm while returned bytes still borrow that buffer. Changes between calls rely on the directory handle's system buffer; bytes=0, `ERROR_NOTIFY_ENUM_DIR`, parse error, sequence overflow, queue full, or re-arm failure becomes overflow/dirty and never guesses events. Cancel through `CancelIoEx`/handle close and join the watcher; do not add a buffer pool.
+
+- [ ] **Step 5: Implement committed/candidate generation and handoff.**
+
+In `store.rs`, replace the candidate `CREATE TABLE AS` with a full explicit table mirroring entry columns and constraints, plus its own FTS table/triggers. `row_id` values are staging-local and are regenerated when copied into committed entries. Persist canonical decimal `committed_generation`, `candidate_generation`, and checked `next_generation`.
+
+The production order is exact:
+
+1. authenticate identity/mount/exclusions/committed generation;
+2. construct sink/bounded queue/sequence, open watcher, and confirm first arm;
+3. create one candidate and set scanning;
+4. enumerate in bounded transactions. Every watcher event receives one sequence and remains in the structured buffer for candidate replay. When a committed generation exists, the same sequenced event is also sent to the single writer, applied to committed rows under Task 3's publication gate, and calls `advance_revision_locked`; active queries therefore see live old-generation updates while the candidate scan continues. Task 4 records no Tauri event yet; Task 5 emits the path-free event for subsequent transactions using this committed revision rule. With no committed generation, do not run the committed writer or update any committed row: replay the buffered event into the candidate exactly once at handoff;
+5. take the handoff mutex and freeze a sequence cutoff;
+6. replay through cutoff, copy denied old prefixes, apply the final batch, replace committed rows, clear candidate, increment/persist revision, set `idle` or `partial`, and switch watcher live in one write transaction before releasing the mutex;
+7. apply later events to the new committed generation.
+
+Any failure stops watcher, clears event queue and all candidate rows, clears candidate metadata, keeps old committed rows, and sets dirty. With no committed generation, the provisional visible set becomes empty. Startup cleanup always removes leftover candidates and checked-increments `next_generation`; no third generation or retained failed partial is permitted.
+
+- [ ] **Step 6: Connect the one lazy owner to one coordinator.**
+
+`FileIndex` owns one coordinator thread and the existing Condvar. It is not a DB-work worker and never joins itself. Task 4 attaches one post-open callback to Task 3's matching lazy-owner completion: after Task 3 has already installed the DB and changed Opening to Active, the callback gives the coordinator one cloned `AppHandle` used only for Tauri path resolution/event emission and merges one immediate per-volume calibration signal. It does not open the DB or repeat any mode transition. Concurrent/repeated `/find` calls continue through Task 3's existing Active/Opening path and cannot start another full scan. The coordinator scans one volume at a time.
+
+The coordinator test injects an already-open sentinel connection and open-call panic seam, completes Task 3's owner once, and requires Active unchanged, open-call count zero, one merged calibration signal, and one coordinator wake. Duplicate post-open callbacks create zero additional coordinator/signal.
+
+- [ ] **Step 7: Run GREEN and regression suites.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::coordinator_consumes_existing_active_lazy_open
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::first_candidate
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::scan_updates_existing_committed
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::failed_candidate
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::candidate_crash
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+```
+
+Expected: all focused/full tests pass; scanner content-open count is zero; watcher and scan owners never exceed one.
+
+- [ ] **Step 8: Commit.**
+
+```powershell
+git add src-tauri/src/file_index/windows_backend.rs src-tauri/src/file_index/mod.rs src-tauri/src/file_index/store.rs
+git diff --cached --check
+git commit -m "功能：建立惰性本地文件元数据索引" -m "目标与根因：首次合法文件查询需要唯一打开数据库并以无丢失 watcher 交接建立固定卷元数据索引。" -m "实现范围：仅实现卷认证、排除规则、candidate generation、结构化事件缓冲和 committed generation 双写。" -m "RED/GREEN验证：先覆盖并发 lazy owner、arm 边界事件、扫描竞态、子树删除改名与属性切换 RED，再通过 focused、全量 Rust、Clippy 与安全门禁。" -m "边界：不读取文件内容，不引入 USN、通用调度器或第二数据库 owner，不实现前端与 Shell 动作。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 4 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 5 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 5: Apply live changes, subtree rules, bounded calibration, and monotonic publication
+
+**Files:**
+- Modify: `src-tauri/src/file_index/mod.rs`
+- Modify: `src-tauri/src/file_index/store.rs`
+- Modify: `src-tauri/src/file_index/windows_backend.rs`
+
+**Interfaces:**
+- Consumes: Task 3's publication gate/checked revision/runtime mirror, Task 4's armed recursive watcher and committed/candidate store, one coordinator, and Tauri event emission.
+- Produces: live metadata transactions, subtree rename/delete/attribute semantics, one per-volume backoff state, aggregate status, and `file-index://changed`; it extends the existing revision rule to every live/calibration/status transition instead of adding a second owner.
+
+**Evidence split:** Automated: deterministic live/revision/backoff RED/GREEN, focused/full Rust, Clippy, formatting, and security. HITL: none. Not executed: real product interaction, user input, final performance evidence, input automation, or runtime probe.
+
+- [ ] **Step 1: Write live-update/calibration/publication RED tests.**
+
+Add exact tests:
+
+```text
+file_index::windows_backend::tests::directory_events_update_or_remove_the_complete_subtree
+file_index::tests::live_and_candidate_replay_apply_identical_event_semantics
+file_index::tests::calibration_backoff_is_bounded_single_owner_and_recovers
+file_index::tests::revision_status_count_and_items_share_one_linearization
+file_index::tests::revision_events_are_monotonic_and_path_free
+file_index::tests::multi_volume_status_uses_the_frozen_priority
+```
+
+Directory rows cover paired rename, unpaired rename, delete, Hidden/System/ReparsePoint allowed-to-forbidden and forbidden-to-allowed transitions. Backoff uses a fake monotonic clock and persistent failures: starts only at 0/1/3/7/15/31/63 seconds, running <=1 per volume and one globally, repeated events coalesce, detach cancels, reattach cannot bypass delay, successful arm+candidate commit resets the next failure to one second. Publication rows cover result changes and status-only changes; unchanged internal state emits nothing; overflow is fail-closed.
+
+- [ ] **Step 2: Run RED.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests::directory_events
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::live_and_candidate
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::calibration_backoff
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::revision
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::multi_volume_status
+```
+
+Expected: exit 101 for missing live event application, calibration, and revision/status publication.
+
+- [ ] **Step 3: Add exact subtree event semantics.**
+
+Reliable directory rename deletes the old relative prefix and performs a bounded rescan at the new prefix. Directory delete removes the complete old prefix. Unpaired/uncertain rename marks the whole volume dirty. A directory becoming Hidden/System/ReparsePoint removes the prefix; becoming allowed rescans that subtree. File changes reread only metadata. Use the same private `apply_event_batch` for committed live transactions and candidate cutoff replay. Exclusions run before metadata/DB work.
+
+- [ ] **Step 4: Add only the per-volume backoff state required by the design.**
+
+```rust
+enum Calibration {
+    Idle,
+    Pending { deadline: Instant, runtime_epoch: u64 },
+    Running { runtime_epoch: u64 },
+}
+
+struct VolumeRuntime {
+    calibration: Calibration,
+    consecutive_failures: u32,
+}
+```
+
+Use one coordinator Condvar and one nearest deadline, not a scheduler/timer abstraction. Delay is exactly `min(60s, 1s * 2^min(failures-1, 6))`. Reset only after watcher arm and candidate commit both succeed.
+
+- [ ] **Step 5: Extend the Task 3 publication rule to every live and aggregate-status transition.**
+
+Reuse Task 3's `index_revision_high_water`, `advance_revision_locked`, publication gate, admission/fatal fields, and runtime atomic. Every externally visible live result or aggregate status change obtains that gate, calls the same checked increment, persists when DB is healthy, commits, computes status, releases the gate, and emits exactly one `{ revision, status }`. Status priority is:
+
+```text
+fatal unavailable > rebuilding > any scanning/dirty/no committed = building > any partial = partial > ready
+```
+
+The event serializes revision as canonical decimal and contains no path/error/list. Internal-only transitions do not increment. Overflow closes admission and sets the process fatal latch under the publication gate, releases that gate, calls narrow File-domain invalidation, then invokes unified `clear_and_hide`; it publishes no wrapped/equal revision. Domain-invalidation exhaustion follows the same already-fatal path and never panics.
+
+- [ ] **Step 6: Keep query snapshots linearized with writer publication.**
+
+Under publication gate, authenticate current volumes/mounts, begin the SQLite read transaction, perform one metadata read to establish its snapshot, capture revision/status, then release the gate. Count and first 200 rows come from that same transaction. Writer/status transitions cannot interleave their linearization. Add a barrier test where writer waits at the gate and prove response status/revision/count/items are all old or all new, never mixed.
+
+- [ ] **Step 7: Run GREEN and full Rust/security gates.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests::directory_events
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::live_and_candidate
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::calibration_backoff
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::revision
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::multi_volume_status
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+```
+
+Expected: all pass, with exact revision/status/event counts.
+
+- [ ] **Step 8: Commit.**
+
+```powershell
+git add src-tauri/src/file_index/mod.rs src-tauri/src/file_index/store.rs src-tauri/src/file_index/windows_backend.rs
+git diff --cached --check
+git commit -m "功能：保持本地文件索引实时一致" -m "目标与根因：watcher、扫描提交和活跃查询必须在同一 revision 线性化，避免旧结果、重复校准或失败热循环。" -m "实现范围：实现 live transaction、子树规则、revision 事件、选择回退、单任务校准与有界 monotonic backoff。" -m "RED/GREEN验证：先覆盖扫描期间双写、overflow、持续失败、恢复和活跃查询刷新 RED，再通过 focused、全量 Rust、Clippy 与格式门禁。" -m "边界：不增加通用 scheduler、channel bus、后台内容读取或新的结果注册表，不改变应用查询行为。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 5 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 6 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 6: Add Task 7 file-mode ownership and revision refresh
+
+**Files:**
+- Modify: `src-tauri/src/settings.rs`
+- Modify: `src-tauri/src/commands.rs`
+- Modify: `src-tauri/src/lib.rs`
+- Modify: `src-tauri/capabilities/main.json`
+- Create: `src-tauri/permissions/autogenerated/set_file_preview_preference.toml`
+- Modify: `scripts/check-security-config.ps1`
+- Modify: `src/protocol.ts`
+- Modify: `src/main.ts`
+- Modify: `src/launcher-core.ts`
+- Modify: `src/launcher.test.tsx`
+
+**Interfaces:**
+- Consumes: final integrated Task 7 cached snapshot/core, SettingsStore atomic persistence/critical reservation, one `querySequence`, one launcher invocation, one view epoch, and backend `search_files`/`file-index://changed` contracts.
+- Produces: the durable preview field/command, the only real file adapter, strict file DTO parsers, `/find` mode entry, listener-before-empty-search, BigInt revision owner, bounded refresh, and stable selection. The commit is production-buildable; no required client method or settings field is left without its Rust/adapter implementation.
+
+**Evidence split:** Automated: pure core/adapter/state RED/GREEN with inert fixtures, headless Vitest, Vite build, Rust, Clippy, formatting, and security. HITL: none in this task; real typing/navigation is deferred to Task 12. Not executed: real product input, browser/OS input synthesis, accessibility smoke, or runtime probe.
+
+- [ ] **Step 1: Write the Rust settings/command RED tests before exposing the TypeScript contract.**
+
+Add exact Rust tests:
+
+```text
+settings::tests::file_preview_defaults_true_and_round_trips_legacy_settings
+settings::tests::user_settings_update_preserves_file_preview_preference
+settings::tests::file_preview_preference_updates_only_that_field
+commands::tests::file_preview_preference_guards_reserves_and_reacquires_managed_store
+commands::tests::file_preview_preference_maps_worker_and_storage_failures
+commands::tests::file_preview_preference_caller_guard_is_first_statement
+```
+
+The command seam counters prove invalid caller and Cleaning/SystemEnding create zero dispatch/store writes; valid flow obtains one critical reservation before dispatch, moves it into the blocking worker, reacquires the one managed `SettingsStore` through `AppHandle::state`, and invokes no hotkey/autostart/AppCache path. Persistence failure leaves memory and disk unchanged.
+
+- [ ] **Step 2: Write protocol, real-adapter, and file-mode RED tests in the sole Task 7 test file.**
+
+Add test groups named exactly `file protocol`, `launcher real file adapter`, `file mode ownership`, and `file index refresh`. Cover:
+
+- strict exact-key parsing for `FileSearchResponse` and `FileIndexChanged`, canonical decimal `u64` revision/total/size, RFC3339 UTC, status/category/sort/kind enums, and whole-payload rejection on extra/missing/wrong/malformed values;
+- `/find`, `/find `, and `/find UiPilot` exact token parsing; `/finder`/`/findx` remain application text;
+- an application search at sequence 1 followed by Enter on `/find` producing file sequence 2 in the same invocation; only a new shown resets to zero;
+- listener resolves before the first file call; listener failure produces zero file call/lazy init; empty `/find` still sends one empty query;
+- literal real-adapter calls `listen('file-index://changed')`, `invoke('search_files', exactCamelCaseObject)`, and `invoke('set_file_preview_preference',{preference:{enabled}})`; no args/path leak, one listener registration, and unlisten before React unmount;
+- stale response/event/new show/hide/view/query/category/sort owner rejection;
+- exact-key `FileResultView` and optional `LauncherSnapshot.file` projection: `resultId` is absent, `file.results` is immutable, selected is absent or references one object in that array, application `LauncherSnapshot.results: readonly ViewResult[]` is unchanged, and no-op/stale input preserves all snapshot/array references;
+- event newer-only rule, response equal/newer acceptance and older rejection, 250 ms trailing debounce plus one-second maximum wait;
+- refresh checked-increments the same sequence and preserves selection by full path, else first row, else none;
+- refresh/Enter ordering through request/result IDs and query sequence overflow hiding once.
+
+- [ ] **Step 3: Run RED before any production edit.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline settings::tests::file_preview
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::file_preview_preference
+npm.cmd test -- --run src/launcher.test.tsx -t "file protocol|launcher real file adapter|file mode ownership|file index refresh"
+```
+
+Expected: Rust exits 101 for the missing field/command, and Vitest fails for missing DTOs/adapter/core state; existing Task 7 tests still load.
+
+- [ ] **Step 4: Add the isolated persisted field, command, and exact permission.**
+
+In `Settings`, add:
+
+```rust
+#[serde(default = "default_file_preview_enabled")]
+pub(crate) file_preview_enabled: bool,
+
+fn default_file_preview_enabled() -> bool { true }
+```
+
+`Settings::default()` sets true. `SettingsView` adds Rust field `file_preview_enabled` serialized as exact `filePreviewEnabled`; `UserSettingsUpdate` and `SettingsUpdate` do not add it. Existing user-setting persistence clones current Settings and therefore preserves it. Add `SettingsStore::set_file_preview_enabled(bool)` that clones current, changes one field, and uses existing `persist`.
+
+Add strict `FilePreviewPreferenceUpdate { enabled: bool }` and `set_file_preview_preference(preference: FilePreviewPreferenceUpdate)`. Caller guard is first. Before dispatch, reserve existing LifecycleCoordinator critical work; move the reservation into `spawn_blocking`; reacquire SettingsStore from cloned AppHandle; keep the reservation until atomic persist returns. Map reservation/storage to existing fixed `settingsFailed`; the frontend supplies the fixed preference text.
+
+Generate only `allow-set-file-preview-preference`, add only that string to main capability, and add only the same expected string to `scripts/check-security-config.ps1`. Together with Task 3, the final trust delta is exactly `allow-search-files` and `allow-set-file-preview-preference`; no wildcard/scoped permission, second capability, CSP/config, or checker-logic change is permitted.
+
+- [ ] **Step 5: Add exact TypeScript protocol types and the real adapter in the same production increment.**
+
+Extend `LauncherClient` only with:
+
+```typescript
+listenFileIndexChanged(handler: (payload: unknown) => void): Promise<() => void>
+searchFiles(input: {
+  query: string
+  category: FileCategory
+  sort: FileSort
+  invocationId: string
+  querySequence: number
+}): Promise<FileSearchResponse | null>
+setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
+```
+
+Freeze `FileCategory`, `FileSort`, `FileIndexStatus`, `FileResultItem`, `FileSearchResponse`, and `FileIndexChanged` exactly to the design. Extend `CommandErrorCode` only with `invalidFileQuery | fileSearchWorkerFailed | searchUnavailable | fileNotFound | fileOpenFailed` and map them to Global Constraints' fixed local text. Add required `filePreviewEnabled: boolean` to `SettingsView` only; do not add it to `UserSettingsUpdate`. Update every Task 7 settings fixture to the exact default true. Parse decimal strings with a regex `^(0|[1-9][0-9]*)$`, then `BigInt`, then require `<= 18446744073709551615n`; never convert revision/total/size to number. Exact-key parsers reject inherited arrays/objects and return null without mutation.
+
+In `src/main.ts`, implement all three required methods immediately: one `listen<unknown>('file-index://changed', event => handler(event.payload))`, one typed `search_files` invoke with the exact camelCase object, and one preference invoke with exact outer `preference`. Preserve the previous eight commands and `launcher://shown`; final source has exactly ten command literals and two event literals, imports no Tauri window API, and logs no payload. No later task repeats this adapter wiring.
+
+- [ ] **Step 6: Extend the existing model, not a second store.**
+
+Add `launcherMode: 'applications' | 'files'` and one private file-state group inside the existing core model: category, sort, preview preference, preference pending/last durable value, latest revision BigInt, file total string, file status, listener owner/unlisten, refresh timer/max-wait owner. Keep one immutable cached `LauncherSnapshot` and one notification per real mutation. File items use a private result carrying `resultId/fullPath`; the existing public result projection exposes only the file row/preview metadata and stable view keys.
+
+Define and project the entire UI-facing contract in this Task 6 commit:
+
+```typescript
+interface FileResultView {
+  key: string
+  name: string
+  kind: FileResultKind
+  sizeBytes: string | null
+  modifiedUtc: string
+  fullPath: string
+}
+
+interface FileSnapshot {
+  category: FileCategory
+  sort: FileSort
+  previewEnabled: boolean
+  preferencePending: boolean
+  total: string
+  indexStatus: FileIndexStatus
+  results: readonly FileResultView[]
+  selected?: FileResultView
+}
+```
+
+Add exact field `file?: FileSnapshot` to the existing `LauncherSnapshot`; every existing field, especially top-level application `results: readonly ViewResult[]`, remains unchanged. `file` is absent in application/settings mode and present in file mode. The private model stores `{ resultId, view }`; `resultId` is used only for `execute_result` and never enters `FileResultView`. `view.key` is the exact full path already exposed as `fullPath`, used only as the React key and never copied to a DOM id/data attribute. Folder `sizeBytes` is null. The immutable projection creates `file.results` from `view` values and makes `selected` reference the matching object from that same array, or omits it. Exact-key tests require `Object.keys(view)` to equal `fullPath,key,kind,modifiedUtc,name,sizeBytes` after case-sensitive sort and reject any `resultId` property. No-op/stale work retains the same snapshot, file object, and results array; one accepted mutation replaces each exactly once. No Task 9 model/protocol edit is needed. The pre-Task-9 `LauncherView` ignores the additional optional field, so `npm.cmd run build` remains GREEN while the file panel is not yet rendered.
+
+Task 7 core must parse the slash command only on non-composing Enter while in application mode. Entering file mode resets category/sort, reads the last successfully loaded `SettingsView.filePreviewEnabled` (or schema default true when startup settings have not loaded successfully), installs the file listener exactly once, then checked-increments the existing safe integer sequence and calls `searchFiles` even for empty query. If `querySequence === Number.MAX_SAFE_INTEGER`, invalidate pending work and request the existing hide path; do not send an imprecise number or create a BigInt wire argument.
+
+While in file mode, ordinary committed query edits, category changes, sort changes, and accepted index events call the same file query owner. They never call `searchApps`. New shown/settings target/destroy cancels timers and pending file ownership; destroy unlistens file and shown listeners exactly once. Do not modify `native-input.ts`.
+
+- [ ] **Step 7: Implement exact refresh and selection behavior.**
+
+Only an event with valid status and revision strictly greater than `latestSeenRevision` can schedule refresh. Capture view epoch, invocation, exact query, category, sort, and required revision. Coalesce with 250 ms trailing delay and one-second maximum wait. Refresh increments the one sequence and accepts a current response only when response revision >= required/latest. Preserve selected full path when present in the new first 200; otherwise select first; no rows clears selection. Equal/older events and stale timers create no snapshot/notification/client call.
+
+- [ ] **Step 8: Run GREEN and the complete build/security gate before commit.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline settings::tests::file_preview
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::file_preview_preference
+npm.cmd test -- --run src/launcher.test.tsx -t "file protocol|launcher real file adapter|file mode ownership|file index refresh"
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+npm.cmd test
+npm.cmd run build
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+```
+
+Expected: all pass. The required Rust settings field exists before TypeScript parses it, every required `LauncherClient` method has the real adapter implementation in this commit, and core/view contain no Tauri import.
+
+- [ ] **Step 9: Commit the buildable vertical increment.**
+
+```powershell
+git add src-tauri/src/settings.rs src-tauri/src/commands.rs src-tauri/src/lib.rs src-tauri/capabilities/main.json src-tauri/permissions/autogenerated/set_file_preview_preference.toml scripts/check-security-config.ps1 src/protocol.ts src/main.ts src/launcher-core.ts src/launcher.test.tsx
+git diff --cached --check
+git commit -m "功能：接入可构建的文件搜索前端所有权" -m "目标与根因：文件模式、revision 刷新和预览偏好必须进入既有 LauncherCore 与真实 adapter，同一提交保持 TypeScript 生产构建完整。" -m "实现范围：扩展 settings DTO、两个窄 client 方法、FileSnapshot 投影、空查询 lazy-init 和预览偏好持久化，并同步真实 main adapter。" -m "RED/GREEN验证：先覆盖模式切换、sequence 延续、stale event、快照不可变、偏好回滚与 adapter 合同 RED，再通过 Vitest、Vite build、Rust、安全脚本和 Clippy。" -m "边界：未渲染最终面板、未执行文件、未暴露 resultId 或 appId，未改变 Task 7 应用模式所有权。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 6 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 7 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 7: Close corruption recovery and lifecycle admission races
+
+**Files:**
+- Modify: `src-tauri/src/lifecycle.rs`
+- Modify: `src-tauri/src/file_index/mod.rs`
+- Modify: `src-tauri/src/file_index/store.rs`
+- Modify: `src-tauri/src/result_registry.rs`
+
+**Interfaces:**
+- Consumes: existing `ExitGate`, Task 3's `IndexState`/publication gate/revision high-water/runtime atomic/fatal latch, Task 5's coordinator, and shared File-domain invalidation.
+- Produces: narrow lifecycle phase/attempt atomics, lifecycle-mode fields and work counters added to the existing state, unified admission reservations, non-self-joining recovery, reversible Cleaning pause, Terminal shutdown, and fail-closed clean-close evidence.
+
+**Evidence split:** Automated: deterministic admission/recovery/lifecycle/clean-close seam RED/GREEN, focused/full Rust, Clippy, formatting, and security. HITL: none. Not executed: real tray/session interaction, real product input, input automation, or runtime probe.
+
+- [ ] **Step 1: Write the admission/recovery RED tests before production changes.**
+
+Add exact test groups:
+
+```text
+lifecycle::tests::file_index_phase_mirror
+file_index::tests::admission_rejects_every_kind_after_phase_store
+file_index::tests::recovery_reporters_never_join_themselves
+file_index::tests::recovery_transition_releases_gate_before_domain_invalidation
+file_index::tests::recovery_quiesces_before_destructive_operations
+file_index::tests::recovery_reopens_once_with_monotonic_revision
+file_index::tests::cleaning_pause_return_running_and_terminal_are_linearized
+file_index::tests::cleaning_attempt_handover_cannot_wedge
+file_index::store::tests::clean_close_uses_prior_snapshot_and_one_final_connection
+```
+
+Required deterministic rows are the complete design matrix:
+
+- query, writer, and integrity worker each report `CORRUPT`; repeated reports select one coordinator and every reporter returns/drops its own reservation;
+- LazyInit under Running/nonfatal/matching epoch returns Task 3's exact Start or ObserveBuilding decision; Opening observer succeeds despite `admission_open=false` and has zero reservation/open/mutation, while Active routes to DbWork and Pausing/Terminal/fatal/epoch mismatch reject;
+- phase Release-stores Cleaning/Terminal while the FileIndex handler is blocked: query snapshot, resolved execution, scanner, watcher, writer, integrity, recovery transition, lazy init, and coordinator start all create zero new owner/DB/path/Shell work;
+- recovery closes admission and Release-updates its atomic runtime epoch under the FileIndex gate, releases that gate, then invalidates only File domain; a query paused between release and invalidation can only return stale or publish an empty rebuilding/unavailable response, never old actions. Application mapping is preserved by narrow invalidation; recovery waits for DB/execution reservations and worker joins and performs zero close/delete/create before zero ownership;
+- execution-first/recovery-first ordering; five-second recovery timeout; high revision delete/rebuild; create/schema/seed/reopen failure; revision/runtime/attempt overflow;
+- Cleaning success/Clean/SystemEnding terminal rows; Cleaning failed/timeout returns lifecycle Running and later exactly one lazy init only after old ownership reaches zero; fatal unavailable survives Cleaning/ReturnRunning;
+- recovery cancelled by Cleaning does not set fatal; Terminal wins Cleaning/ReturnRunning races;
+- late Cleaning start after ReturnRunning is no-op; attempts A/B retag one pause owner in both `start(B)`-first and `ReturnRunning(B)`-first orders; runtime epoch increments once;
+- pause query can only attempt empty unavailable publication and becomes stale/null if invalidation wins before publish;
+- old resolved action remains stale after pause/lazy reopen by runtime epoch;
+- prior clean-close true/false are read before current false write; one process runs at most one integrity check. The final coordinator connection test proves zero calls to Running-only `admit_locked`, exact matching pause/attempt, zero ordinary reservations/connections, one marker permit, and durable true-or-rollback false under Terminal race.
+
+- [ ] **Step 2: Run all RED filters.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lifecycle::tests::file_index_phase_mirror
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::admission
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::recovery
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::cleaning
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::store::tests::clean_close
+```
+
+Expected: exit 101 for missing lifecycle mirrors/mode, admission reservations, recovery state, and pause/clean-close ownership. Task 3's base publication/fatal/runtime tests must still compile and pass; no existing lifecycle regression is accepted as RED evidence.
+
+- [ ] **Step 3: Add only the two lifecycle atomics required by FileIndex.**
+
+In `LifecycleCoordinator`, add `AtomicU8 lifecycle_phase` and `AtomicU64 lifecycle_attempt_epoch`. Private phase encoding is exactly Running/Cleaning/Terminal. Initial values are Running/0. Under the existing `ExitGate` mutex, checked-increment attempt when creating a new tray clean attempt, store attempt mirror, then Release-store Cleaning. Before releasing that mutex on every state transition, Release-store Running for `ExitState::Running` and Terminal for Clean/SystemEnding. Do not expose or duplicate `ExitState`; FileIndex only has crate-private Acquire load helpers.
+
+Attempt overflow still lets existing `LifecycleCoordinator` finish its exit logic but invokes FileIndex's fail-closed overflow handler after releasing the lifecycle mutex. That handler closes admission/sets fatal under FileIndex gate, releases it, performs narrow invalidation, then unified hide. No path holds the lifecycle mutex, FileIndex gate, or registry mutex together.
+
+- [ ] **Step 4: Extend the existing publication state with lifecycle admission and RAII reservations.**
+
+Keep Task 3's `LifecycleMode::{Uninitialized, Opening { owner }, Active}`, `lazy_owner_high_water`, `Availability`, `admission_open`, `fatal_unavailable`, `runtime_epoch`, `index_revision_high_water`, publication mutex, and `publication_runtime_epoch` unchanged. Extend that enum only with Pausing/Terminal and add the work counters:
+
+```rust
+enum LifecycleMode {
+    Uninitialized,
+    Opening { owner: u64 },
+    Active,
+    Pausing { attempt_epoch: u64, resume_requested: bool },
+    Terminal,
+}
+
+enum AdmissionKind { LazyInit, DbWork, Execution }
+
+struct IndexState {
+    lazy_owner_high_water: u64,
+    availability: Availability,
+    admission_open: bool,
+    fatal_unavailable: bool,
+    runtime_epoch: u64,
+    index_revision_high_water: u64,
+    mode: LifecycleMode,
+    db_work: usize,
+    execution_work: usize,
+}
+```
+
+Continue using Task 3's `publication_runtime_epoch`. Every checked runtime-epoch mutation occurs under the existing gate and Release-stores the same new value before gate release. File query publication continues to use Task 2's Acquire authorization closure; it never takes this gate from inside ResultRegistry.
+
+Add one crate-private `admit_locked(kind, expected_runtime_epoch) -> Result<(), AdmissionError>` callable only with the publication guard. It Acquire-loads lifecycle phase and first requires Running, nonfatal state, and matching runtime epoch, then branches by kind. `LazyInit` is the sole admission-open special case: it requires mode Uninitialized or Opening and deliberately does not inspect normal DB-work `admission_open`; while retaining the same guard, the caller immediately invokes Task 3's `begin_lazy_init_locked` and handles its exact `Start { owner }` or `ObserveBuilding` result. Mode Active must route to `DbWork`, never LazyInit. `DbWork` requires Active plus `admission_open=true`; `Execution` requires the same plus the action epoch. Pausing and Terminal reject every kind.
+
+Every fresh query/scanner/watcher/writer/integrity/execution/lazy-init/coordinator DB entry calls the applicable predicate, then only actual DB/execution starters checked-increment the relevant count and create `DbWorkReservation` or `FileExecutionReservation` before releasing the same guard. An Opening observer creates no reservation/open/mutation. Drop checked-decrements and notifies the existing Condvar. A corruption reporter already holding `DbWorkReservation` calls only the DbWork predicate to revalidate its current reservation/epoch before transition; it does not increment `db_work` or create a second reservation. The pause coordinator's already-retained final clean-close connection is the sole exception and uses the one-shot permit in Step 7; it is not fresh work and never calls this Running-only helper.
+
+- [ ] **Step 5: Implement recovery request/winner/coordinator without self-join.**
+
+Any DB task seeing only `CORRUPT`/`NOTADB` calls `request_recovery` while it still owns its current reservation. Under gate and revalidation through `admit_locked(DbWork, reporter_epoch)`, the first reporter:
+
+1. changes Normal to Rebuilding, closes admission, checked-increments revision and runtime epoch, Release-stores the atomic runtime epoch, and stores the active recovery owner/cancel;
+2. releases the FileIndex gate, then calls `registry.invalidate_domain(QueryDomain::File)` without any FileIndex/lifecycle lock held;
+3. if invalidation reports epoch exhaustion, reacquires only the FileIndex gate, verifies the recovery owner, sets fatal/closed, releases it, and invokes unified hide once; otherwise it emits rebuilding and signals the one coordinator;
+4. returns from the DB task and drops its original reservation without creating another.
+
+The transition/invalidation race test uses barriers at gate release and registry invalidation. An old query finishing in that window fails Task 2's Acquire runtime authorization and allocates no action; a new query may publish only empty rebuilding/unavailable. Application mapping/invocation remain until a deliberate full hide. Repeated/Pausing/Terminal/fatal reports only observe and return. The coordinator is never counted as DB work. It waits at most five monotonic seconds for scanner/watcher/writer/reader/integrity/execution joins and zero reservations. At timeout and before each individual close/delete/create/schema/seed operation, reacquire gate and require exact active runtime owner, mode Active, and lifecycle phase Running. Phase/mode mismatch yields to lifecycle teardown with zero later destructive operations and no fatal misclassification.
+
+After successful empty schema/seed at the previous revision high-water, reacquire gate and reauthenticate volumes. Atomically clear only this recovery cancel and old runtime watcher/buffer/candidate ownership, reset each current volume to idle/failures=0, switch Normal/open admission, checked-increment/persist building revision, and create exactly one `pending(now,current_epoch)` per volume before releasing gate. The coordinator consumes existing pending only. Any actual FileIndex failure that transitions to Unavailable sets process-lifetime `fatal_unavailable=true` in the same gate; pause cancellation never does.
+
+- [ ] **Step 6: Implement reversible Cleaning pause and irreversible Terminal.**
+
+After releasing the lifecycle mutex, Cleaning start obtains the FileIndex gate and rechecks Acquire phase plus mirrored attempt. First owner from Active/Opening/Uninitialized checked-increments runtime epoch once, Release-stores it, closes admission, cancels any Opening owner plus pending/running/recovery, and enters `Pausing(attempt,false)`. It releases the FileIndex gate before calling `invalidate_domain(File)` and uses the same exhaustion handling as recovery; no registry/FileIndex lock pair is ever simultaneous. A newer B seeing Pausing(A) retags only when B>A; it reuses teardown and runtime epoch. Old/late lazy-owner and lifecycle handlers no-op under the exact owner/phase/attempt rules.
+
+ReturnRunning(B), after lifecycle mutex release, requires mirrored Running/B. For Pausing(A) and B>=A it retags/sets resume true, covering a missed B start. If old ownership is already zero it becomes nonfatal Uninitialized, or Active/Unavailable when fatal; otherwise the single coordinator completes that transition later. New `/find` during Pausing may take a File registry token, but gets zero DB/new worker and can only attempt empty unavailable publication after releasing the gate; invalidated token returns stale/null.
+
+SystemEnding/CleanDecision::Exit, after lifecycle mutex release, takes the same gate and makes Terminal irreversible, closes admission, cancels pending, signals all work, and never waits for a natural scan. Terminal beats ReturnRunning/recovery/lazy init. The pause coordinator uses a five-second bounded cancel/join attempt but never starts second ownership if old owners remain.
+
+- [ ] **Step 7: Implement integrity and clean-close ordering.**
+
+On first open/lazy reopen, one transaction reads/caches `prior_clean_close` and `prior_last_integrity_check_utc`, then writes current `clean_close=false`. After the first response, schedule at most one low-priority integrity check when prior false, prior check older than seven days, or schema newly created. Exact one-row `ok` permits a timestamp write transaction; ordinary timestamp failure leaves old time and does not rebuild. Non-ok/CORRUPT/NOTADB request recovery.
+
+For clean close, the pause coordinator retains one dedicated SQLite connection while it cancels work, waits for zero DB/execution reservations, and closes every ordinary connection. This is not fresh DB work: it does not call `admit_locked`, increment a reservation, or require lifecycle Running. Under the publication gate, require exact `Pausing { attempt_epoch, .. }` ownership matching the coordinator, atomic phase non-Terminal, zero ordinary reservations, and zero ordinary connections; then consume one private `CleanCloseMarkerPermit` tied to that attempt. The permit acquisition is the clean-close linearization point. Release the gate, use only the retained final connection for a short transaction writing true, then close it. The permit is single-use and its Drop cannot write. Terminal may race and never waits: an atomic durable true or SQLite rollback/false are both safe; no partial marker exists. ReturnRunning lazy reopen immediately writes false before query/worker work. The `clean_close_uses_prior_snapshot_and_one_final_connection` test asserts all permit preconditions, `admit_locked` call count zero, one write attempt, and both Terminal schedules.
+
+- [ ] **Step 8: Run focused GREEN, all lifecycle tests, and full gates.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lifecycle::tests::file_index_phase_mirror
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::admission
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::recovery
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::cleaning
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::store::tests::clean_close
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lifecycle::tests
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-features --all-targets -- -D warnings
+```
+
+Expected: all pass; deterministic lock-order tests time out on no row; all counters/epochs match the design.
+
+- [ ] **Step 9: Commit.**
+
+```powershell
+git add src-tauri/src/lifecycle.rs src-tauri/src/file_index/mod.rs src-tauri/src/file_index/store.rs src-tauri/src/result_registry.rs
+git diff --cached --check
+git commit -m "功能：协调文件索引恢复与生命周期" -m "目标与根因：corruption recovery、Cleaning、ReturnRunning 与 SystemEnding 必须共享可证明的 admission、epoch 和锁序，避免旧 owner 复活或自等待。" -m "实现范围：扩展现有 lifecycle phase mirror、FileIndex mode、DB-work reservation、fatal latch、recovery coordinator 与 clean-close 线性化。" -m "RED/GREEN验证：先覆盖 reporter、执行竞态、跨 attempt、terminal 胜出、revision overflow 与 clean-close RED，再通过 focused、全量 Rust、Clippy 和安全门禁。" -m "边界：不新增任务框架、热重启路径或第二 lifecycle owner，不阻塞 terminal exit，不修改应用域映射。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 7 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 8 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 8: Execute indexed files through pinned Windows paths and the one execute command
+
+**Files:**
+- Modify: `src-tauri/src/file_index/mod.rs`
+- Modify: `src-tauri/src/file_index/store.rs`
+- Modify: `src-tauri/src/file_index/windows_backend.rs`
+- Modify: `src-tauri/src/commands.rs`
+- Modify: `src/protocol.ts`
+- Modify: `src/launcher-core.ts`
+- Modify: `src/launcher.test.tsx`
+
+**Interfaces:**
+- Consumes: resolved `OpenIndexedPath`, FileIndex Execution admission, row identity, authenticated volume/mount, existing `execute_result`, and shared `clear_and_hide`.
+- Produces: secure file reveal/folder open outcomes with zero application side effects; no file-specific execute command.
+
+**Evidence split:** Automated: deterministic row/volume/reparse/pinning/Shell-call seam RED/GREEN, focused/full Rust/TypeScript, Clippy, build, and security. HITL: normal Explorer reveal/open and shared-write smoke are deferred to Task 12. Not executed: real product input, automatic Shell UI control, input automation, or runtime probe.
+
+- [ ] **Step 1: Write the execution RED matrix.**
+
+Add exact tests:
+
+```text
+commands::tests::execute_result_preserves_application_branch_and_isolates_file_branch
+file_index::tests::file_execution_binds_epoch_row_volume_path_and_kind
+file_index::tests::execution_and_recovery_have_two_valid_linearizations
+file_index::windows_backend::tests::pinned_path_rejects_reparse_type_volume_and_prefix_races
+file_index::windows_backend::tests::pinned_path_allows_existing_shared_writers
+file_index::windows_backend::tests::directory_shell_execute_ex_uses_null_verb_args_and_cwd
+launcher file execute outcomes
+```
+
+Application rows must retain existing action, immediate hide, validation, use-count, and `validationFailed > settingsFailed > windowFailed` counts/priority. File rows assert: one resolve; one execution reservation; row lookup missing or reused with changed volume/path/kind gives stale and zero path/Shell; application stores/cache zero; Shell success one hide, Shell failure zero hide; no event receives full path. Race rows cover execution-first/recovery-first, pre-pin same-volume/same-type replacement accepted, reparse/type/volume/prefix rejected, post-pin rename/delete sharing rejection, and an existing `FILE_SHARE_WRITE` writer/writable mapping still accepted.
+
+- [ ] **Step 2: Run RED.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::execute_result_preserves_application_branch
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::file_execution
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::execution_and_recovery
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests::pinned_path
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests::directory_shell_execute_ex
+npm.cmd test -- --run src/launcher.test.tsx -t "file execute outcomes"
+```
+
+Expected: Rust exit 101 and Vitest fail only for missing file execution branch/outcomes.
+
+- [ ] **Step 3: Implement exact execution admission and row rebinding.**
+
+After shared registry resolve releases its mutex, `OpenIndexedPath` obtains publication gate and `admit_locked(Execution, action.runtime_epoch)`, then creates one `FileExecutionReservation` before releasing gate. Phase/mode/epoch failure returns `searchUnavailable` with zero DB/path/Shell.
+
+With reservation held, query by row ID and require exact equality of stored `volume_identity`, `relative_path`, and kind to the cloned action. Missing/mismatch returns stale; only CORRUPT/NOTADB requests recovery. Reauthenticate current `DRIVE_FIXED` mount/identity before path construction.
+
+- [ ] **Step 4: Implement component-by-component native pinning.**
+
+From the authenticated volume root, split only the backend-stored relative path and open every ancestor/final component with `CreateFileW(OPEN_EXISTING)`, `dwDesiredAccess=0`, share exactly `FILE_SHARE_READ | FILE_SHARE_WRITE` without DELETE, `FILE_FLAG_OPEN_REPARSE_POINT`, and `FILE_FLAG_BACKUP_SEMANTICS` for directories. After each open, use `FileAttributeTagInfo`, `GetFinalPathNameByHandleW`, and volume APIs to verify no reparse, expected type at final, same `VolumeIdentity`, and exact normalized GUID-relative prefix. Keep every RAII handle through Shell return.
+
+For files, build PIDLs only from the pinned backend path and call `SHOpenFolderAndSelectItems`. For directories, call `ShellExecuteExW` with the pinned path, null `lpVerb`, null `lpParameters`, null `lpDirectory`, `SEE_MASK_FLAG_NO_UI`, and `SW_SHOWNORMAL`; require the Boolean result and map failure to `fileOpenFailed`. No verb, args, cwd, PID, HWND, or front-end path is accepted. The exact-field seam test asserts one call and every null/fixed field. Test-only local closure seams count Shell calls; do not define a public Shell trait.
+
+- [ ] **Step 5: Exhaustively split the existing execute command.**
+
+Make `execute_result` async only if needed for its file `spawn_blocking` branch; preserve the wire name/arguments. After guard and resolve, use one exhaustive match:
+
+```rust
+match action {
+    ResultAction::LaunchApplication { .. } => execute_application_result(/* existing exact flow */),
+    ResultAction::OpenIndexedPath(action) => execute_indexed_path_result(/* FileIndex worker */).await,
+}
+```
+
+The app helper contains the existing behavior byte-for-byte in semantic order. The file helper never receives `ValidationStore`, `SettingsStore`, or `AppCache`; success calls the same `clear_and_hide` once after Shell, failure retains window/mapping. Add Rust `ExecuteOutcome::{FileRevealRequested, FolderOpenRequested}` and matching TypeScript tagged variants; the core treats either as successful execution without exposing path.
+
+- [ ] **Step 6: Run GREEN and regression gates.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::execute_result
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::file_execution
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::execution_and_recovery
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests::pinned_path
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::windows_backend::tests::directory_shell_execute_ex
+npm.cmd test -- --run src/launcher.test.tsx -t "file execute outcomes"
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+npm.cmd test
+npm.cmd run build
+```
+
+Expected: all existing app execution tests and new file tests pass; no path appears in event/error snapshots.
+
+- [ ] **Step 7: Commit.**
+
+```powershell
+git add src-tauri/src/file_index/mod.rs src-tauri/src/file_index/store.rs src-tauri/src/file_index/windows_backend.rs src-tauri/src/commands.rs src/protocol.ts src/launcher-core.ts src/launcher.test.tsx
+git diff --cached --check
+git commit -m "功能：执行经过认证的本地文件结果" -m "目标与根因：已解析文件动作仍需在 FileIndex admission 下重验 row 与卷路径，并以 pinned handle 阻断 rename/delete 竞态。" -m "实现范围：新增 OpenIndexedPath 执行分支、逐组件 Win32 pin、Explorer 选择与目录 ShellExecuteExW null-verb 路径，并投影脱敏文件结果。" -m "RED/GREEN验证：先覆盖 row_id 复用、卷错配、reparse、pin 竞态、共享写句柄及 app/file 副作用隔离 RED，再通过 focused、全量 Rust、Vitest、Clippy 与安全门禁。" -m "边界：前端只提交 resultId；零任意路径参数、零 validation/use_count/AppCache 访问、零日志路径，不新增 execute command。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 8 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 9 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 9: Render the accessible Ant Design file panel
+
+**Files:**
+- Modify: `src/launcher-view.tsx`
+- Modify: `src/launcher.test.tsx`
+- Modify: `src/styles.css`
+
+**Interfaces:**
+- Consumes: Task 6's already-buildable Rust preference field/command, real adapter, file-mode snapshot/core, and existing Ant Design composition root.
+- Produces: the exact three-pane/stacked `/find` UI; no backend/protocol/core rewiring, new page, route, state library, icon dependency, or settings screen.
+
+**Evidence split:** Automated: headless snapshot/render/accessibility contract tests using pure callbacks and inert fixtures, Vitest, Vite build, and static boundary checks. HITL: real keyboard, pointer, IME, zoom, theme, forced-colors, and Narrator behavior are deferred to Task 12. Not executed: real product input, browser/OS input synthesis, automated UI driving, or runtime probe.
+
+- [ ] **Step 1: Write UI RED tests.**
+
+Under exact groups `file panel accessibility`, `file panel responsive layout`, and `file preview preference`, cover:
+
+- ten fixed categories/order/extensions, one roving category Tab stop, desktop Up/Down and compact Left/Right, Home/End, Tab/Shift+Tab leaving the category region;
+- query Input as the only combobox/`aria-activedescendant` owner, result rows never focus, Arrow Up/Down wraps, Enter executes, mouse selection restores query focus, double-click executes;
+- Alt+S toggles modified ascending/descending and Alt+P toggles preview when no preference save is pending; composition suppresses Enter/arrows/Escape and does not create file queries;
+- exact item name/kind/size/modified/full path preview, directory size `--`, tooltip for full name, no content/thumbnail;
+- bottom order `共 N 条结果`, modified sort, preview Switch, disabled settings icon with accessible name/tooltip `设置暂不可用`;
+- 100% wide three columns; 150%/200% or `<600px` horizontal category row plus result then preview stack, no page horizontal overflow, same DOM/focus order, path wrapping;
+- light/dark/forced colors, long text, live region not reading all paths;
+- preview save single-flight, success persistence, failure rollback to last durable value and exact `无法保存文件预览设置。`.
+
+- [ ] **Step 2: Run RED.**
+
+```powershell
+npm.cmd test -- --run src/launcher.test.tsx -t "file panel accessibility|file panel responsive layout|file preview preference"
+```
+
+Expected: Vitest fails only because the file panel branch and styles are missing; Task 6's real adapter/core/settings tests remain green.
+
+- [ ] **Step 3: Render one file-mode branch in the existing LauncherView.**
+
+Do not create another React root or store. Extend the current launcher branch:
+
+- application mode keeps existing result list unchanged;
+- file mode renders one `.file-workspace` with categories, list, optional preview, and `.file-statusbar` from the one snapshot;
+- use existing AntD `Input`, `Button`, `Spin`, plus `Switch` and `Tooltip`; do not import `@ant-design/icons`, AutoComplete, Select, Card, Modal, Popconfirm, or a new package;
+- use the familiar `⚙` glyph in a fixed square disabled Button with `aria-label="设置暂不可用"`; tooltip names it; no click handler;
+- keep query input mounted and focused; category uses native buttons with roving tabindex; results are non-focusable `role=option` rows;
+- result click changes selection then restores query focus, result double-click invokes the same selected-result path, sort Button and preview Switch preserve native keyboard behavior, and Escape always delegates to the existing hide command;
+- use stable layout dimensions and CSS grid areas, not viewport-scaled fonts or nested cards.
+
+Consume Task 6's existing `snapshot.file.results` and `snapshot.file.selected` without modifying `LauncherSnapshot`, `FileSnapshot`, `FileResultView`, protocol types, or core state. Render `FileResultView.key` only as the React key, never a DOM id/data attribute. The private Task 6 model continues to retain `resultId` for execution; no result ID, VolumeIdentity, row ID, or runtime epoch reaches the snapshot. Preference toggle remains single-flight and optimistic only until its existing command settles: on failure the core restores the last persisted boolean and fixed status, while pending it ignores repeat toggle.
+
+- [ ] **Step 4: Run GREEN, full frontend/Rust, and security gates.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline settings::tests::file_preview
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline commands::tests::file_preview_preference
+npm.cmd test -- --run src/launcher.test.tsx -t "file panel accessibility|file panel responsive layout|file preview preference"
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+npm.cmd test
+npm.cmd run build
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+```
+
+Expected: all pass; Task 9 changes only presentation/test/style files and preserves Task 6's exact two-command trust delta.
+
+- [ ] **Step 5: Commit.**
+
+```powershell
+git add src/launcher-view.tsx src/launcher.test.tsx src/styles.css
+git diff --cached --check
+git commit -m "界面：实现可访问的本地文件搜索面板" -m "目标与根因：文件分类、结果、预览和状态栏需要在固定窗口与 100/150/200% 缩放下保持键盘、屏幕阅读器和响应式可达。" -m "实现范围：仅用已批准 Ant Design primitives 渲染 FileSnapshot，加入单一分类 Tab stop、active descendant、预览开关和窄屏布局样式。" -m "RED/GREEN验证：先覆盖焦点矩阵、方向键、Enter、IME、缩放、长路径、forced colors 与 live region RED，再通过 66 类功能契约对应的 Vitest、Vite build 和静态边界检查。" -m "边界：不增加状态库、AutoComplete/Select/Card/Modal、远程资源、图标依赖或 Tauri 直连，不实现设置按钮功能。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 9 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 10 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 10: Wire the one managed FileIndex into production lifecycle
+
+**Files:**
+- Modify: `src-tauri/src/lib.rs`
+- Modify: `src-tauri/src/lifecycle.rs`
+- Modify: `src-tauri/src/commands.rs`
+- Modify: `src-tauri/src/file_index/mod.rs`
+
+**Interfaces:**
+- Consumes: Task 6's already-built ten-command/two-event real adapter, one managed FileIndex, and Task 6 lifecycle run/tray/session callbacks.
+- Produces: production FileIndex lifecycle signals and final source/lint inventory; no adapter change, direct window API, or alternate event path.
+
+**Evidence split:** Automated: production source contracts, managed-state/lifecycle seams, production build, default/all-features tests, Clippy, frontend, formatting, and security. HITL: real tray/session/window interaction is deferred to Task 12. Not executed: real product input, input automation, runtime positive probe, or release.
+
+- [ ] **Step 1: Write production-wiring RED tests.**
+
+Add exact tests/groups:
+
+```text
+lib::tests::production_file_index_state_commands_and_permissions_are_exact
+lifecycle::tests::file_index_handlers_run_after_exit_lock_release
+file_index::tests::production_callbacks_use_one_managed_index
+```
+
+Rust source contracts require one managed `Arc<FileIndex>`, ten exact command handlers, search/preference generated permissions only, the Task 6 adapter byte-shape still present, test-instrumentation remains probe-only, lifecycle handlers occur after exit mutex release, and run shutdown only signals FileIndex.
+
+- [ ] **Step 2: Run RED.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lib::tests::production_file_index
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lifecycle::tests::file_index_handlers
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::production_callbacks
+```
+
+Expected: failures only for incomplete managed-state/lifecycle source contracts; Task 6's production adapter and build remain green.
+
+- [ ] **Step 3: Complete the one managed FileIndex lifecycle wiring.**
+
+Manage one `Arc<FileIndex>` only in normal production/test graph, never feature-only security-probe graph. It remains inert at normal setup. Pass FileIndex handlers from the existing lifecycle transitions after the ExitGate mutex is released:
+
+- new Cleaning attempt -> `on_cleaning_start(attempt, registry)`;
+- ReturnRunning -> `on_return_running(attempt)`;
+- CleanDecision::Exit/SystemEnding/run exit -> `on_terminal(registry)`.
+
+Each handler rechecks atomic mirrors under its own gate as Task 7 specifies. Window show/focus/hide still uses the existing registry and `clear_and_hide`; no file-specific lifecycle command/event is added. App shutdown never waits for full scan.
+
+Update the existing production lint/source oracle to include `file_index/mod.rs`, `store.rs`, and `windows_backend.rs`; keep zero product `allow/expect` directives beyond the already reviewed exact Task 7 exceptions. Do not add a lint suppression for intermediate stages.
+
+- [ ] **Step 4: Run GREEN and exact source/security inventory.**
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lib::tests::production_file_index
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline lifecycle::tests::file_index_handlers
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::tests::production_callbacks
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+cargo check --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets
+cargo check --manifest-path src-tauri/Cargo.toml --locked --offline --all-features --all-targets
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-features --all-targets -- -D warnings
+npm.cmd test
+npm.cmd run build
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+npm.cmd run tauri build -- --no-bundle
+```
+
+Expected: all exit 0; production release build succeeds; `dist` contains no `security-probe.html`, source map, remote asset, or `security-probe*` artifact.
+
+- [ ] **Step 5: Commit.**
+
+```powershell
+git add src-tauri/src/lib.rs src-tauri/src/lifecycle.rs src-tauri/src/commands.rs src-tauri/src/file_index/mod.rs
+git diff --cached --check
+git commit -m "功能：接入本地文件搜索生产生命周期" -m "目标与根因：唯一 managed FileIndex 必须按 Task 6 生命周期接入启动、Cleaning/ReturnRunning/SystemEnding，并保持 command 与 window guard 顺序。" -m "实现范围：只在现有 setup、run-event、window-event 和 command wiring 中注册一个 FileIndex，并复用 lifecycle phase、ResultRegistry 与 clear-and-hide。" -m "RED/GREEN验证：先覆盖真实 managed identity、listener 顺序、pause/terminal 竞态和零重复 owner RED，再通过 production build、default/all-features tests、Clippy、前端与安全门禁。" -m "边界：不增加 command、event、capability、后台框架或 runtime probe，不改变 Task 6/7 现有生产语义。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 10 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 11 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 11: Add the bounded performance and Windows evidence harness
+
+**Files:**
+- Modify: `.gitignore`
+- Modify: `src-tauri/src/file_index/store.rs`
+- Create: `scripts/test-find-performance.ps1`
+- Create: `scripts/test-find-evidence.ps1`
+
+**Interfaces:**
+- Consumes: private store query seam, authenticated release executable, retained `Diagnostics.Process` identities, and an operator-supplied signed ProcMon path.
+- Produces: one exact ignored million-row test and two repository scripts that retain only bounded aggregate/sanitized evidence under one ignored directory; no benchmark crate, product interface, telemetry, or generic test framework.
+
+**Evidence split:** Automated: million-row harness RED/GREEN, script SelfTest/schema/cleanup/security validation, PowerShell AST, focused/full tests, and build/static gates. HITL: scripts define passive collector checkpoints only; no real user operation is performed in this task. Not executed: Runtime/Io/Smoke/Accessibility evidence modes, product input, input automation, or runtime probe.
+
+- [ ] **Step 1: Write harness RED contracts before helpers.**
+
+In `store.rs`, add exactly one ignored test `file_index::store::tests::million_row_query_gate`; it calls a missing private `run_million_row_query_gate` so the first focused compile is RED. It must eventually exercise the production query path, not a copied SQL query.
+
+Create both PowerShell scripts with strict parameter surfaces and RED `-Mode SelfTest` rows that call their not-yet-defined private validation functions. `test-find-performance.ps1` accepts only `SelfTest | Database | Runtime`, `-RepoRoot`, optional `-ReleaseExe`, `-ArtifactRoot`, optional `-HitlPhase Prepare | Read`, and optional `-HitlGroup ColdPanel | FirstResult | SubsequentQuery | WatcherRefresh`; the two HITL parameters are required only for Runtime. `test-find-evidence.ps1` accepts only `SelfTest | Io | Smoke | Accessibility` plus the same roots, optional `-ProcMonExe`, optional `-AccessibilityMode NormalLight | NormalDark | ForcedColors | Narrator`, optional `-HitlPhase Prepare | Read`, and optional `-HitlGroup IoCapture | SearchKeyboard | FileActions | TrayLifecycle | Accessibility`; the phase/group are required outside SelfTest and Accessibility also requires its exact mode. The RED self-tests require exact schema rejection, root containment, PID+CreationDate identity, owned-tree/ACL/environment/session cleanup, read-only accessibility-state preservation, HITL state transition rejection, and sensitive-field rejection; they fail because those private functions do not exist yet.
+
+- [ ] **Step 2: Run RED and authenticate nonzero test ownership.**
+
+```powershell
+$listed = @(cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::store::tests::million_row_query_gate -- --list --ignored 2>&1)
+if ($LASTEXITCODE -eq 0) { throw 'million-row RED unexpectedly compiled' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode SelfTest -RepoRoot (Get-Location) -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -eq 0) { throw 'performance harness RED unexpectedly passed' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode SelfTest -RepoRoot (Get-Location) -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -eq 0) { throw 'evidence harness RED unexpectedly passed' }
+```
+
+Expected: the Cargo command exits 101 for only the missing private harness; each PowerShell command exits nonzero for only its missing private validation functions. A zero-test success is not accepted.
+
+- [ ] **Step 3: Implement the exact ignored million-row harness.**
+
+Use `%TEMP%` for the SQLite database and a fixed seed/distribution. Insert exactly 1,000,000 rows through bounded transactions into the production schema. The 1-scalar and 2-scalar fixed queries each match at least 30%; the 3+-scalar row exercises the indexed trigram path. Every sample invokes the production same-snapshot count/first-200 query and verifies exact order. Warm samples remain in process; cold samples use the current test executable's private `UIPILOT_FIND_COLD_CHILD=1` mode with one query per child. Retain only aggregate count/P95/DB bytes/peak working-set values, delete the temporary DB/WAL/SHM in a drop guard, and never print names or paths.
+
+- [ ] **Step 4: Implement the two narrow scripts and ignore only their artifact root.**
+
+Append exactly `artifacts/find-local-file-search/` to `.gitignore`. Both scripts resolve `RepoRoot`, require `ArtifactRoot` to equal the resolved ignored directory, reject symlink/reparse ancestors, create only that directory, and delete partial/raw data in `finally` on every failure. Any live test tree is a fresh child of `%TEMP%` on an authenticated `DRIVE_FIXED` volume and contains a random `.uipilot-find-owned-<guid>` marker whose exact value remains in memory. Before recursive cleanup on success or failure, require the original resolved parent, non-reparse ancestry, and matching marker; otherwise stop without deleting. JSON writers use fixed exact-key aggregate schemas and reject usernames, drive-rooted/UNC paths, file names, volume GUIDs, query text, IDs, or content before writing.
+
+`test-find-performance.ps1`:
+
+- `SelfTest` uses local positive/negative fixtures for schema, containment, process creation-time reuse, owned-tree cleanup after injected success/failure, environment/application-source restoration, Prepare/Read ownership, and sensitive-value rejection; it performs no product input or DOM mutation;
+- `Database` first lists the Rust filter, requires exactly one matching test, runs it with `--ignored --exact --nocapture`, parses only its fixed aggregate line, enforces every threshold from Task 12, and writes `database-summary.json`;
+- `Runtime -HitlPhase Prepare` authenticates the exact release path/hash/time, rejects pre-existing exact-path processes/debug-port owners, retains `Diagnostics.Process` handles plus CreationDate for primary/descendants, starts the passive collector for exactly one group, writes a path-free owned session manifest, prints only `HITL_PENDING` plus that exact validated group literal, and exits 3. It performs no query, focus, DOM, pointer, keyboard, clipboard, or navigation action. After the user reports completion, `Runtime -HitlPhase Read` reauthenticates that exact session, reads only `Runtime.evaluate` with expression `globalThis.__UIPILOT_FIND_EVIDENCE__?.read()` and `returnByValue=true`, rejects every other CDP method/expression, validates the fixed aggregate schema/count, cleans owned processes/environment/source in `finally`, and writes only the group aggregate. The fourth successful Read atomically assembles `runtime-summary.json` and rebuilds clean.
+
+`test-find-evidence.ps1`:
+
+- `SelfTest` covers root/process/schema/sensitive fixtures; marker mismatch/reparse refuses deletion; injected Io/Smoke failures remove only the owned tree and restore its original ACL; injected Accessibility failures close owned sessions and prove the captured Windows accessibility/theme state was never changed; Prepare without user completion stays pending, Read without an owned prepared session fails, and four mode fixtures reject missing/duplicate/wrong summaries;
+- `Io -HitlPhase Prepare` verifies the operator-supplied signed Sysinternals ProcMon executable, creates one owned authenticated fixed-volume tree, starts passive capture through a retained process handle, writes the path-free session manifest, prints `HITL_PENDING IoCapture`, and exits 3. Only after the user reports the requested product actions complete may `Read` export and validate aggregate operation classes. `finally` stops only the authenticated handle, removes raw capture and owned tree, and rejects residual ownership. Missing user acknowledgment/capture/export is failure, never empty success;
+- `Smoke -HitlPhase Prepare` creates one owned tree, snapshots its ACL, starts the authenticated release plus passive fixed-category observer, prints `HITL_PENDING` plus the exact validated group literal, and exits 3. The user alone performs each SearchKeyboard, FileActions, or TrayLifecycle operation group. Matching `Read` accepts only fixed booleans/counts/error codes, then restores ACL and owned processes/tree in `finally`. It never creates/attaches a VHD, changes a mount point/drive letter, simulates volume reuse, or controls product input. Detached/reused/wrong-volume remains deterministic seam evidence only;
+- `Accessibility -HitlPhase Prepare` captures AppsUseLightTheme, high-contrast, screen-reader, exact app zoom, and the requested mode; mismatch is Not Runnable. It starts a passive observer, prints `HITL_PENDING Accessibility`, and exits 3 without changing OS or app state. The user alone performs the named keyboard/pointer/IME and 100/150/200% app zoom checks. After acknowledgment, matching `Read` reauthenticates the mode/session, consumes only fixed booleans, restores no state because it changed none, closes owned handles, and proves OS values unchanged. It writes only `accessibility-<Mode>-summary.json` with exact keys `mode`, `keyboard`, `mouse`, `screenReader`, `forcedColors`, `themeMatches`, `zoom100`, `zoom150`, `zoom200`, `noOverlap`, `noHorizontalScroll`, `focusOrder`, `activeOptionVisible`, `pathWraps`, `disabledSettingsSkipped`, `liveRegionPathFree`, `osStateUnchanged`, and `zoomRestored`.
+
+No script launches a bare PID kill, logs command payloads, changes product source permanently, edits a system accessibility/theme setting, controls product input, mutates product/DOM state through CDP, manipulates VHD/mount/drive-letter state, deletes a path without its exact in-memory ownership marker, or touches another evidence directory. Prepare always returns HITL Pending rather than PASS; Read is prohibited until the user reports that exact group complete.
+
+- [ ] **Step 5: Run GREEN, exact-count checks, script self-tests, and full regression.**
+
+```powershell
+$listed = @(cargo test --manifest-path src-tauri/Cargo.toml --locked --offline file_index::store::tests::million_row_query_gate -- --list --ignored)
+if ($LASTEXITCODE -ne 0 -or @($listed | Where-Object { $_ -cmatch '^file_index::store::tests::million_row_query_gate: test$' }).Count -ne 1) { throw 'million-row test count is not exactly one' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode SelfTest -RepoRoot (Get-Location) -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'performance script self-test failed' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode SelfTest -RepoRoot (Get-Location) -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'evidence script self-test failed' }
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+npm.cmd test
+npm.cmd run build
+git check-ignore -q artifacts/find-local-file-search/probe.tmp
+if ($LASTEXITCODE -ne 0) { throw 'find evidence root is not ignored' }
+```
+
+Expected: one listed ignored Rust test; both script self-tests and all normal suites pass; the exact artifact directory is ignored.
+
+- [ ] **Step 6: Commit.**
+
+```powershell
+git add .gitignore src-tauri/src/file_index/store.rs scripts/test-find-performance.ps1 scripts/test-find-evidence.ps1
+git diff --cached --check
+git commit -m "测试：增加本地文件搜索证据门禁" -m "目标与根因：百万行查询、真实 release 时延、I/O 和可访问性要求必须由非零、可清理、无敏感路径的可重复脚本证明。" -m "实现范围：新增两个专用 PowerShell 证据脚本、唯一 ignored 性能测试和精确 gitignored 原始证据目录。" -m "RED/GREEN验证：先让缺失 harness/filter/恢复检查取得 RED，再通过脚本 SelfTest、PowerShell 5.1 AST、精确测试计数、production build 与静态安全检查。" -m "边界：脚本只管理自有 TEMP/进程/测试目录，不自动切换系统可访问性状态、卷或盘符，不提交原始路径与样本。"
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 11 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before Task 12 begins. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+---
+
+### Task 12: Pass performance, I/O, accessibility, Windows smoke, and final trust gates
+
+**Files:**
+- Modify only when a failing gate requires a reviewed fix inside the exact implementation ceiling; rerun that task's RED/GREEN and append a corrective commit.
+- Create after all gates pass: `docs/spikes/2026-07-20-find-local-file-search-evidence.md`
+
+**Interfaces:**
+- Consumes: clean production HEAD and all reviewed functional commits.
+- Produces: de-identified evidence, exact trust inventory, and a Code/Dependency/Security/UI review package; no main integration or release.
+
+**Evidence split:** Automated: deterministic full suite, million-row DB gate, static/source/security checks, owned process preparation/cleanup, and read-only aggregate/log/state validation. HITL: real `/find` typing/navigation, pointer actions, IME, file/folder actions, tray, theme, forced-colors, zoom, and Narrator are separate user-operated checkpoints. Not executed until acknowledged: every pending HITL group, runtime positive probe, integration, push, signing, trial, or release.
+
+- [ ] **Step 1: Run the complete deterministic automated suite from a clean worktree.**
+
+Initialize the approved isolated Cargo environment in this PowerShell session, then run:
+
+```powershell
+$status = @(git status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) { throw 'pre-gate worktree is not clean' }
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+if ($LASTEXITCODE -ne 0) { throw 'fmt failed' }
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline
+if ($LASTEXITCODE -ne 0) { throw 'default tests failed' }
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features
+if ($LASTEXITCODE -ne 0) { throw 'all-features tests failed' }
+cargo check --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets
+if ($LASTEXITCODE -ne 0) { throw 'default check failed' }
+cargo check --manifest-path src-tauri/Cargo.toml --locked --offline --all-features --all-targets
+if ($LASTEXITCODE -ne 0) { throw 'all-features check failed' }
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings
+if ($LASTEXITCODE -ne 0) { throw 'default Clippy failed' }
+$env:CARGO_INCREMENTAL = '0'
+try {
+  cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-features --all-targets -- -D warnings
+  if ($LASTEXITCODE -ne 0) { throw 'all-features Clippy failed' }
+} finally { Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue }
+npm.cmd test
+if ($LASTEXITCODE -ne 0) { throw 'frontend tests failed' }
+npm.cmd run build
+if ($LASTEXITCODE -ne 0) { throw 'frontend build failed' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-security-config.ps1
+if ($LASTEXITCODE -ne 0) { throw 'security config failed' }
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security-config.ps1
+if ($LASTEXITCODE -ne 0) { throw 'security regression failed' }
+npm.cmd run tauri build -- --no-bundle
+if ($LASTEXITCODE -ne 0) { throw 'release no-bundle build failed' }
+```
+
+- [ ] **Step 2: Run the million-row SQLite performance gate.**
+
+Task 11 already committed the sole ignored `file_index::store::tests::million_row_query_gate` and exact-count guard. Invoke it only through the committed script so a missing filter cannot pass as zero tests:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Database -RepoRoot (Get-Location) -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'million-row performance gate failed' }
+```
+
+Expected thresholds:
+
+```text
+30 fresh-process/fresh-connection cold 1-scalar queries: P95 <= 250 ms
+30 fresh-process/fresh-connection cold 2-scalar queries: P95 <= 250 ms
+100 same-connection warm 1-scalar queries: P95 <= 100 ms
+100 same-connection warm 2-scalar queries: P95 <= 100 ms
+30 cold indexed 3+-scalar queries: P95 <= 250 ms
+100 warm indexed 3+-scalar queries: P95 <= 100 ms
+```
+
+The child-process cold harness must invoke the same ignored test binary mode with one query per process, not reopen in one process. A short-query failure is Code No-Go; do not add a minimum query length, raise thresholds, or silently alter the dependency freeze.
+
+- [ ] **Step 3: Measure the real release UI and live-update paths.**
+
+Use the authenticated `uipilot.exe` from the just-completed `tauri build --no-bundle`. A temporary uncommitted `src/main.ts` wrapper may expose only aggregate numeric/boolean timing data through the same loopback-only process-owned CDP read described in Task 11; authenticate its sole diff, rebuild, collect, restore `src/main.ts`, rebuild clean, and require worktree clean. It has no callable mutation method and never emits queries, paths, item names, IDs, raw events, or individual samples.
+
+Measure:
+
+```text
+30 clean /find Enter-to-panel samples: P95 <= 100 ms
+30 existing-index first-result samples: P95 <= 250 ms
+100 subsequent query samples: P95 <= 100 ms
+30 real watcher-change-to-latest-query-publish samples: every sample <= 5 s
+```
+
+Every process is authenticated by exact executable path, PID, and CreationDate and cleaned through retained process handles; do not use a bare PID kill. Reject pre-existing exact-path processes, unexpected debug-port owners, wrong schema, timeouts, or residual descendants. Restore environment and delete the temporary collector in `finally`.
+
+Each row below is a separate HITL checkpoint. Never batch rows. For a row, run only its exact Prepare command, require exit 3 plus the matching `HITL_PENDING` line, tell the user only that row's operation/count, and stop. Run its Read command only in a later turn after the user explicitly reports completion and observations; otherwise classify Task 12 No-Go.
+
+Cold panel row, user personally enters `/find` and presses Enter in each of 30 script-prepared clean starts:
+
+```powershell
+$releaseExe = (Resolve-Path 'src-tauri/target/release/uipilot.exe').Path
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Prepare -HitlGroup ColdPanel -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'ColdPanel did not enter HITL Pending' }
+```
+
+After the user's ColdPanel completion reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Read -HitlGroup ColdPanel -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'ColdPanel aggregate gate failed' }
+```
+
+Existing-index row, user personally enters the fixed `/find UiPilot` query and presses Enter in each of 30 prepared starts:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Prepare -HitlGroup FirstResult -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'FirstResult did not enter HITL Pending' }
+```
+
+After the user's FirstResult completion reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Read -HitlGroup FirstResult -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'FirstResult aggregate gate failed' }
+```
+
+Subsequent-query row, user personally performs the plan-defined fixed sequence of 100 ordinary query edits supplied in the agent's one-group HITL prompt; the script observes only count/timing and never prints, logs, or returns the query text:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Prepare -HitlGroup SubsequentQuery -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'SubsequentQuery did not enter HITL Pending' }
+```
+
+After the user's SubsequentQuery completion reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Read -HitlGroup SubsequentQuery -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'SubsequentQuery aggregate gate failed' }
+```
+
+Watcher row, user personally enters the plan-defined file query supplied in the one-group HITL prompt and reports that the results panel is ready; after that acknowledgment the owned script may create/remove its metadata-only test entries while the user observes 30 refreshes:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Prepare -HitlGroup WatcherRefresh -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'WatcherRefresh did not enter HITL Pending' }
+```
+
+After the user's WatcherRefresh ready reply, run Read while the user observes the 30 owned changes. When Read returns, stop again and require the user's observation reply before accepting the group:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-performance.ps1 -Mode Runtime -HitlPhase Read -HitlGroup WatcherRefresh -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'WatcherRefresh aggregate gate failed' }
+```
+
+Expected: four separately acknowledged groups produce only their fixed aggregate counts/P95/boolean state. Missing acknowledgment or sample remains HITL Pending/No-Go. The script enforces counts/thresholds, restores source/environment, rebuilds the clean release, and leaves zero owned process without controlling product input.
+
+- [ ] **Step 4: Run Windows I/O and action smoke.**
+
+In a dedicated owned test directory on an authenticated fixed volume, execute the following four HITL groups one at a time. Each Prepare must exit 3 and stop the agent turn. The user performs only the named group and reports completion/observations; only then may the matching Read run.
+
+I/O capture group, where the user personally opens `/find`, enters the one requested query, waits for results, and opens the preview while passive ProcMon capture is active:
+
+```powershell
+$procMonExe = (Resolve-Path $env:UIPILOT_SIGNED_PROCMON_EXE).Path
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Io -HitlPhase Prepare -HitlGroup IoCapture -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ProcMonExe $procMonExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'IoCapture did not enter HITL Pending' }
+```
+
+After the user's IoCapture completion reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Io -HitlPhase Read -HitlGroup IoCapture -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ProcMonExe $procMonExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'Windows I/O evidence gate failed' }
+```
+
+Keyboard/search group, where the user personally verifies `/find`, prior application query then file sequence, empty lazy init, typing, category focus, arrows, Tab/Shift+Tab, Enter/Escape, sort, preview, and IME behavior:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Smoke -HitlPhase Prepare -HitlGroup SearchKeyboard -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'SearchKeyboard did not enter HITL Pending' }
+```
+
+After the user's SearchKeyboard completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Smoke -HitlPhase Read -HitlGroup SearchKeyboard -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'SearchKeyboard smoke gate failed' }
+```
+
+File-action group, where the user personally reveals a normal file, opens a directory, and reveals a file while the prepared helper retains its write-sharing handle:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Smoke -HitlPhase Prepare -HitlGroup FileActions -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'FileActions did not enter HITL Pending' }
+```
+
+After the user's FileActions completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Smoke -HitlPhase Read -HitlGroup FileActions -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'FileActions smoke gate failed' }
+```
+
+Tray/lifecycle group, where the user personally invokes the tray and close/session-visible operations requested by the checkpoint and reports the fixed observed outcomes:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Smoke -HitlPhase Prepare -HitlGroup TrayLifecycle -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'TrayLifecycle did not enter HITL Pending' }
+```
+
+After the user's TrayLifecycle completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Smoke -HitlPhase Read -HitlGroup TrayLifecycle -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'TrayLifecycle smoke gate failed' }
+```
+
+The passive scripts' exact evidence rows are:
+
+- use ProcMon filters for exact release process and record only operation classes/counts; prove scanning performs directory enumeration, attributes/metadata, app-owned SQLite I/O, and no target-file content reads;
+- prove app-data/DB/WAL/SHM never appears in results;
+- record the user's reported normal file reveal, directory open, and shared-writer reveal against fixed Shell-call count/category state; deterministic rename/delete/reparse and volume detach/reuse/wrong-identity remain automated seam evidence only;
+- record only fixed booleans/counts for sequence, lazy init, update within five seconds, owned-tree partial status, preview persistence/rollback, application-during-rebuild, keyboard/focus, and tray/lifecycle observations;
+- retain raw ProcMon/screenshots only under gitignored `artifacts/find-local-file-search/`; committed report contains no usernames, full paths, filenames, volume GUIDs, or content. The script removes raw ProcMon exports after aggregate validation.
+
+Expected: all four separately acknowledged groups pass. Any missing acknowledgment stays HITL Pending/No-Go. Any content read, arbitrary path execution, path leak, ownership race, or evidence of automated product input is Security No-Go.
+
+- [ ] **Step 5: Run accessibility and fixed-window visual checks.**
+
+On the clean release executable, execute four independent operator checkpoints. Never batch them. Before each Prepare, the user sets the named Windows mode and confirms readiness. Prepare authenticates state, starts only a passive observer, exits 3 as HITL Pending, and the agent stops. The user then personally checks keyboard/pointer/IME/focus and switches app-local zoom through 100/150/200% and back to 100%. Only after the user's completion/observation reply may the matching Read validate fixed booleans and close the owned session. The script never changes zoom, theme, forced colors, or screen-reader state.
+
+Checkpoint 1, operator-prepared normal light mode:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode NormalLight -HitlPhase Prepare -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'NormalLight did not enter HITL Pending or was Not Runnable' }
+```
+
+After the user's NormalLight completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode NormalLight -HitlPhase Read -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'NormalLight accessibility gate failed' }
+```
+
+Checkpoint 2, only after the user changes Windows to normal dark mode and confirms readiness:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode NormalDark -HitlPhase Prepare -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'NormalDark did not enter HITL Pending or was Not Runnable' }
+```
+
+After the user's NormalDark completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode NormalDark -HitlPhase Read -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'NormalDark accessibility gate failed' }
+```
+
+Checkpoint 3, only after the user enables forced colors/high contrast and confirms readiness:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode ForcedColors -HitlPhase Prepare -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'ForcedColors did not enter HITL Pending or was Not Runnable' }
+```
+
+After the user's ForcedColors completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode ForcedColors -HitlPhase Read -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'ForcedColors accessibility gate failed' }
+```
+
+Checkpoint 4, only after the user returns the chosen normal theme, starts Narrator, and confirms readiness:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode Narrator -HitlPhase Prepare -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 3) { throw 'Narrator did not enter HITL Pending or was Not Runnable' }
+```
+
+After the user's Narrator completion/observation reply:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-find-evidence.ps1 -Mode Accessibility -AccessibilityMode Narrator -HitlPhase Read -HitlGroup Accessibility -RepoRoot (Get-Location) -ReleaseExe $releaseExe -ArtifactRoot (Join-Path (Get-Location) 'artifacts/find-local-file-search')
+if ($LASTEXITCODE -ne 0) { throw 'Narrator accessibility gate failed' }
+$artifactRoot = Join-Path (Get-Location) 'artifacts/find-local-file-search'
+function Assert-AccessibilitySummary([string]$mode) {
+  $summary = Join-Path $artifactRoot "accessibility-$mode-summary.json"
+  if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { throw "accessibility summary missing: $mode" }
+  $value = [IO.File]::ReadAllText($summary, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+  $expectedKeys = @(
+    'activeOptionVisible','disabledSettingsSkipped','focusOrder','forcedColors','keyboard',
+    'liveRegionPathFree','mode','mouse','noHorizontalScroll','noOverlap','osStateUnchanged',
+    'pathWraps','screenReader','themeMatches','zoom100','zoom150','zoom200','zoomRestored'
+  ) | Sort-Object -CaseSensitive
+  $actualKeys = @($value.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+  if (Compare-Object -CaseSensitive $expectedKeys $actualKeys) { throw "accessibility summary key set mismatch: $mode" }
+  if ($value.mode -cne $mode) { throw "accessibility summary mode mismatch: $mode" }
+  foreach ($key in @($expectedKeys | Where-Object { $_ -cne 'mode' })) {
+    if ($value.$key -isnot [bool] -or -not $value.$key) { throw "accessibility summary result is not true Boolean: $mode/$key" }
+  }
+}
+Assert-AccessibilitySummary 'NormalLight'
+Assert-AccessibilitySummary 'NormalDark'
+Assert-AccessibilitySummary 'ForcedColors'
+Assert-AccessibilitySummary 'Narrator'
+```
+
+Expected: four separately acknowledged exact-key summaries exist and each embeds its matching mode literal; no summary may satisfy another mode. Missing user completion remains HITL Pending/No-Go. The user presents each authenticated OS mode and personally performs keyboard, pointer, IME, focus, Narrator, forced-colors, light/dark, and 100/150/200% app-local zoom operations at fixed 720x420. Read proves final zoom 100% and captured OS values unchanged without restoring or changing them. Sanitized read-only screenshots cover desktop and compact states; fixed booleans prove layout/focus/path/live-region contracts without synthesized input.
+
+- [ ] **Step 6: Write and stage the de-identified evidence report.**
+
+Create `docs/spikes/2026-07-20-find-local-file-search-evidence.md` with exact HEAD/baseline/design/plan/dependency identities; separate Automated/HITL/Not executed tables for every Task; user acknowledgment plus fixed observations for every completed HITL group; aggregate performance numbers; sanitized I/O counts; all four accessibility summaries; Windows/zoom/accessibility matrix; explicit `automated seam only` entries for volume detach/reuse/wrong-identity; security/trust inventory; residual SQLite 3.53.2 risk acceptance; and explicit `ReleaseSecurityBlocked / SEC-RUNTIME-PROBE-001`. Include no raw path, query, name, ID, event payload, or content.
+
+```powershell
+git add docs/spikes/2026-07-20-find-local-file-search-evidence.md
+git diff --cached --check
+```
+
+Expected: exactly the de-identified evidence report is staged; do not commit until the final trust checkpoint passes against the committed implementation plus this exact staged file.
+
+- [ ] **Step 7: Run the final exact dependency and source trust checkpoint from its first line.**
+
+Re-run Task 1 environment, lock, feature, SQLite identity, Unicode 15.1, offline build, and 23/11 block oracles. `$allowed` is the ceiling: no changed path may fall outside it. `$required` is the exact set this plan must change; for this plan it intentionally equals the ceiling, and missing required paths fail separately from unexpected paths. Every changed file and ancestor must be regular/non-reparse/root-contained, every index flag visible, every baseline-tracked path outside `$allowed` byte-identical across committed baseline/index/clean-filtered worktree, and nonignored untracked paths absent.
+
+```powershell
+$baseline = (git rev-parse foundation-find-implementation-baseline-r1^{commit}).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'baseline tag failed' }
+$root = (git rev-parse --show-toplevel).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'repository root lookup failed' }
+$root = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $root).Path).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$rootItem = Get-Item -LiteralPath $root -Force
+if ($rootItem -isnot [IO.DirectoryInfo] -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'repository root is not a real directory' }
+$committedChanged = @(git diff --name-only --no-renames $baseline HEAD)
+if ($LASTEXITCODE -ne 0) { throw 'committed changed path inventory failed' }
+$stagedChanged = @(git diff --cached --name-only --no-renames)
+if ($LASTEXITCODE -ne 0) { throw 'staged changed path inventory failed' }
+$changed = @($committedChanged + $stagedChanged | Sort-Object -CaseSensitive -Unique)
+$allowed = @(
+  '.gitignore','rust-toolchain.toml','src-tauri/Cargo.toml','src-tauri/Cargo.lock',
+  'src-tauri/capabilities/main.json','src-tauri/permissions/autogenerated/search_files.toml',
+  'src-tauri/permissions/autogenerated/set_file_preview_preference.toml','src-tauri/src/commands.rs',
+  'src-tauri/src/file_index/mod.rs','src-tauri/src/file_index/store.rs','src-tauri/src/file_index/windows_backend.rs',
+  'src-tauri/src/lib.rs','src-tauri/src/lifecycle.rs','src-tauri/src/result_registry.rs',
+  'src-tauri/src/settings.rs','src/launcher-core.ts',
+  'src/launcher-view.tsx','src/launcher.test.tsx','src/main.ts','src/protocol.ts','src/styles.css',
+  'docs/spikes/2026-07-20-find-local-file-search-evidence.md','scripts/check-security-config.ps1',
+  'scripts/test-find-evidence.ps1','scripts/test-find-performance.ps1'
+) | Sort-Object -CaseSensitive -Unique
+$required = @($allowed)
+$unexpected = @(Compare-Object -CaseSensitive $allowed $changed | Where-Object SideIndicator -eq '=>')
+if ($unexpected.Count -ne 0) { throw "changed path outside ceiling: $($unexpected.InputObject -join ', ')" }
+$missing = @(Compare-Object -CaseSensitive $required $changed | Where-Object SideIndicator -eq '<=')
+if ($missing.Count -ne 0) { throw "required changed path missing: $($missing.InputObject -join ', ')" }
+
+$tracked = @(git ls-files | Sort-Object -CaseSensitive -Unique)
+if ($LASTEXITCODE -ne 0) { throw 'tracked path inventory failed' }
+function Assert-RegularFileUnderRoot([string]$relativePath) {
+  if (-not ($tracked -ccontains $relativePath)) { throw "tracked path case/type missing: $relativePath" }
+  $item = Get-Item -LiteralPath (Join-Path $root $relativePath) -Force
+  if ($item -isnot [IO.FileInfo] -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "path is not a regular non-reparse file: $relativePath" }
+  $resolved = [IO.Path]::GetFullPath($item.FullName)
+  $prefix = $root + [IO.Path]::DirectorySeparatorChar
+  if (-not $resolved.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "path escaped repository root: $relativePath" }
+  $parent = $item.Directory
+  $reachedRoot = $false
+  while ($null -ne $parent) {
+    $parentPath = [IO.Path]::GetFullPath($parent.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "reparse ancestor: $relativePath" }
+    if ($parentPath -ceq $root) { $reachedRoot = $true; break }
+    if (-not $parentPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "ancestor escaped repository root: $relativePath" }
+    $parent = $parent.Parent
+  }
+  if (-not $reachedRoot) { throw "repository ancestry not reached: $relativePath" }
+}
+foreach ($path in $changed) { Assert-RegularFileUnderRoot $path }
+
+$flags = @(git ls-files -v)
+if ($LASTEXITCODE -ne 0 -or @($flags | Where-Object { $_ -cmatch '^[a-zS]' }).Count -ne 0) { throw 'hidden index flag detected' }
+$baselinePaths = @(git ls-tree -r --name-only $baseline | Sort-Object -CaseSensitive -Unique)
+if ($LASTEXITCODE -ne 0) { throw 'baseline path inventory failed' }
+$frozen = @($baselinePaths | Where-Object { -not ($allowed -ccontains $_) })
+foreach ($path in $frozen) {
+  Assert-RegularFileUnderRoot $path
+  $baselineBlob = (& git rev-parse "$baseline`:$path").Trim()
+  if ($LASTEXITCODE -ne 0) { throw "baseline blob lookup failed: $path" }
+  $indexBlob = (& git rev-parse ":$path").Trim()
+  if ($LASTEXITCODE -ne 0) { throw "index blob lookup failed: $path" }
+  $workingBlob = (& git hash-object "--path=$path" -- $path).Trim()
+  if ($LASTEXITCODE -ne 0) { throw "working blob lookup failed: $path" }
+  if ($baselineBlob -cne $indexBlob -or $baselineBlob -cne $workingBlob) { throw "frozen path changed: $path" }
+}
+git diff --check $baseline HEAD
+if ($LASTEXITCODE -ne 0) { throw 'baseline diff check failed' }
+git diff --cached --check
+if ($LASTEXITCODE -ne 0) { throw 'staged evidence diff check failed' }
+$commits = @(git rev-list --reverse "$baseline..HEAD")
+if ($LASTEXITCODE -ne 0 -or $commits.Count -eq 0) { throw 'commit inventory failed' }
+foreach ($commit in $commits) {
+  git show --check --oneline --no-renames $commit
+  if ($LASTEXITCODE -ne 0) { throw "commit check failed: $commit" }
+}
+$status = @(git status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $status.Count -ne 1 -or $status[0] -cne 'A  docs/spikes/2026-07-20-find-local-file-search-evidence.md') {
+  throw 'pre-commit state must contain only the staged evidence report'
+}
+```
+
+Expected: zero unexpected/missing paths; all committed/staged changed paths and ancestors authenticate as regular non-reparse objects under the exact root; every baseline-tracked path outside the ceiling has the same baseline/index/clean-filtered worktree blob; prior commit checks pass; the only non-clean state is the exact staged evidence report.
+
+- [ ] **Step 8: Commit the evidence report, request written reviews, and stop.**
+
+```powershell
+git commit -m "文档：记录本地文件搜索交付证据" -m "目标与根因：汇总已通过的功能、依赖、安全、性能、I/O、Windows 与可访问性门禁，为 Task 12 Code Go 提供去标识审计包。" -m "实现范围：仅提交本 Task 已暂存的证据文档，记录精确 baseline、提交链、每 Task 自动/HITL/未执行分类、用户确认、聚合指标与 ReleaseSecurityBlocked。" -m "RED/GREEN验证：记录全套自动门禁、百万行性能、用户逐组完成的真实 release/I/O/四模式可访问性观察及最终 dependency/source trust checkpoint。" -m "边界：不提交用户名、路径、查询、文件名、ID、原始事件、内容或样本，不控制用户输入，不修改产品，不运行或放宽 runtime positive probe。"
+if ($LASTEXITCODE -ne 0) { throw 'Task 12 evidence commit failed' }
+git show --check --oneline --no-renames HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Task 12 evidence commit check failed' }
+$status = @(git status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) { throw 'Task 12 worktree is not clean after commit' }
+```
+
+Expected checkpoint: commit succeeds; stop and request Task 12 Code Go. The development agent does not integrate `main`; the reviewer alone may ff-only this commit into clean `main` whose HEAD equals its parent, reruns this task's full/integration gates, and must issue Integration Go before final plan completion review. Dirty/diverged/non-ff stops without rebase, cherry-pick, or implicit merge.
+
+Submit the exact baseline..HEAD review package for Dependency re-authentication, Security review, Rust/TypeScript Code review, and UI/accessibility review. Do not merge to main, push, sign, trial, release, run the runtime positive probe, or clean unrelated evidence worktrees. `/find` TaskCodeGo does not imply local integration or Release Go.
+
+---
+
+## Appendix A: Exact 23 Added Cargo.lock Packages
+
+```text
+fallible-iterator 0.3.0
+fallible-streaming-iterator 0.1.9
+icu_casemap 1.5.1
+icu_casemap_data 1.5.1
+icu_collections 1.5.0
+icu_locid 1.5.0
+icu_locid_transform 1.5.0
+icu_locid_transform_data 1.5.1
+icu_properties 1.5.1
+icu_properties_data 1.5.1
+icu_provider 1.5.0
+icu_provider_macros 1.5.0
+libsqlite3-sys 0.38.1
+litemap 0.7.5
+rusqlite 0.40.1
+tinystr 0.7.6
+unicode-normalization 0.1.23
+vcpkg 0.2.15
+writeable 0.5.5
+yoke 0.7.5
+yoke-derive 0.7.5
+zerovec 0.10.4
+zerovec-derive 0.10.3
+```
+
+## Appendix B: Exact 11 Existing Lock Blocks With Dependency-Reference Disambiguation Only
+
+```text
+icu_collections 2.2.0
+icu_locale_core 2.2.0
+icu_normalizer 2.2.0
+icu_properties 2.2.0
+icu_provider 2.2.0
+idna_adapter 1.2.2
+potential_utf 0.1.5
+tinystr 0.8.3
+yoke 0.8.3
+zerotrie 0.2.4
+zerovec 0.11.6
+```
+
+For these blocks, `name`, `version`, `source`, and `checksum` remain byte-equivalent in meaning; only dependency array entries may gain Cargo's version-qualified names required by coexistence with ICU4X 1.5 packages. No other existing block may change.
+
+## Appendix C: Exact Cargo.lock Block Oracle
+
+Run from the implementation worktree after the Required Cargo shell preamble:
+
+```powershell
+function Get-LockBlocks([string] $Text) {
+  $result = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+  $parts = [regex]::Split($Text.Replace("`r`n", "`n"), '(?m)(?=^\[\[package\]\]$)')
+  foreach ($part in $parts) {
+    if (-not $part.StartsWith('[[package]]')) { continue }
+    $name = [regex]::Match($part, '(?m)^name = "([^"]+)"$').Groups[1].Value
+    $version = [regex]::Match($part, '(?m)^version = "([^"]+)"$').Groups[1].Value
+    $source = [regex]::Match($part, '(?m)^source = "([^"]+)"$').Groups[1].Value
+    if (-not $name -or -not $version) { throw 'lock block lacks name/version' }
+    $key = "$name $version $source"
+    if ($result.ContainsKey($key)) { throw "duplicate lock block: $key" }
+    $result[$key] = $part.TrimEnd()
+  }
+  $result
+}
+
+function Remove-DependencyArray([string] $Block) {
+  [regex]::Replace($Block, '(?ms)\ndependencies = \[\n.*?\n\]', '')
+}
+
+$baselineText = (git show foundation-find-implementation-baseline-r1:src-tauri/Cargo.lock) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw 'cannot read baseline lock' }
+$candidateText = [IO.File]::ReadAllText((Resolve-Path 'src-tauri/Cargo.lock'), [Text.UTF8Encoding]::new($false, $true))
+$baselineBlocks = Get-LockBlocks $baselineText
+$candidateBlocks = Get-LockBlocks $candidateText
+if ($baselineBlocks.Count -ne 478 -or $candidateBlocks.Count -ne 501) { throw 'lock package count drift' }
+
+$addedExpected = @(
+  'fallible-iterator 0.3.0','fallible-streaming-iterator 0.1.9','icu_casemap 1.5.1',
+  'icu_casemap_data 1.5.1','icu_collections 1.5.0','icu_locid 1.5.0',
+  'icu_locid_transform 1.5.0','icu_locid_transform_data 1.5.1','icu_properties 1.5.1',
+  'icu_properties_data 1.5.1','icu_provider 1.5.0','icu_provider_macros 1.5.0',
+  'libsqlite3-sys 0.38.1','litemap 0.7.5','rusqlite 0.40.1','tinystr 0.7.6',
+  'unicode-normalization 0.1.23','vcpkg 0.2.15','writeable 0.5.5','yoke 0.7.5',
+  'yoke-derive 0.7.5','zerovec 0.10.4','zerovec-derive 0.10.3'
+) | Sort-Object -CaseSensitive
+$addedActual = @($candidateBlocks.Keys | Where-Object { -not $baselineBlocks.ContainsKey($_) } | ForEach-Object {
+  $match = [regex]::Match($_, '^(.+ [^ ]+) registry\+')
+  if (-not $match.Success) { throw "added package is not registry-backed: $_" }
+  $match.Groups[1].Value
+} | Sort-Object -CaseSensitive)
+if (Compare-Object -CaseSensitive $addedExpected $addedActual) { throw 'added lock packages drifted' }
+$removed = @($baselineBlocks.Keys | Where-Object { -not $candidateBlocks.ContainsKey($_) })
+if ($removed.Count -ne 0) { throw 'lock package removal detected' }
+
+$changedRegistry = @()
+foreach ($key in $baselineBlocks.Keys) {
+  $before = $baselineBlocks[$key]
+  $after = $candidateBlocks[$key]
+  if ($before -ceq $after) { continue }
+  if ($key -like 'uipilot 0.1.0 *') {
+    foreach ($dependency in @('icu_casemap','rusqlite','unicode-normalization')) {
+      if (-not $after.Contains("`"$dependency`"")) { throw "root lock dependency missing: $dependency" }
+    }
+    continue
+  }
+  if ((Remove-DependencyArray $before) -cne (Remove-DependencyArray $after)) {
+    throw "existing lock identity/content changed: $key"
+  }
+  $changedRegistry += ([regex]::Match($key, '^(.+ [^ ]+) registry\+').Groups[1].Value)
+}
+$changedExpected = @(
+  'icu_collections 2.2.0','icu_locale_core 2.2.0','icu_normalizer 2.2.0',
+  'icu_properties 2.2.0','icu_provider 2.2.0','idna_adapter 1.2.2',
+  'potential_utf 0.1.5','tinystr 0.8.3','yoke 0.8.3','zerotrie 0.2.4','zerovec 0.11.6'
+) | Sort-Object -CaseSensitive
+if (Compare-Object -CaseSensitive $changedExpected @($changedRegistry | Sort-Object -CaseSensitive)) {
+  throw 'existing dependency-reference rewrite set drifted'
+}
+```
+
+Expected: no output from `Compare-Object`, 23 additions, zero removals, one root dependency block change, and exact 11 registry dependency-reference-only rewrites.
+
+## Appendix D: Exact New-Crate Source, License, and Build Targets
+
+All 23 additions must have source `registry+https://github.com/rust-lang/crates.io-index`, a nonempty lock checksum, and a matching `.cargo-checksum.json` in the isolated Cargo home. Cargo's verified crate archive covers the whole package, including bundled `sqlite3.c`. Accepted license expressions are exact by group:
+
+```text
+MIT:
+  fallible-iterator, fallible-streaming-iterator, libsqlite3-sys, rusqlite
+MIT OR Apache-2.0:
+  unicode-normalization, vcpkg
+Unicode-3.0:
+  icu_casemap, icu_casemap_data, icu_collections, icu_locid,
+  icu_locid_transform, icu_locid_transform_data, icu_properties,
+  icu_properties_data, icu_provider, icu_provider_macros, litemap,
+  tinystr, writeable, yoke, yoke-derive, zerovec, zerovec-derive
+```
+
+Use `cargo metadata --locked --offline --format-version 1` to locate each package manifest and verify these license expressions, crates.io sources/checksums, and `rust_version <= 1.96.0` when declared. The exact new custom-build targets are:
+
+```text
+icu_casemap_data 1.5.1 build.rs
+icu_locid_transform_data 1.5.1 build.rs
+icu_properties_data 1.5.1 build.rs
+libsqlite3-sys 0.38.1 build.rs
+```
+
+The three ICU data build scripts may select package-local baked data only because `ICU4X_DATA_DIR` is absent; they perform no network request. `libsqlite3-sys` must select bundled `cc` compilation of its checksum-covered SQLite 3.53.2 amalgamation. Its pkg-config/vcpkg/bindgen alternatives must remain inactive. Any additional new custom-build target, source, license, checksum mismatch, undeclared MSRV above 1.96.0, or build-time network access is Dependency No-Go.
