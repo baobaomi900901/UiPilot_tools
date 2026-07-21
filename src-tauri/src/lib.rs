@@ -46,6 +46,9 @@ mod hotkey_hook;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod lifecycle;
 
+#[cfg(test)]
+mod file_index;
+
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
 

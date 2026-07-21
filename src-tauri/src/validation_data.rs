@@ -399,7 +399,7 @@ fn decimal(bytes: &[u8]) -> u16 {
 }
 
 fn leap_year(year: u16) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
 }
 
 fn checked_increment(value: u64) -> Result<u64, ValidationError> {

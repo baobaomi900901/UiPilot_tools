@@ -216,7 +216,21 @@ where
         .iter()
         .map(apps::registry_entry)
         .collect();
-    registry.publish_if_latest(token, entries)
+    registry.publish_if_latest(
+        token,
+        entries,
+        || true,
+        |request_id, items| SearchResponse {
+            request_id,
+            items: items
+                .into_iter()
+                .map(|(result_id, mut item)| {
+                    item.result_id = result_id;
+                    item
+                })
+                .collect(),
+        },
+    )
 }
 
 #[tauri::command]
