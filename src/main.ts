@@ -5,20 +5,39 @@ import { createRoot } from 'react-dom/client'
 
 import { createLauncherCore } from './launcher-core'
 import { LauncherView } from './launcher-view'
-import type {
-  ExecuteOutcome,
-  ExportOutcome,
-  LauncherClient,
-  SearchResponse,
-  SettingsView,
+import {
+  parseFileSearchResponse,
+  type FileSearchResponse,
+  type ExecuteOutcome,
+  type ExportOutcome,
+  type LauncherClient,
+  type SearchResponse,
+  type SettingsView,
 } from './protocol'
 
 export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
+  listenFileIndexChanged: (handler) => listen<unknown>('file-index://changed', (event) => handler(event.payload)),
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', input),
+  searchFiles: async (input) => {
+    const payload = Object.freeze({
+      query: input.query,
+      category: input.category,
+      sort: input.sort,
+      invocationId: input.invocationId,
+      querySequence: input.querySequence,
+    })
+    const response = await invoke<FileSearchResponse | null>('search_files', payload)
+    return response === null ? null : parseFileSearchResponse(response)
+  },
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   loadSettings: () => invoke<SettingsView>('load_settings'),
   saveSettings: (input) => invoke<void>('save_settings', input),
+  setFilePreviewPreference: (input) =>
+    invoke<void>(
+      'set_file_preview_preference',
+      Object.freeze({ preference: Object.freeze({ enabled: input.preference.enabled }) }),
+    ),
   rescanApps: () => invoke<void>('rescan_apps'),
   exportValidationData: () => invoke<ExportOutcome>('export_validation_data'),
   clearValidationData: () => invoke<void>('clear_validation_data'),

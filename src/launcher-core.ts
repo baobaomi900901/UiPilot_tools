@@ -1,9 +1,17 @@
 import {
+  parseFileIndexChanged,
+  parseFileSearchResponse,
   parseLauncherShown,
   type ClassifiedTextRecord,
   type CommandErrorCode,
   type ControlKey,
   type ExecuteOutcome,
+  type FileCategory,
+  type FileIndexStatus,
+  type FileResultItem,
+  type FileResultView,
+  type FileSearchResponse,
+  type FileSort,
   type LauncherClient,
   type LauncherSnapshot,
   type ResultItem,
@@ -24,6 +32,9 @@ export interface LauncherCore {
   readonly requestHide: () => Promise<void>
   readonly setAutostart: (checked: boolean) => void
   readonly setHotkeyCanonical: (value: string) => void
+  readonly setFileCategory: (category: FileCategory) => void
+  readonly setFileSort: (sort: FileSort) => void
+  readonly setFilePreviewEnabled: (enabled: boolean) => void
   readonly addAlias: (application: ControlKey) => void
   readonly removeAlias: (application: ControlKey, alias: ControlKey) => void
   readonly saveSettings: () => Promise<void>
@@ -40,8 +51,27 @@ interface PrivateResult extends ViewResult {
   resultId: string
 }
 
+interface PrivateFileResult {
+  resultId: string
+  view: FileResultView
+}
+
+interface PrivateFileState {
+  category: FileCategory
+  sort: FileSort
+  previewEnabled: boolean
+  durablePreviewEnabled: boolean
+  preferencePending: boolean
+  total: string
+  indexStatus: FileIndexStatus
+  latestSeenRevision: bigint
+  results: PrivateFileResult[]
+  selectedIndex: number
+}
+
 interface Model {
   view: 'launcher' | 'settings'
+  launcherMode: 'applications' | 'files'
   viewEpoch: number
   invocationId?: string
   queryControl: ControlKey
@@ -61,6 +91,7 @@ interface Model {
   settingsNeedsReload: boolean
   settingsLoadError?: string
   clearConfirmation: boolean
+  file?: PrivateFileState
 }
 
 interface CompositionOwner {
@@ -90,6 +121,22 @@ interface PrivateSettings {
   applications: PrivateApplication[]
 }
 
+interface FileSearchOwner {
+  token: number
+  epoch: number
+  invocationId: string
+  sequence: number
+  query: string
+  category: FileCategory
+  sort: FileSort
+  requiredRevision: bigint
+}
+
+interface PreviewPreferenceOwner {
+  token: number
+  enabled: boolean
+}
+
 type SettingsOperationKind = 'load' | 'save' | 'rescan' | 'export' | 'clear'
 
 interface SettingsOperation {
@@ -112,6 +159,11 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   mainThreadDispatchFailed: '导出失败。',
   exportFailed: '导出失败。',
   exportWorkerFailed: '导出失败。',
+  invalidFileQuery: '查询无效。',
+  fileSearchWorkerFailed: '搜索暂不可用。',
+  searchUnavailable: '搜索暂不可用。',
+  fileNotFound: '文件已不存在。',
+  fileOpenFailed: '无法在资源管理器中打开。',
 }
 
 const NOTICE_TEXT = {
@@ -121,6 +173,7 @@ const NOTICE_TEXT = {
 
 const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
 const FALLBACK_ERROR = '操作不可用，请重试。'
+const FILE_PREVIEW_ERROR = '无法保存文件预览设置。'
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
 
 function errorText(value: unknown): string {
@@ -153,6 +206,32 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         needsReload: model.settingsNeedsReload,
       })
     : undefined
+  const fileResults = model.file
+    ? Object.freeze(
+        model.file.results.map(({ view }) =>
+          Object.freeze({
+            key: view.key,
+            name: view.name,
+            kind: view.kind,
+            sizeBytes: view.sizeBytes,
+            modifiedUtc: view.modifiedUtc,
+            fullPath: view.fullPath,
+          }),
+        ),
+      )
+    : undefined
+  const file = model.file
+    ? Object.freeze({
+        category: model.file.category,
+        sort: model.file.sort,
+        previewEnabled: model.file.previewEnabled,
+        preferencePending: model.file.preferencePending,
+        total: model.file.total,
+        indexStatus: model.file.indexStatus,
+        results: fileResults!,
+        ...(model.file.selectedIndex < 0 ? {} : { selected: fileResults![model.file.selectedIndex] }),
+      })
+    : undefined
   return Object.freeze({
     view: model.view,
     viewEpoch: model.viewEpoch,
@@ -169,12 +248,14 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
     status: model.status,
     ...(settings === undefined ? {} : { settings }),
+    ...(file === undefined ? {} : { file }),
   })
 }
 
-export function createLauncherCore(client: LauncherClient): LauncherCore {
+export function createLauncherCore(client: LauncherClient, maximumQuerySequence = Number.MAX_SAFE_INTEGER): LauncherCore {
   const model: Model = {
     view: 'launcher',
+    launcherMode: 'applications',
     viewEpoch: 0,
     queryControl: 1,
     query: '',
@@ -195,6 +276,16 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   let started = false
   let startupSettingsPending = false
   let unlisten: (() => void) | undefined
+  let fileUnlisten: (() => void) | undefined
+  let fileListenerRegistration: Promise<boolean> | undefined
+  let fileListenerToken = 0
+  let fileRefreshTimer: ReturnType<typeof setTimeout> | undefined
+  let fileRefreshMaxTimer: ReturnType<typeof setTimeout> | undefined
+  let fileRefreshRequired = 0n
+  let previewPreferenceToken = 0
+  let previewPreferencePending: PreviewPreferenceOwner | undefined
+  let previewPreferenceDurableGeneration = 0
+  let lastLoadedFilePreviewEnabled = true
   let token = 0
   let searchToken = 0
   let executeToken = 0
@@ -232,11 +323,14 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     return [settings.hotkey, settings.researchId, ...settings.applications.flatMap((application) => application.aliases)]
   }
 
-  function replaceSettings(view: SettingsView): void {
+  function replaceSettings(view: SettingsView, previewGeneration: number): void {
     if (model.settings) {
       for (const control of settingsControls(model.settings)) retireControl(control.key)
     }
     appIds.clear()
+    if (previewGeneration === previewPreferenceDurableGeneration) {
+      lastLoadedFilePreviewEnabled = view.filePreviewEnabled
+    }
     const totals = new Map<string, number>()
     for (const application of view.applications) totals.set(application.displayName, (totals.get(application.displayName) ?? 0) + 1)
     const seen = new Map<string, number>()
@@ -329,6 +423,273 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     model.selectedIndex = -1
   }
 
+  function clearFileRefreshTimers(): void {
+    if (fileRefreshTimer !== undefined) clearTimeout(fileRefreshTimer)
+    if (fileRefreshMaxTimer !== undefined) clearTimeout(fileRefreshMaxTimer)
+    fileRefreshTimer = undefined
+    fileRefreshMaxTimer = undefined
+    fileRefreshRequired = 0n
+  }
+
+  function leaveFileMode(): void {
+    if (model.launcherMode !== 'files') return
+    clearFileRefreshTimers()
+    searchToken = ++token
+    model.searchPending = false
+    model.launcherMode = 'applications'
+    model.file = undefined
+    model.query = ''
+    model.queryControlValue = ''
+    if (!fileUnlisten && fileListenerRegistration) {
+      fileListenerToken += 1
+      fileListenerRegistration = undefined
+    }
+  }
+
+  function fileCommand(value: string): string | null {
+    if (value === '/find') return ''
+    return value.startsWith('/find ') ? value.slice(6) : null
+  }
+
+  function fileStatusText(status: FileIndexStatus): string {
+    if (status === 'building') return '索引正在建立或校准。'
+    if (status === 'partial') return '部分位置无法访问。'
+    if (status === 'rebuilding') return '索引正在重建。'
+    if (status === 'unavailable') return '搜索暂不可用。'
+    return ''
+  }
+
+  function nextFileSequence(): boolean {
+    if (model.querySequence === maximumQuerySequence) {
+      searchToken = ++token
+      model.searchPending = false
+      void requestHide()
+      return false
+    }
+    model.querySequence += 1
+    return true
+  }
+
+  async function ensureFileListener(): Promise<boolean> {
+    if (fileUnlisten) return true
+    if (fileListenerRegistration) return fileListenerRegistration
+    const owner = ++fileListenerToken
+    let registration: Promise<boolean>
+    try {
+      registration = client.listenFileIndexChanged(fileIndexChanged).then(
+        (release) => {
+          if (destroyed || owner !== fileListenerToken) {
+            release()
+            return false
+          }
+          fileUnlisten = release
+          return true
+        },
+        () => false,
+      )
+    } catch {
+      return false
+    }
+    fileListenerRegistration = registration
+    const result = await registration
+    if (fileListenerRegistration === registration) fileListenerRegistration = undefined
+    return result
+  }
+
+  function ownsFileSearch(owner: FileSearchOwner): boolean {
+    const file = model.file
+    return (
+      !destroyed &&
+      model.view === 'launcher' &&
+      model.launcherMode === 'files' &&
+      file !== undefined &&
+      owner.token === searchToken &&
+      owner.epoch === model.viewEpoch &&
+      owner.invocationId === model.invocationId &&
+      owner.sequence === model.querySequence &&
+      owner.query === model.query &&
+      owner.query === model.queryControlValue &&
+      owner.category === file.category &&
+      owner.sort === file.sort
+    )
+  }
+
+  function beginFileSearch(requiredRevision: bigint): void {
+    const invocationId = model.invocationId
+    const file = model.file
+    if (!invocationId || !file) return
+    const owner: FileSearchOwner = {
+      token: ++token,
+      epoch: model.viewEpoch,
+      invocationId,
+      sequence: model.querySequence,
+      query: model.query,
+      category: file.category,
+      sort: file.sort,
+      requiredRevision,
+    }
+    searchToken = owner.token
+    model.searchPending = true
+    publish(true)
+    let pending: Promise<FileSearchResponse | null>
+    try {
+      pending = client.searchFiles({
+        query: owner.query,
+        category: owner.category,
+        sort: owner.sort,
+        invocationId,
+        querySequence: owner.sequence,
+      })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      (response) => finishFileSearch(owner, response),
+      (error: unknown) => failFileSearch(owner, error),
+    )
+  }
+
+  function finishFileSearch(owner: FileSearchOwner, value: FileSearchResponse | null): void {
+    if (!ownsFileSearch(owner)) return
+    const file = model.file!
+    const response = value === null ? null : parseFileSearchResponse(value)
+    if (response === null) {
+      model.searchPending = false
+      publish(true)
+      return
+    }
+    const revision = BigInt(response.indexRevision)
+    if (revision < owner.requiredRevision || revision < file.latestSeenRevision) {
+      model.searchPending = false
+      publish(true)
+      return
+    }
+    if (revision >= fileRefreshRequired) clearFileRefreshTimers()
+    const selectedPath = file.results[file.selectedIndex]?.view.fullPath
+    const results = response.items.map((item: FileResultItem) => ({
+      resultId: item.resultId,
+      view: {
+        key: item.fullPath,
+        name: item.name,
+        kind: item.kind,
+        sizeBytes: item.sizeBytes,
+        modifiedUtc: item.modifiedUtc,
+        fullPath: item.fullPath,
+      },
+    }))
+    const selectedIndex = selectedPath === undefined ? -1 : results.findIndex(({ view }) => view.fullPath === selectedPath)
+    file.latestSeenRevision = revision
+    file.total = response.total
+    file.indexStatus = response.status
+    file.results = results
+    file.selectedIndex = selectedIndex >= 0 ? selectedIndex : results.length ? 0 : -1
+    model.requestId = response.requestId
+    model.searchPending = false
+    model.status = fileStatusText(response.status)
+    publish(true)
+  }
+
+  function failFileSearch(owner: FileSearchOwner, error: unknown): void {
+    if (!ownsFileSearch(owner)) return
+    model.searchPending = false
+    model.status = errorText(error)
+    publish(true)
+  }
+
+  async function enterFileMode(query: string): Promise<void> {
+    const epoch = model.viewEpoch
+    const invocationId = model.invocationId
+    if (!invocationId) return
+    searchToken = ++token
+    clearResults()
+    model.launcherMode = 'files'
+    model.query = query
+    model.queryControlValue = query
+    model.status = ''
+    model.file = {
+      category: 'all',
+      sort: 'modifiedDesc',
+      previewEnabled: previewPreferencePending?.enabled ?? lastLoadedFilePreviewEnabled,
+      durablePreviewEnabled: lastLoadedFilePreviewEnabled,
+      preferencePending: previewPreferencePending !== undefined,
+      total: '0',
+      indexStatus: 'building',
+      latestSeenRevision: 0n,
+      results: [],
+      selectedIndex: -1,
+    }
+    publish(true)
+    const listening = await ensureFileListener()
+    if (
+      !listening ||
+      destroyed ||
+      epoch !== model.viewEpoch ||
+      invocationId !== model.invocationId ||
+      model.launcherMode !== 'files'
+    ) {
+      if (!listening && model.launcherMode === 'files' && epoch === model.viewEpoch) {
+        model.status = '搜索暂不可用。'
+        publish(true)
+      }
+      return
+    }
+    if (!nextFileSequence()) return
+    beginFileSearch(0n)
+  }
+
+  function applyFileEdit(value: string): void {
+    const file = model.file
+    if (!file) return
+    clearFileRefreshTimers()
+    model.shownNotice = undefined
+    model.query = value
+    model.queryControlValue = value
+    model.requestId = undefined
+    file.results = []
+    file.selectedIndex = -1
+    file.total = '0'
+    model.status = ''
+    searchToken = ++token
+    model.searchPending = false
+    if (!fileUnlisten) {
+      publish(true)
+      return
+    }
+    if (!nextFileSequence()) return
+    beginFileSearch(file.latestSeenRevision)
+  }
+
+  function runFileRefresh(): void {
+    const file = model.file
+    const required = fileRefreshRequired
+    clearFileRefreshTimers()
+    if (!file || required === 0n || !nextFileSequence()) return
+    beginFileSearch(required)
+  }
+
+  function scheduleFileRefresh(required: bigint): void {
+    fileRefreshRequired = required > fileRefreshRequired ? required : fileRefreshRequired
+    if (fileRefreshTimer !== undefined) clearTimeout(fileRefreshTimer)
+    fileRefreshTimer = setTimeout(runFileRefresh, 250)
+    fileRefreshMaxTimer ??= setTimeout(runFileRefresh, 1_000)
+  }
+
+  function fileIndexChanged(payload: unknown): void {
+    const event = parseFileIndexChanged(payload)
+    const file = model.file
+    if (!event || !file || model.launcherMode !== 'files') return
+    const revision = BigInt(event.revision)
+    if (revision <= file.latestSeenRevision) return
+    const statusChanged = file.indexStatus !== event.status
+    file.latestSeenRevision = revision
+    file.indexStatus = event.status
+    if (statusChanged) {
+      model.status = fileStatusText(event.status)
+      publish(true)
+    }
+    scheduleFileRefresh(revision)
+  }
+
   function beginSearch(): void {
     const invocationId = model.invocationId
     if (!invocationId || model.query === '') return
@@ -396,6 +757,10 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
   }
 
   function applyEdit(value: string): void {
+    if (model.launcherMode === 'files') {
+      applyFileEdit(value)
+      return
+    }
     model.shownNotice = undefined
     model.query = value
     model.queryControlValue = value
@@ -414,6 +779,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     if (!event) return
     if (composition) restoreControl(composition.control)
     composition = undefined
+    leaveFileMode()
     model.viewEpoch += 1
     model.invocationId = event.invocationId
     model.view = event.target
@@ -593,6 +959,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
 
   async function finishSettingsLoad(operation: SettingsOperation): Promise<void> {
     model.settingsLoadError = undefined
+    const previewGeneration = previewPreferenceDurableGeneration
     try {
       const view = await client.loadSettings()
       if (!ownsSettingsOperation(operation)) return
@@ -601,7 +968,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
         publish(true)
         return
       }
-      replaceSettings(view)
+      replaceSettings(view, previewGeneration)
       releaseSettingsOperation(operation)
       model.status = ''
       publish(true)
@@ -730,7 +1097,8 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
 
   function executeSelection(): void {
     if (model.view !== 'launcher' || model.executePending || !model.requestId) return
-    const selected = model.results[model.selectedIndex]
+    const selected =
+      model.launcherMode === 'files' ? model.file?.results[model.file.selectedIndex] : model.results[model.selectedIndex]
     if (!selected) return
     model.shownNotice = undefined
     model.status = ''
@@ -766,6 +1134,7 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     model.shownNotice = undefined
     model.status = ''
     model.hidePending = true
+    leaveFileMode()
     const captured = { token: ++token, epoch: model.viewEpoch }
     hideToken = captured.token
     publish(true)
@@ -789,7 +1158,13 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
       return
     }
     if (key === 'Enter') {
+      const fileQuery = model.launcherMode === 'applications' ? fileCommand(model.query) : null
+      if (model.view === 'launcher' && fileQuery !== null && model.queryControlValue === model.query) {
+        void enterFileMode(fileQuery)
+        return
+      }
       if (
+        model.launcherMode === 'applications' &&
         model.view === 'launcher' &&
         !model.searchPending &&
         !model.executePending &&
@@ -801,6 +1176,17 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
         return
       }
       executeSelection()
+      return
+    }
+    if (model.launcherMode === 'files') {
+      const file = model.file
+      if (!file?.results.length) return
+      model.shownNotice = undefined
+      const offset = key === 'ArrowDown' ? 1 : -1
+      const selectedIndex = (file.selectedIndex + offset + file.results.length) % file.results.length
+      if (selectedIndex === file.selectedIndex) return
+      file.selectedIndex = selectedIndex
+      publish(true)
       return
     }
     if (!model.results.length) return
@@ -832,10 +1218,11 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     }
     unlisten = registered
     startupSettingsPending = true
+    const previewGeneration = previewPreferenceDurableGeneration
     try {
       const settings = await client.loadSettings()
       if (!destroyed) {
-        replaceSettings(settings)
+        replaceSettings(settings, previewGeneration)
         publish(true)
       }
     } catch (error) {
@@ -855,10 +1242,103 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
+    clearFileRefreshTimers()
     settingsOperation = undefined
     unlisten?.()
     unlisten = undefined
+    fileListenerToken += 1
+    fileUnlisten?.()
+    fileUnlisten = undefined
+    fileListenerRegistration = undefined
     listeners.clear()
+  }
+
+  function setFileCategory(category: FileCategory): void {
+    const file = model.file
+    if (model.launcherMode !== 'files' || !file || file.category === category) return
+    clearFileRefreshTimers()
+    file.category = category
+    file.results = []
+    file.selectedIndex = -1
+    file.total = '0'
+    searchToken = ++token
+    model.searchPending = false
+    if (!fileUnlisten) {
+      publish(true)
+      return
+    }
+    if (!nextFileSequence()) return
+    beginFileSearch(file.latestSeenRevision)
+  }
+
+  function setFileSort(sort: FileSort): void {
+    const file = model.file
+    if (model.launcherMode !== 'files' || !file || file.sort === sort) return
+    clearFileRefreshTimers()
+    file.sort = sort
+    file.results = []
+    file.selectedIndex = -1
+    file.total = '0'
+    searchToken = ++token
+    model.searchPending = false
+    if (!fileUnlisten) {
+      publish(true)
+      return
+    }
+    if (!nextFileSequence()) return
+    beginFileSearch(file.latestSeenRevision)
+  }
+
+  function setFilePreviewEnabled(enabled: boolean): void {
+    const file = model.file
+    if (
+      model.launcherMode !== 'files' ||
+      !file ||
+      previewPreferencePending !== undefined ||
+      file.previewEnabled === enabled
+    ) {
+      return
+    }
+    const owner = { token: ++previewPreferenceToken, enabled }
+    previewPreferencePending = owner
+    file.previewEnabled = enabled
+    file.preferencePending = true
+    model.status = ''
+    publish(true)
+    let pending: Promise<void>
+    try {
+      pending = client.setFilePreviewPreference({ preference: { enabled } })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      () => {
+        if (previewPreferencePending?.token !== owner.token) return
+        previewPreferencePending = undefined
+        lastLoadedFilePreviewEnabled = enabled
+        previewPreferenceDurableGeneration += 1
+        if (destroyed) return
+        const current = model.file
+        if (!current) return
+        const changed = current.previewEnabled !== enabled || current.preferencePending
+        current.previewEnabled = enabled
+        current.durablePreviewEnabled = enabled
+        current.preferencePending = false
+        publish(changed)
+      },
+      () => {
+        if (previewPreferencePending?.token !== owner.token) return
+        previewPreferencePending = undefined
+        if (destroyed) return
+        const current = model.file
+        if (!current) return
+        current.durablePreviewEnabled = lastLoadedFilePreviewEnabled
+        current.previewEnabled = lastLoadedFilePreviewEnabled
+        current.preferencePending = false
+        model.status = FILE_PREVIEW_ERROR
+        publish(true)
+      },
+    )
   }
 
   return {
@@ -873,6 +1353,9 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     requestHide,
     setAutostart,
     setHotkeyCanonical,
+    setFileCategory,
+    setFileSort,
+    setFilePreviewEnabled,
     addAlias,
     removeAlias,
     saveSettings,

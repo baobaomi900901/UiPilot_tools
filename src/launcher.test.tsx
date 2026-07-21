@@ -21,11 +21,15 @@ import { LauncherView } from './launcher-view'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherViewSource from './launcher-view.tsx?raw'
 import {
+  parseFileIndexChanged,
+  parseFileSearchResponse,
   parseLauncherShown,
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
   type ExportOutcome,
+  type FileResultItem,
+  type FileSearchResponse,
   type LauncherClient,
   type LauncherShown,
   type SearchResponse,
@@ -69,12 +73,14 @@ function deferred<T>() {
 const emptySettings: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
+  filePreviewEnabled: true,
   applications: [],
 }
 
 const settingsFixture: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
+  filePreviewEnabled: true,
   applications: [
     { appId: 'private-app-id-a', displayName: '同名应用', aliases: ['alpha'] },
     { appId: 'private-app-id-b', displayName: '同名应用', aliases: [] },
@@ -83,13 +89,21 @@ const settingsFixture: SettingsView = {
 
 function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
+  let fileHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
+  const fileUnlisten = vi.fn()
   const client: LauncherClient = {
     listenShown: vi.fn(async (handler) => {
       shownHandler = handler
       return unlisten
     }),
+    listenFileIndexChanged: vi.fn(async (handler) => {
+      fileHandler = handler
+      return fileUnlisten
+    }),
     searchApps: vi.fn(async () => null),
+    searchFiles: vi.fn(async () => null),
+    setFilePreviewPreference: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
     loadSettings: vi.fn(async () => emptySettings),
     saveSettings: vi.fn(async () => undefined),
@@ -104,7 +118,42 @@ function fakeClient() {
       if (!shownHandler) throw new Error('shown listener is not installed')
       shownHandler(payload)
     },
+    emitFile(payload: unknown) {
+      if (!fileHandler) throw new Error('file listener is not installed')
+      fileHandler(payload)
+    },
     unlisten,
+    fileUnlisten,
+  }
+}
+
+function fileItem(
+  fullPath = String.raw`C:\Private\UiPilot.txt`,
+  resultId = 'file-result-1',
+  modifiedUtc = '2026-07-22T00:00:00.000Z',
+): FileResultItem {
+  const segments = fullPath.split('\\')
+  return {
+    resultId,
+    name: segments[segments.length - 1]!,
+    kind: 'file',
+    sizeBytes: '42',
+    modifiedUtc,
+    fullPath,
+  }
+}
+
+function fileResponse(
+  revision: string,
+  items: FileResultItem[] = [fileItem()],
+  status: FileSearchResponse['status'] = 'ready',
+): FileSearchResponse {
+  return {
+    requestId: `file-request-${revision}`,
+    indexRevision: revision,
+    total: String(items.length),
+    status,
+    items,
   }
 }
 
@@ -456,6 +505,20 @@ describe('execute and hide ownership', () => {
     await expect(hide.promise).rejects.toBeDefined()
     await vi.waitFor(() => expect(core.getSnapshot().hidePending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({ view: 'launcher', invocationId: 'hide', status: '窗口操作失败。' })
+  })
+  it('keeps an application search owner alive when hide is rejected', async () => {
+    const { core, client, emit } = await startedCore()
+    const search = deferred<SearchResponse | null>()
+    const hide = deferred<void>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(search.promise)
+    vi.mocked(client.hideLauncher).mockReturnValueOnce(hide.promise)
+    emit(shown('hide-rejected-search'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
+    const hiding = core.requestHide()
+    hide.reject({ code: 'windowFailed' })
+    await hiding
+    search.resolve({ requestId: 'application-after-hide', items: [{ resultId: 'result', title: 'Calculator' }] })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
   })
 })
 
@@ -1643,5 +1706,618 @@ describe('real adapter and startup', () => {
     expect(mainSource).not.toMatch(/\b(?:path|pid|hwnd|appId)\b/i)
     expect(mainSource.indexOf('core.destroy()')).toBeLessThan(mainSource.indexOf('root.unmount()'))
     expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(1)
+  })
+})
+
+describe('file protocol', () => {
+  it('strictly parses exact file responses and revision events', () => {
+    const response = fileResponse('18446744073709551615', [
+      fileItem(),
+      {
+        resultId: 'folder-result',
+        name: 'Folder',
+        kind: 'folder',
+        sizeBytes: null,
+        modifiedUtc: '2026-07-22T00:00:01Z',
+        fullPath: String.raw`C:\Private\Folder`,
+      },
+    ])
+    expect(parseFileSearchResponse(response)).toEqual(response)
+    expect(parseFileIndexChanged({ revision: '9', status: 'partial' })).toEqual({ revision: '9', status: 'partial' })
+  })
+
+  it('rejects extra missing inherited malformed decimal date and enum values as a whole', () => {
+    const valid = fileResponse('7')
+    const hiddenExtra = Object.defineProperty({ ...valid }, 'hidden', { value: true })
+    const symbolExtraItem = { ...valid.items[0], [Symbol('extra')]: true }
+    const invalid: unknown[] = [
+      { ...valid, extra: true },
+      { requestId: valid.requestId, indexRevision: valid.indexRevision, total: valid.total, status: valid.status },
+      { ...valid, indexRevision: '01' },
+      { ...valid, indexRevision: '18446744073709551616' },
+      { ...valid, total: '-1' },
+      { ...valid, status: 'unknown' },
+      { ...valid, items: [{ ...valid.items[0], sizeBytes: '01' }] },
+      { ...valid, items: [{ ...valid.items[0], kind: 'directory' }] },
+      { ...valid, items: [{ ...valid.items[0], modifiedUtc: '2026-07-22' }] },
+      { ...valid, items: [{ ...valid.items[0], modifiedUtc: '2026-02-31T00:00:00Z' }] },
+      Object.assign(Object.create({ inherited: true }), valid),
+      [valid],
+      { ...valid, items: Array(1) },
+      { ...valid, items: Object.assign([...valid.items], { extra: true }) },
+      hiddenExtra,
+      { ...valid, items: [symbolExtraItem] },
+    ]
+    for (const value of invalid) expect(parseFileSearchResponse(value)).toBeNull()
+    for (const value of [
+      { revision: '01', status: 'ready' },
+      { revision: '1', status: 'ready', extra: true },
+      Object.assign(Object.create({ inherited: true }), { revision: '1', status: 'ready' }),
+      { revision: '1', status: 'unknown' },
+    ]) {
+      expect(parseFileIndexChanged(value)).toBeNull()
+    }
+  })
+
+  it('keeps the frozen file category and sort unions in source', () => {
+    for (const literal of ['all', 'folder', 'excel', 'word', 'ppt', 'pdf', 'image', 'video', 'audio', 'archive']) {
+      expect(protocolSource).toContain(`'${literal}'`)
+    }
+    expect(protocolSource).toContain("'modifiedDesc' | 'modifiedAsc'")
+    expect(protocolSource).not.toMatch(/Number\((?:revision|total|sizeBytes)/)
+  })
+})
+
+describe('launcher real file adapter', () => {
+  it('uses one exact file listener and exact camelCase invoke payloads', async () => {
+    vi.resetModules()
+    document.body.innerHTML = '<main id="app"></main>'
+    installMatchMedia(false)
+    tauriCapture.invoke.mockReset()
+    tauriCapture.listen.mockReset()
+    const shownUnlisten = vi.fn()
+    const fileUnlisten = vi.fn()
+    tauriCapture.listen.mockImplementation((event) =>
+      Promise.resolve(event === 'file-index://changed' ? fileUnlisten : shownUnlisten),
+    )
+    tauriCapture.invoke.mockImplementation((command) =>
+      Promise.resolve(command === 'load_settings' ? emptySettings : command === 'search_files' ? null : undefined),
+    )
+
+    const main = (await import('./main')) as unknown as { client: LauncherClient }
+    const handler = vi.fn()
+    const release = await main.client.listenFileIndexChanged(handler)
+    await main.client.searchFiles({
+      query: 'UiPilot',
+      category: 'all',
+      sort: 'modifiedDesc',
+      invocationId: 'inv-file',
+      querySequence: 2,
+      privateExtra: 'must-not-cross-wire',
+    } as Parameters<LauncherClient['searchFiles']>[0])
+    await main.client.setFilePreviewPreference({
+      preference: { enabled: false, privateExtra: 'must-not-cross-wire' },
+      privateOuter: 'must-not-cross-wire',
+    } as Parameters<LauncherClient['setFilePreviewPreference']>[0])
+
+    expect(tauriCapture.listen).toHaveBeenCalledWith('file-index://changed', expect.any(Function))
+    expect(tauriCapture.invoke).toHaveBeenCalledWith('search_files', {
+      query: 'UiPilot',
+      category: 'all',
+      sort: 'modifiedDesc',
+      invocationId: 'inv-file',
+      querySequence: 2,
+    })
+    expect(tauriCapture.invoke).toHaveBeenCalledWith('set_file_preview_preference', {
+      preference: { enabled: false },
+    })
+    release()
+    expect(fileUnlisten).toHaveBeenCalledOnce()
+    window.dispatchEvent(new Event('pagehide'))
+  })
+
+  it('keeps exactly ten commands two events and no window or payload logging', () => {
+    for (const command of [
+      'search_apps',
+      'search_files',
+      'execute_result',
+      'load_settings',
+      'save_settings',
+      'set_file_preview_preference',
+      'rescan_apps',
+      'export_validation_data',
+      'clear_validation_data',
+      'hide_launcher',
+    ]) {
+      expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
+    }
+    for (const event of ['launcher://shown', 'file-index://changed']) {
+      expect(mainSource.match(new RegExp(`['"]${event}['"]`, 'g'))).toHaveLength(1)
+    }
+    expect(mainSource).not.toMatch(/@tauri-apps\/api\/(?:window|webviewWindow)/)
+    expect(mainSource.match(/event\.payload/g)).toHaveLength(2)
+    expect(mainSource).not.toMatch(/console\.|JSON\.stringify\(event/)
+  })
+})
+
+describe('file mode ownership', () => {
+  it('enters only on exact non-composing slash command and continues the same sequence', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('same-invocation'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find UiPilot', inputType: 'insertText' })
+    expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+      query: '/find UiPilot',
+      invocationId: 'same-invocation',
+      querySequence: 1,
+    })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledOnce())
+    expect(fake.client.searchFiles).toHaveBeenCalledWith({
+      query: 'UiPilot',
+      category: 'all',
+      sort: 'modifiedDesc',
+      invocationId: 'same-invocation',
+      querySequence: 2,
+    })
+    expect(core.getSnapshot().file?.results[0]).toEqual({
+      key: String.raw`C:\Private\UiPilot.txt`,
+      name: 'UiPilot.txt',
+      kind: 'file',
+      sizeBytes: '42',
+      modifiedUtc: '2026-07-22T00:00:00.000Z',
+      fullPath: String.raw`C:\Private\UiPilot.txt`,
+    })
+    expect(core.getSnapshot().file?.results[0]).not.toHaveProperty('resultId')
+    expect(core.getSnapshot().file?.selected).toBe(core.getSnapshot().file?.results[0])
+    expect(Object.keys(core.getSnapshot().file!.results[0]!).sort()).toEqual([
+      'fullPath',
+      'key',
+      'kind',
+      'modifiedUtc',
+      'name',
+      'sizeBytes',
+    ])
+    expect(Object.isFrozen(core.getSnapshot().file)).toBe(true)
+    expect(Object.isFrozen(core.getSnapshot().file!.results)).toBe(true)
+    expect(Object.isFrozen(core.getSnapshot().file!.results[0])).toBe(true)
+
+    fake.emit(shown('next-show'))
+    expect(core.getSnapshot().querySequence).toBe(0)
+    core.text({ kind: 'ordinaryInput', control, value: '/finder', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    expect(fake.client.searchFiles).toHaveBeenCalledTimes(1)
+  })
+
+  it('registers before empty search and listener failure performs zero file calls', async () => {
+    const fake = fakeClient()
+    const order: string[] = []
+    vi.mocked(fake.client.listenFileIndexChanged).mockImplementationOnce(async () => {
+      order.push('listen')
+      return fake.fileUnlisten
+    })
+    vi.mocked(fake.client.searchFiles).mockImplementationOnce(async () => {
+      order.push('search')
+      return fileResponse('0', [], 'building')
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('empty-file'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(order).toEqual(['listen', 'search']))
+    expect(fake.client.searchFiles).toHaveBeenCalledWith(expect.objectContaining({ query: '' }))
+
+    const rejected = fakeClient()
+    vi.mocked(rejected.client.listenFileIndexChanged).mockRejectedValueOnce(new Error('private listener failure'))
+    const rejectedCore = createLauncherCore(rejected.client)
+    await rejectedCore.start()
+    rejected.emit(shown('listener-failure'))
+    rejectedCore.text({
+      kind: 'ordinaryInput',
+      control: rejectedCore.getSnapshot().queryControl,
+      value: '/find ',
+      inputType: 'insertText',
+    })
+    rejectedCore.keyDown('Enter', false)
+    await Promise.resolve()
+    expect(rejected.client.searchFiles).not.toHaveBeenCalled()
+  })
+
+  it('executes the selected private file result without exposing its result id', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('4'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('file-execute'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find result', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.selected).toBeDefined())
+    expect(core.getSnapshot().file?.selected).not.toHaveProperty('resultId')
+    core.keyDown('Enter', false)
+    expect(fake.client.executeResult).toHaveBeenCalledWith({
+      requestId: 'file-request-4',
+      resultId: 'file-result-1',
+    })
+  })
+
+  it('holds edits category and sort behind the pending first listener', async () => {
+    const fake = fakeClient()
+    const registration = deferred<() => void>()
+    vi.mocked(fake.client.listenFileIndexChanged).mockReturnValueOnce(registration.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('pending-listener'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find initial', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    core.text({ kind: 'ordinaryInput', control, value: 'latest', inputType: 'insertText' })
+    core.setFileCategory('pdf')
+    core.setFileSort('modifiedAsc')
+    expect(fake.client.searchFiles).not.toHaveBeenCalled()
+
+    registration.resolve(fake.fileUnlisten)
+    await vi.waitFor(() =>
+      expect(fake.client.searchFiles).toHaveBeenCalledWith({
+        query: 'latest',
+        category: 'pdf',
+        sort: 'modifiedAsc',
+        invocationId: 'pending-listener',
+        querySequence: 2,
+      }),
+    )
+  })
+
+  it('keeps snapshots immutable and rolls preview preference back on failure', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('immutable-file'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.results).toHaveLength(1))
+    const before = core.getSnapshot()
+    const beforeFile = before.file
+    const beforeResults = before.file?.results
+    core.keyDown('ArrowDown', false)
+    expect(core.getSnapshot()).toBe(before)
+    expect(core.getSnapshot().file).toBe(beforeFile)
+    expect(core.getSnapshot().file?.results).toBe(beforeResults)
+
+    vi.mocked(fake.client.setFilePreviewPreference).mockRejectedValueOnce({ code: 'settingsFailed' })
+    core.setFilePreviewEnabled(false)
+    expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: true })
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: true, preferencePending: false }),
+    )
+    expect(core.getSnapshot().status).toBe('无法保存文件预览设置。')
+  })
+  it('keeps one preview write pending across views and applies its durable success', async () => {
+    const fake = fakeClient()
+    const preference = deferred<void>()
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    vi.mocked(fake.client.setFilePreviewPreference).mockReturnValueOnce(preference.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('preview-first'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file).toBeDefined())
+    core.setFilePreviewEnabled(false)
+    fake.emit(shown('preview-settings', 'settings'))
+    expect(core.getSnapshot().file).toBeUndefined()
+    fake.emit(shown('preview-next'))
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: true }),
+    )
+    core.setFilePreviewEnabled(true)
+    expect(fake.client.setFilePreviewPreference).toHaveBeenCalledOnce()
+    preference.resolve()
+    await preference.promise
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: false }),
+    )
+    fake.emit(shown('preview-final'))
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(false))
+  })
+
+  it('rolls one cross-view preview write back on failure without issuing a second write', async () => {
+    const fake = fakeClient()
+    const preference = deferred<void>()
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    vi.mocked(fake.client.setFilePreviewPreference).mockReturnValueOnce(preference.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('preview-failure-old'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(true))
+    core.setFilePreviewEnabled(false)
+    fake.emit(shown('preview-failure-new'))
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: true }),
+    )
+    core.setFilePreviewEnabled(true)
+    expect(fake.client.setFilePreviewPreference).toHaveBeenCalledOnce()
+    preference.reject({ code: 'settingsFailed' })
+    await preference.promise.catch(() => undefined)
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: true, preferencePending: false }),
+    )
+    fake.emit(shown('preview-failure-final'))
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(true))
+  })
+
+  it('does not let an older settings load overwrite a completed preview preference', async () => {
+    const fake = fakeClient()
+    const loaded = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(loaded.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+    fake.emit(shown('late-load-old'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(true))
+    core.setFilePreviewEnabled(false)
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: false }),
+    )
+
+    loaded.resolve(emptySettings)
+    await starting
+    expect(core.getSnapshot().file?.previewEnabled).toBe(false)
+    fake.emit(shown('late-load-next'))
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(false))
+  })
+
+  it('lets category and sort replace older file owners without accepting stale rows', async () => {
+    const fake = fakeClient()
+    const category = deferred<FileSearchResponse | null>()
+    vi.mocked(fake.client.searchFiles)
+      .mockResolvedValueOnce(fileResponse('1', [fileItem(String.raw`C:\Private\Initial.txt`, 'initial')]))
+      .mockReturnValueOnce(category.promise)
+      .mockResolvedValueOnce(fileResponse('3', [fileItem(String.raw`C:\Private\Sorted.txt`, 'sorted')]))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('filter-owner'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find filter', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.results[0]?.name).toBe('Initial.txt'))
+    core.setFileCategory('pdf')
+    core.setFileSort('modifiedAsc')
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith({
+      query: 'filter',
+      category: 'pdf',
+      sort: 'modifiedAsc',
+      invocationId: 'filter-owner',
+      querySequence: 4,
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().file?.results[0]?.name).toBe('Sorted.txt'))
+    category.resolve(fileResponse('2', [fileItem(String.raw`C:\Private\Stale.txt`, 'stale')]))
+    await category.promise
+    await Promise.resolve()
+    expect(core.getSnapshot().file?.results[0]?.name).toBe('Sorted.txt')
+  })
+})
+
+describe('file index refresh', () => {
+  it('accepts newer revisions only and coalesces trailing refresh with a one second maximum', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = fakeClient()
+      vi.mocked(fake.client.searchFiles)
+        .mockResolvedValueOnce(fileResponse('1', [fileItem(String.raw`C:\Private\A.txt`, 'a')]))
+        .mockResolvedValue(fileResponse('3', [fileItem(String.raw`C:\Private\A.txt`, 'a')]))
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('refresh-owner'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/find', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(1))
+      const stable = core.getSnapshot()
+
+      fake.emitFile({ revision: '1', status: 'ready' })
+      fake.emitFile({ revision: '2', status: 'ready' })
+      await vi.advanceTimersByTimeAsync(249)
+      expect(fake.client.searchFiles).toHaveBeenCalledTimes(1)
+      fake.emitFile({ revision: '3', status: 'partial' })
+      await vi.advanceTimersByTimeAsync(250)
+      expect(fake.client.searchFiles).toHaveBeenCalledTimes(2)
+      expect(core.getSnapshot()).not.toBe(stable)
+
+      for (const revision of ['4', '5', '6', '7', '8']) {
+        fake.emitFile({ revision, status: 'ready' })
+        await vi.advanceTimersByTimeAsync(200)
+      }
+      expect(fake.client.searchFiles).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves selection by full path and rejects stale response event view and query owners', async () => {
+    const fake = fakeClient()
+    const first = deferred<FileSearchResponse | null>()
+    const refresh = deferred<FileSearchResponse | null>()
+    vi.mocked(fake.client.searchFiles).mockReturnValueOnce(first.promise).mockReturnValueOnce(refresh.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('selection-owner'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    first.resolve(
+      fileResponse('1', [
+        fileItem(String.raw`C:\Private\A.txt`, 'a'),
+        fileItem(String.raw`C:\Private\B.txt`, 'b'),
+      ]),
+    )
+    await vi.waitFor(() => expect(core.getSnapshot().file?.results).toHaveLength(2))
+    core.keyDown('ArrowDown', false)
+    expect(core.getSnapshot().file?.selected?.fullPath).toBe(String.raw`C:\Private\B.txt`)
+    fake.emitFile({ revision: '2', status: 'ready' })
+    await new Promise((resolve) => setTimeout(resolve, 260))
+    refresh.resolve(
+      fileResponse('2', [
+        fileItem(String.raw`C:\Private\B.txt`, 'b'),
+        fileItem(String.raw`C:\Private\C.txt`, 'c'),
+      ]),
+    )
+    await vi.waitFor(() => expect(core.getSnapshot().file?.selected?.fullPath).toBe(String.raw`C:\Private\B.txt`))
+
+    const after = core.getSnapshot()
+    fake.emitFile({ revision: '2', status: 'ready' })
+    fake.emit(shown('replacement-view', 'settings'))
+    await new Promise((resolve) => setTimeout(resolve, 260))
+    expect(core.getSnapshot().file).toBeUndefined()
+    expect(core.getSnapshot()).not.toBe(after)
+  })
+
+  it('cancels a pending refresh when the query owner changes', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = fakeClient()
+      vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('refresh-cancel'))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find first', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(1))
+      fake.emitFile({ revision: '2', status: 'ready' })
+      core.text({ kind: 'ordinaryInput', control, value: 'second', inputType: 'insertText' })
+      expect(fake.client.searchFiles).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(fake.client.searchFiles).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a pending refresh when the current response already covers its revision', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = fakeClient()
+      const current = deferred<FileSearchResponse | null>()
+      vi.mocked(fake.client.searchFiles).mockReturnValueOnce(current.promise)
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('refresh-covered'))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find covered', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledOnce())
+      fake.emitFile({ revision: '2', status: 'ready' })
+      current.resolve(fileResponse('3'))
+      await current.promise
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(fake.client.searchFiles).toHaveBeenCalledOnce()
+      expect(core.getSnapshot().file?.indexStatus).toBe('ready')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('invalidates refresh and response owners at hide and unlistens once at destroy', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = fakeClient()
+      const stale = deferred<FileSearchResponse | null>()
+      const hidden = deferred<void>()
+      vi.mocked(fake.client.searchFiles).mockReturnValueOnce(stale.promise)
+      vi.mocked(fake.client.hideLauncher).mockReturnValueOnce(hidden.promise)
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('hide-owner'))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find stale', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledOnce())
+      fake.emitFile({ revision: '2', status: 'partial' })
+      const hiding = core.requestHide()
+      expect(core.getSnapshot().file).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(fake.client.searchFiles).toHaveBeenCalledOnce()
+      stale.resolve(fileResponse('2'))
+      hidden.resolve()
+      await hiding
+      expect(core.getSnapshot().file).toBeUndefined()
+      core.destroy()
+      core.destroy()
+      expect(fake.fileUnlisten).toHaveBeenCalledOnce()
+      expect(fake.unlisten).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('hides exactly once instead of sending an imprecise file sequence', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    const hidden = deferred<void>()
+    vi.mocked(fake.client.hideLauncher).mockReturnValueOnce(hidden.promise)
+    const core = createLauncherCore(fake.client, 2)
+    await core.start()
+    fake.emit(shown('sequence-overflow'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find overflow', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledWith(expect.objectContaining({ querySequence: 2 })))
+    core.setFileCategory('pdf')
+    core.setFileSort('modifiedAsc')
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+    expect(fake.client.searchFiles).toHaveBeenCalledOnce()
+    expect(core.getSnapshot().file).toBeUndefined()
+    hidden.resolve()
+  })
+
+  it('executes the current request before a scheduled refresh replaces its mapping', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = fakeClient()
+      vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('refresh-enter'))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find execute', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(core.getSnapshot().file?.selected).toBeDefined())
+      fake.emitFile({ revision: '2', status: 'ready' })
+      core.keyDown('Enter', false)
+      expect(fake.client.executeResult).toHaveBeenCalledWith({
+        requestId: 'file-request-1',
+        resultId: 'file-result-1',
+      })
+      await vi.advanceTimersByTimeAsync(250)
+      expect(fake.client.searchFiles).toHaveBeenCalledTimes(2)
+      expect(fake.client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ querySequence: 3 }))
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
