@@ -2,6 +2,11 @@ import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 
 export default defineConfig(({ mode }) => ({
+  server: {
+    watch: {
+      ignored: ['**/src-tauri/target/**'],
+    },
+  },
   build: {
     rollupOptions:
       mode === 'security-probe'
