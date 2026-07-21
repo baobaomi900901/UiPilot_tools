@@ -106,6 +106,7 @@ $expectedPermissions = @(
   'allow-execute-result',
   'allow-load-settings',
   'allow-save-settings',
+  'allow-set-file-preview-preference',
   'allow-rescan-apps',
   'allow-export-validation-data',
   'allow-clear-validation-data',

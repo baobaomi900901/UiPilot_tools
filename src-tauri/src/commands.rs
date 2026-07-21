@@ -35,6 +35,7 @@ pub(crate) struct AppAliasTarget {
 pub(crate) struct SettingsView {
     hotkey: String,
     autostart: bool,
+    file_preview_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     research_id: Option<String>,
     applications: Vec<AppAliasTarget>,
@@ -47,6 +48,12 @@ pub(crate) struct UserSettingsUpdate {
     autostart: bool,
     research_id: Option<String>,
     aliases: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct FilePreviewPreferenceUpdate {
+    enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -434,6 +441,7 @@ fn load_settings_core(settings: &SettingsStore, cache: &AppCache) -> SettingsVie
     SettingsView {
         hotkey: settings.hotkey,
         autostart: settings.autostart,
+        file_preview_enabled: settings.file_preview_enabled,
         research_id: settings.research_id,
         applications,
     }
@@ -536,6 +544,52 @@ pub(crate) async fn save_settings(
                     update,
                 )
             }
+        },
+    )
+    .await
+}
+
+async fn set_file_preview_preference_with<R, E, W>(
+    preference: FilePreviewPreferenceUpdate,
+    reserve: R,
+    worker: W,
+) -> Result<(), CommandError>
+where
+    R: FnOnce() -> Result<CriticalReservation, E>,
+    W: FnOnce(CriticalReservation, FilePreviewPreferenceUpdate) -> Result<(), ()> + Send + 'static,
+{
+    let reservation = reserve().map_err(|_| CommandError::settings_failed())?;
+    let result = tauri::async_runtime::spawn_blocking(move || worker(reservation, preference))
+        .await
+        .map_err(|_| ());
+    map_file_preview_worker_result(result)
+}
+
+fn map_file_preview_worker_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(())) | Err(()) => Err(CommandError::settings_failed()),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn set_file_preview_preference(
+    window: tauri::WebviewWindow,
+    preference: FilePreviewPreferenceUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let app_for_worker = app.clone();
+    set_file_preview_preference_with(
+        preference,
+        || coordinator.reserve_critical(),
+        move |reservation, preference| {
+            let _reservation = reservation;
+            app_for_worker
+                .state::<SettingsStore>()
+                .set_file_preview_enabled(preference.enabled)
+                .map_err(|_| ())
         },
     )
     .await
@@ -851,7 +905,7 @@ mod tests {
         rc::Rc,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         thread,
     };
@@ -859,12 +913,13 @@ mod tests {
     use super::{
         begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
         execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
-        load_settings_core, load_settings_ready_with, map_export_worker_result, map_rescan_result,
-        map_save_worker_result, prepare_file_query, prepare_settings_save, publish_file_search,
-        require_main_label, rescan_apps_with, save_settings_core, save_settings_with,
-        save_settings_worker_with, search_apps_with, search_files_with, spawn_export_worker,
-        AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome, SaveSettingsCache,
-        SettingsView, UserSettingsUpdate,
+        load_settings_core, load_settings_ready_with, map_export_worker_result,
+        map_file_preview_worker_result, map_rescan_result, map_save_worker_result,
+        prepare_file_query, prepare_settings_save, publish_file_search, require_main_label,
+        rescan_apps_with, save_settings_core, save_settings_with, save_settings_worker_with,
+        search_apps_with, search_files_with, set_file_preview_preference_with, spawn_export_worker,
+        AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate,
+        SaveSettingsCache, SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -983,6 +1038,7 @@ mod tests {
         let settings = Settings {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            file_preview_enabled: true,
             research_id: research_id.map(str::to_owned),
             aliases: BTreeMap::from([
                 (APP_DUPLICATE_A.into(), vec!["seed alias".into()]),
@@ -999,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_guard_rejects_all_nine_non_main_commands_without_side_effects() {
+    fn caller_guard_rejects_all_ten_non_main_commands_without_side_effects() {
         assert_eq!(require_main_label("main"), Ok(()));
         for command in [
             "search_apps",
@@ -1007,6 +1063,7 @@ mod tests {
             "execute_result",
             "load_settings",
             "save_settings",
+            "set_file_preview_preference",
             "rescan_apps",
             "export_validation_data",
             "clear_validation_data",
@@ -1302,6 +1359,7 @@ mod tests {
             SettingsView {
                 hotkey: "Alt+Space".into(),
                 autostart: false,
+                file_preview_enabled: true,
                 research_id: Some("study_01".into()),
                 applications: vec![
                     AppAliasTarget {
@@ -2383,5 +2441,121 @@ mod tests {
             commands_production.find(&preflight).unwrap()
                 < commands_production.find(&reservation).unwrap()
         );
+    }
+
+    #[test]
+    fn file_preview_preference_guards_reserves_and_reacquires_managed_store() {
+        let invalid_dispatch = AtomicUsize::new(0);
+        assert_eq!(
+            require_main_label("secondary"),
+            Err(CommandError::invalid_caller())
+        );
+        assert_eq!(invalid_dispatch.load(Ordering::Relaxed), 0);
+
+        for rejected_phase in ["Cleaning", "SystemEnding"] {
+            let dispatch = Arc::new(AtomicUsize::new(0));
+            let worker_dispatch = Arc::clone(&dispatch);
+            assert_eq!(
+                tauri::async_runtime::block_on(set_file_preview_preference_with(
+                    FilePreviewPreferenceUpdate { enabled: false },
+                    || Err::<crate::lifecycle::CriticalReservation, _>(rejected_phase),
+                    move |_, _| {
+                        worker_dispatch.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    },
+                )),
+                Err(CommandError::settings_failed())
+            );
+            assert_eq!(dispatch.load(Ordering::Relaxed), 0);
+        }
+
+        let coordinator = Arc::new(LifecycleCoordinator::default());
+        let reserve_coordinator = Arc::clone(&coordinator);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let reserve_order = Arc::clone(&order);
+        let worker_order = Arc::clone(&order);
+        assert_eq!(
+            tauri::async_runtime::block_on(set_file_preview_preference_with(
+                FilePreviewPreferenceUpdate { enabled: false },
+                move || {
+                    reserve_order.lock().unwrap().push("reserve");
+                    reserve_coordinator.reserve_critical().map_err(|_| ())
+                },
+                move |_reservation, preference| {
+                    worker_order.lock().unwrap().push("worker");
+                    assert!(!preference.enabled);
+                    Ok(())
+                },
+            )),
+            Ok(())
+        );
+        assert_eq!(*order.lock().unwrap(), ["reserve", "worker"]);
+
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let production = source.split(&marker).next().unwrap();
+        let start = production
+            .find("pub(crate) async fn set_file_preview_preference(")
+            .unwrap();
+        let end = production[start..]
+            .find("#[cfg(test)]\nfn save_settings_core")
+            .map(|offset| start + offset)
+            .unwrap();
+        let command = &production[start..end];
+        let first = command[command.find('{').unwrap() + 1..].trim_start();
+        assert!(first.starts_with("require_main_window(&window)?;"));
+        assert_eq!(command.matches(".state::<SettingsStore>()").count(), 1);
+        assert!(!command.contains("AppCache"));
+        assert!(!command.contains("reconcile_runtime_settings"));
+    }
+
+    #[test]
+    fn file_preview_preference_maps_worker_and_storage_failures() {
+        assert_eq!(map_file_preview_worker_result(Ok(Ok(()))), Ok(()));
+        assert_eq!(
+            map_file_preview_worker_result(Ok(Err(()))),
+            Err(CommandError::settings_failed())
+        );
+        assert_eq!(
+            map_file_preview_worker_result(Err(())),
+            Err(CommandError::settings_failed())
+        );
+
+        let dir = TestDir::new();
+        let store = settings_store(&dir, Some("study_01"));
+        let before = store.snapshot();
+        let current = dir.path().join("settings.json");
+        let before_disk = fs::read(&current).unwrap();
+        fs::remove_file(&current).unwrap();
+        fs::create_dir(&current).unwrap();
+        assert_eq!(
+            store.set_file_preview_enabled(!before.file_preview_enabled),
+            Err(crate::settings::SettingsError::Storage)
+        );
+        assert_eq!(store.snapshot(), before);
+        fs::remove_dir(&current).unwrap();
+        fs::write(&current, &before_disk).unwrap();
+        assert_eq!(fs::read(current).unwrap(), before_disk);
+    }
+
+    #[test]
+    fn file_preview_preference_caller_guard_is_first_statement() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let production = source.split(&marker).next().unwrap();
+        let start = production
+            .find("pub(crate) async fn set_file_preview_preference(")
+            .unwrap();
+        let command = &production[start..];
+        let first = command[command.find('{').unwrap() + 1..].trim_start();
+        assert!(first.starts_with("require_main_window(&window)?;"));
+        let guard = command.find("require_main_window(&window)?;").unwrap();
+        for forbidden in [
+            "reserve_critical",
+            "spawn_blocking",
+            "state::<SettingsStore>",
+        ] {
+            assert!(guard < command.find(forbidden).unwrap());
+        }
     }
 }

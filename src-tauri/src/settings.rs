@@ -19,6 +19,8 @@ use crate::{
 pub(crate) struct Settings {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
+    #[serde(default = "default_file_preview_enabled")]
+    pub(crate) file_preview_enabled: bool,
     pub(crate) research_id: Option<String>,
     pub(crate) aliases: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -56,11 +58,16 @@ impl Default for Settings {
         Self {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            file_preview_enabled: default_file_preview_enabled(),
             research_id: None,
             aliases: BTreeMap::new(),
             use_counts: BTreeMap::new(),
         }
     }
+}
+
+fn default_file_preview_enabled() -> bool {
+    true
 }
 
 impl fmt::Display for SettingsError {
@@ -204,6 +211,13 @@ impl SettingsStore {
         let mut candidate = state.value.clone();
         let count = candidate.use_counts.entry(app_id.into()).or_default();
         *count = count.checked_add(1).ok_or(SettingsError::CountOverflow)?;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_file_preview_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.file_preview_enabled = enabled;
         self.persist(&mut state, candidate)
     }
 
@@ -772,6 +786,73 @@ mod tests {
 
         assert_eq!(read_current(&dir).use_counts[APP_A], 9);
         assert_eq!(read_backup(&dir).use_counts[APP_A], 8);
+    }
+
+    #[test]
+    fn file_preview_defaults_true_and_round_trips_legacy_settings() {
+        let dir = TestDir::new("file-preview-legacy");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":null,"aliases":{},"useCounts":{}}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(dir.path()).unwrap();
+
+        assert!(store.snapshot().file_preview_enabled);
+        store.set_file_preview_enabled(false).unwrap();
+        assert!(!read_current(&dir).file_preview_enabled);
+        assert!(
+            !SettingsStore::load(dir.path())
+                .unwrap()
+                .snapshot()
+                .file_preview_enabled
+        );
+    }
+
+    #[test]
+    fn user_settings_update_preserves_file_preview_preference() {
+        let dir = TestDir::new("file-preview-user-update");
+        let persisted = Settings {
+            file_preview_enabled: false,
+            ..Settings::default()
+        };
+        write_settings(&dir.current(), &persisted);
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let cache = cache(&[(APP_A, "App")]);
+
+        store
+            .update_user_settings(update(Some("study_02"), &[(APP_A, &["alias"])]), &cache)
+            .unwrap();
+
+        assert!(!store.snapshot().file_preview_enabled);
+        assert!(!read_current(&dir).file_preview_enabled);
+    }
+
+    #[test]
+    fn file_preview_preference_updates_only_that_field() {
+        let dir = TestDir::new("file-preview-only-field");
+        let persisted = Settings {
+            hotkey: "Ctrl+Space".into(),
+            autostart: true,
+            research_id: Some("study_01".into()),
+            aliases: BTreeMap::from([(APP_A.into(), vec!["alias".into()])]),
+            use_counts: BTreeMap::from([(APP_A.into(), 9)]),
+            file_preview_enabled: true,
+        };
+        write_settings(&dir.current(), &persisted);
+        let store = SettingsStore::load(dir.path()).unwrap();
+
+        store.set_file_preview_enabled(false).unwrap();
+
+        assert_eq!(
+            store.snapshot(),
+            Settings {
+                file_preview_enabled: false,
+                ..persisted
+            }
+        );
+        assert_eq!(read_current(&dir), store.snapshot());
     }
 
     #[test]

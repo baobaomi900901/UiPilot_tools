@@ -212,6 +212,7 @@ pub fn run() {
             commands::execute_result,
             commands::load_settings,
             commands::save_settings,
+            commands::set_file_preview_preference,
             commands::rescan_apps,
             commands::export_validation_data,
             commands::clear_validation_data,
@@ -381,13 +382,14 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 9);
+        assert_eq!(production.matches("commands::").count(), 10);
         for command in [
             "search_apps",
             "search_files",
             "execute_result",
             "load_settings",
             "save_settings",
+            "set_file_preview_preference",
             "rescan_apps",
             "export_validation_data",
             "clear_validation_data",
