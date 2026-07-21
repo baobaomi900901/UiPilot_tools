@@ -466,6 +466,56 @@ mod tests {
     }
 
     #[test]
+    fn tray_show_does_not_wait_for_application_discovery() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let tray_callback = production
+            .split(".on_menu_event(")
+            .nth(1)
+            .and_then(|tail| tail.split(".build(app)").next())
+            .expect("tray callback markers are missing");
+        assert!(tray_callback.contains("tray_coordinator.request_show(app, target)"));
+        for forbidden in [
+            "start_initial_refresh",
+            "discover",
+            "icon::",
+            "GetImage",
+            "WIC",
+            ".join(",
+            ".recv(",
+        ] {
+            assert!(
+                !tray_callback.contains(forbidden),
+                "tray callback waits for application discovery: {forbidden}"
+            );
+        }
+
+        let setup = production
+            .split("fn setup_production_lifecycle(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn run() {").next())
+            .expect("production setup markers are missing");
+        let background_start = "let _ = apps::start_initial_refresh(Arc::clone(app_cache))?;";
+        assert_eq!(setup.matches(background_start).count(), 1);
+        for forbidden in [".join(", ".recv(", "apps::discover", "GetImage", "WIC"] {
+            assert!(
+                !setup.contains(forbidden),
+                "production setup waits for application discovery: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_icon_module_is_covered_by_the_lint_oracle() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let expected = ["(\"apps/icon.rs\", include_str!(\"apps/", "icon.rs\"))"].concat();
+        assert!(source.contains(&expected));
+    }
+
+    #[test]
     fn feature_only_lifecycle_keeps_every_production_plugin_behind_the_product_cfg() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let run = source
@@ -605,6 +655,7 @@ mod tests {
             ("apps/action.rs", action.as_str()),
             ("apps/cache.rs", cache.as_str()),
             ("apps/discovery.rs", include_str!("apps/discovery.rs")),
+            ("apps/icon.rs", include_str!("apps/icon.rs")),
             ("apps/rank.rs", include_str!("apps/rank.rs")),
             ("apps/shortcut.rs", include_str!("apps/shortcut.rs")),
             (

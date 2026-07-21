@@ -157,6 +157,30 @@ mod tests {
     }
 
     #[test]
+    fn blocked_discovery_does_not_hold_the_snapshot_lock() {
+        let cache = Arc::new(AppCache::from_apps(vec![application("Existing")]));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let worker_cache = Arc::clone(&cache);
+        let worker = thread::spawn(move || {
+            worker_cache
+                .refresh_with(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(snapshot(vec![application("New")]))
+                })
+                .unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(cache.applications.try_read().is_ok());
+        assert_eq!(titles(&cache.snapshot()), ["Existing"]);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(titles(&cache.snapshot()), ["New"]);
+    }
+
+    #[test]
     fn initial_background_refresh_populates_the_shared_instance() {
         let managed = Arc::new(AppCache::new());
         let command_state = Arc::clone(&managed);

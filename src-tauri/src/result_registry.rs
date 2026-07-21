@@ -259,12 +259,18 @@ mod tests {
         let application = registry
             .begin_query(QueryDomain::Application, "inv-1", 1)
             .unwrap();
+        let mut application_item = item("", "Application");
+        application_item.icon = Some("data:image/png;base64,iVBORw==".into());
         let application_response = publish_app(
             &registry,
             application,
-            vec![(item("", "Application"), action("application"))],
+            vec![(application_item, action("application"))],
         )
         .unwrap();
+        assert_eq!(
+            application_response.items[0].icon.as_deref(),
+            Some("data:image/png;base64,iVBORw==")
+        );
 
         let file = registry.begin_query(QueryDomain::File, "inv-1", 2).unwrap();
         assert_eq!(
