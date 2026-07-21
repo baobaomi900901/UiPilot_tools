@@ -10,13 +10,17 @@
 
 ## Global Constraints
 
-- R2 supersedes only the executable baseline and evidence names in R1 Plan Go `12fed01f7ecb8df3ea9d2e9ebe6e2023abdf6ea9`; every product, dependency, trust, test, and delivery contract below remains unchanged unless this R2 amendment says otherwise.
+- R3 supersedes only the executable baseline and evidence names in R2 Plan Go `b2dfe47fefe2eb632220e4122dfc5b64cad46039`; every product, dependency, trust, test, and delivery contract below remains unchanged unless this R3 amendment says otherwise.
 - The first Task 0 run is immutable failed evidence: Steps 1-5 passed on baseline `996a9bfb361df76d922de73c283adc7470012d39`, then Step 6 stopped because the production `cargo build` exposed the `HotkeyHook` `HHOOK` Send/Sync and `SetWindowsHookExW` signature failures. Preserve `codex/find-local-file-search`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search`, `foundation-find-approved-design`, `foundation-find-approved-plan`, and `foundation-find-implementation-baseline` exactly as that run left them. Never delete, move, reset, rebase, merge, cherry-pick, or reuse any of those refs or paths.
-- Baseline Corrective B0 Code Go and Integration Go are bound exactly to `5af0962a09ee0865ef519bb3a4930027a4593fe7`. R2 Task 0 must authenticate that commit as an ancestor of the then-current clean `main`; it may not substitute an unreviewed hotkey correction.
-- R1 Task 0 PASS at `12fed01f7ecb8df3ea9d2e9ebe6e2023abdf6ea9`, its Task 1 RED/partial GREEN five-path WIP, both R1 tags fixed at `12fed01f7ecb8df3ea9d2e9ebe6e2023abdf6ea9`, and unintegrated plan correction `409350f51458390be4c1d12426370d4e3d8ceac8` are immutable failed evidence. Preserve `codex/find-local-file-search-r1`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r1`, `foundation-find-approved-plan-r1`, `foundation-find-implementation-baseline-r1`, `codex/find-local-file-search-r1-plan-main`, and `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r1-plan-main` exactly as-is. Never clean, copy, stash, reset, rebase, cherry-pick, merge, move, delete, or reuse them, and never cite their WIP as R2 RED/GREEN evidence.
-- The R1 Task 1 stop point is exactly an empty index plus modified `src-tauri/Cargo.lock`, `src-tauri/Cargo.toml`, `src-tauri/src/lib.rs` and untracked `rust-toolchain.toml`, `src-tauri/src/file_index/mod.rs`. It proved Cargo 1.96.1 natively writes lock `version = 4` with SHA-256 `BEF66D757E9251F01D815D35D79FB5ED583C819F7EE6D5E7A5A43C8BA9AB22E4`; old SHA `49E9DB86F063353050BCD53C3127FBBD4BB43A3DABA4ED1293C2FFE482F62018` is historical v3-header evidence only and is never executable.
-- R2 uses only `codex/find-local-file-search-r2`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r2`, `foundation-find-approved-plan-r2`, and `foundation-find-implementation-baseline-r2`. Existing names are a hard stop and are never deleted or reused. `foundation-find-approved-design` remains the one design tag and must resolve exactly to Design Go `675e42ba705938fbf8188460b134a793b4be3d97`.
-- Written R2 Plan Go uses `UIPILOT_FIND_APPROVED_PLAN_COMMIT`, whose value must be the exact commit containing this R2 plan. After reviewer ff-only integration into clean `main`, execute Task 0 from Step 1 and reproduce every baseline, dependency, RED, and GREEN result from scratch in the new R2 worktree. R1 evidence authorizes nothing. Task 0 is preflight only and does not receive separate Code Go; only its complete PASS may enter a fresh Task 1 RED.
+- Baseline Corrective B0 Code Go and Integration Go are bound exactly to `5af0962a09ee0865ef519bb3a4930027a4593fe7`. R3 Task 0 must authenticate that commit as an ancestor of the then-current clean `main`; it may not substitute an unreviewed hotkey correction.
+- R1 Task 0 PASS at `12fed01f7ecb8df3ea9d2e9ebe6e2023abdf6ea9`, its Task 1 RED/partial GREEN five-path WIP, both R1 tags fixed at `12fed01f7ecb8df3ea9d2e9ebe6e2023abdf6ea9`, and unintegrated plan correction `409350f51458390be4c1d12426370d4e3d8ceac8` are immutable failed evidence. Preserve `codex/find-local-file-search-r1`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r1`, `foundation-find-approved-plan-r1`, `foundation-find-implementation-baseline-r1`, `codex/find-local-file-search-r1-plan-main`, and `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r1-plan-main` exactly as-is. Never clean, copy, stash, reset, rebase, cherry-pick, merge, move, delete, or reuse them, and never cite their WIP as R3 RED/GREEN evidence.
+- The R1 Task 1 stop point is exactly an empty index plus modified `src-tauri/Cargo.lock`, `src-tauri/Cargo.toml`, `src-tauri/src/lib.rs` and untracked `rust-toolchain.toml`, `src-tauri/src/file_index/mod.rs`. It proved Cargo 1.96.1 natively writes lock `version = 4` with SHA-256 `BEF66D757E9251F01D815D35D79FB5ED583C819F7EE6D5E7A5A43C8BA9AB22E4`; old SHA `49E9DB86F063353050BCD53C3127FBBD4BB43A3DABA4ED1293C2FFE482F62018` is historical v3-header evidence only and is never executable. The existing `C:\Users\moby\AppData\Local\Temp\uipilot-find-cargo-home` is part of that immutable failed evidence: authenticate it read-only, never delete or reuse it, and never set it as R3 `CARGO_HOME`.
+- The R2 Task 0 run is immutable failed evidence at `b2dfe47fefe2eb632220e4122dfc5b64cad46039`: Steps 1-5 passed, Step 6 passed frontend tests/build, production Rust build, and default/all-features Rust tests, then default Clippy stopped only at `src-tauri/src/lifecycle.rs:1608` with `redundant_closure`; Task 1 and every product commit remained not run. Preserve `codex/find-local-file-search-r2`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r2`, `foundation-find-approved-plan-r2`, and `foundation-find-implementation-baseline-r2`. Its index stays empty and its exact eight autogenerated-permission status entries remain stat-only with content diff zero. Never clean, copy, reset, rebase, merge, move, delete, reuse, or cite that run as R3 evidence.
+- Baseline Corrective B1 Code Go and Integration Go are bound exactly to `55964473ce687cdce9e47041a52741c638e223e8`, whose parent is R2 Plan Go `b2dfe47fefe2eb632220e4122dfc5b64cad46039` and whose only change is `1 insertion / 1 deletion` in `src-tauri/src/lifecycle.rs`, replacing `|handle| Err(handle)` with `Err`. Preserve `codex/find-baseline-clippy-corrective` and `D:\code\UiPilot_tools\.worktrees\find-baseline-clippy-corrective` clean at that commit. R3 Task 0 must authenticate B1 as the exact integrated Clippy baseline correction and as the direct parent of the Vite watch corrective below.
+- Plan Content Go was granted to `10c73844264aa1bc1f9f90bbac52caa613af9e7f`, whose parent is B1 `55964473ce687cdce9e47041a52741c638e223e8` and whose only change is this plan file. Main advanced before integration, so preserve `codex/find-local-file-search-r3-plan-main` and `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r3-plan-main` clean at `10c73844264aa1bc1f9f90bbac52caa613af9e7f` as immutable unintegrated Plan Go evidence. Never amend, merge, rebase, cherry-pick, move, delete, or reuse that commit, branch, or worktree.
+- The independently reviewed Vite watch corrective Code Go and Integration Go are bound exactly to `16bc09b600f14e51fcd619392fbe6257d49003ef`, whose direct parent is B1 `55964473ce687cdce9e47041a52741c638e223e8`, whose subject is `修复：排除 Rust 构建目录以消除开发启动延迟`, and whose exact scope is `5 insertions / 0 deletions` in `vite.config.ts`. It adds only `server.watch.ignored: ['**/src-tauri/target/**']`. R3 Plan Go must be a single plan-only child of this corrective, and R3 Task 0 must authenticate both baseline-correction segments exactly.
+- R3 uses only `codex/find-local-file-search-r3`, `D:\code\UiPilot_tools\.worktrees\find-local-file-search-r3`, `foundation-find-approved-plan-r3`, and `foundation-find-implementation-baseline-r3`. Existing names are a hard stop and are never deleted or reused. `foundation-find-approved-design` remains the one design tag and must resolve exactly to Design Go `675e42ba705938fbf8188460b134a793b4be3d97`.
+- Written R3 Plan Go uses `UIPILOT_FIND_APPROVED_PLAN_COMMIT`, whose value must be the exact commit containing this R3 plan. After reviewer ff-only integration into clean `main`, execute Task 0 from Step 1 and reproduce every baseline, dependency, RED, and GREEN result from scratch in the new R3 worktree. R1/R2 evidence authorizes nothing. Task 0 is preflight only and does not receive separate Code Go; only its complete PASS may enter a fresh Task 1 RED.
 - Tasks 1-12 each produce exactly one detailed Chinese commit after their own RED, minimal GREEN, and prescribed verification pass. Every subject and body is Chinese; every body records target/root cause, exact implementation scope, RED/GREEN evidence, and the boundary that was not expanded. Immediately after each task commit, the development agent stops and requests that task's written Code Go; it never integrates `main`.
 - After a task's Code Go, the reviewer may integrate only when the primary `main` worktree is clean and its HEAD is exactly that task commit's parent. The only integration command is `git merge --ff-only <approved-feature-commit>`. The reviewer then reruns that task's prescribed full/integration gates on `main` and issues written Integration Go. Only that Integration Go permits the next task. Dirty, diverged, or non-fast-forward state is a hard stop; never substitute rebase, cherry-pick, an implicit merge commit, or a hidden baseline rewrite.
 - The development agent never controls or injects mouse or keyboard input during development, diagnosis, tests, evidence collection, or review. It does not move/click the pointer, simulate keys, paste from the clipboard, invoke UI automation input/click actions, or drive the real product through a browser automation surface. Headless unit/integration tests may call pure controller/state methods with inert typed fixtures; they may not synthesize OS/browser input into a real product process.
@@ -27,7 +31,7 @@
 - Whenever the development agent stops for completion, test failure, a plan/trust/environment gate, HITL, or any other reason, its final message must use `<codex_delegation>` to actively hand off to review thread `019f6eeb-829b-76c0-9f11-c4692b7cc285` with conclusion and requested Go/No-Go; branch/worktree/parent/HEAD and clean/index state; Chinese commit SHA/scope when present; Automated/HITL/Not executed; RED/GREEN and raw failure classification; main state, frozen next task, and unexecuted boundaries. If handoff delivery fails, state `handoff failed`, preserve all evidence, and do not continue.
 
 ```text
-R2_INPUT_AUTOMATION_DENYLIST_BEGIN
+R3_INPUT_AUTOMATION_DENYLIST_BEGIN
 SendKeys
 SendInput
 keybd_event
@@ -37,11 +41,11 @@ Playwright product driving
 CDP Input.dispatch*
 clipboard paste triggering
 synthetic OS/browser input into the real product
-R2_INPUT_AUTOMATION_DENYLIST_END
+R3_INPUT_AUTOMATION_DENYLIST_END
 ```
 - Design Go is bound to `675e42ba705938fbf8188460b134a793b4be3d97` and exact file `docs/superpowers/specs/2026-07-20-find-local-file-search-design.md`. Dependency/Rust-floor Go accepts the SQLite `3.53.2` versus `3.53.3` residual patch risk only under the exact freeze below.
 - This plan is not implementation authorization. Execution requires a written Plan Go naming this plan's exact 40-hex commit, an independently reviewed Task 7 Code Go, and a clean Task 7 integration on the then-current local `main`.
-- Current `main` at plan authoring is `a8626e72e97a5caa924333e6d6545efe9cd2e6d0` and does not contain Task 7 React/Ant Design production files. Do not implement `/find` from that commit.
+- Current `main` at R3 plan authoring is clean at Vite watch corrective `16bc09b600f14e51fcd619392fbe6257d49003ef` and contains B1 plus the reviewed Task 7 React/Ant Design production files. `vite.config.ts` is therefore a frozen pre-R3 implementation-baseline input: its Rust target ignore is not `/find` product work and does not enlarge the exact 25-path implementation ceiling, allowlist, or required set. Execution still starts only after written R3 Plan Go is ff-only integrated into a clean `main`; never implement from an older evidence branch or worktree.
 - `D:\code\UiPilot_tools\.worktrees\foundation-task-7` at plan authoring is dirty at `28f058be94d4fadb0b490b08f4bb5f99a77c08f0`. It is read-only historical interface evidence, not an approved baseline. Do not modify, clean, commit, merge, or base work on it.
 - Task 0 must use the `using-git-worktrees` skill and create a new implementation branch/worktree from the then-current clean `main`. Never implement in this design worktree, the Task 7 worktree, another feature worktree, or the primary `main` worktree.
 - At execution, authenticate the written Task 7 Code Go SHA as an ancestor of `main`, authenticate all expected Task 7 files and command/event interfaces, and rerun its baseline tests. Any drift from the interfaces named below stops execution and returns this plan to written review.
@@ -139,7 +143,9 @@ $environment = [Environment]::GetEnvironmentVariables()
 foreach ($key in $forbidden) {
   if ($environment.Contains($key)) { throw "forbidden dependency environment key present: $key" }
 }
-$env:CARGO_HOME = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+$historicalCargoHome = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+if (-not (Test-Path -LiteralPath $historicalCargoHome -PathType Container)) { throw 'immutable R1 Cargo home evidence is missing' }
+$env:CARGO_HOME = Join-Path $env:TEMP 'uipilot-find-cargo-home-r3'
 if (-not (Test-Path -LiteralPath $env:CARGO_HOME -PathType Container)) { throw 'approved isolated Cargo home is missing' }
 $rustVersion = (& rustc +1.96.1 --version)
 if ($LASTEXITCODE -ne 0 -or $rustVersion -notmatch '^rustc 1\.96\.1 ') { throw 'Rust 1.96.1 is not active' }
@@ -156,8 +162,8 @@ Every later `cargo` command shown without an explicit `+1.96.1` runs only after 
 **Files:** No repository file changes.
 
 **Interfaces:**
-- Consumes: written R2 `/find` Plan Go, Design Go `675e42ba705938fbf8188460b134a793b4be3d97`, written Dependency/Rust-floor Go, B0 Code/Integration Go `5af0962a09ee0865ef519bb3a4930027a4593fe7`, written Task 7 Code Go, the exact double-tap baseline parent `42d4d43e00039e5f1b2b541aac0d959820e7a7f6`, and a clean local `main` containing the approved plan commit.
-- Produces: one isolated `codex/find-local-file-search-r2` worktree, immutable R2 evidence tags, and a recorded R2 implementation baseline SHA; no product diff.
+- Consumes: written R3 `/find` Plan Go, Design Go `675e42ba705938fbf8188460b134a793b4be3d97`, written Dependency/Rust-floor Go, B0 Code/Integration Go `5af0962a09ee0865ef519bb3a4930027a4593fe7`, B1 Code/Integration Go `55964473ce687cdce9e47041a52741c638e223e8`, Vite watch corrective `16bc09b600f14e51fcd619392fbe6257d49003ef`, written Task 7 Code Go, and a clean local `main` containing the approved plan commit.
+- Produces: one isolated `codex/find-local-file-search-r3` worktree, immutable R3 evidence tags, and a recorded R3 implementation baseline SHA; no product diff.
 
 **Evidence split:** Automated: owner/ref/interface, dependency recheck, worktree, baseline build/test/Clippy/frontend/security, and clean-state gates. HITL: none. Not executed: product edits, Task 1, real product interaction, input automation, runtime positive probe, integration, or release.
 
@@ -173,7 +179,12 @@ $historicalBaseline = '996a9bfb361df76d922de73c283adc7470012d39'
 $baselineCorrective = '5af0962a09ee0865ef519bb3a4930027a4593fe7'
 $r1PlanCommit = '12fed01f7ecb8df3ea9d2e9ebe6e2023abdf6ea9'
 $unintegratedR1Correction = '409350f51458390be4c1d12426370d4e3d8ceac8'
-$r2PlanParent = '42d4d43e00039e5f1b2b541aac0d959820e7a7f6'
+$doubleTapBaseline = '42d4d43e00039e5f1b2b541aac0d959820e7a7f6'
+$r2PlanCommit = 'b2dfe47fefe2eb632220e4122dfc5b64cad46039'
+$b1Corrective = '55964473ce687cdce9e47041a52741c638e223e8'
+$unintegratedR3Plan = '10c73844264aa1bc1f9f90bbac52caa613af9e7f'
+$viteWatchCorrective = '16bc09b600f14e51fcd619392fbe6257d49003ef'
+$r3PlanParent = $viteWatchCorrective
 $planCommit = $env:UIPILOT_FIND_APPROVED_PLAN_COMMIT
 $task7CodeGo = $env:UIPILOT_TASK7_CODE_GO_SHA
 if ($planCommit -notmatch '^[0-9a-f]{40}$') { throw 'missing written /find Plan Go commit' }
@@ -186,20 +197,60 @@ $mainStatus = @(git status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0 -or $mainStatus.Count -ne 0) { throw 'main must be clean' }
 $baseline = (git rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $baseline -notmatch '^[0-9a-f]{40}$') { throw 'invalid main baseline' }
-if ($baseline -cne $planCommit) { throw 'main HEAD is not the exact written R2 Plan Go' }
+if ($baseline -cne $planCommit) { throw 'main HEAD is not the exact written R3 Plan Go' }
 $actualPlanParent = (git rev-parse "$planCommit^").Trim()
-if ($LASTEXITCODE -ne 0 -or $actualPlanParent -cne $r2PlanParent) { throw 'R2 plan parent drifted from the reviewed double-tap baseline' }
-git merge-base --is-ancestor $r2PlanParent $planCommit
-if ($LASTEXITCODE -ne 0) { throw 'double-tap baseline is not an ancestor of R2 Plan Go' }
-$planDelta = @(git diff --name-only --no-renames $r2PlanParent $planCommit)
-if ($LASTEXITCODE -ne 0 -or $planDelta.Count -ne 1 -or $planDelta[0] -cne 'docs/superpowers/plans/2026-07-20-find-local-file-search.md') { throw 'R2 Plan Go is not one plan-only commit' }
+if ($LASTEXITCODE -ne 0 -or $actualPlanParent -cne $r3PlanParent) { throw 'R3 plan parent drifted from the Vite watch corrective' }
+$r2PlanParent = (git rev-parse "$r2PlanCommit^").Trim()
+if ($LASTEXITCODE -ne 0 -or $r2PlanParent -cne $doubleTapBaseline) { throw 'R2 plan parent drifted from the reviewed double-tap baseline' }
+$r2PlanDelta = @(git diff --name-only --no-renames $doubleTapBaseline $r2PlanCommit)
+if ($LASTEXITCODE -ne 0 -or $r2PlanDelta.Count -ne 1 -or $r2PlanDelta[0] -cne 'docs/superpowers/plans/2026-07-20-find-local-file-search.md') { throw 'R2 failed plan evidence is not one plan-only commit' }
+$b1Parent = (git rev-parse "$b1Corrective^").Trim()
+if ($LASTEXITCODE -ne 0 -or $b1Parent -cne $r2PlanCommit) { throw 'B1 parent drifted from R2 Plan Go' }
+$b1Paths = @(git diff-tree --no-commit-id --name-only -r $b1Corrective)
+if ($LASTEXITCODE -ne 0 -or $b1Paths.Count -ne 1 -or $b1Paths[0] -cne 'src-tauri/src/lifecycle.rs') { throw 'B1 file scope drifted' }
+$b1Numstat = @(git diff-tree --no-commit-id --numstat -r $b1Corrective)
+if ($LASTEXITCODE -ne 0 -or $b1Numstat.Count -ne 1 -or $b1Numstat[0] -cne "1`t1`tsrc-tauri/src/lifecycle.rs") { throw 'B1 line scope drifted' }
+$b1Patch = (git show --format= --unified=0 $b1Corrective -- src-tauri/src/lifecycle.rs) -join "`n"
+if ($LASTEXITCODE -ne 0 -or
+    [regex]::Matches($b1Patch, [regex]::Escape('-        assert_eq!(uninstall_slot_with(&slot, |handle| Err(handle)), Err(()));')).Count -ne 1 -or
+    [regex]::Matches($b1Patch, [regex]::Escape('+        assert_eq!(uninstall_slot_with(&slot, Err), Err(()));')).Count -ne 1) {
+  throw 'B1 exact one-line correction drifted'
+}
+$viteWatchParent = (git rev-parse "$viteWatchCorrective^").Trim()
+if ($LASTEXITCODE -ne 0 -or $viteWatchParent -cne $b1Corrective) { throw 'Vite watch corrective is not a direct child of B1' }
+$viteWatchSubject = (git show -s --format=%s $viteWatchCorrective).Trim()
+if ($LASTEXITCODE -ne 0 -or $viteWatchSubject -cne '修复：排除 Rust 构建目录以消除开发启动延迟') { throw 'Vite watch corrective subject drifted' }
+$viteWatchPaths = @(git diff-tree --no-commit-id --name-only -r $viteWatchCorrective)
+if ($LASTEXITCODE -ne 0 -or $viteWatchPaths.Count -ne 1 -or $viteWatchPaths[0] -cne 'vite.config.ts') { throw 'Vite watch corrective file scope drifted' }
+$viteWatchNumstat = @(git diff-tree --no-commit-id --numstat -r $viteWatchCorrective)
+if ($LASTEXITCODE -ne 0 -or $viteWatchNumstat.Count -ne 1 -or $viteWatchNumstat[0] -cne "5`t0`tvite.config.ts") { throw 'Vite watch corrective line scope drifted' }
+$viteWatchPatch = (git show --format= --unified=0 $viteWatchCorrective -- vite.config.ts) -join "`n"
+if ($LASTEXITCODE -ne 0 -or [regex]::Matches($viteWatchPatch, [regex]::Escape("+      ignored: ['**/src-tauri/target/**'],")).Count -ne 1) {
+  throw 'Vite watch corrective target ignore drifted'
+}
+$unintegratedR3PlanParent = (git rev-parse "$unintegratedR3Plan^").Trim()
+if ($LASTEXITCODE -ne 0 -or $unintegratedR3PlanParent -cne $b1Corrective) { throw 'unintegrated 10c7384 parent drifted' }
+$unintegratedR3PlanDelta = @(git diff --name-only --no-renames $b1Corrective $unintegratedR3Plan)
+if ($LASTEXITCODE -ne 0 -or $unintegratedR3PlanDelta.Count -ne 1 -or $unintegratedR3PlanDelta[0] -cne 'docs/superpowers/plans/2026-07-20-find-local-file-search.md') { throw 'unintegrated 10c7384 is not one plan-only commit' }
+$unintegratedR3PlanRef = (git rev-parse refs/heads/codex/find-local-file-search-r3-plan-main).Trim()
+if ($LASTEXITCODE -ne 0 -or $unintegratedR3PlanRef -cne $unintegratedR3Plan) { throw 'unintegrated 10c7384 branch drifted' }
+$unintegratedR3PlanRoot = 'D:\code\UiPilot_tools\.worktrees\find-local-file-search-r3-plan-main'
+if ((git -C $unintegratedR3PlanRoot branch --show-current).Trim() -cne 'codex/find-local-file-search-r3-plan-main' -or
+    (git -C $unintegratedR3PlanRoot rev-parse HEAD).Trim() -cne $unintegratedR3Plan -or
+    @(git -C $unintegratedR3PlanRoot status --porcelain=v1 --untracked-files=all).Count -ne 0) {
+  throw 'unintegrated 10c7384 evidence worktree drifted'
+}
+$planDelta = @(git diff --name-only --no-renames $r3PlanParent $planCommit)
+if ($LASTEXITCODE -ne 0 -or $planDelta.Count -ne 1 -or $planDelta[0] -cne 'docs/superpowers/plans/2026-07-20-find-local-file-search.md') { throw 'R3 Plan Go is not one plan-only commit' }
+git merge-base --is-ancestor $viteWatchCorrective $planCommit
+if ($LASTEXITCODE -ne 0) { throw 'Vite watch corrective is not an ancestor of R3 Plan Go' }
 $expectedDoubleTapCommits = @(
   '52722620443d74a03fbcc429e6c6ee24390f7e8a',
   'd63060e2f31856f209511f111b7b657f43ede97a',
   '66e6cf88c0d5ad5495e5e0177d93f7cb1773c83e',
   '42d4d43e00039e5f1b2b541aac0d959820e7a7f6'
 )
-$actualDoubleTapCommits = @(git rev-list --reverse "$r1PlanCommit..$r2PlanParent")
+$actualDoubleTapCommits = @(git rev-list --reverse "$r1PlanCommit..$doubleTapBaseline")
 if ($LASTEXITCODE -ne 0 -or (Compare-Object -CaseSensitive $expectedDoubleTapCommits $actualDoubleTapCommits)) { throw 'double-tap commit chain drifted' }
 $doubleTapPaths = [ordered]@{
   '52722620443d74a03fbcc429e6c6ee24390f7e8a' = @('docs/superpowers/specs/2026-07-21-double-tap-hook-main-thread-design.md')
@@ -225,6 +276,8 @@ $historicalEvidence = [ordered]@{
   'foundation-find-implementation-baseline' = $historicalBaseline
   'foundation-find-approved-plan-r1' = $r1PlanCommit
   'foundation-find-implementation-baseline-r1' = $r1PlanCommit
+  'foundation-find-approved-plan-r2' = $r2PlanCommit
+  'foundation-find-implementation-baseline-r2' = $r2PlanCommit
 }
 foreach ($entry in $historicalEvidence.GetEnumerator()) {
   git show-ref --verify --quiet "refs/tags/$($entry.Key)"
@@ -256,10 +309,41 @@ if ((Get-FileHash -Algorithm SHA256 $failedLock).Hash -cne 'BEF66D757E9251F01D81
     [regex]::Matches($failedLockText, '(?m)^version = 4$').Count -ne 1) {
   throw 'R1 failed lock evidence drifted'
 }
+$r2FailedRoot = 'D:\code\UiPilot_tools\.worktrees\find-local-file-search-r2'
+$expectedR2Status = @(
+  ' M src-tauri/permissions/autogenerated/clear_validation_data.toml',
+  ' M src-tauri/permissions/autogenerated/execute_result.toml',
+  ' M src-tauri/permissions/autogenerated/export_validation_data.toml',
+  ' M src-tauri/permissions/autogenerated/hide_launcher.toml',
+  ' M src-tauri/permissions/autogenerated/load_settings.toml',
+  ' M src-tauri/permissions/autogenerated/rescan_apps.toml',
+  ' M src-tauri/permissions/autogenerated/save_settings.toml',
+  ' M src-tauri/permissions/autogenerated/search_apps.toml'
+) | Sort-Object -CaseSensitive
+$actualR2Status = @(git -C $r2FailedRoot status --porcelain=v1 --untracked-files=all | Sort-Object -CaseSensitive)
+if ((git -C $r2FailedRoot branch --show-current).Trim() -cne 'codex/find-local-file-search-r2' -or
+    (git -C $r2FailedRoot rev-parse HEAD).Trim() -cne $r2PlanCommit -or
+    @(git -C $r2FailedRoot diff --cached --name-only).Count -ne 0 -or
+    (Compare-Object -CaseSensitive $expectedR2Status $actualR2Status)) {
+  throw 'R2 Task 0 failed evidence drifted'
+}
+foreach ($statusLine in $expectedR2Status) {
+  $path = $statusLine.Substring(3)
+  git -C $r2FailedRoot diff --exit-code -- $path
+  if ($LASTEXITCODE -ne 0) { throw "R2 generated permission has content drift: $path" }
+}
+$b1EvidenceRoot = 'D:\code\UiPilot_tools\.worktrees\find-baseline-clippy-corrective'
+if ((git -C $b1EvidenceRoot branch --show-current).Trim() -cne 'codex/find-baseline-clippy-corrective' -or
+    (git -C $b1EvidenceRoot rev-parse HEAD).Trim() -cne $b1Corrective -or
+    @(git -C $b1EvidenceRoot status --porcelain=v1 --untracked-files=all).Count -ne 0) {
+  throw 'B1 evidence worktree drifted'
+}
+$historicalCargoHome = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+if (-not (Test-Path -LiteralPath $historicalCargoHome -PathType Container)) { throw 'immutable R1 Cargo home evidence is missing' }
 $planSource = (git show "$planCommit`:docs/superpowers/plans/2026-07-20-find-local-file-search.md") -join "`n"
-if ($LASTEXITCODE -ne 0) { throw 'approved R2 plan source cannot be read' }
+if ($LASTEXITCODE -ne 0) { throw 'approved R3 plan source cannot be read' }
 $commitLines = @($planSource -split "`n" | Where-Object { $_.StartsWith('git commit -m "', [StringComparison]::Ordinal) })
-if ($commitLines.Count -ne 12) { throw 'R2 plan must contain exactly 12 task commit commands' }
+if ($commitLines.Count -ne 12) { throw 'R3 plan must contain exactly 12 task commit commands' }
 $powershellBodies = @([regex]::Matches($planSource, '(?ms)^```powershell\s*\r?\n(.*?)^```\s*$') | ForEach-Object { $_.Groups[1].Value })
 $powershellCommitLines = @(($powershellBodies -join "`n") -split "`n" | Where-Object { $_.StartsWith('git commit -m "', [StringComparison]::Ordinal) })
 if ($powershellCommitLines.Count -ne 12) { throw 'every task commit command must be inside an executable PowerShell fence' }
@@ -275,16 +359,48 @@ foreach ($line in $commitLines) {
 if ([regex]::Matches($planSource, '(?m)^Expected checkpoint: commit succeeds; stop and request Task (?:[1-9]|1[0-2]) Code Go\. ').Count -ne 12) {
   throw 'per-task Code Go checkpoint count drifted'
 }
+$task1Marker = '### Task ' + '1:'
+$task1Index = $planSource.IndexOf($task1Marker, [StringComparison]::Ordinal)
+if ($task1Index -lt 0) { throw 'Task 1 marker is missing' }
+$downstreamPlan = $planSource.Substring($task1Index)
+foreach ($oldBaselineTag in @(
+  ('foundation-find-implementation-baseline-' + 'r1'),
+  ('foundation-find-implementation-baseline-' + 'r2')
+)) {
+  if ($downstreamPlan.Contains($oldBaselineTag)) { throw "downstream executable baseline still uses historical tag: $oldBaselineTag" }
+}
+$r3BaselineTag = 'foundation-find-implementation-baseline-' + 'r3'
+if ([regex]::Matches($downstreamPlan, [regex]::Escape($r3BaselineTag)).Count -ne 3) { throw 'downstream R3 baseline tag count drifted' }
+$expectedR3NameCounts = [ordered]@{
+  ('codex/find-local-file-search-' + 'r3') = 8
+  ('D:\code\UiPilot_tools\.worktrees\find-local-file-search-' + 'r3') = 4
+  ('foundation-find-approved-plan-' + 'r3') = 3
+  ('foundation-find-implementation-baseline-' + 'r3') = 6
+}
+foreach ($entry in $expectedR3NameCounts.GetEnumerator()) {
+  if ([regex]::Matches($planSource, [regex]::Escape($entry.Key)).Count -ne $entry.Value) { throw "R3 execution name count drifted: $($entry.Key)" }
+}
+$unintegratedR3EvidenceHash = '10c73844264aa1bc1f9f90bbac52caa6' + '13af9e7f'
+if ([regex]::Matches($planSource, [regex]::Escape($unintegratedR3EvidenceHash)).Count -ne 3) { throw 'unintegrated R3 Plan Go evidence count drifted' }
+$viteWatchEvidenceHash = '16bc09b600f14e51fcd619392fbe6257d' + '49003ef'
+if ([regex]::Matches($planSource, [regex]::Escape($viteWatchEvidenceHash)).Count -ne 5) { throw 'Vite watch corrective evidence count drifted' }
+$historicalCargoAssignment = '$historicalCargoHome = Join-Path $env:TEMP ' + "'uipilot-find-cargo-home'"
+if ([regex]::Matches($planSource, [regex]::Escape($historicalCargoAssignment)).Count -ne 3) { throw 'historical Cargo home authentication count drifted' }
+$r3CargoHome = 'uipilot-find-cargo-home-' + 'r3'
+if ([regex]::Matches($planSource, [regex]::Escape("'$r3CargoHome'")).Count -ne 2) { throw 'R3 Cargo home execution count drifted' }
+if ($planSource.Contains('$env:CARGO_HOME = Join-Path $env:TEMP ' + "'uipilot-find-cargo-home'")) { throw 'historical Cargo home is still executable' }
+$task1CargoHomeIndex = $downstreamPlan.IndexOf("`$cargoHome = Join-Path `$env:TEMP '$r3CargoHome'", [StringComparison]::Ordinal)
+if ($task1CargoHomeIndex -lt 0) { throw 'Task 1 R3 Cargo home assignment is missing' }
 foreach ($fragment in @(
   ('The only integration command is `git merge --ff-only ' + '<approved-feature-commit>`.'),
   ('The reviewer then reruns that task''s prescribed full/' + 'integration gates on `main` and issues written Integration Go.'),
   ('the development agent stops and requests that task''s written Code Go; it never integrates ' + '`main`.'),
   ('never substitute rebase, cherry-pick, an implicit merge commit, or a hidden baseline ' + 'rewrite.')
 )) {
-  if ([regex]::Matches($planSource, [regex]::Escape($fragment)).Count -ne 1) { throw "R2 delivery protocol fragment count drifted: $fragment" }
+  if ([regex]::Matches($planSource, [regex]::Escape($fragment)).Count -ne 1) { throw "R3 delivery protocol fragment count drifted: $fragment" }
 }
-$denyMatch = [regex]::Match($planSource, '(?ms)^R2_INPUT_AUTOMATION_DENYLIST_BEGIN\r?\n.*?^R2_INPUT_AUTOMATION_DENYLIST_END$')
-if (-not $denyMatch.Success -or [regex]::Matches($planSource, '(?m)^R2_INPUT_AUTOMATION_DENYLIST_BEGIN$').Count -ne 1) {
+$denyMatch = [regex]::Match($planSource, '(?ms)^R3_INPUT_AUTOMATION_DENYLIST_BEGIN\r?\n.*?^R3_INPUT_AUTOMATION_DENYLIST_END$')
+if (-not $denyMatch.Success -or [regex]::Matches($planSource, '(?m)^R3_INPUT_AUTOMATION_DENYLIST_BEGIN$').Count -ne 1) {
   throw 'input automation denylist is missing or duplicated'
 }
 $scannedPlan = $planSource.Remove($denyMatch.Index, $denyMatch.Length)
@@ -314,7 +430,7 @@ foreach ($fragment in @(
 }
 ```
 
-Expected: every command exits 0; `main` is the exact R2 Plan Go child of `42d4d43e00039e5f1b2b541aac0d959820e7a7f6`; B0 and the exact written Task 7 Code Go are ancestors; the four double-tap commits/path sets match; both reviewed document blobs exist; all five historical tags plus the R1 WIP and unintegrated `409350f` worktree remain unchanged.
+Expected: every command exits 0; `main` is the exact R3 Plan Go child of Vite watch corrective `16bc09b600f14e51fcd619392fbe6257d49003ef`; B0, B1, the Vite watch corrective, and the exact written Task 7 Code Go are ancestors; B1 is the Vite corrective's direct parent; both corrections' exact scope and the four double-tap commits/path sets match; both reviewed document blobs exist; all seven historical tags, the R1 WIP, the unintegrated `409350f` and `10c7384` worktrees, the R2 failed worktree/stat-only state, and the old Cargo home remain unchanged.
 
 - [ ] **Step 2: Enforce the Task 7 integration hard gate.**
 
@@ -454,23 +570,23 @@ Expected: all official/API/checksum/solver/archive/metadata operations are authe
 Use the worktree skill's native isolation mechanism when available. If and only if no native mechanism exists, use this fallback after confirming `.worktrees` is ignored. Existing path/branch/tag names are a hard stop; never delete or reset them automatically.
 
 ```powershell
-$implementation = 'D:\code\UiPilot_tools\.worktrees\find-local-file-search-r2'
+$implementation = 'D:\code\UiPilot_tools\.worktrees\find-local-file-search-r3'
 git check-ignore -q .worktrees
 if ($LASTEXITCODE -ne 0) { throw '.worktrees is not ignored' }
 if (Test-Path -LiteralPath $implementation) { throw 'implementation worktree already exists' }
-git show-ref --verify --quiet refs/heads/codex/find-local-file-search-r2
+git show-ref --verify --quiet refs/heads/codex/find-local-file-search-r3
 if ($LASTEXITCODE -eq 0) { throw 'implementation branch already exists' }
 if ($LASTEXITCODE -ne 1) { throw 'implementation branch lookup failed' }
-foreach ($tag in @('foundation-find-approved-plan-r2','foundation-find-implementation-baseline-r2')) {
+foreach ($tag in @('foundation-find-approved-plan-r3','foundation-find-implementation-baseline-r3')) {
   git show-ref --verify --quiet "refs/tags/$tag"
-  if ($LASTEXITCODE -eq 0) { throw "R2 evidence tag already exists before worktree creation: $tag" }
-  if ($LASTEXITCODE -ne 1) { throw "R2 evidence tag lookup failed before worktree creation: $tag" }
+  if ($LASTEXITCODE -eq 0) { throw "R3 evidence tag already exists before worktree creation: $tag" }
+  if ($LASTEXITCODE -ne 1) { throw "R3 evidence tag lookup failed before worktree creation: $tag" }
 }
-git worktree add $implementation -b codex/find-local-file-search-r2 $baseline
+git worktree add $implementation -b codex/find-local-file-search-r3 $baseline
 if ($LASTEXITCODE -ne 0) { throw 'worktree creation failed' }
 Set-Location $implementation
 if ((git rev-parse HEAD).Trim() -cne $baseline) { throw 'implementation baseline drifted' }
-if ((git branch --show-current) -cne 'codex/find-local-file-search-r2') { throw 'implementation branch drifted' }
+if ((git branch --show-current) -cne 'codex/find-local-file-search-r3') { throw 'implementation branch drifted' }
 if (@(git status --porcelain=v1 --untracked-files=all).Count -ne 0) { throw 'new worktree is dirty' }
 ```
 
@@ -478,7 +594,7 @@ Expected: clean isolated worktree at the then-current main SHA.
 
 - [ ] **Step 5: Bind immutable evidence refs without moving existing refs.**
 
-Authenticate the immutable original and R1 historical tags first. Create the two R2 lightweight tags only when absent; if either R2 name is already present, stop rather than moving or reusing it.
+Authenticate the immutable original, R1, and R2 historical tags first. Create the two R3 lightweight tags only when absent; if either R3 name is already present, stop rather than moving or reusing it.
 
 ```powershell
 $historicalTags = [ordered]@{
@@ -487,6 +603,8 @@ $historicalTags = [ordered]@{
   'foundation-find-implementation-baseline' = $historicalBaseline
   'foundation-find-approved-plan-r1' = $r1PlanCommit
   'foundation-find-implementation-baseline-r1' = $r1PlanCommit
+  'foundation-find-approved-plan-r2' = $r2PlanCommit
+  'foundation-find-implementation-baseline-r2' = $r2PlanCommit
 }
 foreach ($entry in $historicalTags.GetEnumerator()) {
   git show-ref --verify --quiet "refs/tags/$($entry.Key)"
@@ -494,16 +612,16 @@ foreach ($entry in $historicalTags.GetEnumerator()) {
   if ((git rev-parse "$($entry.Key)^{commit}").Trim() -cne $entry.Value) { throw "historical tag moved: $($entry.Key)" }
   if ($LASTEXITCODE -ne 0) { throw "historical tag cannot be read: $($entry.Key)" }
 }
-$r2Tags = [ordered]@{
-  'foundation-find-approved-plan-r2' = $planCommit
-  'foundation-find-implementation-baseline-r2' = $baseline
+$r3Tags = [ordered]@{
+  'foundation-find-approved-plan-r3' = $planCommit
+  'foundation-find-implementation-baseline-r3' = $baseline
 }
-foreach ($entry in $r2Tags.GetEnumerator()) {
+foreach ($entry in $r3Tags.GetEnumerator()) {
   git show-ref --verify --quiet "refs/tags/$($entry.Key)"
-  if ($LASTEXITCODE -eq 0) { throw "R2 evidence tag already exists: $($entry.Key)" }
-  if ($LASTEXITCODE -ne 1) { throw "R2 tag lookup failed: $($entry.Key)" }
+  if ($LASTEXITCODE -eq 0) { throw "R3 evidence tag already exists: $($entry.Key)" }
+  if ($LASTEXITCODE -ne 1) { throw "R3 tag lookup failed: $($entry.Key)" }
   git tag $entry.Key $entry.Value
-  if ($LASTEXITCODE -ne 0) { throw "R2 tag create failed: $($entry.Key)" }
+  if ($LASTEXITCODE -ne 0) { throw "R3 tag create failed: $($entry.Key)" }
 }
 ```
 
@@ -538,7 +656,7 @@ $baselineStatus = @(git status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0 -or $baselineStatus.Count -ne 0) { throw 'baseline gate changed the implementation worktree' }
 ```
 
-Expected: production Rust build, default/all-features Rust tests, default/all-features Clippy, frontend tests/build, and both security gates all exit 0 with nonzero Task 7 Vitest coverage; no product diff is created. On any failure, preserve the R2 worktree/tags as evidence, create no product commit, and do not enter Task 1. A complete PASS authorizes only a fresh Task 1 RED; after Task 1 GREEN is committed, stop and request written Task 1 Code Go.
+Expected: production Rust build, default/all-features Rust tests, default/all-features Clippy, frontend tests/build, and both security gates all exit 0 with nonzero Task 7 Vitest coverage; no product diff is created. On any failure, preserve the R3 worktree/tags as evidence, create no product commit, and do not enter Task 1. A complete PASS authorizes only a fresh Task 1 RED; after Task 1 GREEN is committed, stop and request written Task 1 Code Go.
 
 ---
 
@@ -634,7 +752,9 @@ Add `rust-toolchain.toml` and the three exact direct dependencies from Global Co
 $forbidden = @('ICU4X_DATA_DIR','LIBSQLITE3_SYS_USE_PKG_CONFIG','LIBSQLITE3_FLAGS','SQLITE_MAX_VARIABLE_NUMBER','SQLITE_MAX_EXPR_DEPTH','SQLITE_MAX_COLUMN')
 $environment = [Environment]::GetEnvironmentVariables()
 foreach ($key in $forbidden) { if ($environment.Contains($key)) { throw "forbidden environment key present: $key" } }
-$cargoHome = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+$historicalCargoHome = Join-Path $env:TEMP 'uipilot-find-cargo-home'
+if (-not (Test-Path -LiteralPath $historicalCargoHome -PathType Container)) { throw 'immutable R1 Cargo home evidence is missing' }
+$cargoHome = Join-Path $env:TEMP 'uipilot-find-cargo-home-r3'
 if (Test-Path -LiteralPath $cargoHome) { throw 'isolated Cargo home already exists' }
 New-Item -ItemType Directory -Path $cargoHome | Out-Null
 $env:CARGO_HOME = $cargoHome
@@ -663,7 +783,7 @@ Compare baseline and candidate `Cargo.lock` package blocks. Require candidate SH
 ```powershell
 $lockHash = (Get-FileHash -Algorithm SHA256 src-tauri/Cargo.lock).Hash
 if ($lockHash -cne 'BEF66D757E9251F01D815D35D79FB5ED583C819F7EE6D5E7A5A43C8BA9AB22E4') { throw 'candidate lock hash drift' }
-$baselineLock = git show foundation-find-implementation-baseline-r2:src-tauri/Cargo.lock
+$baselineLock = git show foundation-find-implementation-baseline-r3:src-tauri/Cargo.lock
 if ($LASTEXITCODE -ne 0) { throw 'baseline lock read failed' }
 $candidateLock = [IO.File]::ReadAllText((Resolve-Path 'src-tauri/Cargo.lock'), [Text.UTF8Encoding]::new($false, $true))
 if ([regex]::Matches($candidateLock, '(?m)^version = 4$').Count -ne 1 -or $candidateLock -match '(?m)^version = 3$') { throw 'candidate lock format drift' }
@@ -2419,7 +2539,7 @@ Expected: exactly the de-identified evidence report is staged; do not commit unt
 Re-run Task 1 environment, lock, feature, SQLite identity, Unicode 15.1, offline build, and 23/11 block oracles. `$allowed` is the ceiling: no changed path may fall outside it. `$required` is the exact set this plan must change; for this plan it intentionally equals the ceiling, and missing required paths fail separately from unexpected paths. Every changed file and ancestor must be regular/non-reparse/root-contained, every index flag visible, every baseline-tracked path outside `$allowed` byte-identical across committed baseline/index/clean-filtered worktree, and nonignored untracked paths absent.
 
 ```powershell
-$baseline = (git rev-parse foundation-find-implementation-baseline-r2^{commit}).Trim()
+$baseline = (git rev-parse foundation-find-implementation-baseline-r3^{commit}).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'baseline tag failed' }
 $root = (git rev-parse --show-toplevel).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'repository root lookup failed' }
@@ -2444,7 +2564,7 @@ $allowed = @(
 ) | Sort-Object -CaseSensitive -Unique
 $required = @($allowed)
 if ($allowed.Count -ne 25 -or $required.Count -ne 25 -or $allowed -ccontains 'docs/superpowers/plans/2026-07-20-find-local-file-search.md') {
-  throw 'R2 final exact path set drifted'
+  throw 'R3 final exact path set drifted'
 }
 $unexpected = @(Compare-Object -CaseSensitive $allowed $changed | Where-Object SideIndicator -eq '=>')
 if ($unexpected.Count -ne 0) { throw "changed path outside ceiling: $($unexpected.InputObject -join ', ')" }
@@ -2594,7 +2714,7 @@ function Remove-DependencyArray([string] $Block) {
   [regex]::Replace($Block, '(?ms)\ndependencies = \[\n.*?\n\]', '')
 }
 
-$baselineText = (git show foundation-find-implementation-baseline-r2:src-tauri/Cargo.lock) -join "`n"
+$baselineText = (git show foundation-find-implementation-baseline-r3:src-tauri/Cargo.lock) -join "`n"
 if ($LASTEXITCODE -ne 0) { throw 'cannot read baseline lock' }
 $candidateText = [IO.File]::ReadAllText((Resolve-Path 'src-tauri/Cargo.lock'), [Text.UTF8Encoding]::new($false, $true))
 $baselineBlocks = Get-LockBlocks $baselineText
