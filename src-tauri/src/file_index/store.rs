@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{c_int, c_void, CString},
     path::Path,
     slice, str,
@@ -20,12 +21,21 @@ use windows::Win32::{
 };
 
 use super::{
-    FileIndexStatus, FileSort, IndexEntry, IndexedKind, QuerySpec, VolumeIdentity,
-    FOLD_ALGORITHM_ID,
+    FileIndexStatus, FileSort, IndexChangeBatch, IndexEntry, IndexedKind, QuerySpec,
+    VolumeIdentity, FOLD_ALGORITHM_ID,
 };
 
 const APPLICATION_ID: i64 = 1_430_868_038;
 const USER_VERSION: i64 = 1;
+const LIVE_VISIBLE_SNAPSHOT: &str = "uipilot_live_visible_before";
+const LIVE_TOUCHED_PATHS: &str = "uipilot_live_touched_paths";
+const LIVE_TOUCHED_PREFIXES: &str = "uipilot_live_touched_prefixes";
+const WIRE_VISIBLE_BEFORE: &str = "uipilot_wire_visible_before";
+const WIRE_VISIBLE_AFTER: &str = "uipilot_wire_visible_after";
+const VISIBLE_ENTRY_COLUMNS: &str =
+    "relative_path,display_path,name,folded_name,kind,category,size_bytes,modified_utc_ms";
+const VISIBLE_ENTRY_COLUMNS_E: &str =
+    "e.relative_path,e.display_path,e.name,e.folded_name,e.kind,e.category,e.size_bytes,e.modified_utc_ms";
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -333,6 +343,30 @@ impl Store {
             transaction.commit()?;
             return Ok(None);
         }
+        let mut identity_statement = transaction
+            .prepare("SELECT volume_guid_path,volume_serial,filesystem_name FROM volumes")?;
+        let identities = identity_statement
+            .query_map([], |row| {
+                Ok(VolumeIdentity {
+                    volume_guid_path: row.get(0)?,
+                    volume_serial: row.get(1)?,
+                    filesystem_name: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(identity_statement);
+        let before_status = read_status(&transaction, &identities)?;
+        let visible_candidate_removed: i64 = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM candidate_entries c
+               JOIN volumes v ON v.volume_guid_path=c.volume_guid_path
+                             AND v.volume_serial=c.volume_serial
+                             AND v.filesystem_name=c.filesystem_name
+               WHERE v.committed_generation IS NULL AND v.candidate_generation IS NOT NULL
+             )",
+            [],
+            |row| row.get(0),
+        )?;
         transaction.execute("DELETE FROM candidate_entries", [])?;
         let mut statement = transaction.prepare(
             "SELECT volume_guid_path, volume_serial, filesystem_name, next_generation FROM volumes WHERE candidate_generation IS NOT NULL",
@@ -357,7 +391,13 @@ impl Store {
                 params![next.to_string(), guid, serial, filesystem],
             )?;
         }
-        let revision = advance_revision(&transaction)?;
+        let after_status = read_status(&transaction, &identities)?;
+        let revision = revision_after_wire_change(
+            &transaction,
+            before_status,
+            after_status,
+            visible_candidate_removed != 0,
+        )?;
         transaction.commit()?;
         Ok(Some(revision))
     }
@@ -366,8 +406,13 @@ impl Store {
         &mut self,
         volume: &VolumeIdentity,
         mount_point: &str,
+        before_authenticated: &[VolumeIdentity],
+        provisional_authenticated: &[VolumeIdentity],
     ) -> Result<(u64, u64, bool), StoreError> {
         let transaction = self.connection.transaction()?;
+        let before_status = read_status(&transaction, before_authenticated)?;
+        let visible_candidate_removed =
+            visible_candidate_rows_exist(&transaction, volume, before_authenticated)?;
         let existing = transaction
             .query_row(
                 "SELECT committed_generation, next_generation FROM volumes WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3",
@@ -398,7 +443,18 @@ impl Store {
                 next.to_string(),
             ],
         )?;
-        let revision = advance_revision(&transaction)?;
+        let after_authenticated = if committed.is_some() {
+            before_authenticated
+        } else {
+            provisional_authenticated
+        };
+        let after_status = read_status(&transaction, after_authenticated)?;
+        let revision = revision_after_wire_change(
+            &transaction,
+            before_status,
+            after_status,
+            visible_candidate_removed,
+        )?;
         transaction.commit()?;
         Ok((generation, revision, committed.is_some()))
     }
@@ -407,8 +463,11 @@ impl Store {
         &mut self,
         current: &[(VolumeIdentity, String)],
         transitions: &[VolumeIdentity],
+        previous_authenticated: &[VolumeIdentity],
+        quarantined: &HashSet<VolumeIdentity>,
     ) -> Result<(Vec<VolumeIdentity>, u64, bool), StoreError> {
         let transaction = self.connection.transaction()?;
+        let before_status = read_status(&transaction, previous_authenticated)?;
         let mut authenticated = Vec::new();
         let mut changed = !transitions.is_empty();
         for identity in transitions {
@@ -443,19 +502,40 @@ impl Store {
                     }
                     changed = true;
                 }
-                Some(_) | None if !transitions.contains(identity) => {
+                Some(_) | None
+                    if !transitions.contains(identity) && !quarantined.contains(identity) =>
+                {
                     authenticated.push(identity.clone());
                 }
                 Some(_) | None => {}
             }
         }
-        let revision = if changed {
-            advance_revision(&transaction)?
+        let authentication_changed = previous_authenticated.len() != authenticated.len()
+            || previous_authenticated
+                .iter()
+                .any(|identity| !authenticated.contains(identity));
+        let inventory_changed = changed || authentication_changed;
+        let revision = if inventory_changed {
+            begin_wire_snapshots(&transaction)?;
+            populate_wire_snapshot_for_identities(
+                &transaction,
+                WIRE_VISIBLE_BEFORE,
+                previous_authenticated,
+            )?;
+            populate_wire_snapshot_for_identities(
+                &transaction,
+                WIRE_VISIBLE_AFTER,
+                &authenticated,
+            )?;
+            let rowset_changed = wire_snapshots_differ(&transaction)?;
+            let after_status = read_status(&transaction, &authenticated)?;
+            drop_wire_snapshots(&transaction)?;
+            revision_after_wire_change(&transaction, before_status, after_status, rowset_changed)?
         } else {
             read_revision(&transaction)?
         };
         transaction.commit()?;
-        Ok((authenticated, revision, changed))
+        Ok((authenticated, revision, inventory_changed))
     }
 
     pub(super) fn append_candidate(
@@ -463,24 +543,30 @@ impl Store {
         volume: &VolumeIdentity,
         generation: u64,
         entries: impl IntoIterator<Item = IndexEntry>,
+        identities: &[VolumeIdentity],
     ) -> Result<u64, StoreError> {
         let transaction = self.connection.transaction()?;
-        require_candidate(&transaction, volume, generation)?;
+        let committed = require_candidate(&transaction, volume, generation)?;
+        let mut changed = false;
         for entry in entries {
-            upsert_entry(
+            changed |= upsert_entry(
                 &transaction,
                 "candidate_entries",
                 volume,
                 generation,
                 &entry,
-            )?;
+            )? != 0;
         }
-        let revision = advance_revision(&transaction)?;
+        let revision = if committed.is_none() && identities.contains(volume) && changed {
+            advance_revision(&transaction)?
+        } else {
+            read_revision(&transaction)?
+        };
         transaction.commit()?;
         Ok(revision)
     }
 
-    #[cfg(not(test))]
+    #[cfg(test)]
     pub(super) fn apply_live_changes<'a>(
         &mut self,
         volume: &VolumeIdentity,
@@ -488,29 +574,85 @@ impl Store {
         deleted_prefixes: impl IntoIterator<Item = &'a str>,
         entries: impl IntoIterator<Item = IndexEntry>,
     ) -> Result<u64, StoreError> {
+        let batch = IndexChangeBatch {
+            deleted_prefixes: deleted_prefixes.into_iter().map(str::to_owned).collect(),
+            entries: entries.into_iter().collect(),
+        };
+        self.apply_live_streaming(volume, generation, std::slice::from_ref(volume), |apply| {
+            apply(batch)
+        })
+    }
+
+    pub(super) fn apply_live_streaming<F>(
+        &mut self,
+        volume: &VolumeIdentity,
+        generation: u64,
+        identities: &[VolumeIdentity],
+        materialize: F,
+    ) -> Result<u64, StoreError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(IndexChangeBatch) -> Result<(), StoreError>,
+        ) -> Result<(), StoreError>,
+    {
         let transaction = self.connection.transaction()?;
         let (candidate, committed) = require_generation(&transaction, volume, generation)?;
-        for prefix in deleted_prefixes {
-            if candidate.is_some() {
-                delete_prefix(&transaction, "candidate_entries", volume, prefix)?;
-            }
-            if committed.is_some() {
-                delete_prefix(&transaction, "entries", volume, prefix)?;
-            }
+        let (visible_table, visible_generation) = committed
+            .map(|committed| ("entries", committed))
+            .or_else(|| candidate.map(|candidate| ("candidate_entries", candidate)))
+            .ok_or(StoreError::InvalidData)?;
+        let externally_visible = identities.contains(volume);
+        if externally_visible {
+            begin_visible_snapshot(&transaction)?;
         }
-        for entry in entries {
+        materialize(&mut |batch| {
+            if externally_visible {
+                capture_touched_visibility(
+                    &transaction,
+                    visible_table,
+                    volume,
+                    visible_generation,
+                    &batch,
+                )?;
+            }
             if let Some(candidate) = candidate {
-                upsert_entry(&transaction, "candidate_entries", volume, candidate, &entry)?;
+                apply_event_batch(
+                    &transaction,
+                    volume,
+                    &[("candidate_entries", candidate)],
+                    &batch.deleted_prefixes,
+                    &batch.entries,
+                )?;
             }
             if let Some(committed) = committed {
-                upsert_entry(&transaction, "entries", volume, committed, &entry)?;
+                apply_event_batch(
+                    &transaction,
+                    volume,
+                    &[("entries", committed)],
+                    &batch.deleted_prefixes,
+                    &batch.entries,
+                )?;
             }
-        }
-        let revision = advance_revision(&transaction)?;
+            Ok(())
+        })?;
+        let external_changed = if externally_visible {
+            let changed =
+                visible_snapshot_changed(&transaction, visible_table, volume, visible_generation)?;
+            drop_visible_snapshot(&transaction)?;
+            changed
+        } else {
+            false
+        };
+        let revision = if external_changed {
+            advance_revision(&transaction)?
+        } else {
+            read_revision(&transaction)?
+        };
         transaction.commit()?;
         Ok(revision)
     }
 
+    #[cfg(test)]
     pub(super) fn apply_committed_changes_during_scan<'a>(
         &mut self,
         volume: &VolumeIdentity,
@@ -518,6 +660,27 @@ impl Store {
         deleted_prefixes: impl IntoIterator<Item = &'a str>,
         entries: impl IntoIterator<Item = IndexEntry>,
     ) -> Result<u64, StoreError> {
+        let batch = IndexChangeBatch {
+            deleted_prefixes: deleted_prefixes.into_iter().map(str::to_owned).collect(),
+            entries: entries.into_iter().collect(),
+        };
+        self.apply_committed_streaming(volume, generation, std::slice::from_ref(volume), |apply| {
+            apply(batch)
+        })
+    }
+
+    pub(super) fn apply_committed_streaming<F>(
+        &mut self,
+        volume: &VolumeIdentity,
+        generation: u64,
+        identities: &[VolumeIdentity],
+        materialize: F,
+    ) -> Result<u64, StoreError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(IndexChangeBatch) -> Result<(), StoreError>,
+        ) -> Result<(), StoreError>,
+    {
         let transaction = self.connection.transaction()?;
         let (_, committed) = require_generation(&transaction, volume, generation)?;
         let Some(committed) = committed else {
@@ -525,17 +688,40 @@ impl Store {
             transaction.commit()?;
             return Ok(revision);
         };
-        for prefix in deleted_prefixes {
-            delete_prefix(&transaction, "entries", volume, prefix)?;
+        let externally_visible = identities.contains(volume);
+        if externally_visible {
+            begin_visible_snapshot(&transaction)?;
         }
-        for entry in entries {
-            upsert_entry(&transaction, "entries", volume, committed, &entry)?;
-        }
-        let revision = advance_revision(&transaction)?;
+        materialize(&mut |batch| {
+            if externally_visible {
+                capture_touched_visibility(&transaction, "entries", volume, committed, &batch)?;
+            }
+            apply_event_batch(
+                &transaction,
+                volume,
+                &[("entries", committed)],
+                &batch.deleted_prefixes,
+                &batch.entries,
+            )?;
+            Ok(())
+        })?;
+        let external_changed = if externally_visible {
+            let changed = visible_snapshot_changed(&transaction, "entries", volume, committed)?;
+            drop_visible_snapshot(&transaction)?;
+            changed
+        } else {
+            false
+        };
+        let revision = if external_changed {
+            advance_revision(&transaction)?
+        } else {
+            read_revision(&transaction)?
+        };
         transaction.commit()?;
         Ok(revision)
     }
 
+    #[cfg(test)]
     pub(super) fn commit_candidate(
         &mut self,
         volume: &VolumeIdentity,
@@ -545,8 +731,55 @@ impl Store {
         replay_entries: Vec<IndexEntry>,
         denied_prefixes: &[String],
     ) -> Result<u64, StoreError> {
+        let replay = IndexChangeBatch {
+            deleted_prefixes: replay_deleted_prefixes.to_vec(),
+            entries: replay_entries,
+        };
+        self.commit_candidate_streaming(
+            volume,
+            generation,
+            final_entries,
+            denied_prefixes,
+            (std::slice::from_ref(volume), std::slice::from_ref(volume)),
+            |apply| apply(replay),
+        )
+    }
+
+    pub(super) fn commit_candidate_streaming<F>(
+        &mut self,
+        volume: &VolumeIdentity,
+        generation: u64,
+        final_entries: Vec<IndexEntry>,
+        denied_prefixes: &[String],
+        authenticated: (&[VolumeIdentity], &[VolumeIdentity]),
+        materialize_replay: F,
+    ) -> Result<u64, StoreError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(IndexChangeBatch) -> Result<(), StoreError>,
+        ) -> Result<(), StoreError>,
+    {
+        let (before_authenticated, after_authenticated) = authenticated;
         let transaction = self.connection.transaction()?;
-        require_candidate(&transaction, volume, generation)?;
+        let committed = require_candidate(&transaction, volume, generation)?;
+        let before_status = read_status(&transaction, before_authenticated)?;
+        let visibility_relevant =
+            before_authenticated.contains(volume) || after_authenticated.contains(volume);
+        if visibility_relevant {
+            begin_wire_snapshots(&transaction)?;
+            if before_authenticated.contains(volume) {
+                let (table, visible_generation) = committed
+                    .map(|committed| ("entries", committed))
+                    .unwrap_or(("candidate_entries", generation));
+                populate_wire_snapshot_from_table(
+                    &transaction,
+                    WIRE_VISIBLE_BEFORE,
+                    table,
+                    volume,
+                    visible_generation,
+                )?;
+            }
+        }
         for entry in final_entries {
             upsert_entry(
                 &transaction,
@@ -559,18 +792,30 @@ impl Store {
         for prefix in denied_prefixes {
             copy_denied_prefix(&transaction, volume, generation, prefix)?;
         }
-        for prefix in replay_deleted_prefixes {
-            delete_prefix(&transaction, "candidate_entries", volume, prefix)?;
-        }
-        for entry in replay_entries {
-            upsert_entry(
+        materialize_replay(&mut |batch| {
+            apply_event_batch(
                 &transaction,
-                "candidate_entries",
                 volume,
-                generation,
-                &entry,
-            )?;
-        }
+                &[("candidate_entries", generation)],
+                &batch.deleted_prefixes,
+                &batch.entries,
+            )
+            .map(|_| ())
+        })?;
+        let rowset_changed = if visibility_relevant {
+            if after_authenticated.contains(volume) {
+                populate_wire_snapshot_from_table(
+                    &transaction,
+                    WIRE_VISIBLE_AFTER,
+                    "candidate_entries",
+                    volume,
+                    generation,
+                )?;
+            }
+            wire_snapshots_differ(&transaction)?
+        } else {
+            false
+        };
         transaction.execute(
             "DELETE FROM entries WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3",
             params![volume.volume_guid_path, volume.volume_serial, volume.filesystem_name],
@@ -589,7 +834,12 @@ impl Store {
         )? != 1 {
             return Err(StoreError::InvalidData);
         }
-        let revision = advance_revision(&transaction)?;
+        let after_status = read_status(&transaction, after_authenticated)?;
+        if visibility_relevant {
+            drop_wire_snapshots(&transaction)?;
+        }
+        let revision =
+            revision_after_wire_change(&transaction, before_status, after_status, rowset_changed)?;
         transaction.commit()?;
         Ok(revision)
     }
@@ -605,15 +855,39 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::InvalidData)?;
-        self.mark_volume_dirty(volume, &mount_point)
+        self.mark_volume_dirty(volume, &mount_point, std::slice::from_ref(volume))
     }
 
     pub(super) fn mark_volume_dirty(
         &mut self,
         volume: &VolumeIdentity,
         mount_point: &str,
+        identities: &[VolumeIdentity],
     ) -> Result<u64, StoreError> {
         let transaction = self.connection.transaction()?;
+        let before_status = read_status(&transaction, identities)?;
+        let visible_candidate_removed =
+            visible_candidate_rows_exist(&transaction, volume, identities)?;
+        let existing = transaction
+            .query_row(
+                "SELECT mount_point,candidate_generation,scan_state FROM volumes WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3",
+                params![volume.volume_guid_path, volume.volume_serial, volume.filesystem_name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if existing.as_ref().is_some_and(|(mount, candidate, state)| {
+            mount == mount_point && candidate.is_none() && state == "dirty"
+        }) {
+            let revision = read_revision(&transaction)?;
+            transaction.commit()?;
+            return Ok(revision);
+        }
         transaction.execute(
             "DELETE FROM candidate_entries WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3",
             params![volume.volume_guid_path, volume.volume_serial, volume.filesystem_name],
@@ -627,7 +901,13 @@ impl Store {
                 mount_point,
             ],
         )?;
-        let revision = advance_revision(&transaction)?;
+        let after_status = read_status(&transaction, identities)?;
+        let revision = revision_after_wire_change(
+            &transaction,
+            before_status,
+            after_status,
+            visible_candidate_removed,
+        )?;
         transaction.commit()?;
         Ok(revision)
     }
@@ -865,31 +1145,359 @@ fn require_generation(
     Ok((candidate, committed))
 }
 
+fn begin_visible_snapshot(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(&format!(
+        "CREATE TEMP TABLE {LIVE_VISIBLE_SNAPSHOT} (
+           relative_path TEXT PRIMARY KEY,
+           display_path TEXT NOT NULL,
+           name TEXT NOT NULL,
+           folded_name TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           category TEXT NOT NULL,
+           size_bytes TEXT,
+           modified_utc_ms INTEGER NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE {LIVE_TOUCHED_PATHS} (
+           relative_path TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE {LIVE_TOUCHED_PREFIXES} (
+           prefix TEXT PRIMARY KEY
+         ) WITHOUT ROWID;"
+    ))?;
+    Ok(())
+}
+
+fn binary_prefix_predicate(path: &str, prefix: &str) -> String {
+    format!(
+        "({path} = {prefix} COLLATE BINARY OR (substr({path},1,length({prefix})) = {prefix} COLLATE BINARY AND substr({path},length({prefix})+1,1)=char(92)))"
+    )
+}
+
+fn capture_touched_visibility(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    volume: &VolumeIdentity,
+    generation: u64,
+    batch: &IndexChangeBatch,
+) -> Result<(), StoreError> {
+    if table != "entries" && table != "candidate_entries" {
+        return Err(StoreError::InvalidData);
+    }
+    let previously_touched_prefix = binary_prefix_predicate("e.relative_path", "p.prefix");
+    let not_previously_touched = format!(
+        "NOT EXISTS (SELECT 1 FROM temp.{LIVE_TOUCHED_PATHS} p WHERE p.relative_path=e.relative_path COLLATE BINARY)
+         AND NOT EXISTS (SELECT 1 FROM temp.{LIVE_TOUCHED_PREFIXES} p WHERE {previously_touched_prefix})"
+    );
+    for prefix in &batch.deleted_prefixes {
+        let prefix_predicate = binary_prefix_predicate("e.relative_path", "?5");
+        transaction.execute(
+            &format!(
+                "INSERT OR IGNORE INTO temp.{LIVE_VISIBLE_SNAPSHOT}({VISIBLE_ENTRY_COLUMNS})
+                 SELECT {VISIBLE_ENTRY_COLUMNS_E} FROM {table} e
+                 WHERE e.volume_guid_path=?1 AND e.volume_serial=?2 AND e.filesystem_name=?3
+                   AND e.generation=?4 AND {prefix_predicate}
+                   AND {not_previously_touched}"
+            ),
+            params![
+                volume.volume_guid_path,
+                volume.volume_serial,
+                volume.filesystem_name,
+                generation.to_string(),
+                prefix,
+            ],
+        )?;
+        transaction.execute(
+            &format!("INSERT OR IGNORE INTO temp.{LIVE_TOUCHED_PREFIXES}(prefix) VALUES(?1)"),
+            params![prefix],
+        )?;
+    }
+    for entry in &batch.entries {
+        transaction.execute(
+            &format!(
+                "INSERT OR IGNORE INTO temp.{LIVE_VISIBLE_SNAPSHOT}({VISIBLE_ENTRY_COLUMNS})
+                 SELECT {VISIBLE_ENTRY_COLUMNS_E} FROM {table} e
+                 WHERE e.volume_guid_path=?1 AND e.volume_serial=?2 AND e.filesystem_name=?3
+                   AND e.generation=?4 AND e.relative_path=?5 AND {not_previously_touched}"
+            ),
+            params![
+                volume.volume_guid_path,
+                volume.volume_serial,
+                volume.filesystem_name,
+                generation.to_string(),
+                entry.relative_path,
+            ],
+        )?;
+        transaction.execute(
+            &format!("INSERT OR IGNORE INTO temp.{LIVE_TOUCHED_PATHS}(relative_path) VALUES(?1)"),
+            params![entry.relative_path],
+        )?;
+    }
+    Ok(())
+}
+
+fn visible_snapshot_changed(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    volume: &VolumeIdentity,
+    generation: u64,
+) -> Result<bool, StoreError> {
+    if table != "entries" && table != "candidate_entries" {
+        return Err(StoreError::InvalidData);
+    }
+    let current = touched_visible_rows_sql(table)?;
+    let changed: i64 = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(
+               SELECT {VISIBLE_ENTRY_COLUMNS} FROM temp.{LIVE_VISIBLE_SNAPSHOT}
+               EXCEPT SELECT * FROM ({current})
+             ) OR EXISTS(
+               SELECT * FROM ({current})
+               EXCEPT SELECT {VISIBLE_ENTRY_COLUMNS} FROM temp.{LIVE_VISIBLE_SNAPSHOT}
+             )"
+        ),
+        params![
+            volume.volume_guid_path,
+            volume.volume_serial,
+            volume.filesystem_name,
+            generation.to_string(),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(changed != 0)
+}
+
+fn touched_visible_rows_sql(table: &str) -> Result<String, StoreError> {
+    if table != "entries" && table != "candidate_entries" {
+        return Err(StoreError::InvalidData);
+    }
+    let prefix_predicate = binary_prefix_predicate("e.relative_path", "p.prefix");
+    Ok(format!(
+        "SELECT {VISIBLE_ENTRY_COLUMNS_E} FROM temp.{LIVE_TOUCHED_PATHS} p
+         JOIN {table} e
+           ON e.volume_guid_path=?1 AND e.volume_serial=?2 AND e.filesystem_name=?3
+          AND e.generation=?4 AND e.relative_path=p.relative_path COLLATE BINARY
+         UNION
+         SELECT {VISIBLE_ENTRY_COLUMNS_E} FROM temp.{LIVE_TOUCHED_PREFIXES} p
+         JOIN {table} e
+           ON e.volume_guid_path=?1 AND e.volume_serial=?2 AND e.filesystem_name=?3
+          AND e.generation=?4
+          AND {prefix_predicate}"
+    ))
+}
+
+fn drop_visible_snapshot(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(&format!(
+        "DROP TABLE temp.{LIVE_VISIBLE_SNAPSHOT};
+         DROP TABLE temp.{LIVE_TOUCHED_PATHS};
+         DROP TABLE temp.{LIVE_TOUCHED_PREFIXES};"
+    ))?;
+    Ok(())
+}
+
+fn begin_wire_snapshots(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(&format!(
+        "CREATE TEMP TABLE {WIRE_VISIBLE_BEFORE} (
+           relative_path TEXT NOT NULL,
+           display_path TEXT NOT NULL,
+           name TEXT NOT NULL,
+           folded_name TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           category TEXT NOT NULL,
+           size_bytes TEXT,
+           modified_utc_ms INTEGER NOT NULL,
+           copies INTEGER NOT NULL
+         );
+         CREATE TEMP TABLE {WIRE_VISIBLE_AFTER} (
+           relative_path TEXT NOT NULL,
+           display_path TEXT NOT NULL,
+           name TEXT NOT NULL,
+           folded_name TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           category TEXT NOT NULL,
+           size_bytes TEXT,
+           modified_utc_ms INTEGER NOT NULL,
+           copies INTEGER NOT NULL
+         );"
+    ))?;
+    Ok(())
+}
+
+fn populate_wire_snapshot_from_table(
+    transaction: &rusqlite::Transaction<'_>,
+    snapshot: &str,
+    table: &str,
+    volume: &VolumeIdentity,
+    generation: u64,
+) -> Result<(), StoreError> {
+    if (snapshot != WIRE_VISIBLE_BEFORE && snapshot != WIRE_VISIBLE_AFTER)
+        || (table != "entries" && table != "candidate_entries")
+    {
+        return Err(StoreError::InvalidData);
+    }
+    transaction.execute(
+        &format!(
+            "INSERT INTO temp.{snapshot}({VISIBLE_ENTRY_COLUMNS},copies)
+             SELECT {VISIBLE_ENTRY_COLUMNS_E},COUNT(*) FROM {table} e
+             WHERE e.volume_guid_path=?1 AND e.volume_serial=?2 AND e.filesystem_name=?3
+               AND e.generation=?4
+             GROUP BY {VISIBLE_ENTRY_COLUMNS_E}"
+        ),
+        params![
+            volume.volume_guid_path,
+            volume.volume_serial,
+            volume.filesystem_name,
+            generation.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn populate_wire_snapshot_for_identities(
+    transaction: &rusqlite::Transaction<'_>,
+    snapshot: &str,
+    identities: &[VolumeIdentity],
+) -> Result<(), StoreError> {
+    if snapshot != WIRE_VISIBLE_BEFORE && snapshot != WIRE_VISIBLE_AFTER {
+        return Err(StoreError::InvalidData);
+    }
+    if identities.is_empty() {
+        return Ok(());
+    }
+    let (identity_sql, values) = identity_predicate("e", identities);
+    transaction.execute(
+        &format!(
+            "INSERT INTO temp.{snapshot}({VISIBLE_ENTRY_COLUMNS},copies)
+             SELECT {VISIBLE_ENTRY_COLUMNS_E},COUNT(*) FROM (
+               SELECT e.volume_guid_path,e.volume_serial,e.filesystem_name,
+                      e.relative_path,e.display_path,e.name,e.folded_name,e.kind,e.category,
+                      e.size_bytes,e.modified_utc_ms
+               FROM entries e
+               JOIN volumes v ON v.volume_guid_path=e.volume_guid_path
+                             AND v.volume_serial=e.volume_serial
+                             AND v.filesystem_name=e.filesystem_name
+               WHERE v.committed_generation IS NOT NULL
+               UNION ALL
+               SELECT c.volume_guid_path,c.volume_serial,c.filesystem_name,
+                      c.relative_path,c.display_path,c.name,c.folded_name,c.kind,c.category,
+                      c.size_bytes,c.modified_utc_ms
+               FROM candidate_entries c
+               JOIN volumes v ON v.volume_guid_path=c.volume_guid_path
+                             AND v.volume_serial=c.volume_serial
+                             AND v.filesystem_name=c.filesystem_name
+               WHERE v.committed_generation IS NULL AND v.candidate_generation IS NOT NULL
+             ) e
+             WHERE {identity_sql}
+             GROUP BY {VISIBLE_ENTRY_COLUMNS_E}"
+        ),
+        params_from_iter(values.iter()),
+    )?;
+    Ok(())
+}
+
+fn wire_snapshots_differ(transaction: &rusqlite::Transaction<'_>) -> Result<bool, StoreError> {
+    let changed: i64 = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(
+               SELECT {VISIBLE_ENTRY_COLUMNS},copies FROM temp.{WIRE_VISIBLE_BEFORE}
+               EXCEPT SELECT {VISIBLE_ENTRY_COLUMNS},copies FROM temp.{WIRE_VISIBLE_AFTER}
+             ) OR EXISTS(
+               SELECT {VISIBLE_ENTRY_COLUMNS},copies FROM temp.{WIRE_VISIBLE_AFTER}
+               EXCEPT SELECT {VISIBLE_ENTRY_COLUMNS},copies FROM temp.{WIRE_VISIBLE_BEFORE}
+             )"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(changed != 0)
+}
+
+fn drop_wire_snapshots(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(&format!(
+        "DROP TABLE temp.{WIRE_VISIBLE_BEFORE};
+         DROP TABLE temp.{WIRE_VISIBLE_AFTER};"
+    ))?;
+    Ok(())
+}
+
+fn visible_candidate_rows_exist(
+    transaction: &rusqlite::Transaction<'_>,
+    volume: &VolumeIdentity,
+    identities: &[VolumeIdentity],
+) -> Result<bool, StoreError> {
+    if !identities.contains(volume) {
+        return Ok(false);
+    }
+    let exists: i64 = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM candidate_entries c
+           JOIN volumes v ON v.volume_guid_path=c.volume_guid_path
+                         AND v.volume_serial=c.volume_serial
+                         AND v.filesystem_name=c.filesystem_name
+           WHERE c.volume_guid_path=?1 AND c.volume_serial=?2 AND c.filesystem_name=?3
+             AND v.committed_generation IS NULL AND v.candidate_generation IS NOT NULL
+         )",
+        params![
+            volume.volume_guid_path,
+            volume.volume_serial,
+            volume.filesystem_name,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn revision_after_wire_change(
+    transaction: &rusqlite::Transaction<'_>,
+    before_status: FileIndexStatus,
+    after_status: FileIndexStatus,
+    rowset_changed: bool,
+) -> Result<u64, StoreError> {
+    if rowset_changed || before_status != after_status {
+        advance_revision(transaction)
+    } else {
+        read_revision(transaction)
+    }
+}
+
 fn delete_prefix(
     transaction: &rusqlite::Transaction<'_>,
     table: &str,
     volume: &VolumeIdentity,
     prefix: &str,
-) -> Result<(), StoreError> {
+) -> Result<usize, StoreError> {
     if table != "entries" && table != "candidate_entries" {
         return Err(StoreError::InvalidData);
     }
-    let escaped = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let descendants = format!("{escaped}\\\\%");
-    transaction.execute(
-        &format!("DELETE FROM {table} WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3 AND (relative_path=?4 OR relative_path LIKE ?5 ESCAPE '\\')"),
+    let prefix_predicate = binary_prefix_predicate("relative_path", "?4");
+    let changed = transaction.execute(
+        &format!("DELETE FROM {table} WHERE volume_guid_path=?1 AND volume_serial=?2 AND filesystem_name=?3 AND {prefix_predicate}"),
         params![
             volume.volume_guid_path,
             volume.volume_serial,
             volume.filesystem_name,
             prefix,
-            descendants,
         ],
     )?;
-    Ok(())
+    Ok(changed)
+}
+
+fn apply_event_batch(
+    transaction: &rusqlite::Transaction<'_>,
+    volume: &VolumeIdentity,
+    targets: &[(&str, u64)],
+    deleted_prefixes: &[String],
+    entries: &[IndexEntry],
+) -> Result<bool, StoreError> {
+    let mut changed = false;
+    for (table, generation) in targets {
+        for prefix in deleted_prefixes {
+            changed |= delete_prefix(transaction, table, volume, prefix)? != 0;
+        }
+        for entry in entries {
+            changed |= upsert_entry(transaction, table, volume, *generation, entry)? != 0;
+        }
+    }
+    Ok(changed)
 }
 
 fn copy_denied_prefix(
@@ -898,20 +1506,15 @@ fn copy_denied_prefix(
     generation: u64,
     prefix: &str,
 ) -> Result<(), StoreError> {
-    let escaped = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let descendants = format!("{escaped}\\\\%");
+    let prefix_predicate = binary_prefix_predicate("e.relative_path", "?5");
     transaction.execute(
-        "INSERT OR IGNORE INTO candidate_entries(volume_guid_path,volume_serial,filesystem_name,relative_path,display_path,name,folded_name,kind,category,size_bytes,modified_utc_ms,generation) SELECT e.volume_guid_path,e.volume_serial,e.filesystem_name,e.relative_path,CASE WHEN substr(v.mount_point,-1,1)=char(92) OR substr(v.mount_point,-1,1)='/' THEN v.mount_point || e.relative_path ELSE v.mount_point || char(92) || e.relative_path END,e.name,e.folded_name,e.kind,e.category,e.size_bytes,e.modified_utc_ms,?1 FROM entries e JOIN volumes v ON v.volume_guid_path=e.volume_guid_path AND v.volume_serial=e.volume_serial AND v.filesystem_name=e.filesystem_name WHERE e.volume_guid_path=?2 AND e.volume_serial=?3 AND e.filesystem_name=?4 AND (?5='' OR e.relative_path=?5 OR e.relative_path LIKE ?6 ESCAPE '\\')",
+        &format!("INSERT OR IGNORE INTO candidate_entries(volume_guid_path,volume_serial,filesystem_name,relative_path,display_path,name,folded_name,kind,category,size_bytes,modified_utc_ms,generation) SELECT e.volume_guid_path,e.volume_serial,e.filesystem_name,e.relative_path,CASE WHEN substr(v.mount_point,-1,1)=char(92) OR substr(v.mount_point,-1,1)='/' THEN v.mount_point || e.relative_path ELSE v.mount_point || char(92) || e.relative_path END,e.name,e.folded_name,e.kind,e.category,e.size_bytes,e.modified_utc_ms,?1 FROM entries e JOIN volumes v ON v.volume_guid_path=e.volume_guid_path AND v.volume_serial=e.volume_serial AND v.filesystem_name=e.filesystem_name WHERE e.volume_guid_path=?2 AND e.volume_serial=?3 AND e.filesystem_name=?4 AND (?5='' OR {prefix_predicate})"),
         params![
             generation.to_string(),
             volume.volume_guid_path,
             volume.volume_serial,
             volume.filesystem_name,
             prefix,
-            descendants,
         ],
     )?;
     Ok(())
@@ -923,14 +1526,14 @@ fn upsert_entry(
     volume: &VolumeIdentity,
     generation: u64,
     entry: &IndexEntry,
-) -> Result<(), StoreError> {
+) -> Result<usize, StoreError> {
     if table != "entries" && table != "candidate_entries" {
         return Err(StoreError::InvalidData);
     }
     let sql = format!(
-        "INSERT INTO {table}(volume_guid_path,volume_serial,filesystem_name,relative_path,display_path,name,folded_name,kind,category,size_bytes,modified_utc_ms,generation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(volume_guid_path,volume_serial,filesystem_name,relative_path) DO UPDATE SET display_path=excluded.display_path,name=excluded.name,folded_name=excluded.folded_name,kind=excluded.kind,category=excluded.category,size_bytes=excluded.size_bytes,modified_utc_ms=excluded.modified_utc_ms,generation=excluded.generation"
+        "INSERT INTO {table}(volume_guid_path,volume_serial,filesystem_name,relative_path,display_path,name,folded_name,kind,category,size_bytes,modified_utc_ms,generation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(volume_guid_path,volume_serial,filesystem_name,relative_path) DO UPDATE SET display_path=excluded.display_path,name=excluded.name,folded_name=excluded.folded_name,kind=excluded.kind,category=excluded.category,size_bytes=excluded.size_bytes,modified_utc_ms=excluded.modified_utc_ms,generation=excluded.generation WHERE display_path IS NOT excluded.display_path OR name IS NOT excluded.name OR folded_name IS NOT excluded.folded_name OR kind IS NOT excluded.kind OR category IS NOT excluded.category OR size_bytes IS NOT excluded.size_bytes OR modified_utc_ms IS NOT excluded.modified_utc_ms OR generation IS NOT excluded.generation"
     );
-    transaction.execute(
+    let changed = transaction.execute(
         &sql,
         params![
             volume.volume_guid_path,
@@ -950,7 +1553,7 @@ fn upsert_entry(
             generation.to_string(),
         ],
     )?;
-    Ok(())
+    Ok(changed)
 }
 
 fn read_status(
@@ -966,13 +1569,17 @@ fn read_status(
         params_from_iter(values.iter()),
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    Ok(if volumes == 0 || building != 0 {
-        FileIndexStatus::Building
-    } else if partial != 0 {
-        FileIndexStatus::Partial
-    } else {
-        FileIndexStatus::Ready
-    })
+    Ok(
+        if volumes != i64::try_from(identities.len()).map_err(|_| StoreError::InvalidData)?
+            || building != 0
+        {
+            FileIndexStatus::Building
+        } else if partial != 0 {
+            FileIndexStatus::Partial
+        } else {
+            FileIndexStatus::Ready
+        },
+    )
 }
 
 fn query_parts(
@@ -1089,6 +1696,10 @@ impl Store {
         Self::initialize(Connection::open_in_memory()?, identity)
     }
 
+    pub(super) fn connection_for_test(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+
     fn pragma_i64(&self, name: &str) -> i64 {
         self.connection
             .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
@@ -1167,7 +1778,7 @@ impl Store {
         self.query(spec, identities)
     }
 
-    fn query_with_hook_for_test<F>(
+    pub(super) fn query_with_hook_for_test<F>(
         &mut self,
         spec: &QuerySpec,
         identities: &[VolumeIdentity],
@@ -1209,6 +1820,43 @@ impl Store {
             && details.iter().all(|detail| !detail.contains("TEMP B-TREE"))
     }
 
+    pub(super) fn exact_live_visibility_plan_for_test(
+        &mut self,
+        volume: &VolumeIdentity,
+        generation: u64,
+        relative_path: &str,
+    ) -> Vec<String> {
+        let transaction = self.connection.transaction().unwrap();
+        begin_visible_snapshot(&transaction).unwrap();
+        transaction
+            .execute(
+                &format!("INSERT INTO temp.{LIVE_TOUCHED_PATHS}(relative_path) VALUES(?1)"),
+                [relative_path],
+            )
+            .unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            touched_visible_rows_sql("entries").unwrap()
+        );
+        let mut statement = transaction.prepare(&sql).unwrap();
+        let details = statement
+            .query_map(
+                params![
+                    volume.volume_guid_path,
+                    volume.volume_serial,
+                    volume.filesystem_name,
+                    generation.to_string(),
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        transaction.rollback().unwrap();
+        details
+    }
+
     fn ensure_sort_identity_for_test(&mut self, identity: &str) -> Result<bool, StoreError> {
         self.ensure_sort_identity(identity)
             .map(|revision| revision.is_some())
@@ -1228,6 +1876,10 @@ impl Store {
         self.index_revision().unwrap()
     }
 
+    pub(super) fn set_index_revision_for_test(&mut self, revision: u64) {
+        self.persist_index_revision(revision).unwrap();
+    }
+
     pub(super) fn remove_metadata_for_test(&self) {
         self.connection.execute("DELETE FROM metadata", []).unwrap();
     }
@@ -1241,7 +1893,22 @@ impl Store {
         volume: &VolumeIdentity,
         mount_point: &str,
     ) -> Result<u64, StoreError> {
-        self.begin_candidate(volume, mount_point)
+        self.begin_candidate(
+            volume,
+            mount_point,
+            std::slice::from_ref(volume),
+            std::slice::from_ref(volume),
+        )
+        .map(|(generation, _, _)| generation)
+    }
+
+    pub(super) fn begin_candidate_for_test_with_identities(
+        &mut self,
+        volume: &VolumeIdentity,
+        mount_point: &str,
+        identities: &[VolumeIdentity],
+    ) -> Result<u64, StoreError> {
+        self.begin_candidate(volume, mount_point, identities, identities)
             .map(|(generation, _, _)| generation)
     }
 
@@ -1255,6 +1922,22 @@ impl Store {
             volume,
             generation,
             entries.into_iter().map(IndexEntry::from),
+            std::slice::from_ref(volume),
+        )
+    }
+
+    pub(super) fn append_candidate_for_test_with_identities(
+        &mut self,
+        volume: &VolumeIdentity,
+        generation: u64,
+        entries: impl IntoIterator<Item = TestEntry>,
+        identities: &[VolumeIdentity],
+    ) -> Result<u64, StoreError> {
+        self.append_candidate(
+            volume,
+            generation,
+            entries.into_iter().map(IndexEntry::from),
+            identities,
         )
     }
 
@@ -1288,6 +1971,27 @@ impl Store {
                 .iter()
                 .map(|prefix| (*prefix).to_owned())
                 .collect::<Vec<_>>(),
+        )
+    }
+
+    pub(super) fn commit_candidate_for_test_with_identities(
+        &mut self,
+        volume: &VolumeIdentity,
+        generation: u64,
+        denied_prefixes: &[&str],
+        identities: &[VolumeIdentity],
+    ) -> Result<u64, StoreError> {
+        let denied_prefixes = denied_prefixes
+            .iter()
+            .map(|prefix| (*prefix).to_owned())
+            .collect::<Vec<_>>();
+        self.commit_candidate_streaming(
+            volume,
+            generation,
+            Vec::new(),
+            &denied_prefixes,
+            (identities, identities),
+            |_| Ok(()),
         )
     }
 
