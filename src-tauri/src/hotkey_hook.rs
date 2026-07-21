@@ -1,24 +1,17 @@
-use std::{
-    sync::{Arc, Mutex, OnceLock},
-    time::Instant,
-};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::AppHandle;
-use windows::Win32::{
-    Foundation::{LPARAM, LRESULT, WPARAM},
-    UI::WindowsAndMessaging::{
-        CallNextHookEx, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN,
-    },
-};
 
-use crate::{
-    double_tap::{DoubleTapDetector, TapKey},
-    hotkey::DoubleTapModifier,
-};
+#[cfg(all(not(test), not(feature = "test-instrumentation")))]
+use crate::double_tap::DoubleTapDetector;
+use crate::{double_tap::TapKey, hotkey::DoubleTapModifier};
 
 struct HookState {
+    #[cfg(all(not(test), not(feature = "test-instrumentation")))]
     detector: DoubleTapDetector,
+    #[cfg(all(not(test), not(feature = "test-instrumentation")))]
     target: DoubleTapModifier,
+    #[cfg(all(not(test), not(feature = "test-instrumentation")))]
     on_match: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -39,9 +32,14 @@ fn tap_key_from_vk(vk: u32) -> TapKey {
 #[cfg(all(not(test), not(feature = "test-instrumentation")))]
 unsafe extern "system" fn keyboard_hook_proc(
     code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use std::time::Instant;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN,
+    };
+
     if code >= 0 {
         let message = wparam.0 as u32;
         if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
@@ -66,7 +64,7 @@ unsafe extern "system" fn keyboard_hook_proc(
 #[derive(Debug)]
 pub(crate) struct HotkeyHook {
     #[cfg(all(not(test), not(feature = "test-instrumentation")))]
-    handle: HHOOK,
+    handle: isize,
 }
 
 impl HotkeyHook {
@@ -78,16 +76,19 @@ impl HotkeyHook {
         {
             let mut state = hook_state().lock().map_err(|_| ())?;
             *state = Some(HookState {
+                #[cfg(all(not(test), not(feature = "test-instrumentation")))]
                 detector: DoubleTapDetector::default(),
+                #[cfg(all(not(test), not(feature = "test-instrumentation")))]
                 target: modifier,
+                #[cfg(all(not(test), not(feature = "test-instrumentation")))]
                 on_match,
             });
         }
 
         #[cfg(any(test, feature = "test-instrumentation"))]
         {
-            let _ = _app;
-            return Ok(Self {});
+            let _ = (_app, modifier, on_match);
+            Ok(Self {})
         }
 
         #[cfg(all(not(test), not(feature = "test-instrumentation")))]
@@ -97,7 +98,12 @@ impl HotkeyHook {
                 UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL},
             };
             let handle = match unsafe {
-                SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), HINSTANCE::default(), 0)
+                SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(keyboard_hook_proc),
+                    Some(HINSTANCE::default()),
+                    0,
+                )
             } {
                 Ok(handle) => handle,
                 Err(_) => {
@@ -107,7 +113,9 @@ impl HotkeyHook {
                     return Err(());
                 }
             };
-            Ok(Self { handle })
+            Ok(Self {
+                handle: handle.0 as isize,
+            })
         }
     }
 
@@ -117,8 +125,11 @@ impl HotkeyHook {
 
     fn uninstall_internal(self) {
         #[cfg(all(not(test), not(feature = "test-instrumentation")))]
-        unsafe {
-            let _ = UnhookWindowsHookEx(self.handle);
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
+            unsafe {
+                let _ = UnhookWindowsHookEx(HHOOK(self.handle as *mut _));
+            }
         }
         if let Ok(mut state) = hook_state().lock() {
             *state = None;

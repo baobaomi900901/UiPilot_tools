@@ -36,10 +36,6 @@ impl DoubleTapDetector {
             }
         }
     }
-
-    pub(crate) fn reset(&mut self) {
-        self.pending = None;
-    }
 }
 
 #[cfg(test)]
@@ -58,7 +54,10 @@ mod tests {
             d.on_key_down(TapKey::Ctrl, t0 + Duration::from_millis(399)),
             Some(DoubleTapModifier::Ctrl)
         );
-        assert_eq!(d.on_key_down(TapKey::Ctrl, t0 + Duration::from_millis(400)), None);
+        assert_eq!(
+            d.on_key_down(TapKey::Ctrl, t0 + Duration::from_millis(400)),
+            None
+        );
     }
 
     #[test]
@@ -66,7 +65,10 @@ mod tests {
         let mut d = DoubleTapDetector::default();
         let t0 = Instant::now();
         assert_eq!(d.on_key_down(TapKey::Alt, t0), None);
-        assert_eq!(d.on_key_down(TapKey::Alt, t0 + Duration::from_millis(401)), None);
+        assert_eq!(
+            d.on_key_down(TapKey::Alt, t0 + Duration::from_millis(401)),
+            None
+        );
         assert_eq!(
             d.on_key_down(TapKey::Alt, t0 + Duration::from_millis(500)),
             Some(DoubleTapModifier::Alt)
@@ -78,7 +80,13 @@ mod tests {
         let mut d = DoubleTapDetector::default();
         let t0 = Instant::now();
         assert_eq!(d.on_key_down(TapKey::Ctrl, t0), None);
-        assert_eq!(d.on_key_down(TapKey::Other, t0 + Duration::from_millis(10)), None);
-        assert_eq!(d.on_key_down(TapKey::Ctrl, t0 + Duration::from_millis(20)), None);
+        assert_eq!(
+            d.on_key_down(TapKey::Other, t0 + Duration::from_millis(10)),
+            None
+        );
+        assert_eq!(
+            d.on_key_down(TapKey::Ctrl, t0 + Duration::from_millis(20)),
+            None
+        );
     }
 }

@@ -359,7 +359,7 @@ pub(crate) async fn save_settings(
         {
             let app_for_worker = app.clone();
             let coordinator_for_worker = Arc::clone(coordinator.inner());
-                move |reservation, kind, update| {
+            move |reservation, kind, update| {
                 let _reservation = reservation;
                 let settings = app_for_worker.state::<SettingsStore>();
                 let cache = app_for_worker.state::<Arc<AppCache>>();
