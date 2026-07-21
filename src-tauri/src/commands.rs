@@ -5,10 +5,14 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
     apps::{self, AppCache, Application},
+    file_index::{
+        fold_name, FileCategory, FileIndex, FileResultItem, FileSearchBatch, FileSearchResponse,
+        FileSort, QuerySpec,
+    },
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
-    result_registry::{RegistryError, ResultAction, ResultRegistry},
+    result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
     validation_export::{choose_export_destination, write_validation_export, ExportDestination},
@@ -152,6 +156,27 @@ impl CommandError {
             message: "validation export worker failed",
         }
     }
+
+    fn invalid_file_query() -> Self {
+        Self {
+            code: "invalidFileQuery",
+            message: "file query is invalid",
+        }
+    }
+
+    fn file_search_worker_failed() -> Self {
+        Self {
+            code: "fileSearchWorkerFailed",
+            message: "file search worker failed",
+        }
+    }
+
+    fn search_unavailable() -> Self {
+        Self {
+            code: "searchUnavailable",
+            message: "file search is unavailable",
+        }
+    }
 }
 
 impl From<SettingsError> for CommandError {
@@ -209,7 +234,7 @@ where
     S: FnOnce() -> Vec<Application>,
     D: FnOnce(&mut [Application]),
 {
-    let token = registry.begin_query(invocation_id, query_sequence)?;
+    let token = registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
     let mut applications = snapshot();
     decorate(&mut applications);
     let entries = apps::rank(&applications, query)
@@ -227,6 +252,132 @@ where
                 .map(|(result_id, mut item)| {
                     item.result_id = result_id;
                     item
+                })
+                .collect(),
+        },
+    )
+}
+
+struct PreparedFileQuery {
+    spec: QuerySpec,
+    invocation_id: String,
+    query_sequence: u64,
+}
+
+fn prepare_file_query(
+    query: String,
+    category: String,
+    sort: String,
+    invocation_id: String,
+    query_sequence: u64,
+) -> Result<PreparedFileQuery, CommandError> {
+    if query.len() > 1_024
+        || query.chars().count() > 255
+        || query.contains('\0')
+        || invocation_id.is_empty()
+        || query_sequence == 0
+    {
+        return Err(CommandError::invalid_file_query());
+    }
+    let category = FileCategory::parse(&category).ok_or_else(CommandError::invalid_file_query)?;
+    let sort = FileSort::parse(&sort).ok_or_else(CommandError::invalid_file_query)?;
+    let folded_query = fold_name(&query);
+    if folded_query.len() > 4_096 || folded_query.chars().count() > 1_024 {
+        return Err(CommandError::invalid_file_query());
+    }
+    Ok(PreparedFileQuery {
+        spec: QuerySpec {
+            folded_query,
+            category,
+            sort,
+        },
+        invocation_id,
+        query_sequence,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub(crate) async fn search_files(
+    window: WebviewWindow,
+    app: AppHandle,
+    registry: State<'_, ResultRegistry>,
+    file_index: State<'_, Arc<FileIndex>>,
+    query: String,
+    category: String,
+    sort: String,
+    invocation_id: String,
+    query_sequence: u64,
+) -> Result<Option<FileSearchResponse>, CommandError> {
+    require_main_window(&window)?;
+    let prepared = prepare_file_query(query, category, sort, invocation_id, query_sequence)?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| CommandError::search_unavailable())?;
+    search_files_with(
+        &registry,
+        Arc::clone(file_index.inner()),
+        app_data_dir,
+        prepared,
+    )
+    .await
+}
+
+async fn search_files_with(
+    registry: &ResultRegistry,
+    file_index: Arc<FileIndex>,
+    app_data_dir: std::path::PathBuf,
+    prepared: PreparedFileQuery,
+) -> Result<Option<FileSearchResponse>, CommandError> {
+    let token = match registry.begin_query(
+        QueryDomain::File,
+        &prepared.invocation_id,
+        prepared.query_sequence,
+    ) {
+        Some(token) => token,
+        None => return Ok(None),
+    };
+    let runtime_epoch = file_index.runtime_epoch();
+    let worker_index = Arc::clone(&file_index);
+    let batch = tauri::async_runtime::spawn_blocking(move || {
+        worker_index.search(&app_data_dir, prepared.spec, runtime_epoch)
+    })
+    .await
+    .map_err(|_| CommandError::file_search_worker_failed())?
+    .map_err(|_| CommandError::search_unavailable())?;
+    Ok(publish_file_search(registry, &file_index, token, batch))
+}
+
+fn publish_file_search(
+    registry: &ResultRegistry,
+    file_index: &FileIndex,
+    token: QueryToken,
+    batch: FileSearchBatch,
+) -> Option<FileSearchResponse> {
+    let entries = batch
+        .items
+        .into_iter()
+        .map(|item| (item, ResultAction::OpenIndexedPath))
+        .collect();
+    registry.publish_if_latest(
+        token,
+        entries,
+        || file_index.authorizes_publication(batch.runtime_epoch, batch.publication_generation),
+        |request_id, items| FileSearchResponse {
+            request_id,
+            index_revision: batch.index_revision.to_string(),
+            total: batch.total.to_string(),
+            status: batch.status,
+            items: items
+                .into_iter()
+                .map(|(result_id, item)| FileResultItem {
+                    result_id,
+                    name: item.name,
+                    kind: item.kind,
+                    size_bytes: item.size_bytes.map(|value| value.to_string()),
+                    modified_utc: item.modified_utc,
+                    full_path: item.full_path,
                 })
                 .collect(),
         },
@@ -450,10 +601,11 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
-    let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
     let app_id = match &action {
         ResultAction::LaunchApplication { app_id, .. } => app_id.as_str(),
+        ResultAction::OpenIndexedPath => return Err(CommandError::application_entry_unavailable()),
     };
+    let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
     let (response, event) = outcome_parts(outcome);
 
     let window_error = clear_and_hide().err();
@@ -708,16 +860,20 @@ mod tests {
         begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
         execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
         load_settings_core, load_settings_ready_with, map_export_worker_result, map_rescan_result,
-        map_save_worker_result, prepare_settings_save, require_main_label, rescan_apps_with,
-        save_settings_core, save_settings_with, save_settings_worker_with, search_apps_with,
-        spawn_export_worker, AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome,
-        SaveSettingsCache, SettingsView, UserSettingsUpdate,
+        map_save_worker_result, prepare_file_query, prepare_settings_save, publish_file_search,
+        require_main_label, rescan_apps_with, save_settings_core, save_settings_with,
+        save_settings_worker_with, search_apps_with, search_files_with, spawn_export_worker,
+        AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome, SaveSettingsCache,
+        SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome, ApplicationLaunchTarget},
+        file_index::{
+            FileIndex, FileIndexStatus, FileResultDraft, FileResultKind, FileSearchBatch,
+        },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
-        result_registry::{RegistryError, ResultAction, ResultRegistry},
+        result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore, SettingsUpdate},
         validation_data::ValidationEvent,
     };
@@ -843,10 +999,11 @@ mod tests {
     }
 
     #[test]
-    fn caller_guard_rejects_all_eight_non_main_commands_without_side_effects() {
+    fn caller_guard_rejects_all_nine_non_main_commands_without_side_effects() {
         assert_eq!(require_main_label("main"), Ok(()));
         for command in [
             "search_apps",
+            "search_files",
             "execute_result",
             "load_settings",
             "save_settings",
@@ -925,7 +1082,9 @@ mod tests {
             1,
             || vec![application(1)],
             |_| {
-                assert!(registry.begin_query("invocation", 2).is_some());
+                assert!(registry
+                    .begin_query(QueryDomain::Application, "invocation", 2)
+                    .is_some());
             },
         )
         .is_none());
@@ -956,6 +1115,179 @@ mod tests {
         )
         .unwrap();
         assert!(response.items.is_empty());
+    }
+
+    #[test]
+    fn file_query_rejects_wire_input_before_registry_or_index() {
+        let invalid = [
+            (
+                "x".repeat(1_025),
+                "all".into(),
+                "modifiedDesc".into(),
+                "inv".into(),
+                1,
+            ),
+            (
+                "x".repeat(256),
+                "all".into(),
+                "modifiedDesc".into(),
+                "inv".into(),
+                1,
+            ),
+            (
+                "bad\0query".into(),
+                "all".into(),
+                "modifiedDesc".into(),
+                "inv".into(),
+                1,
+            ),
+            (
+                "ok".into(),
+                "other".into(),
+                "modifiedDesc".into(),
+                "inv".into(),
+                1,
+            ),
+            ("ok".into(), "all".into(), "nameAsc".into(), "inv".into(), 1),
+            (
+                "ok".into(),
+                "all".into(),
+                "modifiedDesc".into(),
+                "".into(),
+                1,
+            ),
+            (
+                "ok".into(),
+                "all".into(),
+                "modifiedDesc".into(),
+                "inv".into(),
+                0,
+            ),
+        ];
+        for (query, category, sort, invocation, sequence) in invalid {
+            assert!(matches!(
+                prepare_file_query(query, category, sort, invocation, sequence),
+                Err(error) if error == CommandError::invalid_file_query()
+            ));
+        }
+
+        let registry = ResultRegistry::default();
+        registry.on_show("inv".into());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "inv", 1)
+            .is_some());
+    }
+
+    #[test]
+    fn file_query_publishes_only_through_shared_registry() {
+        let registry = ResultRegistry::default();
+        let index = FileIndex::default();
+        registry.on_show("inv".into());
+        let token = registry.begin_query(QueryDomain::File, "inv", 1).unwrap();
+        let batch = FileSearchBatch {
+            runtime_epoch: 0,
+            publication_generation: 0,
+            index_revision: 7,
+            total: 2,
+            status: FileIndexStatus::Ready,
+            items: vec![
+                FileResultDraft {
+                    name: "First.txt".into(),
+                    kind: FileResultKind::File,
+                    size_bytes: Some(1),
+                    modified_utc: "2026-07-21T00:00:00.000Z".into(),
+                    full_path: r"C:\Results\First.txt".into(),
+                },
+                FileResultDraft {
+                    name: "Folder".into(),
+                    kind: FileResultKind::Folder,
+                    size_bytes: None,
+                    modified_utc: "2026-07-21T00:00:01.000Z".into(),
+                    full_path: r"C:\Results\Folder".into(),
+                },
+            ],
+        };
+
+        let response = publish_file_search(&registry, &index, token, batch).unwrap();
+        assert_eq!(response.request_id, "req-0000000000000001");
+        assert_eq!(response.index_revision, "7");
+        assert_eq!(response.total, "2");
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(
+            registry.resolve(&response.request_id, &response.items[0].result_id),
+            Ok(ResultAction::OpenIndexedPath)
+        );
+        assert_eq!(
+            registry.resolve(&response.request_id, &response.items[1].result_id),
+            Ok(ResultAction::OpenIndexedPath)
+        );
+    }
+
+    #[test]
+    fn empty_file_query_initializes_and_clears_the_file_mapping() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv".into());
+        let old_token = registry.begin_query(QueryDomain::File, "inv", 1).unwrap();
+        let old = registry
+            .publish_if_latest(
+                old_token,
+                vec![((), ResultAction::OpenIndexedPath)],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+
+        let dir = TestDir::new();
+        let prepared = prepare_file_query(
+            "".into(),
+            "all".into(),
+            "modifiedDesc".into(),
+            "inv".into(),
+            2,
+        )
+        .unwrap();
+        let response = tauri::async_runtime::block_on(search_files_with(
+            &registry,
+            Arc::new(FileIndex::default()),
+            dir.path().to_path_buf(),
+            prepared,
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.total, "0");
+        assert!(response.items.is_empty());
+        assert_eq!(response.status, FileIndexStatus::Building);
+        assert_eq!(
+            registry.resolve(&old.0, &old.1[0].0),
+            Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn search_files_caller_guard_is_first_statement() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let start = source
+            .find("pub(crate) async fn search_files(")
+            .expect("search_files command missing");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}").expect("search_files body missing")];
+        let guard = body
+            .find("require_main_window(&window)?;")
+            .expect("main guard missing");
+        for forbidden in [
+            "app.path()",
+            "registry.inner()",
+            "file_index.inner()",
+            "prepare_file_query(",
+            "begin_query(",
+            "spawn_blocking",
+        ] {
+            assert!(
+                body[..guard].find(forbidden).is_none(),
+                "{forbidden} occurs before caller guard"
+            );
+        }
     }
 
     #[test]
@@ -1428,6 +1760,36 @@ mod tests {
     }
 
     #[test]
+    fn execute_file_marker_fails_closed_before_application_side_effects() {
+        let execute_calls = Cell::new(0);
+        let later_calls = Cell::new(0);
+        let result = execute_result_with(
+            ("request", "result"),
+            |_, _| Ok(ResultAction::OpenIndexedPath),
+            |_| {
+                execute_calls.set(execute_calls.get() + 1);
+                Ok(ApplicationActionOutcome::LaunchRequested)
+            },
+            || {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_calls.set(later_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(CommandError::application_entry_unavailable()));
+        assert_eq!(execute_calls.get(), 0);
+        assert_eq!(later_calls.get(), 0);
+    }
+
+    #[test]
     fn execute_success_clears_and_hides_before_persistence_in_order() {
         let cases = [
             (
@@ -1691,7 +2053,9 @@ mod tests {
             registry.resolve(&response.request_id, result_id),
             Err(RegistryError::StaleRequest)
         );
-        assert!(registry.begin_query("invocation", 2).is_none());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "invocation", 2)
+            .is_none());
     }
 
     #[test]

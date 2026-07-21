@@ -1507,7 +1507,7 @@ mod tests {
     use crate::{
         commands::save_settings_worker_with,
         hotkey::{DoubleTapModifier, HotkeyKind, DOUBLE_ALT, DOUBLE_CTRL},
-        result_registry::ResultRegistry,
+        result_registry::{QueryDomain, ResultRegistry},
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
@@ -2120,7 +2120,9 @@ mod tests {
 
         let registry = ResultRegistry::default();
         registry.on_show("old".into());
-        assert!(registry.begin_query("old", 1).is_some());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "old", 1)
+            .is_some());
         let hides = Cell::new(0);
         let mut center = || Ok(());
         let mut always_on_top = || Ok(());
@@ -2148,7 +2150,9 @@ mod tests {
             Err(LifecycleError::WindowFailed)
         );
         assert_eq!(hides.get(), 1);
-        assert!(registry.begin_query("old", 2).is_none());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "old", 2)
+            .is_none());
     }
 
     #[test]

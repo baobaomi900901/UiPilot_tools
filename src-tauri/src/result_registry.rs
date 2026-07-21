@@ -14,6 +14,13 @@ pub(crate) enum ResultAction {
         app_id: String,
         target: ApplicationLaunchTarget,
     },
+    OpenIndexedPath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryDomain {
+    Application,
+    File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +44,7 @@ impl std::error::Error for RegistryError {}
 pub(crate) struct QueryToken {
     generation: u64,
     query_sequence: u64,
+    domain: QueryDomain,
 }
 
 struct ResultSet {
@@ -50,6 +58,7 @@ struct RegistryState {
     active: bool,
     active_invocation_id: Option<String>,
     latest_query_sequence: u64,
+    latest_query_domain: Option<QueryDomain>,
     current: Option<ResultSet>,
 }
 
@@ -77,11 +86,13 @@ impl ResultRegistry {
         state.active = true;
         state.active_invocation_id = Some(invocation_id);
         state.latest_query_sequence = 0;
+        state.latest_query_domain = None;
         state.current = None;
     }
 
     pub(crate) fn begin_query(
         &self,
+        domain: QueryDomain,
         invocation_id: &str,
         query_sequence: u64,
     ) -> Option<QueryToken> {
@@ -94,10 +105,12 @@ impl ResultRegistry {
         }
 
         state.latest_query_sequence = query_sequence;
+        state.latest_query_domain = Some(domain);
         state.current = None;
         Some(QueryToken {
             generation: state.generation,
             query_sequence,
+            domain,
         })
     }
 
@@ -116,6 +129,7 @@ impl ResultRegistry {
         if !state.active
             || token.generation != state.generation
             || token.query_sequence != state.latest_query_sequence
+            || Some(token.domain) != state.latest_query_domain
             || !authorize()
         {
             return None;
@@ -164,6 +178,7 @@ impl ResultRegistry {
         state.active = false;
         state.active_invocation_id = None;
         state.latest_query_sequence = 0;
+        state.latest_query_domain = None;
         state.current = None;
     }
 
@@ -184,7 +199,7 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{QueryToken, RegistryError, ResultAction, ResultRegistry};
+    use super::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry};
     use crate::{
         apps::ApplicationLaunchTarget,
         model::{ResultItem, SearchResponse},
@@ -237,10 +252,96 @@ mod tests {
     }
 
     #[test]
+    fn query_domains_share_one_invocation_sequence_and_mapping() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+
+        let application = registry
+            .begin_query(QueryDomain::Application, "inv-1", 1)
+            .unwrap();
+        let application_response = publish_app(
+            &registry,
+            application,
+            vec![(item("", "Application"), action("application"))],
+        )
+        .unwrap();
+
+        let file = registry.begin_query(QueryDomain::File, "inv-1", 2).unwrap();
+        assert_eq!(
+            registry.resolve(
+                &application_response.request_id,
+                &application_response.items[0].result_id,
+            ),
+            Err(RegistryError::StaleRequest)
+        );
+        assert!(registry
+            .begin_query(QueryDomain::Application, "inv-1", 1)
+            .is_none());
+
+        let file_response = registry
+            .publish_if_latest(
+                file,
+                vec![
+                    (FileDraft { name: "First" }, ResultAction::OpenIndexedPath),
+                    (FileDraft { name: "Second" }, ResultAction::OpenIndexedPath),
+                ],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        assert_eq!(file_response.0, "req-0000000000000003");
+        assert_eq!(file_response.1[0].0, "item-0000000000000004");
+        assert_eq!(file_response.1[1].0, "item-0000000000000005");
+        assert_eq!(
+            registry.resolve(&file_response.0, &file_response.1[0].0),
+            Ok(ResultAction::OpenIndexedPath)
+        );
+
+        registry.hide_and_clear();
+        assert_eq!(
+            registry.resolve(&file_response.0, &file_response.1[0].0),
+            Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn token_domain_tamper_is_fail_closed_without_consuming_ids() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let token = registry.begin_query(QueryDomain::File, "inv-1", 1).unwrap();
+        let tampered = QueryToken {
+            domain: QueryDomain::Application,
+            ..token
+        };
+
+        assert!(registry
+            .publish_if_latest(
+                tampered,
+                vec![(FileDraft { name: "Wrong" }, ResultAction::OpenIndexedPath)],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .is_none());
+
+        let current = registry
+            .publish_if_latest(
+                token,
+                vec![(FileDraft { name: "Current" }, ResultAction::OpenIndexedPath)],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        assert_eq!(current.0, "req-0000000000000001");
+        assert_eq!(current.1[0].0, "item-0000000000000002");
+    }
+
+    #[test]
     fn generic_publication_reuses_existing_ids_mapping_and_hide() {
         let registry = ResultRegistry::default();
         registry.on_show("inv-1".into());
-        let token = registry.begin_query("inv-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "inv-1", 1)
+            .unwrap();
         let expected = [action("first"), action("second")];
         let response = registry
             .publish_if_latest(
@@ -281,7 +382,9 @@ mod tests {
     fn authorization_rejection_has_zero_side_effects_and_consumes_no_ids() {
         let registry = ResultRegistry::default();
         registry.on_show("inv-1".into());
-        let token = registry.begin_query("inv-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "inv-1", 1)
+            .unwrap();
         let current_action = action("current");
         let current = publish_app(
             &registry,
@@ -326,7 +429,9 @@ mod tests {
     fn latest_publish_assigns_opaque_ids_and_replaces_supplied_ids() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
-        let token = registry.begin_query("invocation-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
 
         let response = publish_app(
             &registry,
@@ -355,7 +460,9 @@ mod tests {
             },
         };
         registry.on_show("invocation-1".into());
-        let token = registry.begin_query("invocation-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
         let response = publish_app(
             &registry,
             token,
@@ -382,8 +489,12 @@ mod tests {
     fn older_query_cannot_replace_newer_published_results() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
-        let first = registry.begin_query("invocation-1", 1).unwrap();
-        let second = registry.begin_query("invocation-1", 2).unwrap();
+        let first = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
+        let second = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 2)
+            .unwrap();
         let expected = action("second");
         let current = publish_app(
             &registry,
@@ -408,19 +519,27 @@ mod tests {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
 
-        assert!(registry.begin_query("invocation-1", 2).is_some());
-        assert!(registry.begin_query("invocation-1", 1).is_none());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "invocation-1", 2)
+            .is_some());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .is_none());
     }
 
     #[test]
     fn valid_new_query_immediately_invalidates_published_results() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
-        let first = registry.begin_query("invocation-1", 1).unwrap();
+        let first = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
         let response =
             publish_app(&registry, first, vec![(item("", "First"), action("first"))]).unwrap();
 
-        assert!(registry.begin_query("invocation-1", 2).is_some());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "invocation-1", 2)
+            .is_some());
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
             Err(RegistryError::StaleRequest)
@@ -431,7 +550,9 @@ mod tests {
     fn hidden_generation_rejects_in_flight_publish() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
-        let token = registry.begin_query("invocation-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
 
         registry.hide_and_clear();
 
@@ -443,7 +564,9 @@ mod tests {
         let registry = ResultRegistry::default();
         registry.on_show("old-invocation".into());
         registry.on_show("new-invocation".into());
-        let token = registry.begin_query("new-invocation", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "new-invocation", 1)
+            .unwrap();
         let expected = action("current");
         let current = publish_app(
             &registry,
@@ -452,7 +575,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(registry.begin_query("old-invocation", 2).is_none());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "old-invocation", 2)
+            .is_none());
         assert_eq!(
             registry
                 .resolve(&current.request_id, &current.items[0].result_id)
@@ -465,7 +590,9 @@ mod tests {
     fn unknown_and_stale_ids_return_fixed_path_free_errors() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
-        let token = registry.begin_query("invocation-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
         let response = publish_app(
             &registry,
             token,
@@ -492,7 +619,9 @@ mod tests {
     fn response_serialization_is_camel_case_and_omits_unused_fields() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
-        let token = registry.begin_query("invocation-1", 1).unwrap();
+        let token = registry
+            .begin_query(QueryDomain::Application, "invocation-1", 1)
+            .unwrap();
         let response = publish_app(
             &registry,
             token,
@@ -516,10 +645,14 @@ mod tests {
     fn stale_token_consumes_no_ids_and_cannot_partially_replace_current() {
         let registry = ResultRegistry::default();
         registry.on_show("old-invocation".into());
-        let stale = registry.begin_query("old-invocation", 1).unwrap();
+        let stale = registry
+            .begin_query(QueryDomain::Application, "old-invocation", 1)
+            .unwrap();
 
         registry.on_show("new-invocation".into());
-        let current_token = registry.begin_query("new-invocation", 1).unwrap();
+        let current_token = registry
+            .begin_query(QueryDomain::Application, "new-invocation", 1)
+            .unwrap();
         let current_action = action("current");
         let current = publish_app(
             &registry,
@@ -538,7 +671,9 @@ mod tests {
             current_action
         );
 
-        let next_token = registry.begin_query("new-invocation", 2).unwrap();
+        let next_token = registry
+            .begin_query(QueryDomain::Application, "new-invocation", 2)
+            .unwrap();
         let next = publish_app(
             &registry,
             next_token,

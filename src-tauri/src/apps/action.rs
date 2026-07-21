@@ -55,7 +55,12 @@ where
     L: FnMut(&Path) -> Result<(), NativeActionError>,
     P: FnMut(&str) -> Result<(), NativeActionError>,
 {
-    let ResultAction::LaunchApplication { target, .. } = action;
+    let target = match action {
+        ResultAction::LaunchApplication { target, .. } => target,
+        ResultAction::OpenIndexedPath => {
+            return Err(ApplicationActionError::ApplicationEntryUnavailable)
+        }
+    };
     let (shortcut, executable) = match target {
         ApplicationLaunchTarget::Shortcut {
             shortcut,
@@ -246,5 +251,36 @@ mod tests {
             Err(ApplicationActionError::ApplicationEntryUnavailable)
         );
         assert_eq!(packaged_calls.get(), 1);
+    }
+
+    #[test]
+    fn file_action_is_rejected_before_all_application_launch_paths() {
+        let activation_calls = Cell::new(0);
+        let shortcut_calls = Cell::new(0);
+        let packaged_calls = Cell::new(0);
+
+        let result = execute_application_with(
+            &ResultAction::OpenIndexedPath,
+            |_| {
+                activation_calls.set(activation_calls.get() + 1);
+                NativeActivation::Activated
+            },
+            |_| {
+                shortcut_calls.set(shortcut_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                packaged_calls.set(packaged_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(ApplicationActionError::ApplicationEntryUnavailable)
+        );
+        assert_eq!(activation_calls.get(), 0);
+        assert_eq!(shortcut_calls.get(), 0);
+        assert_eq!(packaged_calls.get(), 0);
     }
 }

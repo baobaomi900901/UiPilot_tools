@@ -102,6 +102,7 @@ if (
 
 $expectedPermissions = @(
   'allow-search-apps',
+  'allow-search-files',
   'allow-execute-result',
   'allow-load-settings',
   'allow-save-settings',

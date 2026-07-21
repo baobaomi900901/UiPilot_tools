@@ -46,7 +46,7 @@ mod hotkey_hook;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod lifecycle;
 
-#[cfg(test)]
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod file_index;
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
@@ -174,6 +174,9 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let file_index = Arc::new(file_index::FileIndex::default());
+
     let builder = tauri::Builder::default();
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -201,9 +204,11 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
+        .manage(Arc::clone(&file_index))
         .manage(result_registry::ResultRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
+            commands::search_files,
             commands::execute_result,
             commands::load_settings,
             commands::save_settings,
@@ -376,9 +381,10 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 8);
+        assert_eq!(production.matches("commands::").count(), 9);
         for command in [
             "search_apps",
+            "search_files",
             "execute_result",
             "load_settings",
             "save_settings",
@@ -559,6 +565,7 @@ mod tests {
             "double_tap",
             "hotkey_hook",
             "lifecycle",
+            "file_index",
         ] {
             assert!(
                 source.contains(&format!("{product_cfg}\nmod {module};")),
@@ -576,10 +583,24 @@ mod tests {
         let commands = include_str!("commands.rs").replace("\r\n", "\n");
         let action = include_str!("apps/action.rs").replace("\r\n", "\n");
         let cache = include_str!("apps/cache.rs").replace("\r\n", "\n");
+        let file_index = include_str!("file_index/mod.rs").replace("\r\n", "\n");
+        let file_store = include_str!("file_index/store.rs").replace("\r\n", "\n");
+        let search_files_allow = "#[allow(clippy::too_many_arguments)]";
+        let search_files_command =
+            format!("{search_files_allow}\n#[tauri::command]\npub(crate) async fn search_files(");
+        assert_eq!(commands.matches(search_files_allow).count(), 1);
+        assert!(commands.contains(&search_files_command));
+        let commands_without_search_files_allow = commands.replacen(search_files_allow, "", 1);
+        assert!(has_forbidden_production_lint_suppression(&format!(
+            "{search_files_allow}\n#[tauri::command]\nfn near_miss() {{}}"
+        )));
+        assert!(has_forbidden_production_lint_suppression(&format!(
+            "{commands_without_search_files_allow}\n{search_files_allow}"
+        )));
         let product_sources = [
             ("lib.rs", production_root),
             ("atomic_file.rs", include_str!("atomic_file.rs")),
-            ("commands.rs", commands.as_str()),
+            ("commands.rs", commands_without_search_files_allow.as_str()),
             ("apps/mod.rs", include_str!("apps/mod.rs")),
             ("apps/action.rs", action.as_str()),
             ("apps/cache.rs", cache.as_str()),
@@ -594,6 +615,8 @@ mod tests {
             ("double_tap.rs", include_str!("double_tap.rs")),
             ("hotkey_hook.rs", include_str!("hotkey_hook.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("file_index/mod.rs", file_index.as_str()),
+            ("file_index/store.rs", file_store.as_str()),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
             ("session_marker.rs", include_str!("session_marker.rs")),
@@ -607,6 +630,20 @@ mod tests {
                 !has_forbidden_production_lint_suppression(product_source),
                 "unapproved production lint suppression is forbidden: {name}"
             );
+        }
+
+        for (name, product_source) in [
+            ("file_index/mod.rs", file_index.as_str()),
+            ("file_index/store.rs", file_store.as_str()),
+        ] {
+            for directive in ["#[allow(dead_code)]", "#[expect(dead_code)]"] {
+                assert!(
+                    has_forbidden_production_lint_suppression(&format!(
+                        "{product_source}\n{directive}\nfn injected() {{}}"
+                    )),
+                    "file index lint fixture was accepted: {name} {directive}"
+                );
+            }
         }
 
         let enum_variant_allow = "#[allow(clippy::enum_variant_names)]";
