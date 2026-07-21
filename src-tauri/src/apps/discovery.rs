@@ -20,9 +20,10 @@ use windows::{
 };
 
 use super::{
-    app_id,
+    app_id, appsfolder,
     shortcut::{load_shortcut, ShortcutError, ShortcutMetadata},
-    Application, DiscoveryDiagnostics, DiscoveryError, DiscoverySnapshot, RootKind, StartMenuRoot,
+    Application, ApplicationEntryKind, ApplicationLaunchTarget, DiscoveryDiagnostics,
+    DiscoveryError, DiscoverySnapshot, RootKind, StartMenuRoot,
 };
 use crate::{model::ResultItem, result_registry::ResultAction};
 
@@ -297,8 +298,10 @@ where
         applications.push(Application {
             app_id: id,
             display_name: candidate.display_name,
-            shortcut: candidate.shortcut,
-            executable: metadata.executable,
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: candidate.shortcut,
+                executable: metadata.executable,
+            },
             icon: None,
             aliases: Vec::new(),
             use_count: 0,
@@ -310,13 +313,47 @@ where
     })
 }
 
+fn discover_with<I, R, P>(
+    roots: I,
+    resolve: R,
+    packaged: P,
+) -> Result<DiscoverySnapshot, DiscoveryError>
+where
+    I: IntoIterator<Item = StartMenuRoot>,
+    R: FnMut(&Path) -> Result<ShortcutMetadata, ShortcutError>,
+    P: FnOnce() -> Result<DiscoverySnapshot, DiscoveryError>,
+{
+    let mut snapshot = discover_from_roots(roots, resolve)?;
+    let packaged = packaged()?;
+    let mut ids: HashSet<_> = snapshot
+        .applications
+        .iter()
+        .map(|application| application.app_id.clone())
+        .collect();
+    for application in packaged.applications {
+        if !ids.insert(application.app_id.clone()) {
+            return Err(DiscoveryError::DuplicateAppId);
+        }
+        snapshot.applications.push(application);
+    }
+    snapshot.diagnostics.missing_roots += packaged.diagnostics.missing_roots;
+    snapshot.diagnostics.inaccessible_entries += packaged.diagnostics.inaccessible_entries;
+    snapshot.diagnostics.reparse_entries += packaged.diagnostics.reparse_entries;
+    snapshot.diagnostics.non_unicode_entries += packaged.diagnostics.non_unicode_entries;
+    snapshot.diagnostics.invalid_shortcuts += packaged.diagnostics.invalid_shortcuts;
+    snapshot.diagnostics.unmapped_executables += packaged.diagnostics.unmapped_executables;
+    snapshot.diagnostics.invalid_packaged_names += packaged.diagnostics.invalid_packaged_names;
+    snapshot.diagnostics.invalid_packaged_aumids += packaged.diagnostics.invalid_packaged_aumids;
+    Ok(snapshot)
+}
+
 pub(crate) fn discover() -> Result<DiscoverySnapshot, DiscoveryError> {
     let roots = known_folder_roots()?;
     if unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_err() {
         return Err(DiscoveryError::ComUnavailable);
     }
     let _com = ComGuard;
-    discover_from_roots(roots, load_shortcut)
+    discover_with(roots, load_shortcut, appsfolder::discover)
 }
 
 pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAction) {
@@ -324,13 +361,18 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
         ResultItem {
             result_id: String::new(),
             title: application.display_name.clone(),
-            subtitle: None,
+            subtitle: Some(
+                match application.entry_kind() {
+                    ApplicationEntryKind::DesktopShortcut => "应用程序",
+                    ApplicationEntryKind::PackagedApp => "打包的应用程序",
+                }
+                .into(),
+            ),
             icon: None,
         },
         ResultAction::LaunchApplication {
             app_id: application.app_id.clone(),
-            shortcut: application.shortcut.clone(),
-            executable: application.executable.clone(),
+            target: application.target.clone(),
         },
     )
 }
@@ -356,12 +398,15 @@ mod tests {
     };
 
     use super::{
-        classify_child_metadata, classify_root_metadata, discover_from_roots,
+        classify_child_metadata, classify_root_metadata, discover_from_roots, discover_with,
         known_folder_path_with, known_folder_roots_with, normalize_relative_path,
     };
     use crate::apps::shortcut::{ShortcutError, ShortcutMetadata};
     use crate::{
-        apps::{Application, DiscoveryDiagnostics, DiscoveryError, RootKind, StartMenuRoot},
+        apps::{
+            Application, ApplicationLaunchTarget, DiscoveryDiagnostics, DiscoveryError,
+            DiscoverySnapshot, RootKind, StartMenuRoot,
+        },
         result_registry::ResultAction,
     };
 
@@ -597,6 +642,51 @@ mod tests {
     }
 
     #[test]
+    fn desktop_and_packaged_snapshots_merge_without_name_deduplication() {
+        let user = TempRoot::new("merged-user");
+        let common = TempRoot::new("merged-common");
+        fs::write(user.child("Settings.lnk"), []).unwrap();
+        let packaged = DiscoverySnapshot {
+            applications: vec![Application {
+                app_id: "app-packaged".into(),
+                display_name: "Settings".into(),
+                target: ApplicationLaunchTarget::PackagedApp {
+                    aumid: "family!settings".into(),
+                },
+                icon: None,
+                aliases: Vec::new(),
+                use_count: 0,
+            }],
+            diagnostics: DiscoveryDiagnostics {
+                invalid_packaged_aumids: 3,
+                ..DiscoveryDiagnostics::default()
+            },
+        };
+
+        let merged = discover_with(roots(user.path(), common.path()), no_target, || {
+            Ok(packaged)
+        })
+        .unwrap();
+
+        assert_eq!(titles(&merged.applications), ["Settings", "Settings"]);
+        assert_eq!(merged.diagnostics.invalid_packaged_aumids, 3);
+    }
+
+    #[test]
+    fn packaged_discovery_failure_rejects_the_complete_snapshot() {
+        let user = TempRoot::new("packaged-error-user");
+        let common = TempRoot::new("packaged-error-common");
+        fs::write(user.child("Desktop.lnk"), []).unwrap();
+
+        assert_eq!(
+            discover_with(roots(user.path(), common.path()), no_target, || {
+                Err(DiscoveryError::AppsFolderEnumeration)
+            }),
+            Err(DiscoveryError::AppsFolderEnumeration)
+        );
+    }
+
+    #[test]
     fn target_and_absolute_root_do_not_change_entry_identity() {
         let first = TempRoot::new("identity-first");
         let second = TempRoot::new("identity-second");
@@ -625,25 +715,43 @@ mod tests {
 
     #[test]
     fn registry_entry_keeps_private_values_out_of_the_dto() {
-        let application = Application {
-            app_id: "app-secret".into(),
+        let desktop = Application {
+            app_id: "app-desktop-secret".into(),
             display_name: "Calculator".into(),
-            shortcut: PathBuf::from(r"C:\Private\Calculator.lnk"),
-            executable: Some(PathBuf::from(r"C:\Private\Calculator.exe")),
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(r"C:\Private\Calculator.lnk"),
+                executable: Some(PathBuf::from(r"C:\Private\Calculator.exe")),
+            },
+            icon: None,
+            aliases: Vec::new(),
+            use_count: 0,
+        };
+        let packaged = Application {
+            app_id: "app-packaged-secret".into(),
+            display_name: "Calculator".into(),
+            target: ApplicationLaunchTarget::PackagedApp {
+                aumid: "family!secret".into(),
+            },
             icon: None,
             aliases: Vec::new(),
             use_count: 0,
         };
 
-        let (item, action) = crate::apps::registry_entry(&application);
+        let (desktop_item, _) = crate::apps::registry_entry(&desktop);
+        let (packaged_item, packaged_action) = crate::apps::registry_entry(&packaged);
 
-        assert_eq!(item.icon, None);
-        let json = serde_json::to_string(&item).unwrap();
-        assert!(!json.contains("app-secret"));
-        assert!(!json.contains("Private"));
+        assert_eq!(desktop_item.subtitle.as_deref(), Some("应用程序"));
+        assert_eq!(packaged_item.subtitle.as_deref(), Some("打包的应用程序"));
+        assert_eq!(packaged_item.icon, None);
+        let json = serde_json::to_string(&packaged_item).unwrap();
+        assert!(!json.contains("app-packaged-secret"));
+        assert!(!json.contains("family!secret"));
         assert!(matches!(
-            action,
-            ResultAction::LaunchApplication { app_id, .. } if app_id == "app-secret"
+            packaged_action,
+            ResultAction::LaunchApplication {
+                app_id,
+                target: ApplicationLaunchTarget::PackagedApp { aumid },
+            } if app_id == "app-packaged-secret" && aumid == "family!secret"
         ));
     }
 
@@ -667,6 +775,14 @@ mod tests {
                 "start menu root is a reparse point",
             ),
             (DiscoveryError::ComUnavailable, "COM is unavailable"),
+            (
+                DiscoveryError::AppsFolderUnavailable,
+                "AppsFolder is unavailable",
+            ),
+            (
+                DiscoveryError::AppsFolderEnumeration,
+                "AppsFolder enumeration failed",
+            ),
             (
                 DiscoveryError::HashFailed,
                 "application identity hashing failed",

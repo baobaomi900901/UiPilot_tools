@@ -1,14 +1,18 @@
 use std::{ffi::OsStr, fmt, mem::size_of, os::windows::ffi::OsStrExt, path::Path};
 
 use windows::{
-    core::{BOOL, PCWSTR, PWSTR},
+    core::{BOOL, HRESULT, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
             CloseHandle, GetLastError, SetLastError, ERROR_NO_MORE_FILES, ERROR_SUCCESS, HANDLE,
-            HWND, LPARAM,
+            HWND, LPARAM, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL},
         System::{
+            Com::{
+                CoAllowSetForegroundWindow, CoCreateInstance, CoInitializeEx, CoUninitialize,
+                CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+            },
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
@@ -19,7 +23,9 @@ use windows::{
             },
         },
         UI::{
-            Shell::ShellExecuteW,
+            Shell::{
+                ApplicationActivationManager, IApplicationActivationManager, ShellExecuteW, AO_NONE,
+            },
             WindowsAndMessaging::{
                 EnumWindows, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
                 IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, SW_SHOWNORMAL,
@@ -193,6 +199,87 @@ where
     } else {
         Err(NativeActionError::ApplicationEntryUnavailable)
     }
+}
+
+struct ActivationCom<U: FnOnce()> {
+    uninitialize: Option<U>,
+}
+
+impl<U: FnOnce()> Drop for ActivationCom<U> {
+    fn drop(&mut self) {
+        self.uninitialize
+            .take()
+            .expect("COM uninitializer is missing")();
+    }
+}
+
+fn with_activation_com<I, U, O, T>(
+    initialize: I,
+    uninitialize: U,
+    operation: O,
+) -> Result<T, NativeActionError>
+where
+    I: FnOnce() -> HRESULT,
+    U: FnOnce(),
+    O: FnOnce() -> Result<T, NativeActionError>,
+{
+    let status = initialize();
+    let _guard = if status == S_OK || status == S_FALSE {
+        Some(ActivationCom {
+            uninitialize: Some(uninitialize),
+        })
+    } else if status == RPC_E_CHANGED_MODE {
+        None
+    } else {
+        return Err(NativeActionError::ApplicationEntryUnavailable);
+    };
+    operation()
+}
+
+fn activate_packaged_with<M, C, F, A>(
+    aumid: &str,
+    create: C,
+    allow_foreground: F,
+    activate: A,
+) -> Result<(), NativeActionError>
+where
+    C: FnOnce() -> Result<M, ()>,
+    F: FnOnce(&M) -> Result<(), ()>,
+    A: FnOnce(&M, &str) -> Result<(), ()>,
+{
+    let manager = create().map_err(|_| NativeActionError::ApplicationEntryUnavailable)?;
+    let _ = allow_foreground(&manager);
+    activate(&manager, aumid).map_err(|_| NativeActionError::ApplicationEntryUnavailable)
+}
+
+pub(crate) fn launch_packaged_app(aumid: &str) -> Result<(), NativeActionError> {
+    with_activation_com(
+        || unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) },
+        || unsafe { CoUninitialize() },
+        || {
+            activate_packaged_with(
+                aumid,
+                || unsafe {
+                    CoCreateInstance::<_, IApplicationActivationManager>(
+                        &ApplicationActivationManager,
+                        None,
+                        CLSCTX_LOCAL_SERVER,
+                    )
+                    .map_err(|_| ())
+                },
+                |manager| unsafe { CoAllowSetForegroundWindow(manager, None).map_err(|_| ()) },
+                |manager, aumid| {
+                    let aumid: Vec<u16> = aumid.encode_utf16().chain([0]).collect();
+                    unsafe {
+                        manager
+                            .ActivateApplication(PCWSTR(aumid.as_ptr()), PCWSTR::null(), AO_NONE)
+                            .map(|_| ())
+                            .map_err(|_| ())
+                    }
+                },
+            )
+        },
+    )
 }
 
 struct OwnedHandle(HANDLE);
@@ -407,10 +494,13 @@ fn nul_terminated_slice(value: &[u16]) -> &[u16] {
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
+    use windows::Win32::Foundation::{E_FAIL, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+
     use super::{
-        consider_window, finish_window_enumeration, launch_shortcut_with, ordinal_eq,
-        select_unique_process_with, try_activate_with, NativeActionError, NativeActivation,
-        ProcessLookup, ProcessStep, WindowEnumeration, WindowLookup, WindowProperties,
+        activate_packaged_with, consider_window, finish_window_enumeration, launch_shortcut_with,
+        ordinal_eq, select_unique_process_with, try_activate_with, with_activation_com,
+        NativeActionError, NativeActivation, ProcessLookup, ProcessStep, WindowEnumeration,
+        WindowLookup, WindowProperties,
     };
 
     fn wide(value: &str) -> Vec<u16> {
@@ -734,5 +824,62 @@ mod tests {
             launch_shortcut_with(shortcut, |_| 32),
             Err(NativeActionError::ApplicationEntryUnavailable)
         );
+    }
+
+    #[test]
+    fn packaged_com_ownership_matches_initialize_status() {
+        for (status, expected, expected_operations, expected_uninitializes) in [
+            (S_OK, Ok(17), 1, 1),
+            (S_FALSE, Ok(17), 1, 1),
+            (RPC_E_CHANGED_MODE, Ok(17), 1, 0),
+            (
+                E_FAIL,
+                Err(NativeActionError::ApplicationEntryUnavailable),
+                0,
+                0,
+            ),
+        ] {
+            let operations = Cell::new(0);
+            let uninitializes = Cell::new(0);
+
+            let result = with_activation_com(
+                || status,
+                || uninitializes.set(uninitializes.get() + 1),
+                || {
+                    operations.set(operations.get() + 1);
+                    Ok(17)
+                },
+            );
+
+            assert_eq!(result, expected);
+            assert_eq!(operations.get(), expected_operations);
+            assert_eq!(uninitializes.get(), expected_uninitializes);
+        }
+    }
+
+    #[test]
+    fn foreground_allowance_failure_does_not_block_packaged_activation() {
+        let allowances = Cell::new(0);
+        let activations = Cell::new(0);
+
+        let result = activate_packaged_with(
+            "family!app",
+            || Ok(17_u32),
+            |manager| {
+                assert_eq!(*manager, 17);
+                allowances.set(allowances.get() + 1);
+                Err(())
+            },
+            |manager, aumid| {
+                assert_eq!(*manager, 17);
+                assert_eq!(aumid, "family!app");
+                activations.set(activations.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(allowances.get(), 1);
+        assert_eq!(activations.get(), 1);
     }
 }

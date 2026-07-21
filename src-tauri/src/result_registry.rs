@@ -1,21 +1,22 @@
 use std::{
     collections::HashMap,
     fmt,
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
     },
 };
 
-use crate::model::{ResultItem, SearchResponse};
+use crate::{
+    apps::ApplicationLaunchTarget,
+    model::{ResultItem, SearchResponse},
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
     LaunchApplication {
         app_id: String,
-        shortcut: PathBuf,
-        executable: Option<PathBuf>,
+        target: ApplicationLaunchTarget,
     },
 }
 
@@ -181,7 +182,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{RegistryError, ResultAction, ResultRegistry};
-    use crate::model::ResultItem;
+    use crate::{apps::ApplicationLaunchTarget, model::ResultItem};
 
     fn item(result_id: &str, title: &str) -> ResultItem {
         ResultItem {
@@ -195,8 +196,10 @@ mod tests {
     fn action(name: &str) -> ResultAction {
         ResultAction::LaunchApplication {
             app_id: format!("app-{name}"),
-            shortcut: PathBuf::from(format!(r"C:\private\{name}.lnk")),
-            executable: Some(PathBuf::from(format!(r"C:\private\{name}.exe"))),
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(format!(r"C:\private\{name}.lnk")),
+                executable: Some(PathBuf::from(format!(r"C:\private\{name}.exe"))),
+            },
         }
     }
 
@@ -226,7 +229,12 @@ mod tests {
     #[test]
     fn current_ids_resolve_rust_owned_action_without_serializing_it() {
         let registry = ResultRegistry::default();
-        let expected = action("calculator");
+        let expected = ResultAction::LaunchApplication {
+            app_id: "app-calculator".into(),
+            target: ApplicationLaunchTarget::PackagedApp {
+                aumid: "family!private-calculator".into(),
+            },
+        };
         registry.on_show("invocation-1".into());
         let token = registry.begin_query("invocation-1", 1).unwrap();
         let response = registry
@@ -247,6 +255,8 @@ mod tests {
         assert!(!json.contains("app-calculator"));
         assert!(!json.contains("shortcut"));
         assert!(!json.contains("executable"));
+        assert!(!json.contains("family!private-calculator"));
+        assert!(!json.contains("target"));
     }
 
     #[test]

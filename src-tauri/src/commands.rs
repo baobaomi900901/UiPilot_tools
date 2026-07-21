@@ -700,7 +700,7 @@ mod tests {
         SaveSettingsCache, SettingsView, UserSettingsUpdate,
     };
     use crate::{
-        apps::{AppCache, Application, ApplicationActionOutcome},
+        apps::{AppCache, Application, ApplicationActionOutcome, ApplicationLaunchTarget},
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
         result_registry::{RegistryError, ResultAction, ResultRegistry},
@@ -751,8 +751,10 @@ mod tests {
         Application {
             app_id: format!("app-{index:064x}"),
             display_name: format!("App {index:02}"),
-            shortcut: PathBuf::from(format!(r"C:\Private\App{index:02}.lnk")),
-            executable: Some(PathBuf::from(format!(r"C:\Private\App{index:02}.exe"))),
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(format!(r"C:\Private\App{index:02}.lnk")),
+                executable: Some(PathBuf::from(format!(r"C:\Private\App{index:02}.exe"))),
+            },
             icon: None,
             aliases: Vec::new(),
             use_count: 0,
@@ -764,8 +766,10 @@ mod tests {
             Application {
                 app_id: APP_EMPTY.into(),
                 display_name: "Empty App".into(),
-                shortcut: PathBuf::from(r"C:\Private\Empty.lnk"),
-                executable: Some(PathBuf::from(r"C:\Private\Empty.exe")),
+                target: ApplicationLaunchTarget::Shortcut {
+                    shortcut: PathBuf::from(r"C:\Private\Empty.lnk"),
+                    executable: Some(PathBuf::from(r"C:\Private\Empty.exe")),
+                },
                 icon: None,
                 aliases: vec!["cache alias must not leak".into()],
                 use_count: 17,
@@ -773,8 +777,10 @@ mod tests {
             Application {
                 app_id: APP_DUPLICATE_A.into(),
                 display_name: "Duplicate App".into(),
-                shortcut: PathBuf::from(r"C:\Private\DuplicateA.lnk"),
-                executable: Some(PathBuf::from(r"C:\Private\DuplicateA.exe")),
+                target: ApplicationLaunchTarget::Shortcut {
+                    shortcut: PathBuf::from(r"C:\Private\DuplicateA.lnk"),
+                    executable: Some(PathBuf::from(r"C:\Private\DuplicateA.exe")),
+                },
                 icon: Some("icon-a".into()),
                 aliases: Vec::new(),
                 use_count: 23,
@@ -782,8 +788,10 @@ mod tests {
             Application {
                 app_id: APP_DUPLICATE_B.into(),
                 display_name: "Duplicate App".into(),
-                shortcut: PathBuf::from(r"C:\Private\DuplicateB.lnk"),
-                executable: None,
+                target: ApplicationLaunchTarget::Shortcut {
+                    shortcut: PathBuf::from(r"C:\Private\DuplicateB.lnk"),
+                    executable: None,
+                },
                 icon: None,
                 aliases: Vec::new(),
                 use_count: 31,
@@ -794,8 +802,10 @@ mod tests {
     fn trusted_action() -> ResultAction {
         ResultAction::LaunchApplication {
             app_id: APP_CURRENT.into(),
-            shortcut: PathBuf::from(r"C:\Private\Current.lnk"),
-            executable: Some(PathBuf::from(r"C:\Private\Current.exe")),
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(r"C:\Private\Current.lnk"),
+                executable: Some(PathBuf::from(r"C:\Private\Current.exe")),
+            },
         }
     }
 

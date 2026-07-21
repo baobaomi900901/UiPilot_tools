@@ -9,6 +9,7 @@ use windows::Win32::Security::Cryptography::{
 };
 
 mod action;
+mod appsfolder;
 mod cache;
 mod discovery;
 mod rank;
@@ -50,14 +51,45 @@ pub(crate) struct StartMenuRoot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationLaunchTarget {
+    Shortcut {
+        shortcut: PathBuf,
+        executable: Option<PathBuf>,
+    },
+    PackagedApp {
+        aumid: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationEntryKind {
+    DesktopShortcut,
+    PackagedApp,
+}
+
+impl ApplicationLaunchTarget {
+    pub(crate) fn entry_kind(&self) -> ApplicationEntryKind {
+        match self {
+            Self::Shortcut { .. } => ApplicationEntryKind::DesktopShortcut,
+            Self::PackagedApp { .. } => ApplicationEntryKind::PackagedApp,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Application {
     pub(crate) app_id: String,
     pub(crate) display_name: String,
-    pub(crate) shortcut: PathBuf,
-    pub(crate) executable: Option<PathBuf>,
+    pub(crate) target: ApplicationLaunchTarget,
     pub(crate) icon: Option<String>,
     pub(crate) aliases: Vec<String>,
     pub(crate) use_count: u64,
+}
+
+impl Application {
+    pub(crate) fn entry_kind(&self) -> ApplicationEntryKind {
+        self.target.entry_kind()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -68,6 +100,8 @@ pub(crate) struct DiscoveryDiagnostics {
     pub(crate) non_unicode_entries: u64,
     pub(crate) invalid_shortcuts: u64,
     pub(crate) unmapped_executables: u64,
+    pub(crate) invalid_packaged_names: u64,
+    pub(crate) invalid_packaged_aumids: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +126,8 @@ pub(crate) enum DiscoveryError {
     RootUnavailable,
     RootReparsePoint,
     ComUnavailable,
+    AppsFolderUnavailable,
+    AppsFolderEnumeration,
     HashFailed,
     DuplicateAppId,
 }
@@ -104,6 +140,8 @@ impl fmt::Display for DiscoveryError {
             Self::RootUnavailable => "start menu root is unavailable",
             Self::RootReparsePoint => "start menu root is a reparse point",
             Self::ComUnavailable => "COM is unavailable",
+            Self::AppsFolderUnavailable => "AppsFolder is unavailable",
+            Self::AppsFolderEnumeration => "AppsFolder enumeration failed",
             Self::HashFailed => "application identity hashing failed",
             Self::DuplicateAppId => "duplicate application identity",
         })
@@ -128,6 +166,14 @@ fn app_id(root_kind: RootKind, relative_shortcut_path: &str) -> Result<String, D
         root_kind.identity(),
         relative_shortcut_path.to_lowercase()
     );
+    hashed_app_id(&preimage)
+}
+
+fn packaged_app_id(aumid: &str) -> Result<String, DiscoveryError> {
+    hashed_app_id(&format!("packaged-aumid-v1\0{}", aumid.to_lowercase()))
+}
+
+fn hashed_app_id(preimage: &str) -> Result<String, DiscoveryError> {
     let mut raw_handle = BCRYPT_ALG_HANDLE::default();
     let open_status = unsafe {
         BCryptOpenAlgorithmProvider(
@@ -157,7 +203,9 @@ fn app_id(root_kind: RootKind, relative_shortcut_path: &str) -> Result<String, D
 
 #[cfg(test)]
 mod tests {
-    use super::{app_id, RootKind};
+    use std::path::PathBuf;
+
+    use super::{app_id, packaged_app_id, ApplicationEntryKind, ApplicationLaunchTarget, RootKind};
 
     #[test]
     fn app_id_has_fixed_vectors_and_case_only_stability() {
@@ -177,5 +225,40 @@ mod tests {
             app_id(RootKind::User, "Tools\\WeChat.lnk"),
             app_id(RootKind::User, "Other\\WeChat.lnk"),
         );
+    }
+
+    #[test]
+    fn packaged_app_id_has_fixed_vector_and_ignores_aumid_case() {
+        let aumid = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+
+        assert_eq!(
+            packaged_app_id(aumid).unwrap(),
+            "app-2fd98ca12c5a7f7424b3068943429ef5eacf4bccd48a90d588d01df4dd4d4145",
+        );
+        assert_eq!(
+            packaged_app_id(aumid),
+            packaged_app_id(&aumid.to_uppercase())
+        );
+        assert_ne!(
+            packaged_app_id(aumid),
+            app_id(
+                RootKind::User,
+                "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+            )
+        );
+    }
+
+    #[test]
+    fn entry_kind_is_derived_from_the_only_launch_target() {
+        let shortcut = ApplicationLaunchTarget::Shortcut {
+            shortcut: PathBuf::from(r"C:\Menu\Settings.lnk"),
+            executable: None,
+        };
+        let packaged = ApplicationLaunchTarget::PackagedApp {
+            aumid: "family!app".into(),
+        };
+
+        assert_eq!(shortcut.entry_kind(), ApplicationEntryKind::DesktopShortcut);
+        assert_eq!(packaged.entry_kind(), ApplicationEntryKind::PackagedApp);
     }
 }

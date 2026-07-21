@@ -1,4 +1,6 @@
-use super::Application;
+use std::cmp::Ordering;
+
+use super::{Application, ApplicationEntryKind};
 
 #[derive(Clone, Copy)]
 struct Match {
@@ -64,6 +66,15 @@ pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application
                     .to_lowercase()
                     .cmp(&right.display_name.to_lowercase())
             })
+            .then_with(|| match (left.entry_kind(), right.entry_kind()) {
+                (ApplicationEntryKind::PackagedApp, ApplicationEntryKind::DesktopShortcut) => {
+                    Ordering::Less
+                }
+                (ApplicationEntryKind::DesktopShortcut, ApplicationEntryKind::PackagedApp) => {
+                    Ordering::Greater
+                }
+                _ => Ordering::Equal,
+            })
             .then_with(|| left.app_id.cmp(&right.app_id))
     });
     matches
@@ -77,14 +88,32 @@ pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application
 mod tests {
     use std::path::PathBuf;
 
-    use crate::apps::{rank, Application};
+    use crate::apps::{rank, Application, ApplicationLaunchTarget};
 
     fn application(id: &str, name: &str, aliases: &[&str], use_count: u64) -> Application {
+        application_with_target(
+            id,
+            name,
+            aliases,
+            use_count,
+            ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(format!(r"C:\Menu\{id}.lnk")),
+                executable: None,
+            },
+        )
+    }
+
+    fn application_with_target(
+        id: &str,
+        name: &str,
+        aliases: &[&str],
+        use_count: u64,
+        target: ApplicationLaunchTarget,
+    ) -> Application {
         Application {
             app_id: id.into(),
             display_name: name.into(),
-            shortcut: PathBuf::from(format!(r"C:\Menu\{id}.lnk")),
-            executable: None,
+            target,
             icon: None,
             aliases: aliases.iter().map(|alias| (*alias).into()).collect(),
             use_count,
@@ -177,5 +206,43 @@ mod tests {
         let ranked = rank(&applications, "console");
         assert_eq!(ids(&ranked), ["first", "second"]);
         assert_ne!(ranked[0].aliases, ranked[1].aliases);
+    }
+
+    #[test]
+    fn packaged_app_only_wins_after_match_alias_use_count_and_name_tie() {
+        let desktop = application("desktop", "设置", &[], 0);
+        let packaged = application_with_target(
+            "packaged",
+            "设置",
+            &[],
+            0,
+            ApplicationLaunchTarget::PackagedApp {
+                aumid: "family!settings".into(),
+            },
+        );
+
+        assert_eq!(
+            ids(&rank(&[desktop, packaged], "设置")),
+            ["packaged", "desktop"]
+        );
+    }
+
+    #[test]
+    fn higher_use_count_still_beats_packaged_kind() {
+        let desktop = application("desktop", "设置", &[], 2);
+        let packaged = application_with_target(
+            "packaged",
+            "设置",
+            &[],
+            1,
+            ApplicationLaunchTarget::PackagedApp {
+                aumid: "family!settings".into(),
+            },
+        );
+
+        assert_eq!(
+            ids(&rank(&[desktop, packaged], "设置")),
+            ["desktop", "packaged"]
+        );
     }
 }

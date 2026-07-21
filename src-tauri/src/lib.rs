@@ -252,7 +252,7 @@ mod tests {
     };
 
     use super::{
-        apps::{AppCache, Application},
+        apps::{AppCache, Application, ApplicationLaunchTarget},
         load_and_open_validation_store, load_settings_store,
         settings::Settings,
     };
@@ -324,8 +324,10 @@ mod tests {
         let cache = AppCache::from_apps(vec![Application {
             app_id: APP_A.into(),
             display_name: "App".into(),
-            shortcut: PathBuf::from(r"C:\Menu\App.lnk"),
-            executable: None,
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(r"C:\Menu\App.lnk"),
+                executable: None,
+            },
             icon: None,
             aliases: Vec::new(),
             use_count: 0,

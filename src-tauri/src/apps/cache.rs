@@ -97,14 +97,19 @@ mod tests {
     };
 
     use super::{start_initial_refresh_with, AppCache};
-    use crate::apps::{Application, DiscoveryDiagnostics, DiscoveryError, DiscoverySnapshot};
+    use crate::apps::{
+        Application, ApplicationLaunchTarget, DiscoveryDiagnostics, DiscoveryError,
+        DiscoverySnapshot,
+    };
 
     fn application(name: &str) -> Application {
         Application {
             app_id: format!("app-{name}"),
             display_name: name.into(),
-            shortcut: PathBuf::from(format!(r"C:\Menu\{name}.lnk")),
-            executable: None,
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(format!(r"C:\Menu\{name}.lnk")),
+                executable: None,
+            },
             icon: None,
             aliases: Vec::new(),
             use_count: 0,
@@ -127,14 +132,16 @@ mod tests {
 
     #[test]
     fn failed_refresh_preserves_last_good_snapshot() {
-        let cache = AppCache::from_apps(vec![application("Existing")]);
+        for error in [
+            DiscoveryError::KnownFolderQuery,
+            DiscoveryError::AppsFolderEnumeration,
+        ] {
+            let cache = AppCache::from_apps(vec![application("Existing")]);
 
-        assert_eq!(
-            cache.refresh_with(|| Err(DiscoveryError::KnownFolderQuery)),
-            Err(DiscoveryError::KnownFolderQuery),
-        );
-        assert_eq!(titles(&cache.snapshot()), ["Existing"]);
-        assert!(cache.contains("app-Existing"));
+            assert_eq!(cache.refresh_with(|| Err(error)), Err(error));
+            assert_eq!(titles(&cache.snapshot()), ["Existing"]);
+            assert!(cache.contains("app-Existing"));
+        }
     }
 
     #[test]

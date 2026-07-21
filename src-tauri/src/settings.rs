@@ -296,7 +296,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::apps::{AppCache, Application};
+    use crate::apps::{AppCache, Application, ApplicationLaunchTarget};
 
     const APP_A: &str = "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const APP_B: &str = "app-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -341,8 +341,10 @@ mod tests {
         Application {
             app_id: app_id.into(),
             display_name: display_name.into(),
-            shortcut: PathBuf::from(r"C:\Menu\App.lnk"),
-            executable: None,
+            target: ApplicationLaunchTarget::Shortcut {
+                shortcut: PathBuf::from(r"C:\Menu\App.lnk"),
+                executable: None,
+            },
             icon: None,
             aliases: Vec::new(),
             use_count: 0,
