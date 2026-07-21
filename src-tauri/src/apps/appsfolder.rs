@@ -293,18 +293,27 @@ mod tests {
 
     #[test]
     fn packaged_icon_survives_validation_and_deduplication() {
-        let safe_icon = "data:image/png;base64,iVBORw==".to_owned();
+        let retained_icon = "data:image/png;base64,QWxwaGE=".to_owned();
         let snapshot = snapshot_from_raw(
-            [RawPackagedEntry {
-                display_name: Some("Calculator".into()),
-                aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
-                icon: Some(safe_icon.clone()),
-            }],
+            [
+                RawPackagedEntry {
+                    display_name: Some("Zulu Calculator".into()),
+                    aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+                    icon: Some("data:image/png;base64,WnVsdQ==".into()),
+                },
+                RawPackagedEntry {
+                    display_name: Some("Alpha Calculator".into()),
+                    aumid: Some("MICROSOFT.WINDOWSCALCULATOR_8WEKYB3D8BBWE!APP".into()),
+                    icon: Some(retained_icon.clone()),
+                },
+            ],
             |_| true,
         )
         .unwrap();
 
-        assert_eq!(snapshot.applications[0].icon, Some(safe_icon));
+        assert_eq!(snapshot.applications.len(), 1);
+        assert_eq!(snapshot.applications[0].display_name, "Alpha Calculator");
+        assert_eq!(snapshot.applications[0].icon, Some(retained_icon));
     }
 
     #[test]

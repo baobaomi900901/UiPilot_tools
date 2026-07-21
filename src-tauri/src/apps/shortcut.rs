@@ -170,7 +170,7 @@ mod tests {
             Some(PathBuf::from(r"Z:\missing\NativeApp.exe"))
         );
         assert!(metadata.icon.as_deref().is_some_and(|icon| {
-            icon.starts_with("data:image/png;base64,") && icon.len() <= 65_536
+            icon.starts_with("data:image/png;base64,iVBORw0KGgo") && icon.len() <= 65_536
         }));
         fs::remove_dir_all(shortcut.parent().unwrap()).unwrap();
     }
