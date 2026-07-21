@@ -19,7 +19,7 @@
 - `#app` 内由 Ant Design `App` 生成一层直接子元素 `.ant-app`，其内才是 `.launcher-surface`。
 - `.launcher-surface` 已用 Grid 将当前视图和 `.status-region` 分成上下两行。
 - `.launcher-view` 已用 Grid 将搜索输入框和 `Spin` 分成上下两行。
-- `Spin` 生成 `.ant-spin-nested-loading` 与 `.ant-spin-container` 两层包装；`.result-list` 位于最内层。
+- Ant Design 6.5.1 的 `Spin` 生成 `.ant-spin` 根元素与 `.ant-spin-container` 内容层；`.result-list` 位于最内层。旧版 `.ant-spin-nested-loading` 类在当前真实 DOM 中不存在。
 - `.result-list` 已是 `listbox`，选中行是 `option`；输入框已通过 `aria-controls` 和 `aria-activedescendant` 关联结果。
 - 键盘选择变化已经调用 `scrollIntoView({ block: 'nearest' })`。
 
@@ -66,12 +66,12 @@
 
 ```text
 .launcher-view 的 minmax(0, 1fr) 行
-  -> .ant-spin-nested-loading
+  -> .ant-spin
     -> .ant-spin-container
       -> .result-list
 ```
 
-`.launcher-view`、两个 Spin 包装层和 `.result-list` 都必须允许收缩到 `min-height: 0`；Spin 包装层和结果列表继续占满该行高度。加载指示器只覆盖中间结果区域，不覆盖搜索输入框或状态栏。
+`.launcher-view`、`.ant-spin`、`.ant-spin-container` 和 `.result-list` 都必须允许收缩到 `min-height: 0`；两个 Spin 层和结果列表继续占满该行高度。CSS 必须选择真实的 `.launcher-view > .ant-spin`，不得依赖不存在的旧版 `.ant-spin-nested-loading`。加载指示器只覆盖中间结果区域，不覆盖搜索输入框或状态栏。
 
 在启动器视图中，`.result-list` 是唯一使用 `overflow-y: auto` 的元素。页面根、外层表面和中间包装层只负责约束或裁切，不建立竞争的纵向滚动容器。设置页现有 `.settings-form` 滚动属于另一互斥视图，不在本任务中改变。
 

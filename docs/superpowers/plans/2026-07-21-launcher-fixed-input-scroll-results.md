@@ -17,6 +17,7 @@
 - 启动器视图只有 `.result-list` 使用 `overflow-y: auto`；设置页现有滚动不在本任务范围内。
 - 结果滚动条使用 `6px` 透明轨道和默认可见滑块；不增加 hover 后才显示的分支、JavaScript、DOM 或第三方滚动组件。
 - `.launcher-surface` 首轨最小为 `52px`；`.status-region` 最大 `72px` 并隐藏视觉溢出，完整 live-region 文本不变。
+- Spin 高度链使用 Ant Design 6.5.1 的真实 `.launcher-view > .ant-spin` 根类和 `.ant-spin-container` 内容类；不得使用不存在的 `.ant-spin-nested-loading`。
 
 ---
 
@@ -214,7 +215,7 @@ expect(getComputedStyle(results).minHeight).toMatch(/^0(?:px)?$/)
 expect(getComputedStyle(results).height).toBe('100%')
 expect(getComputedStyle(results).overflowY).toBe('auto')
 expect(getComputedStyle(status).maxHeight).toBe('72px')
-expect(getComputedStyle(status).overflowY).toBe('hidden')
+expect(getComputedStyle(status).overflow).toBe('hidden')
 expect(autoScrollers).toEqual([results])
 ```
 
@@ -240,6 +241,8 @@ Expected: 布局契约测试因外层仍为 `minmax(0, 1fr)` 且状态区没有 
 ```
 
 保留 `.launcher-view`、Spin 与 `.result-list` 的既有收缩和滚动规则。
+
+同时把高度链第一段选择器从不存在的旧版 `.launcher-view > .ant-spin-nested-loading` 更正为真实 `.launcher-view > .ant-spin`；`.ant-spin-container` 与 `.result-list` 选择器保持不变。
 
 - [ ] **Step 4: 运行聚焦与完整自动验证**
 
