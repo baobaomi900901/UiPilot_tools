@@ -1116,18 +1116,56 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('passes the viewport height through AntD App to the launcher grid', () => {
-    expect(stylesSource).toMatch(/#app\s*>\s*\.ant-app\s*\{[^}]*height:\s*100%;/s)
-    expect(stylesSource).toMatch(/\.launcher-view\s*\{[^}]*grid-template-rows:\s*44px minmax\(0, 1fr\);/s)
-    expect(stylesSource).toMatch(/\.result-list\s*\{[^}]*overflow-y:\s*auto;/s)
+  it('keeps launcher chrome separated and gives scrolling only to results', async () => {
+    installMatchMedia(false)
+    const style = document.createElement('style')
+    style.textContent = stylesSource
+    document.head.append(style)
+    const { core } = await startedCore()
+    const mounted = await mountLauncherView(core)
+    mounted.host.id = 'app'
+    try {
+      const app = mounted.host.querySelector<HTMLElement>(':scope > .ant-app')!
+      const surface = app.querySelector<HTMLElement>('.launcher-surface')!
+      const launcher = surface.querySelector<HTMLElement>('.launcher-view')!
+      const spinRoot = launcher.querySelector<HTMLElement>(':scope > .ant-spin')!
+      const spinContainer = spinRoot.querySelector<HTMLElement>('.ant-spin-container')!
+      const results = spinContainer.querySelector<HTMLElement>('.result-list')!
+      const status = surface.querySelector<HTMLElement>('.status-region')!
+      const normalized = (value: string) => value.replace(/\s+/g, ' ').trim()
+      const isZero = (value: string) => /^0(?:px)?$/.test(value)
+
+      expect(getComputedStyle(app).height).toBe('100%')
+      expect(normalized(getComputedStyle(surface).gridTemplateRows)).toBe('minmax(52px, 1fr) minmax(24px, auto)')
+      expect(normalized(getComputedStyle(launcher).gridTemplateRows)).toBe('44px minmax(0, 1fr)')
+      for (const element of [spinRoot, spinContainer, results]) {
+        expect(isZero(getComputedStyle(element).minHeight)).toBe(true)
+        expect(getComputedStyle(element).height).toBe('100%')
+      }
+      expect(getComputedStyle(results).overflowY).toBe('auto')
+      expect(getComputedStyle(status).maxHeight).toBe('72px')
+      expect(getComputedStyle(status).overflow).toBe('hidden')
+      const autoScrollers = [surface, ...surface.querySelectorAll<HTMLElement>('*')].filter(
+        (element) => getComputedStyle(element).overflowY === 'auto',
+      )
+      expect(autoScrollers).toEqual([results])
+    } finally {
+      await mounted.unmount()
+      style.remove()
+    }
   })
 
   it('keeps the slim result scrollbar visible without hover', () => {
+    expect(stylesSource).toMatch(/\.result-list\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
     expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
     expect(stylesSource).toMatch(
       /\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
+    expect(stylesSource).toMatch(
+      /@media \(prefers-color-scheme: dark\)[\s\S]*\.result-list\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
+    )
     expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )

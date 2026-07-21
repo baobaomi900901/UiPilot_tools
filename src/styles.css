@@ -29,7 +29,7 @@ input {
 
 .launcher-surface {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(24px, auto);
+  grid-template-rows: minmax(52px, 1fr) minmax(24px, auto);
   width: min(100%, 720px);
   height: min(100%, 420px);
   padding: 12px;
@@ -46,7 +46,7 @@ input {
   min-height: 0;
 }
 
-.launcher-view > .ant-spin-nested-loading,
+.launcher-view > .ant-spin,
 .launcher-view .ant-spin-container,
 .result-list {
   min-height: 0;
@@ -121,7 +121,9 @@ input {
 
 .status-region {
   min-height: 24px;
+  max-height: 72px;
   padding-top: 5px;
+  overflow: hidden;
   color: #404040;
   font-size: 0.875rem;
 }
