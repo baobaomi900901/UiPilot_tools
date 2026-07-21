@@ -54,8 +54,27 @@ input {
 }
 
 .result-list {
+  --result-scrollbar-thumb: rgba(64, 64, 64, 0.48);
+
   overflow-y: auto;
   border-block: 1px solid #d9d9d9;
+}
+
+.result-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.result-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.result-list::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+}
+
+.result-list:hover::-webkit-scrollbar-thumb {
+  background: var(--result-scrollbar-thumb);
 }
 
 .result-row {
@@ -218,6 +237,10 @@ input {
     border-color: #595959;
   }
 
+  .result-list {
+    --result-scrollbar-thumb: rgba(217, 217, 217, 0.55);
+  }
+
   .result-row.is-selected {
     background: #263b4d;
     box-shadow: inset 3px 0 #69b1ff;
@@ -242,6 +265,11 @@ input {
     background: Highlight;
     color: HighlightText;
     box-shadow: inset 3px 0 HighlightText;
+  }
+
+  .result-list::-webkit-scrollbar-thumb,
+  .result-list:hover::-webkit-scrollbar-thumb {
+    background: ButtonText;
   }
 
   :focus-visible {
