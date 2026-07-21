@@ -244,7 +244,23 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                   else optionRefs.current.delete(item.key)
                 }}
               >
-                <span className="app-mark" aria-hidden="true" />
+                <span className="result-icon" aria-hidden="true">
+                  <span className="app-mark" hidden={item.icon !== undefined} />
+                  {item.icon ? (
+                    <img
+                      className="result-icon-image"
+                      src={item.icon}
+                      alt=""
+                      aria-hidden="true"
+                      draggable={false}
+                      onError={(event) => {
+                        event.currentTarget.hidden = true
+                        const fallback = event.currentTarget.previousElementSibling
+                        if (fallback instanceof HTMLElement) fallback.hidden = false
+                      }}
+                    />
+                  ) : null}
+                </span>
                 <span className="result-copy">
                   <span className="result-title">{item.title}</span>
                   {item.subtitle ? <span className="result-subtitle">{item.subtitle}</span> : null}

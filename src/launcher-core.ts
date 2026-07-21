@@ -122,6 +122,15 @@ const NOTICE_TEXT = {
 const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
 const FALLBACK_ERROR = '操作不可用，请重试。'
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
+const ICON_PREFIX = 'data:image/png;base64,'
+const MAX_ICON_LENGTH = 65_536
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
+function safeApplicationIcon(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > MAX_ICON_LENGTH || !value.startsWith(ICON_PREFIX)) return undefined
+  const payload = value.slice(ICON_PREFIX.length)
+  return payload.length > 0 && BASE64.test(payload) ? value : undefined
+}
 
 function errorText(value: unknown): string {
   if (typeof value !== 'object' || value === null || !Object.prototype.hasOwnProperty.call(value, 'code')) return FALLBACK_ERROR
@@ -131,7 +140,14 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle }) => Object.freeze(subtitle === undefined ? { key, title } : { key, title, subtitle })),
+    model.results.map(({ key, title, subtitle, icon }) =>
+      Object.freeze({
+        key,
+        title,
+        ...(subtitle === undefined ? {} : { subtitle }),
+        ...(icon === undefined ? {} : { icon }),
+      }),
+    ),
   )
   const settings = model.settings
     ? Object.freeze({
@@ -373,12 +389,16 @@ export function createLauncherCore(client: LauncherClient): LauncherCore {
     model.searchPending = false
     if (response !== null) {
       model.requestId = response.requestId
-      model.results = response.items.map((item: ResultItem) => ({
-        key: resultKey++,
-        resultId: item.resultId,
-        title: item.title,
-        ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
-      }))
+      model.results = response.items.map((item: ResultItem) => {
+        const icon = safeApplicationIcon(item.icon)
+        return {
+          key: resultKey++,
+          resultId: item.resultId,
+          title: item.title,
+          ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
+          ...(icon === undefined ? {} : { icon }),
+        }
+      })
       model.selectedIndex = model.results.length ? 0 : -1
       model.status = model.results.length ? '' : '未找到应用'
     }

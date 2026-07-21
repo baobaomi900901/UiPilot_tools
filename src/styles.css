@@ -96,6 +96,58 @@ input {
   opacity: 0.65;
 }
 
+.result-icon {
+  display: grid;
+  place-items: center;
+  align-self: center;
+  width: 28px;
+  height: 28px;
+  margin-top: 0;
+}
+
+.result-icon > * {
+  grid-area: 1 / 1;
+}
+
+.result-icon > [hidden] {
+  display: none;
+}
+
+.result-icon .app-mark {
+  position: relative;
+  align-self: center;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  background: none;
+}
+
+.result-icon .app-mark::before,
+.result-icon .app-mark::after {
+  position: absolute;
+  content: "";
+}
+
+.result-icon .app-mark::before {
+  inset-block: 0;
+  left: 50%;
+  border-left: 1px solid currentColor;
+}
+
+.result-icon .app-mark::after {
+  inset-inline: 0;
+  top: 50%;
+  border-top: 1px solid currentColor;
+}
+
+.result-icon-image {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+}
+
 .result-copy {
   display: grid;
   gap: 2px;
@@ -267,6 +319,11 @@ input {
 
   .result-list::-webkit-scrollbar-thumb {
     background: ButtonText;
+  }
+
+  .result-icon .app-mark {
+    forced-color-adjust: none;
+    color: ButtonText;
   }
 
   :focus-visible {

@@ -90,6 +90,7 @@ export interface ViewResult {
   key: number
   title: string
   subtitle?: string
+  icon?: string
 }
 
 export interface AliasControlView {

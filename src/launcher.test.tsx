@@ -418,6 +418,37 @@ describe('shown and search ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot().status).toBe('')
   })
+
+  it('keeps only strict bounded PNG data icons', async () => {
+    const { core, client, emit } = await startedCore()
+    const valid = `data:image/png;base64,${'A'.repeat(65_512)}`
+    const invalid = [
+      'data:image/png;base64,',
+      'data:image/svg+xml;base64,AAAA',
+      'file:///C:/private/icon.png',
+      'https://example.invalid/icon.png',
+      'data:image/png;base64,AAA',
+      'data:image/png;base64,AA=A',
+      'data:image/png;base64,AAAA===',
+      'data:image/png;base64,AA_A',
+      'data:image/png;base64,AA%2F',
+      'data:image/png;base64,AAAA\n',
+      `data:image/png;base64,${'A'.repeat(65_516)}`,
+    ]
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'icons',
+      items: [
+        { resultId: 'valid', title: 'Valid', icon: valid },
+        ...invalid.map((icon, index) => ({ resultId: `bad-${index}`, title: `Bad ${index}`, icon })),
+      ],
+    })
+    emit(shown('icons'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results[0]?.icon).toBe(valid)
+    expect(core.getSnapshot().results.slice(1).every((item) => item.icon === undefined)).toBe(true)
+  })
 })
 
 describe('execute and hide ownership', () => {
@@ -1118,19 +1149,31 @@ describe('React view and accessibility', () => {
 
   it('keeps launcher chrome separated and gives scrolling only to results', async () => {
     installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const style = document.createElement('style')
     style.textContent = stylesSource
     document.head.append(style)
-    const { core } = await startedCore()
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'layout',
+      items: [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==' }],
+    })
     const mounted = await mountLauncherView(core)
     mounted.host.id = 'app'
     try {
+      await act(async () => emit(shown('layout')))
+      await act(async () =>
+        core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'layout', inputType: 'insertText' }),
+      )
+      await vi.waitFor(() => expect(mounted.host.querySelector('.result-icon')).toBeInstanceOf(HTMLElement))
       const app = mounted.host.querySelector<HTMLElement>(':scope > .ant-app')!
       const surface = app.querySelector<HTMLElement>('.launcher-surface')!
       const launcher = surface.querySelector<HTMLElement>('.launcher-view')!
       const spinRoot = launcher.querySelector<HTMLElement>(':scope > .ant-spin')!
       const spinContainer = spinRoot.querySelector<HTMLElement>('.ant-spin-container')!
       const results = spinContainer.querySelector<HTMLElement>('.result-list')!
+      const icon = results.querySelector<HTMLElement>('.result-icon')!
+      const image = icon.querySelector<HTMLImageElement>('.result-icon-image')!
       const status = surface.querySelector<HTMLElement>('.status-region')!
       const normalized = (value: string) => value.replace(/\s+/g, ' ').trim()
       const isZero = (value: string) => /^0(?:px)?$/.test(value)
@@ -1143,12 +1186,22 @@ describe('React view and accessibility', () => {
         expect(getComputedStyle(element).height).toBe('100%')
       }
       expect(getComputedStyle(results).overflowY).toBe('auto')
+      expect(getComputedStyle(icon).width).toBe('28px')
+      expect(getComputedStyle(icon).height).toBe('28px')
+      expect(getComputedStyle(icon).alignSelf).toBe('center')
+      expect(getComputedStyle(icon).marginTop).toBe('0px')
+      expect(getComputedStyle(image).objectFit).toBe('contain')
       expect(getComputedStyle(status).maxHeight).toBe('72px')
       expect(getComputedStyle(status).overflow).toBe('hidden')
       const autoScrollers = [surface, ...surface.querySelectorAll<HTMLElement>('*')].filter(
         (element) => getComputedStyle(element).overflowY === 'auto',
       )
       expect(autoScrollers).toEqual([results])
+      expect(stylesSource).toMatch(/\.result-icon \.app-mark::before[\s\S]*border-left:\s*1px solid currentColor;/)
+      expect(stylesSource).toMatch(/\.result-icon \.app-mark::after[\s\S]*border-top:\s*1px solid currentColor;/)
+      expect(stylesSource).toMatch(
+        /@media \(forced-colors: active\)[\s\S]*\.result-icon \.app-mark\s*\{[^}]*forced-color-adjust:\s*none;[^}]*color:\s*ButtonText;/,
+      )
     } finally {
       await mounted.unmount()
       style.remove()
@@ -1169,6 +1222,67 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
+  })
+
+  it('shows real icons, falls back on error, and resets the error for a new src', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const firstIcon = 'data:image/png;base64,iVBORw=='
+    const secondIcon = 'data:image/png;base64,iVBORw0K'
+    vi.mocked(fake.client.searchApps)
+      .mockResolvedValueOnce({
+        requestId: 'first-icons',
+        items: [
+          { resultId: 'with-icon', title: 'With icon', icon: firstIcon },
+          { resultId: 'without-icon', title: 'Without icon' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        requestId: 'second-icons',
+        items: [{ resultId: 'new-icon', title: 'New icon', icon: secondIcon }],
+      })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => fake.emit(shown('icon-view')))
+      await act(async () =>
+        core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' }),
+      )
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+
+      const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+      const image = rows[0]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const fallback = rows[0]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      expect(image).toBeInstanceOf(HTMLImageElement)
+      expect(fallback).toBeInstanceOf(HTMLElement)
+      expect(image!.alt).toBe('')
+      expect(image!.getAttribute('aria-hidden')).toBe('true')
+      expect(image!.draggable).toBe(false)
+      expect(image!.hidden).toBe(false)
+      expect(fallback!.hidden).toBe(true)
+      expect(rows[1]!.querySelector('.result-icon-image')).toBeNull()
+      expect(rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')?.hidden).toBe(false)
+
+      await act(async () => image!.dispatchEvent(new Event('error')))
+      expect(image!.hidden).toBe(true)
+      expect(fallback!.hidden).toBe(false)
+
+      await act(async () =>
+        core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'new icon', inputType: 'insertText' }),
+      )
+      await vi.waitFor(() =>
+        expect(mounted.host.querySelector<HTMLImageElement>('.result-icon-image')?.src).toContain(secondIcon),
+      )
+      const nextImage = mounted.host.querySelector<HTMLImageElement>('.result-icon-image')!
+      const nextFallback = mounted.host.querySelector<HTMLElement>('.result-icon .app-mark')!
+      expect(nextImage).not.toBe(image)
+      expect(nextImage.hidden).toBe(false)
+      expect(nextFallback.hidden).toBe(true)
+    } finally {
+      await mounted.unmount()
+    }
   })
 
   it('renders local combobox/listbox ownership and keeps the active option visible', async () => {
