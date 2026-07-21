@@ -1122,16 +1122,14 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/\.result-list\s*\{[^}]*overflow-y:\s*auto;/s)
   })
 
-  it('styles only the result list scrollbar as a slim hover overlay', () => {
+  it('keeps the slim result scrollbar visible without hover', () => {
     expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
     expect(stylesSource).toMatch(
-      /\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*transparent;[^}]*border-radius:\s*3px;/s,
+      /\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
     )
+    expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
     expect(stylesSource).toMatch(
-      /\.result-list:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);/s,
-    )
-    expect(stylesSource).toMatch(
-      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,[\s\S]*\.result-list:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
+      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
   })
 

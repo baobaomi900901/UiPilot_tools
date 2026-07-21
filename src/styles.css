@@ -69,12 +69,8 @@ input {
 }
 
 .result-list::-webkit-scrollbar-thumb {
-  background: transparent;
-  border-radius: 3px;
-}
-
-.result-list:hover::-webkit-scrollbar-thumb {
   background: var(--result-scrollbar-thumb);
+  border-radius: 3px;
 }
 
 .result-row {
@@ -267,8 +263,7 @@ input {
     box-shadow: inset 3px 0 HighlightText;
   }
 
-  .result-list::-webkit-scrollbar-thumb,
-  .result-list:hover::-webkit-scrollbar-thumb {
+  .result-list::-webkit-scrollbar-thumb {
     background: ButtonText;
   }
 
