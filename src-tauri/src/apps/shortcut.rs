@@ -105,6 +105,7 @@ mod tests {
     use windows::{
         core::{Interface, PCWSTR},
         Win32::{
+            Security::Cryptography::{CryptStringToBinaryW, CRYPT_STRING_BASE64},
             System::Com::{
                 CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
@@ -122,6 +123,30 @@ mod tests {
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain([0]).collect()
+    }
+
+    fn decode_icon(icon: &str) -> Vec<u8> {
+        let payload = icon.strip_prefix("data:image/png;base64,").unwrap();
+        let payload = payload.encode_utf16().collect::<Vec<_>>();
+        let mut length = 0;
+        unsafe {
+            CryptStringToBinaryW(&payload, CRYPT_STRING_BASE64, None, &mut length, None, None)
+        }
+        .unwrap();
+        let mut decoded = vec![0; length as usize];
+        unsafe {
+            CryptStringToBinaryW(
+                &payload,
+                CRYPT_STRING_BASE64,
+                Some(decoded.as_mut_ptr()),
+                &mut length,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        decoded.truncate(length as usize);
+        decoded
     }
 
     struct ComGuard;
@@ -169,9 +194,16 @@ mod tests {
             metadata.executable,
             Some(PathBuf::from(r"Z:\missing\NativeApp.exe"))
         );
-        assert!(metadata.icon.as_deref().is_some_and(|icon| {
-            icon.starts_with("data:image/png;base64,iVBORw0KGgo") && icon.len() <= 65_536
-        }));
+        let icon = metadata.icon.as_deref().unwrap();
+        assert!(icon.len() <= 65_536);
+        let png = decode_icon(icon);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(u32::from_be_bytes(png[8..12].try_into().unwrap()), 13);
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 32);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 32);
+        assert_eq!(png[24], 8);
+        assert_eq!(png[25], 6);
         fs::remove_dir_all(shortcut.parent().unwrap()).unwrap();
     }
 

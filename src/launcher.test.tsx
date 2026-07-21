@@ -1300,6 +1300,7 @@ describe('React view and accessibility', () => {
         items: [
           { resultId: 'with-icon', title: 'With icon', icon: firstIcon },
           { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon },
+          { resultId: 'without-icon', title: 'Without icon' },
         ],
       })
       .mockResolvedValueOnce({
@@ -1314,13 +1315,15 @@ describe('React view and accessibility', () => {
       await act(async () =>
         core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' }),
       )
-      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
 
       const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
       const image = rows[0]!.querySelector<HTMLImageElement>('.result-icon-image')
       const fallback = rows[0]!.querySelector<HTMLElement>('.result-icon .app-mark')
       const siblingImage = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
       const siblingFallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const missingImage = rows[2]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const missingFallback = rows[2]!.querySelector<HTMLElement>('.result-icon .app-mark')
       expect(image).toBeInstanceOf(HTMLImageElement)
       expect(fallback).toBeInstanceOf(HTMLElement)
       expect(siblingImage).toBeInstanceOf(HTMLImageElement)
@@ -1332,6 +1335,9 @@ describe('React view and accessibility', () => {
       expect(fallback!.hidden).toBe(true)
       expect(siblingImage!.hidden).toBe(false)
       expect(siblingFallback!.hidden).toBe(true)
+      expect(missingImage).toBeNull()
+      expect(missingFallback).toBeInstanceOf(HTMLElement)
+      expect(missingFallback!.hidden).toBe(false)
 
       await act(async () => image!.dispatchEvent(new Event('error')))
       expect(image!.hidden).toBe(true)

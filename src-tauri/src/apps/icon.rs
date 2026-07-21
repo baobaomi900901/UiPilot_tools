@@ -62,10 +62,21 @@ fn bitmap_png_data_url(bitmap: HBITMAP) -> Option<String> {
     let source =
         unsafe { factory.CreateBitmapFromHBITMAP(bitmap, HPALETTE::default(), WICBitmapUseAlpha) }
             .ok()?;
-    let bytes = vec![0_u8; MAX_PNG_BYTES];
+    let mut bytes = vec![0_u8; MAX_PNG_BYTES];
+    let buffer_length = u32::try_from(bytes.len()).ok()?;
     let written = {
         let stream = unsafe { factory.CreateStream() }.ok()?;
-        unsafe { stream.InitializeFromMemory(&bytes) }.ok()?;
+        // SAFETY: the pointer comes from the mutable Vec allocation WIC writes into. The Vec is
+        // neither moved, resized, nor accessed until frame, encoder, and stream drop at block end.
+        unsafe {
+            (Interface::vtable(&stream).InitializeFromMemory)(
+                Interface::as_raw(&stream),
+                bytes.as_mut_ptr().cast_const(),
+                buffer_length,
+            )
+        }
+        .ok()
+        .ok()?;
         let encoder =
             unsafe { factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()) }.ok()?;
         unsafe { encoder.Initialize(&*stream, WICBitmapEncoderNoCache) }.ok()?;
