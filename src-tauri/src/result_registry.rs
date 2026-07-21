@@ -8,8 +8,6 @@ use std::{
     },
 };
 
-use crate::model::{ResultItem, SearchResponse};
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
     LaunchApplication {
@@ -104,15 +102,22 @@ impl ResultRegistry {
         })
     }
 
-    pub(crate) fn publish_if_latest(
+    pub(crate) fn publish_if_latest<T, R, A, F>(
         &self,
         token: QueryToken,
-        entries: Vec<(ResultItem, ResultAction)>,
-    ) -> Option<SearchResponse> {
+        entries: Vec<(T, ResultAction)>,
+        authorize: A,
+        response: F,
+    ) -> Option<R>
+    where
+        A: FnOnce() -> bool,
+        F: FnOnce(String, Vec<(String, T)>) -> R,
+    {
         let mut state = self.state.lock().expect("result registry lock poisoned");
         if !state.active
             || token.generation != state.generation
             || token.query_sequence != state.latest_query_sequence
+            || !authorize()
         {
             return None;
         }
@@ -120,17 +125,17 @@ impl ResultRegistry {
         let request_id = self.allocate_id("req");
         let mut items = Vec::with_capacity(entries.len());
         let mut actions = HashMap::with_capacity(entries.len());
-        for (mut item, action) in entries {
-            item.result_id = self.allocate_id("item");
-            actions.insert(item.result_id.clone(), action);
-            items.push(item);
+        for (item, action) in entries {
+            let result_id = self.allocate_id("item");
+            actions.insert(result_id.clone(), action);
+            items.push((result_id, item));
         }
 
         state.current = Some(ResultSet {
             request_id: request_id.clone(),
             actions,
         });
-        Some(SearchResponse { request_id, items })
+        Some(response(request_id, items))
     }
 
     pub(crate) fn resolve(
@@ -176,12 +181,17 @@ impl ResultRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{cell::Cell, path::PathBuf};
 
     use serde_json::Value;
 
-    use super::{RegistryError, ResultAction, ResultRegistry};
-    use crate::model::ResultItem;
+    use super::{QueryToken, RegistryError, ResultAction, ResultRegistry};
+    use crate::model::{ResultItem, SearchResponse};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FileDraft {
+        name: &'static str,
+    }
 
     fn item(result_id: &str, title: &str) -> ResultItem {
         ResultItem {
@@ -200,21 +210,129 @@ mod tests {
         }
     }
 
+    fn publish_app(
+        registry: &ResultRegistry,
+        token: QueryToken,
+        entries: Vec<(ResultItem, ResultAction)>,
+    ) -> Option<SearchResponse> {
+        registry.publish_if_latest(
+            token,
+            entries,
+            || true,
+            |request_id, items| SearchResponse {
+                request_id,
+                items: items
+                    .into_iter()
+                    .map(|(result_id, mut item)| {
+                        item.result_id = result_id;
+                        item
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn generic_publication_reuses_existing_ids_mapping_and_hide() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let token = registry.begin_query("inv-1", 1).unwrap();
+        let expected = [action("first"), action("second")];
+        let response = registry
+            .publish_if_latest(
+                token,
+                vec![
+                    (FileDraft { name: "First" }, expected[0].clone()),
+                    (FileDraft { name: "Second" }, expected[1].clone()),
+                ],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+
+        assert_eq!(response.0, "req-0000000000000001");
+        assert_eq!(response.1[0].0, "item-0000000000000002");
+        assert_eq!(response.1[1].0, "item-0000000000000003");
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[0].0),
+            Ok(expected[0].clone())
+        );
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[1].0),
+            Ok(expected[1].clone())
+        );
+
+        registry.hide_and_clear();
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[0].0),
+            Err(RegistryError::StaleRequest)
+        );
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[1].0),
+            Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn authorization_rejection_has_zero_side_effects_and_consumes_no_ids() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let token = registry.begin_query("inv-1", 1).unwrap();
+        let current_action = action("current");
+        let current = publish_app(
+            &registry,
+            token,
+            vec![(item("", "Current"), current_action.clone())],
+        )
+        .unwrap();
+        let response_called = Cell::new(false);
+
+        assert!(registry
+            .publish_if_latest(
+                token,
+                vec![(FileDraft { name: "Rejected" }, action("rejected"))],
+                || false,
+                |request_id, items| {
+                    response_called.set(true);
+                    (request_id, items)
+                },
+            )
+            .is_none());
+        assert!(!response_called.get());
+        assert_eq!(
+            registry
+                .resolve(&current.request_id, &current.items[0].result_id)
+                .unwrap(),
+            current_action
+        );
+
+        let accepted = registry
+            .publish_if_latest(
+                token,
+                vec![(FileDraft { name: "Accepted" }, action("accepted"))],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        assert_eq!(accepted.0, "req-0000000000000003");
+        assert_eq!(accepted.1[0].0, "item-0000000000000004");
+    }
+
     #[test]
     fn latest_publish_assigns_opaque_ids_and_replaces_supplied_ids() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
         let token = registry.begin_query("invocation-1", 1).unwrap();
 
-        let response = registry
-            .publish_if_latest(
-                token,
-                vec![
-                    (item("forged-1", "First"), action("first")),
-                    (item("forged-2", "Second"), action("second")),
-                ],
-            )
-            .unwrap();
+        let response = publish_app(
+            &registry,
+            token,
+            vec![
+                (item("forged-1", "First"), action("first")),
+                (item("forged-2", "Second"), action("second")),
+            ],
+        )
+        .unwrap();
 
         assert_eq!(response.request_id, "req-0000000000000001");
         assert_eq!(response.items[0].result_id, "item-0000000000000002");
@@ -229,12 +347,12 @@ mod tests {
         let expected = action("calculator");
         registry.on_show("invocation-1".into());
         let token = registry.begin_query("invocation-1", 1).unwrap();
-        let response = registry
-            .publish_if_latest(
-                token,
-                vec![(item("forged", "Calculator"), expected.clone())],
-            )
-            .unwrap();
+        let response = publish_app(
+            &registry,
+            token,
+            vec![(item("forged", "Calculator"), expected.clone())],
+        )
+        .unwrap();
 
         assert_eq!(
             registry
@@ -256,13 +374,16 @@ mod tests {
         let first = registry.begin_query("invocation-1", 1).unwrap();
         let second = registry.begin_query("invocation-1", 2).unwrap();
         let expected = action("second");
-        let current = registry
-            .publish_if_latest(second, vec![(item("", "Second"), expected.clone())])
-            .unwrap();
+        let current = publish_app(
+            &registry,
+            second,
+            vec![(item("", "Second"), expected.clone())],
+        )
+        .unwrap();
 
-        assert!(registry
-            .publish_if_latest(first, vec![(item("", "First"), action("first"))])
-            .is_none());
+        assert!(
+            publish_app(&registry, first, vec![(item("", "First"), action("first"))],).is_none()
+        );
         assert_eq!(
             registry
                 .resolve(&current.request_id, &current.items[0].result_id)
@@ -285,9 +406,8 @@ mod tests {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
         let first = registry.begin_query("invocation-1", 1).unwrap();
-        let response = registry
-            .publish_if_latest(first, vec![(item("", "First"), action("first"))])
-            .unwrap();
+        let response =
+            publish_app(&registry, first, vec![(item("", "First"), action("first"))]).unwrap();
 
         assert!(registry.begin_query("invocation-1", 2).is_some());
         assert_eq!(
@@ -304,9 +424,7 @@ mod tests {
 
         registry.hide_and_clear();
 
-        assert!(registry
-            .publish_if_latest(token, vec![(item("", "Late"), action("late"))])
-            .is_none());
+        assert!(publish_app(&registry, token, vec![(item("", "Late"), action("late"))],).is_none());
     }
 
     #[test]
@@ -316,9 +434,12 @@ mod tests {
         registry.on_show("new-invocation".into());
         let token = registry.begin_query("new-invocation", 1).unwrap();
         let expected = action("current");
-        let current = registry
-            .publish_if_latest(token, vec![(item("", "Current"), expected.clone())])
-            .unwrap();
+        let current = publish_app(
+            &registry,
+            token,
+            vec![(item("", "Current"), expected.clone())],
+        )
+        .unwrap();
 
         assert!(registry.begin_query("old-invocation", 2).is_none());
         assert_eq!(
@@ -334,9 +455,12 @@ mod tests {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
         let token = registry.begin_query("invocation-1", 1).unwrap();
-        let response = registry
-            .publish_if_latest(token, vec![(item("", "Secret"), action("secret"))])
-            .unwrap();
+        let response = publish_app(
+            &registry,
+            token,
+            vec![(item("", "Secret"), action("secret"))],
+        )
+        .unwrap();
 
         let stale = registry
             .resolve("unknown-request", &response.items[0].result_id)
@@ -358,9 +482,12 @@ mod tests {
         let registry = ResultRegistry::default();
         registry.on_show("invocation-1".into());
         let token = registry.begin_query("invocation-1", 1).unwrap();
-        let response = registry
-            .publish_if_latest(token, vec![(item("", "Calculator"), action("calculator"))])
-            .unwrap();
+        let response = publish_app(
+            &registry,
+            token,
+            vec![(item("", "Calculator"), action("calculator"))],
+        )
+        .unwrap();
 
         let json: Value = serde_json::to_value(response).unwrap();
         assert!(json.get("requestId").is_some());
@@ -383,16 +510,16 @@ mod tests {
         registry.on_show("new-invocation".into());
         let current_token = registry.begin_query("new-invocation", 1).unwrap();
         let current_action = action("current");
-        let current = registry
-            .publish_if_latest(
-                current_token,
-                vec![(item("", "Current"), current_action.clone())],
-            )
-            .unwrap();
+        let current = publish_app(
+            &registry,
+            current_token,
+            vec![(item("", "Current"), current_action.clone())],
+        )
+        .unwrap();
 
-        assert!(registry
-            .publish_if_latest(stale, vec![(item("", "Stale"), action("stale"))])
-            .is_none());
+        assert!(
+            publish_app(&registry, stale, vec![(item("", "Stale"), action("stale"))],).is_none()
+        );
         assert_eq!(
             registry
                 .resolve(&current.request_id, &current.items[0].result_id)
@@ -401,9 +528,12 @@ mod tests {
         );
 
         let next_token = registry.begin_query("new-invocation", 2).unwrap();
-        let next = registry
-            .publish_if_latest(next_token, vec![(item("", "Next"), action("next"))])
-            .unwrap();
+        let next = publish_app(
+            &registry,
+            next_token,
+            vec![(item("", "Next"), action("next"))],
+        )
+        .unwrap();
         assert_eq!(next.request_id, "req-0000000000000003");
         assert_eq!(next.items[0].result_id, "item-0000000000000004");
     }
