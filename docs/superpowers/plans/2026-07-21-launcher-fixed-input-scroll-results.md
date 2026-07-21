@@ -15,7 +15,7 @@
 - `src/launcher-view.tsx`、`src/launcher-core.ts`、协议、Rust 后端、窗口配置和设置页保持不变。
 - 输入焦点、上下选择、Enter、Escape、输入法组合态和 `scrollIntoView({ block: 'nearest' })` 行为保持不变。
 - 启动器视图只有 `.result-list` 使用 `overflow-y: auto`；设置页现有滚动不在本任务范围内。
-- 结果滚动条使用 `6px` 透明轨道和悬停滑块；不增加 JavaScript、DOM 或第三方滚动组件。
+- 结果滚动条使用 `6px` 透明轨道和默认可见滑块；不增加 hover 后才显示的分支、JavaScript、DOM 或第三方滚动组件。
 
 ---
 
@@ -116,11 +116,11 @@ git commit -m "修复：固定启动器输入与状态区域" -m "补齐 AntD Ap
 在 Task 1 的 CSS 契约测试后加入：
 
 ```ts
-it('styles only the result list scrollbar as a slim hover overlay', () => {
+it('keeps the slim result scrollbar visible without hover', () => {
   expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
-  expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*transparent;[^}]*border-radius:\s*3px;/s)
-  expect(stylesSource).toMatch(/\.result-list:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);/s)
-  expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,[\s\S]*\.result-list:hover::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s)
+  expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s)
+  expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
+  expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s)
 })
 ```
 
@@ -148,12 +148,8 @@ Expected: 新测试因缺少 `.result-list::-webkit-scrollbar` 规则失败，Ta
 }
 
 .result-list::-webkit-scrollbar-thumb {
-  background: transparent;
-  border-radius: 3px;
-}
-
-.result-list:hover::-webkit-scrollbar-thumb {
   background: var(--result-scrollbar-thumb);
+  border-radius: 3px;
 }
 ```
 
@@ -166,8 +162,7 @@ Expected: 新测试因缺少 `.result-list::-webkit-scrollbar` 规则失败，Ta
 在现有强制颜色媒体查询中加入：
 
 ```css
-.result-list::-webkit-scrollbar-thumb,
-.result-list:hover::-webkit-scrollbar-thumb {
+.result-list::-webkit-scrollbar-thumb {
   background: ButtonText;
 }
 ```
