@@ -2124,18 +2124,16 @@ mod tests {
             Err(BackendError::InvalidData)
         ));
         assert!(validate_pinned_shape(attributes, None, PinnedPathPolicy::EventLeaf).is_ok());
-        let production = include_str!("windows_backend.rs")
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
+        let source = include_str!("windows_backend.rs");
+        let test_module_marker = ["mod", "tests {"].join(" ");
+        assert_eq!(source.matches(&test_module_marker).count(), 1);
+        let production = source.split_once(&test_module_marker).unwrap().0;
         assert_eq!(production.matches("PinnedPathPolicy::EventLeaf").count(), 1);
-        let read_path_update = production
-            .split("fn read_path_update(")
-            .nth(1)
+        let read_path_update = production.split_once("fn read_path_update(").unwrap().1;
+        let read_path_update = read_path_update
+            .split_once("pub(super) struct ScanSummary")
             .unwrap()
-            .split("\n}\n")
-            .next()
-            .unwrap();
+            .0;
         assert!(read_path_update.contains("open_pinned_with_policy"));
         assert!(read_path_update.contains("PinnedPathPolicy::EventLeaf"));
     }
