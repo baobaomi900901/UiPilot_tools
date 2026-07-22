@@ -87,34 +87,6 @@ pub(crate) fn commit_with_backup(
     commit_with(paths, previous, candidate, write_synced, replace_file)
 }
 
-pub(crate) fn replace_without_backup(
-    destination: &Path,
-    candidate: &[u8],
-) -> Result<(), AtomicFileError> {
-    replace_without_backup_with(destination, candidate, write_synced, replace_file)
-}
-
-fn replace_without_backup_with<W, R>(
-    destination: &Path,
-    candidate: &[u8],
-    mut write_synced: W,
-    mut replace: R,
-) -> Result<(), AtomicFileError>
-where
-    W: FnMut(&Path, &[u8]) -> io::Result<()>,
-    R: FnMut(&Path, &Path, MOVE_FILE_FLAGS) -> io::Result<()>,
-{
-    let candidate_temp = sibling_temp(destination, "temp");
-    if write_synced(&candidate_temp, candidate).is_err() {
-        return Err(AtomicFileError::CandidateWrite);
-    }
-    if replace(&candidate_temp, destination, replace_flags()).is_err() {
-        remove_temp(&candidate_temp);
-        return Err(AtomicFileError::CurrentReplace);
-    }
-    Ok(())
-}
-
 fn commit_with<W, R>(
     paths: &AtomicPaths,
     previous: Option<&[u8]>,
@@ -490,45 +462,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(contents.contains(&b"first-invalid".to_vec()));
         assert!(contents.contains(&b"second-invalid".to_vec()));
-    }
-
-    #[test]
-    fn replace_without_backup_only_replaces_current() {
-        let dir = TestDir::new("replace-without-backup");
-        let paths = AtomicPaths::new(dir.path(), "validation-data.json");
-        fs::write(paths.current(), b"old").unwrap();
-
-        replace_without_backup(paths.current(), b"new").unwrap();
-
-        assert_eq!(fs::read(paths.current()).unwrap(), b"new");
-        assert!(!paths.backup().exists());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn replace_without_backup_collision_preserves_foreign_temp() {
-        let dir = TestDir::new("replace-without-backup-collision");
-        let destination = dir.path().join("validation-data.json");
-        let mut foreign_temp = None;
-
-        let error = replace_without_backup_with(
-            &destination,
-            b"candidate",
-            |path, bytes| {
-                fs::write(path, b"foreign-replacement")?;
-                foreign_temp = Some(path.to_path_buf());
-                write_synced(path, bytes)
-            },
-            |_source, _destination, _flags| panic!("replace must not run"),
-        )
-        .unwrap_err();
-
-        assert_eq!(error, AtomicFileError::CandidateWrite);
-        assert_eq!(
-            fs::read(foreign_temp.unwrap()).unwrap(),
-            b"foreign-replacement"
-        );
-        assert!(!destination.exists());
     }
 
     #[test]

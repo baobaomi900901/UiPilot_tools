@@ -11,13 +11,11 @@ use crate::{
         FileResultItem, FileSearchBatch, FileSearchResponse, FileSort, OpenIndexedPath, QuerySpec,
     },
     hotkey::HotkeyKind,
-    lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
+    lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
     plugins::{PluginManager, PluginQueryError},
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate, WindowPosition},
-    validation_data::{ValidationEvent, ValidationStore},
-    validation_export::{choose_export_destination, write_validation_export, ExportDestination},
 };
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
@@ -28,16 +26,13 @@ pub(crate) struct SettingsView {
     hotkey: String,
     autostart: bool,
     file_preview_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    research_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct UserSettingsUpdate {
     hotkey: String,
     autostart: bool,
-    research_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -77,13 +72,6 @@ pub(crate) enum ExecuteOutcome {
     FolderOpenRequested,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
-pub(crate) enum ExportOutcome {
-    Cancelled,
-    Exported,
-}
-
 impl CommandError {
     fn invalid_caller() -> Self {
         Self {
@@ -120,52 +108,10 @@ impl CommandError {
         }
     }
 
-    fn validation_failed() -> Self {
-        Self {
-            code: "validationFailed",
-            message: "validation data operation failed",
-        }
-    }
-
     fn window_failed() -> Self {
         Self {
             code: "windowFailed",
             message: "launcher window operation failed",
-        }
-    }
-
-    fn scan_failed() -> Self {
-        Self {
-            code: "scanFailed",
-            message: "application scan failed",
-        }
-    }
-
-    fn scan_worker_failed() -> Self {
-        Self {
-            code: "scanWorkerFailed",
-            message: "application scan worker failed",
-        }
-    }
-
-    fn main_thread_dispatch_failed() -> Self {
-        Self {
-            code: "mainThreadDispatchFailed",
-            message: "main thread dispatch failed",
-        }
-    }
-
-    fn export_failed() -> Self {
-        Self {
-            code: "exportFailed",
-            message: "validation export failed",
-        }
-    }
-
-    fn export_worker_failed() -> Self {
-        Self {
-            code: "exportWorkerFailed",
-            message: "validation export worker failed",
         }
     }
 
@@ -516,7 +462,6 @@ fn load_settings_core(settings: &SettingsStore) -> SettingsView {
         hotkey: settings.hotkey,
         autostart: settings.autostart,
         file_preview_enabled: settings.file_preview_enabled,
-        research_id: settings.research_id,
     }
 }
 
@@ -527,9 +472,7 @@ fn prepare_settings_save(
     let update = SettingsUpdate {
         hotkey: kind.canonical(),
         autostart: settings.autostart,
-        research_id: settings.research_id,
     };
-    SettingsStore::validate_user_settings(&update)?;
     Ok((kind, update))
 }
 
@@ -716,7 +659,6 @@ fn save_settings_core(
         .update_user_settings(SettingsUpdate {
             hotkey: settings.hotkey,
             autostart: settings.autostart,
-            research_id: settings.research_id,
         })
         .map_err(|_| CommandError::settings_failed())
 }
@@ -732,7 +674,6 @@ pub(crate) async fn execute_result(
     let registry = app.state::<ResultRegistry>();
     let file_index = app.state::<Arc<FileIndex>>();
     let plugins = app.state::<Arc<PluginManager>>();
-    let validation = app.state::<ValidationStore>();
     let settings = app.state::<SettingsStore>();
     let cache = app.state::<Arc<AppCache>>();
     let worker_index = Arc::clone(file_index.inner());
@@ -753,27 +694,25 @@ pub(crate) async fn execute_result(
             authorize_plugin: |plugin_id: &str| plugins.authorizes_clipboard(plugin_id),
             copy_text: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
             clear_and_hide: || clear_and_hide(&registry, &window),
-            record: |event| validation.record(event).map_err(|_| ()),
             increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
         },
     )
     .await
 }
 
-struct ClipboardExecution<R, A, F, P, C, H, V, S> {
+struct ClipboardExecution<R, A, F, P, C, H, S> {
     resolve: R,
     execute: A,
     execute_file: F,
     authorize_plugin: P,
     copy_text: C,
     clear_and_hide: H,
-    record: V,
     increment: S,
 }
 
-async fn execute_result_with_clipboard<R, A, F, Fut, P, C, H, V, S>(
+async fn execute_result_with_clipboard<R, A, F, Fut, P, C, H, S>(
     ids: (&str, &str),
-    execution: ClipboardExecution<R, A, F, P, C, H, V, S>,
+    execution: ClipboardExecution<R, A, F, P, C, H, S>,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
@@ -783,7 +722,6 @@ where
     P: FnOnce(&str) -> bool,
     C: FnOnce(&str) -> Result<(), ()>,
     H: FnOnce() -> Result<(), CommandError>,
-    V: FnOnce(ValidationEvent) -> Result<(), ()>,
     S: FnOnce(&str) -> Result<(), ()>,
 {
     let (request_id, result_id) = ids;
@@ -794,7 +732,6 @@ where
         authorize_plugin,
         copy_text,
         clear_and_hide,
-        record,
         increment,
     } = execution;
     let action = resolve(request_id, result_id).map_err(|error| match error {
@@ -815,7 +752,6 @@ where
         execute,
         execute_file,
         clear_and_hide,
-        record,
         increment,
     )
     .await
@@ -830,13 +766,12 @@ fn map_file_execution_error(error: FileExecutionError) -> CommandError {
     }
 }
 
-async fn execute_resolved_result_with<R, A, F, Fut, H, V, S>(
+async fn execute_resolved_result_with<R, A, F, Fut, H, S>(
     ids: (&str, &str),
     resolve: R,
     execute_application: A,
     execute_file: F,
     clear_and_hide: H,
-    record: V,
     increment: S,
 ) -> Result<ExecuteOutcome, CommandError>
 where
@@ -845,7 +780,6 @@ where
     F: FnOnce(OpenIndexedPath) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     H: FnOnce() -> Result<(), CommandError>,
-    V: FnOnce(ValidationEvent) -> Result<(), ()>,
     S: FnOnce(&str) -> Result<(), ()>,
 {
     let action = resolve(ids.0, ids.1).map_err(|error| match error {
@@ -853,13 +787,9 @@ where
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
     match action {
-        ResultAction::LaunchApplication { .. } => execute_application_result_with(
-            &action,
-            execute_application,
-            clear_and_hide,
-            record,
-            increment,
-        ),
+        ResultAction::LaunchApplication { .. } => {
+            execute_application_result_with(&action, execute_application, clear_and_hide, increment)
+        }
         ResultAction::OpenIndexedPath(action) => {
             let outcome = execute_file(action).await?;
             let response = match outcome {
@@ -874,19 +804,17 @@ where
 }
 
 #[cfg(test)]
-fn execute_result_with<R, A, H, V, S>(
+fn execute_result_with<R, A, H, S>(
     ids: (&str, &str),
     resolve: R,
     execute: A,
     clear_and_hide: H,
-    record: V,
     increment: S,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
     H: FnOnce() -> Result<(), CommandError>,
-    V: FnOnce(ValidationEvent) -> Result<(), ()>,
     S: FnOnce(&str) -> Result<(), ()>,
 {
     let (request_id, result_id) = ids;
@@ -900,231 +828,44 @@ where
     if matches!(action, ResultAction::CopyText { .. }) {
         return Err(CommandError::application_entry_unavailable());
     }
-    execute_application_result_with(&action, execute, clear_and_hide, record, increment)
+    execute_application_result_with(&action, execute, clear_and_hide, increment)
 }
 
-fn execute_application_result_with<A, H, V, S>(
+fn execute_application_result_with<A, H, S>(
     action: &ResultAction,
     execute: A,
     clear_and_hide: H,
-    record: V,
     increment: S,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
     H: FnOnce() -> Result<(), CommandError>,
-    V: FnOnce(ValidationEvent) -> Result<(), ()>,
     S: FnOnce(&str) -> Result<(), ()>,
 {
     let ResultAction::LaunchApplication { app_id, .. } = action else {
         return Err(CommandError::application_entry_unavailable());
     };
     let outcome = execute(action).map_err(|_| CommandError::application_entry_unavailable())?;
-    let (response, event) = outcome_parts(outcome);
+    let response = outcome_parts(outcome);
 
     let window_error = clear_and_hide().err();
-    let validation_error = record(event)
-        .err()
-        .map(|_| CommandError::validation_failed());
     let settings_error = increment(app_id)
         .err()
         .map(|_| CommandError::settings_failed());
 
-    validation_error
-        .or(settings_error)
-        .or(window_error)
-        .map_or(Ok(response), Err)
+    settings_error.or(window_error).map_or(Ok(response), Err)
 }
 
-fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> (ExecuteOutcome, ValidationEvent) {
+fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> ExecuteOutcome {
     match outcome {
-        apps::ApplicationActionOutcome::LaunchRequested => (
-            ExecuteOutcome::LaunchRequested,
-            ValidationEvent::LaunchRequested,
-        ),
-        apps::ApplicationActionOutcome::ActivationRequested => (
-            ExecuteOutcome::ActivationRequested,
-            ValidationEvent::ActivationRequested,
-        ),
-        apps::ApplicationActionOutcome::ActivationRefusedLaunchRequested => (
+        apps::ApplicationActionOutcome::LaunchRequested => ExecuteOutcome::LaunchRequested,
+        apps::ApplicationActionOutcome::ActivationRequested => ExecuteOutcome::ActivationRequested,
+        apps::ApplicationActionOutcome::ActivationRefusedLaunchRequested => {
             ExecuteOutcome::ActivationRefusedLaunchRequested {
                 message: ACTIVATION_REFUSED_MESSAGE,
-            },
-            ValidationEvent::ActivationRefusedLaunchRequested,
-        ),
-    }
-}
-
-#[tauri::command]
-pub(crate) async fn rescan_apps(
-    window: WebviewWindow,
-    cache: State<'_, Arc<AppCache>>,
-) -> Result<(), CommandError> {
-    require_main_window(&window)?;
-    let cache = Arc::clone(cache.inner());
-    rescan_apps_with(move || cache.refresh().map(|_| ()).map_err(|_| ())).await
-}
-
-async fn rescan_apps_with<W>(worker: W) -> Result<(), CommandError>
-where
-    W: FnOnce() -> Result<(), ()> + Send + 'static,
-{
-    let result = tauri::async_runtime::spawn_blocking(worker)
-        .await
-        .map_err(|_| ());
-    map_rescan_result(result)
-}
-
-fn map_rescan_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(())) => Err(CommandError::scan_failed()),
-        Err(()) => Err(CommandError::scan_worker_failed()),
-    }
-}
-
-#[tauri::command]
-pub(crate) async fn export_validation_data(
-    window: WebviewWindow,
-    app: AppHandle,
-    coordinator: State<'_, Arc<LifecycleCoordinator>>,
-    registry: State<'_, ResultRegistry>,
-) -> Result<ExportOutcome, CommandError> {
-    require_main_window(&window)?;
-    let coordinator = Arc::clone(coordinator.inner());
-    let modal_guard = begin_modal_export_with(
-        &coordinator,
-        || window.is_focused().map_err(|_| ()),
-        || clear_and_hide(&registry, &window),
-    )?;
-    let chooser_window = window.clone();
-    export_validation_data_guarded_with(
-        modal_guard,
-        || choose_export_on_main(chooser_window),
-        move |destination| {
-            let app = app.clone();
-            spawn_export_worker(move || {
-                let settings = app.state::<SettingsStore>();
-                let validation = app.state::<ValidationStore>();
-                write_validation_export(destination, &settings, &validation).map_err(|_| ())
-            })
-        },
-    )
-    .await
-}
-
-fn begin_modal_export_with<Q, H>(
-    coordinator: &Arc<LifecycleCoordinator>,
-    query_focus: Q,
-    clear_and_hide: H,
-) -> Result<crate::lifecycle::ModalGuard, CommandError>
-where
-    Q: FnOnce() -> Result<bool, ()>,
-    H: FnOnce() -> Result<(), CommandError>,
-{
-    match coordinator.begin_modal_export(query_focus) {
-        Ok(guard) => Ok(guard),
-        Err(FocusDecision::Suppress) => Err(CommandError::export_failed()),
-        Err(FocusDecision::ClearAndHide) => {
-            let _ = clear_and_hide();
-            Err(CommandError::export_failed())
-        }
-        Err(FocusDecision::ReportWindowFailureAndHide) => {
-            let _window_error = CommandError::window_failed();
-            let _ = clear_and_hide();
-            Err(CommandError::export_failed())
+            }
         }
     }
-}
-
-async fn choose_export_on_main(
-    window: WebviewWindow,
-) -> Result<Option<ExportDestination>, CommandError> {
-    let (sender, mut receiver) = tauri::async_runtime::channel(1);
-    let chooser_window = window.clone();
-    window
-        .run_on_main_thread(move || {
-            let result = chooser_window
-                .hwnd()
-                .map_err(|_| CommandError::export_failed())
-                .and_then(|hwnd| {
-                    choose_export_destination(hwnd).map_err(|_| CommandError::export_failed())
-                });
-            let _ = sender.blocking_send(result);
-        })
-        .map_err(|_| CommandError::main_thread_dispatch_failed())?;
-    receiver
-        .recv()
-        .await
-        .ok_or_else(CommandError::main_thread_dispatch_failed)?
-}
-
-#[cfg(test)]
-async fn export_validation_data_with<D, C, CF, W, WF>(
-    choose: C,
-    write: W,
-) -> Result<ExportOutcome, CommandError>
-where
-    C: FnOnce() -> CF,
-    CF: Future<Output = Result<Option<D>, CommandError>>,
-    W: FnOnce(D) -> WF,
-    WF: Future<Output = Result<(), CommandError>>,
-{
-    export_validation_data_guarded_with((), choose, write).await
-}
-
-async fn export_validation_data_guarded_with<G, D, C, CF, W, WF>(
-    guard: G,
-    choose: C,
-    write: W,
-) -> Result<ExportOutcome, CommandError>
-where
-    C: FnOnce() -> CF,
-    CF: Future<Output = Result<Option<D>, CommandError>>,
-    W: FnOnce(D) -> WF,
-    WF: Future<Output = Result<(), CommandError>>,
-{
-    let destination = choose().await;
-    drop(guard);
-    let Some(destination) = destination? else {
-        return Ok(ExportOutcome::Cancelled);
-    };
-    write(destination).await?;
-    Ok(ExportOutcome::Exported)
-}
-
-async fn spawn_export_worker<W>(writer: W) -> Result<(), CommandError>
-where
-    W: FnOnce() -> Result<(), ()> + Send + 'static,
-{
-    let result = tauri::async_runtime::spawn_blocking(writer)
-        .await
-        .map_err(|_| ());
-    map_export_worker_result(result)
-}
-
-fn map_export_worker_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(())) => Err(CommandError::export_failed()),
-        Err(()) => Err(CommandError::export_worker_failed()),
-    }
-}
-
-#[tauri::command]
-pub(crate) fn clear_validation_data(
-    window: WebviewWindow,
-    validation: State<'_, ValidationStore>,
-) -> Result<(), CommandError> {
-    require_main_window(&window)?;
-    clear_validation_data_with(|| validation.clear_daily_counts().map_err(|_| ()))
-}
-
-fn clear_validation_data_with<C>(clear: C) -> Result<(), CommandError>
-where
-    C: FnOnce() -> Result<(), ()>,
-{
-    clear().map_err(|_| CommandError::validation_failed())
 }
 
 #[tauri::command]
@@ -1188,7 +929,6 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
-        rc::Rc,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex,
@@ -1197,15 +937,12 @@ mod tests {
     };
 
     use super::{
-        begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
-        execute_resolved_result_with, execute_result_with, export_validation_data_guarded_with,
-        export_validation_data_with, load_settings_core, load_settings_ready_with,
-        map_export_worker_result, map_file_preview_worker_result, map_rescan_result,
-        map_save_worker_result, prepare_file_query, prepare_hotkey_save, prepare_settings_save,
-        publish_file_search, require_main_label, rescan_apps_with, save_settings_core,
-        save_settings_with, save_settings_worker_with, search_apps_with, search_files_with,
-        set_file_preview_preference_with, spawn_export_worker, CommandError, ExecuteOutcome,
-        ExportOutcome, FilePreviewPreferenceUpdate, HotkeySettingsUpdate, UserSettingsUpdate,
+        clear_and_hide_with, execute_resolved_result_with, execute_result_with, load_settings_core,
+        load_settings_ready_with, map_file_preview_worker_result, map_save_worker_result,
+        prepare_file_query, prepare_hotkey_save, prepare_settings_save, publish_file_search,
+        require_main_label, save_settings_core, save_settings_with, save_settings_worker_with,
+        search_apps_with, search_files_with, set_file_preview_preference_with, CommandError,
+        ExecuteOutcome, FilePreviewPreferenceUpdate, HotkeySettingsUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -1217,7 +954,6 @@ mod tests {
         lifecycle::LifecycleCoordinator,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore, SettingsUpdate},
-        validation_data::ValidationEvent,
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
@@ -1287,12 +1023,11 @@ mod tests {
         )
     }
 
-    fn settings_store(dir: &TestDir, research_id: Option<&str>) -> SettingsStore {
+    fn settings_store(dir: &TestDir) -> SettingsStore {
         let settings = Settings {
             hotkey: "Alt+Space".into(),
             autostart: false,
             file_preview_enabled: true,
-            research_id: research_id.map(str::to_owned),
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
         };
@@ -1315,9 +1050,6 @@ mod tests {
             "save_settings",
             "save_hotkey",
             "set_file_preview_preference",
-            "rescan_apps",
-            "export_validation_data",
-            "clear_validation_data",
             "hide_launcher",
         ] {
             let trace = RefCell::new(Vec::new());
@@ -1614,7 +1346,7 @@ mod tests {
     #[test]
     fn settings_load_uses_alias_free_wire_contract() {
         let dir = TestDir::new();
-        let store = settings_store(&dir, None);
+        let store = settings_store(&dir);
 
         assert_eq!(
             serde_json::to_value(load_settings_core(&store)).unwrap(),
@@ -1627,40 +1359,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_research_id_json_contract_distinguishes_view_and_update() {
+    fn settings_research_id_is_rejected_from_the_update_contract() {
         let dir = TestDir::new();
-        let store = settings_store(&dir, None);
+        let store = settings_store(&dir);
         let view_json = serde_json::to_value(load_settings_core(&store)).unwrap();
 
         assert!(!view_json.as_object().unwrap().contains_key("researchId"));
-
-        for input in [
-            serde_json::json!({
-                "hotkey": "Alt+Space",
-                "autostart": false
-            }),
-            serde_json::json!({
+        assert!(
+            serde_json::from_value::<UserSettingsUpdate>(serde_json::json!({
                 "hotkey": "Alt+Space",
                 "autostart": false,
                 "researchId": null
-            }),
-        ] {
-            let update: UserSettingsUpdate = serde_json::from_value(input).unwrap();
-            assert_eq!(update.research_id, None);
-        }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn settings_update_preserves_use_counts() {
         let dir = TestDir::new();
-        let store = settings_store(&dir, Some("study_01"));
+        let store = settings_store(&dir);
         let before = store.snapshot().use_counts;
 
         save_settings_core(
             UserSettingsUpdate {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
-                research_id: Some("study_02".into()),
             },
             &store,
         )
@@ -1761,215 +1485,6 @@ mod tests {
     }
 
     #[test]
-    fn modal_export_rejects_concurrent_and_drops_guard_after_chooser() {
-        let coordinator = Arc::new(LifecycleCoordinator::default());
-        let queries = Cell::new(0);
-        let clears = Cell::new(0);
-        let guard = begin_modal_export_with(
-            &coordinator,
-            || {
-                queries.set(queries.get() + 1);
-                Ok(true)
-            },
-            || {
-                clears.set(clears.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            begin_modal_export_with(
-                &coordinator,
-                || {
-                    queries.set(queries.get() + 1);
-                    Ok(true)
-                },
-                || {
-                    clears.set(clears.get() + 1);
-                    Ok(())
-                },
-            )
-            .unwrap_err(),
-            CommandError::export_failed()
-        );
-        assert_eq!(queries.get(), 0);
-        assert_eq!(clears.get(), 0);
-
-        assert_eq!(
-            tauri::async_runtime::block_on(export_validation_data_guarded_with(
-                guard,
-                || async { Ok(None::<usize>) },
-                |_| async { panic!("cancel must skip writer") },
-            )),
-            Ok(ExportOutcome::Cancelled)
-        );
-        let recovered = begin_modal_export_with(
-            &coordinator,
-            || {
-                queries.set(queries.get() + 1);
-                Ok(true)
-            },
-            || {
-                clears.set(clears.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(queries.get(), 1);
-        drop(recovered);
-    }
-
-    #[test]
-    fn modal_export_recovery_classifies_queued_and_real_focus_loss() {
-        let coordinator = Arc::new(LifecycleCoordinator::default());
-        let first = begin_modal_export_with(&coordinator, || Ok(true), || Ok(())).unwrap();
-        drop(first);
-
-        let queries = Cell::new(0);
-        let clears = Cell::new(0);
-        let queued = begin_modal_export_with(
-            &coordinator,
-            || {
-                queries.set(queries.get() + 1);
-                Ok(true)
-            },
-            || {
-                clears.set(clears.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(queries.get(), 1);
-        assert_eq!(clears.get(), 0);
-        drop(queued);
-
-        assert_eq!(
-            begin_modal_export_with(
-                &coordinator,
-                || {
-                    queries.set(queries.get() + 1);
-                    Ok(false)
-                },
-                || {
-                    clears.set(clears.get() + 1);
-                    Ok(())
-                },
-            )
-            .unwrap_err(),
-            CommandError::export_failed()
-        );
-        assert_eq!(queries.get(), 2);
-        assert_eq!(clears.get(), 1);
-        let after_real_loss = begin_modal_export_with(
-            &coordinator,
-            || panic!("Normal must not query focus"),
-            || panic!("Normal must not clear"),
-        )
-        .unwrap();
-        drop(after_real_loss);
-    }
-
-    #[test]
-    fn modal_export_query_error_and_successful_show_restore_normal() {
-        let coordinator = Arc::new(LifecycleCoordinator::default());
-        let first = begin_modal_export_with(&coordinator, || Ok(true), || Ok(())).unwrap();
-        drop(first);
-        let clears = Cell::new(0);
-        assert_eq!(
-            begin_modal_export_with(
-                &coordinator,
-                || Err(()),
-                || {
-                    clears.set(clears.get() + 1);
-                    Err(CommandError::window_failed())
-                },
-            )
-            .unwrap_err(),
-            CommandError::export_failed()
-        );
-        assert_eq!(clears.get(), 1);
-        let after_error = begin_modal_export_with(
-            &coordinator,
-            || panic!("Normal must not query focus"),
-            || panic!("Normal must not clear"),
-        )
-        .unwrap();
-        drop(after_error);
-
-        coordinator.on_successful_show();
-        let after_show = begin_modal_export_with(
-            &coordinator,
-            || panic!("successful show must restore Normal"),
-            || panic!("successful show must not clear"),
-        )
-        .unwrap();
-        drop(after_show);
-    }
-
-    #[test]
-    fn modal_export_preserves_cancel_dispatch_writer_and_join_failures() {
-        struct DropProbe(Rc<Cell<bool>>);
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
-
-        for error in [
-            CommandError::main_thread_dispatch_failed(),
-            CommandError::main_thread_dispatch_failed(),
-        ] {
-            let dropped = Rc::new(Cell::new(false));
-            let expected = error.clone();
-            assert_eq!(
-                tauri::async_runtime::block_on(export_validation_data_guarded_with(
-                    DropProbe(Rc::clone(&dropped)),
-                    || async { Err::<Option<usize>, _>(error.clone()) },
-                    |_| async { panic!("failed chooser must skip writer") },
-                )),
-                Err(expected)
-            );
-            assert!(dropped.get());
-        }
-
-        for error in [
-            CommandError::export_failed(),
-            CommandError::export_worker_failed(),
-        ] {
-            let dropped = Rc::new(Cell::new(false));
-            let writer_dropped = Rc::clone(&dropped);
-            let writer_error = error.clone();
-            assert_eq!(
-                tauri::async_runtime::block_on(export_validation_data_guarded_with(
-                    DropProbe(Rc::clone(&dropped)),
-                    || async { Ok(Some(7_usize)) },
-                    move |destination| async move {
-                        assert!(writer_dropped.get());
-                        assert_eq!(destination, 7);
-                        Err(writer_error)
-                    },
-                )),
-                Err(error)
-            );
-        }
-
-        let dropped = Rc::new(Cell::new(false));
-        let writer_dropped = Rc::clone(&dropped);
-        assert_eq!(
-            tauri::async_runtime::block_on(export_validation_data_guarded_with(
-                DropProbe(Rc::clone(&dropped)),
-                || async { Ok(Some(9_usize)) },
-                move |destination| async move {
-                    assert!(writer_dropped.get());
-                    assert_eq!(destination, 9);
-                    Ok(())
-                },
-            )),
-            Ok(ExportOutcome::Exported)
-        );
-    }
-
-    #[test]
     fn execute_stale_or_unknown_result_stops_before_all_side_effects() {
         for registry_error in [RegistryError::StaleRequest, RegistryError::UnknownResult] {
             let side_effects = Cell::new(0);
@@ -1985,10 +1500,6 @@ mod tests {
                     unreachable!()
                 },
                 || {
-                    side_effects.set(side_effects.get() + 1);
-                    Ok(())
-                },
-                |_| {
                     side_effects.set(side_effects.get() + 1);
                     Ok(())
                 },
@@ -2032,10 +1543,6 @@ mod tests {
                 later_calls.set(later_calls.get() + 1);
                 Ok(())
             },
-            |_| {
-                later_calls.set(later_calls.get() + 1);
-                Ok(())
-            },
         );
 
         assert_eq!(result, Err(CommandError::application_entry_unavailable()));
@@ -2049,25 +1556,21 @@ mod tests {
             (
                 ApplicationActionOutcome::LaunchRequested,
                 ExecuteOutcome::LaunchRequested,
-                ValidationEvent::LaunchRequested,
             ),
             (
                 ApplicationActionOutcome::ActivationRequested,
                 ExecuteOutcome::ActivationRequested,
-                ValidationEvent::ActivationRequested,
             ),
             (
                 ApplicationActionOutcome::ActivationRefusedLaunchRequested,
                 ExecuteOutcome::ActivationRefusedLaunchRequested {
                     message: "Windows 拒绝了前台切换，已发送启动请求",
                 },
-                ValidationEvent::ActivationRefusedLaunchRequested,
             ),
         ];
 
-        for (action_outcome, expected_outcome, expected_event) in cases {
+        for (action_outcome, expected_outcome) in cases {
             let trace = RefCell::new(Vec::new());
-            let actual_event = Cell::new(None);
             let result = execute_result_with(
                 ("request", "result"),
                 |_, _| {
@@ -2083,11 +1586,6 @@ mod tests {
                     trace.borrow_mut().push("window-hide");
                     Ok(())
                 },
-                |event| {
-                    trace.borrow_mut().push("validation-record");
-                    actual_event.set(Some(event));
-                    Ok(())
-                },
                 |app_id| {
                     trace.borrow_mut().push("settings-increment");
                     assert_eq!(app_id, APP_CURRENT);
@@ -2096,7 +1594,6 @@ mod tests {
             );
 
             assert_eq!(result, Ok(expected_outcome));
-            assert_eq!(actual_event.get(), Some(expected_event));
             assert_eq!(
                 *trace.borrow(),
                 [
@@ -2104,7 +1601,6 @@ mod tests {
                     "system-action",
                     "registry-hide-and-clear",
                     "window-hide",
-                    "validation-record",
                     "settings-increment",
                 ]
             );
@@ -2114,19 +1610,14 @@ mod tests {
     #[test]
     fn execute_uses_fixed_post_action_error_priority_and_runs_every_step_once() {
         let cases = [
-            (true, false, false, CommandError::validation_failed()),
-            (false, true, false, CommandError::settings_failed()),
-            (false, false, true, CommandError::window_failed()),
-            (true, true, false, CommandError::validation_failed()),
-            (true, false, true, CommandError::validation_failed()),
-            (false, true, true, CommandError::settings_failed()),
-            (true, true, true, CommandError::validation_failed()),
+            (true, false, CommandError::settings_failed()),
+            (false, true, CommandError::window_failed()),
+            (true, true, CommandError::settings_failed()),
         ];
 
-        for (validation_fails, settings_fails, hide_fails, expected) in cases {
+        for (settings_fails, hide_fails, expected) in cases {
             let actions = Cell::new(0);
             let helpers = Cell::new(0);
-            let validations = Cell::new(0);
             let increments = Cell::new(0);
             let hides = Cell::new(0);
             let result = execute_result_with(
@@ -2146,14 +1637,6 @@ mod tests {
                     }
                 },
                 |_| {
-                    validations.set(validations.get() + 1);
-                    if validation_fails {
-                        Err(())
-                    } else {
-                        Ok(())
-                    }
-                },
-                |_| {
                     increments.set(increments.get() + 1);
                     if settings_fails {
                         Err(())
@@ -2166,7 +1649,6 @@ mod tests {
             assert_eq!(result, Err(expected));
             assert_eq!(actions.get(), 1);
             assert_eq!(helpers.get(), 1);
-            assert_eq!(validations.get(), 1);
             assert_eq!(increments.get(), 1);
             assert_eq!(hides.get(), 1);
         }
@@ -2187,72 +1669,10 @@ mod tests {
                 later_calls.set(later_calls.get() + 1);
                 Ok(())
             },
-            |_| {
-                later_calls.set(later_calls.get() + 1);
-                Ok(())
-            },
         );
 
         assert_eq!(result, Err(CommandError::application_entry_unavailable()));
         assert_eq!(later_calls.get(), 0);
-    }
-
-    #[test]
-    fn maintenance_rescan_uses_blocking_worker_and_maps_both_failure_layers() {
-        let caller = thread::current().id();
-        let worker = tauri::async_runtime::block_on(rescan_apps_with(move || {
-            assert_ne!(thread::current().id(), caller);
-            Ok(())
-        }));
-        assert_eq!(worker, Ok(()));
-        assert_eq!(
-            map_rescan_result(Ok(Err(()))),
-            Err(CommandError::scan_failed())
-        );
-        assert_eq!(
-            map_rescan_result(Err(())),
-            Err(CommandError::scan_worker_failed())
-        );
-    }
-
-    #[test]
-    fn maintenance_export_cancel_skips_writer_and_confirm_writes_in_worker() {
-        let writes = Arc::new(AtomicUsize::new(0));
-        let cancel_writes = Arc::clone(&writes);
-        let cancelled = tauri::async_runtime::block_on(export_validation_data_with(
-            || async { Ok(None::<usize>) },
-            move |_| {
-                cancel_writes.fetch_add(1, Ordering::Relaxed);
-                async { Ok(()) }
-            },
-        ));
-        assert_eq!(cancelled, Ok(ExportOutcome::Cancelled));
-        assert_eq!(writes.load(Ordering::Relaxed), 0);
-
-        let caller = thread::current().id();
-        let confirmed_writes = Arc::clone(&writes);
-        let exported = tauri::async_runtime::block_on(export_validation_data_with(
-            || async { Ok(Some(17_usize)) },
-            move |destination| {
-                spawn_export_worker(move || {
-                    assert_eq!(destination, 17);
-                    assert_ne!(thread::current().id(), caller);
-                    confirmed_writes.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                })
-            },
-        ));
-        assert_eq!(exported, Ok(ExportOutcome::Exported));
-        assert_eq!(writes.load(Ordering::Relaxed), 1);
-
-        assert_eq!(
-            map_export_worker_result(Ok(Err(()))),
-            Err(CommandError::export_failed())
-        );
-        assert_eq!(
-            map_export_worker_result(Err(())),
-            Err(CommandError::export_worker_failed())
-        );
     }
 
     #[test]
@@ -2280,12 +1700,6 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(*trace.borrow(), ["position", "clear", "hide", "save"]);
-
-        assert_eq!(clear_validation_data_with(|| Ok(())), Ok(()));
-        assert_eq!(
-            clear_validation_data_with(|| Err(())),
-            Err(CommandError::validation_failed())
-        );
     }
 
     #[test]
@@ -2366,16 +1780,13 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_all_eight_wrappers_guard_before_their_first_body_statement() {
+    fn maintenance_wrappers_guard_before_their_first_body_statement() {
         let source = include_str!("commands.rs");
         for command in [
             "search_apps",
             "execute_result",
             "load_settings",
             "save_settings",
-            "rescan_apps",
-            "export_validation_data",
-            "clear_validation_data",
             "hide_launcher",
         ] {
             let start = source
@@ -2390,11 +1801,10 @@ mod tests {
         }
     }
 
-    fn user_settings(hotkey: &str, research_id: Option<&str>) -> UserSettingsUpdate {
+    fn user_settings(hotkey: &str) -> UserSettingsUpdate {
         UserSettingsUpdate {
             hotkey: hotkey.into(),
             autostart: false,
-            research_id: research_id.map(str::to_owned),
         }
     }
 
@@ -2424,12 +1834,8 @@ mod tests {
     #[test]
     fn save_settings_preflight_rejects_invalid_input_before_worker_dispatch() {
         let dir = TestDir::new();
-        let _settings_store = settings_store(&dir, Some("study_01"));
-        for settings in [
-            user_settings("not a shortcut", None),
-            user_settings("doublectrl", None),
-            user_settings("Alt+Space", Some(" ")),
-        ] {
+        let _settings_store = settings_store(&dir);
+        for settings in [user_settings("not a shortcut"), user_settings("doublectrl")] {
             let coordinator = Arc::new(LifecycleCoordinator::default());
             let counts = Arc::new(SaveSideEffectCounts::default());
             let reserve_counts = Arc::clone(&counts);
@@ -2471,12 +1877,11 @@ mod tests {
     #[test]
     fn save_settings_preflight_accepts_valid_input_without_persisting() {
         let dir = TestDir::new();
-        let store = settings_store(&dir, Some("study_01"));
+        let store = settings_store(&dir);
         let before_memory = store.snapshot();
         let before_disk = fs::read(dir.path().join("settings.json")).unwrap();
 
-        let (kind, update) =
-            prepare_settings_save(user_settings("Control+Space", Some("study_02"))).unwrap();
+        let (kind, update) = prepare_settings_save(user_settings("Control+Space")).unwrap();
 
         match &kind {
             HotkeyKind::Chord(shortcut) => {
@@ -2485,7 +1890,6 @@ mod tests {
             _ => panic!("expected chord"),
         }
         assert_eq!(update.hotkey, "control+Space");
-        assert_eq!(update.research_id.as_deref(), Some("study_02"));
         assert_eq!(store.snapshot(), before_memory);
         assert_eq!(
             fs::read(dir.path().join("settings.json")).unwrap(),
@@ -2495,7 +1899,7 @@ mod tests {
 
     #[test]
     fn save_settings_preflight_accepts_double_tap_without_shortcut_parse() {
-        let (kind, update) = prepare_settings_save(user_settings("DoubleCtrl", None)).unwrap();
+        let (kind, update) = prepare_settings_save(user_settings("DoubleCtrl")).unwrap();
         assert_eq!(kind, HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl));
         assert_eq!(update.hotkey, "DoubleCtrl");
     }
@@ -2554,14 +1958,13 @@ mod tests {
         let dir = TestDir::new();
         let coordinator = Arc::new(LifecycleCoordinator::default());
         let managed = Arc::new(ManagedState {
-            store: settings_store(&dir, Some("study_01")),
+            store: settings_store(&dir),
         });
         let expected_store = &managed.store as *const SettingsStore as usize;
         let shortcut: Shortcut = "Alt+Space".parse().unwrap();
         let update = SettingsUpdate {
             hotkey: "Alt+Space".into(),
             autostart: false,
-            research_id: Some("study_02".into()),
         };
         let caller = thread::current().id();
         let expected_coordinator = Arc::clone(&coordinator);
@@ -2674,7 +2077,6 @@ mod tests {
                             hide.set(hide.get() + 1);
                             Ok(())
                         },
-                        record: |_: ValidationEvent| unreachable!(),
                         increment: |_: &str| unreachable!(),
                     },
                 )),
@@ -2713,10 +2115,6 @@ mod tests {
                             trace.borrow_mut().push("clear-hide");
                             Ok(())
                         },
-                        record: |_: ValidationEvent| {
-                            trace.borrow_mut().push("validation");
-                            unreachable!()
-                        },
                         increment: |_: &str| {
                             trace.borrow_mut().push("use-count");
                             unreachable!()
@@ -2747,7 +2145,6 @@ mod tests {
                             hide.set(hide.get() + 1);
                             Ok(())
                         },
-                        record: |_: ValidationEvent| unreachable!(),
                         increment: |_: &str| unreachable!(),
                     },
                 )),
@@ -2778,7 +2175,6 @@ mod tests {
                             side_effects.set(side_effects.get() + 1);
                             Ok(())
                         },
-                        record: |_: ValidationEvent| unreachable!(),
                         increment: |_: &str| unreachable!(),
                     },
                 ));
@@ -2829,45 +2225,6 @@ mod tests {
             let production = source.split("#[cfg(test)]").next().unwrap();
             assert!(production.contains("Err(PluginQueryError::Timeout) => Vec::new(),"));
         }
-    }
-
-    #[test]
-    fn settings_validator_wrapper_is_production_consumed() {
-        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
-        let settings_source = include_str!("settings.rs").replace("\r\n", "\n");
-        let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
-        assert_eq!(settings_source.matches(&marker).count(), 1);
-        assert_eq!(commands_source.matches(&marker).count(), 1);
-        let settings_production = settings_source.split(&marker).next().unwrap();
-        let commands_production = commands_source.split(&marker).next().unwrap();
-        let save_start = commands_production
-            .find("pub(crate) async fn save_settings(")
-            .unwrap();
-        let save_end = commands_production[save_start..]
-            .find("#[tauri::command]\npub(crate) async fn save_hotkey(")
-            .map(|offset| save_start + offset)
-            .unwrap();
-        let save_command = &commands_production[save_start..save_end];
-        let wrapper = [
-            "pub(crate) fn validate_user_",
-            "settings(update: &SettingsUpdate) -> Result<(), SettingsError> {\n",
-            "        validate_user_settings_update(update)\n",
-            "    }",
-        ]
-        .concat();
-        let preflight = ["SettingsStore::validate_user_", "settings(&update)?;"].concat();
-        let reservation = ["coordinator.reserve_", "critical()?;"].concat();
-
-        assert_eq!(settings_production.matches(&wrapper).count(), 1);
-        assert_eq!(commands_production.matches(&preflight).count(), 1);
-        assert_eq!(save_command.matches(&reservation).count(), 1);
-        assert!(
-            commands_production.find(&preflight).unwrap()
-                < commands_production[save_start..save_end]
-                    .find(&reservation)
-                    .map(|offset| save_start + offset)
-                    .unwrap()
-        );
     }
 
     #[test]
@@ -2949,7 +2306,7 @@ mod tests {
         );
 
         let dir = TestDir::new();
-        let store = settings_store(&dir, Some("study_01"));
+        let store = settings_store(&dir);
         let before = store.snapshot();
         let current = dir.path().join("settings.json");
         let before_disk = fs::read(&current).unwrap();
@@ -3014,10 +2371,6 @@ mod tests {
             },
             || {
                 hide_calls.set(hide_calls.get() + 1);
-                Ok(())
-            },
-            |_| {
-                later_application_calls.set(later_application_calls.get() + 1);
                 Ok(())
             },
             |_| {

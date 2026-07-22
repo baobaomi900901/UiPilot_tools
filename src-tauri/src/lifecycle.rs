@@ -29,7 +29,6 @@ use crate::{
     hotkey_hook::HotkeyHook,
     result_registry::ResultRegistry,
     settings::{Settings, SettingsStore, SettingsUpdate, WindowPosition},
-    validation_data::{ValidationEvent, ValidationStore},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -63,7 +62,6 @@ pub(crate) fn tray_action(id: &str) -> Option<TrayAction> {
 #[serde(rename_all = "camelCase")]
 enum LifecycleNotice {
     SettingsFailed,
-    ValidationFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -321,93 +319,6 @@ impl RuntimeSettings {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModalState {
-    Normal,
-    Open,
-    AwaitingFocusRestore,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FocusDecision {
-    Suppress,
-    ClearAndHide,
-    ReportWindowFailureAndHide,
-}
-
-impl ModalState {
-    fn finish_export(&mut self) {
-        if *self == Self::Open {
-            *self = Self::AwaitingFocusRestore;
-        }
-    }
-
-    fn claim_export(&mut self) -> Result<bool, FocusDecision> {
-        match self {
-            Self::Normal => {
-                *self = Self::Open;
-                Ok(false)
-            }
-            Self::Open => Err(FocusDecision::Suppress),
-            Self::AwaitingFocusRestore => {
-                *self = Self::Open;
-                Ok(true)
-            }
-        }
-    }
-
-    fn resolve_export_focus(&mut self, focused: Result<bool, ()>) -> Result<(), FocusDecision> {
-        match focused {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                *self = Self::Normal;
-                Err(FocusDecision::ClearAndHide)
-            }
-            Err(()) => {
-                *self = Self::Normal;
-                Err(FocusDecision::ReportWindowFailureAndHide)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn on_focus<F>(&mut self, focused: bool, query_focus: F) -> FocusDecision
-    where
-        F: FnOnce() -> Result<bool, ()>,
-    {
-        if let Some(decision) = self.begin_focus(focused) {
-            return decision;
-        }
-        match query_focus() {
-            Ok(true) => FocusDecision::Suppress,
-            Ok(false) => FocusDecision::ClearAndHide,
-            Err(()) => FocusDecision::ReportWindowFailureAndHide,
-        }
-    }
-
-    fn begin_focus(&mut self, focused: bool) -> Option<FocusDecision> {
-        match (*self, focused) {
-            (Self::Open, _) => Some(FocusDecision::Suppress),
-            (Self::AwaitingFocusRestore, true) => {
-                *self = Self::Normal;
-                Some(FocusDecision::Suppress)
-            }
-            (Self::AwaitingFocusRestore, false) => {
-                *self = Self::Normal;
-                None
-            }
-            (Self::Normal, true) => Some(FocusDecision::Suppress),
-            (Self::Normal, false) => Some(FocusDecision::ClearAndHide),
-        }
-    }
-
-    fn on_successful_show(&mut self) {
-        if *self == Self::AwaitingFocusRestore {
-            *self = Self::Normal;
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExitState {
     Running,
     Cleaning,
@@ -496,7 +407,6 @@ pub(crate) struct LifecycleCoordinator {
     lifecycle_attempt_epoch: AtomicU64,
     window_move_active: AtomicBool,
     readiness: Mutex<Readiness>,
-    modal: Mutex<ModalState>,
     exit_gate: Mutex<ExitGate>,
     critical_changed: Condvar,
     pending_notice: Mutex<Option<LifecycleNotice>>,
@@ -512,58 +422,12 @@ impl Default for LifecycleCoordinator {
             lifecycle_attempt_epoch: AtomicU64::new(0),
             window_move_active: AtomicBool::new(false),
             readiness: Mutex::new(Readiness::default()),
-            modal: Mutex::new(ModalState::Normal),
             exit_gate: Mutex::new(ExitGate::default()),
             critical_changed: Condvar::new(),
             pending_notice: Mutex::new(None),
             runtime_settings: Mutex::new(RuntimeSettings::default()),
             hotkey_hook: Mutex::new(None),
         }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ModalGuard {
-    coordinator: Arc<LifecycleCoordinator>,
-}
-
-struct ModalRecoveryClaim {
-    coordinator: Arc<LifecycleCoordinator>,
-    committed: bool,
-}
-
-impl ModalRecoveryClaim {
-    fn new(coordinator: &Arc<LifecycleCoordinator>) -> Self {
-        Self {
-            coordinator: Arc::clone(coordinator),
-            committed: false,
-        }
-    }
-
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for ModalRecoveryClaim {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        let mut modal = self.coordinator.modal.lock().expect("modal lock poisoned");
-        if *modal == ModalState::Open {
-            *modal = ModalState::Normal;
-        }
-    }
-}
-
-impl Drop for ModalGuard {
-    fn drop(&mut self) {
-        self.coordinator
-            .modal
-            .lock()
-            .expect("modal lock poisoned")
-            .finish_export();
     }
 }
 
@@ -633,7 +497,6 @@ struct ShowMainClosures<'a> {
     registry_on_show: &'a mut dyn FnMut(String),
     emit: &'a mut dyn FnMut(&LauncherShown) -> Result<(), ()>,
     clear_and_hide: &'a mut dyn FnMut(),
-    record_launcher: &'a mut dyn FnMut(CriticalReservation),
 }
 
 type MainThreadOperation = Box<dyn FnOnce() + Send>;
@@ -1032,72 +895,21 @@ impl LifecycleCoordinator {
         Ok(())
     }
 
-    pub(crate) fn begin_modal_export<F>(
-        self: &Arc<Self>,
-        query_focus: F,
-    ) -> Result<ModalGuard, FocusDecision>
-    where
-        F: FnOnce() -> Result<bool, ()>,
-    {
-        let query_required = self
-            .modal
-            .lock()
-            .expect("modal lock poisoned")
-            .claim_export()?;
-        if query_required {
-            let rollback = ModalRecoveryClaim::new(self);
-            let focused = query_focus();
-            self.modal
-                .lock()
-                .expect("modal lock poisoned")
-                .resolve_export_focus(focused)?;
-            rollback.commit();
-        }
-        Ok(ModalGuard {
-            coordinator: Arc::clone(self),
-        })
-    }
-
-    pub(crate) fn handle_focus_event_with<Q, H>(
+    pub(crate) fn handle_focus_event_with<H>(
         &self,
         focused: bool,
-        query_focus: Q,
         mut clear_and_hide: H,
     ) -> Result<(), LifecycleError>
     where
-        Q: FnOnce() -> Result<bool, ()>,
         H: FnMut() -> Result<(), ()>,
     {
         if !focused && self.window_move_active.load(Ordering::Acquire) {
             return Ok(());
         }
-        let decision = self
-            .modal
-            .lock()
-            .expect("modal lock poisoned")
-            .begin_focus(focused);
-        let decision = decision.unwrap_or_else(|| match query_focus() {
-            Ok(true) => FocusDecision::Suppress,
-            Ok(false) => FocusDecision::ClearAndHide,
-            Err(()) => FocusDecision::ReportWindowFailureAndHide,
-        });
-        match decision {
-            FocusDecision::Suppress => Ok(()),
-            FocusDecision::ClearAndHide => {
-                clear_and_hide().map_err(|_| LifecycleError::WindowFailed)
-            }
-            FocusDecision::ReportWindowFailureAndHide => {
-                let _ = clear_and_hide();
-                Err(LifecycleError::WindowFailed)
-            }
+        if focused {
+            return Ok(());
         }
-    }
-
-    pub(crate) fn on_successful_show(&self) {
-        self.modal
-            .lock()
-            .expect("modal lock poisoned")
-            .on_successful_show();
+        clear_and_hide().map_err(|_| LifecycleError::WindowFailed)
     }
 
     fn observe_window_move_message(&self, message: u32) {
@@ -1138,20 +950,6 @@ impl LifecycleCoordinator {
         let mut clear_window = || {
             let _ = clear_and_hide(&registry, &window);
         };
-        let app_for_record = app.clone();
-        let coordinator_for_record = Arc::clone(self);
-        let mut record_launcher = move |reservation| {
-            let app = app_for_record.clone();
-            let coordinator = Arc::clone(&coordinator_for_record);
-            drop(tauri::async_runtime::spawn_blocking(move || {
-                let _reservation = reservation;
-                let result = app
-                    .state::<ValidationStore>()
-                    .record(ValidationEvent::LauncherInvoked)
-                    .map_err(|_| ());
-                coordinator.finish_launcher_record(result);
-            }));
-        };
         let mut operations = ShowMainClosures {
             place_window: &mut place_window,
             always_on_top: &mut always_on_top,
@@ -1160,7 +958,6 @@ impl LifecycleCoordinator {
             registry_on_show: &mut registry_on_show,
             emit: &mut emit,
             clear_and_hide: &mut clear_window,
-            record_launcher: &mut record_launcher,
         };
         self.show_main_core(target, &mut operations)
     }
@@ -1220,21 +1017,8 @@ impl LifecycleCoordinator {
             return Err(LifecycleError::WindowFailed);
         }
         self.consume_notice(notice);
-        self.on_successful_show();
 
-        if target == ShowTarget::Launcher {
-            match self.reserve_critical() {
-                Ok(reservation) => (operations.record_launcher)(reservation),
-                Err(_) => self.set_notice_once(LifecycleNotice::ValidationFailed),
-            }
-        }
         Ok(ShowOutcome::Shown)
-    }
-
-    fn finish_launcher_record(&self, result: Result<(), ()>) {
-        if result.is_err() {
-            self.set_notice_once(LifecycleNotice::ValidationFailed);
-        }
     }
 
     fn set_notice_once(&self, notice: LifecycleNotice) {
@@ -1438,7 +1222,6 @@ impl LifecycleCoordinator {
         match decision {
             CleanDecision::Exit => exit(),
             CleanDecision::ReturnRunning => {
-                self.set_notice_once(LifecycleNotice::ValidationFailed);
                 show(ShowTarget::Settings);
             }
             _ => {}
@@ -1500,7 +1283,6 @@ impl LifecycleCoordinator {
         let coordinator = Arc::clone(self);
         let app = app.clone();
         drop(tauri::async_runtime::spawn_blocking(move || {
-            let marker_app = app.clone();
             let marker_index = Arc::clone(&file_index);
             let exit_dispatcher = app.clone();
             let exit_app = app.clone();
@@ -1513,12 +1295,7 @@ impl LifecycleCoordinator {
                 start.decision,
                 |deadline| coordinator.wait_for_clean_change(deadline),
                 || {
-                    if marker_index.mark_clean_close(start.attempt_epoch)
-                        && marker_app
-                            .state::<ValidationStore>()
-                            .mark_clean_exit()
-                            .is_ok()
-                    {
+                    if marker_index.mark_clean_close(start.attempt_epoch) {
                         CleanResult::Succeeded
                     } else {
                         CleanResult::Failed
@@ -1539,21 +1316,10 @@ impl LifecycleCoordinator {
     }
 
     fn run_system_end(&self, app: &AppHandle) {
-        let marker_app = app.clone();
         let terminal_index = Arc::clone(app.state::<Arc<FileIndex>>().inner());
         let _ = self.run_system_end_nonblocking_with(
             Instant::now(),
-            || {
-                if marker_app
-                    .state::<ValidationStore>()
-                    .mark_clean_exit()
-                    .is_ok()
-                {
-                    CleanResult::Succeeded
-                } else {
-                    CleanResult::Failed
-                }
-            },
+            || CleanResult::Succeeded,
             move || terminal_index.enter_terminal(),
         );
     }
@@ -1984,7 +1750,7 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("fn run_system_end(").next())
             .expect("tray quit source markers are missing");
-        let marker = tray.find("mark_clean_exit").unwrap();
+        let marker = tray.find("mark_clean_close").unwrap();
         let uninstall = tray.find("uninstall_hook_for_exit").unwrap();
         assert!(marker < uninstall);
         assert_eq!(tray.matches("uninstall_hook_for_exit").count(), 1);
@@ -2069,110 +1835,6 @@ mod tests {
     }
 
     #[test]
-    fn modal_normal_and_open_export_paths_allow_only_one_chooser() {
-        let mut state = ModalState::Normal;
-        assert_eq!(state.claim_export(), Ok(false));
-        assert_eq!(state, ModalState::Open);
-        assert_eq!(state.claim_export(), Err(FocusDecision::Suppress));
-        assert_eq!(state, ModalState::Open);
-    }
-
-    #[test]
-    fn modal_guard_drop_and_focus_events_restore_normal() {
-        let mut state = ModalState::Open;
-        assert_eq!(
-            state.on_focus(false, || panic!("Open must not query focus")),
-            FocusDecision::Suppress
-        );
-        assert_eq!(state, ModalState::Open);
-
-        state.finish_export();
-        assert_eq!(state, ModalState::AwaitingFocusRestore);
-        assert_eq!(
-            state.on_focus(true, || panic!("Focused(true) must not query focus")),
-            FocusDecision::Suppress
-        );
-        assert_eq!(state, ModalState::Normal);
-    }
-
-    #[test]
-    fn modal_awaiting_false_classifies_after_leaving_awaiting() {
-        for (focus_result, expected) in [
-            (Ok(true), FocusDecision::Suppress),
-            (Ok(false), FocusDecision::ClearAndHide),
-            (Err(()), FocusDecision::ReportWindowFailureAndHide),
-        ] {
-            let mut state = ModalState::AwaitingFocusRestore;
-            assert_eq!(state.on_focus(false, || focus_result), expected);
-            assert_eq!(state, ModalState::Normal);
-        }
-
-        let mut state = ModalState::AwaitingFocusRestore;
-        let query = catch_unwind(AssertUnwindSafe(|| {
-            state.on_focus(false, || panic!("focus query sentinel"));
-        }));
-        assert!(query.is_err());
-        assert_eq!(state, ModalState::Normal);
-    }
-
-    #[test]
-    fn modal_retry_and_successful_show_cannot_leave_awaiting_stuck() {
-        let mut focused = ModalState::AwaitingFocusRestore;
-        assert_eq!(focused.claim_export(), Ok(true));
-        assert_eq!(focused.resolve_export_focus(Ok(true)), Ok(()));
-        assert_eq!(focused, ModalState::Open);
-
-        for (focus_result, expected) in [
-            (Ok(false), FocusDecision::ClearAndHide),
-            (Err(()), FocusDecision::ReportWindowFailureAndHide),
-        ] {
-            let mut state = ModalState::AwaitingFocusRestore;
-            assert_eq!(state.claim_export(), Ok(true));
-            assert_eq!(state.resolve_export_focus(focus_result), Err(expected));
-            assert_eq!(state, ModalState::Normal);
-            assert_eq!(state.claim_export(), Ok(false));
-            assert_eq!(state, ModalState::Open);
-        }
-
-        let mut state = ModalState::AwaitingFocusRestore;
-        state.on_successful_show();
-        assert_eq!(state, ModalState::Normal);
-        state = ModalState::Open;
-        state.on_successful_show();
-        assert_eq!(state, ModalState::Open);
-
-        let coordinator = coordinator_for_test();
-        let first = coordinator.begin_modal_export(|| Ok(true)).unwrap();
-        drop(first);
-        let recovered = coordinator
-            .begin_modal_export(|| {
-                let lock = coordinator
-                    .modal
-                    .try_lock()
-                    .expect("focus query must run without the modal lock");
-                drop(lock);
-                assert_eq!(
-                    coordinator
-                        .begin_modal_export(|| panic!("Open must not query focus"))
-                        .unwrap_err(),
-                    FocusDecision::Suppress
-                );
-                Ok(true)
-            })
-            .unwrap();
-        drop(recovered);
-
-        let panic_result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = coordinator.begin_modal_export(|| panic!("live focus query sentinel"));
-        }));
-        assert!(panic_result.is_err());
-        let after_panic = coordinator
-            .begin_modal_export(|| panic!("rollback must restore Normal"))
-            .unwrap();
-        drop(after_panic);
-    }
-
-    #[test]
     fn saved_window_position_must_fit_one_complete_work_area() {
         let size = tauri::PhysicalSize::new(720, 420);
         let left = tauri::PhysicalRect {
@@ -2226,8 +1888,6 @@ mod tests {
         Show,
         Focus,
         Emit,
-        Record,
-        PanicRecord,
     }
 
     #[derive(Default)]
@@ -2235,7 +1895,6 @@ mod tests {
         trace: RefCell<Vec<String>>,
         payloads: RefCell<Vec<LauncherShown>>,
         clears: Cell<usize>,
-        records: Cell<usize>,
     }
 
     fn run_show_case(
@@ -2283,19 +1942,6 @@ mod tests {
             probe.clears.set(probe.clears.get() + 1);
             probe.trace.borrow_mut().push(format!("clear-{index}"));
         };
-        let coordinator_for_record = Arc::clone(coordinator);
-        let mut record_launcher = move |_reservation: CriticalReservation| {
-            probe.records.set(probe.records.get() + 1);
-            probe
-                .trace
-                .borrow_mut()
-                .push(format!("reserve-launcher-record-{index}"));
-            match failure {
-                ShowFailure::Record => coordinator_for_record.finish_launcher_record(Err(())),
-                ShowFailure::PanicRecord => panic!("launcher record panic sentinel"),
-                _ => coordinator_for_record.finish_launcher_record(Ok(())),
-            }
-        };
         let mut operations = ShowMainClosures {
             place_window: &mut place_window,
             always_on_top: &mut always_on_top,
@@ -2304,7 +1950,6 @@ mod tests {
             registry_on_show: &mut registry_on_show,
             emit: &mut emit,
             clear_and_hide: &mut clear_and_hide,
-            record_launcher: &mut record_launcher,
         };
         coordinator.show_main_core(target, &mut operations)
     }
@@ -2349,7 +1994,6 @@ mod tests {
                 "focus-1",
                 "registry-on-show-1",
                 "emit-1",
-                "reserve-launcher-record-1",
                 "dispatch-2",
                 "invocation-2",
                 "place-2",
@@ -2358,10 +2002,8 @@ mod tests {
                 "focus-2",
                 "registry-on-show-2",
                 "emit-2",
-                "reserve-launcher-record-2",
             ]
         );
-        assert_eq!(probe.records.get(), 2);
         assert_eq!(probe.clears.get(), 0);
         assert_eq!(probe.payloads.borrow().len(), 2);
         assert_eq!(exit_snapshot(&coordinator).1, 0);
@@ -2406,7 +2048,6 @@ mod tests {
                 Err(LifecycleError::WindowFailed)
             );
             assert_eq!(probe.clears.get(), 1);
-            assert_eq!(probe.records.get(), 0);
             assert_eq!(exit_snapshot(&coordinator).1, 0);
         }
 
@@ -2423,7 +2064,6 @@ mod tests {
             Ok(ShowOutcome::Shown)
         );
         assert_eq!(probe.clears.get(), 0);
-        assert_eq!(probe.records.get(), 1);
 
         let registry = ResultRegistry::default();
         registry.on_show("old".into());
@@ -2441,7 +2081,6 @@ mod tests {
             registry.hide_and_clear();
             hides.set(hides.get() + 1);
         };
-        let mut record_launcher = |_: CriticalReservation| {};
         let mut operations = ShowMainClosures {
             place_window: &mut place_window,
             always_on_top: &mut always_on_top,
@@ -2450,7 +2089,6 @@ mod tests {
             registry_on_show: &mut registry_on_show,
             emit: &mut emit,
             clear_and_hide: &mut clear_and_hide,
-            record_launcher: &mut record_launcher,
         };
         assert_eq!(
             coordinator_for_test().show_main_core(ShowTarget::Launcher, &mut operations),
@@ -2536,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn show_target_notice_and_record_failures_keep_first_pending_notice() {
+    fn show_target_notice_keeps_first_pending_notice() {
         let coordinator = coordinator_for_test();
         coordinator.set_notice_once(LifecycleNotice::SettingsFailed);
         let probe = ShowProbe::default();
@@ -2550,7 +2188,6 @@ mod tests {
             ),
             Ok(ShowOutcome::Shown)
         );
-        assert_eq!(probe.records.get(), 0);
         assert_eq!(
             probe.payloads.borrow()[0].notice,
             Some(LifecycleNotice::SettingsFailed)
@@ -2568,41 +2205,11 @@ mod tests {
             ),
             Err(LifecycleError::WindowFailed)
         );
-        coordinator.set_notice_once(LifecycleNotice::ValidationFailed);
+        coordinator.set_notice_once(LifecycleNotice::SettingsFailed);
         assert_eq!(
             *coordinator.pending_notice.lock().unwrap(),
             Some(LifecycleNotice::SettingsFailed)
         );
-
-        *coordinator.pending_notice.lock().unwrap() = None;
-        assert_eq!(
-            run_show_case(
-                &coordinator,
-                ShowTarget::Launcher,
-                3,
-                ShowFailure::Record,
-                &probe,
-            ),
-            Ok(ShowOutcome::Shown)
-        );
-        assert_eq!(
-            *coordinator.pending_notice.lock().unwrap(),
-            Some(LifecycleNotice::ValidationFailed)
-        );
-
-        let panicking = coordinator_for_test();
-        let panic_probe = ShowProbe::default();
-        let panic_result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = run_show_case(
-                &panicking,
-                ShowTarget::Launcher,
-                1,
-                ShowFailure::PanicRecord,
-                &panic_probe,
-            );
-        }));
-        assert!(panic_result.is_err());
-        assert_eq!(exit_snapshot(&panicking).1, 0);
     }
 
     #[test]
@@ -2632,11 +2239,11 @@ mod tests {
             let value = serde_json::to_value(LauncherShown {
                 invocation_id: "invocation-1".into(),
                 target,
-                notice: Some(LifecycleNotice::ValidationFailed),
+                notice: Some(LifecycleNotice::SettingsFailed),
             })
             .unwrap();
             assert_eq!(value["target"], expected);
-            assert_eq!(value["notice"], "validationFailed");
+            assert_eq!(value["notice"], "settingsFailed");
         }
     }
 
@@ -2790,12 +2397,6 @@ mod tests {
             assert_eq!(readiness.request(ShowTarget::Launcher), None);
             assert_eq!(readiness.mark_setup_ready(), None);
             assert_eq!(readiness.mark_frontend_ready(), Some(ShowTarget::Launcher));
-        }
-        {
-            let mut modal = coordinator.modal.lock().expect("modal lock poisoned");
-            assert_eq!(modal.claim_export(), Ok(false));
-            modal.finish_export();
-            modal.on_successful_show();
         }
         assert_eq!(exit_snapshot(&coordinator).1, 0);
     }
@@ -3175,7 +2776,6 @@ mod tests {
         }
 
         let read_failure = coordinator_for_test();
-        read_failure.set_notice_once(LifecycleNotice::ValidationFailed);
         let read_failure_registers = Cell::new(0);
         let read_failure_changes = Cell::new(0);
         assert_eq!(
@@ -3213,8 +2813,7 @@ mod tests {
         );
         assert_eq!(
             *read_failure.pending_notice.lock().unwrap(),
-            Some(LifecycleNotice::ValidationFailed),
-            "startup SettingsFailed must not overwrite the first notice"
+            Some(LifecycleNotice::SettingsFailed)
         );
 
         let change_failure = coordinator_for_test();
@@ -3417,32 +3016,17 @@ mod tests {
     }
 
     #[test]
-    fn production_callbacks_focus_query_and_hide_seams_are_lock_free() {
+    fn production_focus_callback_hides_without_coordinator_locks() {
         let coordinator = coordinator_for_test();
         let clear_calls = Cell::new(0);
         coordinator
-            .handle_focus_event_with(
-                false,
-                || panic!("Normal focus loss must not query focus"),
-                || {
-                    assert!(coordinator.modal.try_lock().is_ok());
-                    clear_calls.set(clear_calls.get() + 1);
-                    Ok(())
-                },
-            )
+            .handle_focus_event_with(false, || {
+                assert!(coordinator.exit_gate.try_lock().is_ok());
+                clear_calls.set(clear_calls.get() + 1);
+                Ok(())
+            })
             .unwrap();
         assert_eq!(clear_calls.get(), 1);
-
-        let guard = coordinator.begin_modal_export(|| Ok(true)).unwrap();
-        coordinator
-            .handle_focus_event_with(
-                false,
-                || panic!("Open must not query focus"),
-                || panic!("Open must suppress hide"),
-            )
-            .unwrap();
-        assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Open);
-        drop(guard);
     }
 
     #[test]
@@ -3452,91 +3036,18 @@ mod tests {
         let coordinator = coordinator_for_test();
         coordinator.observe_window_move_message(WM_ENTERSIZEMOVE);
         coordinator
-            .handle_focus_event_with(
-                false,
-                || panic!("native move focus loss must not query"),
-                || panic!("native move focus loss must not hide"),
-            )
+            .handle_focus_event_with(false, || panic!("native move focus loss must not hide"))
             .unwrap();
 
         coordinator.observe_window_move_message(WM_EXITSIZEMOVE);
         let hides = Cell::new(0);
         coordinator
-            .handle_focus_event_with(
-                false,
-                || panic!("normal focus loss must not query"),
-                || {
-                    hides.set(hides.get() + 1);
-                    Ok(())
-                },
-            )
+            .handle_focus_event_with(false, || {
+                hides.set(hides.get() + 1);
+                Ok(())
+            })
             .unwrap();
         assert_eq!(hides.get(), 1);
-    }
-
-    #[test]
-    fn production_callbacks_focus_awaiting_resolves_every_query_result() {
-        for (focus_result, expected, expected_clears) in [
-            (Ok(true), Ok(()), 0),
-            (Ok(false), Ok(()), 1),
-            (Err(()), Err(LifecycleError::WindowFailed), 1),
-        ] {
-            let coordinator = coordinator_for_test();
-            drop(coordinator.begin_modal_export(|| Ok(true)).unwrap());
-            let clear_calls = Cell::new(0);
-            assert_eq!(
-                coordinator.handle_focus_event_with(
-                    false,
-                    || {
-                        assert!(coordinator.modal.try_lock().is_ok());
-                        focus_result
-                    },
-                    || {
-                        assert!(coordinator.modal.try_lock().is_ok());
-                        clear_calls.set(clear_calls.get() + 1);
-                        Ok(())
-                    },
-                ),
-                expected
-            );
-            assert_eq!(clear_calls.get(), expected_clears);
-            assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Normal);
-        }
-    }
-
-    #[test]
-    fn production_callbacks_focus_repeated_events_never_leave_awaiting() {
-        let coordinator = coordinator_for_test();
-        drop(coordinator.begin_modal_export(|| Ok(true)).unwrap());
-        coordinator
-            .handle_focus_event_with(false, || Ok(true), || panic!("still focused"))
-            .unwrap();
-        assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Normal);
-
-        let clear_calls = Cell::new(0);
-        coordinator
-            .handle_focus_event_with(
-                false,
-                || panic!("late Normal focus loss must not query"),
-                || {
-                    clear_calls.set(clear_calls.get() + 1);
-                    Ok(())
-                },
-            )
-            .unwrap();
-        assert_eq!(clear_calls.get(), 1);
-
-        let second = coordinator.begin_modal_export(|| panic!("Normal retry must not query"));
-        assert!(second.is_ok());
-        drop(second);
-        coordinator
-            .handle_focus_event_with(
-                true,
-                || panic!("Focused(true) must not query"),
-                || panic!("Focused(true) must not hide"),
-            )
-            .unwrap();
-        assert_eq!(*coordinator.modal.lock().unwrap(), ModalState::Normal);
     }
 
     #[test]
@@ -3638,10 +3149,7 @@ mod tests {
         assert_eq!(marker_calls.get(), 0);
         assert_eq!(exit_calls.get(), 0);
         assert_eq!(*shown.borrow(), [ShowTarget::Settings]);
-        assert_eq!(
-            *timed_out.pending_notice.lock().unwrap(),
-            Some(LifecycleNotice::ValidationFailed)
-        );
+        assert_eq!(*timed_out.pending_notice.lock().unwrap(), None);
         assert_eq!(exit_snapshot(&timed_out).0, ExitState::Running);
         drop(reservation);
 

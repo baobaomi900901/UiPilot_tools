@@ -27,7 +27,6 @@ import {
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
-  type ExportOutcome,
   type FileResultItem,
   type FileSearchResponse,
   type LauncherClient,
@@ -39,6 +38,26 @@ import {
 import protocolSource from './protocol.ts?raw'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
+
+describe('retired validation settings contract', () => {
+  it('contains no research, rescan, export, or validation-clear surface', () => {
+    const productionSources = [protocolSource, launcherCoreSource, launcherViewSource, mainSource]
+    for (const forbidden of [
+      'researchId',
+      'rescanApps',
+      'exportValidation',
+      'exportValidationData',
+      'clearValidationData',
+      'clearConfirmation',
+      'validationFailed',
+      "'rescan'",
+      "'export'",
+      "'clear'",
+    ]) {
+      expect(productionSources.every((source) => !source.includes(forbidden)), forbidden).toBe(true)
+    }
+  })
+})
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
 const tauriCapture = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }))
@@ -103,9 +122,6 @@ function fakeClient() {
     loadSettings: vi.fn(async () => emptySettings),
     saveSettings: vi.fn(async () => undefined),
     saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
-    rescanApps: vi.fn(async () => undefined),
-    exportValidationData: vi.fn(async () => ({ status: 'cancelled' }) satisfies ExportOutcome),
-    clearValidationData: vi.fn(async () => undefined),
     hideLauncher: vi.fn(async () => undefined),
   }
   return {
@@ -267,7 +283,7 @@ function r3(record: R3TextRecord): ClassifiedTextRecord {
 describe('protocol and cached store', () => {
   it('strictly parses only the frozen launcher shown shape', () => {
     for (const target of ['launcher', 'settings'] as const) {
-      for (const notice of [null, 'settingsFailed', 'validationFailed'] as const) {
+      for (const notice of [null, 'settingsFailed'] as const) {
         const value = shown('invocation', target, notice)
         expect(parseLauncherShown(value)).toEqual(value)
       }
@@ -278,6 +294,7 @@ describe('protocol and cached store', () => {
       [],
       {},
       { ...shown('x'), extra: true },
+      { ...shown('x'), notice: 'validationFailed' },
       { invocationId: 'x', target: 'launcher' },
       { invocationId: 7, target: 'launcher', notice: null },
       { invocationId: 'x', target: 'other', notice: null },
@@ -691,7 +708,7 @@ describe('R3 correlated composition boundary', () => {
 
   it('commits a settings draft locally and makes its same-value tail a no-op', async () => {
     const { core, client } = await startedSettingsCore()
-    const control = core.getSnapshot().settings!.researchId.key
+    const control = core.getSnapshot().settings!.hotkey.key
     core.text(r3({ kind: 'compositionStart', control }))
     core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
     const listener = vi.fn()
@@ -699,7 +716,7 @@ describe('R3 correlated composition boundary', () => {
 
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(listener).toHaveBeenCalledOnce()
-    expect(core.getSnapshot().settings!.researchId.value).toBe('\u6d4b\u8bd5')
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('\u6d4b\u8bd5')
     expect(client.searchApps).not.toHaveBeenCalled()
     expect(client.saveSettings).not.toHaveBeenCalled()
 
@@ -711,7 +728,7 @@ describe('R3 correlated composition boundary', () => {
     expect(listener).not.toHaveBeenCalled()
 
     core.text(r3({ kind: 'ordinaryInput', control, value: '\u4e0d\u540c', inputType: 'insertReplacementText' }))
-    expect(core.getSnapshot().settings!.researchId.value).toBe('\u4e0d\u540c')
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('\u4e0d\u540c')
     expect(listener).toHaveBeenCalledOnce()
     expect(client.searchApps).not.toHaveBeenCalled()
     expect(client.saveSettings).not.toHaveBeenCalled()
@@ -719,7 +736,7 @@ describe('R3 correlated composition boundary', () => {
 
   it('commits settings ordinary-before-end and cancel paths once with zero Rust calls', async () => {
     const { core, client } = await startedSettingsCore()
-    const control = core.getSnapshot().settings!.researchId.key
+    const control = core.getSnapshot().settings!.hotkey.key
     const listener = vi.fn()
     core.subscribe(listener)
 
@@ -733,7 +750,7 @@ describe('R3 correlated composition boundary', () => {
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(cancelled).not.toBe(beforeCancel)
     expect(core.getSnapshot()).toBe(cancelled)
-    expect(core.getSnapshot().settings!.researchId.value).toBe('alph')
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('alph')
 
     listener.mockClear()
     core.text(r3({ kind: 'compositionStart', control }))
@@ -742,7 +759,7 @@ describe('R3 correlated composition boundary', () => {
     const ordinary = core.getSnapshot()
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(core.getSnapshot()).toBe(ordinary)
-    expect(core.getSnapshot().settings!.researchId.value).toBe('ordinary-first')
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('ordinary-first')
     expect(client.searchApps).not.toHaveBeenCalled()
     expect(client.saveSettings).not.toHaveBeenCalled()
   })
@@ -847,14 +864,14 @@ describe('R3 correlated composition boundary', () => {
     expect(listener).not.toHaveBeenCalled()
 
     vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'old-empty', items: [] })
-    emit(shown('idempotent-rerun', 'launcher', 'validationFailed'))
+    emit(shown('idempotent-rerun', 'launcher', 'settingsFailed'))
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({
       query: 'calc',
       querySequence: 1,
       results: [],
       selectedIndex: -1,
-      shownNotice: '本地验证数据操作失败。',
+      shownNotice: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
     })
 
     const rerun = deferred<SearchResponse | null>()
@@ -963,31 +980,27 @@ describe('settings ownership', () => {
     return { core, ...fake }
   }
 
-  it('saves exact hotkey, autostart, and research ID', async () => {
+  it('saves exact hotkey and autostart', async () => {
     const { core, client } = await settingsCore()
-    const settings = core.getSnapshot().settings!
     core.setHotkeyCanonical('Ctrl+Space')
-    core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
     core.setAutostart(true)
     await core.saveSettings()
     expect(client.saveSettings).toHaveBeenCalledWith({
       settings: {
         hotkey: 'Ctrl+Space',
         autostart: true,
-        researchId: 'research_1',
       },
     })
   })
 
   it('preserves edits and fails closed after a save error', async () => {
     const { core, client } = await settingsCore()
-    const researchId = core.getSnapshot().settings!.researchId
-    core.text({ kind: 'ordinaryInput', control: researchId.key, value: 'research_1', inputType: 'insertText' })
+    core.setHotkeyCanonical('Ctrl+Space')
     vi.mocked(client.saveSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private backend text' })
     await core.saveSettings()
     expect(client.loadSettings).toHaveBeenCalledTimes(1)
     expect(core.getSnapshot().settings).toMatchObject({ readOnly: true, needsReload: true })
-    expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('Ctrl+Space')
     expect(core.getSnapshot().status).toBe('设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
@@ -995,18 +1008,17 @@ describe('settings ownership', () => {
   it('retires form controls before fresh replacement', async () => {
     const { core, client } = await settingsCore()
     const original = core.getSnapshot().settings!
-    const oldKeys = [original.hotkey.key, original.researchId.key]
-    core.text({ kind: 'compositionStart', control: original.researchId.key })
-    core.text({ kind: 'compositionInput', control: original.researchId.key, value: 'uncommitted', inputType: 'insertCompositionText' })
+    const oldKey = original.hotkey.key
+    core.text({ kind: 'compositionStart', control: oldKey })
+    core.text({ kind: 'compositionInput', control: oldKey, value: 'uncommitted', inputType: 'insertCompositionText' })
     vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
     await core.reloadSettings()
     const replacement = core.getSnapshot().settings!
     const replacedSnapshot = core.getSnapshot()
-    core.text({ kind: 'compositionBoundary', control: original.researchId.key })
-    core.text({ kind: 'compositionInput', control: original.researchId.key, value: 'late', inputType: 'insertCompositionText' })
+    core.text({ kind: 'compositionBoundary', control: oldKey })
+    core.text({ kind: 'compositionInput', control: oldKey, value: 'late', inputType: 'insertCompositionText' })
     expect(core.getSnapshot()).toBe(replacedSnapshot)
-    const newKeys = [replacement.hotkey.key, replacement.researchId.key]
-    expect(Math.min(...newKeys)).toBeGreaterThan(Math.max(...oldKeys))
+    expect(replacement.hotkey.key).toBeGreaterThan(oldKey)
 
     const replaceStart = launcherCoreSource.indexOf('function replaceSettings')
     const replaceRetire = launcherCoreSource.indexOf('retireControl(control.key)', replaceStart)
@@ -1027,40 +1039,10 @@ describe('settings ownership', () => {
     expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
   })
 
-  it('keeps one global settings operation and makes stale rescan require reload', async () => {
-    const { core, client, emit } = await settingsCore()
-    const rescan = deferred<void>()
-    vi.mocked(client.rescanApps).mockReturnValueOnce(rescan.promise)
-    const pending = core.rescanApps()
-    void core.saveSettings()
-    void core.exportValidation()
-    core.beginClearValidation()
-    expect(client.saveSettings).not.toHaveBeenCalled()
-    expect(client.exportValidationData).not.toHaveBeenCalled()
-    expect(core.getSnapshot().settings).toMatchObject({ operation: 'rescan', clearConfirmation: false })
-    emit(shown('stale-rescan', 'settings'))
-    rescan.resolve()
-    await pending
-    expect(client.loadSettings).toHaveBeenCalledTimes(1)
-    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
-  })
-
-  it('also makes a stale rejected rescan require reload', async () => {
-    const { core, client, emit } = await settingsCore()
-    const rescan = deferred<void>()
-    vi.mocked(client.rescanApps).mockReturnValueOnce(rescan.promise)
-    const pending = core.rescanApps()
-    emit(shown('stale-rescan-error', 'settings'))
-    rescan.reject({ code: 'scanFailed', message: 'raw' })
-    await pending
-    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
-    expect(core.getSnapshot().status).toBe('')
-  })
-
   it('clears a shown notice on a settings text edit', async () => {
     const { core, emit } = await settingsCore()
-    emit(shown('settings-notice', 'settings', 'validationFailed'))
-    expect(core.getSnapshot().shownNotice).toBe('本地验证数据操作失败。')
+    emit(shown('settings-notice', 'settings', 'settingsFailed'))
+    expect(core.getSnapshot().shownNotice).toBe('快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。')
     core.setHotkeyCanonical('Ctrl+Space')
     expect(core.getSnapshot().shownNotice).toBeUndefined()
   })
@@ -1074,8 +1056,6 @@ describe('settings ownership', () => {
 
   it('records hotkey through dedicated save without saving other drafts', async () => {
     const { core, client } = await settingsCore()
-    const settings = core.getSnapshot().settings!
-    core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
     core.setAutostart(true)
 
     await core.saveHotkeyCanonical('DoubleCtrl')
@@ -1083,7 +1063,6 @@ describe('settings ownership', () => {
     expect(client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } })
     expect(client.saveSettings).not.toHaveBeenCalled()
     expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl')
-    expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
     expect(core.getSnapshot().settings!.autostart).toBe(true)
   })
 
@@ -1108,14 +1087,13 @@ describe('settings ownership', () => {
 
   it('restores durable hotkey and preserves other drafts after dedicated save failure', async () => {
     const { core, client } = await settingsCore()
-    const settings = core.getSnapshot().settings!
-    core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
+    core.setAutostart(true)
     vi.mocked(client.saveHotkey).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private backend text' })
 
     await core.saveHotkeyCanonical('DoubleCtrl')
 
     expect(core.getSnapshot().settings!.hotkey.value).toBe('Alt+Space')
-    expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
+    expect(core.getSnapshot().settings!.autostart).toBe(true)
     expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
@@ -1161,41 +1139,6 @@ describe('settings ownership', () => {
     })
   })
 
-  it('keeps rescan failure editable but fails closed when its reload fails', async () => {
-    const { core, client } = await settingsCore()
-    vi.mocked(client.rescanApps).mockRejectedValueOnce({ code: 'scanFailed', message: 'raw' })
-    await core.rescanApps()
-    expect(core.getSnapshot().settings).toMatchObject({ needsReload: false, readOnly: false })
-    expect(core.getSnapshot().status).toBe('重新扫描失败。')
-
-    vi.mocked(client.rescanApps).mockResolvedValueOnce(undefined)
-    vi.mocked(client.loadSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'raw' })
-    await core.rescanApps()
-    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
-    expect(core.getSnapshot().status).toBe('设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。')
-  })
-
-  it('runs rescan reload, export, and inline clear with one settings owner', async () => {
-    const { core, client } = await settingsCore()
-    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, autostart: true })
-    await core.rescanApps()
-    expect(client.rescanApps).toHaveBeenCalledOnce()
-    expect(client.loadSettings).toHaveBeenCalledTimes(2)
-    expect(core.getSnapshot().settings?.autostart).toBe(true)
-
-    vi.mocked(client.exportValidationData).mockResolvedValueOnce({ status: 'exported' })
-    await core.exportValidation()
-    expect(client.exportValidationData).toHaveBeenCalledOnce()
-
-    core.beginClearValidation()
-    expect(core.getSnapshot().settings?.clearConfirmation).toBe(true)
-    core.cancelClearValidation()
-    expect(core.getSnapshot().settings?.clearConfirmation).toBe(false)
-    core.beginClearValidation()
-    await core.confirmClearValidation()
-    expect(client.clearValidationData).toHaveBeenCalledOnce()
-    expect(core.getSnapshot().settings?.clearConfirmation).toBe(false)
-  })
 })
 
 describe('execute and hide continuation', () => {
@@ -1212,8 +1155,8 @@ describe('execute and hide continuation', () => {
     execute.resolve({ status: 'activationRefusedLaunchRequested', message: 'raw backend text' })
     await execute.promise
     await Promise.resolve()
-    emit(shown('notice-priority', 'launcher', 'validationFailed'))
-    expect(core.getSnapshot().shownNotice).toBe('本地验证数据操作失败。')
+    emit(shown('notice-priority', 'launcher', 'settingsFailed'))
+    expect(core.getSnapshot().shownNotice).toBe('快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。')
     emit(shown('eligible'))
     expect(core.getSnapshot().shownNotice).toBe('Windows 拒绝了前台切换，已发送启动请求')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('raw backend')
@@ -1507,7 +1450,7 @@ describe('React view and accessibility', () => {
     const heading = mounted.host.querySelector<HTMLElement>('h1')!
     expect(heading.textContent).toBe('设置')
     expect(document.activeElement).toBe(heading)
-    expect(mounted.host.querySelector('input[maxlength="64"][pattern="[A-Za-z0-9_-]{1,64}"]')).toBeTruthy()
+    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
     const close = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
     expect(close.getAttribute('aria-label')).toBe('关闭')
     await act(async () => close.click())
@@ -1610,37 +1553,26 @@ describe('React view and accessibility', () => {
     bind.mockRestore()
   })
 
-  it('unbinds and retires old settings controls before a form replacement', async () => {
+  it('retires the old settings control before a form replacement', async () => {
     installMatchMedia(false)
-    const cleanup: string[] = []
-    const bind = vi.spyOn(nativeInput, 'bindNativeTextInput').mockImplementation((_input, control) => () => {
-      cleanup.push(`native-unbind:${control}`)
-    })
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const core = createLauncherCore(fake.client)
-    const originalRetire = core.retireControl
-    vi.spyOn(core, 'retireControl').mockImplementation((control) => {
-      cleanup.push(`retire:${control}`)
-      originalRetire(control)
-    })
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('replacement-view', 'settings')))
-    const oldResearchId = core.getSnapshot().settings!.researchId.key
-    cleanup.length = 0
+    const oldHotkey = core.getSnapshot().settings!.hotkey.key
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     await act(async () => core.reloadSettings())
-    const unbindIndex = cleanup.indexOf(`native-unbind:${oldResearchId}`)
-    const retireIndex = cleanup.indexOf(`retire:${oldResearchId}`)
-    expect(unbindIndex).toBeGreaterThanOrEqual(0)
-    expect(retireIndex).toBeGreaterThan(unbindIndex)
+    const replaced = core.getSnapshot()
+    expect(replaced.settings!.hotkey.key).toBeGreaterThan(oldHotkey)
+    core.text({ kind: 'ordinaryInput', control: oldHotkey, value: 'late', inputType: 'insertText' })
+    expect(core.getSnapshot()).toBe(replaced)
     await mounted.unmount()
-    bind.mockRestore()
   })
 
   it('keeps the React/AntD source boundary exact', () => {
-    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Alert', 'Spin', 'theme']) {
+    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Spin', 'theme']) {
       expect(launcherViewSource).toContain(required)
     }
     for (const forbidden of [
@@ -1713,18 +1645,12 @@ describe('real adapter and startup', () => {
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
-    await main.client.rescanApps()
-    await main.client.exportValidationData()
-    await main.client.clearValidationData()
     await main.client.hideLauncher()
     const invokeRows = [
       ['search_apps', [{ query: 'calc', invocationId: 'inv-1', querySequence: 1 }]],
       ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
-      ['rescan_apps', []],
-      ['export_validation_data', []],
-      ['clear_validation_data', []],
       ['hide_launcher', []],
     ] as const
     expect(tauriCapture.invoke.mock.calls.map(([command, ...args]) => [command, args])).toEqual(invokeRows)
@@ -1884,12 +1810,12 @@ describe('real adapter and startup', () => {
 
     for (const command of [
       'search_apps',
+      'search_files',
       'execute_result',
       'load_settings',
       'save_settings',
-      'rescan_apps',
-      'export_validation_data',
-      'clear_validation_data',
+      'save_hotkey',
+      'set_file_preview_preference',
       'hide_launcher',
     ]) {
       expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
@@ -2010,17 +1936,15 @@ describe('launcher real file adapter', () => {
     window.dispatchEvent(new Event('pagehide'))
   })
 
-  it('keeps exactly ten commands two events and no window or payload logging', () => {
+  it('keeps exactly eight commands two events and no window or payload logging', () => {
     for (const command of [
       'search_apps',
       'search_files',
       'execute_result',
       'load_settings',
       'save_settings',
+      'save_hotkey',
       'set_file_preview_preference',
-      'rescan_apps',
-      'export_validation_data',
-      'clear_validation_data',
       'hide_launcher',
     ]) {
       expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)

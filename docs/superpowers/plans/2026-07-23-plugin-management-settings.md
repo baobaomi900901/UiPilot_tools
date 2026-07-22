@@ -41,17 +41,17 @@
 - Delete: `src-tauri/src/validation_export.rs`
 - Delete: `src-tauri/src/session_marker.rs`
 
-- [ ] Add/adjust frontend contract tests proving `SettingsView`, `UserSettingsUpdate`, `LauncherClient`, `SettingsSnapshot`, error codes, notices, and settings UI contain no Research ID, rescan, validation export, validation clear, or confirmation state.
-- [ ] Run `npm test -- --run launcher.test.tsx`; expect the new contract assertions to fail against the existing fields and controls.
-- [ ] Add Rust source/serialization tests proving old `researchId` input is ignored, the next settings write omits it, the three obsolete commands are absent from handler/build/capabilities, and startup/execute/exit paths contain no validation state or notice.
-- [ ] Run `cargo test --manifest-path .\src-tauri\Cargo.toml settings::tests commands::tests lib::tests lifecycle::tests`; expect failures while the old subsystem remains.
-- [ ] Remove the frontend fields, actions, methods, notices, buttons, and operation variants. Keep only ordinary settings `load | save | hotkey` operation ownership.
-- [ ] Remove `research_id` from persisted and wire settings structures. Let serde ignore the legacy JSON key, so a subsequent atomic settings write naturally drops it.
-- [ ] Remove validation recording from application execution and launcher lifecycle without changing action, persistence, hide, or file-index cleanup ordering.
-- [ ] Remove the validation modules and only their now-unused export/dialog/marker helpers. Keep `atomic_file.rs` wherever settings or file-index persistence still consumes it.
-- [ ] Run `npm test -- --run launcher.test.tsx` and the focused Rust test command; expect green.
-- [ ] Run `rg -n "researchId|research_id|rescan_apps|export_validation_data|clear_validation_data|validation_data|validation_export|session_marker|validationFailed" src src-tauri --glob '!src-tauri/target/**'`; expect no production references and only intentional legacy fixture strings, if any.
-- [ ] Commit with `git commit -am "refactor: remove validation settings subsystem"` after deleting files with `git add -A`.
+- [x] Add/adjust frontend contract tests proving `SettingsView`, `UserSettingsUpdate`, `LauncherClient`, `SettingsSnapshot`, error codes, notices, and settings UI contain no Research ID, rescan, validation export, validation clear, or confirmation state.
+- [x] Run `npm test -- --run launcher.test.tsx`; expect the new contract assertions to fail against the existing fields and controls.
+- [x] Add Rust source/serialization tests proving old `researchId` input is ignored, the next settings write omits it, the three obsolete commands are absent from handler/build/capabilities, and startup/execute/exit paths contain no validation state or notice.
+- [x] Run `cargo test --manifest-path .\src-tauri\Cargo.toml settings::tests commands::tests lib::tests lifecycle::tests`; expect failures while the old subsystem remains.
+- [x] Remove the frontend fields, actions, methods, notices, buttons, and operation variants. Keep only ordinary settings `load | save | hotkey` operation ownership.
+- [x] Remove `research_id` from persisted and wire settings structures. Let serde ignore the legacy JSON key, so a subsequent atomic settings write naturally drops it.
+- [x] Remove validation recording from application execution and launcher lifecycle without changing action, persistence, hide, or file-index cleanup ordering.
+- [x] Remove the validation modules and only their now-unused export/dialog/marker helpers. Keep `atomic_file.rs` wherever settings or file-index persistence still consumes it.
+- [x] Run `npm test -- --run launcher.test.tsx` and the focused Rust test command; expect green.
+- [x] Run `rg -n "researchId|research_id|rescan_apps|export_validation_data|clear_validation_data|validation_data|validation_export|session_marker|validationFailed" src src-tauri --glob '!src-tauri/target/**'`; expect no production references and only intentional legacy fixture strings, if any.
+- [x] Commit with `git commit -am "refactor: remove validation settings subsystem"` after deleting files with `git add -A`.
 
 ## Task 2: Add Plugin Description And Inventory Contracts
 

@@ -1,6 +1,5 @@
 import {
   App,
-  Alert,
   Button,
   Checkbox,
   ConfigProvider,
@@ -506,55 +505,15 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               disabled={locked}
             />
           </Form.Item>
-          <Form.Item label="Research ID" htmlFor={`settings-research-${settings.researchId.key}`}>
-            <BoundInput
-              core={core}
-              control={settings.researchId.key}
-              value={settings.researchId.value}
-              id={`settings-research-${settings.researchId.key}`}
-              name={`settings-research-${settings.researchId.key}`}
-              maxLength={64}
-              pattern="[A-Za-z0-9_-]{1,64}"
-              disabled={locked}
-              onKeyDown={settingsKeyDown}
-            />
-          </Form.Item>
           <Checkbox checked={settings.autostart} disabled={locked} onChange={(event) => core.setAutostart(event.target.checked)}>
             开机启动
           </Checkbox>
-          {settings.clearConfirmation ? (
-            <Alert
-              role="group"
-              type="warning"
-              showIcon={false}
-              message="确认清除本地验证数据？"
-              action={
-                <span className="confirmation-actions">
-                  <Button disabled={busy} onClick={() => void core.confirmClearValidation()}>
-                    确认清除
-                  </Button>
-                  <Button disabled={busy} onClick={() => core.cancelClearValidation()}>
-                    取消
-                  </Button>
-                </span>
-              }
-            />
-          ) : null}
           <div className="settings-actions">
             <Button type="primary" disabled={locked} loading={settings.operation === 'save'} onClick={() => void core.saveSettings()}>
               保存
             </Button>
             <Button disabled={busy} loading={settings.operation === 'load'} onClick={() => void core.reloadSettings()}>
               重新加载设置
-            </Button>
-            <Button disabled={locked} loading={settings.operation === 'rescan'} onClick={() => void core.rescanApps()}>
-              重新扫描
-            </Button>
-            <Button disabled={busy} loading={settings.operation === 'export'} onClick={() => void core.exportValidation()}>
-              导出验证数据
-            </Button>
-            <Button disabled={busy} loading={settings.operation === 'clear'} onClick={() => core.beginClearValidation()}>
-              清除验证数据
             </Button>
           </div>
         </Form>

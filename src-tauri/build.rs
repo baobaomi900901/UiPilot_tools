@@ -7,9 +7,6 @@ fn main() {
             "load_settings",
             "save_settings",
             "save_hotkey",
-            "rescan_apps",
-            "export_validation_data",
-            "clear_validation_data",
             "hide_launcher",
         ]),
     ))

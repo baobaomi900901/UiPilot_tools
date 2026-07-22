@@ -26,16 +26,7 @@ mod model;
 mod result_registry;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
-mod session_marker;
-
-#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod settings;
-
-#[cfg(any(test, not(feature = "test-instrumentation")))]
-mod validation_data;
-
-#[cfg(any(test, not(feature = "test-instrumentation")))]
-mod validation_export;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod hotkey;
@@ -66,15 +57,6 @@ fn load_settings_store(
 }
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
-fn load_and_open_validation_store(
-    app_data_dir: &std::path::Path,
-) -> Result<validation_data::ValidationStore, validation_data::ValidationError> {
-    let store = validation_data::ValidationStore::load(app_data_dir)?;
-    store.reconcile_and_open_session()?;
-    Ok(store)
-}
-
-#[cfg(any(test, not(feature = "test-instrumentation")))]
 fn lifecycle_setup_error() -> std::io::Error {
     std::io::Error::other("lifecycle setup failed")
 }
@@ -95,11 +77,6 @@ fn setup_production_lifecycle(
         return Err(lifecycle_setup_error().into());
     }
 
-    let validation = load_and_open_validation_store(&app_data_dir)?;
-    if !app.manage(validation) {
-        return Err(lifecycle_setup_error().into());
-    }
-
     let window = app
         .get_webview_window("main")
         .ok_or_else(lifecycle_setup_error)?;
@@ -109,11 +86,9 @@ fn setup_production_lifecycle(
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
             let registry = event_app.state::<result_registry::ResultRegistry>();
-            let _ = event_coordinator.handle_focus_event_with(
-                *focused,
-                || event_window.is_focused().map_err(|_| ()),
-                || commands::clear_and_hide(&registry, &event_window).map_err(|_| ()),
-            );
+            let _ = event_coordinator.handle_focus_event_with(*focused, || {
+                commands::clear_and_hide(&registry, &event_window).map_err(|_| ())
+            });
         }
         tauri::WindowEvent::CloseRequested { api, .. }
             if event_coordinator.should_prevent_close() =>
@@ -245,9 +220,6 @@ pub fn run() {
             commands::save_settings,
             commands::save_hotkey,
             commands::set_file_preview_preference,
-            commands::rescan_apps,
-            commands::export_validation_data,
-            commands::clear_validation_data,
             commands::hide_launcher,
         ]);
 
@@ -298,7 +270,7 @@ mod tests {
 
     use super::{
         apps::{AppCache, Application, ApplicationLaunchTarget},
-        load_and_open_validation_store, load_settings_store,
+        load_settings_store,
         settings::Settings,
     };
 
@@ -385,12 +357,43 @@ mod tests {
     }
 
     #[test]
-    fn load_and_open_validation_store_creates_marker_before_returning() {
-        let dir = TestDir::new();
+    fn production_has_no_retired_validation_subsystem() {
+        let lib = include_str!("lib.rs").replace("\r\n", "\n");
+        let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
+        let lifecycle_source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let production = lib
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let commands = commands_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
+        let lifecycle = lifecycle_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("lifecycle test module marker is missing");
+        let build = include_str!("../build.rs");
+        let capability = include_str!("../capabilities/main.json");
 
-        let _store = load_and_open_validation_store(dir.path()).unwrap();
-
-        assert!(dir.path().join("open-session.json").exists());
+        for forbidden in [
+            "validation_data",
+            "validation_export",
+            "session_marker",
+            "load_and_open_validation_store",
+            "rescan_apps",
+            "export_validation_data",
+            "clear_validation_data",
+            "ValidationFailed",
+            "validationFailed",
+        ] {
+            assert!(
+                ![production, commands, lifecycle, build, capability]
+                    .iter()
+                    .any(|source| source.contains(forbidden)),
+                "retired validation surface remains: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -417,7 +420,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 12);
+        assert_eq!(production.matches("commands::").count(), 9);
         for command in [
             "search_apps",
             "publish_plugin_results",
@@ -427,9 +430,6 @@ mod tests {
             "save_settings",
             "save_hotkey",
             "set_file_preview_preference",
-            "rescan_apps",
-            "export_validation_data",
-            "clear_validation_data",
             "hide_launcher",
         ] {
             assert!(production.contains(&format!("commands::{command}")));
@@ -687,10 +687,7 @@ mod tests {
             "commands",
             "model",
             "result_registry",
-            "session_marker",
             "settings",
-            "validation_data",
-            "validation_export",
             "hotkey",
             "double_tap",
             "hotkey_hook",
@@ -757,10 +754,7 @@ mod tests {
             ("file_index/windows_backend.rs", file_windows_production),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
-            ("session_marker.rs", include_str!("session_marker.rs")),
             ("settings.rs", include_str!("settings.rs")),
-            ("validation_data.rs", include_str!("validation_data.rs")),
-            ("validation_export.rs", include_str!("validation_export.rs")),
             ("plugins.rs", include_str!("plugins.rs")),
         ];
 
@@ -800,16 +794,6 @@ mod tests {
         assert!(action.contains(&format!(
             "{enum_variant_allow}\npub(crate) enum ApplicationActionOutcome"
         )));
-
-        let test_only_allow = "#[cfg_attr(test, allow(dead_code))]";
-        assert_eq!(
-            product_sources
-                .iter()
-                .map(|(_, product_source)| product_source.matches(test_only_allow).count())
-                .sum::<usize>(),
-            1
-        );
-        assert!(cache.contains(&format!("{test_only_allow}\n    pub(crate) fn refresh")));
     }
 
     #[test]

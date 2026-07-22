@@ -28,7 +28,6 @@ pub(crate) struct Settings {
     pub(crate) autostart: bool,
     #[serde(default = "default_file_preview_enabled")]
     pub(crate) file_preview_enabled: bool,
-    pub(crate) research_id: Option<String>,
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,7 +37,6 @@ pub(crate) struct Settings {
 pub(crate) struct SettingsUpdate {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
-    pub(crate) research_id: Option<String>,
 }
 
 struct SettingsState {
@@ -55,7 +53,6 @@ pub(crate) struct SettingsStore {
 pub(crate) enum SettingsError {
     Storage,
     Serialize,
-    InvalidUpdate,
     UnknownApplication,
     CountOverflow,
 }
@@ -66,7 +63,6 @@ impl Default for Settings {
             hotkey: "Alt+Space".into(),
             autostart: false,
             file_preview_enabled: default_file_preview_enabled(),
-            research_id: None,
             use_counts: BTreeMap::new(),
             window_position: None,
         }
@@ -82,7 +78,6 @@ impl fmt::Display for SettingsError {
         formatter.write_str(match self {
             Self::Storage => "settings storage failed",
             Self::Serialize => "settings serialization failed",
-            Self::InvalidUpdate => "settings update is invalid",
             Self::UnknownApplication => "settings application is unknown",
             Self::CountOverflow => "settings count overflow",
         })
@@ -97,22 +92,7 @@ impl From<AtomicFileError> for SettingsError {
     }
 }
 
-fn validate_user_settings_update(update: &SettingsUpdate) -> Result<(), SettingsError> {
-    if update
-        .research_id
-        .as_deref()
-        .is_some_and(|value| !valid_research_id(value))
-    {
-        return Err(SettingsError::InvalidUpdate);
-    }
-    Ok(())
-}
-
 impl SettingsStore {
-    pub(crate) fn validate_user_settings(update: &SettingsUpdate) -> Result<(), SettingsError> {
-        validate_user_settings_update(update)
-    }
-
     pub(crate) fn load(app_data_dir: &Path) -> Result<Self, SettingsError> {
         fs::create_dir_all(app_data_dir).map_err(|_| SettingsError::Storage)?;
         let paths = AtomicPaths::new(app_data_dir, "settings.json");
@@ -158,13 +138,11 @@ impl SettingsStore {
     }
 
     pub(crate) fn update_user_settings(&self, update: SettingsUpdate) -> Result<(), SettingsError> {
-        validate_user_settings_update(&update)?;
         let mut state = self.state.lock().expect("settings lock poisoned");
 
         let mut candidate = state.value.clone();
         candidate.hotkey = update.hotkey;
         candidate.autostart = update.autostart;
-        candidate.research_id = update.research_id;
         self.persist(&mut state, candidate)
     }
 
@@ -216,15 +194,6 @@ impl SettingsStore {
             .window_position
     }
 
-    pub(crate) fn research_id(&self) -> Option<String> {
-        self.state
-            .lock()
-            .expect("settings lock poisoned")
-            .value
-            .research_id
-            .clone()
-    }
-
     pub(crate) fn snapshot(&self) -> Settings {
         self.state
             .lock()
@@ -266,20 +235,10 @@ fn load_candidate(path: &Path) -> Result<Option<Settings>, SettingsError> {
 }
 
 fn valid_settings(settings: &Settings) -> bool {
-    !matches!(
-        settings.research_id.as_deref(),
-        Some(value) if !valid_research_id(value)
-    ) && settings
+    settings
         .use_counts
         .keys()
         .all(|app_id| valid_app_id(app_id))
-}
-
-fn valid_research_id(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn valid_app_id(value: &str) -> bool {
@@ -370,11 +329,10 @@ mod tests {
         fs::write(path, serde_json::to_vec(settings).unwrap()).unwrap();
     }
 
-    fn update(research_id: Option<&str>) -> SettingsUpdate {
+    fn update() -> SettingsUpdate {
         SettingsUpdate {
             hotkey: "Alt+Space".into(),
             autostart: false,
-            research_id: research_id.map(Into::into),
         }
     }
 
@@ -399,11 +357,11 @@ mod tests {
     fn valid_current_has_priority_over_backup() {
         let dir = TestDir::new("current-priority");
         let current = Settings {
-            research_id: Some("current".into()),
+            hotkey: "Ctrl+Space".into(),
             ..Settings::default()
         };
         let backup = Settings {
-            research_id: Some("backup".into()),
+            hotkey: "DoubleCtrl".into(),
             ..Settings::default()
         };
         write_settings(&dir.current(), &current);
@@ -419,7 +377,7 @@ mod tests {
         let dir = TestDir::new("backup-recovery");
         fs::write(dir.current(), b"not-json").unwrap();
         let backup = Settings {
-            research_id: Some("backup".into()),
+            hotkey: "DoubleCtrl".into(),
             ..Settings::default()
         };
         write_settings(&dir.backup(), &backup);
@@ -489,7 +447,7 @@ mod tests {
 
         let store = SettingsStore::load(dir.path()).unwrap();
 
-        assert_eq!(store.research_id().as_deref(), Some("legacy"));
+        assert_eq!(store.snapshot().hotkey, "Alt+Space");
         assert!(store.snapshot().use_counts.is_empty());
     }
 
@@ -509,7 +467,7 @@ mod tests {
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.current()).unwrap()).unwrap();
-        assert_eq!(persisted["researchId"], "study_01");
+        assert!(persisted.get("researchId").is_none());
         assert_eq!(persisted["filePreviewEnabled"], false);
         assert!(persisted.get("aliases").is_none());
     }
@@ -528,7 +486,6 @@ mod tests {
             .update_user_settings(SettingsUpdate {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
-                research_id: Some("study_01".into()),
             })
             .unwrap();
 
@@ -536,41 +493,18 @@ mod tests {
         assert_eq!(value.use_counts[APP_A], 7);
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
-        assert_eq!(value.research_id.as_deref(), Some("study_01"));
-    }
-
-    #[test]
-    fn validate_user_settings_accepts_valid_input_without_changing_memory_or_disk() {
-        let dir = TestDir::new("preflight-no-write");
-        let persisted = Settings {
-            research_id: Some("study_01".into()),
-            ..Settings::default()
-        };
-        write_settings(&dir.current(), &persisted);
-        let current_bytes = fs::read(dir.current()).unwrap();
-        let store = SettingsStore::load(dir.path()).unwrap();
-        let before = store.snapshot();
-        let update = update(Some("study_02"));
-
-        validate_user_settings_update(&update).unwrap();
-
-        assert_eq!(store.snapshot(), before);
-        assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
     }
 
     #[test]
     fn update_hotkey_only_preserves_other_settings() {
         let dir = TestDir::new("hotkey-only");
         let store = SettingsStore::load(dir.path()).unwrap();
-        store
-            .update_user_settings(update(Some("study_01")))
-            .unwrap();
+        store.update_user_settings(update()).unwrap();
 
         store.update_hotkey("DoubleCtrl".into()).unwrap();
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.hotkey, "DoubleCtrl");
-        assert_eq!(snapshot.research_id.as_deref(), Some("study_01"));
         assert_eq!(read_current(&dir), snapshot);
     }
 
@@ -598,36 +532,6 @@ mod tests {
             }
         );
         assert_eq!(read_current(&dir), store.snapshot());
-    }
-
-    #[test]
-    fn preflight_and_final_validation_reject_the_same_invalid_updates() {
-        let dir = TestDir::new("preflight-final-validation");
-        let persisted = Settings {
-            research_id: Some("study_01".into()),
-            ..Settings::default()
-        };
-        write_settings(&dir.current(), &persisted);
-        let current_bytes = fs::read(dir.current()).unwrap();
-        let store = SettingsStore::load(dir.path()).unwrap();
-
-        for (preflight, final_update, expected) in [
-            (
-                update(Some(" ")),
-                update(Some(" ")),
-                SettingsError::InvalidUpdate,
-            ),
-            (
-                update(Some(&"A".repeat(65))),
-                update(Some(&"A".repeat(65))),
-                SettingsError::InvalidUpdate,
-            ),
-        ] {
-            assert_eq!(validate_user_settings_update(&preflight), Err(expected));
-            assert_eq!(store.update_user_settings(final_update), Err(expected));
-            assert_eq!(store.snapshot(), persisted);
-            assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
-        }
     }
 
     #[test]
@@ -672,49 +576,21 @@ mod tests {
     }
 
     #[test]
-    fn research_id_accepts_only_the_approved_boundaries_on_update() {
-        let dir = TestDir::new("research-update");
+    fn legacy_research_id_is_ignored_and_dropped_on_next_write() {
+        let dir = TestDir::new("legacy-research-id");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":{"retired":true},"useCounts":{}}"#,
+        )
+        .unwrap();
+
         let store = SettingsStore::load(dir.path()).unwrap();
-        let allowed_64 = "A".repeat(64);
+        assert_eq!(store.snapshot(), Settings::default());
+        store.update_user_settings(update()).unwrap();
 
-        store.update_user_settings(update(Some("A"))).unwrap();
-        assert_eq!(store.research_id().as_deref(), Some("A"));
-        store
-            .update_user_settings(update(Some(&allowed_64)))
-            .unwrap();
-        assert_eq!(store.research_id().as_deref(), Some(allowed_64.as_str()));
-    }
-
-    #[test]
-    fn invalid_research_ids_are_rejected_on_update_without_state_changes() {
-        let dir = TestDir::new("invalid-research-update");
-        let store = SettingsStore::load(dir.path()).unwrap();
-
-        for invalid in ["", " ", "é", &"A".repeat(65)] {
-            assert_eq!(
-                store.update_user_settings(update(Some(invalid))),
-                Err(SettingsError::InvalidUpdate)
-            );
-            assert_eq!(store.snapshot(), Settings::default());
-            assert!(!dir.current().exists());
-        }
-    }
-
-    #[test]
-    fn invalid_research_ids_in_current_are_quarantined() {
-        for (index, invalid) in ["", " ", "é", &"A".repeat(65)].into_iter().enumerate() {
-            let dir = TestDir::new(&format!("invalid-research-load-{index}"));
-            let persisted = Settings {
-                research_id: Some(invalid.into()),
-                ..Settings::default()
-            };
-            write_settings(&dir.current(), &persisted);
-
-            let store = SettingsStore::load(dir.path()).unwrap();
-
-            assert_eq!(store.snapshot(), Settings::default());
-            assert!(!dir.current().exists());
-        }
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.current()).unwrap()).unwrap();
+        assert!(persisted.get("researchId").is_none());
     }
 
     #[test]
@@ -808,9 +684,7 @@ mod tests {
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();
 
-        store
-            .update_user_settings(update(Some("study_02")))
-            .unwrap();
+        store.update_user_settings(update()).unwrap();
 
         assert!(!store.snapshot().file_preview_enabled);
         assert!(!read_current(&dir).file_preview_enabled);
@@ -822,7 +696,6 @@ mod tests {
         let persisted = Settings {
             hotkey: "Ctrl+Space".into(),
             autostart: true,
-            research_id: Some("study_01".into()),
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             window_position: None,
@@ -850,7 +723,6 @@ mod tests {
         let cases = [
             (SettingsError::Storage, "settings storage failed"),
             (SettingsError::Serialize, "settings serialization failed"),
-            (SettingsError::InvalidUpdate, "settings update is invalid"),
             (
                 SettingsError::UnknownApplication,
                 "settings application is unknown",

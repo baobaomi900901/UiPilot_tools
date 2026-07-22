@@ -9,7 +9,6 @@ import {
   parseFileSearchResponse,
   type FileSearchResponse,
   type ExecuteOutcome,
-  type ExportOutcome,
   type HotkeySettingsView,
   type LauncherClient,
   type SearchResponse,
@@ -40,9 +39,6 @@ export const client: LauncherClient = {
       'set_file_preview_preference',
       Object.freeze({ preference: Object.freeze({ enabled: input.preference.enabled }) }),
     ),
-  rescanApps: () => invoke<void>('rescan_apps'),
-  exportValidationData: () => invoke<ExportOutcome>('export_validation_data'),
-  clearValidationData: () => invoke<void>('clear_validation_data'),
   hideLauncher: () => invoke<void>('hide_launcher'),
 }
 

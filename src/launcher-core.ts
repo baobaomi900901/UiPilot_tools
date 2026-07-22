@@ -38,11 +38,6 @@ export interface LauncherCore {
   readonly setFilePreviewEnabled: (enabled: boolean) => void
   readonly saveSettings: () => Promise<void>
   readonly reloadSettings: () => Promise<void>
-  readonly rescanApps: () => Promise<void>
-  readonly exportValidation: () => Promise<void>
-  readonly beginClearValidation: () => void
-  readonly cancelClearValidation: () => void
-  readonly confirmClearValidation: () => Promise<void>
   readonly destroy: () => void
 }
 
@@ -89,7 +84,6 @@ interface Model {
   settingsOperation?: SettingsOperationKind
   settingsNeedsReload: boolean
   settingsLoadError?: string
-  clearConfirmation: boolean
   file?: PrivateFileState
 }
 
@@ -109,7 +103,6 @@ interface TextControl {
 
 interface PrivateSettings {
   hotkey: TextControl
-  researchId: TextControl
   autostart: boolean
 }
 
@@ -129,7 +122,7 @@ interface PreviewPreferenceOwner {
   enabled: boolean
 }
 
-type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'rescan' | 'export' | 'clear'
+type SettingsOperationKind = 'load' | 'save' | 'hotkey'
 
 interface SettingsOperation {
   token: number
@@ -144,13 +137,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   unknownResult: '搜索结果已过期，请重新搜索。',
   applicationEntryUnavailable: '应用入口不可用，请重新扫描。',
   settingsFailed: '设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。',
-  validationFailed: '验证数据操作失败。',
   windowFailed: '窗口操作失败。',
-  scanFailed: '重新扫描失败。',
-  scanWorkerFailed: '重新扫描失败。',
-  mainThreadDispatchFailed: '导出失败。',
-  exportFailed: '导出失败。',
-  exportWorkerFailed: '导出失败。',
   invalidFileQuery: '查询无效。',
   fileSearchWorkerFailed: '搜索暂不可用。',
   searchUnavailable: '搜索暂不可用。',
@@ -162,7 +149,6 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
 
 const NOTICE_TEXT = {
   settingsFailed: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
-  validationFailed: '本地验证数据操作失败。',
 } as const
 
 const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
@@ -199,11 +185,9 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   const settings = model.settings
     ? Object.freeze({
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
-        researchId: Object.freeze({ key: model.settings.researchId.key, value: model.settings.researchId.draft }),
         autostart: model.settings.autostart,
         readOnly: model.settingsNeedsReload,
         ...(model.settingsOperation === undefined ? {} : { operation: model.settingsOperation }),
-        clearConfirmation: model.clearConfirmation,
         needsReload: model.settingsNeedsReload,
       })
     : undefined
@@ -269,7 +253,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     hidePending: false,
     status: '',
     settingsNeedsReload: false,
-    clearConfirmation: false,
   }
   const listeners = new Set<() => void>()
   let snapshot = projectSnapshot(model)
@@ -321,7 +304,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function settingsControls(settings: PrivateSettings): TextControl[] {
-    return [settings.hotkey, settings.researchId]
+    return [settings.hotkey]
   }
 
   function replaceSettings(view: SettingsView, previewGeneration: number): void {
@@ -333,18 +316,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     model.settings = {
       hotkey: newTextControl(view.hotkey),
-      researchId: newTextControl(view.researchId ?? ''),
       autostart: view.autostart,
     }
     model.settingsNeedsReload = false
     model.settingsLoadError = undefined
-    model.clearConfirmation = false
   }
 
   function findTextControl(control: ControlKey): TextControl | undefined {
     if (!model.settings) return undefined
     if (model.settings.hotkey.key === control) return model.settings.hotkey
-    if (model.settings.researchId.key === control) return model.settings.researchId
     return undefined
   }
 
@@ -902,7 +882,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const operation = { token: ++token, kind, viewEpoch: model.viewEpoch, view: model.view }
     settingsOperation = operation
     model.settingsOperation = kind
-    model.clearConfirmation = false
     model.shownNotice = undefined
     model.status = ''
     publish(true)
@@ -928,7 +907,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return {
       hotkey: settings.hotkey.value,
       autostart: settings.autostart,
-      ...(settings.researchId.value === '' ? {} : { researchId: settings.researchId.value }),
     }
   }
 
@@ -1032,78 +1010,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       } else {
         model.settingsNeedsReload = true
       }
-      publish(true)
-    }
-  }
-
-  async function rescanApps(): Promise<void> {
-    if (!settingsEditable()) return
-    const operation = startSettingsOperation('rescan')
-    if (!operation) return
-    try {
-      await client.rescanApps()
-    } catch (error) {
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      releaseSettingsOperation(operation)
-      if (current) model.status = errorText(error)
-      else model.settingsNeedsReload = true
-      publish(true)
-      return
-    }
-    await reloadAfterMutation(operation)
-  }
-
-  async function exportValidation(): Promise<void> {
-    const operation = startSettingsOperation('export')
-    if (!operation) return
-    try {
-      const outcome = await client.exportValidationData()
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      releaseSettingsOperation(operation)
-      if (current) model.status = outcome.status === 'exported' ? '验证数据已导出。' : ''
-      publish(true)
-    } catch (error) {
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      releaseSettingsOperation(operation)
-      if (current) model.status = errorText(error)
-      publish(true)
-    }
-  }
-
-  function beginClearValidation(): void {
-    if (!model.settings || settingsOperation || model.clearConfirmation) return
-    model.clearConfirmation = true
-    model.shownNotice = undefined
-    model.status = ''
-    publish(true)
-  }
-
-  function cancelClearValidation(): void {
-    if (!model.clearConfirmation || settingsOperation) return
-    model.clearConfirmation = false
-    model.shownNotice = undefined
-    publish(true)
-  }
-
-  async function confirmClearValidation(): Promise<void> {
-    if (!model.clearConfirmation) return
-    const operation = startSettingsOperation('clear')
-    if (!operation) return
-    try {
-      await client.clearValidationData()
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      releaseSettingsOperation(operation)
-      if (current) model.status = '验证数据已清除。'
-      publish(true)
-    } catch (error) {
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      releaseSettingsOperation(operation)
-      if (current) model.status = errorText(error)
       publish(true)
     }
   }
@@ -1372,11 +1278,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setFilePreviewEnabled,
     saveSettings,
     reloadSettings,
-    rescanApps,
-    exportValidation,
-    beginClearValidation,
-    cancelClearValidation,
-    confirmClearValidation,
     destroy,
   }
 }

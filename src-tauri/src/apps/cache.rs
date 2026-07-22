@@ -42,11 +42,6 @@ impl AppCache {
             .any(|application| application.app_id == app_id)
     }
 
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn refresh(&self) -> Result<DiscoveryDiagnostics, DiscoveryError> {
-        self.refresh_with(discover)
-    }
-
     pub(crate) fn refresh_with<F>(
         &self,
         discover: F,
@@ -209,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_refresh_and_later_rescan_are_serialized_and_later_result_wins() {
+    fn initial_refresh_and_later_refresh_are_serialized_and_later_result_wins() {
         let cache = Arc::new(AppCache::new());
         let (release_initial_tx, release_initial_rx) = mpsc::sync_channel(0);
         let initial = start_initial_refresh_with(Arc::clone(&cache), move || {

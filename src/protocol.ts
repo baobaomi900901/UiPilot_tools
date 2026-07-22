@@ -14,13 +14,11 @@ export interface SettingsView {
   hotkey: string
   autostart: boolean
   filePreviewEnabled: boolean
-  researchId?: string
 }
 
 export interface UserSettingsUpdate {
   hotkey: string
   autostart: boolean
-  researchId?: string | null
 }
 
 export interface HotkeySettingsUpdate {
@@ -39,21 +37,13 @@ export type ExecuteOutcome =
   | { status: 'fileRevealRequested' }
   | { status: 'folderOpenRequested' }
 
-export type ExportOutcome = { status: 'cancelled' } | { status: 'exported' }
-
 export type CommandErrorCode =
   | 'invalidCaller'
   | 'staleRequest'
   | 'unknownResult'
   | 'applicationEntryUnavailable'
   | 'settingsFailed'
-  | 'validationFailed'
   | 'windowFailed'
-  | 'scanFailed'
-  | 'scanWorkerFailed'
-  | 'mainThreadDispatchFailed'
-  | 'exportFailed'
-  | 'exportWorkerFailed'
   | 'invalidFileQuery'
   | 'fileSearchWorkerFailed'
   | 'searchUnavailable'
@@ -68,7 +58,7 @@ export interface CommandError {
 }
 
 export type ShowTarget = 'launcher' | 'settings'
-export type LifecycleNotice = 'settingsFailed' | 'validationFailed'
+export type LifecycleNotice = 'settingsFailed'
 
 export interface LauncherShown {
   invocationId: string
@@ -100,9 +90,6 @@ export interface LauncherClient {
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
   setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
-  rescanApps(): Promise<void>
-  exportValidationData(): Promise<ExportOutcome>
-  clearValidationData(): Promise<void>
   hideLauncher(): Promise<void>
 }
 
@@ -120,11 +107,9 @@ export interface TextControlView {
 
 export interface SettingsSnapshot {
   hotkey: TextControlView
-  researchId: TextControlView
   autostart: boolean
   readOnly: boolean
-  operation?: 'load' | 'save' | 'hotkey' | 'rescan' | 'export' | 'clear'
-  clearConfirmation: boolean
+  operation?: 'load' | 'save' | 'hotkey'
   needsReload: boolean
 }
 
@@ -205,7 +190,7 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
   if (keys.length !== shownKeys.length || keys.some((key, index) => key !== shownKeys[index])) return null
   if (typeof candidate.invocationId !== 'string') return null
   if (candidate.target !== 'launcher' && candidate.target !== 'settings') return null
-  if (candidate.notice !== null && candidate.notice !== 'settingsFailed' && candidate.notice !== 'validationFailed') return null
+  if (candidate.notice !== null && candidate.notice !== 'settingsFailed') return null
   return candidate as unknown as LauncherShown
 }
 
