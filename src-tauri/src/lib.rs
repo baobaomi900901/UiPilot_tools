@@ -222,6 +222,7 @@ pub fn run() {
             commands::execute_result,
             commands::load_settings,
             commands::save_settings,
+            commands::save_hotkey,
             commands::set_file_preview_preference,
             commands::rescan_apps,
             commands::export_validation_data,

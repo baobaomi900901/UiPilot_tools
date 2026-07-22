@@ -198,6 +198,13 @@ impl SettingsStore {
         self.persist(&mut state, candidate)
     }
 
+    pub(crate) fn update_hotkey(&self, hotkey: String) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.hotkey = hotkey;
+        self.persist(&mut state, candidate)
+    }
+
     pub(crate) fn increment_use_count(
         &self,
         app_id: &str,
@@ -564,6 +571,24 @@ mod tests {
 
         assert_eq!(store.snapshot(), before);
         assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
+    }
+
+    #[test]
+    fn update_hotkey_only_preserves_other_settings() {
+        let dir = TestDir::new("hotkey-only");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let cache = cache(&[(APP_A, "App")]);
+        store
+            .update_user_settings(update(Some("study_01"), &[(APP_A, &["alias"])]), &cache)
+            .unwrap();
+
+        store.update_hotkey("DoubleCtrl".into()).unwrap();
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.hotkey, "DoubleCtrl");
+        assert_eq!(snapshot.research_id.as_deref(), Some("study_01"));
+        assert_eq!(snapshot.aliases[APP_A], ["alias"]);
+        assert_eq!(read_current(&dir), snapshot);
     }
 
     #[test]

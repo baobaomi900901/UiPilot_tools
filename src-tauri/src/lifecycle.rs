@@ -665,6 +665,46 @@ impl LifecycleCoordinator {
     ) -> Result<(), ()> {
         let persisted = settings.snapshot();
         let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
+        self.apply_production_hotkey_transaction(
+            app,
+            HotkeyBindingChange {
+                persisted: persisted_kind,
+                requested: kind,
+                autostart: update.autostart,
+            },
+            || settings.update_user_settings(update, cache).map_err(|_| ()),
+        )
+    }
+
+    pub(crate) fn save_hotkey_transaction(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        settings: &SettingsStore,
+        kind: HotkeyKind,
+        hotkey: String,
+    ) -> Result<(), ()> {
+        let persisted = settings.snapshot();
+        let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
+        self.apply_production_hotkey_transaction(
+            app,
+            HotkeyBindingChange {
+                persisted: persisted_kind,
+                requested: kind,
+                autostart: persisted.autostart,
+            },
+            || settings.update_hotkey(hotkey).map_err(|_| ()),
+        )
+    }
+
+    fn apply_production_hotkey_transaction<P>(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        change: HotkeyBindingChange,
+        persist: P,
+    ) -> Result<(), ()>
+    where
+        P: FnOnce() -> Result<(), ()>,
+    {
         let global_shortcut = app.global_shortcut();
         let autostart = app.autolaunch();
         let install_coordinator = Arc::clone(self);
@@ -672,11 +712,7 @@ impl LifecycleCoordinator {
         let install_app = app.clone();
         let uninstall_app = app.clone();
         self.apply_hotkey_settings_transaction(
-            HotkeyBindingChange {
-                persisted: persisted_kind,
-                requested: kind,
-                autostart: update.autostart,
-            },
+            change,
             (
                 |shortcut| global_shortcut.register(shortcut).map_err(|_| ()),
                 |shortcut| global_shortcut.unregister(shortcut).map_err(|_| ()),
@@ -698,7 +734,7 @@ impl LifecycleCoordinator {
                     .map_err(|_| ())
                 },
             ),
-            || settings.update_user_settings(update, cache).map_err(|_| ()),
+            persist,
         )
     }
 

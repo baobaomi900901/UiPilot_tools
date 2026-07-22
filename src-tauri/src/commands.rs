@@ -50,6 +50,18 @@ pub(crate) struct UserSettingsUpdate {
     aliases: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct HotkeySettingsUpdate {
+    hotkey: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HotkeySettingsView {
+    hotkey: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct FilePreviewPreferenceUpdate {
@@ -471,6 +483,14 @@ fn prepare_settings_save(
     Ok((kind, update))
 }
 
+fn prepare_hotkey_save(
+    update: HotkeySettingsUpdate,
+) -> Result<(HotkeyKind, HotkeySettingsView), CommandError> {
+    let kind = HotkeyKind::parse(&update.hotkey).map_err(|_| CommandError::settings_failed())?;
+    let hotkey = kind.canonical();
+    Ok((kind, HotkeySettingsView { hotkey }))
+}
+
 async fn save_settings_with<R, E, W>(
     settings: UserSettingsUpdate,
     _settings_store: &SettingsStore,
@@ -487,6 +507,24 @@ where
         worker(reservation, kind, update)
     })
     .await
+}
+
+async fn save_hotkey_with<R, E, W>(
+    hotkey: HotkeySettingsUpdate,
+    reserve: R,
+    worker: W,
+) -> Result<HotkeySettingsView, CommandError>
+where
+    R: FnOnce() -> Result<CriticalReservation, E>,
+    W: FnOnce(CriticalReservation, HotkeyKind, String) -> Result<(), ()> + Send + 'static,
+{
+    let (kind, view) = prepare_hotkey_save(hotkey)?;
+    let persisted = view.hotkey.clone();
+    save_settings_worker_with(reserve, move |reservation| {
+        worker(reservation, kind, persisted)
+    })
+    .await?;
+    Ok(view)
 }
 
 pub(crate) async fn save_settings_worker_with<R, E, W>(
@@ -542,6 +580,38 @@ pub(crate) async fn save_settings(
                     cache.inner(),
                     kind,
                     update,
+                )
+            }
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn save_hotkey(
+    window: tauri::WebviewWindow,
+    hotkey: HotkeySettingsUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+) -> Result<HotkeySettingsView, CommandError> {
+    require_main_window(&window)?;
+    save_hotkey_with(
+        hotkey,
+        || {
+            let reservation = coordinator.reserve_critical()?;
+            Ok::<_, ReservationError>(reservation)
+        },
+        {
+            let app_for_worker = app.clone();
+            let coordinator_for_worker = Arc::clone(coordinator.inner());
+            move |reservation, kind, hotkey| {
+                let _reservation = reservation;
+                let settings = app_for_worker.state::<SettingsStore>();
+                coordinator_for_worker.save_hotkey_transaction(
+                    &app_for_worker,
+                    &settings,
+                    kind,
+                    hotkey,
                 )
             }
         },
@@ -915,10 +985,11 @@ mod tests {
         execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
         load_settings_core, load_settings_ready_with, map_export_worker_result,
         map_file_preview_worker_result, map_rescan_result, map_save_worker_result,
-        prepare_file_query, prepare_settings_save, publish_file_search, require_main_label,
-        rescan_apps_with, save_settings_core, save_settings_with, save_settings_worker_with,
-        search_apps_with, search_files_with, set_file_preview_preference_with, spawn_export_worker,
-        AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate,
+        prepare_file_query, prepare_hotkey_save, prepare_settings_save, publish_file_search,
+        require_main_label, rescan_apps_with, save_settings_core, save_settings_with,
+        save_settings_worker_with, search_apps_with, search_files_with,
+        set_file_preview_preference_with, spawn_export_worker, AppAliasTarget, CommandError,
+        ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate, HotkeySettingsUpdate,
         SaveSettingsCache, SettingsView, UserSettingsUpdate,
     };
     use crate::{
@@ -1055,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_guard_rejects_all_ten_non_main_commands_without_side_effects() {
+    fn caller_guard_rejects_non_main_commands_without_side_effects() {
         assert_eq!(require_main_label("main"), Ok(()));
         for command in [
             "search_apps",
@@ -1063,6 +1134,7 @@ mod tests {
             "execute_result",
             "load_settings",
             "save_settings",
+            "save_hotkey",
             "set_file_preview_preference",
             "rescan_apps",
             "export_validation_data",
@@ -2294,6 +2366,36 @@ mod tests {
         assert_eq!(kind, HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl));
         assert_eq!(update.hotkey, "DoubleCtrl");
         let _ = settings_store;
+    }
+
+    #[test]
+    fn save_hotkey_preflight_accepts_only_hotkey_and_canonicalizes() {
+        let input: HotkeySettingsUpdate =
+            serde_json::from_value(serde_json::json!({ "hotkey": "Control+Space" })).unwrap();
+        let (kind, view) = prepare_hotkey_save(input).unwrap();
+        match &kind {
+            HotkeyKind::Chord(shortcut) => assert_eq!(shortcut.to_string(), "control+Space"),
+            _ => panic!("expected chord"),
+        }
+        assert_eq!(view.hotkey, "control+Space");
+
+        let input: HotkeySettingsUpdate =
+            serde_json::from_value(serde_json::json!({ "hotkey": "DoubleCtrl" })).unwrap();
+        let (kind, view) = prepare_hotkey_save(input).unwrap();
+        assert_eq!(kind, HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl));
+        assert_eq!(view.hotkey, "DoubleCtrl");
+
+        assert!(serde_json::from_value::<HotkeySettingsUpdate>(serde_json::json!({
+            "hotkey": "DoubleCtrl",
+            "autostart": true
+        }))
+        .is_err());
+        assert_eq!(
+            prepare_hotkey_save(HotkeySettingsUpdate {
+                hotkey: "doublectrl".into()
+            }),
+            Err(CommandError::settings_failed())
+        );
     }
 
     #[test]
