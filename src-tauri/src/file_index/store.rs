@@ -2505,9 +2505,9 @@ mod tests {
                 for offset in 0..BATCH.min(ROWS - start) {
                     let number = start + offset;
                     let name = if number % 10 < 3 {
-                        format!("alpha-beta-gamma-{number:07}.txt")
+                        format!("alpha beta gamma {number:07}.txt")
                     } else if number % 10 < 6 {
-                        format!("alpha-beta-{number:07}.txt")
+                        format!("alpha beta {number:07}.txt")
                     } else {
                         format!("other-{number:07}.txt")
                     };
