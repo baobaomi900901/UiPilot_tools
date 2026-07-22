@@ -14,7 +14,8 @@ use windows::{
         Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
         System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED},
         UI::Shell::{
-            FOLDERID_CommonPrograms, FOLDERID_Programs, KF_FLAG_DONT_VERIFY, KNOWN_FOLDER_FLAG,
+            FOLDERID_CommonPrograms, FOLDERID_CommonStartMenu, FOLDERID_Programs,
+            FOLDERID_StartMenu, KF_FLAG_DONT_VERIFY, KNOWN_FOLDER_FLAG,
         },
     },
 };
@@ -59,7 +60,7 @@ impl Drop for ComGuard {
     }
 }
 
-fn known_folder_roots() -> Result<[StartMenuRoot; 2], DiscoveryError> {
+fn known_folder_roots() -> Result<[StartMenuRoot; 4], DiscoveryError> {
     known_folder_roots_with(known_folder_path)
 }
 
@@ -110,13 +111,17 @@ where
     }
 }
 
-fn known_folder_roots_with<F>(mut provider: F) -> Result<[StartMenuRoot; 2], DiscoveryError>
+fn known_folder_roots_with<F>(mut provider: F) -> Result<[StartMenuRoot; 4], DiscoveryError>
 where
     F: FnMut(&GUID, KNOWN_FOLDER_FLAG, Option<HANDLE>) -> Result<PathBuf, ()>,
 {
     let user = provider(&FOLDERID_Programs, KF_FLAG_DONT_VERIFY, None)
         .map_err(|_| DiscoveryError::KnownFolderQuery)?;
     let common = provider(&FOLDERID_CommonPrograms, KF_FLAG_DONT_VERIFY, None)
+        .map_err(|_| DiscoveryError::KnownFolderQuery)?;
+    let user_top_level = provider(&FOLDERID_StartMenu, KF_FLAG_DONT_VERIFY, None)
+        .map_err(|_| DiscoveryError::KnownFolderQuery)?;
+    let common_top_level = provider(&FOLDERID_CommonStartMenu, KF_FLAG_DONT_VERIFY, None)
         .map_err(|_| DiscoveryError::KnownFolderQuery)?;
     Ok([
         StartMenuRoot {
@@ -126,6 +131,14 @@ where
         StartMenuRoot {
             kind: RootKind::Common,
             path: common,
+        },
+        StartMenuRoot {
+            kind: RootKind::UserTopLevel,
+            path: user_top_level,
+        },
+        StartMenuRoot {
+            kind: RootKind::CommonTopLevel,
+            path: common_top_level,
         },
     ])
 }
@@ -383,7 +396,7 @@ mod tests {
         cell::Cell,
         ffi::OsString,
         fs, io,
-        os::windows::ffi::OsStringExt,
+        os::windows::ffi::{OsStrExt, OsStringExt},
         path::{Path, PathBuf},
         ptr::NonNull,
         sync::atomic::{AtomicU64, Ordering},
@@ -393,7 +406,10 @@ mod tests {
         core::PWSTR,
         Win32::{
             Foundation::{E_FAIL, S_OK},
-            UI::Shell::{FOLDERID_CommonPrograms, FOLDERID_Programs, KF_FLAG_DONT_VERIFY},
+            UI::Shell::{
+                FOLDERID_CommonPrograms, FOLDERID_CommonStartMenu, FOLDERID_Programs,
+                FOLDERID_StartMenu, KF_FLAG_DONT_VERIFY,
+            },
         },
     };
 
@@ -471,33 +487,45 @@ mod tests {
 
     #[test]
     fn known_folder_provider_uses_exact_ids_flags_and_null_token() {
+        let expected = [
+            (FOLDERID_Programs, RootKind::User),
+            (FOLDERID_CommonPrograms, RootKind::Common),
+            (FOLDERID_StartMenu, RootKind::UserTopLevel),
+            (FOLDERID_CommonStartMenu, RootKind::CommonTopLevel),
+        ];
         let mut calls = Vec::new();
         let result = known_folder_roots_with(|id, flags, token| {
             calls.push((*id, flags, token));
-            Ok(PathBuf::from(if *id == FOLDERID_Programs {
-                r"C:\KnownUser"
-            } else {
-                r"C:\KnownCommon"
-            }))
+            Ok(PathBuf::from(format!(r"C:\Known\{}", calls.len())))
         })
         .unwrap();
 
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, FOLDERID_Programs);
-        assert_eq!(calls[1].0, FOLDERID_CommonPrograms);
-        assert!(calls
-            .iter()
-            .all(|(_, flags, token)| *flags == KF_FLAG_DONT_VERIFY && token.is_none()));
-        assert_eq!(result[0].kind, RootKind::User);
-        assert_eq!(result[1].kind, RootKind::Common);
+        assert_eq!(calls.len(), expected.len());
+        for (index, (guid, kind)) in expected.into_iter().enumerate() {
+            assert_eq!(calls[index].0, guid);
+            assert_eq!(calls[index].1, KF_FLAG_DONT_VERIFY);
+            assert!(calls[index].2.is_none());
+            assert_eq!(result[index].kind, kind);
+        }
     }
 
     #[test]
-    fn known_folder_failure_has_a_fixed_error() {
-        assert_eq!(
-            known_folder_roots_with(|_, _, _| Err(())).unwrap_err(),
-            DiscoveryError::KnownFolderQuery,
-        );
+    fn every_known_folder_failure_has_the_fixed_hard_error() {
+        for failed_at in 0..4 {
+            let calls = Cell::new(0);
+            let result = known_folder_roots_with(|_, _, _| {
+                let current = calls.get();
+                calls.set(current + 1);
+                if current == failed_at {
+                    Err(())
+                } else {
+                    Ok(PathBuf::from(format!(r"C:\Known\{current}")))
+                }
+            });
+
+            assert_eq!(result, Err(DiscoveryError::KnownFolderQuery));
+            assert_eq!(calls.get(), failed_at + 1);
+        }
     }
 
     #[test]
@@ -536,6 +564,33 @@ mod tests {
         );
         assert_eq!(null_success, Err(()));
         assert!(null_freed.get());
+    }
+
+    #[test]
+    fn raw_known_folder_result_frees_success_pointer_without_lossy_unicode() {
+        let mut raw = [0xD800_u16, 0];
+        let raw_pointer = raw.as_mut_ptr();
+        let freed = Cell::new(false);
+        let path = known_folder_path_with(
+            &FOLDERID_StartMenu,
+            KF_FLAG_DONT_VERIFY,
+            None,
+            |id, flags, token, output| {
+                assert_eq!(id, &FOLDERID_StartMenu);
+                assert_eq!(flags, KF_FLAG_DONT_VERIFY);
+                assert!(token.is_none());
+                unsafe { *output = PWSTR(raw_pointer) };
+                S_OK
+            },
+            |pointer| {
+                assert_eq!(pointer, raw_pointer);
+                freed.set(true);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(path.as_os_str().encode_wide().collect::<Vec<_>>(), [0xD800]);
+        assert!(freed.get());
     }
 
     #[test]

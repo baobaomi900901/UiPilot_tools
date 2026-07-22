@@ -43,6 +43,8 @@ pub(crate) fn registry_entry(
 pub(crate) enum RootKind {
     User,
     Common,
+    UserTopLevel,
+    CommonTopLevel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +118,8 @@ impl RootKind {
         match self {
             Self::User => "user",
             Self::Common => "common",
+            Self::UserTopLevel => "user-top-level",
+            Self::CommonTopLevel => "common-top-level",
         }
     }
 }
@@ -226,6 +230,25 @@ mod tests {
             app_id(RootKind::User, "Tools\\WeChat.lnk"),
             app_id(RootKind::User, "Other\\WeChat.lnk"),
         );
+
+        assert_eq!(
+            app_id(RootKind::UserTopLevel, "WeChat.lnk").unwrap(),
+            "app-e684e7a96f1d6ae34db93d8c136b6bacdab085480613eaa465f1c2a272b63bc5",
+        );
+        assert_eq!(
+            app_id(RootKind::CommonTopLevel, "wechat.LNK").unwrap(),
+            "app-c3e23407846549d3c69673779157f1daac00a7f503aa5770aabf4809e16214f3",
+        );
+
+        let mut scoped = vec![
+            app_id(RootKind::User, "WeChat.lnk").unwrap(),
+            app_id(RootKind::Common, "WeChat.lnk").unwrap(),
+            app_id(RootKind::UserTopLevel, "WeChat.lnk").unwrap(),
+            app_id(RootKind::CommonTopLevel, "WeChat.lnk").unwrap(),
+        ];
+        scoped.sort();
+        scoped.dedup();
+        assert_eq!(scoped.len(), 4);
     }
 
     #[test]
