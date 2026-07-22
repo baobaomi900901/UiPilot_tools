@@ -111,7 +111,6 @@ mod tests {
                 executable: None,
             },
             icon: None,
-            aliases: Vec::new(),
             use_count: 0,
         }
     }

@@ -319,7 +319,6 @@ where
                 executable: metadata.executable,
             },
             icon: metadata.icon,
-            aliases: Vec::new(),
             use_count: 0,
         });
     }
@@ -824,7 +823,6 @@ mod tests {
                     aumid: "family!settings".into(),
                 },
                 icon: Some(safe_icon.clone()),
-                aliases: Vec::new(),
                 use_count: 0,
             }],
             diagnostics: DiscoveryDiagnostics {
@@ -907,7 +905,6 @@ mod tests {
                 executable: Some(PathBuf::from(r"C:\Private\Calculator.exe")),
             },
             icon: Some(safe_icon.clone()),
-            aliases: Vec::new(),
             use_count: 0,
         };
         let packaged = Application {
@@ -917,7 +914,6 @@ mod tests {
                 aumid: "family!secret".into(),
             },
             icon: None,
-            aliases: Vec::new(),
             use_count: 0,
         };
 

@@ -85,7 +85,6 @@ pub(crate) struct Application {
     pub(crate) display_name: String,
     pub(crate) target: ApplicationLaunchTarget,
     pub(crate) icon: Option<String>,
-    pub(crate) aliases: Vec<String>,
     pub(crate) use_count: u64,
 }
 

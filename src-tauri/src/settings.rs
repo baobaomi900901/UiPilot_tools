@@ -22,7 +22,6 @@ pub(crate) struct Settings {
     #[serde(default = "default_file_preview_enabled")]
     pub(crate) file_preview_enabled: bool,
     pub(crate) research_id: Option<String>,
-    pub(crate) aliases: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
 }
@@ -31,7 +30,6 @@ pub(crate) struct SettingsUpdate {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
     pub(crate) research_id: Option<String>,
-    pub(crate) aliases: BTreeMap<String, Vec<String>>,
 }
 
 struct SettingsState {
@@ -60,7 +58,6 @@ impl Default for Settings {
             autostart: false,
             file_preview_enabled: default_file_preview_enabled(),
             research_id: None,
-            aliases: BTreeMap::new(),
             use_counts: BTreeMap::new(),
         }
     }
@@ -90,34 +87,20 @@ impl From<AtomicFileError> for SettingsError {
     }
 }
 
-fn validate_user_settings_against(
-    update: &SettingsUpdate,
-    applications: &[Application],
-) -> Result<(), SettingsError> {
+fn validate_user_settings_update(update: &SettingsUpdate) -> Result<(), SettingsError> {
     if update
         .research_id
         .as_deref()
         .is_some_and(|value| !valid_research_id(value))
-        || update.aliases.keys().any(|app_id| !valid_app_id(app_id))
     {
         return Err(SettingsError::InvalidUpdate);
-    }
-    if update
-        .aliases
-        .keys()
-        .any(|app_id| !applications.iter().any(|app| app.app_id == *app_id))
-    {
-        return Err(SettingsError::UnknownApplication);
     }
     Ok(())
 }
 
 impl SettingsStore {
-    pub(crate) fn validate_user_settings(
-        update: &SettingsUpdate,
-        cache: &AppCache,
-    ) -> Result<(), SettingsError> {
-        validate_user_settings_against(update, &cache.snapshot())
+    pub(crate) fn validate_user_settings(update: &SettingsUpdate) -> Result<(), SettingsError> {
+        validate_user_settings_update(update)
     }
 
     pub(crate) fn load(app_data_dir: &Path) -> Result<Self, SettingsError> {
@@ -155,12 +138,6 @@ impl SettingsStore {
     pub(crate) fn decorate_applications(&self, applications: &mut [Application]) {
         let state = self.state.lock().expect("settings lock poisoned");
         for application in applications {
-            application.aliases = state
-                .value
-                .aliases
-                .get(&application.app_id)
-                .cloned()
-                .unwrap_or_default();
             application.use_count = state
                 .value
                 .use_counts
@@ -170,31 +147,14 @@ impl SettingsStore {
         }
     }
 
-    pub(crate) fn update_user_settings(
-        &self,
-        update: SettingsUpdate,
-        cache: &AppCache,
-    ) -> Result<(), SettingsError> {
-        let applications = cache.snapshot();
-        validate_user_settings_against(&update, &applications)?;
+    pub(crate) fn update_user_settings(&self, update: SettingsUpdate) -> Result<(), SettingsError> {
+        validate_user_settings_update(&update)?;
         let mut state = self.state.lock().expect("settings lock poisoned");
 
         let mut candidate = state.value.clone();
         candidate.hotkey = update.hotkey;
         candidate.autostart = update.autostart;
         candidate.research_id = update.research_id;
-        for application in applications {
-            match update.aliases.get(&application.app_id) {
-                Some(aliases) if !aliases.is_empty() => {
-                    candidate
-                        .aliases
-                        .insert(application.app_id.clone(), aliases.clone());
-                }
-                _ => {
-                    candidate.aliases.remove(&application.app_id);
-                }
-            }
-        }
         self.persist(&mut state, candidate)
     }
 
@@ -281,11 +241,10 @@ fn valid_settings(settings: &Settings) -> bool {
     !matches!(
         settings.research_id.as_deref(),
         Some(value) if !valid_research_id(value)
-    ) && settings.aliases.keys().all(|app_id| valid_app_id(app_id))
-        && settings
-            .use_counts
-            .keys()
-            .all(|app_id| valid_app_id(app_id))
+    ) && settings
+        .use_counts
+        .keys()
+        .all(|app_id| valid_app_id(app_id))
 }
 
 fn valid_research_id(value: &str) -> bool {
@@ -367,7 +326,6 @@ mod tests {
                 executable: None,
             },
             icon: None,
-            aliases: Vec::new(),
             use_count: 0,
         }
     }
@@ -384,20 +342,11 @@ mod tests {
         fs::write(path, serde_json::to_vec(settings).unwrap()).unwrap();
     }
 
-    fn update(research_id: Option<&str>, aliases: &[(&str, &[&str])]) -> SettingsUpdate {
+    fn update(research_id: Option<&str>) -> SettingsUpdate {
         SettingsUpdate {
             hotkey: "Alt+Space".into(),
             autostart: false,
             research_id: research_id.map(Into::into),
-            aliases: aliases
-                .iter()
-                .map(|(app_id, values)| {
-                    (
-                        (*app_id).into(),
-                        values.iter().map(|value| (*value).into()).collect(),
-                    )
-                })
-                .collect(),
         }
     }
 
@@ -477,7 +426,7 @@ mod tests {
         let dir = TestDir::new("bad-app-id");
         fs::write(
             dir.current(),
-            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":null,"aliases":{"app-BAD":["bad"]},"useCounts":{}}"#,
+            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":null,"useCounts":{"app-BAD":1}}"#,
         )
         .unwrap();
 
@@ -491,7 +440,6 @@ mod tests {
     fn valid_temporarily_absent_app_ids_are_preserved_on_load() {
         let dir = TestDir::new("absent-id");
         let persisted = Settings {
-            aliases: BTreeMap::from([(APP_ABSENT.into(), vec!["keep".into()])]),
             use_counts: BTreeMap::from([(APP_ABSENT.into(), 4)]),
             ..Settings::default()
         };
@@ -507,7 +455,7 @@ mod tests {
         let dir = TestDir::new("missing-use-counts");
         fs::write(
             dir.current(),
-            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":"legacy","aliases":{}}"#,
+            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":"legacy"}"#,
         )
         .unwrap();
 
@@ -518,36 +466,46 @@ mod tests {
     }
 
     #[test]
-    fn user_update_preserves_use_counts_and_absent_aliases() {
+    fn legacy_aliases_are_dropped_on_next_write() {
+        let dir = TestDir::new("drop-legacy-aliases");
+        fs::write(
+            dir.current(),
+            format!(
+                r#"{{"hotkey":"Alt+Space","autostart":false,"filePreviewEnabled":true,"researchId":"study_01","aliases":{{"{APP_A}":["legacy"]}},"useCounts":{{}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(dir.path()).unwrap();
+        store.set_file_preview_enabled(false).unwrap();
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.current()).unwrap()).unwrap();
+        assert_eq!(persisted["researchId"], "study_01");
+        assert_eq!(persisted["filePreviewEnabled"], false);
+        assert!(persisted.get("aliases").is_none());
+    }
+
+    #[test]
+    fn user_update_preserves_use_counts() {
         let dir = TestDir::new("preserve-fields");
         let persisted = Settings {
-            aliases: BTreeMap::from([
-                (APP_A.into(), vec!["old".into()]),
-                (APP_ABSENT.into(), vec!["keep".into()]),
-            ]),
             use_counts: BTreeMap::from([(APP_A.into(), 7)]),
             ..Settings::default()
         };
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[(APP_A, "App")]);
 
         store
-            .update_user_settings(
-                SettingsUpdate {
-                    hotkey: "Ctrl+Space".into(),
-                    autostart: true,
-                    research_id: Some("study_01".into()),
-                    aliases: BTreeMap::from([(APP_A.into(), vec!["new".into()])]),
-                },
-                &cache,
-            )
+            .update_user_settings(SettingsUpdate {
+                hotkey: "Ctrl+Space".into(),
+                autostart: true,
+                research_id: Some("study_01".into()),
+            })
             .unwrap();
 
         let value = store.snapshot();
         assert_eq!(value.use_counts[APP_A], 7);
-        assert_eq!(value.aliases[APP_ABSENT], ["keep"]);
-        assert_eq!(value.aliases[APP_A], ["new"]);
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
         assert_eq!(value.research_id.as_deref(), Some("study_01"));
@@ -563,11 +521,10 @@ mod tests {
         write_settings(&dir.current(), &persisted);
         let current_bytes = fs::read(dir.current()).unwrap();
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[(APP_A, "App")]);
         let before = store.snapshot();
-        let update = update(Some("study_02"), &[(APP_A, &["alias"])]);
+        let update = update(Some("study_02"));
 
-        validate_user_settings_against(&update, &cache.snapshot()).unwrap();
+        validate_user_settings_update(&update).unwrap();
 
         assert_eq!(store.snapshot(), before);
         assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
@@ -577,9 +534,8 @@ mod tests {
     fn update_hotkey_only_preserves_other_settings() {
         let dir = TestDir::new("hotkey-only");
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[(APP_A, "App")]);
         store
-            .update_user_settings(update(Some("study_01"), &[(APP_A, &["alias"])]), &cache)
+            .update_user_settings(update(Some("study_01")))
             .unwrap();
 
         store.update_hotkey("DoubleCtrl".into()).unwrap();
@@ -587,7 +543,6 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.hotkey, "DoubleCtrl");
         assert_eq!(snapshot.research_id.as_deref(), Some("study_01"));
-        assert_eq!(snapshot.aliases[APP_A], ["alias"]);
         assert_eq!(read_current(&dir), snapshot);
     }
 
@@ -601,60 +556,24 @@ mod tests {
         write_settings(&dir.current(), &persisted);
         let current_bytes = fs::read(dir.current()).unwrap();
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[(APP_A, "App")]);
 
         for (preflight, final_update, expected) in [
             (
-                update(Some(" "), &[]),
-                update(Some(" "), &[]),
+                update(Some(" ")),
+                update(Some(" ")),
                 SettingsError::InvalidUpdate,
             ),
             (
-                update(Some(&"A".repeat(65)), &[]),
-                update(Some(&"A".repeat(65)), &[]),
+                update(Some(&"A".repeat(65))),
+                update(Some(&"A".repeat(65))),
                 SettingsError::InvalidUpdate,
-            ),
-            (
-                update(None, &[("app-BAD", &["bad"])]),
-                update(None, &[("app-BAD", &["bad"])]),
-                SettingsError::InvalidUpdate,
-            ),
-            (
-                update(None, &[(APP_ABSENT, &["absent"])]),
-                update(None, &[(APP_ABSENT, &["absent"])]),
-                SettingsError::UnknownApplication,
             ),
         ] {
-            assert_eq!(
-                validate_user_settings_against(&preflight, &cache.snapshot()),
-                Err(expected)
-            );
-            assert_eq!(
-                store.update_user_settings(final_update, &cache),
-                Err(expected)
-            );
+            assert_eq!(validate_user_settings_update(&preflight), Err(expected));
+            assert_eq!(store.update_user_settings(final_update), Err(expected));
             assert_eq!(store.snapshot(), persisted);
             assert_eq!(fs::read(dir.current()).unwrap(), current_bytes);
         }
-    }
-
-    #[test]
-    fn unknown_or_malformed_update_keys_leave_memory_and_disk_unchanged() {
-        let dir = TestDir::new("bad-update-key");
-        let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[(APP_A, "App")]);
-
-        assert_eq!(
-            store.update_user_settings(update(None, &[(APP_B, &["unknown"])]), &cache),
-            Err(SettingsError::UnknownApplication)
-        );
-        assert_eq!(
-            store.update_user_settings(update(None, &[("app-BAD", &["bad"])]), &cache),
-            Err(SettingsError::InvalidUpdate)
-        );
-        assert_eq!(store.snapshot(), Settings::default());
-        assert!(!dir.current().exists());
-        assert!(!dir.backup().exists());
     }
 
     #[test]
@@ -685,10 +604,6 @@ mod tests {
     fn decoration_uses_stable_id_when_display_names_are_duplicates() {
         let dir = TestDir::new("decorate");
         let persisted = Settings {
-            aliases: BTreeMap::from([
-                (APP_A.into(), vec!["alpha".into()]),
-                (APP_B.into(), vec!["beta".into()]),
-            ]),
             use_counts: BTreeMap::from([(APP_A.into(), 3), (APP_B.into(), 8)]),
             ..Settings::default()
         };
@@ -698,9 +613,7 @@ mod tests {
 
         store.decorate_applications(&mut applications);
 
-        assert_eq!(applications[0].aliases, ["alpha"]);
         assert_eq!(applications[0].use_count, 3);
-        assert_eq!(applications[1].aliases, ["beta"]);
         assert_eq!(applications[1].use_count, 8);
     }
 
@@ -708,15 +621,12 @@ mod tests {
     fn research_id_accepts_only_the_approved_boundaries_on_update() {
         let dir = TestDir::new("research-update");
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[]);
         let allowed_64 = "A".repeat(64);
 
-        store
-            .update_user_settings(update(Some("A"), &[]), &cache)
-            .unwrap();
+        store.update_user_settings(update(Some("A"))).unwrap();
         assert_eq!(store.research_id().as_deref(), Some("A"));
         store
-            .update_user_settings(update(Some(&allowed_64), &[]), &cache)
+            .update_user_settings(update(Some(&allowed_64)))
             .unwrap();
         assert_eq!(store.research_id().as_deref(), Some(allowed_64.as_str()));
     }
@@ -725,11 +635,10 @@ mod tests {
     fn invalid_research_ids_are_rejected_on_update_without_state_changes() {
         let dir = TestDir::new("invalid-research-update");
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[]);
 
         for invalid in ["", " ", "é", &"A".repeat(65)] {
             assert_eq!(
-                store.update_user_settings(update(Some(invalid), &[]), &cache),
+                store.update_user_settings(update(Some(invalid))),
                 Err(SettingsError::InvalidUpdate)
             );
             assert_eq!(store.snapshot(), Settings::default());
@@ -818,7 +727,7 @@ mod tests {
         let dir = TestDir::new("file-preview-legacy");
         fs::write(
             dir.current(),
-            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":null,"aliases":{},"useCounts":{}}"#,
+            br#"{"hotkey":"Alt+Space","autostart":false,"researchId":null,"useCounts":{}}"#,
         )
         .unwrap();
 
@@ -844,10 +753,9 @@ mod tests {
         };
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();
-        let cache = cache(&[(APP_A, "App")]);
 
         store
-            .update_user_settings(update(Some("study_02"), &[(APP_A, &["alias"])]), &cache)
+            .update_user_settings(update(Some("study_02")))
             .unwrap();
 
         assert!(!store.snapshot().file_preview_enabled);
@@ -861,7 +769,6 @@ mod tests {
             hotkey: "Ctrl+Space".into(),
             autostart: true,
             research_id: Some("study_01".into()),
-            aliases: BTreeMap::from([(APP_A.into(), vec!["alias".into()])]),
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
         };
