@@ -88,6 +88,7 @@ fn setup_production_lifecycle(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
     plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
+    plugin_manager.create_runtimes(app, &app_data_dir)?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -217,6 +218,12 @@ pub fn run() {
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
         .manage(Arc::clone(&plugin_manager))
+        .register_uri_scheme_protocol("uipilot-plugin", {
+            let plugin_manager = Arc::clone(&plugin_manager);
+            move |ctx, request| {
+                plugin_manager.asset_response(ctx.webview_label(), request.uri().path())
+            }
+        })
         .manage(result_registry::ResultRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
@@ -458,6 +465,7 @@ mod tests {
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
             "setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;",
             "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
+            "plugin_manager.create_runtimes(app, &app_data_dir)?;",
             "lifecycle::install_session_end_hook",
             "tauri::tray::TrayIconBuilder::new()",
             "tauri::WindowEvent::Focused(focused)",
@@ -764,6 +772,55 @@ mod tests {
                     "host source contains {forbidden}: {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn plugin_runtime_wiring_is_narrow() {
+        let lib = include_str!("lib.rs").replace("\r\n", "\n");
+        let plugins = include_str!("plugins.rs").replace("\r\n", "\n");
+        for fragment in [
+            ".register_uri_scheme_protocol(\"uipilot-plugin\",",
+            "ctx.webview_label()",
+            "plugin_manager.asset_response(",
+            "plugin_manager.create_runtimes(app, &app_data_dir)?;",
+        ] {
+            assert!(lib.contains(fragment), "missing runtime wiring: {fragment}");
+        }
+        for fragment in [
+            "WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))",
+            ".visible(false)",
+            ".focusable(false)",
+            ".skip_taskbar(true)",
+            ".incognito(true)",
+            ".data_directory(data_directory)",
+            ".on_navigation(",
+            ".on_new_window(|_, _| NewWindowResponse::Deny)",
+            ".on_download(|_, _| false)",
+            ".on_document_title_changed(",
+            ".initialization_script(PLUGIN_BRIDGE)",
+            "WebviewWindow::with_webview",
+            "ProcessFailedEventHandler",
+            "disable_runtime",
+        ] {
+            assert!(
+                plugins.contains(fragment),
+                "missing runtime builder: {fragment}"
+            );
+        }
+        for forbidden in [
+            [".visible", "(true)"].concat(),
+            "NewWindowResponse::Allow".into(),
+            "ShellOpen".into(),
+            "open_path".into(),
+            "asset://".into(),
+            "file://".into(),
+            "appDataDir".into(),
+        ] {
+            assert!(
+                !plugins.contains(&forbidden),
+                "forbidden plugin runtime wiring: {forbidden}"
+            );
         }
     }
 }

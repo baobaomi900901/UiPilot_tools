@@ -2,8 +2,38 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{OnceLock, RwLock},
 };
+
+use tauri::{
+    http::Response,
+    webview::{NewWindowResponse, WebviewWindow},
+    App, Manager, WebviewUrl, WebviewWindowBuilder,
+};
+
+pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
+const PLUGIN_BRIDGE: &str = r#"
+(() => {
+  let handler = null;
+  let pending = [];
+  const internals = window.__TAURI_INTERNALS__;
+  const deliver = (query) => handler ? handler(query) : pending.push(query);
+  const api = Object.freeze({
+    onQuery(next) {
+      if (typeof next !== 'function') throw new TypeError('handler required');
+      handler = next;
+      for (const query of pending.splice(0)) handler(query);
+      document.title = 'uipilot-plugin-ready';
+    },
+    publishResults(response) {
+      return internals.invoke('publish_plugin_results', { response });
+    }
+  });
+  internals.event.listen('uipilot-plugin-query', (event) => deliver(event.payload));
+  Object.defineProperty(window, 'uipilot', { value: api, configurable: false, writable: false });
+  Object.freeze(window.uipilot);
+})();
+"#;
 
 #[derive(Debug)]
 pub(crate) enum PluginSetupError {
@@ -30,12 +60,16 @@ impl From<io::Error> for PluginSetupError {
 
 pub(crate) struct PluginManager {
     catalog: OnceLock<PluginCatalog>,
+    ready: RwLock<HashSet<String>>,
+    disabled: RwLock<HashSet<String>>,
 }
 
 impl PluginManager {
     pub(crate) fn new() -> Self {
         Self {
             catalog: OnceLock::new(),
+            ready: RwLock::new(HashSet::new()),
+            disabled: RwLock::new(HashSet::new()),
         }
     }
 
@@ -58,6 +92,87 @@ impl PluginManager {
         self.catalog
             .get()
             .is_some_and(|catalog| catalog.authorizes_clipboard(plugin_id))
+    }
+
+    pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
+        self.catalog.get().map_or_else(
+            || response(403, Vec::new(), None),
+            |catalog| catalog.asset_response(label, request_path),
+        )
+    }
+
+    pub(crate) fn create_runtimes(
+        &self,
+        app: &App,
+        app_data_dir: &Path,
+    ) -> Result<(), PluginSetupError> {
+        let Some(catalog) = self.catalog.get() else {
+            return Ok(());
+        };
+        for entry in &catalog.entries {
+            let Some(route) = self.route(&entry.feature.trigger) else {
+                continue;
+            };
+            if route.plugin_id != entry.id
+                || route.window_label != entry.window_label
+                || !route.input.is_empty()
+            {
+                continue;
+            }
+            let _clipboard_allowed = self.authorizes_clipboard(&entry.id);
+            let label = entry.window_label.clone();
+            let runtime_name = entry
+                .runtime
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| io::Error::other("invalid plugin runtime"))?;
+            let url = tauri::Url::parse(&format!("uipilot-plugin://localhost/{runtime_name}"))
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let origin = "uipilot-plugin://localhost".to_string();
+            let data_directory = app_data_dir
+                .join("plugin-runtime-data")
+                .join(&entry.window_label)
+                .join(entry.version.to_path_segment())
+                .join(&entry.feature.id);
+            let manager = app.state::<std::sync::Arc<PluginManager>>().inner().clone();
+            let ready_manager = manager.clone();
+            let label_for_ready = label.clone();
+            let disabled_manager = manager.clone();
+            let label_for_failure = label.clone();
+            let window = WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))
+                .visible(false)
+                .focusable(false)
+                .skip_taskbar(true)
+                .incognito(true)
+                .data_directory(data_directory)
+                .initialization_script(PLUGIN_BRIDGE)
+                .on_navigation(move |url| url.as_str().starts_with(&origin))
+                .on_new_window(|_, _| NewWindowResponse::Deny)
+                .on_download(|_, _| false)
+                .on_document_title_changed(move |_, title| {
+                    if title == "uipilot-plugin-ready" {
+                        ready_manager.mark_ready(&label_for_ready);
+                    }
+                })
+                .build()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            attach_process_failed_handler(&window, move || {
+                disabled_manager.disable_runtime(&label_for_failure);
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_ready(&self, label: &str) {
+        if let Ok(mut ready) = self.ready.write() {
+            ready.insert(label.to_string());
+        }
+    }
+
+    pub(crate) fn disable_runtime(&self, label: &str) {
+        if let Ok(mut disabled) = self.disabled.write() {
+            disabled.insert(label.to_string());
+        }
     }
 }
 
@@ -105,6 +220,10 @@ impl Version {
             parts.next()?.parse().ok()?,
         ]);
         parts.next().is_none().then_some(version)
+    }
+
+    fn to_path_segment(self) -> String {
+        format!("{}.{}.{}", self.0[0], self.0[1], self.0[2])
     }
 }
 
@@ -166,6 +285,35 @@ impl PluginCatalog {
                     .iter()
                     .any(|permission| permission == "clipboard.writeText")
         })
+    }
+
+    pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.window_label == label)
+        else {
+            return response(403, Vec::new(), None);
+        };
+        let Some((relative, content_type)) = asset_path(request_path) else {
+            return response(415, Vec::new(), None);
+        };
+        let path = entry.root.join(relative);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return response(404, Vec::new(), None);
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return response(403, Vec::new(), None);
+        }
+        let Ok(body) = fs::read(&path) else {
+            return response(404, Vec::new(), None);
+        };
+        let body = if content_type.starts_with("text/html") {
+            inject_bridge(body)
+        } else {
+            body
+        };
+        response(200, body, Some(content_type))
     }
 }
 
@@ -273,6 +421,76 @@ fn route(entry: &PluginCatalogEntry, input: &str) -> PluginRoute {
         window_label: entry.window_label.clone(),
         input: input.to_string(),
     }
+}
+
+fn asset_path(request_path: &str) -> Option<(PathBuf, &'static str)> {
+    let path = request_path.strip_prefix('/')?;
+    if path.is_empty() || request_path.contains('%') || request_path.contains('\\') {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains(':') {
+            return None;
+        }
+        relative.push(part);
+    }
+    let mime = match relative.extension()?.to_str()? {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        _ => return None,
+    };
+    Some((relative, mime))
+}
+
+fn inject_bridge(mut body: Vec<u8>) -> Vec<u8> {
+    let mut injected = format!("<script>{PLUGIN_BRIDGE}</script>").into_bytes();
+    injected.append(&mut body);
+    injected
+}
+
+fn response(status: u16, body: Vec<u8>, content_type: Option<&str>) -> Response<Vec<u8>> {
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder
+            .header("content-type", content_type)
+            .header("content-security-policy", PLUGIN_CSP);
+    }
+    builder.body(body).unwrap()
+}
+
+#[cfg(windows)]
+fn attach_process_failed_handler<F>(
+    window: &WebviewWindow,
+    callback: F,
+) -> Result<(), PluginSetupError>
+where
+    F: Fn() + Send + 'static,
+{
+    use webview2_com::ProcessFailedEventHandler;
+
+    WebviewWindow::with_webview(window, move |webview| unsafe {
+        if let Ok(core) = webview.controller().CoreWebView2() {
+            let handler = ProcessFailedEventHandler::create(Box::new(move |_, _| {
+                callback();
+                Ok(())
+            }));
+            let mut token = 0;
+            let _ = core.add_ProcessFailed(&handler, &mut token);
+        }
+    })
+    .map_err(|error| PluginSetupError::Io(io::Error::other(error.to_string())))
+}
+
+#[cfg(not(windows))]
+fn attach_process_failed_handler<F>(
+    _window: &WebviewWindow,
+    _callback: F,
+) -> Result<(), PluginSetupError>
+where
+    F: Fn() + Send + 'static,
+{
+    Ok(())
 }
 
 #[cfg(test)]
@@ -482,5 +700,123 @@ mod tests {
         assert!(loaded.route("/good body").is_none());
         assert!(loaded.route("ordinary query").is_none());
         assert!(loaded.authorizes_clipboard("plugin"));
+    }
+
+    mod asset {
+        use std::fs;
+
+        use super::{load, valid_manifest, TestRoot};
+
+        fn header(response: &tauri::http::Response<Vec<u8>>, name: &str) -> String {
+            response
+                .headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        #[test]
+        fn serves_label_bound_html_and_js_with_csp_and_bridge() {
+            let root = TestRoot::new();
+            root.write_plugin("one", valid_manifest("one", "/one"));
+            root.write_plugin("two", valid_manifest("two", "/two"));
+            fs::write(root.path.join("one").join("index.html"), "<h1>one</h1>").unwrap();
+            fs::write(root.path.join("two").join("index.html"), "<h1>two</h1>").unwrap();
+            fs::write(root.path.join("one").join("main.js"), "window.answer=1;").unwrap();
+            let catalog = load(&root);
+
+            let html = catalog.asset_response("plugin-6f6e65", "/index.html");
+            assert_eq!(html.status(), 200);
+            assert_eq!(
+                header(&html, "content-security-policy"),
+                super::super::PLUGIN_CSP
+            );
+            assert_eq!(header(&html, "content-type"), "text/html; charset=utf-8");
+            let body = String::from_utf8(html.into_body()).unwrap();
+            assert!(body.contains("Object.freeze"));
+            assert!(body.contains("window.uipilot"));
+            assert!(body.contains("onQuery"));
+            assert!(body.contains("publishResults"));
+            assert!(body.contains("uipilot-plugin-ready"));
+            assert!(!body.contains("<h1>two</h1>"));
+
+            let script = catalog.asset_response("plugin-6f6e65", "/main.js");
+            assert_eq!(script.status(), 200);
+            assert_eq!(
+                header(&script, "content-type"),
+                "text/javascript; charset=utf-8"
+            );
+            assert_eq!(script.into_body(), b"window.answer=1;");
+        }
+
+        #[test]
+        fn rejects_unknown_labels_and_bad_paths_with_fixed_statuses() {
+            let root = TestRoot::new();
+            root.write_plugin("one", valid_manifest("one", "/one"));
+            fs::write(root.path.join("one").join("style.css"), "").unwrap();
+            let catalog = load(&root);
+            let label = "plugin-6f6e65";
+
+            assert_eq!(
+                catalog
+                    .asset_response("plugin-74776f", "/index.html")
+                    .status(),
+                403
+            );
+            for path in [
+                "",
+                "/",
+                "/.",
+                "/./index.html",
+                "/../index.html",
+                "/nested/../index.html",
+                "C:/index.html",
+                "/index.html%00",
+                "/index.html:ads",
+                "/style.css",
+            ] {
+                assert_eq!(
+                    catalog.asset_response(label, path).status(),
+                    415,
+                    "bad path accepted: {path}"
+                );
+            }
+            assert_eq!(catalog.asset_response(label, "/missing.html").status(), 404);
+        }
+
+        #[test]
+        fn rejects_another_plugin_root_and_reparse_assets() {
+            let root = TestRoot::new();
+            root.write_plugin("one", valid_manifest("one", "/one"));
+            root.write_plugin("two", valid_manifest("two", "/two"));
+            let catalog = load(&root);
+
+            assert_eq!(
+                catalog
+                    .asset_response("plugin-6f6e65", "/../two/index.html")
+                    .status(),
+                415
+            );
+
+            #[cfg(windows)]
+            {
+                let link = root.path.join("one").join("linked.html");
+                if std::os::windows::fs::symlink_file(
+                    root.path.join("two").join("index.html"),
+                    link,
+                )
+                .is_ok()
+                {
+                    assert_eq!(
+                        catalog
+                            .asset_response("plugin-6f6e65", "/linked.html")
+                            .status(),
+                        403
+                    );
+                }
+            }
+        }
     }
 }

@@ -4144,6 +4144,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-single-instance",
  "unicode-normalization",
+ "webview2-com",
  "windows",
 ]
 
