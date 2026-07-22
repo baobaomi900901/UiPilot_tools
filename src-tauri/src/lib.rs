@@ -216,6 +216,7 @@ pub fn run() {
             commands::publish_plugin_results,
             commands::search_files,
             commands::execute_result,
+            commands::list_plugins,
             commands::load_settings,
             commands::save_settings,
             commands::save_hotkey,
@@ -420,12 +421,13 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 9);
+        assert_eq!(production.matches("commands::").count(), 10);
         for command in [
             "search_apps",
             "publish_plugin_results",
             "search_files",
             "execute_result",
+            "list_plugins",
             "load_settings",
             "save_settings",
             "save_hotkey",

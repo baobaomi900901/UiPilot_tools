@@ -7,6 +7,7 @@
     "allow-search-apps",
     "allow-search-files",
     "allow-execute-result",
+    "allow-list-plugins",
     "allow-load-settings",
     "allow-save-settings",
     "allow-save-hotkey",

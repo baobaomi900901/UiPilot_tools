@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
+const PLUGIN_README_MAX_BYTES: u64 = 16 * 1024;
 const PLUGIN_BRIDGE: &str = r#"
 (() => {
   let handler = null;
@@ -129,6 +130,13 @@ impl PluginManager {
 
     pub(crate) fn route(&self, query: &str) -> Option<PluginRoute> {
         self.catalog.get()?.route(query)
+    }
+
+    pub(crate) fn list_views(&self) -> Result<Vec<PluginView>, PluginManagementError> {
+        self.catalog
+            .get()
+            .map(PluginCatalog::views)
+            .ok_or(PluginManagementError::Unavailable)
     }
 
     pub(crate) fn authorizes_clipboard(&self, plugin_id: &str) -> bool {
@@ -484,6 +492,11 @@ pub(crate) enum PluginQueryError {
     InvalidResponse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginManagementError {
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginQueryRequest {
@@ -527,6 +540,16 @@ pub(crate) struct PluginCatalogEntry {
     pub(crate) permissions: Vec<String>,
     pub(crate) root: PathBuf,
     pub(crate) window_label: String,
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginView {
+    pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) trigger: String,
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Clone)]
@@ -618,6 +641,21 @@ impl PluginCatalog {
                     .map(|input| route(entry, input))
             }
         })
+    }
+
+    pub(crate) fn views(&self) -> Vec<PluginView> {
+        let mut views = self
+            .entries
+            .iter()
+            .map(|entry| PluginView {
+                id: entry.id.clone(),
+                version: entry.version.to_path_segment(),
+                trigger: entry.feature.trigger.clone(),
+                description: entry.description.clone(),
+            })
+            .collect::<Vec<_>>();
+        views.sort_by(|left, right| left.id.cmp(&right.id));
+        views
     }
 
     pub(crate) fn authorizes_clipboard(&self, plugin_id: &str) -> bool {
@@ -716,7 +754,24 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
         },
         permissions: manifest.permissions,
         root: root.to_path_buf(),
+        description: read_description(root),
     })
+}
+
+fn read_description(root: &Path) -> Option<String> {
+    let path = root.join("README.md");
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file()
+        || is_reparse_point(&metadata)
+        || metadata.len() > PLUGIN_README_MAX_BYTES
+    {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    if bytes.len() as u64 > PLUGIN_README_MAX_BYTES || !ordinary_file(&path) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn valid_id(id: &str) -> bool {
@@ -1109,6 +1164,82 @@ mod tests {
         assert!(loaded.route("/good body").is_none());
         assert!(loaded.route("ordinary query").is_none());
         assert!(loaded.authorizes_clipboard("plugin"));
+    }
+
+    mod description {
+        use std::fs;
+
+        use super::{load, valid_manifest, TestRoot};
+
+        #[test]
+        fn reads_only_valid_root_readme_with_a_fixed_size_limit() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let package = root.path.join("plugin");
+
+            fs::write(package.join("README.md"), "# Plugin\n\nWorks.").unwrap();
+            assert_eq!(
+                load(&root).views()[0].description.as_deref(),
+                Some("# Plugin\n\nWorks.")
+            );
+
+            fs::write(package.join("README.md"), vec![b'x'; 16 * 1024]).unwrap();
+            assert_eq!(
+                load(&root).views()[0].description.as_deref(),
+                Some("x".repeat(16 * 1024).as_str())
+            );
+
+            fs::write(package.join("README.md"), vec![b'x'; 16 * 1024 + 1]).unwrap();
+            assert_eq!(load(&root).views()[0].description, None);
+            fs::write(package.join("README.md"), [0xff, 0xfe]).unwrap();
+            assert_eq!(load(&root).views()[0].description, None);
+            fs::remove_file(package.join("README.md")).unwrap();
+            assert_eq!(load(&root).views()[0].description, None);
+            fs::create_dir(package.join("README.md")).unwrap();
+            assert_eq!(load(&root).views()[0].description, None);
+        }
+
+        #[test]
+        fn rejects_reparse_readme_without_disabling_the_plugin() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let package = root.path.join("plugin");
+            let target = root.path.join("outside.md");
+            fs::write(&target, "private").unwrap();
+
+            #[cfg(windows)]
+            if std::os::windows::fs::symlink_file(&target, package.join("README.md")).is_err() {
+                return;
+            }
+
+            let catalog = load(&root);
+            assert_eq!(catalog.views()[0].description, None);
+            assert!(catalog.route("/plugin").is_some());
+        }
+
+        #[test]
+        fn inventory_is_sorted_and_serializes_only_the_approved_fields() {
+            let root = TestRoot::new();
+            root.write_plugin("zeta", valid_manifest("zeta", "/zeta"));
+            root.write_plugin("alpha", valid_manifest("alpha", "/alpha"));
+            fs::write(root.path.join("zeta").join("README.md"), "Zeta docs").unwrap();
+
+            let views = load(&root).views();
+            assert_eq!(
+                views
+                    .iter()
+                    .map(|view| view.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["alpha", "zeta"]
+            );
+            assert_eq!(
+                serde_json::to_value(&views).unwrap(),
+                serde_json::json!([
+                    {"id":"alpha","version":"1.0.0","trigger":"/alpha","description":null},
+                    {"id":"zeta","version":"1.0.0","trigger":"/zeta","description":"Zeta docs"}
+                ])
+            );
+        }
     }
 
     mod asset {

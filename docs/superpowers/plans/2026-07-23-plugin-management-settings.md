@@ -64,15 +64,15 @@
 - Modify: `src-tauri/capabilities/main.json`
 - Add: `examples/plugins/internal.math/README.md`
 
-- [ ] Add plugin tests for valid, missing, oversized, invalid UTF-8, directory, symlink/junction, and other reparse `README.md` inputs. Assert description failures return `None` while the plugin itself remains loadable.
-- [ ] Add command contract tests for a camelCase `PluginView { id, version, trigger, description }`, fixed `pluginListFailed`, main-window caller guard before manager access, deterministic ID ordering, and the exact approved DTO fields.
-- [ ] Run `cargo test --manifest-path .\src-tauri\Cargo.toml plugins::tests commands::tests::plugin`; expect compilation/assertion failures before the DTO and reader exist.
-- [ ] Add `Version::display() -> String` and `PluginCatalogEntry::view() -> PluginView`. Read only root `README.md`, require a non-reparse ordinary file, cap bytes at `16 * 1024`, validate UTF-8, and never make description validity part of plugin activation.
-- [ ] Add `PluginManager::list_views(&self) -> Result<Vec<PluginView>, PluginManagementError>` returning a short-lived snapshot sorted by ID.
-- [ ] Add `#[tauri::command] list_plugins` with `require_main_window` as its first side-effecting step and fixed error mapping. Register only the main-window capability and build manifest permission.
-- [ ] Write `examples/plugins/internal.math/README.md` documenting `/math <expression>`, live host-rendered results, and Enter copying the result.
-- [ ] Run the focused Rust tests; expect green.
-- [ ] Commit with `git add src-tauri examples && git commit -m "feat: expose plugin inventory descriptions"`.
+- [x] Add plugin tests for valid, missing, oversized, invalid UTF-8, directory, symlink/junction, and other reparse `README.md` inputs. Assert description failures return `None` while the plugin itself remains loadable.
+- [x] Add command contract tests for a camelCase `PluginView { id, version, trigger, description }`, fixed `pluginListFailed`, main-window caller guard before manager access, deterministic ID ordering, and the exact approved DTO fields.
+- [x] Run `cargo test --manifest-path .\src-tauri\Cargo.toml plugins::tests commands::tests::plugin`; expect compilation/assertion failures before the DTO and reader exist.
+- [x] Reuse the canonical version formatter and add `PluginCatalog::views() -> Vec<PluginView>`. Read only root `README.md`, require a non-reparse ordinary file, cap bytes at `16 * 1024`, validate UTF-8, and never make description validity part of plugin activation.
+- [x] Add `PluginManager::list_views(&self) -> Result<Vec<PluginView>, PluginManagementError>` returning a short-lived snapshot sorted by ID.
+- [x] Add `#[tauri::command] list_plugins` with `require_main_window` as its first side-effecting step and fixed error mapping. Register only the main-window capability and build manifest permission.
+- [x] Write `examples/plugins/internal.math/README.md` documenting `/math <expression>`, live host-rendered results, and Enter copying the result.
+- [x] Run the focused Rust tests; expect green.
+- [x] Commit with `git add src-tauri examples && git commit -m "feat: expose plugin inventory descriptions"`.
 
 ## Task 3: Bind Plugin Queries And Actions To Generations
 

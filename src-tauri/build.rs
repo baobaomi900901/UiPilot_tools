@@ -4,6 +4,7 @@ fn main() {
             "search_apps",
             "publish_plugin_results",
             "execute_result",
+            "list_plugins",
             "load_settings",
             "save_settings",
             "save_hotkey",

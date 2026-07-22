@@ -13,7 +13,7 @@ use crate::{
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
-    plugins::{PluginManager, PluginQueryError},
+    plugins::{PluginManagementError, PluginManager, PluginQueryError, PluginView},
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate, WindowPosition},
 };
@@ -143,6 +143,13 @@ impl CommandError {
         }
     }
 
+    fn plugin_list_failed() -> Self {
+        Self {
+            code: "pluginListFailed",
+            message: "plugin list failed",
+        }
+    }
+
     fn clipboard_write_failed() -> Self {
         Self {
             code: "clipboardWriteFailed",
@@ -192,6 +199,22 @@ fn require_main_label(label: &str) -> Result<(), CommandError> {
 
 fn require_main_window(window: &WebviewWindow) -> Result<(), CommandError> {
     require_main_label(window.label())
+}
+
+fn list_plugins_with_label<L>(label: &str, list: L) -> Result<Vec<PluginView>, CommandError>
+where
+    L: FnOnce() -> Result<Vec<PluginView>, PluginManagementError>,
+{
+    require_main_label(label)?;
+    list().map_err(|_| CommandError::plugin_list_failed())
+}
+
+#[tauri::command]
+pub(crate) fn list_plugins(
+    window: WebviewWindow,
+    plugins: State<'_, Arc<PluginManager>>,
+) -> Result<Vec<PluginView>, CommandError> {
+    list_plugins_with_label(window.label(), || plugins.list_views())
 }
 
 #[tauri::command]
@@ -1046,6 +1069,7 @@ mod tests {
             "search_apps",
             "search_files",
             "execute_result",
+            "list_plugins",
             "load_settings",
             "save_settings",
             "save_hotkey",
@@ -2193,8 +2217,38 @@ mod tests {
     mod plugin {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use super::super::{publish_plugin_results_with_label, CommandError};
-        use crate::plugins::PluginQueryError;
+        use super::super::{
+            list_plugins_with_label, publish_plugin_results_with_label, CommandError,
+        };
+        use crate::plugins::{PluginManagementError, PluginQueryError, PluginView};
+
+        #[test]
+        fn list_guard_and_fixed_error_mapping_precede_manager_access() {
+            let calls = AtomicUsize::new(0);
+            assert_eq!(
+                list_plugins_with_label("secondary", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Vec::new())
+                }),
+                Err(CommandError::invalid_caller())
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+            let expected = vec![PluginView {
+                id: "plugin".into(),
+                version: "1.0.0".into(),
+                trigger: "/plugin".into(),
+                description: None,
+            }];
+            assert_eq!(
+                list_plugins_with_label("main", || Ok(expected.clone())),
+                Ok(expected)
+            );
+            assert_eq!(
+                list_plugins_with_label("main", || Err(PluginManagementError::Unavailable)),
+                Err(CommandError::plugin_list_failed())
+            );
+        }
 
         #[test]
         fn publish_rejects_non_plugin_label_before_state_access() {
