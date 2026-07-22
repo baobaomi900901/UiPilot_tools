@@ -15,7 +15,10 @@ pub(crate) enum ResultAction {
         target: ApplicationLaunchTarget,
     },
     OpenIndexedPath,
-    CopyText { plugin_id: String, text: String },
+    CopyText {
+        plugin_id: String,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,7 +319,9 @@ mod tests {
     fn query_domains_accept_plugin_domain() {
         let registry = ResultRegistry::default();
         registry.on_show("inv-1".into());
-        let plugin = registry.begin_query(QueryDomain::Plugin, "inv-1", 1).unwrap();
+        let plugin = registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 1)
+            .unwrap();
         let response = registry
             .publish_if_latest(
                 plugin,

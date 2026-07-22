@@ -214,6 +214,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
@@ -763,8 +764,8 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("plugins.rs", include_str!("plugins.rs")),
         ] {
-        for forbidden in [
-            ["/", "math"].concat(),
+            for forbidden in [
+                ["/", "math"].concat(),
                 ["internal", ".", "math"].concat(),
                 ["Expr", "ession"].concat(),
                 ["calculate", "("].concat(),
