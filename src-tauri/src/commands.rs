@@ -15,7 +15,7 @@ use crate::{
     model::SearchResponse,
     plugins::{PluginManager, PluginQueryError},
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
-    settings::{SettingsError, SettingsStore, SettingsUpdate},
+    settings::{SettingsError, SettingsStore, SettingsUpdate, WindowPosition},
     validation_data::{ValidationEvent, ValidationStore},
     validation_export::{choose_export_destination, write_validation_export, ExportDestination},
 };
@@ -1140,19 +1140,42 @@ pub(crate) fn clear_and_hide(
     registry: &ResultRegistry,
     window: &WebviewWindow,
 ) -> Result<(), CommandError> {
+    let settings = window.state::<SettingsStore>();
     clear_and_hide_with(
+        || {
+            window
+                .outer_position()
+                .map(|position| WindowPosition {
+                    x: position.x,
+                    y: position.y,
+                })
+                .map_err(|_| ())
+        },
         || registry.hide_and_clear(),
         || window.hide().map_err(|_| ()),
+        |position| settings.set_window_position(position).map_err(|_| ()),
     )
 }
 
-fn clear_and_hide_with<C, H>(clear: C, hide: H) -> Result<(), CommandError>
+fn clear_and_hide_with<P, C, H, S>(
+    read_position: P,
+    clear: C,
+    hide: H,
+    save_position: S,
+) -> Result<(), CommandError>
 where
+    P: FnOnce() -> Result<WindowPosition, ()>,
     C: FnOnce(),
     H: FnOnce() -> Result<(), ()>,
+    S: FnOnce(WindowPosition) -> Result<(), ()>,
 {
+    let position = read_position();
     clear();
-    hide().map_err(|_| CommandError::window_failed())
+    hide().map_err(|_| CommandError::window_failed())?;
+    if let Ok(position) = position {
+        let _ = save_position(position);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2230,30 +2253,57 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_shared_clear_and_hide_runs_once_in_registry_first_order() {
+    fn maintenance_shared_clear_and_hide_saves_after_successful_hide() {
         let trace = RefCell::new(Vec::new());
-        let clears = Cell::new(0);
-        let hides = Cell::new(0);
+        let position = crate::settings::WindowPosition { x: 40, y: -20 };
         let result = clear_and_hide_with(
             || {
-                clears.set(clears.get() + 1);
+                trace.borrow_mut().push("position");
+                Ok(position)
+            },
+            || {
                 trace.borrow_mut().push("clear");
             },
             || {
-                hides.set(hides.get() + 1);
                 trace.borrow_mut().push("hide");
+                Ok(())
+            },
+            |saved| {
+                assert_eq!(saved, position);
+                trace.borrow_mut().push("save");
                 Err(())
             },
         );
-        assert_eq!(result, Err(CommandError::window_failed()));
-        assert_eq!(*trace.borrow(), ["clear", "hide"]);
-        assert_eq!(clears.get(), 1);
-        assert_eq!(hides.get(), 1);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*trace.borrow(), ["position", "clear", "hide", "save"]);
 
         assert_eq!(clear_validation_data_with(|| Ok(())), Ok(()));
         assert_eq!(
             clear_validation_data_with(|| Err(())),
             Err(CommandError::validation_failed())
+        );
+    }
+
+    #[test]
+    fn maintenance_shared_clear_and_hide_ignores_position_failure_but_not_hide_failure() {
+        assert_eq!(
+            clear_and_hide_with(
+                || Err(()),
+                || {},
+                || Ok(()),
+                |_| panic!("missing position must not be saved"),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            clear_and_hide_with(
+                || Ok(crate::settings::WindowPosition { x: 1, y: 2 }),
+                || {},
+                || Err(()),
+                |_| panic!("failed hide must not be persisted"),
+            ),
+            Err(CommandError::window_failed())
         );
     }
 
@@ -2274,7 +2324,12 @@ mod tests {
         assert!(registry.resolve(&response.request_id, result_id).is_ok());
 
         assert_eq!(
-            clear_and_hide_with(|| registry.hide_and_clear(), || Err(())),
+            clear_and_hide_with(
+                || Err(()),
+                || registry.hide_and_clear(),
+                || Err(()),
+                |_| Ok(()),
+            ),
             Err(CommandError::window_failed())
         );
         assert_eq!(
