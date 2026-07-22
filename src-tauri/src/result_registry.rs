@@ -15,12 +15,17 @@ pub(crate) enum ResultAction {
         target: ApplicationLaunchTarget,
     },
     OpenIndexedPath,
+    CopyText {
+        plugin_id: String,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryDomain {
     Application,
     File,
+    Plugin,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,8 +69,8 @@ struct RegistryState {
     active_invocation_id: Option<String>,
     latest_query_sequence: u64,
     latest_query_domain: Option<QueryDomain>,
-    domain_epochs: [u64; 2],
-    domain_exhausted: [bool; 2],
+    domain_epochs: [u64; 3],
+    domain_exhausted: [bool; 3],
     current: Option<ResultSet>,
 }
 
@@ -205,6 +210,27 @@ impl ResultRegistry {
             .ok_or(RegistryError::UnknownResult)
     }
 
+    pub(crate) fn invalidate_plugin(&self, plugin_id: &str) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        if state.current.as_ref().is_some_and(|current| {
+            current.actions.values().any(|action| {
+                matches!(
+                    action,
+                    ResultAction::CopyText {
+                        plugin_id: owner,
+                        ..
+                    } if owner == plugin_id
+                )
+            })
+        }) {
+            state.current = None;
+        }
+    }
+
     pub(crate) fn hide_and_clear(&self) {
         let mut state = self
             .inner
@@ -271,6 +297,7 @@ impl QueryDomain {
         match self {
             Self::Application => 0,
             Self::File => 1,
+            Self::Plugin => 2,
         }
     }
 }
@@ -308,6 +335,13 @@ mod tests {
                 shortcut: PathBuf::from(format!(r"C:\private\{name}.lnk")),
                 executable: Some(PathBuf::from(format!(r"C:\private\{name}.exe"))),
             },
+        }
+    }
+
+    fn copy_action(plugin_id: &str) -> ResultAction {
+        ResultAction::CopyText {
+            plugin_id: plugin_id.into(),
+            text: "copy me".into(),
         }
     }
 
@@ -389,6 +423,37 @@ mod tests {
         assert_eq!(
             registry.resolve(&file_response.0, &file_response.1[0].0),
             Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn query_domains_accept_plugin_domain() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let plugin = registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 1)
+            .unwrap();
+        let response = registry
+            .publish_if_latest(
+                plugin,
+                vec![(
+                    item("", "Plugin"),
+                    ResultAction::CopyText {
+                        plugin_id: "plugin".into(),
+                        text: "copy".into(),
+                    },
+                )],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        assert_eq!(response.0, "req-0000000000000001");
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[0].0),
+            Ok(ResultAction::CopyText {
+                plugin_id: "plugin".into(),
+                text: "copy".into(),
+            })
         );
     }
 
@@ -711,6 +776,31 @@ mod tests {
             .is_some());
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
+            Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn plugin_invalidation_clears_only_matching_plugin_results() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invocation-1".into());
+        let token = registry
+            .begin_query(QueryDomain::Plugin, "invocation-1", 1)
+            .unwrap();
+        let response = publish_app(
+            &registry,
+            token,
+            vec![(item("", "2"), copy_action("plugin-b"))],
+        )
+        .unwrap();
+        let result_id = &response.items[0].result_id;
+
+        registry.invalidate_plugin("plugin-a");
+        assert!(registry.resolve(&response.request_id, result_id).is_ok());
+
+        registry.invalidate_plugin("plugin-b");
+        assert_eq!(
+            registry.resolve(&response.request_id, result_id),
             Err(RegistryError::StaleRequest)
         );
     }

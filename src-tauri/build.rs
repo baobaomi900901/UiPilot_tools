@@ -2,6 +2,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "search_apps",
+            "publish_plugin_results",
             "execute_result",
             "load_settings",
             "save_settings",

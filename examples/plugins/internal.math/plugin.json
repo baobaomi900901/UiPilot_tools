@@ -1,0 +1,14 @@
+{
+  "manifest": 1,
+  "id": "internal.math",
+  "version": "0.2.0",
+  "minHostVersion": "0.2.0",
+  "runtime": "runtime.html",
+  "feature": {
+    "id": "calculate",
+    "trigger": "/math"
+  },
+  "permissions": [
+    "clipboard.writeText"
+  ]
+}

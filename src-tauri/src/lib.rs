@@ -8,6 +8,9 @@ use tauri::Manager;
 use lifecycle::ShowTarget;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+use plugins::{PluginManager, Version};
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod atomic_file;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -49,6 +52,9 @@ mod lifecycle;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod file_index;
 
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod plugins;
+
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
 
@@ -78,8 +84,11 @@ fn setup_production_lifecycle(
     app: &mut tauri::App,
     app_cache: &Arc<apps::AppCache>,
     coordinator: &Arc<lifecycle::LifecycleCoordinator>,
+    plugin_manager: &Arc<PluginManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
+    plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
+    plugin_manager.create_runtimes(app, &app_data_dir)?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -187,6 +196,9 @@ pub fn run() {
         result_registry.clone(),
     ));
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let plugin_manager = Arc::new(PluginManager::new());
+
     let builder = tauri::Builder::default();
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -212,12 +224,21 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
+        .manage(Arc::clone(&plugin_manager))
+        .register_uri_scheme_protocol("uipilot-plugin", {
+            let plugin_manager = Arc::clone(&plugin_manager);
+            move |ctx, request| {
+                plugin_manager.asset_response(ctx.webview_label(), request.uri().path())
+            }
+        })
         .manage(result_registry)
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
+            commands::publish_plugin_results,
             commands::search_files,
             commands::execute_result,
             commands::load_settings,
@@ -242,7 +263,7 @@ pub fn run() {
             security_probe::setup(_app)?;
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
-            setup_production_lifecycle(_app, &app_cache, &coordinator)?;
+            setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -393,9 +414,10 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 11);
+        assert_eq!(production.matches("commands::").count(), 12);
         for command in [
             "search_apps",
+            "publish_plugin_results",
             "search_files",
             "execute_result",
             "load_settings",
@@ -470,13 +492,22 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            production
+                .matches(".manage(Arc::clone(&plugin_manager))")
+                .count(),
+            1
+        );
         for fragment in [
             "let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());",
+            "let plugin_manager = Arc::new(PluginManager::new());",
             "tauri_plugin_single_instance::init(",
             "move |app, _args, _cwd|",
             "tauri_plugin_global_shortcut::Builder::new()",
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
-            "setup_production_lifecycle(_app, &app_cache, &coordinator)?;",
+            "setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;",
+            "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
+            "plugin_manager.create_runtimes(app, &app_data_dir)?;",
             "lifecycle::install_session_end_hook",
             "tauri::tray::TrayIconBuilder::new()",
             "tauri::WindowEvent::Focused(focused)",
@@ -664,6 +695,7 @@ mod tests {
             "hotkey_hook",
             "lifecycle",
             "file_index",
+            "plugins",
         ] {
             assert!(
                 source.contains(&format!("{product_cfg}\nmod {module};")),
@@ -722,6 +754,7 @@ mod tests {
             ("settings.rs", include_str!("settings.rs")),
             ("validation_data.rs", include_str!("validation_data.rs")),
             ("validation_export.rs", include_str!("validation_export.rs")),
+            ("plugins.rs", include_str!("plugins.rs")),
         ];
 
         for (name, product_source) in product_sources {
@@ -769,5 +802,86 @@ mod tests {
             1
         );
         assert!(cache.contains(&format!("{test_only_allow}\n    pub(crate) fn refresh")));
+    }
+
+    #[test]
+    fn host_source_has_no_builtin_math_plugin() {
+        for (name, source) in [
+            ("lib.rs", include_str!("lib.rs")),
+            ("plugins.rs", include_str!("plugins.rs")),
+        ] {
+            for forbidden in [
+                ["/", "math"].concat(),
+                ["internal", ".", "math"].concat(),
+                ["Expr", "ession"].concat(),
+                ["calculate", "("].concat(),
+            ] {
+                assert!(
+                    !source.contains(&forbidden),
+                    "host source contains {forbidden}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_runtime_capability_is_narrow() {
+        let capability = include_str!("../capabilities/plugin-runtime.json");
+        assert!(capability.contains("\"windows\": [\"plugin-*\"]"));
+        assert!(capability.contains("\"allow-publish-plugin-results\""));
+        assert!(capability.contains("\"core:event:allow-listen\""));
+        assert!(capability.contains("\"core:event:allow-unlisten\""));
+        for forbidden in ["\"*\"", "clipboard", "allow-search-apps", "main"] {
+            assert!(!capability.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn plugin_runtime_wiring_is_narrow() {
+        let lib = include_str!("lib.rs").replace("\r\n", "\n");
+        let plugins = include_str!("plugins.rs").replace("\r\n", "\n");
+        for fragment in [
+            ".register_uri_scheme_protocol(\"uipilot-plugin\",",
+            "ctx.webview_label()",
+            "plugin_manager.asset_response(",
+            "plugin_manager.create_runtimes(app, &app_data_dir)?;",
+        ] {
+            assert!(lib.contains(fragment), "missing runtime wiring: {fragment}");
+        }
+        for fragment in [
+            "WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))",
+            ".visible(false)",
+            ".focusable(false)",
+            ".skip_taskbar(true)",
+            ".incognito(true)",
+            ".data_directory(data_directory)",
+            ".on_navigation(",
+            ".on_new_window(|_, _| NewWindowResponse::Deny)",
+            ".on_download(|_, _| false)",
+            ".on_document_title_changed(",
+            ".initialization_script(PLUGIN_BRIDGE)",
+            "WebviewWindow::with_webview",
+            "ProcessFailedEventHandler",
+            "disable_runtime",
+        ] {
+            assert!(
+                plugins.contains(fragment),
+                "missing runtime builder: {fragment}"
+            );
+        }
+        for forbidden in [
+            [".visible", "(true)"].concat(),
+            "NewWindowResponse::Allow".into(),
+            "ShellOpen".into(),
+            "open_path".into(),
+            "asset://".into(),
+            "file://".into(),
+            "appDataDir".into(),
+        ] {
+            assert!(
+                !plugins.contains(&forbidden),
+                "forbidden plugin runtime wiring: {forbidden}"
+            );
+        }
     }
 }

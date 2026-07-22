@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "plugin-runtime",
+  "description": "Minimal permissions for hidden internal plugin runtimes",
+  "windows": ["plugin-*"],
+  "permissions": [
+    "allow-publish-plugin-results",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}
