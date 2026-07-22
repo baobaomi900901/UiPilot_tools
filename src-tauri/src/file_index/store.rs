@@ -131,14 +131,25 @@ CREATE INDEX IF NOT EXISTS candidate_entries_category_sort_asc ON candidate_entr
 #[derive(Debug)]
 pub(super) enum StoreError {
     Sqlite,
+    Corrupt,
     InvalidData,
     Platform,
     RevisionExhausted,
 }
 
 impl From<rusqlite::Error> for StoreError {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::Sqlite
+    fn from(error: rusqlite::Error) -> Self {
+        match error {
+            rusqlite::Error::SqliteFailure(inner, _)
+                if matches!(
+                    inner.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) =>
+            {
+                Self::Corrupt
+            }
+            _ => Self::Sqlite,
+        }
     }
 }
 
@@ -240,40 +251,111 @@ pub(super) struct StoreQueryResult {
     pub(super) strategy: QueryStrategy,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PriorIntegrityMetadata {
+    pub(super) clean_close: bool,
+    pub(super) last_integrity_check_utc: Option<String>,
+    pub(super) created_schema: bool,
+}
+
 pub(super) struct Store {
     connection: Connection,
     invalid_collations: [Arc<AtomicBool>; 2],
+    prior_integrity: PriorIntegrityMetadata,
     #[cfg(test)]
     reindex_statement_count: usize,
 }
 
 impl Store {
     pub(super) fn open(path: &Path, ordinal_identity: &str) -> Result<Self, StoreError> {
+        Self::open_authorized(path, ordinal_identity, || true)
+    }
+
+    pub(super) fn open_authorized<A>(
+        path: &Path,
+        ordinal_identity: &str,
+        mut authorize: A,
+    ) -> Result<Self, StoreError>
+    where
+        A: FnMut() -> bool,
+    {
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
-        Self::initialize(connection, ordinal_identity)
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        Self::initialize_authorized(connection, ordinal_identity, authorize)
     }
 
+    #[cfg(test)]
     fn initialize(connection: Connection, ordinal_identity: &str) -> Result<Self, StoreError> {
+        Self::initialize_authorized(connection, ordinal_identity, || true)
+    }
+
+    fn initialize_authorized<A>(
+        connection: Connection,
+        ordinal_identity: &str,
+        mut authorize: A,
+    ) -> Result<Self, StoreError>
+    where
+        A: FnMut() -> bool,
+    {
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
         let invalid_collations = [
             register_collation(&connection, "uipilot_name_ordinal_ci", true)?,
             register_collation(&connection, "uipilot_path_ordinal_cs", false)?,
         ];
         let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        if page_count == 0 {
+        let created_schema = page_count == 0;
+        if created_schema {
+            if !authorize() {
+                return Err(StoreError::InvalidData);
+            }
             connection.execute_batch(SCHEMA)?;
+            if !authorize() {
+                return Err(StoreError::InvalidData);
+            }
             connection.execute(
                 "INSERT INTO metadata(singleton, fold_algorithm_id, ordinal_sort_identity, index_revision, clean_close, last_integrity_check_utc) VALUES(1, ?1, ?2, '0', 0, NULL)",
                 params![FOLD_ALGORITHM_ID, ordinal_identity],
             )?;
         } else {
+            if !authorize() {
+                return Err(StoreError::InvalidData);
+            }
             validate_existing_schema(&connection)?;
         }
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        let transaction = connection.unchecked_transaction()?;
+        let (clean_close, last_integrity_check_utc) = transaction.query_row(
+            "SELECT clean_close, last_integrity_check_utc FROM metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        if transaction.execute("UPDATE metadata SET clean_close=0 WHERE singleton=1", [])? != 1 {
+            return Err(StoreError::InvalidData);
+        }
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        transaction.commit()?;
         Ok(Self {
             connection,
             invalid_collations,
+            prior_integrity: PriorIntegrityMetadata {
+                clean_close,
+                last_integrity_check_utc,
+                created_schema,
+            },
             #[cfg(test)]
             reindex_statement_count: 0,
         })
@@ -320,12 +402,140 @@ impl Store {
     }
 
     pub(super) fn persist_index_revision(&mut self, revision: u64) -> Result<(), StoreError> {
+        self.persist_index_revision_authorized(revision, || true)
+    }
+
+    pub(super) fn persist_index_revision_authorized<A>(
+        &mut self,
+        revision: u64,
+        mut authorize: A,
+    ) -> Result<(), StoreError>
+    where
+        A: FnMut() -> bool,
+    {
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
         let transaction = self.connection.transaction()?;
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
         if transaction.execute(
             "UPDATE metadata SET index_revision=?1 WHERE singleton=1",
             [revision.to_string()],
         )? != 1
         {
+            return Err(StoreError::InvalidData);
+        }
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn prior_integrity_metadata(&self) -> PriorIntegrityMetadata {
+        self.prior_integrity.clone()
+    }
+
+    pub(super) fn integrity_check_due(&self, now_utc: &str) -> Result<bool, StoreError> {
+        let old_or_missing = match self.prior_integrity.last_integrity_check_utc.as_deref() {
+            None => true,
+            Some(previous) => self.connection.query_row(
+                "SELECT unixepoch(?1) <= unixepoch(?2, '-7 days')",
+                params![previous, now_utc],
+                |row| row.get::<_, bool>(0),
+            )?,
+        };
+        Ok(self.prior_integrity.created_schema
+            || !self.prior_integrity.clean_close
+            || old_or_missing)
+    }
+
+    pub(super) fn integrity_check_due_now(&self) -> Result<bool, StoreError> {
+        let now = self.connection.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        self.integrity_check_due(&now)
+    }
+
+    pub(super) fn run_integrity_check_at(path: &Path) -> Result<bool, StoreError> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let _collations = [
+            register_collation(&connection, "uipilot_name_ordinal_ci", true)?,
+            register_collation(&connection, "uipilot_path_ordinal_cs", false)?,
+        ];
+        let mut statement = connection.prepare("PRAGMA integrity_check")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.len() == 1 && rows[0] == "ok")
+    }
+
+    pub(super) fn record_integrity_check_at_authorized<A>(
+        path: &Path,
+        mut authorize: A,
+    ) -> Result<(), StoreError>
+    where
+        A: FnMut() -> bool,
+    {
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        let mut connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        let transaction = connection.transaction()?;
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        if transaction.execute(
+            "UPDATE metadata SET last_integrity_check_utc=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE singleton=1",
+            [],
+        )? != 1
+        {
+            return Err(StoreError::InvalidData);
+        }
+        if !authorize() {
+            return Err(StoreError::InvalidData);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn write_clean_close(
+        self,
+        permit: super::CleanCloseMarkerPermit,
+    ) -> Result<(), StoreError> {
+        self.write_clean_close_with(permit, || {})
+    }
+
+    fn write_clean_close_with<F>(
+        mut self,
+        permit: super::CleanCloseMarkerPermit,
+        before_commit: F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnOnce(),
+    {
+        if !permit.is_authorized() {
+            return Err(StoreError::InvalidData);
+        }
+        let transaction = self.connection.transaction()?;
+        if transaction.execute("UPDATE metadata SET clean_close=1 WHERE singleton=1", [])? != 1 {
+            return Err(StoreError::InvalidData);
+        }
+        before_commit();
+        if !permit.is_authorized() {
             return Err(StoreError::InvalidData);
         }
         transaction.commit()?;
@@ -2156,7 +2366,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{register_collation, QueryStrategy, Store, TestEntry};
+    use super::{register_collation, QueryStrategy, Store, StoreError, TestEntry};
     use crate::file_index::{
         FileCategory, FileIndexStatus, FileSort, IndexedKind, QuerySpec, VolumeIdentity,
     };
@@ -2714,5 +2924,182 @@ mod tests {
     fn new_schema_initializes_dirty_integrity_metadata() {
         let store = Store::open_in_memory_for_test("identity-a").unwrap();
         assert_eq!(store.metadata_integrity_marker(), (false, None));
+    }
+
+    #[test]
+    fn integrity_timestamp_reauth_failure_writes_nothing() {
+        use std::cell::Cell;
+
+        let directory = TestDir::new();
+        let path = directory.path().join("file-index.sqlite3");
+        drop(Store::open(&path, "identity-a").unwrap());
+        let authorizations = Cell::new(0);
+
+        let result = Store::record_integrity_check_at_authorized(&path, || {
+            let next = authorizations.get() + 1;
+            authorizations.set(next);
+            next == 1
+        });
+
+        assert!(matches!(result, Err(StoreError::InvalidData)));
+        assert!(authorizations.get() >= 2);
+        let connection = Connection::open(&path).unwrap();
+        let timestamp = connection
+            .query_row(
+                "SELECT last_integrity_check_utc FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(timestamp, None);
+    }
+
+    #[test]
+    fn clean_close_uses_prior_snapshot_and_one_final_connection() {
+        use std::sync::Arc;
+
+        use crate::{
+            file_index::{FileIndex, LifecycleMode},
+            lifecycle::{FileIndexPhase, LifecycleCoordinator},
+            result_registry::ResultRegistry,
+        };
+
+        let directory = TestDir::new();
+        let path = directory.path().join("file-index.sqlite3");
+        drop(Store::open(&path, "identity-a").unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET clean_close=1,last_integrity_check_utc='2026-07-01T00:00:00Z' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path, "identity-a").unwrap();
+        let prior = store.prior_integrity_metadata();
+        assert!(prior.clean_close);
+        assert_eq!(
+            prior.last_integrity_check_utc.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            store.metadata_integrity_marker(),
+            (false, Some("2026-07-01T00:00:00Z".into()))
+        );
+        assert!(store.integrity_check_due("2026-07-20T00:00:00Z").unwrap());
+
+        let lifecycle = Arc::new(LifecycleCoordinator::default());
+        let index = Arc::new(FileIndex::new(
+            Arc::clone(&lifecycle),
+            ResultRegistry::default(),
+        ));
+        {
+            let mut state = index.state.lock().unwrap();
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.store = Some(store);
+        }
+        lifecycle.set_file_index_mirror_for_test(FileIndexPhase::Cleaning, 7);
+        assert!(index.start_cleaning_until(
+            7,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
+        assert_eq!(index.db_work_count_for_test(), 0);
+        assert!(index.take_clean_close_marker(6).is_none());
+        let pause_deadline = index.state.lock().unwrap().pause_deadline.unwrap();
+        assert!(matches!(
+            index.clean_close_readiness(7, pause_deadline),
+            crate::file_index::CleanCloseReadiness::Reject
+        ));
+        assert_eq!(index.db_work_count_for_test(), 0);
+        let (store, permit) = index.take_clean_close_marker(7).unwrap();
+        let state_owner = permit.state.clone();
+        store.write_clean_close(permit).unwrap();
+        assert_eq!(index.db_work_count_for_test(), 0);
+        let clean: bool = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT clean_close FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(clean);
+        assert!(index.take_clean_close_marker(7).is_none());
+
+        lifecycle.set_file_index_mirror_for_test(FileIndexPhase::Terminal, 7);
+        index.enter_terminal();
+        assert!(index.take_clean_close_marker(7).is_none());
+        drop(index);
+        assert!(state_owner.upgrade().is_none());
+
+        let before_path = directory.path().join("terminal-before.sqlite3");
+        let before_store = Store::open(&before_path, "identity-a").unwrap();
+        let before_lifecycle = Arc::new(LifecycleCoordinator::default());
+        let before = Arc::new(FileIndex::new(
+            Arc::clone(&before_lifecycle),
+            ResultRegistry::default(),
+        ));
+        {
+            let mut state = before.state.lock().unwrap();
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.store = Some(before_store);
+            state.session_started = true;
+        }
+        before_lifecycle.set_file_index_mirror_for_test(FileIndexPhase::Cleaning, 8);
+        assert!(before.start_cleaning_until(
+            8,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
+        before_lifecycle.set_file_index_mirror_for_test(FileIndexPhase::Terminal, 8);
+        before.enter_terminal();
+        assert!(before.take_clean_close_marker(8).is_none());
+        let before_clean: bool = Connection::open(&before_path)
+            .unwrap()
+            .query_row(
+                "SELECT clean_close FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!before_clean);
+
+        let after_path = directory.path().join("terminal-after.sqlite3");
+        let after_store = Store::open(&after_path, "identity-a").unwrap();
+        let after_lifecycle = Arc::new(LifecycleCoordinator::default());
+        let after = Arc::new(FileIndex::new(
+            Arc::clone(&after_lifecycle),
+            ResultRegistry::default(),
+        ));
+        {
+            let mut state = after.state.lock().unwrap();
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.store = Some(after_store);
+            state.session_started = true;
+        }
+        after_lifecycle.set_file_index_mirror_for_test(FileIndexPhase::Cleaning, 9);
+        assert!(after.start_cleaning_until(
+            9,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
+        let (after_store, after_permit) = after.take_clean_close_marker(9).unwrap();
+        assert!(after_store
+            .write_clean_close_with(after_permit, || {
+                after_lifecycle.set_file_index_mirror_for_test(FileIndexPhase::Terminal, 9);
+                after.enter_terminal();
+            })
+            .is_err());
+        let after_clean: bool = Connection::open(&after_path)
+            .unwrap()
+            .query_row(
+                "SELECT clean_close FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!after_clean);
     }
 }

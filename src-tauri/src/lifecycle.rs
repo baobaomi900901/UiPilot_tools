@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -20,6 +20,7 @@ use windows::Win32::{
 
 use crate::{
     commands::clear_and_hide,
+    file_index::FileIndex,
     hotkey::{DoubleTapModifier, HotkeyKind},
     hotkey_hook::HotkeyHook,
     result_registry::ResultRegistry,
@@ -411,6 +412,14 @@ enum ExitState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum FileIndexPhase {
+    Running = 0,
+    Cleaning = 1,
+    Terminal = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CleanOwner {
     Tray,
     System,
@@ -446,6 +455,13 @@ enum CleanDecision {
     ObserveOnly,
 }
 
+struct TrayCleanStart {
+    decision: CleanDecision,
+    attempt_epoch: u64,
+    attempt_overflowed: bool,
+    deadline: Instant,
+}
+
 #[derive(Debug)]
 struct ExitGate {
     state: ExitState,
@@ -472,6 +488,8 @@ pub(crate) enum ReservationError {
 #[derive(Debug)]
 pub(crate) struct LifecycleCoordinator {
     next_invocation: AtomicU64,
+    lifecycle_phase: AtomicU8,
+    lifecycle_attempt_epoch: AtomicU64,
     readiness: Mutex<Readiness>,
     modal: Mutex<ModalState>,
     exit_gate: Mutex<ExitGate>,
@@ -485,6 +503,8 @@ impl Default for LifecycleCoordinator {
     fn default() -> Self {
         Self {
             next_invocation: AtomicU64::new(0),
+            lifecycle_phase: AtomicU8::new(FileIndexPhase::Running as u8),
+            lifecycle_attempt_epoch: AtomicU64::new(0),
             readiness: Mutex::new(Readiness::default()),
             modal: Mutex::new(ModalState::Normal),
             exit_gate: Mutex::new(ExitGate::default()),
@@ -612,6 +632,29 @@ impl Drop for CriticalReservation {
 }
 
 impl LifecycleCoordinator {
+    pub(crate) fn file_index_phase(&self) -> FileIndexPhase {
+        match self.lifecycle_phase.load(Ordering::Acquire) {
+            0 => FileIndexPhase::Running,
+            1 => FileIndexPhase::Cleaning,
+            _ => FileIndexPhase::Terminal,
+        }
+    }
+
+    pub(crate) fn file_index_attempt_epoch(&self) -> u64 {
+        self.lifecycle_attempt_epoch.load(Ordering::Acquire)
+    }
+
+    fn store_file_index_phase(&self, phase: FileIndexPhase) {
+        self.lifecycle_phase.store(phase as u8, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_file_index_mirror_for_test(&self, phase: FileIndexPhase, attempt_epoch: u64) {
+        self.lifecycle_attempt_epoch
+            .store(attempt_epoch, Ordering::Release);
+        self.store_file_index_phase(phase);
+    }
+
     pub(crate) fn save_settings_transaction(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1124,19 +1167,43 @@ impl LifecycleCoordinator {
         })
     }
 
-    fn begin_tray_clean(&self, deadline: Instant) -> CleanDecision {
+    fn begin_tray_clean_start(&self, deadline: Instant) -> TrayCleanStart {
         let mut gate = self.exit_gate.lock().expect("exit gate lock poisoned");
         if gate.state != ExitState::Running || !matches!(gate.clean_attempt, CleanAttempt::Idle) {
-            return CleanDecision::ObserveOnly;
+            return TrayCleanStart {
+                decision: CleanDecision::ObserveOnly,
+                attempt_epoch: self.lifecycle_attempt_epoch.load(Ordering::Relaxed),
+                attempt_overflowed: false,
+                deadline,
+            };
         }
 
+        let previous = self.lifecycle_attempt_epoch.load(Ordering::Relaxed);
+        let (attempt, attempt_overflowed) = match previous.checked_add(1) {
+            Some(attempt) => (attempt, false),
+            None => (previous, true),
+        };
+        self.lifecycle_attempt_epoch
+            .store(attempt, Ordering::Release);
         gate.state = ExitState::Cleaning;
-        Self::start_waiting(&mut gate, CleanOwner::Tray, deadline)
+        self.store_file_index_phase(FileIndexPhase::Cleaning);
+        TrayCleanStart {
+            decision: Self::start_waiting(&mut gate, CleanOwner::Tray, deadline),
+            attempt_epoch: attempt,
+            attempt_overflowed,
+            deadline,
+        }
+    }
+
+    #[cfg(test)]
+    fn begin_tray_clean(&self, deadline: Instant) -> CleanDecision {
+        self.begin_tray_clean_start(deadline).decision
     }
 
     fn begin_system_end_nonblocking(&self, now: Instant) -> CleanDecision {
         let mut gate = self.exit_gate.lock().expect("exit gate lock poisoned");
         gate.state = ExitState::SystemEnding;
+        self.store_file_index_phase(FileIndexPhase::Terminal);
 
         match gate.clean_attempt {
             CleanAttempt::Idle | CleanAttempt::Waiting { .. } if gate.in_flight_critical == 0 => {
@@ -1163,6 +1230,7 @@ impl LifecycleCoordinator {
                 let decision = if owner == CleanOwner::Tray && gate.state == ExitState::Cleaning {
                     gate.state = ExitState::Running;
                     gate.clean_attempt = CleanAttempt::Idle;
+                    self.store_file_index_phase(FileIndexPhase::Running);
                     CleanDecision::ReturnRunning
                 } else {
                     gate.clean_attempt = CleanAttempt::Finished(CleanResult::TimedOut);
@@ -1200,11 +1268,13 @@ impl LifecycleCoordinator {
                 CleanResult::Succeeded => {
                     gate.state = ExitState::Clean;
                     gate.clean_attempt = CleanAttempt::Finished(result);
+                    self.store_file_index_phase(FileIndexPhase::Terminal);
                     CleanDecision::Exit
                 }
                 CleanResult::Failed | CleanResult::TimedOut => {
                     gate.state = ExitState::Running;
                     gate.clean_attempt = CleanAttempt::Idle;
+                    self.store_file_index_phase(FileIndexPhase::Running);
                     CleanDecision::ReturnRunning
                 }
             }
@@ -1265,11 +1335,19 @@ impl LifecycleCoordinator {
         decision
     }
 
-    fn run_system_end_nonblocking_with<M>(&self, now: Instant, marker: M) -> CleanDecision
+    fn run_system_end_nonblocking_with<M, T>(
+        &self,
+        now: Instant,
+        marker: M,
+        terminal: T,
+    ) -> CleanDecision
     where
         M: FnOnce() -> CleanResult,
+        T: FnOnce(),
     {
-        match self.begin_system_end_nonblocking(now) {
+        let decision = self.begin_system_end_nonblocking(now);
+        terminal();
+        match decision {
             CleanDecision::CallMarker => self.complete_clean(marker()),
             decision => decision,
         }
@@ -1297,28 +1375,38 @@ impl LifecycleCoordinator {
     }
 
     pub(crate) fn request_tray_quit(self: &Arc<Self>, app: &AppHandle) {
-        let decision = self.begin_tray_clean(Instant::now() + Duration::from_secs(1));
-        if decision == CleanDecision::ObserveOnly {
+        let start = self.begin_tray_clean_start(Instant::now() + Duration::from_secs(5));
+        if start.decision == CleanDecision::ObserveOnly {
             return;
+        }
+        let file_index = Arc::clone(app.state::<Arc<FileIndex>>().inner());
+        if start.attempt_overflowed {
+            file_index.fail_closed_exhaustion();
+        } else {
+            let _ = file_index.start_cleaning_until(start.attempt_epoch, start.deadline);
         }
 
         let coordinator = Arc::clone(self);
         let app = app.clone();
         drop(tauri::async_runtime::spawn_blocking(move || {
             let marker_app = app.clone();
+            let marker_index = Arc::clone(&file_index);
             let exit_dispatcher = app.clone();
             let exit_app = app.clone();
             let exit_coordinator = Arc::clone(&coordinator);
+            let exit_index = Arc::clone(&file_index);
             let show_app = app.clone();
             let show_coordinator = Arc::clone(&coordinator);
+            let show_index = Arc::clone(&file_index);
             coordinator.run_tray_quit_with(
-                decision,
+                start.decision,
                 |deadline| coordinator.wait_for_clean_change(deadline),
                 || {
-                    if marker_app
-                        .state::<ValidationStore>()
-                        .mark_clean_exit()
-                        .is_ok()
+                    if marker_index.mark_clean_close(start.attempt_epoch)
+                        && marker_app
+                            .state::<ValidationStore>()
+                            .mark_clean_exit()
+                            .is_ok()
                     {
                         CleanResult::Succeeded
                     } else {
@@ -1326,11 +1414,13 @@ impl LifecycleCoordinator {
                     }
                 },
                 move || {
+                    exit_index.enter_terminal();
                     exit_coordinator.uninstall_hook_for_exit();
                     let app = exit_app.clone();
                     let _ = exit_dispatcher.run_on_main_thread(move || app.exit(0));
                 },
                 move |target| {
+                    let _ = show_index.return_running(start.attempt_epoch);
                     let _ = show_coordinator.request_show(&show_app, target);
                 },
             );
@@ -1339,17 +1429,22 @@ impl LifecycleCoordinator {
 
     fn run_system_end(&self, app: &AppHandle) {
         let marker_app = app.clone();
-        self.run_system_end_nonblocking_with(Instant::now(), || {
-            if marker_app
-                .state::<ValidationStore>()
-                .mark_clean_exit()
-                .is_ok()
-            {
-                CleanResult::Succeeded
-            } else {
-                CleanResult::Failed
-            }
-        });
+        let terminal_index = Arc::clone(app.state::<Arc<FileIndex>>().inner());
+        let _ = self.run_system_end_nonblocking_with(
+            Instant::now(),
+            || {
+                if marker_app
+                    .state::<ValidationStore>()
+                    .mark_clean_exit()
+                    .is_ok()
+                {
+                    CleanResult::Succeeded
+                } else {
+                    CleanResult::Failed
+                }
+            },
+            move || terminal_index.enter_terminal(),
+        );
     }
 
     pub(crate) fn should_prevent_exit(&self) -> bool {
@@ -1460,6 +1555,8 @@ unsafe extern "system" fn session_subclass_proc(
                 .run_system_end(&app);
         },
         || {
+            app.state::<Arc<FileIndex>>()
+                .clear_main_window_hwnd(hwnd.0 as isize);
             let _ = unsafe {
                 remove_subclass_context_with::<AppHandle, _>(context, || {
                     RemoveWindowSubclass(hwnd, Some(session_subclass_proc), SESSION_SUBCLASS_ID)
@@ -1634,11 +1731,14 @@ mod tests {
         let system_marker_calls = Arc::clone(&marker_calls);
         let (decision_sender, decision_receiver) = std::sync::mpsc::sync_channel(1);
         let system = thread::spawn(move || {
-            let decision =
-                system_coordinator.run_system_end_nonblocking_with(Instant::now(), || {
+            let decision = system_coordinator.run_system_end_nonblocking_with(
+                Instant::now(),
+                || {
                     system_marker_calls.fetch_add(1, Ordering::Relaxed);
                     CleanResult::Succeeded
-                });
+                },
+                || {},
+            );
             decision_sender.send(decision).unwrap();
         });
 
@@ -1744,6 +1844,7 @@ mod tests {
             .and_then(|tail| tail.split("pub(crate) fn install_session_end_hook").next())
             .expect("session callback source markers are missing");
         assert!(session_callback.contains("run_system_end(&app)"));
+        assert!(session_callback.contains("clear_main_window_hwnd(hwnd.0 as isize)"));
         assert!(!session_callback.contains("uninstall_hook_for_exit"));
         assert!(!session_callback.contains("wait_for_clean_change"));
     }
@@ -3400,10 +3501,14 @@ mod tests {
                 },
                 || {
                     assert_eq!(
-                        coordinator.run_system_end_nonblocking_with(deadline, || {
-                            marker_calls.set(marker_calls.get() + 1);
-                            CleanResult::Succeeded
-                        }),
+                        coordinator.run_system_end_nonblocking_with(
+                            deadline,
+                            || {
+                                marker_calls.set(marker_calls.get() + 1);
+                                CleanResult::Succeeded
+                            },
+                            || {}
+                        ),
                         CleanDecision::ObserveOnly
                     );
                 },
@@ -3423,10 +3528,14 @@ mod tests {
         ));
 
         assert_eq!(
-            coordinator.run_system_end_nonblocking_with(deadline, || {
-                marker_calls.set(marker_calls.get() + 1);
-                CleanResult::Succeeded
-            }),
+            coordinator.run_system_end_nonblocking_with(
+                deadline,
+                || {
+                    marker_calls.set(marker_calls.get() + 1);
+                    CleanResult::Succeeded
+                },
+                || {}
+            ),
             CleanDecision::ObserveOnly
         );
         assert_eq!(marker_calls.get(), 1);
@@ -3458,10 +3567,14 @@ mod tests {
             drop(reservation);
             let system_marker_calls = Cell::new(0);
             assert_eq!(
-                coordinator.run_system_end_nonblocking_with(deadline, || {
-                    system_marker_calls.set(system_marker_calls.get() + 1);
-                    CleanResult::Succeeded
-                }),
+                coordinator.run_system_end_nonblocking_with(
+                    deadline,
+                    || {
+                        system_marker_calls.set(system_marker_calls.get() + 1);
+                        CleanResult::Succeeded
+                    },
+                    || {}
+                ),
                 CleanDecision::ObserveOnly
             );
             assert_eq!(system_marker_calls.get(), 1);
@@ -4072,5 +4185,31 @@ mod tests {
             Some(DoubleTapModifier::Alt)
         );
         assert!(HotkeyKind::parse(DOUBLE_CTRL).is_ok());
+    }
+
+    #[test]
+    fn file_index_phase_mirror() {
+        let coordinator = coordinator_for_test();
+        assert_eq!(coordinator.file_index_phase(), FileIndexPhase::Running);
+        assert_eq!(coordinator.file_index_attempt_epoch(), 0);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_ne!(
+            coordinator.begin_tray_clean(deadline),
+            CleanDecision::ObserveOnly
+        );
+        assert_eq!(coordinator.file_index_phase(), FileIndexPhase::Cleaning);
+        assert_eq!(coordinator.file_index_attempt_epoch(), 1);
+
+        assert_eq!(
+            coordinator.complete_clean(CleanResult::Failed),
+            CleanDecision::ReturnRunning
+        );
+        assert_eq!(coordinator.file_index_phase(), FileIndexPhase::Running);
+        assert_eq!(coordinator.file_index_attempt_epoch(), 1);
+
+        let _ = coordinator.begin_system_end_nonblocking(Instant::now());
+        assert_eq!(coordinator.file_index_phase(), FileIndexPhase::Terminal);
+        assert_eq!(coordinator.file_index_attempt_epoch(), 1);
     }
 }
