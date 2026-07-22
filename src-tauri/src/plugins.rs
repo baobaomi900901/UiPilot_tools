@@ -26,20 +26,39 @@ const PLUGIN_BRIDGE: &str = r#"
 (() => {
   let handler = null;
   let pending = [];
+  let activeRequest = null;
+  let listening = false;
   const internals = window.__TAURI_INTERNALS__;
-  const deliver = (query) => handler ? handler(query) : pending.push(query);
+  const deliver = (request) => handler ? run(request) : pending.push(request);
+  const run = (request) => {
+    activeRequest = request;
+    handler(request.input);
+  };
+  const ready = () => {
+    if (handler && listening) document.title = 'uipilot-plugin-ready';
+  };
   const api = Object.freeze({
     onQuery(next) {
       if (typeof next !== 'function') throw new TypeError('handler required');
       handler = next;
-      for (const query of pending.splice(0)) handler(query);
-      document.title = 'uipilot-plugin-ready';
+      for (const request of pending.splice(0)) run(request);
+      ready();
     },
     publishResults(response) {
-      return internals.invoke('publish_plugin_results', { response });
+      if (!activeRequest) return Promise.reject(new Error('no active request'));
+      return internals.invoke('publish_plugin_results', {
+        response: {
+          protocolVersion: 1,
+          requestId: activeRequest.requestId,
+          items: response.items,
+        },
+      });
     }
   });
-  internals.event.listen('uipilot-plugin-query', (event) => deliver(event.payload));
+  internals.event.listen('uipilot-plugin-query', (event) => deliver(event.payload)).then(() => {
+    listening = true;
+    ready();
+  });
   Object.defineProperty(window, 'uipilot', { value: api, configurable: false, writable: false });
   Object.freeze(window.uipilot);
 })();
@@ -985,6 +1004,9 @@ mod tests {
             assert!(body.contains("window.uipilot"));
             assert!(body.contains("onQuery"));
             assert!(body.contains("publishResults"));
+            assert!(body.contains("handler(request.input)"));
+            assert!(body.contains("requestId: activeRequest.requestId"));
+            assert!(body.contains("protocolVersion: 1"));
             assert!(body.contains("uipilot-plugin-ready"));
             assert!(!body.contains("<h1>two</h1>"));
 
