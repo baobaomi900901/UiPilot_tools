@@ -441,32 +441,30 @@ impl PluginManager {
     }
 
     pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
-        let Ok(_admission) = self.admission.read() else {
-            return response(403, Vec::new(), None);
+        let entry = {
+            let Ok(_admission) = self.admission.read() else {
+                return response(403, Vec::new(), None);
+            };
+            self.state.get().and_then(|state| {
+                let state = state.read().ok()?;
+                state
+                    .active
+                    .entries
+                    .iter()
+                    .find(|entry| entry.window_label == label)
+                    .or_else(|| {
+                        state
+                            .staged_assets
+                            .values()
+                            .find(|entry| entry.window_label == label)
+                    })
+                    .cloned()
+            })
         };
-        self.state
-            .get()
-            .and_then(|state| state.read().ok())
-            .map_or_else(
-                || response(403, Vec::new(), None),
-                |state| {
-                    state
-                        .active
-                        .entries
-                        .iter()
-                        .find(|entry| entry.window_label == label)
-                        .or_else(|| {
-                            state
-                                .staged_assets
-                                .values()
-                                .find(|entry| entry.window_label == label)
-                        })
-                        .map_or_else(
-                            || response(403, Vec::new(), None),
-                            |entry| asset_response(entry, request_path),
-                        )
-                },
-            )
+        entry.map_or_else(
+            || response(403, Vec::new(), None),
+            |entry| asset_response(&entry, request_path),
+        )
     }
 
     pub(crate) fn create_runtimes(
@@ -814,22 +812,35 @@ impl PluginManager {
                     .admission
                     .write()
                     .map_err(|_| PluginManagementError::Unavailable)?;
-                let mut state = self
+                let state = self
                     .state
                     .get()
                     .ok_or(PluginManagementError::Unavailable)?
-                    .write()
+                    .read()
                     .map_err(|_| PluginManagementError::Unavailable)?;
-                let active_index = state.active.entries.iter().position(|entry| {
+                let current_entry = state.active.entries.iter().any(|entry| {
                     entry.id == plugin_id
                         && entry.identity() == identity
                         && entry.package_identity == current_identity
                 });
-                let Some(active_index) = active_index else {
+                if !current_entry {
                     return Err(PluginManagementError::Unavailable);
-                };
+                }
+                drop(state);
                 move_directory_handle(&package_handle, &quarantine_path)
                     .map_err(|_| PluginManagementError::Unavailable)?;
+                let mut state = self
+                    .state
+                    .get()
+                    .expect("plugin state disappeared during delete")
+                    .write()
+                    .expect("plugin state poisoned during delete");
+                let active_index = state
+                    .active
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == plugin_id && entry.identity() == identity)
+                    .expect("active plugin changed while delete held admission");
                 state.active.entries.remove(active_index);
                 state.ownership.remove(&identity);
                 state.latest_generations.remove(plugin_id);
