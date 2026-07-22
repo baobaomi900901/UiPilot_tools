@@ -109,9 +109,9 @@ PluginView {
 
 插件变更由一个管理器内的 mutation lock 串行化。MVP 同一时刻只执行一次重载或删除，避免两个操作同时修改目录、admission、ready 状态和 WebView。
 
-管理器同时维护仅在重载期间存在的 staged runtime 映射。自定义协议可以为活动运行时和 staged runtime 提供资产，但查询路由只指向活动目录。
+管理器同时维护仅在重载期间存在的 staged asset 映射和 staged ownership 映射。两张映射使用同一个 runtime identity（`plugin_id + label + generation`）并在同一个 manager 临界区创建、晋升或移除。每个 identity 唯一拥有自己的 generation data directory，该目录随 ownership 一起从 staged 晋升为 active。自定义协议可以为活动 runtime 和 staged runtime 提供资产，但查询路由只指向活动目录。
 
-管理器另有一个 plugin admission gate。查询发布、插件剪贴板副作用和不改变活动 generation 的 runtime ownership callback 取得 read admission；重载切换、删除提交和活动 runtime 失败转换取得 write admission。mutation lock 只负责串行化管理命令，不能代替 admission gate。
+管理器另有一个 plugin admission gate。查询发布、插件剪贴板副作用和 ready callback 取得 read admission；重载切换、回滚、删除提交及 process-failed/意外 close callback 取得 write admission。mutation lock 只负责串行化管理命令，不能代替 admission gate。
 
 ## 事务式重新加载
 
@@ -120,14 +120,15 @@ PluginView {
 1. 通过活动插件 ID 定位原目录；校验该目录仍是插件根下的普通直接子目录。
 2. 从磁盘重新读取 manifest、运行时入口和 README。
 3. 要求新 manifest ID 与原 ID 一致，并验证版本、host 版本、权限、触发词及与其他活动插件的冲突。
-4. 为候选插件分配新的 generation 和临时 label，注册 staged asset/ownership 映射并创建不可见、不可聚焦的临时 WebView。
-5. 等待带有该 label+generation ownership 的候选运行时通过现有 title 协议上报 ready。此期间旧插件继续处理查询。
-6. 候选成功后取得 write admission；在 admission 内取消旧 generation pending query，把活动目录切换到候选 entry并清理该插件旧 generation 的 timeout/disabled/ready 状态，然后释放全部 manager 细粒度状态锁。
-7. 在仍持有 write admission、但不持有 manager 状态锁时调用 `ResultRegistry::invalidate_domain(QueryDomain::Plugin)`，使所有旧 Plugin token 失效。active entry 切换和 domain epoch 推进均完成后才释放 admission，对外发布事务提交。
-8. 提交后 best-effort 关闭旧 WebView 并移除 staged 标记，新 generation 成为活动运行时。
-9. 候选完成切换前任一步失败时，关闭临时 WebView 并移除 staged 映射，活动目录和旧 WebView 保持不变。
+4. 为候选插件分配新的 generation 和临时 label，以同一个 runtime identity 注册 staged asset/ownership 映射并创建不可见、不可聚焦的临时 WebView。
+5. 等待该 runtime identity 的 ready callback 把 staged attempt 标记为 `ready=true`。此期间旧插件继续处理查询；ready 只表示可以尝试提交，不提前改变 ownership。
+6. 候选 ready 后取得 write admission；在 admission 和同一个 manager 临界区内最后重验该 identity 仍唯一拥有 staged asset/ownership slot、`ready=true`、`failed=false`，且对应 WebView 仍存在。任一条件不满足都不能晋升。
+7. 最终健康复核通过后，在同一个 manager 临界区把候选 asset entry 和 ownership 从 staged 两张映射原子移出并写入 active entry，同时移除旧 active ownership、取消旧 generation pending query并清理其 timeout/disabled/ready 状态。候选 identity 在任何时刻只属于 staged 或 active 之一，不能双重归属。
+8. 在仍持有 write admission、但不持有 manager 状态锁时调用 `ResultRegistry::invalidate_domain(QueryDomain::Plugin)`，使所有旧 Plugin token 失效。active entry 切换和 domain epoch 推进均完成后才释放 admission，对外发布事务提交。
+9. 提交成功后只关闭旧 active runtime；关闭完成后 best-effort 清理旧 generation data。promoted generation data 属于当前活动 WebView，必须保留到其后续被替换或删除。
+10. 候选完成切换前任一步失败时，取得 write admission 并在同一个 manager 临界区同时移除该 identity 的 staged asset/ownership 映射；释放 admission 后先关闭 staged runtime，再 best-effort 清理 staged generation data。活动目录和旧 active runtime 保持不变。
 
-旧窗口关闭和临时运行时数据目录删除属于提交后的 best-effort 清理。清理失败不改变已经成功的切换结果，也不暴露路径；旧 generation 已无路由和 pending request，不能继续发布结果。
+旧 generation 或回滚 staged generation 的数据清理失败，不改变已经确定的提交或回滚结果，也不暴露路径。任何路径都不得在 promoted runtime 仍活动时清理其 generation data。
 
 ## 物理删除
 
@@ -138,8 +139,8 @@ PluginView {
 3. 后端取得 mutation lock 和 write admission，通过 `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` 打开当前插件目录 entry，不跟随重解析点；校验它仍是普通目录、其 volume/file identity 与活动 entry 一致，并且目标是插件根的直接子 entry。
 4. 使用目录 handle 的 Windows rename primitive，把该 entry 原子移动到隔离目录中的宿主生成唯一名称，不允许覆盖。移动是删除提交点。
 5. 移动失败时返回 `pluginDeleteFailed`；活动 entry、路由、授权、runtime 和原目录均保持不变，不能发生部分递归删除。
-6. 移动成功后，在仍持有 write admission 时取消该 generation pending query并移除活动 entry/路由/授权；释放 manager 状态锁后调用 `invalidate_domain(QueryDomain::Plugin)`，最后释放 admission 并 best-effort 关闭 runtime。
-7. 隔离目录中的包和宿主生成的 runtime data 由宿主 best-effort 递归清理；清理失败仍算删除成功。因为包已在插件根之外，当前进程触发词立即失效且重启不会恢复。
+6. 移动成功后，在仍持有 write admission 时取消该 generation pending query并移除活动 entry/ownership/路由/授权；释放 manager 状态锁后调用 `invalidate_domain(QueryDomain::Plugin)`，最后释放 admission。
+7. 提交后关闭被删除的 active runtime；关闭完成后 best-effort 清理该 generation data，并对隔离目录中的包做 best-effort 递归清理。任一清理失败仍算删除成功。因为包已在插件根之外，当前进程触发词立即失效且重启不会恢复。
 
 删除不使用“先检查路径再 `remove_dir_all`”作为提交协议。文件 identity 与 handle-based rename 把路径替换检查和移动绑定到同一个已打开对象，关闭校验后替换的 TOCTOU 窗口。
 
@@ -183,11 +184,13 @@ Markdown 使用 `react-markdown`，配置明确的 allowed elements；不启用 
 
 ## Runtime callback ownership
 
-- 每个 ready、process-failed 和 close callback 捕获不可变的 `plugin_id + label + generation + slot_kind(active|staged)`。
-- callback 在改变 ready/disabled/pending/catalog 或 ResultRegistry 前必须取得 admission，并确认该精确 tuple 仍拥有对应 active 或 staged slot。staged ready/failure/close 和无 ownership 的旧 callback 使用 read admission；会 disable 活动 generation、取消其 pending 或推进 Plugin domain epoch 的 active process-failed 使用 write admission。
-- staged process-failed 只把自己的 staged attempt 标为失败并唤醒 reload waiter；不能 disable 活动 generation，也不能 invalidate Plugin domain。
-- 旧 active runtime 在切换提交后延迟触发 process-failed/close 时，因为已不拥有 active slot，只能清理自己的 callback/runtime data，不能 disable、取消 pending 或 invalidate 新 generation。
-- staged rollback 后延迟到达的 ready/process-failed/close 同样只能清理自己，不能重新插入 staged slot或影响活动 entry。
+- 每个 ready、process-failed 和 close callback 只捕获不可变 runtime identity：`plugin_id + label + generation`，不捕获 `slot_kind`。
+- callback 取得 admission 后由 manager 动态解析该 identity 当前属于 staged、active 还是无 ownership；所有状态改变前必须在对应临界区再次确认 ownership。
+- ready callback 取得 read admission。identity 当前属于 staged 时只设置该 staged attempt 的 `ready=true` 并唤醒 waiter；属于 active 时 ready 是幂等 no-op；无 ownership 时忽略。
+- process-failed 和意外 close callback 取得 write admission。identity 当前属于 staged 时只设置该 staged attempt 的 `failed=true` 并唤醒 reload waiter；不能 disable 活动 generation，也不能 invalidate Plugin domain。
+- 同一 failure/close callback 在 promotion 之后取得 write admission时，manager 会把该 identity 动态解析为 active，并执行当前 generation 的 active failure 转换：disable、取消 pending、释放 manager 状态锁后推进 Plugin domain epoch并使当前结果失效。
+- 旧 active runtime 被替换后或 staged rollback 后延迟到达的 callback 动态解析为无 ownership，只能结束自己的 callback；不能重新插入 slot、disable、取消 pending 或 invalidate 新 generation。
+- 正常关闭旧 active、回滚 staged 或删除 active 前，manager 已在 write admission 内移除对应 ownership；因此由宿主主动关闭产生的 close callback 解析为无 ownership，不会被误判为活动 runtime 崩溃。
 
 ## 锁顺序与提交边界
 
@@ -204,7 +207,7 @@ mutation lock（仅管理命令）
 - 不同时持有两个 ready/disabled/timeout/pending 状态锁；取得 ResultRegistry 前释放这些细粒度状态锁，但 admission 继续持有。
 - `ResultRegistry::resolve` 在取得 admission 前完成并释放 registry lock，避免 registry -> admission 的反向嵌套。
 - 不在任何 catalog、状态或 ResultRegistry lock 下等待 runtime ready、执行文件 I/O、调用 clipboard 或关闭 WebView；clipboard 只在 admission read guard 下执行。
-- 重载提交点是 write admission 内的 Plugin domain epoch 推进和 active entry 切换；此前失败完整回滚 staged 状态，此后旧窗口/数据清理失败不回滚。
+- 重载提交点是 write admission 内完成最终 staged 健康复核、将 staged asset/ownership 原子移动为 active，并推进 Plugin domain epoch；此前失败同时移除 staged 两张映射并回滚，此后旧窗口/旧 generation data 清理失败不回滚。
 - 删除提交点是 write admission 内成功完成的 handle-based 原子移动；移动前失败零状态和文件副作用，移动后内存移除不得失败，窗口/隔离目录清理失败不回滚。
 
 Plugin domain epoch 或 plugin generation 溢出时 fail closed：旧 token 不能重新变为有效，不执行剪贴板副作用；重载不切换到无法表示的新 generation。
@@ -226,13 +229,19 @@ Rust：
 - 插件清单只暴露批准字段。
 - 非主窗口调用在任何状态和文件副作用前失败。
 - ID 改变、重复触发词、非法 manifest 和运行时未 ready 均回滚并保留旧路由。
+- staged runtime 上报 ready 后、reload 取得 write admission 前发生 process-failed 时，最终健康复核必须拒绝晋升，同时移除 staged asset/ownership 映射并保留旧 active generation。
 - 成功重载只在候选 ready 后切换，并推进 Plugin domain epoch。
+- promotion 临界区内 staged asset/ownership 同时移出并成为唯一 active ownership；任何观察点都不能看到同一 identity 同时属于 staged 和 active。
+- promotion 后新 active runtime 的 process-failed 或意外 close callback 必须被动态解析为 active，disable 当前 generation、取消其 pending 并推进 Plugin domain epoch。
 - 提交前签发的旧 Plugin token 在提交后晚发布时被拒绝且不能重建 result mapping。
 - 旧 `CopyText` action 在 resolve 后发生重载或删除时 generation 校验失败；mutation 与 clipboard read admission 的两种线性化均被覆盖。
 - 删除原子移动失败时文件、目录项、路由和授权零变化；移动成功后路由和授权消失。
 - 隔离目录递归清理失败仍返回删除成功，且下一次启动不会加载该插件。
 - 活动目录被 junction、symlink 或不同 file identity 的普通目录替换时移动被拒绝；伪造插件 ID 不能越过插件根。
 - staged rollback 后和 active 切换后的延迟 ready/process-failed/close callback 不能影响新活动 generation。
+- reload 成功只在旧 runtime 关闭后尝试清理旧 generation data，promoted generation data 保持存在且可继续服务资产。
+- reload 回滚先移除 staged 映射并关闭 staged runtime，再尝试清理 staged generation data；清理失败不改变回滚结果。
+- delete 成功先移除 active ownership并关闭被删 runtime，再尝试清理被删 generation data；清理失败不改变删除结果。
 - Research ID、验证模块和三个旧 command 不再出现在生产 wiring。
 
 前端：
