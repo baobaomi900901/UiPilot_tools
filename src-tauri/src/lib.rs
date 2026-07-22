@@ -945,6 +945,8 @@ mod lib {
             let capability = include_str!("../capabilities/main.json");
             assert!(capability.contains("\"allow-search-files\""));
             assert!(capability.contains("\"allow-execute-result\""));
+            assert!(capability.contains("\"core:window:allow-start-dragging\""));
+            assert!(!capability.contains("\"core:window:default\""));
             let probe_load_settings = ["security_probe", "::", "load_settings"].concat();
             assert_eq!(source.matches(&probe_load_settings).count(), 3);
             let probe_search_files = ["security_probe", "::", "search_files"].concat();

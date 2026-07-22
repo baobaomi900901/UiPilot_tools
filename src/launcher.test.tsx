@@ -1249,6 +1249,40 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('marks blank surfaces but not controls or result rows as native drag regions', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'drag-regions',
+      items: [{ resultId: 'drag-result', title: 'Drag Result' }],
+    })
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('drag-regions')))
+    await act(async () =>
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'drag', inputType: 'insertText' }),
+    )
+    await vi.waitFor(() => expect(mounted.host.querySelector('.result-row')).toBeInstanceOf(HTMLElement))
+
+    for (const selector of ['.launcher-surface', '.launcher-view', '.result-list', '.status-region']) {
+      expect(mounted.host.querySelector(selector)?.getAttribute('data-tauri-drag-region')).toBe('true')
+    }
+    for (const selector of ['input', '.result-row']) {
+      expect(mounted.host.querySelector(selector)?.hasAttribute('data-tauri-drag-region')).toBe(false)
+    }
+
+    await act(async () => emit(shown('drag-settings', 'settings')))
+    await vi.waitFor(() => expect(mounted.host.querySelector('.settings-form')).toBeInstanceOf(HTMLElement))
+    for (const selector of ['.settings-view', '.settings-header', '.settings-form']) {
+      expect(mounted.host.querySelector(selector)?.getAttribute('data-tauri-drag-region')).toBe('true')
+    }
+    for (const selector of ['input', 'button']) {
+      expect(mounted.host.querySelector(selector)?.hasAttribute('data-tauri-drag-region')).toBe(false)
+    }
+
+    await mounted.unmount()
+  })
+
   it('keeps launcher chrome separated and gives scrolling only to results', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
