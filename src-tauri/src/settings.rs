@@ -14,6 +14,13 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowPosition {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
@@ -24,6 +31,8 @@ pub(crate) struct Settings {
     pub(crate) research_id: Option<String>,
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) window_position: Option<WindowPosition>,
 }
 
 pub(crate) struct SettingsUpdate {
@@ -59,6 +68,7 @@ impl Default for Settings {
             file_preview_enabled: default_file_preview_enabled(),
             research_id: None,
             use_counts: BTreeMap::new(),
+            window_position: None,
         }
     }
 }
@@ -186,6 +196,24 @@ impl SettingsStore {
         let mut candidate = state.value.clone();
         candidate.file_preview_enabled = enabled;
         self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_window_position(
+        &self,
+        position: WindowPosition,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.window_position = Some(position);
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn window_position(&self) -> Option<WindowPosition> {
+        self.state
+            .lock()
+            .expect("settings lock poisoned")
+            .value
+            .window_position
     }
 
     pub(crate) fn research_id(&self) -> Option<String> {
@@ -547,6 +575,32 @@ mod tests {
     }
 
     #[test]
+    fn window_position_defaults_and_updates_only_that_field() {
+        let dir = TestDir::new("window-position");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Ctrl+Space","autostart":true,"filePreviewEnabled":false,"researchId":"study_01","useCounts":{}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let before = store.snapshot();
+
+        assert_eq!(store.window_position(), None);
+        let position = WindowPosition { x: -1280, y: 48 };
+        store.set_window_position(position).unwrap();
+
+        assert_eq!(store.window_position(), Some(position));
+        assert_eq!(
+            store.snapshot(),
+            Settings {
+                window_position: Some(position),
+                ..before
+            }
+        );
+        assert_eq!(read_current(&dir), store.snapshot());
+    }
+
+    #[test]
     fn preflight_and_final_validation_reject_the_same_invalid_updates() {
         let dir = TestDir::new("preflight-final-validation");
         let persisted = Settings {
@@ -771,6 +825,7 @@ mod tests {
             research_id: Some("study_01".into()),
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
+            window_position: None,
         };
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();

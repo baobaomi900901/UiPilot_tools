@@ -1268,6 +1268,7 @@ mod tests {
             file_preview_enabled: true,
             research_id: research_id.map(str::to_owned),
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
+            window_position: None,
         };
         fs::write(
             dir.path().join("settings.json"),
