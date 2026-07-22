@@ -1,20 +1,24 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalRect, PhysicalSize, WebviewWindow,
+};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
-        WindowsAndMessaging::{WM_ENDSESSION, WM_NCDESTROY, WM_QUERYENDSESSION},
+        WindowsAndMessaging::{
+            WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_QUERYENDSESSION,
+        },
     },
 };
 
@@ -24,7 +28,7 @@ use crate::{
     hotkey::{DoubleTapModifier, HotkeyKind},
     hotkey_hook::HotkeyHook,
     result_registry::ResultRegistry,
-    settings::{Settings, SettingsStore, SettingsUpdate},
+    settings::{Settings, SettingsStore, SettingsUpdate, WindowPosition},
     validation_data::{ValidationEvent, ValidationStore},
 };
 
@@ -490,6 +494,7 @@ pub(crate) struct LifecycleCoordinator {
     next_invocation: AtomicU64,
     lifecycle_phase: AtomicU8,
     lifecycle_attempt_epoch: AtomicU64,
+    window_move_active: AtomicBool,
     readiness: Mutex<Readiness>,
     modal: Mutex<ModalState>,
     exit_gate: Mutex<ExitGate>,
@@ -505,6 +510,7 @@ impl Default for LifecycleCoordinator {
             next_invocation: AtomicU64::new(0),
             lifecycle_phase: AtomicU8::new(FileIndexPhase::Running as u8),
             lifecycle_attempt_epoch: AtomicU64::new(0),
+            window_move_active: AtomicBool::new(false),
             readiness: Mutex::new(Readiness::default()),
             modal: Mutex::new(ModalState::Normal),
             exit_gate: Mutex::new(ExitGate::default()),
@@ -561,8 +567,66 @@ impl Drop for ModalGuard {
     }
 }
 
+fn position_fits_work_area(
+    position: WindowPosition,
+    window_size: PhysicalSize<u32>,
+    work_area: PhysicalRect<i32, u32>,
+) -> bool {
+    let left = i64::from(position.x);
+    let top = i64::from(position.y);
+    let right = left + i64::from(window_size.width);
+    let bottom = top + i64::from(window_size.height);
+    let area_left = i64::from(work_area.position.x);
+    let area_top = i64::from(work_area.position.y);
+    let area_right = area_left + i64::from(work_area.size.width);
+    let area_bottom = area_top + i64::from(work_area.size.height);
+    left >= area_left && top >= area_top && right <= area_right && bottom <= area_bottom
+}
+
+fn centered_position(
+    window_size: PhysicalSize<u32>,
+    work_area: PhysicalRect<i32, u32>,
+) -> Option<WindowPosition> {
+    let x_offset = work_area.size.width.checked_sub(window_size.width)? / 2;
+    let y_offset = work_area.size.height.checked_sub(window_size.height)? / 2;
+    Some(WindowPosition {
+        x: i32::try_from(i64::from(work_area.position.x) + i64::from(x_offset)).ok()?,
+        y: i32::try_from(i64::from(work_area.position.y) + i64::from(y_offset)).ok()?,
+    })
+}
+
+fn place_main_window(window: &WebviewWindow, saved: Option<WindowPosition>) -> Result<(), ()> {
+    let window_size = match window.outer_size() {
+        Ok(size) => size,
+        Err(_) => return window.center().map_err(|_| ()),
+    };
+    if let Some(saved) = saved {
+        if window.available_monitors().is_ok_and(|monitors| {
+            monitors
+                .iter()
+                .any(|monitor| position_fits_work_area(saved, window_size, *monitor.work_area()))
+        }) && window
+            .set_position(PhysicalPosition::new(saved.x, saved.y))
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    if let Ok(Some(primary)) = window.primary_monitor() {
+        if let Some(position) = centered_position(window_size, *primary.work_area()) {
+            if window
+                .set_position(PhysicalPosition::new(position.x, position.y))
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+    window.center().map_err(|_| ())
+}
+
 struct ShowMainClosures<'a> {
-    center: &'a mut dyn FnMut() -> Result<(), ()>,
+    place_window: &'a mut dyn FnMut() -> Result<(), ()>,
     always_on_top: &'a mut dyn FnMut() -> Result<(), ()>,
     show: &'a mut dyn FnMut() -> Result<(), ()>,
     focus: &'a mut dyn FnMut() -> Result<(), ()>,
@@ -1004,6 +1068,9 @@ impl LifecycleCoordinator {
         Q: FnOnce() -> Result<bool, ()>,
         H: FnMut() -> Result<(), ()>,
     {
+        if !focused && self.window_move_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let decision = self
             .modal
             .lock()
@@ -1033,6 +1100,14 @@ impl LifecycleCoordinator {
             .on_successful_show();
     }
 
+    fn observe_window_move_message(&self, message: u32) {
+        match message {
+            WM_ENTERSIZEMOVE => self.window_move_active.store(true, Ordering::Release),
+            WM_EXITSIZEMOVE => self.window_move_active.store(false, Ordering::Release),
+            _ => {}
+        }
+    }
+
     fn show_main(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1052,7 +1127,8 @@ impl LifecycleCoordinator {
             return Ok(ShowOutcome::Ignored);
         };
 
-        let mut center = || window.center().map_err(|_| ());
+        let saved_position = app.state::<SettingsStore>().window_position();
+        let mut place_window = || place_main_window(&window, saved_position);
         let mut always_on_top = || window.set_always_on_top(true).map_err(|_| ());
         let mut show = || window.show().map_err(|_| ());
         let mut focus = || window.set_focus().map_err(|_| ());
@@ -1077,7 +1153,7 @@ impl LifecycleCoordinator {
             }));
         };
         let mut operations = ShowMainClosures {
-            center: &mut center,
+            place_window: &mut place_window,
             always_on_top: &mut always_on_top,
             show: &mut show,
             focus: &mut focus,
@@ -1117,7 +1193,7 @@ impl LifecycleCoordinator {
             .map_err(|_| LifecycleError::InvocationExhausted)?;
         let invocation_id = format!("invocation-{}", previous + 1);
 
-        let _ = (operations.center)();
+        let _ = (operations.place_window)();
         for operation in [
             &mut operations.always_on_top,
             &mut operations.show,
@@ -1581,6 +1657,11 @@ unsafe extern "system" fn session_subclass_proc(
     context: usize,
 ) -> LRESULT {
     let app = unsafe { (&*(context as *const AppHandle)).clone() };
+    app.state::<Arc<LifecycleCoordinator>>()
+        .observe_window_move_message(message);
+    if message == WM_EXITSIZEMOVE {
+        let _ = save_window_position(&app);
+    }
     LRESULT(handle_session_message_with(
         message,
         wparam.0,
@@ -1600,6 +1681,20 @@ unsafe extern "system" fn session_subclass_proc(
             };
         },
     ))
+}
+
+fn save_window_position(app: &AppHandle) -> Result<(), ()> {
+    let position = app
+        .get_webview_window("main")
+        .ok_or(())?
+        .outer_position()
+        .map_err(|_| ())?;
+    app.state::<SettingsStore>()
+        .set_window_position(WindowPosition {
+            x: position.x,
+            y: position.y,
+        })
+        .map_err(|_| ())
 }
 
 pub(crate) fn install_session_end_hook(
@@ -2077,10 +2172,56 @@ mod tests {
         drop(after_panic);
     }
 
+    #[test]
+    fn saved_window_position_must_fit_one_complete_work_area() {
+        let size = tauri::PhysicalSize::new(720, 420);
+        let left = tauri::PhysicalRect {
+            position: tauri::PhysicalPosition::new(-1920, 0),
+            size: tauri::PhysicalSize::new(1920, 1040),
+        };
+
+        assert!(position_fits_work_area(
+            crate::settings::WindowPosition { x: -1920, y: 0 },
+            size,
+            left,
+        ));
+        assert!(position_fits_work_area(
+            crate::settings::WindowPosition { x: -720, y: 620 },
+            size,
+            left,
+        ));
+        assert!(!position_fits_work_area(
+            crate::settings::WindowPosition { x: -719, y: 620 },
+            size,
+            left,
+        ));
+        assert!(!position_fits_work_area(
+            crate::settings::WindowPosition { x: -1920, y: 621 },
+            size,
+            left,
+        ));
+    }
+
+    #[test]
+    fn invalid_position_falls_back_to_primary_work_area_center() {
+        let primary = tauri::PhysicalRect {
+            position: tauri::PhysicalPosition::new(100, 40),
+            size: tauri::PhysicalSize::new(1920, 1040),
+        };
+        assert_eq!(
+            centered_position(tauri::PhysicalSize::new(720, 420), primary),
+            Some(crate::settings::WindowPosition { x: 700, y: 350 })
+        );
+        assert_eq!(
+            centered_position(tauri::PhysicalSize::new(2000, 420), primary),
+            None
+        );
+    }
+
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum ShowFailure {
         None,
-        Center,
+        Placement,
         AlwaysOnTop,
         Show,
         Focus,
@@ -2104,10 +2245,10 @@ mod tests {
         failure: ShowFailure,
         probe: &ShowProbe,
     ) -> Result<ShowOutcome, LifecycleError> {
-        let mut center = || {
+        let mut place_window = || {
             probe.trace.borrow_mut().push(format!("invocation-{index}"));
-            probe.trace.borrow_mut().push(format!("center-{index}"));
-            (failure != ShowFailure::Center).then_some(()).ok_or(())
+            probe.trace.borrow_mut().push(format!("place-{index}"));
+            (failure != ShowFailure::Placement).then_some(()).ok_or(())
         };
         let mut always_on_top = || {
             probe
@@ -2156,7 +2297,7 @@ mod tests {
             }
         };
         let mut operations = ShowMainClosures {
-            center: &mut center,
+            place_window: &mut place_window,
             always_on_top: &mut always_on_top,
             show: &mut show,
             focus: &mut focus,
@@ -2202,7 +2343,7 @@ mod tests {
             [
                 "dispatch-1",
                 "invocation-1",
-                "center-1",
+                "place-1",
                 "always-on-top-1",
                 "show-1",
                 "focus-1",
@@ -2211,7 +2352,7 @@ mod tests {
                 "reserve-launcher-record-1",
                 "dispatch-2",
                 "invocation-2",
-                "center-2",
+                "place-2",
                 "always-on-top-2",
                 "show-2",
                 "focus-2",
@@ -2251,7 +2392,7 @@ mod tests {
     }
 
     #[test]
-    fn show_window_and_emit_failures_clear_once_while_center_continues() {
+    fn show_window_and_emit_failures_clear_once_while_placement_continues() {
         for failure in [
             ShowFailure::AlwaysOnTop,
             ShowFailure::Show,
@@ -2276,7 +2417,7 @@ mod tests {
                 &coordinator,
                 ShowTarget::Launcher,
                 1,
-                ShowFailure::Center,
+                ShowFailure::Placement,
                 &probe,
             ),
             Ok(ShowOutcome::Shown)
@@ -2290,7 +2431,7 @@ mod tests {
             .begin_query(QueryDomain::Application, "old", 1)
             .is_some());
         let hides = Cell::new(0);
-        let mut center = || Ok(());
+        let mut place_window = || Ok(());
         let mut always_on_top = || Ok(());
         let mut show = || Ok(());
         let mut focus = || Err(());
@@ -2302,7 +2443,7 @@ mod tests {
         };
         let mut record_launcher = |_: CriticalReservation| {};
         let mut operations = ShowMainClosures {
-            center: &mut center,
+            place_window: &mut place_window,
             always_on_top: &mut always_on_top,
             show: &mut show,
             focus: &mut focus,
@@ -3305,6 +3446,35 @@ mod tests {
     }
 
     #[test]
+    fn native_window_move_suppresses_only_its_focus_loss() {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE};
+
+        let coordinator = coordinator_for_test();
+        coordinator.observe_window_move_message(WM_ENTERSIZEMOVE);
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("native move focus loss must not query"),
+                || panic!("native move focus loss must not hide"),
+            )
+            .unwrap();
+
+        coordinator.observe_window_move_message(WM_EXITSIZEMOVE);
+        let hides = Cell::new(0);
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("normal focus loss must not query"),
+                || {
+                    hides.set(hides.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(hides.get(), 1);
+    }
+
+    #[test]
     fn production_callbacks_focus_awaiting_resolves_every_query_result() {
         for (focus_result, expected, expected_clears) in [
             (Ok(true), Ok(()), 0),
@@ -3762,6 +3932,13 @@ mod tests {
             assert!(production.contains(generated_api));
         }
         assert!(production.contains("install_subclass_context_with(app.clone()"));
+        assert!(production.contains("observe_window_move_message(message)"));
+        let session_callback = production
+            .split("unsafe extern \"system\" fn session_subclass_proc")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn install_session_end_hook").next())
+            .expect("session callback source markers are missing");
+        assert!(session_callback.contains("save_window_position"));
         assert!(!production.contains("windows_link::link!"));
         assert!(!production.contains("#[link("));
         assert!(!production.contains("struct SessionHookContext"));

@@ -1249,6 +1249,17 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('uses native app regions without invoking Tauri mouse capture', () => {
+    expect(launcherViewSource).not.toContain('data-tauri-drag-region')
+    expect(stylesSource).toMatch(
+      /\.launcher-surface,[\s\S]*\.status-region\s*\{[^}]*app-region:\s*drag;/,
+    )
+    expect(stylesSource).toMatch(
+      /button,[\s\S]*\.settings-form\s*\{[^}]*app-region:\s*no-drag;/,
+    )
+    expect(stylesSource).toMatch(/\.result-list:empty\s*\{[^}]*app-region:\s*drag;/)
+  })
+
   it('keeps launcher chrome separated and gives scrolling only to results', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
