@@ -36,6 +36,7 @@ export type ExecuteOutcome =
   | { status: 'launchRequested' }
   | { status: 'activationRequested' }
   | { status: 'activationRefusedLaunchRequested'; message: string }
+  | { status: 'textCopied' }
 
 export type ExportOutcome = { status: 'cancelled' } | { status: 'exported' }
 
@@ -55,6 +56,8 @@ export type CommandErrorCode =
   | 'invalidFileQuery'
   | 'fileSearchWorkerFailed'
   | 'searchUnavailable'
+  | 'clipboardWriteFailed'
+  | 'pluginPermissionDenied'
   | 'fileNotFound'
   | 'fileOpenFailed'
 

@@ -18,6 +18,7 @@ try {
   Copy-Item "$repoRoot/src-tauri/tauri.conf.json" "$fixtureRoot/src-tauri/tauri.conf.json"
   Copy-Item "$repoRoot/src-tauri/tauri.security-probe.conf.json" "$fixtureRoot/src-tauri/tauri.security-probe.conf.json"
   Copy-Item "$repoRoot/src-tauri/capabilities/main.json" "$fixtureRoot/src-tauri/capabilities/main.json"
+  Copy-Item "$repoRoot/src-tauri/capabilities/plugin-runtime.json" "$fixtureRoot/src-tauri/capabilities/plugin-runtime.json"
 
   $baseline = Invoke-FixtureCheck
   if ($baseline.ExitCode -ne 0) {
@@ -86,6 +87,7 @@ permissions = ["core:default"]
   }
 
   Copy-Item "$repoRoot/src-tauri/capabilities/main.json" $capabilityPath -Force
+  Copy-Item "$repoRoot/src-tauri/capabilities/plugin-runtime.json" "$fixtureRoot/src-tauri/capabilities/plugin-runtime.json" -Force
   $config = Get-Content $configPath -Raw | ConvertFrom-Json
   $inlineCapability = [pscustomobject]@{
     identifier = 'inline-extra'

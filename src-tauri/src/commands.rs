@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::{
     apps::{self, AppCache, Application},
@@ -12,6 +13,7 @@ use crate::{
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
+    plugins::{PluginManager, PluginQueryError},
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
@@ -70,6 +72,7 @@ pub(crate) enum ExecuteOutcome {
     LaunchRequested,
     ActivationRequested,
     ActivationRefusedLaunchRequested { message: &'static str },
+    TextCopied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -184,6 +187,27 @@ impl CommandError {
             message: "file search is unavailable",
         }
     }
+
+    fn plugin_query_failed() -> Self {
+        Self {
+            code: "pluginQueryFailed",
+            message: "plugin query failed",
+        }
+    }
+
+    fn clipboard_write_failed() -> Self {
+        Self {
+            code: "clipboardWriteFailed",
+            message: "clipboard write failed",
+        }
+    }
+
+    fn plugin_permission_denied() -> Self {
+        Self {
+            code: "pluginPermissionDenied",
+            message: "plugin permission denied",
+        }
+    }
 }
 
 impl From<SettingsError> for CommandError {
@@ -209,16 +233,44 @@ fn require_main_window(window: &WebviewWindow) -> Result<(), CommandError> {
 }
 
 #[tauri::command]
-pub(crate) fn search_apps(
+pub(crate) async fn search_apps(
     window: WebviewWindow,
-    registry: State<'_, ResultRegistry>,
-    cache: State<'_, Arc<AppCache>>,
-    settings: State<'_, SettingsStore>,
     query: String,
     invocation_id: String,
     query_sequence: u64,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
+    let app = window.app_handle();
+    let registry = app.state::<ResultRegistry>();
+    let cache = app.state::<Arc<AppCache>>();
+    let settings = app.state::<SettingsStore>();
+    let plugins = app.state::<Arc<PluginManager>>();
+    if let Some(route) = plugins.route(&query) {
+        let Some(token) = registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
+        else {
+            return Ok(None);
+        };
+        let entries = match plugins.query(window.app_handle(), route).await {
+            Ok(entries) => entries,
+            Err(PluginQueryError::Timeout) => Vec::new(),
+            Err(_) => return Err(CommandError::plugin_query_failed()),
+        };
+        return Ok(registry.publish_if_latest(
+            token,
+            entries,
+            || true,
+            |request_id, items| SearchResponse {
+                request_id,
+                items: items
+                    .into_iter()
+                    .map(|(result_id, mut item)| {
+                        item.result_id = result_id;
+                        item
+                    })
+                    .collect(),
+            },
+        ));
+    }
     Ok(search_apps_with(
         &registry,
         &query,
@@ -227,6 +279,27 @@ pub(crate) fn search_apps(
         || cache.snapshot(),
         |applications| settings.decorate_applications(applications),
     ))
+}
+
+#[tauri::command]
+pub(crate) fn publish_plugin_results(
+    window: WebviewWindow,
+    plugins: State<'_, Arc<PluginManager>>,
+    response: serde_json::Value,
+) -> Result<(), CommandError> {
+    publish_plugin_results_with_label(window.label(), || {
+        plugins.publish_response(window.label(), response)
+    })
+}
+
+fn publish_plugin_results_with_label<P>(label: &str, publish: P) -> Result<(), CommandError>
+where
+    P: FnOnce() -> Result<(), PluginQueryError>,
+{
+    if !label.starts_with("plugin-") {
+        return Err(CommandError::invalid_caller());
+    }
+    publish().map_err(|_| CommandError::plugin_query_failed())
 }
 
 fn search_apps_with<S, D>(
@@ -617,21 +690,82 @@ fn save_settings_core(
 #[tauri::command]
 pub(crate) fn execute_result(
     window: WebviewWindow,
-    registry: State<'_, ResultRegistry>,
-    validation: State<'_, ValidationStore>,
-    settings: State<'_, SettingsStore>,
-    cache: State<'_, Arc<AppCache>>,
     request_id: String,
     result_id: String,
 ) -> Result<ExecuteOutcome, CommandError> {
     require_main_window(&window)?;
-    execute_result_with(
+    let app = window.app_handle().clone();
+    let registry = app.state::<ResultRegistry>();
+    let plugins = app.state::<Arc<PluginManager>>();
+    let validation = app.state::<ValidationStore>();
+    let settings = app.state::<SettingsStore>();
+    let cache = app.state::<Arc<AppCache>>();
+    execute_result_with_clipboard(
         (&request_id, &result_id),
-        |request_id, result_id| registry.resolve(request_id, result_id),
-        |action| apps::execute_application(action).map_err(|_| ()),
-        || clear_and_hide(&registry, &window),
-        |event| validation.record(event).map_err(|_| ()),
-        |app_id| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
+        ClipboardExecution {
+            resolve: |request_id: &str, result_id: &str| registry.resolve(request_id, result_id),
+            execute: |action: &ResultAction| apps::execute_application(action).map_err(|_| ()),
+            authorize_plugin: |plugin_id: &str| plugins.authorizes_clipboard(plugin_id),
+            copy_text: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
+            clear_and_hide: || clear_and_hide(&registry, &window),
+            record: |event| validation.record(event).map_err(|_| ()),
+            increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
+        },
+    )
+}
+
+struct ClipboardExecution<R, A, P, C, H, V, S> {
+    resolve: R,
+    execute: A,
+    authorize_plugin: P,
+    copy_text: C,
+    clear_and_hide: H,
+    record: V,
+    increment: S,
+}
+
+fn execute_result_with_clipboard<R, A, P, C, H, V, S>(
+    ids: (&str, &str),
+    execution: ClipboardExecution<R, A, P, C, H, V, S>,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
+    A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    P: FnOnce(&str) -> bool,
+    C: FnOnce(&str) -> Result<(), ()>,
+    H: FnOnce() -> Result<(), CommandError>,
+    V: FnOnce(ValidationEvent) -> Result<(), ()>,
+    S: FnOnce(&str) -> Result<(), ()>,
+{
+    let (request_id, result_id) = ids;
+    let ClipboardExecution {
+        resolve,
+        execute,
+        authorize_plugin,
+        copy_text,
+        clear_and_hide,
+        record,
+        increment,
+    } = execution;
+    let action = resolve(request_id, result_id).map_err(|error| match error {
+        RegistryError::StaleRequest => CommandError::stale_request(),
+        RegistryError::UnknownResult => CommandError::unknown_result(),
+    })?;
+    if let ResultAction::CopyText { plugin_id, text } = &action {
+        if !authorize_plugin(plugin_id) {
+            return Err(CommandError::plugin_permission_denied());
+        }
+        copy_text(text).map_err(|_| CommandError::clipboard_write_failed())?;
+        clear_and_hide()?;
+        return Ok(ExecuteOutcome::TextCopied);
+    }
+    execute_result_with(
+        ids,
+        |_, _| Ok(action),
+        execute,
+        clear_and_hide,
+        record,
+        increment,
     )
 }
 
@@ -658,6 +792,7 @@ where
     let app_id = match &action {
         ResultAction::LaunchApplication { app_id, .. } => app_id.as_str(),
         ResultAction::OpenIndexedPath => return Err(CommandError::application_entry_unavailable()),
+        ResultAction::CopyText { .. } => return Err(CommandError::application_entry_unavailable()),
     };
     let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
     let (response, event) = outcome_parts(outcome);
@@ -2406,6 +2541,190 @@ mod tests {
         let command = &production[production.find(&expected).unwrap()..];
         let first_statement = command[command.find('{').unwrap() + 1..].trim_start();
         assert!(first_statement.starts_with("require_main_window(&window)?;"));
+    }
+
+    mod execute_plugin {
+        use super::super::{execute_result_with_clipboard, ClipboardExecution};
+        use super::*;
+
+        fn copy_action() -> ResultAction {
+            ResultAction::CopyText {
+                plugin_id: "plugin".into(),
+                text: "copy me".into(),
+            }
+        }
+
+        #[test]
+        fn copy_rechecks_permission_before_clipboard() {
+            let clipboard = Cell::new(0);
+            let hide = Cell::new(0);
+            assert_eq!(
+                execute_result_with_clipboard(
+                    ("request", "result"),
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Ok(copy_action()),
+                        execute: |_: &ResultAction| unreachable!(),
+                        authorize_plugin: |_: &str| false,
+                        copy_text: |_: &str| {
+                            clipboard.set(clipboard.get() + 1);
+                            Ok(())
+                        },
+                        clear_and_hide: || {
+                            hide.set(hide.get() + 1);
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| unreachable!(),
+                        increment: |_: &str| unreachable!(),
+                    },
+                ),
+                Err(CommandError::plugin_permission_denied())
+            );
+            assert_eq!(clipboard.get(), 0);
+            assert_eq!(hide.get(), 0);
+        }
+
+        #[test]
+        fn copy_success_hides_once_without_app_validation_or_use_count() {
+            let trace = RefCell::new(Vec::new());
+            assert_eq!(
+                execute_result_with_clipboard(
+                    ("request", "result"),
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| {
+                            trace.borrow_mut().push("resolve");
+                            Ok(copy_action())
+                        },
+                        execute: |_: &ResultAction| {
+                            trace.borrow_mut().push("launch");
+                            unreachable!()
+                        },
+                        authorize_plugin: |plugin_id: &str| {
+                            trace.borrow_mut().push("permission");
+                            plugin_id == "plugin"
+                        },
+                        copy_text: |text: &str| {
+                            trace.borrow_mut().push("clipboard");
+                            assert_eq!(text, "copy me");
+                            Ok(())
+                        },
+                        clear_and_hide: || {
+                            trace.borrow_mut().push("clear-hide");
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| {
+                            trace.borrow_mut().push("validation");
+                            unreachable!()
+                        },
+                        increment: |_: &str| {
+                            trace.borrow_mut().push("use-count");
+                            unreachable!()
+                        },
+                    },
+                ),
+                Ok(ExecuteOutcome::TextCopied)
+            );
+            assert_eq!(
+                *trace.borrow(),
+                ["resolve", "permission", "clipboard", "clear-hide"]
+            );
+        }
+
+        #[test]
+        fn clipboard_failure_keeps_registry_and_window_usable() {
+            let hide = Cell::new(0);
+            assert_eq!(
+                execute_result_with_clipboard(
+                    ("request", "result"),
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Ok(copy_action()),
+                        execute: |_: &ResultAction| unreachable!(),
+                        authorize_plugin: |_: &str| true,
+                        copy_text: |_: &str| Err(()),
+                        clear_and_hide: || {
+                            hide.set(hide.get() + 1);
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| unreachable!(),
+                        increment: |_: &str| unreachable!(),
+                    },
+                ),
+                Err(CommandError::clipboard_write_failed())
+            );
+            assert_eq!(hide.get(), 0);
+        }
+
+        #[test]
+        fn stale_or_unknown_copy_ids_stop_before_permission_and_clipboard() {
+            for error in [RegistryError::StaleRequest, RegistryError::UnknownResult] {
+                let side_effects = Cell::new(0);
+                let result = execute_result_with_clipboard(
+                    ("request", "result"),
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Err(error),
+                        execute: |_: &ResultAction| unreachable!(),
+                        authorize_plugin: |_: &str| {
+                            side_effects.set(side_effects.get() + 1);
+                            true
+                        },
+                        copy_text: |_: &str| {
+                            side_effects.set(side_effects.get() + 1);
+                            Ok(())
+                        },
+                        clear_and_hide: || {
+                            side_effects.set(side_effects.get() + 1);
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| unreachable!(),
+                        increment: |_: &str| unreachable!(),
+                    },
+                );
+                assert_eq!(
+                    result,
+                    Err(match error {
+                        RegistryError::StaleRequest => CommandError::stale_request(),
+                        RegistryError::UnknownResult => CommandError::unknown_result(),
+                    })
+                );
+                assert_eq!(side_effects.get(), 0);
+            }
+        }
+    }
+
+    mod plugin {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::super::{publish_plugin_results_with_label, CommandError};
+        use crate::plugins::PluginQueryError;
+
+        #[test]
+        fn publish_rejects_non_plugin_label_before_state_access() {
+            let calls = AtomicUsize::new(0);
+            assert_eq!(
+                publish_plugin_results_with_label("main", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }),
+                Err(CommandError::invalid_caller())
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn publish_maps_plugin_validation_failure_to_fixed_error() {
+            assert_eq!(
+                publish_plugin_results_with_label("plugin-abc", || {
+                    Err(PluginQueryError::InvalidResponse)
+                }),
+                Err(CommandError::plugin_query_failed())
+            );
+        }
+
+        #[test]
+        fn plugin_timeout_publishes_empty_results_silently() {
+            let source = include_str!("commands.rs");
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(production.contains("Err(PluginQueryError::Timeout) => Vec::new(),"));
+        }
     }
 
     #[test]

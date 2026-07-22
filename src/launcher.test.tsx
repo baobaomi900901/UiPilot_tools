@@ -522,6 +522,24 @@ describe('execute and hide ownership', () => {
     expect(client.hideLauncher).not.toHaveBeenCalled()
   })
 
+  it('treats host-owned text copy as execute success without frontend hide', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'copy-request',
+      items: [{ resultId: 'copy-result', title: 'Copy' }],
+    })
+    vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
+    emit(shown('copy'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'copy', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+
+    expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'copy-request', resultId: 'copy-result' })
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
   it('shares one hide owner, ignores composing Escape, and keeps current state on rejection', async () => {
     const { core, client, emit } = await startedCore()
     const hide = deferred<void>()
