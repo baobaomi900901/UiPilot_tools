@@ -1833,6 +1833,36 @@ mod tests {
     }
 
     #[test]
+    fn file_index_handlers_run_after_exit_lock_release() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+
+        let tray = production
+            .split("pub(crate) fn request_tray_quit")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_system_end(").next())
+            .expect("tray quit source markers are missing");
+        let start = tray
+            .find("let start = self.begin_tray_clean_start")
+            .unwrap();
+        let file_index = tray.find("let file_index = Arc::clone").unwrap();
+        let cleaning = tray.find("file_index.start_cleaning_until(").unwrap();
+        let spawn = tray.find("spawn_blocking").unwrap();
+        assert!(start < file_index && file_index < cleaning && cleaning < spawn);
+        assert!(tray.contains("show_index.return_running(start.attempt_epoch);"));
+        assert!(tray.contains("exit_index.enter_terminal();"));
+
+        let system_end = production
+            .split("fn run_system_end(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn should_prevent_exit").next())
+            .expect("system end source markers are missing");
+        assert!(system_end.contains("run_system_end_nonblocking_with"));
+        assert!(system_end.contains("terminal_index.enter_terminal()"));
+        assert!(!system_end.contains("wait_for_clean_change"));
+    }
+
+    #[test]
     fn production_wiring_uses_main_wrappers_only_for_dynamic_save() {
         let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();

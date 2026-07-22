@@ -257,6 +257,9 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let run_coordinator = Arc::clone(&coordinator);
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let run_file_index = Arc::clone(&file_index);
+
     let app = builder
         .setup(move |_app| {
             #[cfg(all(not(test), feature = "test-instrumentation"))]
@@ -276,6 +279,7 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                run_file_index.enter_terminal();
                 run_coordinator.uninstall_hook_for_exit();
                 run_coordinator.observe_run_exit();
             }
@@ -713,6 +717,11 @@ mod tests {
         let cache = include_str!("apps/cache.rs").replace("\r\n", "\n");
         let file_index = include_str!("file_index/mod.rs").replace("\r\n", "\n");
         let file_store = include_str!("file_index/store.rs").replace("\r\n", "\n");
+        let file_windows = include_str!("file_index/windows_backend.rs").replace("\r\n", "\n");
+        let file_windows_production = file_windows
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("windows backend test module marker is missing");
         let search_files_allow = "#[allow(clippy::too_many_arguments)]";
         let search_files_command =
             format!("{search_files_allow}\n#[tauri::command]\npub(crate) async fn search_files(");
@@ -746,6 +755,7 @@ mod tests {
             ("lifecycle.rs", include_str!("lifecycle.rs")),
             ("file_index/mod.rs", file_index.as_str()),
             ("file_index/store.rs", file_store.as_str()),
+            ("file_index/windows_backend.rs", file_windows_production),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
             ("session_marker.rs", include_str!("session_marker.rs")),
@@ -765,6 +775,7 @@ mod tests {
         for (name, product_source) in [
             ("file_index/mod.rs", file_index.as_str()),
             ("file_index/store.rs", file_store.as_str()),
+            ("file_index/windows_backend.rs", file_windows_production),
         ] {
             for directive in ["#[allow(dead_code)]", "#[expect(dead_code)]"] {
                 assert!(
@@ -880,6 +891,65 @@ mod tests {
                 !plugins.contains(&forbidden),
                 "forbidden plugin runtime wiring: {forbidden}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lib {
+    mod tests {
+        #[test]
+        fn production_file_index_state_commands_and_permissions_are_exact() {
+            let source = include_str!("lib.rs").replace("\r\n", "\n");
+            let production = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .expect("test module marker is missing");
+
+            assert_eq!(
+                production
+                    .matches("let file_index = Arc::new(file_index::FileIndex::new(")
+                    .count(),
+                1
+            );
+            assert!(production.contains(
+                "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registry.clone(),\n    ));"
+            ));
+            assert_eq!(
+                production
+                    .matches(".manage(Arc::clone(&file_index))")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                production
+                    .matches("let run_file_index = Arc::clone(&file_index);")
+                    .count(),
+                1
+            );
+
+            let run_exit = production
+                .split("tauri::RunEvent::Exit => {")
+                .nth(1)
+                .and_then(|tail| tail.split("_ => {}").next())
+                .expect("run exit branch is missing");
+            assert!(run_exit.contains("run_file_index.enter_terminal();"));
+            assert!(run_exit.contains("run_coordinator.uninstall_hook_for_exit();"));
+            assert!(run_exit.contains("run_coordinator.observe_run_exit();"));
+            assert!(
+                run_exit.find("run_file_index.enter_terminal();").unwrap()
+                    < run_exit
+                        .find("run_coordinator.observe_run_exit();")
+                        .unwrap()
+            );
+
+            let capability = include_str!("../capabilities/main.json");
+            assert!(capability.contains("\"allow-search-files\""));
+            assert!(capability.contains("\"allow-execute-result\""));
+            let probe_load_settings = ["security_probe", "::", "load_settings"].concat();
+            assert_eq!(source.matches(&probe_load_settings).count(), 3);
+            let probe_search_files = ["security_probe", "::", "search_files"].concat();
+            assert!(!source.contains(&probe_search_files));
         }
     }
 }

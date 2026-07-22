@@ -107,6 +107,58 @@ mod tests {
     }
 
     #[test]
+    fn production_callbacks_use_one_managed_index() {
+        let lib = include_str!("../lib.rs").replace("\r\n", "\n");
+        let production = lib
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        assert_eq!(
+            production
+                .matches("let file_index = Arc::new(file_index::FileIndex::new(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches(".manage(Arc::clone(&file_index))")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches("app.state::<Arc<file_index::FileIndex>>()")
+                .count(),
+            1
+        );
+        assert_eq!(
+            include_str!("../lifecycle.rs")
+                .replace("\r\n", "\n")
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .matches("Arc::clone(app.state::<Arc<FileIndex>>().inner())")
+                .count(),
+            2
+        );
+        assert_eq!(
+            production
+                .matches("let run_file_index = Arc::clone(&file_index);")
+                .count(),
+            1
+        );
+
+        let run_exit = production
+            .split("tauri::RunEvent::Exit => {")
+            .nth(1)
+            .and_then(|tail| tail.split("_ => {}").next())
+            .expect("run exit branch is missing");
+        assert!(run_exit.contains("run_file_index.enter_terminal();"));
+        assert!(!production.contains("FileIndex::default()"));
+        assert!(!production.contains("file_index::FileIndex::default()"));
+    }
+
+    #[test]
     fn dependency_contract_unicode_15_1_and_full_fold() {
         assert_eq!(FOLD_ALGORITHM_ID, "uipilot-unicode-15.1-full-fold-nfc-v1");
         assert_eq!(unicode_normalization::UNICODE_VERSION, (15, 1, 0));
