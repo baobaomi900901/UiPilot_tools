@@ -7,14 +7,14 @@ use std::{
     },
 };
 
-use crate::apps::ApplicationLaunchTarget;
+use crate::{apps::ApplicationLaunchTarget, file_index::OpenIndexedPath};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
     LaunchApplication {
         app_id: String,
         target: ApplicationLaunchTarget,
     },
-    OpenIndexedPath,
+    OpenIndexedPath(OpenIndexedPath),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +284,7 @@ mod tests {
     use super::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry};
     use crate::{
         apps::ApplicationLaunchTarget,
+        file_index::{IndexedKind, OpenIndexedPath, VolumeIdentity},
         model::{ResultItem, SearchResponse},
     };
 
@@ -309,6 +310,16 @@ mod tests {
                 executable: Some(PathBuf::from(format!(r"C:\private\{name}.exe"))),
             },
         }
+    }
+
+    fn file_action() -> ResultAction {
+        ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+            0,
+            1,
+            VolumeIdentity::for_test(r"\\?\Volume{REGISTRY}\", 1, "ntfs"),
+            "file.txt",
+            IndexedKind::File,
+        ))
     }
 
     fn publish_app(
@@ -370,8 +381,8 @@ mod tests {
             .publish_if_latest(
                 file,
                 vec![
-                    (FileDraft { name: "First" }, ResultAction::OpenIndexedPath),
-                    (FileDraft { name: "Second" }, ResultAction::OpenIndexedPath),
+                    (FileDraft { name: "First" }, file_action()),
+                    (FileDraft { name: "Second" }, file_action()),
                 ],
                 || true,
                 |request_id, items| (request_id, items),
@@ -382,7 +393,7 @@ mod tests {
         assert_eq!(file_response.1[1].0, "item-0000000000000005");
         assert_eq!(
             registry.resolve(&file_response.0, &file_response.1[0].0),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(file_action())
         );
 
         registry.hide_and_clear();
@@ -405,7 +416,7 @@ mod tests {
         assert!(registry
             .publish_if_latest(
                 tampered,
-                vec![(FileDraft { name: "Wrong" }, ResultAction::OpenIndexedPath)],
+                vec![(FileDraft { name: "Wrong" }, file_action())],
                 || true,
                 |request_id, items| (request_id, items),
             )
@@ -414,7 +425,7 @@ mod tests {
         let current = registry
             .publish_if_latest(
                 token,
-                vec![(FileDraft { name: "Current" }, ResultAction::OpenIndexedPath)],
+                vec![(FileDraft { name: "Current" }, file_action())],
                 || true,
                 |request_id, items| (request_id, items),
             )
@@ -443,7 +454,7 @@ mod tests {
         assert!(recovery
             .publish_if_latest(
                 stale_file,
-                vec![(FileDraft { name: "Stale" }, ResultAction::OpenIndexedPath)],
+                vec![(FileDraft { name: "Stale" }, file_action())],
                 || true,
                 |request_id, items| (request_id, items),
             )
@@ -460,7 +471,7 @@ mod tests {
         let response = registry
             .publish_if_latest(
                 next,
-                vec![(FileDraft { name: "Current" }, ResultAction::OpenIndexedPath)],
+                vec![(FileDraft { name: "Current" }, file_action())],
                 || true,
                 |request_id, items| (request_id, items),
             )
@@ -483,7 +494,7 @@ mod tests {
         assert!(registry
             .publish_if_latest(
                 token,
-                vec![(FileDraft { name: "Stale" }, ResultAction::OpenIndexedPath)],
+                vec![(FileDraft { name: "Stale" }, file_action())],
                 || true,
                 |request_id, items| (request_id, items),
             )

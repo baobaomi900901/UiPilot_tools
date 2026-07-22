@@ -6,8 +6,8 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 use crate::{
     apps::{self, AppCache, Application},
     file_index::{
-        fold_name, FileCategory, FileIndex, FileResultItem, FileSearchBatch, FileSearchResponse,
-        FileSort, QuerySpec,
+        fold_name, FileCategory, FileExecutionError, FileExecutionOutcome, FileIndex,
+        FileResultItem, FileSearchBatch, FileSearchResponse, FileSort, OpenIndexedPath, QuerySpec,
     },
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
@@ -70,6 +70,8 @@ pub(crate) enum ExecuteOutcome {
     LaunchRequested,
     ActivationRequested,
     ActivationRefusedLaunchRequested { message: &'static str },
+    FileRevealRequested,
+    FolderOpenRequested,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -182,6 +184,20 @@ impl CommandError {
         Self {
             code: "searchUnavailable",
             message: "file search is unavailable",
+        }
+    }
+
+    fn file_not_found() -> Self {
+        Self {
+            code: "fileNotFound",
+            message: "indexed file no longer exists",
+        }
+    }
+
+    fn file_open_failed() -> Self {
+        Self {
+            code: "fileOpenFailed",
+            message: "indexed file could not be opened",
         }
     }
 }
@@ -365,7 +381,10 @@ fn publish_file_search(
     let entries = batch
         .items
         .into_iter()
-        .map(|item| (item, ResultAction::OpenIndexedPath))
+        .map(|item| {
+            let action = ResultAction::OpenIndexedPath(item.action.clone());
+            (item, action)
+        })
         .collect();
     registry.publish_if_latest(
         token,
@@ -615,26 +634,91 @@ fn save_settings_core(
 }
 
 #[tauri::command]
-pub(crate) fn execute_result(
+pub(crate) async fn execute_result(
     window: WebviewWindow,
-    registry: State<'_, ResultRegistry>,
-    validation: State<'_, ValidationStore>,
-    settings: State<'_, SettingsStore>,
-    cache: State<'_, Arc<AppCache>>,
+    app: AppHandle,
     request_id: String,
     result_id: String,
 ) -> Result<ExecuteOutcome, CommandError> {
     require_main_window(&window)?;
-    execute_result_with(
+    let registry = app.state::<ResultRegistry>();
+    let file_index = app.state::<Arc<FileIndex>>();
+    let validation = app.state::<ValidationStore>();
+    let settings = app.state::<SettingsStore>();
+    let cache = app.state::<Arc<AppCache>>();
+    let worker_index = Arc::clone(file_index.inner());
+    execute_resolved_result_with(
         (&request_id, &result_id),
         |request_id, result_id| registry.resolve(request_id, result_id),
         |action| apps::execute_application(action).map_err(|_| ()),
+        move |action| async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                worker_index
+                    .execute_indexed_path(action)
+                    .map_err(map_file_execution_error)
+            })
+            .await
+            .map_err(|_| CommandError::file_open_failed())?
+        },
         || clear_and_hide(&registry, &window),
         |event| validation.record(event).map_err(|_| ()),
         |app_id| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
     )
+    .await
 }
 
+fn map_file_execution_error(error: FileExecutionError) -> CommandError {
+    match error {
+        FileExecutionError::SearchUnavailable => CommandError::search_unavailable(),
+        FileExecutionError::Stale => CommandError::stale_request(),
+        FileExecutionError::NotFound => CommandError::file_not_found(),
+        FileExecutionError::OpenFailed => CommandError::file_open_failed(),
+    }
+}
+
+async fn execute_resolved_result_with<R, A, F, Fut, H, V, S>(
+    ids: (&str, &str),
+    resolve: R,
+    execute_application: A,
+    execute_file: F,
+    clear_and_hide: H,
+    record: V,
+    increment: S,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
+    A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    F: FnOnce(OpenIndexedPath) -> Fut,
+    Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
+    H: FnOnce() -> Result<(), CommandError>,
+    V: FnOnce(ValidationEvent) -> Result<(), ()>,
+    S: FnOnce(&str) -> Result<(), ()>,
+{
+    let action = resolve(ids.0, ids.1).map_err(|error| match error {
+        RegistryError::StaleRequest => CommandError::stale_request(),
+        RegistryError::UnknownResult => CommandError::unknown_result(),
+    })?;
+    match action {
+        ResultAction::LaunchApplication { .. } => execute_application_result_with(
+            &action,
+            execute_application,
+            clear_and_hide,
+            record,
+            increment,
+        ),
+        ResultAction::OpenIndexedPath(action) => {
+            let outcome = execute_file(action).await?;
+            let response = match outcome {
+                FileExecutionOutcome::FileRevealRequested => ExecuteOutcome::FileRevealRequested,
+                FileExecutionOutcome::FolderOpenRequested => ExecuteOutcome::FolderOpenRequested,
+            };
+            clear_and_hide()?;
+            Ok(response)
+        }
+    }
+}
+
+#[cfg(test)]
 fn execute_result_with<R, A, H, V, S>(
     ids: (&str, &str),
     resolve: R,
@@ -655,11 +739,29 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
-    let app_id = match &action {
-        ResultAction::LaunchApplication { app_id, .. } => app_id.as_str(),
-        ResultAction::OpenIndexedPath => return Err(CommandError::application_entry_unavailable()),
+    if matches!(action, ResultAction::OpenIndexedPath(_)) {
+        return Err(CommandError::application_entry_unavailable());
+    }
+    execute_application_result_with(&action, execute, clear_and_hide, record, increment)
+}
+
+fn execute_application_result_with<A, H, V, S>(
+    action: &ResultAction,
+    execute: A,
+    clear_and_hide: H,
+    record: V,
+    increment: S,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    H: FnOnce() -> Result<(), CommandError>,
+    V: FnOnce(ValidationEvent) -> Result<(), ()>,
+    S: FnOnce(&str) -> Result<(), ()>,
+{
+    let ResultAction::LaunchApplication { app_id, .. } = action else {
+        return Err(CommandError::application_entry_unavailable());
     };
-    let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
+    let outcome = execute(action).map_err(|_| CommandError::application_entry_unavailable())?;
     let (response, event) = outcome_parts(outcome);
 
     let window_error = clear_and_hide().err();
@@ -912,19 +1014,21 @@ mod tests {
 
     use super::{
         begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
-        execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
-        load_settings_core, load_settings_ready_with, map_export_worker_result,
-        map_file_preview_worker_result, map_rescan_result, map_save_worker_result,
-        prepare_file_query, prepare_settings_save, publish_file_search, require_main_label,
-        rescan_apps_with, save_settings_core, save_settings_with, save_settings_worker_with,
-        search_apps_with, search_files_with, set_file_preview_preference_with, spawn_export_worker,
-        AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate,
-        SaveSettingsCache, SettingsView, UserSettingsUpdate,
+        execute_resolved_result_with, execute_result_with, export_validation_data_guarded_with,
+        export_validation_data_with, load_settings_core, load_settings_ready_with,
+        map_export_worker_result, map_file_preview_worker_result, map_rescan_result,
+        map_save_worker_result, prepare_file_query, prepare_settings_save, publish_file_search,
+        require_main_label, rescan_apps_with, save_settings_core, save_settings_with,
+        save_settings_worker_with, search_apps_with, search_files_with,
+        set_file_preview_preference_with, spawn_export_worker, AppAliasTarget, CommandError,
+        ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate, SaveSettingsCache,
+        SettingsView, UserSettingsUpdate,
     };
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome, ApplicationLaunchTarget},
         file_index::{
-            FileIndex, FileIndexStatus, FileResultDraft, FileResultKind, FileSearchBatch,
+            FileExecutionOutcome, FileIndex, FileIndexStatus, FileResultDraft, FileResultKind,
+            FileSearchBatch, IndexedKind, OpenIndexedPath, VolumeIdentity,
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
@@ -1032,6 +1136,16 @@ mod tests {
                 executable: Some(PathBuf::from(r"C:\Private\Current.exe")),
             },
         }
+    }
+
+    fn file_action(row_id: i64, relative_path: &str, kind: IndexedKind) -> OpenIndexedPath {
+        OpenIndexedPath::for_test(
+            0,
+            row_id,
+            VolumeIdentity::for_test(r"\\?\Volume{COMMANDS}\", 1, "ntfs"),
+            relative_path,
+            kind,
+        )
     }
 
     fn settings_store(dir: &TestDir, research_id: Option<&str>) -> SettingsStore {
@@ -1249,6 +1363,7 @@ mod tests {
             status: FileIndexStatus::Ready,
             items: vec![
                 FileResultDraft {
+                    action: file_action(1, "First.txt", IndexedKind::File),
                     name: "First.txt".into(),
                     kind: FileResultKind::File,
                     size_bytes: Some(1),
@@ -1256,6 +1371,7 @@ mod tests {
                     full_path: r"C:\Results\First.txt".into(),
                 },
                 FileResultDraft {
+                    action: file_action(2, "Folder", IndexedKind::Directory),
                     name: "Folder".into(),
                     kind: FileResultKind::Folder,
                     size_bytes: None,
@@ -1272,11 +1388,19 @@ mod tests {
         assert_eq!(response.items.len(), 2);
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(ResultAction::OpenIndexedPath(file_action(
+                1,
+                "First.txt",
+                IndexedKind::File
+            )))
         );
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[1].result_id),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(ResultAction::OpenIndexedPath(file_action(
+                2,
+                "Folder",
+                IndexedKind::Directory
+            )))
         );
     }
 
@@ -1288,7 +1412,10 @@ mod tests {
         let old = registry
             .publish_if_latest(
                 old_token,
-                vec![((), ResultAction::OpenIndexedPath)],
+                vec![(
+                    (),
+                    ResultAction::OpenIndexedPath(file_action(3, "old.txt", IndexedKind::File)),
+                )],
                 || true,
                 |request_id, items| (request_id, items),
             )
@@ -1823,7 +1950,13 @@ mod tests {
         let later_calls = Cell::new(0);
         let result = execute_result_with(
             ("request", "result"),
-            |_, _| Ok(ResultAction::OpenIndexedPath),
+            |_, _| {
+                Ok(ResultAction::OpenIndexedPath(file_action(
+                    4,
+                    "blocked.txt",
+                    IndexedKind::File,
+                )))
+            },
             |_| {
                 execute_calls.set(execute_calls.get() + 1);
                 Ok(ApplicationActionOutcome::LaunchRequested)
@@ -2557,5 +2690,52 @@ mod tests {
         ] {
             assert!(guard < command.find(forbidden).unwrap());
         }
+    }
+
+    #[test]
+    fn execute_result_preserves_application_branch_and_isolates_file_branch() {
+        let volume = VolumeIdentity::for_test(r"\\?\Volume{EXECUTION}\", 41, "ntfs");
+        let file = ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+            7,
+            19,
+            volume,
+            r"docs\report.pdf",
+            IndexedKind::File,
+        ));
+        let application_calls = Cell::new(0);
+        let file_calls = Cell::new(0);
+        let hide_calls = Cell::new(0);
+        let later_application_calls = Cell::new(0);
+
+        let outcome = tauri::async_runtime::block_on(execute_resolved_result_with(
+            ("request", "result"),
+            |_, _| Ok(file),
+            |_| {
+                application_calls.set(application_calls.get() + 1);
+                Ok(ApplicationActionOutcome::LaunchRequested)
+            },
+            |_| {
+                file_calls.set(file_calls.get() + 1);
+                async { Ok(FileExecutionOutcome::FileRevealRequested) }
+            },
+            || {
+                hide_calls.set(hide_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_application_calls.set(later_application_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_application_calls.set(later_application_calls.get() + 1);
+                Ok(())
+            },
+        ));
+
+        assert_eq!(outcome, Ok(ExecuteOutcome::FileRevealRequested));
+        assert_eq!(application_calls.get(), 0);
+        assert_eq!(file_calls.get(), 1);
+        assert_eq!(hide_calls.get(), 1);
+        assert_eq!(later_application_calls.get(), 0);
     }
 }

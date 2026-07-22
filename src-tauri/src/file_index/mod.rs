@@ -33,9 +33,9 @@ use store::{ordinal_sort_identity, Store, StoreError, StoreQueryResult};
 #[cfg(not(test))]
 use windows_backend::{
     filter_replay_events, fixed_volumes, materialize_events, scan_volume, system_exclusions,
-    BackendError, ScanSummary, Watcher,
+    ScanSummary, Watcher,
 };
-use windows_backend::{EventBuffer, ExcludedPrefix, FixedVolume};
+use windows_backend::{BackendError, EventBuffer, ExcludedPrefix, FixedVolume};
 
 pub(crate) const FOLD_ALGORITHM_ID: &str = "uipilot-unicode-15.1-full-fold-nfc-v1";
 
@@ -62,8 +62,8 @@ mod tests {
     use super::{
         authenticate_app_data_root, begin_lazy_init_locked, fold_name, open_store,
         validate_index_path_shape, AdmissionError, FileCategory, FileIndex, FileIndexError,
-        FileIndexStatus, FileSort, IndexState, LazyInitDecision, LifecycleMode, QuerySpec,
-        StoreError, VolumeRuntime, FOLD_ALGORITHM_ID,
+        FileIndexStatus, FileSort, IndexState, IndexedKind, LazyInitDecision, LifecycleMode,
+        OpenIndexedPath, QuerySpec, StoreError, VolumeIdentity, VolumeRuntime, FOLD_ALGORITHM_ID,
     };
     use icu_casemap::CaseMapper;
     use rusqlite::Connection;
@@ -643,6 +643,16 @@ mod tests {
             volume_serial: 42,
             filesystem_name: "NTFS".into(),
         }
+    }
+
+    fn file_action() -> ResultAction {
+        ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+            0,
+            1,
+            volume(),
+            "file.txt",
+            IndexedKind::File,
+        ))
     }
 
     #[test]
@@ -2116,7 +2126,7 @@ mod tests {
             .registry
             .publish_if_latest(
                 application,
-                vec![((), ResultAction::OpenIndexedPath)],
+                vec![((), file_action())],
                 || true,
                 |request, items| (request, items[0].0.clone()),
             )
@@ -2139,7 +2149,7 @@ mod tests {
         assert_eq!(posts.get(), 1);
         assert_eq!(
             index.registry.resolve(&application.0, &application.1),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(file_action())
         );
 
         let cleared = Arc::new(FileIndex::default());
@@ -3439,7 +3449,7 @@ mod tests {
         let application = registry
             .publish_if_latest(
                 application,
-                vec![((), ResultAction::OpenIndexedPath)],
+                vec![((), file_action())],
                 || true,
                 |request, items| (request, items[0].0.clone()),
             )
@@ -3452,7 +3462,7 @@ mod tests {
         }));
         assert_eq!(
             registry.resolve(&application.0, &application.1),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(file_action())
         );
         assert!(observed_unlocked.get());
     }
@@ -3863,6 +3873,63 @@ mod tests {
             panic!("unreachable clean-close state must reject without waiting")
         }));
     }
+
+    #[test]
+    fn file_execution_binds_epoch_row_volume_path_and_kind() {
+        let (index, _) = active_task7_index();
+        let volume = VolumeIdentity::for_test(r"\\?\Volume{EXECUTION}\", 41, "ntfs");
+        let action = OpenIndexedPath::for_test(
+            index.runtime_epoch(),
+            19,
+            volume.clone(),
+            r"docs\report.pdf",
+            IndexedKind::File,
+        );
+
+        let reservation = index.reserve_execution_for_test(&action).unwrap();
+        assert_eq!(reservation.runtime_epoch(), action.runtime_epoch());
+        assert_eq!(index.execution_count_for_test(), 1);
+        assert!(index.execution_action_matches_for_test(
+            &action,
+            19,
+            &volume,
+            r"docs\report.pdf",
+            IndexedKind::File,
+        ));
+        assert!(!index.execution_action_matches_for_test(
+            &action,
+            19,
+            &volume,
+            r"docs\other.pdf",
+            IndexedKind::File,
+        ));
+        drop(reservation);
+        assert_eq!(index.execution_count_for_test(), 0);
+    }
+
+    #[test]
+    fn execution_and_recovery_have_two_valid_linearizations() {
+        let (index, _) = active_task7_index();
+        let action = OpenIndexedPath::for_test(
+            index.runtime_epoch(),
+            1,
+            volume(),
+            "report.pdf",
+            IndexedKind::File,
+        );
+        let execution = index.reserve_execution_for_test(&action).unwrap();
+        assert!(!index.recovery_quiescent_for_test());
+        drop(execution);
+        assert!(index.recovery_quiescent_for_test());
+
+        let reporter = index
+            .reserve_db_work_for_test(index.runtime_epoch())
+            .unwrap();
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        assert!(index.reserve_execution_for_test(&action).is_err());
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -3876,6 +3943,67 @@ pub(crate) struct VolumeIdentity {
 pub(crate) enum IndexedKind {
     File,
     Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OpenIndexedPath {
+    runtime_epoch: u64,
+    row_id: i64,
+    volume_identity: VolumeIdentity,
+    relative_path: String,
+    kind: IndexedKind,
+}
+
+impl OpenIndexedPath {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        runtime_epoch: u64,
+        row_id: i64,
+        volume_identity: VolumeIdentity,
+        relative_path: impl Into<String>,
+        kind: IndexedKind,
+    ) -> Self {
+        Self {
+            runtime_epoch,
+            row_id,
+            volume_identity,
+            relative_path: relative_path.into(),
+            kind,
+        }
+    }
+
+    pub(crate) fn runtime_epoch(&self) -> u64 {
+        self.runtime_epoch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileExecutionOutcome {
+    FileRevealRequested,
+    FolderOpenRequested,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileExecutionError {
+    SearchUnavailable,
+    Stale,
+    NotFound,
+    OpenFailed,
+}
+
+impl VolumeIdentity {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        volume_guid_path: impl Into<String>,
+        volume_serial: u32,
+        filesystem_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            volume_guid_path: volume_guid_path.into(),
+            volume_serial,
+            filesystem_name: filesystem_name.into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3979,6 +4107,7 @@ pub(crate) enum FileResultKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileResultDraft {
+    pub(crate) action: OpenIndexedPath,
     pub(crate) name: String,
     pub(crate) kind: FileResultKind,
     pub(crate) size_bytes: Option<u64>,
@@ -4057,6 +4186,7 @@ enum AdmissionError {
 enum AdmissionKind {
     LazyInit,
     DbWork,
+    Execution,
 }
 
 struct IndexState {
@@ -4068,6 +4198,7 @@ struct IndexState {
     runtime_epoch: u64,
     index_revision_high_water: u64,
     db_work: usize,
+    execution_work: usize,
     recovery_owner: Option<u64>,
     recovery_deadline: Option<std::time::Instant>,
     pause_deadline: Option<std::time::Instant>,
@@ -4101,6 +4232,7 @@ impl Default for IndexState {
             runtime_epoch: 0,
             index_revision_high_water: 0,
             db_work: 0,
+            execution_work: 0,
             recovery_owner: None,
             recovery_deadline: None,
             pause_deadline: None,
@@ -4316,6 +4448,20 @@ struct DbWorkReservation {
     released: bool,
 }
 
+pub(crate) struct FileExecutionReservation {
+    state: Arc<Mutex<IndexState>>,
+    coordinator: Arc<CoordinatorControl>,
+    runtime_epoch: u64,
+    released: bool,
+}
+
+impl FileExecutionReservation {
+    #[cfg(test)]
+    fn runtime_epoch(&self) -> u64 {
+        self.runtime_epoch
+    }
+}
+
 enum SearchAdmission {
     Work {
         owner: Option<u64>,
@@ -4374,6 +4520,22 @@ impl Drop for DbWorkReservation {
             .db_work
             .checked_sub(1)
             .expect("file index DB-work reservation underflow");
+        self.released = true;
+        drop(state);
+        self.coordinator.signal.notify_all();
+    }
+}
+
+impl Drop for FileExecutionReservation {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        state.execution_work = state
+            .execution_work
+            .checked_sub(1)
+            .expect("file index execution reservation underflow");
         self.released = true;
         drop(state);
         self.coordinator.signal.notify_all();
@@ -4743,6 +4905,68 @@ impl FileIndex {
         self.publication_runtime_epoch.load(Ordering::Acquire)
     }
 
+    pub(crate) fn execute_indexed_path(
+        self: &Arc<Self>,
+        action: OpenIndexedPath,
+    ) -> Result<FileExecutionOutcome, FileExecutionError> {
+        let reservation = self
+            .reserve_execution(action.runtime_epoch())
+            .map_err(|_| FileExecutionError::SearchUnavailable)?;
+        let (volume, row_match) = {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            let mount = state
+                .authenticated_mounts
+                .iter()
+                .find(|(identity, _)| identity == &action.volume_identity)
+                .map(|(_, mount)| mount.clone())
+                .ok_or(FileExecutionError::Stale)?;
+            let result = state
+                .store
+                .as_mut()
+                .ok_or(FileExecutionError::SearchUnavailable)?
+                .execution_row_matches(&action);
+            (
+                FixedVolume {
+                    identity: action.volume_identity.clone(),
+                    mount_point: PathBuf::from(mount),
+                },
+                result,
+            )
+        };
+        let row_match = match row_match {
+            Ok(row_match) => row_match,
+            Err(StoreError::Corrupt) => {
+                let _ = self.request_recovery_from_execution(&reservation);
+                return Err(FileExecutionError::SearchUnavailable);
+            }
+            Err(
+                StoreError::Sqlite
+                | StoreError::InvalidData
+                | StoreError::Platform
+                | StoreError::RevisionExhausted,
+            ) => return Err(FileExecutionError::SearchUnavailable),
+        };
+        if !row_match {
+            return Err(FileExecutionError::Stale);
+        }
+        windows_backend::reauthenticate_volume(&volume).map_err(|error| match error {
+            BackendError::Missing => FileExecutionError::NotFound,
+            BackendError::InvalidData => FileExecutionError::Stale,
+            BackendError::Platform
+            | BackendError::Denied
+            | BackendError::Overflow
+            | BackendError::Stopped => FileExecutionError::OpenFailed,
+        })?;
+        windows_backend::execute_indexed_path(&volume, &action).map_err(|error| match error {
+            BackendError::Missing => FileExecutionError::NotFound,
+            BackendError::InvalidData => FileExecutionError::Stale,
+            BackendError::Platform
+            | BackendError::Denied
+            | BackendError::Overflow
+            | BackendError::Stopped => FileExecutionError::OpenFailed,
+        })
+    }
+
     fn admit_locked(
         &self,
         state: &IndexState,
@@ -4772,8 +4996,38 @@ impl FileIndex {
             {
                 Ok(())
             }
-            AdmissionKind::LazyInit | AdmissionKind::DbWork => Err(AdmissionError::WrongMode),
+            AdmissionKind::Execution
+                if state.mode == LifecycleMode::Active && state.admission_open =>
+            {
+                Ok(())
+            }
+            AdmissionKind::LazyInit | AdmissionKind::DbWork | AdmissionKind::Execution => {
+                Err(AdmissionError::WrongMode)
+            }
         }
+    }
+
+    fn reserve_execution(
+        &self,
+        expected_runtime_epoch: u64,
+    ) -> Result<FileExecutionReservation, AdmissionError> {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        self.admit_locked(&state, AdmissionKind::Execution, expected_runtime_epoch)?;
+        let Some(next) = state.execution_work.checked_add(1) else {
+            let newly_fatal = self.latch_exhaustion_locked(&mut state);
+            drop(state);
+            if newly_fatal {
+                self.consume_fatal_effects();
+            }
+            return Err(AdmissionError::CounterExhausted);
+        };
+        state.execution_work = next;
+        Ok(FileExecutionReservation {
+            state: Arc::clone(&self.state),
+            coordinator: Arc::clone(&self.coordinator),
+            runtime_epoch: expected_runtime_epoch,
+            released: false,
+        })
     }
 
     fn reserve_db_work(
@@ -4904,6 +5158,43 @@ impl FileIndex {
     }
 
     #[cfg(test)]
+    fn reserve_execution_for_test(
+        &self,
+        action: &OpenIndexedPath,
+    ) -> Result<FileExecutionReservation, AdmissionError> {
+        self.reserve_execution(action.runtime_epoch)
+    }
+
+    #[cfg(test)]
+    fn execution_count_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .expect("file index lock poisoned")
+            .execution_work
+    }
+
+    #[cfg(test)]
+    fn recovery_quiescent_for_test(&self) -> bool {
+        let state = self.state.lock().expect("file index lock poisoned");
+        state.db_work == 0 && state.execution_work == 0
+    }
+
+    #[cfg(test)]
+    fn execution_action_matches_for_test(
+        &self,
+        action: &OpenIndexedPath,
+        row_id: i64,
+        identity: &VolumeIdentity,
+        relative_path: &str,
+        kind: IndexedKind,
+    ) -> bool {
+        action.row_id == row_id
+            && &action.volume_identity == identity
+            && action.relative_path == relative_path
+            && action.kind == kind
+    }
+
+    #[cfg(test)]
     fn db_work_count_for_test(&self) -> usize {
         self.state.lock().expect("file index lock poisoned").db_work
     }
@@ -4926,13 +5217,31 @@ impl FileIndex {
     where
         I: FnOnce() -> Result<(), crate::result_registry::DomainEpochExhausted>,
     {
-        if !Arc::ptr_eq(&self.state, &reporter.state) {
+        self.transition_recovery_with(
+            &reporter.state,
+            reporter.runtime_epoch,
+            AdmissionKind::DbWork,
+            invalidate,
+        )
+    }
+
+    fn transition_recovery_with<I>(
+        self: &Arc<Self>,
+        reporter_state: &Arc<Mutex<IndexState>>,
+        reporter_runtime_epoch: u64,
+        reporter_kind: AdmissionKind,
+        invalidate: I,
+    ) -> bool
+    where
+        I: FnOnce() -> Result<(), crate::result_registry::DomainEpochExhausted>,
+    {
+        if !Arc::ptr_eq(&self.state, reporter_state) {
             return false;
         }
         let recovery_owner = {
             let mut state = self.state.lock().expect("file index lock poisoned");
             if self
-                .admit_locked(&state, AdmissionKind::DbWork, reporter.runtime_epoch)
+                .admit_locked(&state, reporter_kind, reporter_runtime_epoch)
                 .is_err()
                 || state.recovery_owner.is_some()
             {
@@ -5026,6 +5335,23 @@ impl FileIndex {
         won
     }
 
+    fn request_recovery_from_execution(
+        self: &Arc<Self>,
+        reporter: &FileExecutionReservation,
+    ) -> bool {
+        let won = self.transition_recovery_with(
+            &reporter.state,
+            reporter.runtime_epoch,
+            AdmissionKind::Execution,
+            || self.registry.invalidate_domain(QueryDomain::File),
+        );
+        if won {
+            self.ensure_coordinator_thread();
+            self.coordinator.signal.notify_all();
+        }
+        won
+    }
+
     fn classify_recovery_boundary(
         &self,
         state: &IndexState,
@@ -5046,7 +5372,7 @@ impl FileIndex {
         {
             return RecoveryBoundary::TimedOut;
         }
-        if state.db_work != 0 {
+        if state.db_work != 0 || state.execution_work != 0 {
             return RecoveryBoundary::Waiting;
         }
         RecoveryBoundary::Authorized
@@ -5503,6 +5829,7 @@ impl FileIndex {
                 return false;
             };
             if state.db_work != 0
+                || state.execution_work != 0
                 || self.lifecycle.file_index_phase() != FileIndexPhase::Running
                 || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
             {
@@ -5548,6 +5875,7 @@ impl FileIndex {
         }
         let mut state = self.state.lock().expect("file index lock poisoned");
         if state.db_work != 0
+            || state.execution_work != 0
             || state.mode
                 != (LifecycleMode::Pausing {
                     attempt_epoch,
@@ -5594,6 +5922,7 @@ impl FileIndex {
             || self.lifecycle.file_index_phase() != FileIndexPhase::Cleaning
             || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
             || state.db_work != 0
+            || state.execution_work != 0
             || state.store.is_some()
             || state.clean_close_permit_issued
             || state.pause_deadline.is_none_or(|deadline| now >= deadline)
@@ -6742,6 +7071,13 @@ impl FileIndex {
                 .entries
                 .into_iter()
                 .map(|entry| FileResultDraft {
+                    action: OpenIndexedPath {
+                        runtime_epoch: expected_runtime_epoch,
+                        row_id: entry.row_id,
+                        volume_identity: entry.volume_identity,
+                        relative_path: entry.relative_path,
+                        kind: entry.kind,
+                    },
                     name: entry.name,
                     kind: match entry.kind {
                         IndexedKind::File => FileResultKind::File,

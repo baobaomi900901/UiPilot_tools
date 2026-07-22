@@ -1,53 +1,64 @@
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::c_void,
     path::{Path, PathBuf},
 };
 
 #[cfg(not(test))]
-use std::{
-    ffi::c_void,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::Win32::{
-    Globalization::CompareStringOrdinal,
-    Storage::FileSystem::{
-        FILE_ACTION, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
-        FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
-        FILE_FULL_DIR_INFO,
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Globalization::CompareStringOrdinal,
+        Storage::FileSystem::{
+            CreateFileW, FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandleEx,
+            GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, GetVolumeInformationW,
+            GetVolumeNameForVolumeMountPointW, FILE_ACTION, FILE_ACTION_ADDED,
+            FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+            FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_GUID,
+        },
+        System::Com::CoTaskMemFree,
+        UI::{
+            Shell::{
+                Common::ITEMIDLIST, ILClone, ILCreateFromPathW, ILFindLastID, ILRemoveLastID,
+                SHOpenFolderAndSelectItems, ShellExecuteExW, SEE_MASK_FLAG_NO_UI,
+                SHELLEXECUTEINFOW,
+            },
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
     },
 };
 
 #[cfg(not(test))]
-use windows::{
-    core::PCWSTR,
-    Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        Storage::FileSystem::{
-            CreateFileW, FileAttributeTagInfo, FileBasicInfo, FileFullDirectoryInfo,
-            FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx,
-            GetFinalPathNameByHandleW, GetLogicalDriveStringsW, GetTempPathW,
-            GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
-            ReadDirectoryChangesW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
-            FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
-            FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-            FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING, VOLUME_NAME_GUID,
+use windows::Win32::{
+    Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Storage::FileSystem::{
+        FileBasicInfo, FileFullDirectoryInfo, FileStandardInfo, GetLogicalDriveStringsW,
+        GetTempPathW, GetVolumePathNameW, ReadDirectoryChangesW, FILE_BASIC_INFO,
+        FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE,
+        FILE_STANDARD_INFO,
+    },
+    System::{
+        SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
+        Threading::{
+            CreateEventW, GetCurrentThread, ResetEvent, SetThreadPriority, WaitForSingleObject,
+            THREAD_PRIORITY_BELOW_NORMAL,
         },
-        System::{
-            SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
-            Threading::{
-                CreateEventW, GetCurrentThread, ResetEvent, SetThreadPriority, WaitForSingleObject,
-                THREAD_PRIORITY_BELOW_NORMAL,
-            },
-            IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
-        },
+        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
     },
 };
 
-use super::{fold_name, IndexChangeBatch, IndexEntry, IndexedKind, VolumeIdentity};
+use super::{
+    fold_name, FileExecutionOutcome, IndexChangeBatch, IndexEntry, IndexedKind, OpenIndexedPath,
+    VolumeIdentity,
+};
 
 pub(super) const EVENT_CAPACITY: usize = 65_536;
 pub(super) const SCAN_BATCH_SIZE: usize = 512;
@@ -86,22 +97,122 @@ fn push_denied_prefix(
     Ok(())
 }
 
-#[cfg(not(test))]
 struct OwnedHandle(HANDLE);
 
-#[cfg(not(test))]
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
-#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct ExecutionShare;
+
+impl ExecutionShare {
+    #[cfg(test)]
+    fn allows_write(self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn allows_delete(self) -> bool {
+        false
+    }
+}
+
+fn pin_indexed_path_components_with<H, O, I>(
+    identity: &VolumeIdentity,
+    relative_path: &str,
+    final_is_directory: bool,
+    mut open: O,
+    mut inspect: I,
+) -> Result<Vec<H>, BackendError>
+where
+    O: FnMut(&str, bool, ExecutionShare) -> Result<H, BackendError>,
+    I: FnMut(&H, &str, bool) -> Result<(bool, bool, VolumeIdentity, String), BackendError>,
+{
+    let components = relative_path.split('\\').collect::<Vec<_>>();
+    if components.is_empty()
+        || components.iter().any(|component| {
+            component.is_empty()
+                || *component == "."
+                || *component == ".."
+                || component.contains('/')
+        })
+    {
+        return Err(BackendError::InvalidData);
+    }
+    let mut handles = Vec::with_capacity(components.len());
+    let mut cumulative = String::new();
+    for (index, component) in components.iter().enumerate() {
+        if !cumulative.is_empty() {
+            cumulative.push('\\');
+        }
+        cumulative.push_str(component);
+        let expected_directory = index + 1 != components.len() || final_is_directory;
+        let handle = open(&cumulative, expected_directory, ExecutionShare)?;
+        let (reparse, directory, actual_identity, actual_relative_path) =
+            inspect(&handle, &cumulative, expected_directory)?;
+        if reparse
+            || directory != expected_directory
+            || actual_identity != *identity
+            || actual_relative_path != cumulative
+        {
+            return Err(BackendError::InvalidData);
+        }
+        handles.push(handle);
+    }
+    Ok(handles)
+}
+
+struct DirectoryShellCall<'a> {
+    path: &'a str,
+}
+
+impl DirectoryShellCall<'_> {
+    fn path(&self) -> &str {
+        self.path
+    }
+
+    #[cfg(test)]
+    fn verb(&self) -> Option<&str> {
+        None
+    }
+
+    #[cfg(test)]
+    fn parameters(&self) -> Option<&str> {
+        None
+    }
+
+    #[cfg(test)]
+    fn directory(&self) -> Option<&str> {
+        None
+    }
+
+    #[cfg(test)]
+    fn no_ui(&self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn show_normal(&self) -> bool {
+        true
+    }
+}
+
+fn directory_shell_execute_ex_with(
+    path: &str,
+    execute: impl FnOnce(&DirectoryShellCall<'_>) -> bool,
+) -> Result<(), BackendError> {
+    execute(&DirectoryShellCall { path })
+        .then_some(())
+        .ok_or(BackendError::Platform)
+}
+
 fn native_root(volume: &FixedVolume) -> PathBuf {
     PathBuf::from(&volume.identity.volume_guid_path)
 }
 
-#[cfg(not(test))]
 fn native_path(volume: &FixedVolume, relative_path: &str) -> PathBuf {
     if relative_path.is_empty() {
         native_root(volume)
@@ -195,6 +306,165 @@ fn open_pinned_with_policy(
         return Err(BackendError::InvalidData);
     }
     Ok((handle, tag))
+}
+
+struct OwnedPidl(*mut ITEMIDLIST);
+
+impl Drop for OwnedPidl {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
+fn open_execution_component(path: &str, directory: bool) -> Result<OwnedHandle, BackendError> {
+    let wide = to_wide(path)?;
+    let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
+    if directory {
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| match classify_open_failure(error.code()) {
+        OpenFailure::Missing => BackendError::Missing,
+        OpenFailure::Denied => BackendError::Denied,
+        OpenFailure::Failed => BackendError::Platform,
+    })
+}
+
+fn inspect_execution_component(
+    handle: &OwnedHandle,
+    identity: &VolumeIdentity,
+) -> Result<(bool, bool, VolumeIdentity, String), BackendError> {
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileAttributeTagInfo,
+            (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast::<c_void>(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>())
+                .map_err(|_| BackendError::Overflow)?,
+        )
+    }
+    .map_err(|_| BackendError::Platform)?;
+    let mut serial = 0u32;
+    let mut filesystem = vec![0u16; 64];
+    unsafe {
+        GetVolumeInformationByHandleW(
+            handle.0,
+            None,
+            Some(&mut serial),
+            None,
+            None,
+            Some(&mut filesystem),
+        )
+    }
+    .map_err(|_| BackendError::Platform)?;
+
+    let mut final_path = vec![0u16; 32_768];
+    let written = unsafe { GetFinalPathNameByHandleW(handle.0, &mut final_path, VOLUME_NAME_GUID) };
+    let written = usize::try_from(written).map_err(|_| BackendError::Overflow)?;
+    if written == 0 || written >= final_path.len() {
+        return Err(BackendError::Platform);
+    }
+    let final_path =
+        String::from_utf16(&final_path[..written]).map_err(|_| BackendError::InvalidData)?;
+    let root = normalize_guid(&identity.volume_guid_path)?;
+    if final_path.len() < root.len()
+        || !path_strings_equal_ignore_case(&final_path[..root.len()], &root)?
+    {
+        return Err(BackendError::InvalidData);
+    }
+    let relative = final_path[root.len()..]
+        .trim_matches(['\\', '/'])
+        .replace('/', "\\");
+    Ok((
+        tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
+        tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+        VolumeIdentity {
+            volume_guid_path: root,
+            volume_serial: serial,
+            filesystem_name: from_nul_terminated(&filesystem)?.to_uppercase(),
+        },
+        relative,
+    ))
+}
+
+fn pin_indexed_path(
+    volume: &FixedVolume,
+    relative_path: &str,
+    final_is_directory: bool,
+) -> Result<Vec<OwnedHandle>, BackendError> {
+    pin_indexed_path_components_with(
+        &volume.identity,
+        relative_path,
+        final_is_directory,
+        |relative, directory, _| {
+            let path = native_path(volume, relative);
+            open_execution_component(path.to_str().ok_or(BackendError::InvalidData)?, directory)
+        },
+        |handle, _, _| inspect_execution_component(handle, &volume.identity),
+    )
+}
+
+fn reveal_file(path: &str) -> Result<(), BackendError> {
+    let wide = to_wide(path)?;
+    let full = OwnedPidl(unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) });
+    if full.0.is_null() {
+        return Err(BackendError::Platform);
+    }
+    let folder = OwnedPidl(unsafe { ILClone(full.0) });
+    if folder.0.is_null() || !unsafe { ILRemoveLastID(Some(folder.0)) }.as_bool() {
+        return Err(BackendError::Platform);
+    }
+    let child = unsafe { ILFindLastID(full.0) };
+    if child.is_null() {
+        return Err(BackendError::Platform);
+    }
+    unsafe { SHOpenFolderAndSelectItems(folder.0, Some(&[child]), 0) }
+        .map_err(|_| BackendError::Platform)
+}
+
+fn open_directory(path: &str) -> Result<(), BackendError> {
+    directory_shell_execute_ex_with(path, |call| {
+        let Ok(wide) = to_wide(call.path()) else {
+            return false;
+        };
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap_or(0),
+            fMask: SEE_MASK_FLAG_NO_UI,
+            lpFile: PCWSTR(wide.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        unsafe { ShellExecuteExW(&mut info) }.is_ok()
+    })
+}
+
+pub(super) fn execute_indexed_path(
+    volume: &FixedVolume,
+    action: &OpenIndexedPath,
+) -> Result<FileExecutionOutcome, BackendError> {
+    let directory = action.kind == IndexedKind::Directory;
+    let _handles = pin_indexed_path(volume, &action.relative_path, directory)?;
+    let path = native_path(volume, &action.relative_path);
+    let path = path.to_str().ok_or(BackendError::InvalidData)?;
+    if directory {
+        open_directory(path)?;
+        Ok(FileExecutionOutcome::FolderOpenRequested)
+    } else {
+        reveal_file(path)?;
+        Ok(FileExecutionOutcome::FileRevealRequested)
+    }
 }
 
 struct ScanBatcher<F> {
@@ -968,7 +1238,6 @@ pub(super) fn fixed_volumes() -> Result<Vec<FixedVolume>, BackendError> {
     collect_fixed_volumes_with(raw)
 }
 
-#[cfg(not(test))]
 fn read_raw_volume(mount: &str) -> Result<RawVolume, BackendError> {
     let wide = to_wide(mount)?;
     let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
@@ -1011,7 +1280,6 @@ pub(super) fn reauthenticate_volume_with(
     Ok(())
 }
 
-#[cfg(not(test))]
 pub(super) fn reauthenticate_volume(volume: &FixedVolume) -> Result<(), BackendError> {
     let mount = volume
         .mount_point
@@ -1606,7 +1874,6 @@ fn compare_paths(left: &Path, right: &Path) -> Result<std::cmp::Ordering, Backen
     )
 }
 
-#[cfg(not(test))]
 fn path_strings_equal_ignore_case(left: &str, right: &str) -> Result<bool, BackendError> {
     let left = left.encode_utf16().collect::<Vec<_>>();
     let right = right.encode_utf16().collect::<Vec<_>>();
@@ -1622,7 +1889,6 @@ fn split_multi_sz(value: &[u16]) -> Result<Vec<String>, BackendError> {
         .collect()
 }
 
-#[cfg(not(test))]
 fn to_wide(value: &str) -> Result<Vec<u16>, BackendError> {
     if value.contains('\0') {
         return Err(BackendError::InvalidData);
@@ -1630,7 +1896,6 @@ fn to_wide(value: &str) -> Result<Vec<u16>, BackendError> {
     Ok(value.encode_utf16().chain(std::iter::once(0)).collect())
 }
 
-#[cfg(not(test))]
 fn from_nul_terminated(value: &[u16]) -> Result<String, BackendError> {
     let end = value
         .iter()
@@ -1876,15 +2141,17 @@ mod tests {
 
     use super::{
         classify_category, classify_enumeration_error_for_test, classify_open_failure_for_test,
-        collect_fixed_volumes_with, drive_relative_path, excluded_prefix_for_resolved_path_with,
-        filter_replay_events, is_excluded, materialize_event_batches_with, parse_directory_records,
-        parse_event_batch, parse_notifications, path_is_same_or_descendant, push_denied_prefix,
-        reauthenticate_volume_with, run_scanner_batches_with, run_scanner_with,
+        collect_fixed_volumes_with, directory_shell_execute_ex_with, drive_relative_path,
+        excluded_prefix_for_resolved_path_with, filter_replay_events, is_excluded,
+        materialize_event_batches_with, parse_directory_records, parse_event_batch,
+        parse_notifications, path_is_same_or_descendant, pin_indexed_path_components_with,
+        push_denied_prefix, reauthenticate_volume_with, run_scanner_batches_with, run_scanner_with,
         scan_directories_with, shutdown_pending_io_with, validate_pinned_shape, watcher_cycle_with,
         windows_time_to_unix_ms, BackendError, CancelOutcome, CompletionOutcome, DirectoryRecord,
         DirectoryStack, EnumerationStep, EventBuffer, ExcludedPrefix, FixedVolume, IndexEntry,
         IndexedKind, NativeEntry, OpenFailure, PathUpdate, PinnedPathPolicy, RawVolume,
-        ScanBatcher, StructuredEvent, WatchCompletion, DRIVE_FIXED_VALUE, EVENT_CAPACITY,
+        ScanBatcher, StructuredEvent, VolumeIdentity, WatchCompletion, DRIVE_FIXED_VALUE,
+        EVENT_CAPACITY,
     };
 
     fn raw_volume(mount: &str, guid: &str, serial: u32, drive_type: u32) -> RawVolume {
@@ -1894,6 +2161,14 @@ mod tests {
             volume_guid_path: guid.into(),
             volume_serial: serial,
             filesystem_name: "ntfs".into(),
+        }
+    }
+
+    fn execution_identity() -> VolumeIdentity {
+        VolumeIdentity {
+            volume_guid_path: r"\\?\Volume{PIN}\".into(),
+            volume_serial: 1,
+            filesystem_name: "NTFS".into(),
         }
     }
 
@@ -2606,5 +2881,109 @@ mod tests {
             || cancel_failed.borrow_mut().push("release"),
         ));
         assert_eq!(*cancel_failed.borrow(), ["failed", "complete", "release"]);
+    }
+
+    #[test]
+    fn pinned_path_rejects_reparse_type_volume_and_prefix_races() {
+        let opened = RefCell::new(Vec::new());
+        let identity = execution_identity();
+        let handles = pin_indexed_path_components_with(
+            &identity,
+            r"docs\report.pdf",
+            false,
+            |component, expected_directory, share| {
+                opened
+                    .borrow_mut()
+                    .push((component.to_owned(), expected_directory, share));
+                Ok(component.to_owned())
+            },
+            |_, component, expected_directory| {
+                Ok((
+                    false,
+                    expected_directory,
+                    identity.clone(),
+                    component.to_owned(),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(opened.borrow().len(), 2);
+
+        for (reparse, directory, volume, prefix) in [
+            (true, false, r"\\?\Volume{PIN}\", r"docs\report.pdf"),
+            (false, true, r"\\?\Volume{PIN}\", r"docs\report.pdf"),
+            (false, false, r"\\?\Volume{OTHER}\", r"docs\report.pdf"),
+            (false, false, r"\\?\Volume{PIN}\", r"other\report.pdf"),
+        ] {
+            let mut actual_identity = execution_identity();
+            actual_identity.volume_guid_path = volume.to_owned();
+            assert!(pin_indexed_path_components_with(
+                &identity,
+                r"docs\report.pdf",
+                false,
+                |component, _, _| Ok(component.to_owned()),
+                |_, component, expected_directory| Ok((
+                    reparse,
+                    if component.ends_with("report.pdf") {
+                        directory
+                    } else {
+                        expected_directory
+                    },
+                    actual_identity.clone(),
+                    if component.ends_with("report.pdf") {
+                        prefix.to_owned()
+                    } else {
+                        component.to_owned()
+                    },
+                )),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn pinned_path_allows_existing_shared_writers() {
+        let shares = RefCell::new(Vec::new());
+        let identity = execution_identity();
+        assert!(pin_indexed_path_components_with(
+            &identity,
+            r"docs\report.pdf",
+            false,
+            |component, _, share| {
+                shares.borrow_mut().push(share);
+                Ok(component.to_owned())
+            },
+            |_, component, expected_directory| Ok((
+                false,
+                expected_directory,
+                identity.clone(),
+                component.to_owned(),
+            )),
+        )
+        .is_ok());
+        assert!(shares
+            .borrow()
+            .iter()
+            .all(|share| share.allows_write() && !share.allows_delete()));
+    }
+
+    #[test]
+    fn directory_shell_execute_ex_uses_null_verb_args_and_cwd() {
+        let calls = Cell::new(0);
+        assert!(
+            directory_shell_execute_ex_with(r"\\?\Volume{PIN}\docs", |call| {
+                calls.set(calls.get() + 1);
+                assert_eq!(call.path(), r"\\?\Volume{PIN}\docs");
+                assert!(call.verb().is_none());
+                assert!(call.parameters().is_none());
+                assert!(call.directory().is_none());
+                assert!(call.no_ui());
+                assert!(call.show_normal());
+                true
+            },)
+            .is_ok()
+        );
+        assert_eq!(calls.get(), 1);
     }
 }
