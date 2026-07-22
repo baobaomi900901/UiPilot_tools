@@ -16,10 +16,7 @@ use tauri::{
     App, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
-use crate::{
-    model::ResultItem,
-    result_registry::ResultAction,
-};
+use crate::{model::ResultItem, result_registry::ResultAction};
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
 const PLUGIN_BRIDGE: &str = r#"
@@ -171,7 +168,6 @@ impl PluginManager {
                 .ok_or_else(|| io::Error::other("invalid plugin runtime"))?;
             let url = tauri::Url::parse(&format!("uipilot-plugin://localhost/{runtime_name}"))
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            let origin = "uipilot-plugin://localhost".to_string();
             let data_directory = app_data_dir
                 .join("plugin-runtime-data")
                 .join(&entry.window_label)
@@ -189,7 +185,7 @@ impl PluginManager {
                 .incognito(true)
                 .data_directory(data_directory)
                 .initialization_script(PLUGIN_BRIDGE)
-                .on_navigation(move |url| url.as_str().starts_with(&origin))
+                .on_navigation(plugin_navigation_allowed)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .on_download(|_, _| false)
                 .on_document_title_changed(move |_, title| {
@@ -296,9 +292,15 @@ impl PluginManager {
         let entry = self
             .catalog
             .get()
-            .and_then(|catalog| catalog.entries.iter().find(|entry| entry.window_label == label))
+            .and_then(|catalog| {
+                catalog
+                    .entries
+                    .iter()
+                    .find(|entry| entry.window_label == label)
+            })
             .ok_or(PluginQueryError::InvalidResponse)?;
-        let serialized = serde_json::to_vec(&response).map_err(|_| PluginQueryError::InvalidResponse)?;
+        let serialized =
+            serde_json::to_vec(&response).map_err(|_| PluginQueryError::InvalidResponse)?;
         if serialized.len() > 128 * 1024 {
             return self.reject_response(response);
         }
@@ -323,7 +325,10 @@ impl PluginManager {
         for item in response.items {
             if item.title.is_empty()
                 || item.title.chars().count() > 200
-                || item.subtitle.as_ref().is_some_and(|value| value.chars().count() > 500)
+                || item
+                    .subtitle
+                    .as_ref()
+                    .is_some_and(|value| value.chars().count() > 500)
             {
                 let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
                 return Err(PluginQueryError::InvalidResponse);
@@ -706,6 +711,13 @@ fn asset_path(request_path: &str) -> Option<(PathBuf, &'static str)> {
     Some((relative, mime))
 }
 
+fn plugin_navigation_allowed(url: &tauri::Url) -> bool {
+    matches!(
+        (url.scheme(), url.host_str()),
+        ("uipilot-plugin", Some("localhost")) | ("http", Some("uipilot-plugin.localhost"))
+    )
+}
+
 fn response(status: u16, body: Vec<u8>, content_type: Option<&str>) -> Response<Vec<u8>> {
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
@@ -847,8 +859,7 @@ mod tests {
         let cases = [
             valid_manifest("one", "/one")
                 .replace(r#""permissions""#, r#""extra":true,"permissions""#),
-            valid_manifest("manifest-missing", "/manifest-missing")
-                .replace(r#""manifest":1,"#, ""),
+            valid_manifest("manifest-missing", "/manifest-missing").replace(r#""manifest":1,"#, ""),
             valid_manifest("manifest-wrong", "/manifest-wrong")
                 .replace(r#""manifest":1"#, r#""manifest":2"#),
             valid_manifest("two", "/two").replace(r#""1.0.0""#, r#""1.0""#),
@@ -1084,7 +1095,12 @@ mod tests {
             let source = std::fs::read_to_string(file!()).unwrap();
             let bridge = super::super::PLUGIN_BRIDGE;
             assert!(source.contains(".initialization_script(PLUGIN_BRIDGE)"));
-            assert!(bridge.find("Object.defineProperty(window, 'uipilot'").unwrap() < bridge.find("plugin:event|listen").unwrap());
+            assert!(
+                bridge
+                    .find("Object.defineProperty(window, 'uipilot'")
+                    .unwrap()
+                    < bridge.find("plugin:event|listen").unwrap()
+            );
             assert!(bridge.contains("handler(request.input)"));
             assert!(bridge.contains("const internals = () => window.__TAURI_INTERNALS__"));
             assert!(bridge.contains("waitForInternals().then((tauri) =>"));
@@ -1101,6 +1117,26 @@ mod tests {
             assert!(!source.contains(&["wait_until_ready", "(&route.window_label)"].concat()));
             assert!(!source.contains(&["thread", "::sleep"].concat()));
         }
+
+        #[test]
+        fn allows_only_plugin_navigation_origins() {
+            for url in [
+                "uipilot-plugin://localhost/runtime.html",
+                "http://uipilot-plugin.localhost/runtime.html",
+            ] {
+                assert!(super::super::plugin_navigation_allowed(
+                    &tauri::Url::parse(url).unwrap()
+                ));
+            }
+            for url in [
+                "http://uipilot-plugin.localhost.evil/runtime.html",
+                "https://example.com/runtime.html",
+            ] {
+                assert!(!super::super::plugin_navigation_allowed(
+                    &tauri::Url::parse(url).unwrap()
+                ));
+            }
+        }
     }
 
     mod query {
@@ -1108,8 +1144,8 @@ mod tests {
 
         use serde_json::json;
 
-        use super::{load, valid_manifest, TestRoot};
         use super::super::{PendingPluginQuery, PluginManager, PluginQueryError};
+        use super::{load, valid_manifest, TestRoot};
 
         fn manager(root: &TestRoot) -> PluginManager {
             let manager = PluginManager::new();
@@ -1117,7 +1153,18 @@ mod tests {
             manager
         }
 
-        fn wait_for(manager: &PluginManager, request_id: &str) -> mpsc::Receiver<Result<Vec<(crate::model::ResultItem, crate::result_registry::ResultAction)>, PluginQueryError>> {
+        fn wait_for(
+            manager: &PluginManager,
+            request_id: &str,
+        ) -> mpsc::Receiver<
+            Result<
+                Vec<(
+                    crate::model::ResultItem,
+                    crate::result_registry::ResultAction,
+                )>,
+                PluginQueryError,
+            >,
+        > {
             let (sender, receiver) = mpsc::channel();
             manager.pending.write().unwrap().insert(
                 request_id.into(),
@@ -1226,6 +1273,5 @@ mod tests {
             }
             assert!(manager.disabled.read().unwrap().contains("plugin-label"));
         }
-
     }
 }
