@@ -206,7 +206,6 @@ where
             display_name,
             target: ApplicationLaunchTarget::PackagedApp { aumid },
             icon,
-            aliases: Vec::new(),
             use_count: 0,
         });
     }

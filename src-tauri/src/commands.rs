@@ -1056,7 +1056,6 @@ mod tests {
                 executable: Some(PathBuf::from(format!(r"C:\Private\App{index:02}.exe"))),
             },
             icon: None,
-            aliases: Vec::new(),
             use_count: 0,
         }
     }
