@@ -235,15 +235,16 @@ fn require_main_window(window: &WebviewWindow) -> Result<(), CommandError> {
 #[tauri::command]
 pub(crate) async fn search_apps(
     window: WebviewWindow,
-    registry: State<'_, ResultRegistry>,
-    cache: State<'_, Arc<AppCache>>,
-    settings: State<'_, SettingsStore>,
-    plugins: State<'_, Arc<PluginManager>>,
     query: String,
     invocation_id: String,
     query_sequence: u64,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
+    let app = window.app_handle();
+    let registry = app.state::<ResultRegistry>();
+    let cache = app.state::<Arc<AppCache>>();
+    let settings = app.state::<SettingsStore>();
+    let plugins = app.state::<Arc<PluginManager>>();
     if let Some(route) = plugins.route(&query) {
         let Some(token) = registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
         else {
@@ -688,30 +689,31 @@ fn save_settings_core(
 #[tauri::command]
 pub(crate) fn execute_result(
     window: WebviewWindow,
-    app: AppHandle,
-    registry: State<'_, ResultRegistry>,
-    plugins: State<'_, Arc<PluginManager>>,
-    validation: State<'_, ValidationStore>,
-    settings: State<'_, SettingsStore>,
-    cache: State<'_, Arc<AppCache>>,
     request_id: String,
     result_id: String,
 ) -> Result<ExecuteOutcome, CommandError> {
     require_main_window(&window)?;
+    let app = window.app_handle().clone();
+    let registry = app.state::<ResultRegistry>();
+    let plugins = app.state::<Arc<PluginManager>>();
+    let validation = app.state::<ValidationStore>();
+    let settings = app.state::<SettingsStore>();
+    let cache = app.state::<Arc<AppCache>>();
     execute_result_with_clipboard(
         (&request_id, &result_id),
-        |request_id, result_id| registry.resolve(request_id, result_id),
-        |action| apps::execute_application(action).map_err(|_| ()),
-        |plugin_id| plugins.authorizes_clipboard(plugin_id),
-        |text| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
-        || clear_and_hide(&registry, &window),
-        |event| validation.record(event).map_err(|_| ()),
-        |app_id| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
+        ClipboardExecution {
+            resolve: |request_id: &str, result_id: &str| registry.resolve(request_id, result_id),
+            execute: |action: &ResultAction| apps::execute_application(action).map_err(|_| ()),
+            authorize_plugin: |plugin_id: &str| plugins.authorizes_clipboard(plugin_id),
+            copy_text: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
+            clear_and_hide: || clear_and_hide(&registry, &window),
+            record: |event| validation.record(event).map_err(|_| ()),
+            increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
+        },
     )
 }
 
-fn execute_result_with_clipboard<R, A, P, C, H, V, S>(
-    ids: (&str, &str),
+struct ClipboardExecution<R, A, P, C, H, V, S> {
     resolve: R,
     execute: A,
     authorize_plugin: P,
@@ -719,6 +721,11 @@ fn execute_result_with_clipboard<R, A, P, C, H, V, S>(
     clear_and_hide: H,
     record: V,
     increment: S,
+}
+
+fn execute_result_with_clipboard<R, A, P, C, H, V, S>(
+    ids: (&str, &str),
+    execution: ClipboardExecution<R, A, P, C, H, V, S>,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
@@ -730,6 +737,15 @@ where
     S: FnOnce(&str) -> Result<(), ()>,
 {
     let (request_id, result_id) = ids;
+    let ClipboardExecution {
+        resolve,
+        execute,
+        authorize_plugin,
+        copy_text,
+        clear_and_hide,
+        record,
+        increment,
+    } = execution;
     let action = resolve(request_id, result_id).map_err(|error| match error {
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
@@ -2527,7 +2543,7 @@ mod tests {
     }
 
     mod execute_plugin {
-        use super::super::execute_result_with_clipboard;
+        use super::super::{execute_result_with_clipboard, ClipboardExecution};
         use super::*;
 
         fn copy_action() -> ResultAction {
@@ -2544,19 +2560,21 @@ mod tests {
             assert_eq!(
                 execute_result_with_clipboard(
                     ("request", "result"),
-                    |_, _| Ok(copy_action()),
-                    |_| unreachable!(),
-                    |_| false,
-                    |_| {
-                        clipboard.set(clipboard.get() + 1);
-                        Ok(())
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Ok(copy_action()),
+                        execute: |_: &ResultAction| unreachable!(),
+                        authorize_plugin: |_: &str| false,
+                        copy_text: |_: &str| {
+                            clipboard.set(clipboard.get() + 1);
+                            Ok(())
+                        },
+                        clear_and_hide: || {
+                            hide.set(hide.get() + 1);
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| unreachable!(),
+                        increment: |_: &str| unreachable!(),
                     },
-                    || {
-                        hide.set(hide.get() + 1);
-                        Ok(())
-                    },
-                    |_| unreachable!(),
-                    |_| unreachable!(),
                 ),
                 Err(CommandError::plugin_permission_denied())
             );
@@ -2570,34 +2588,36 @@ mod tests {
             assert_eq!(
                 execute_result_with_clipboard(
                     ("request", "result"),
-                    |_, _| {
-                        trace.borrow_mut().push("resolve");
-                        Ok(copy_action())
-                    },
-                    |_| {
-                        trace.borrow_mut().push("launch");
-                        unreachable!()
-                    },
-                    |plugin_id| {
-                        trace.borrow_mut().push("permission");
-                        plugin_id == "plugin"
-                    },
-                    |text| {
-                        trace.borrow_mut().push("clipboard");
-                        assert_eq!(text, "copy me");
-                        Ok(())
-                    },
-                    || {
-                        trace.borrow_mut().push("clear-hide");
-                        Ok(())
-                    },
-                    |_| {
-                        trace.borrow_mut().push("validation");
-                        unreachable!()
-                    },
-                    |_| {
-                        trace.borrow_mut().push("use-count");
-                        unreachable!()
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| {
+                            trace.borrow_mut().push("resolve");
+                            Ok(copy_action())
+                        },
+                        execute: |_: &ResultAction| {
+                            trace.borrow_mut().push("launch");
+                            unreachable!()
+                        },
+                        authorize_plugin: |plugin_id: &str| {
+                            trace.borrow_mut().push("permission");
+                            plugin_id == "plugin"
+                        },
+                        copy_text: |text: &str| {
+                            trace.borrow_mut().push("clipboard");
+                            assert_eq!(text, "copy me");
+                            Ok(())
+                        },
+                        clear_and_hide: || {
+                            trace.borrow_mut().push("clear-hide");
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| {
+                            trace.borrow_mut().push("validation");
+                            unreachable!()
+                        },
+                        increment: |_: &str| {
+                            trace.borrow_mut().push("use-count");
+                            unreachable!()
+                        },
                     },
                 ),
                 Ok(ExecuteOutcome::TextCopied)
@@ -2614,16 +2634,18 @@ mod tests {
             assert_eq!(
                 execute_result_with_clipboard(
                     ("request", "result"),
-                    |_, _| Ok(copy_action()),
-                    |_| unreachable!(),
-                    |_| true,
-                    |_| Err(()),
-                    || {
-                        hide.set(hide.get() + 1);
-                        Ok(())
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Ok(copy_action()),
+                        execute: |_: &ResultAction| unreachable!(),
+                        authorize_plugin: |_: &str| true,
+                        copy_text: |_: &str| Err(()),
+                        clear_and_hide: || {
+                            hide.set(hide.get() + 1);
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| unreachable!(),
+                        increment: |_: &str| unreachable!(),
                     },
-                    |_| unreachable!(),
-                    |_| unreachable!(),
                 ),
                 Err(CommandError::clipboard_write_failed())
             );
@@ -2636,22 +2658,24 @@ mod tests {
                 let side_effects = Cell::new(0);
                 let result = execute_result_with_clipboard(
                     ("request", "result"),
-                    |_, _| Err(error),
-                    |_| unreachable!(),
-                    |_| {
-                        side_effects.set(side_effects.get() + 1);
-                        true
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Err(error),
+                        execute: |_: &ResultAction| unreachable!(),
+                        authorize_plugin: |_: &str| {
+                            side_effects.set(side_effects.get() + 1);
+                            true
+                        },
+                        copy_text: |_: &str| {
+                            side_effects.set(side_effects.get() + 1);
+                            Ok(())
+                        },
+                        clear_and_hide: || {
+                            side_effects.set(side_effects.get() + 1);
+                            Ok(())
+                        },
+                        record: |_: ValidationEvent| unreachable!(),
+                        increment: |_: &str| unreachable!(),
                     },
-                    |_| {
-                        side_effects.set(side_effects.get() + 1);
-                        Ok(())
-                    },
-                    || {
-                        side_effects.set(side_effects.get() + 1);
-                        Ok(())
-                    },
-                    |_| unreachable!(),
-                    |_| unreachable!(),
                 );
                 assert_eq!(
                     result,
