@@ -2417,6 +2417,7 @@ mod tests {
             mpsc,
         },
         thread,
+        time::Instant,
     };
 
     use rusqlite::{params, Connection};
@@ -2480,6 +2481,102 @@ mod tests {
             category,
             sort,
         }
+    }
+
+    fn run_million_row_query_gate() {
+        const ROWS: usize = 1_000_000;
+        const BATCH: usize = 5_000;
+        const SAMPLES: usize = 7;
+
+        let dir = TestDir::new();
+        let database = dir.path().join("million-row.sqlite3");
+        let volume = volume();
+        let mut store = Store::open(&database, "identity-a").unwrap();
+        {
+            let connection = store.connection_for_test();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO volumes(volume_guid_path, volume_serial, filesystem_name, mount_point, committed_generation, candidate_generation, next_generation, scan_state) VALUES(?1,?2,?3,'C:\\','1',NULL,'2','idle')",
+                    params![volume.volume_guid_path, volume.volume_serial, volume.filesystem_name],
+                )
+                .unwrap();
+            for start in (0..ROWS).step_by(BATCH) {
+                let transaction = connection.transaction().unwrap();
+                for offset in 0..BATCH.min(ROWS - start) {
+                    let number = start + offset;
+                    let name = if number % 10 < 3 {
+                        format!("alpha-beta-gamma-{number:07}.txt")
+                    } else if number % 10 < 6 {
+                        format!("alpha-beta-{number:07}.txt")
+                    } else {
+                        format!("other-{number:07}.txt")
+                    };
+                    let category = if number % 5 == 0 {
+                        "documents"
+                    } else {
+                        "other"
+                    };
+                    transaction
+                        .execute(
+                            "INSERT INTO entries(volume_guid_path, volume_serial, filesystem_name, relative_path, display_path, name, folded_name, kind, category, size_bytes, modified_utc_ms, generation) VALUES(?1,?2,?3,?4,?5,?6,?7,'file',?8,?9,?10,'1')",
+                            params![
+                                volume.volume_guid_path,
+                                volume.volume_serial,
+                                volume.filesystem_name,
+                                format!(r"Corpus\{number:07}.txt"),
+                                format!(r"C:\Corpus\{number:07}.txt"),
+                                name,
+                                crate::file_index::fold_name(&name),
+                                category,
+                                (number % 8192).to_string(),
+                                1_700_000_000_000_i64 + i64::try_from(number).unwrap(),
+                            ],
+                        )
+                        .unwrap();
+                }
+                transaction.commit().unwrap();
+            }
+        }
+
+        let mut durations = Vec::new();
+        for text in ["a", "al", "alpha beta gamma"] {
+            let spec = query(text, FileCategory::All, FileSort::ModifiedDesc);
+            let warm = store
+                .query_for_test(&spec, std::slice::from_ref(&volume))
+                .unwrap();
+            assert!(
+                warm.total >= 300_000,
+                "query did not match the required floor"
+            );
+            assert!(warm.entries.len() <= 200);
+            for pair in warm.entries.windows(2) {
+                assert!(pair[0].modified_utc >= pair[1].modified_utc);
+            }
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let sampled = store
+                    .query_for_test(&spec, std::slice::from_ref(&volume))
+                    .unwrap();
+                assert_eq!(sampled.total, warm.total);
+                assert_eq!(sampled.entries.len(), warm.entries.len());
+                durations.push(started.elapsed().as_millis() as u64);
+            }
+        }
+        durations.sort_unstable();
+        let p95_index = ((durations.len() * 95).div_ceil(100)).saturating_sub(1);
+        let database_bytes = fs::metadata(&database).unwrap().len();
+        println!(
+            "UIPILOT_FIND_DATABASE_SUMMARY {{\"rows\":{ROWS},\"samples\":{},\"p95Ms\":{},\"databaseBytes\":{},\"peakWorkingSetBytes\":0}}",
+            durations.len(),
+            durations[p95_index],
+            database_bytes
+        );
+    }
+
+    #[test]
+    #[ignore = "Task11 million-row gate is run only by scripts/test-find-performance.ps1"]
+    fn million_row_query_gate() {
+        run_million_row_query_gate();
     }
 
     fn assert_rejected_without_writes(path: &Path) {
