@@ -9,6 +9,7 @@
     "allow-execute-result",
     "allow-load-settings",
     "allow-save-settings",
+    "allow-save-hotkey",
     "allow-set-file-preview-preference",
     "allow-rescan-apps",
     "allow-export-validation-data",

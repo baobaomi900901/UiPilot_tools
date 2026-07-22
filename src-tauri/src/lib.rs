@@ -450,6 +450,14 @@ mod tests {
     }
 
     #[test]
+    fn save_hotkey_command_is_declared_and_allowed() {
+        assert!(include_str!("../build.rs").contains("\"save_hotkey\","));
+        assert!(
+            include_str!("../capabilities/main.json").contains("\"allow-save-hotkey\"")
+        );
+    }
+
+    #[test]
     fn production_lifecycle_wires_one_coordinator_and_exact_event_sources() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let production = source

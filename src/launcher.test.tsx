@@ -1125,6 +1125,25 @@ describe('settings ownership', () => {
     expect(core.getSnapshot().settings!.autostart).toBe(true)
   })
 
+  it('records DoubleCtrl from the settings hotkey input', async () => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore()
+    const mounted = await mountLauncherView(core)
+    const settings = core.getSnapshot().settings!
+    const input = mounted.host.querySelector<HTMLInputElement>(`input[name="settings-hotkey-${settings.hotkey.key}"]`)
+    if (!input) throw new Error('settings hotkey input missing')
+
+    await act(async () => input.focus())
+    await act(async () => {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft', bubbles: true, cancelable: true }))
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
+    })
+
+    expect(client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } })
+    await mounted.unmount()
+  })
+
   it('restores durable hotkey and preserves other drafts after dedicated save failure', async () => {
     const { core, client } = await settingsCore()
     const settings = core.getSnapshot().settings!
