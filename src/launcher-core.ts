@@ -282,6 +282,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let fileListenerToken = 0
   let fileRefreshTimer: ReturnType<typeof setTimeout> | undefined
   let fileRefreshMaxTimer: ReturnType<typeof setTimeout> | undefined
+  let fileStreamingPollTimer: ReturnType<typeof setTimeout> | undefined
   let fileRefreshRequired = 0n
   let previewPreferenceToken = 0
   let previewPreferencePending: PreviewPreferenceOwner | undefined
@@ -406,8 +407,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function clearFileRefreshTimers(): void {
     if (fileRefreshTimer !== undefined) clearTimeout(fileRefreshTimer)
     if (fileRefreshMaxTimer !== undefined) clearTimeout(fileRefreshMaxTimer)
+    if (fileStreamingPollTimer !== undefined) clearTimeout(fileStreamingPollTimer)
     fileRefreshTimer = undefined
     fileRefreshMaxTimer = undefined
+    fileStreamingPollTimer = undefined
     fileRefreshRequired = 0n
   }
 
@@ -568,6 +571,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     model.status = fileStatusText(response.status, results.length > 0)
     publish(true)
+    scheduleFileStreamingPoll()
   }
 
   function failFileSearch(owner: FileSearchOwner, error: unknown): void {
@@ -648,9 +652,23 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     beginFileSearch(required)
   }
 
+  function runFileStreamingPoll(): void {
+    fileStreamingPollTimer = undefined
+    const file = model.file
+    if (!file || file.indexStatus !== 'building' || model.searchPending || !nextFileSequence()) return
+    beginFileSearch(file.latestSeenRevision)
+  }
+
+  function scheduleFileStreamingPoll(): void {
+    if (!model.file || model.file.indexStatus !== 'building' || model.searchPending || fileStreamingPollTimer !== undefined) return
+    fileStreamingPollTimer = setTimeout(runFileStreamingPoll, 1_000)
+  }
+
   function scheduleFileRefresh(required: bigint): void {
     fileRefreshRequired = required > fileRefreshRequired ? required : fileRefreshRequired
     if (fileRefreshTimer !== undefined) clearTimeout(fileRefreshTimer)
+    if (fileStreamingPollTimer !== undefined) clearTimeout(fileStreamingPollTimer)
+    fileStreamingPollTimer = undefined
     fileRefreshTimer = setTimeout(runFileRefresh, 250)
     fileRefreshMaxTimer ??= setTimeout(runFileRefresh, 1_000)
   }

@@ -2472,6 +2472,34 @@ describe('file index refresh', () => {
     }
   })
 
+  it('polls while the file index is building so streaming candidate rows become visible', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = fakeClient()
+      vi.mocked(fake.client.searchFiles)
+        .mockResolvedValueOnce(fileResponse('1', [], 'building'))
+        .mockResolvedValueOnce(
+          fileResponse('2', [folderItem(String.raw`C:\Users\moby\Desktop\云图`, 'cloud-map')], 'building'),
+        )
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('streaming-poll'))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find 云图', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+
+      await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledOnce())
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() =>
+        expect(core.getSnapshot().file?.results[0]?.fullPath).toBe(String.raw`C:\Users\moby\Desktop\云图`),
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('invalidates refresh and response owners at hide and unlistens once at destroy', async () => {
     vi.useFakeTimers()
     try {

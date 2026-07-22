@@ -69,7 +69,7 @@ permissions = ["core:default"]
 
   Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
   $config = Get-Content $configPath -Raw | ConvertFrom-Json
-  $config.app.windows[0] | Add-Member -NotePropertyName url -NotePropertyValue 'https://example.com'
+  $config.app.windows[0].PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('url', 'https://example.com'))
   $config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $configPath
   $remoteWindowResult = Invoke-FixtureCheck
   if ($remoteWindowResult.ExitCode -eq 0) {
@@ -79,7 +79,7 @@ permissions = ["core:default"]
   Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
   $capabilityPath = "$fixtureRoot/src-tauri/capabilities/main.json"
   $capability = Get-Content $capabilityPath -Raw | ConvertFrom-Json
-  $capability | Add-Member -NotePropertyName remote -NotePropertyValue ([pscustomobject]@{})
+  $capability.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('remote', [pscustomobject]@{}))
   $capability | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $capabilityPath
   $remoteCapabilityResult = Invoke-FixtureCheck
   if ($remoteCapabilityResult.ExitCode -eq 0) {
@@ -94,7 +94,7 @@ permissions = ["core:default"]
     windows = @('main')
     permissions = @('core:default')
   }
-  $config.app.security | Add-Member -NotePropertyName capabilities -NotePropertyValue @($inlineCapability)
+  $config.app.security.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('capabilities', @($inlineCapability)))
   $config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $configPath
   $inlineResult = Invoke-FixtureCheck
   if ($inlineResult.ExitCode -eq 0) {
@@ -104,7 +104,7 @@ permissions = ["core:default"]
   Copy-Item "$repoRoot/src-tauri/tauri.conf.json" $configPath -Force
   $probeConfigPath = "$fixtureRoot/src-tauri/tauri.security-probe.conf.json"
   $probeConfig = Get-Content $probeConfigPath -Raw | ConvertFrom-Json
-  $probeConfig | Add-Member -NotePropertyName app -NotePropertyValue ([pscustomobject]@{
+  $probeConfig.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('app', [pscustomobject]@{
     security = [pscustomobject]@{
       capabilities = @([pscustomobject]@{
         identifier = 'probe-inline-extra'
@@ -112,7 +112,7 @@ permissions = ["core:default"]
         permissions = @('core:event:allow-listen')
       })
     }
-  })
+  }))
   $probeConfig | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $probeConfigPath
   $probeInlineResult = Invoke-FixtureCheck
   if ($probeInlineResult.ExitCode -eq 0) {

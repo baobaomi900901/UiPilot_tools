@@ -66,7 +66,8 @@ pub(super) const DRIVE_FIXED_VALUE: u32 = 3;
 const ERROR_NO_MORE_FILES_CODE: u32 = 18;
 
 struct DirectoryStack {
-    priority: Vec<String>,
+    warm: Vec<String>,
+    user: Vec<String>,
     ordinary: Vec<String>,
 }
 
@@ -74,34 +75,54 @@ impl DirectoryStack {
     #[cfg(test)]
     fn root() -> Self {
         Self {
-            priority: Vec::new(),
+            warm: Vec::new(),
+            user: Vec::new(),
             ordinary: vec![String::new()],
         }
     }
 
     fn push(&mut self, relative_path: String) -> Result<(), BackendError> {
-        if self.priority.len() + self.ordinary.len() == EVENT_CAPACITY {
+        if self.warm.len() + self.user.len() + self.ordinary.len() == EVENT_CAPACITY {
             return Err(BackendError::Overflow);
         }
-        if scan_priority(&relative_path) == 0 {
-            self.ordinary.push(relative_path);
-        } else {
-            self.priority.push(relative_path);
+        match scan_priority(&relative_path) {
+            2 => self.warm.push(relative_path),
+            1 => self.user.push(relative_path),
+            _ => self.ordinary.push(relative_path),
         }
         Ok(())
     }
 
     fn pop(&mut self) -> Option<String> {
-        self.priority.pop().or_else(|| self.ordinary.pop())
+        self.warm
+            .pop()
+            .or_else(|| self.user.pop())
+            .or_else(|| self.ordinary.pop())
     }
 }
 
 fn scan_priority(relative_path: &str) -> u8 {
-    if relative_path == "Users" || relative_path.starts_with(r"Users\") {
+    if is_warm_user_path(relative_path) {
+        2
+    } else if relative_path == "Users" || relative_path.starts_with(r"Users\") {
         1
     } else {
         0
     }
+}
+
+fn is_warm_user_path(relative_path: &str) -> bool {
+    let mut parts = relative_path.split('\\');
+    if parts.next() != Some("Users") {
+        return false;
+    }
+    if parts.next().is_none() {
+        return false;
+    }
+    matches!(
+        parts.next(),
+        Some("Desktop" | "Downloads" | "Documents" | "Pictures" | "Videos" | "Music")
+    )
 }
 
 fn push_denied_prefix(
@@ -1550,7 +1571,8 @@ where
     ) -> Result<(), BackendError>,
 {
     let mut pending = DirectoryStack {
-        priority: Vec::new(),
+        warm: Vec::new(),
+        user: Vec::new(),
         ordinary: vec![relative_root],
     };
     while let Some(relative_directory) = pending.pop() {
@@ -2802,6 +2824,89 @@ mod tests {
                         for index in 0..SCAN_BATCH_SIZE {
                             visit(DirectoryRecord {
                                 name: format!("system-{index}.dll"),
+                                attributes: 0,
+                                size: 1,
+                                modified: 116_444_736_000_000_000,
+                            })?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let first_batch = first_batch.into_inner().unwrap();
+        assert!(first_batch
+            .iter()
+            .any(|path| path == r"Users\moby\Desktop\云图"));
+    }
+
+    #[test]
+    fn user_profile_scan_prioritizes_warm_folders_before_app_data() {
+        let volume = collect_fixed_volumes_with([raw_volume(
+            "C:\\",
+            r"\\?\Volume{C}\",
+            7,
+            DRIVE_FIXED_VALUE,
+        )])
+        .unwrap()
+        .remove(0);
+        let first_batch = RefCell::new(None::<Vec<String>>);
+        let mut batcher = ScanBatcher::new(|batch: Vec<IndexEntry>| {
+            if first_batch.borrow().is_none() {
+                *first_batch.borrow_mut() =
+                    Some(batch.into_iter().map(|entry| entry.relative_path).collect());
+            }
+            Ok(())
+        });
+        let mut denied_prefixes = Vec::new();
+
+        scan_directories_with(
+            &volume,
+            &[],
+            || false,
+            &mut batcher,
+            &mut denied_prefixes,
+            |relative, visit| {
+                match relative {
+                    "" => visit(DirectoryRecord {
+                        name: "Users".into(),
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        size: 0,
+                        modified: 116_444_736_000_000_000,
+                    })?,
+                    "Users" => visit(DirectoryRecord {
+                        name: "moby".into(),
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        size: 0,
+                        modified: 116_444_736_000_000_000,
+                    })?,
+                    r"Users\moby" => {
+                        visit(DirectoryRecord {
+                            name: "Desktop".into(),
+                            attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                            size: 0,
+                            modified: 116_444_736_000_000_000,
+                        })?;
+                        visit(DirectoryRecord {
+                            name: "AppData".into(),
+                            attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                            size: 0,
+                            modified: 116_444_736_000_000_000,
+                        })?;
+                    }
+                    r"Users\moby\Desktop" => visit(DirectoryRecord {
+                        name: "云图".into(),
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        size: 0,
+                        modified: 116_444_736_000_000_000,
+                    })?,
+                    r"Users\moby\AppData" => {
+                        for index in 0..SCAN_BATCH_SIZE {
+                            visit(DirectoryRecord {
+                                name: format!("cache-{index}.bin"),
                                 attributes: 0,
                                 size: 1,
                                 modified: 116_444_736_000_000_000,
