@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -16,7 +16,9 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
-        WindowsAndMessaging::{WM_ENDSESSION, WM_NCDESTROY, WM_QUERYENDSESSION},
+        WindowsAndMessaging::{
+            WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_QUERYENDSESSION,
+        },
     },
 };
 
@@ -492,6 +494,7 @@ pub(crate) struct LifecycleCoordinator {
     next_invocation: AtomicU64,
     lifecycle_phase: AtomicU8,
     lifecycle_attempt_epoch: AtomicU64,
+    window_move_active: AtomicBool,
     readiness: Mutex<Readiness>,
     modal: Mutex<ModalState>,
     exit_gate: Mutex<ExitGate>,
@@ -507,6 +510,7 @@ impl Default for LifecycleCoordinator {
             next_invocation: AtomicU64::new(0),
             lifecycle_phase: AtomicU8::new(FileIndexPhase::Running as u8),
             lifecycle_attempt_epoch: AtomicU64::new(0),
+            window_move_active: AtomicBool::new(false),
             readiness: Mutex::new(Readiness::default()),
             modal: Mutex::new(ModalState::Normal),
             exit_gate: Mutex::new(ExitGate::default()),
@@ -1064,6 +1068,9 @@ impl LifecycleCoordinator {
         Q: FnOnce() -> Result<bool, ()>,
         H: FnMut() -> Result<(), ()>,
     {
+        if !focused && self.window_move_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let decision = self
             .modal
             .lock()
@@ -1091,6 +1098,14 @@ impl LifecycleCoordinator {
             .lock()
             .expect("modal lock poisoned")
             .on_successful_show();
+    }
+
+    fn observe_window_move_message(&self, message: u32) {
+        match message {
+            WM_ENTERSIZEMOVE => self.window_move_active.store(true, Ordering::Release),
+            WM_EXITSIZEMOVE => self.window_move_active.store(false, Ordering::Release),
+            _ => {}
+        }
     }
 
     fn show_main(
@@ -1642,6 +1657,8 @@ unsafe extern "system" fn session_subclass_proc(
     context: usize,
 ) -> LRESULT {
     let app = unsafe { (&*(context as *const AppHandle)).clone() };
+    app.state::<Arc<LifecycleCoordinator>>()
+        .observe_window_move_message(message);
     LRESULT(handle_session_message_with(
         message,
         wparam.0,
@@ -3412,6 +3429,35 @@ mod tests {
     }
 
     #[test]
+    fn native_window_move_suppresses_only_its_focus_loss() {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE};
+
+        let coordinator = coordinator_for_test();
+        coordinator.observe_window_move_message(WM_ENTERSIZEMOVE);
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("native move focus loss must not query"),
+                || panic!("native move focus loss must not hide"),
+            )
+            .unwrap();
+
+        coordinator.observe_window_move_message(WM_EXITSIZEMOVE);
+        let hides = Cell::new(0);
+        coordinator
+            .handle_focus_event_with(
+                false,
+                || panic!("normal focus loss must not query"),
+                || {
+                    hides.set(hides.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(hides.get(), 1);
+    }
+
+    #[test]
     fn production_callbacks_focus_awaiting_resolves_every_query_result() {
         for (focus_result, expected, expected_clears) in [
             (Ok(true), Ok(()), 0),
@@ -3869,6 +3915,7 @@ mod tests {
             assert!(production.contains(generated_api));
         }
         assert!(production.contains("install_subclass_context_with(app.clone()"));
+        assert!(production.contains("observe_window_move_message(message)"));
         assert!(!production.contains("windows_link::link!"));
         assert!(!production.contains("#[link("));
         assert!(!production.contains("struct SessionHookContext"));
