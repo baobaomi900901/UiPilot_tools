@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc, OnceLock, RwLock,
     },
+    thread,
     time::Duration,
 };
 
@@ -55,7 +56,11 @@ const PLUGIN_BRIDGE: &str = r#"
       });
     }
   });
-  internals.event.listen('uipilot-plugin-query', (event) => deliver(event.payload)).then(() => {
+  internals.invoke('plugin:event|listen', {
+    event: 'uipilot-plugin-query',
+    target: { kind: 'Any' },
+    handler: internals.transformCallback((event) => deliver(event.payload)),
+  }).then(() => {
     listening = true;
     ready();
   });
@@ -204,6 +209,29 @@ impl PluginManager {
         }
     }
 
+    fn wait_until_ready(&self, label: &str) -> Result<(), PluginQueryError> {
+        for _ in 0..50 {
+            if self
+                .disabled
+                .read()
+                .map_err(|_| PluginQueryError::RuntimeDisabled)?
+                .contains(label)
+            {
+                return Err(PluginQueryError::RuntimeDisabled);
+            }
+            if self
+                .ready
+                .read()
+                .map_err(|_| PluginQueryError::RuntimeDisabled)?
+                .contains(label)
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Err(PluginQueryError::Timeout)
+    }
+
     pub(crate) fn disable_runtime(&self, label: &str) {
         if let Ok(mut disabled) = self.disabled.write() {
             disabled.insert(label.to_string());
@@ -233,6 +261,7 @@ impl PluginManager {
         {
             return Err(PluginQueryError::RuntimeDisabled);
         }
+        self.wait_until_ready(&route.window_label)?;
         let request_id = self.allocate_request_id();
         let (sender, receiver) = mpsc::channel();
         self.pending
@@ -1074,11 +1103,14 @@ mod tests {
         #[test]
         fn bridge_is_loaded_by_tauri_not_csp_blocked_html() {
             let source = std::fs::read_to_string(file!()).unwrap();
+            let bridge = super::super::PLUGIN_BRIDGE;
             assert!(source.contains(".initialization_script(PLUGIN_BRIDGE)"));
-            assert!(source.contains("handler(request.input)"));
-            assert!(source.contains("requestId: activeRequest.requestId"));
-            assert!(source.contains("protocolVersion: 1"));
-            assert!(source.contains("uipilot-plugin-ready"));
+            assert!(bridge.contains("handler(request.input)"));
+            assert!(bridge.contains("internals.invoke('plugin:event|listen'"));
+            assert!(bridge.contains("internals.transformCallback"));
+            assert!(bridge.contains("requestId: activeRequest.requestId"));
+            assert!(bridge.contains("protocolVersion: 1"));
+            assert!(bridge.contains("uipilot-plugin-ready"));
         }
     }
 
@@ -1204,6 +1236,18 @@ mod tests {
                 manager.record_timeout("plugin-label");
             }
             assert!(manager.disabled.read().unwrap().contains("plugin-label"));
+        }
+
+        #[test]
+        fn query_waits_until_runtime_is_ready() {
+            let manager = std::sync::Arc::new(PluginManager::new());
+            let marker = manager.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                marker.mark_ready("plugin-label");
+            });
+
+            assert_eq!(manager.wait_until_ready("plugin-label"), Ok(()));
         }
     }
 }
