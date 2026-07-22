@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-07-22
-- 状态：实现完成，等待 worktree 验收
+- 状态：实现完成，worktree 与 main 人工验收通过
 - 实现基线：本地 `main@16dd26ea9346809c1aad8462aa811df37036b68b`
 - 影响范围：Rust Start Menu Known Folder 查询、快捷方式候选收集、应用身份与发现测试
 
