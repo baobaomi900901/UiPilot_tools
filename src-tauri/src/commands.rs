@@ -1143,6 +1143,9 @@ pub(crate) fn clear_and_hide(
     let settings = window.state::<SettingsStore>();
     clear_and_hide_with(
         || {
+            if !window.is_visible().map_err(|_| ())? {
+                return Err(());
+            }
             window
                 .outer_position()
                 .map(|position| WindowPosition {
@@ -2349,6 +2352,17 @@ mod tests {
         assert!(body.contains("clear_and_hide(&registry, &window)"));
         assert!(!body.contains("registry.hide_and_clear"));
         assert!(!body.contains("window.hide()"));
+    }
+
+    #[test]
+    fn shared_clear_and_hide_does_not_save_a_never_visible_startup_position() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let body = source
+            .split("pub(crate) fn clear_and_hide(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn clear_and_hide_with(").next())
+            .expect("clear_and_hide source markers are missing");
+        assert!(body.find("window.is_visible()").unwrap() < body.find("outer_position()").unwrap());
     }
 
     #[test]

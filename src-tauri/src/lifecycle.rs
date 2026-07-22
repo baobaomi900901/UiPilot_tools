@@ -1659,6 +1659,9 @@ unsafe extern "system" fn session_subclass_proc(
     let app = unsafe { (&*(context as *const AppHandle)).clone() };
     app.state::<Arc<LifecycleCoordinator>>()
         .observe_window_move_message(message);
+    if message == WM_EXITSIZEMOVE {
+        let _ = save_window_position(&app);
+    }
     LRESULT(handle_session_message_with(
         message,
         wparam.0,
@@ -1678,6 +1681,20 @@ unsafe extern "system" fn session_subclass_proc(
             };
         },
     ))
+}
+
+fn save_window_position(app: &AppHandle) -> Result<(), ()> {
+    let position = app
+        .get_webview_window("main")
+        .ok_or(())?
+        .outer_position()
+        .map_err(|_| ())?;
+    app.state::<SettingsStore>()
+        .set_window_position(WindowPosition {
+            x: position.x,
+            y: position.y,
+        })
+        .map_err(|_| ())
 }
 
 pub(crate) fn install_session_end_hook(
@@ -3916,6 +3933,12 @@ mod tests {
         }
         assert!(production.contains("install_subclass_context_with(app.clone()"));
         assert!(production.contains("observe_window_move_message(message)"));
+        let session_callback = production
+            .split("unsafe extern \"system\" fn session_subclass_proc")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn install_session_end_hook").next())
+            .expect("session callback source markers are missing");
+        assert!(session_callback.contains("save_window_position"));
         assert!(!production.contains("windows_link::link!"));
         assert!(!production.contains("#[link("));
         assert!(!production.contains("struct SessionHookContext"));
