@@ -105,9 +105,13 @@ PluginView {
 
 当前一次性 `OnceLock<PluginCatalog>` 改为受锁保护的活动目录。目录读取仍提供短生命周期快照，查询路径不持有写锁等待插件运行时响应。
 
-插件变更由一个管理器内的 mutation lock 串行化。MVP 同一时刻只执行一次重载或删除，避免两个操作同时修改目录、ready 状态和 WebView。
+每个活动 entry 记录宿主生成且单调递增的 `generation`、运行时 label，以及该活动包在加载或成功重载时取得的 Windows volume/file identity。generation 溢出时该插件的后续重载 fail closed，旧 generation 保持活动。
+
+插件变更由一个管理器内的 mutation lock 串行化。MVP 同一时刻只执行一次重载或删除，避免两个操作同时修改目录、admission、ready 状态和 WebView。
 
 管理器同时维护仅在重载期间存在的 staged runtime 映射。自定义协议可以为活动运行时和 staged runtime 提供资产，但查询路由只指向活动目录。
+
+管理器另有一个 plugin admission gate。查询发布、插件剪贴板副作用和不改变活动 generation 的 runtime ownership callback 取得 read admission；重载切换、删除提交和活动 runtime 失败转换取得 write admission。mutation lock 只负责串行化管理命令，不能代替 admission gate。
 
 ## 事务式重新加载
 
@@ -116,11 +120,12 @@ PluginView {
 1. 通过活动插件 ID 定位原目录；校验该目录仍是插件根下的普通直接子目录。
 2. 从磁盘重新读取 manifest、运行时入口和 README。
 3. 要求新 manifest ID 与原 ID 一致，并验证版本、host 版本、权限、触发词及与其他活动插件的冲突。
-4. 为候选插件分配临时 generation label，注册 staged asset 映射并创建不可见、不可聚焦的临时 WebView。
-5. 等待候选运行时通过现有 title 协议上报 ready。此期间旧插件继续处理查询。
-6. 候选成功后，在写锁内把活动目录切换到新 entry；取消旧插件 pending query、使旧结果失效，并清理 timeout/disabled/ready 状态。
-7. 活动目录切换是事务提交点；提交后关闭旧 WebView 并移除 staged 标记，新 generation 成为活动运行时。
-8. 候选完成切换前任一步失败时，关闭临时 WebView 并移除 staged 映射，活动目录和旧 WebView 保持不变。
+4. 为候选插件分配新的 generation 和临时 label，注册 staged asset/ownership 映射并创建不可见、不可聚焦的临时 WebView。
+5. 等待带有该 label+generation ownership 的候选运行时通过现有 title 协议上报 ready。此期间旧插件继续处理查询。
+6. 候选成功后取得 write admission；在 admission 内取消旧 generation pending query，把活动目录切换到候选 entry并清理该插件旧 generation 的 timeout/disabled/ready 状态，然后释放全部 manager 细粒度状态锁。
+7. 在仍持有 write admission、但不持有 manager 状态锁时调用 `ResultRegistry::invalidate_domain(QueryDomain::Plugin)`，使所有旧 Plugin token 失效。active entry 切换和 domain epoch 推进均完成后才释放 admission，对外发布事务提交。
+8. 提交后 best-effort 关闭旧 WebView 并移除 staged 标记，新 generation 成为活动运行时。
+9. 候选完成切换前任一步失败时，关闭临时 WebView 并移除 staged 映射，活动目录和旧 WebView 保持不变。
 
 旧窗口关闭和临时运行时数据目录删除属于提交后的 best-effort 清理。清理失败不改变已经成功的切换结果，也不暴露路径；旧 generation 已无路由和 pending request，不能继续发布结果。
 
@@ -129,12 +134,14 @@ PluginView {
 删除流程：
 
 1. 前端显示明确的二次确认。
-2. 后端在 mutation lock 和活动目录写锁保护下重新验证插件根目录边界。
-3. 先尝试删除插件包目录；删除失败时目录项和运行时保持不变。
-4. 删除成功后移除活动目录项、取消 pending query、使旧结果失效并关闭运行时。
-5. 插件触发词立即无法路由；重启后因为包目录不存在，也不会重新出现。
+2. 宿主在 app data 下预先维护与插件根同卷、位于插件根之外的隔离目录；隔离目录不是插件扫描入口。
+3. 后端取得 mutation lock 和 write admission，通过 `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` 打开当前插件目录 entry，不跟随重解析点；校验它仍是普通目录、其 volume/file identity 与活动 entry 一致，并且目标是插件根的直接子 entry。
+4. 使用目录 handle 的 Windows rename primitive，把该 entry 原子移动到隔离目录中的宿主生成唯一名称，不允许覆盖。移动是删除提交点。
+5. 移动失败时返回 `pluginDeleteFailed`；活动 entry、路由、授权、runtime 和原目录均保持不变，不能发生部分递归删除。
+6. 移动成功后，在仍持有 write admission 时取消该 generation pending query并移除活动 entry/路由/授权；释放 manager 状态锁后调用 `invalidate_domain(QueryDomain::Plugin)`，最后释放 admission 并 best-effort 关闭 runtime。
+7. 隔离目录中的包和宿主生成的 runtime data 由宿主 best-effort 递归清理；清理失败仍算删除成功。因为包已在插件根之外，当前进程触发词立即失效且重启不会恢复。
 
-宿主生成的 runtime data 目录做 best-effort 清理，不影响“插件包目录已物理删除”的成功语义。
+删除不使用“先检查路径再 `remove_dir_all`”作为提交协议。文件 identity 与 handle-based rename 把路径替换检查和移动绑定到同一个已打开对象，关闭校验后替换的 TOCTOU 窗口。
 
 ## 设置页交互
 
@@ -149,7 +156,10 @@ PluginView {
 
 交互规则：
 
-- 没有活动插件时显示“未安装插件”。
+- 每次进入设置页都启动独立的插件清单请求；普通设置可以先显示，插件区单独显示 loading。
+- 插件清单状态固定为 `idle | loading | ready | error`。只有 `ready` 且 entries 为空时显示“未安装插件”，`error` 不能降级为空态。
+- `pluginListFailed` 时显示“插件清单加载失败”和“重试”按钮；重试只重载插件清单，不重载或覆盖普通设置草稿。
+- 每次清单请求绑定设置 view epoch 和前端 operation token。离开设置页立即废弃 owner；重新进入后旧响应、旧错误和旧逐行操作结果均不能覆盖当前插件状态。
 - 缺少有效 README 时显示“未提供说明”。
 - 重新加载只锁定当前插件行，并显示该行 loading 状态。
 - 重载成功后使用返回的 `PluginView` 更新版本、触发词和说明。
@@ -159,18 +169,51 @@ PluginView {
 
 Markdown 使用 `react-markdown`，配置明确的 allowed elements；不启用 raw HTML 插件，不渲染 `a` 和 `img`。
 
-## 并发与结果一致性
+插件清单状态、普通设置状态和逐行 mutation 状态是三个独立状态域。清单加载失败不把普通设置设为只读；某一行重载/删除也不占用普通设置 save/load operation。
 
-- 插件 mutation 全局串行，普通查询只读取活动 entry 快照。
+## Generation 与副作用线性化
+
+- `PluginRoute`、`PendingPluginQuery` 和内部 `ResultAction::CopyText` 都绑定 `plugin_id + generation`；generation 不进入前端 DTO。
+- 插件查询建立 route、签发 `QueryDomain::Plugin` token 和登记 pending request 时取得 read admission，随后释放；不能跨 admission 长时间等待 runtime。
+- `publish_plugin_results` 取得 read admission，验证 callback label、pending generation 和当前活动 generation 全部一致，并在仍持有 admission 时调用 `publish_if_latest`。因此重载/删除提交后的旧查询即使晚到，也无法发布。
+- 每次重载或删除提交都在 write admission 内调用 `invalidate_domain(QueryDomain::Plugin)`。这既清除当前 Plugin result set，也推进 Plugin domain epoch，使提交前已经签发的 token 永久失效；`invalidate_plugin` 不能替代该步骤。
+- `resolve` 返回的 `CopyText` action 保留签发时的 generation。执行路径先完成 `resolve` 并释放 registry lock，再取得 read admission，重新验证 plugin ID、generation 和当前剪贴板权限，并在同一个 read admission 内完成 clipboard write。write admission 无法穿透 generation 校验与剪贴板副作用之间的区间。
+- 如果剪贴板路径先取得 read admission，副作用线性化在 mutation 之前；如果 mutation 先取得 write admission，旧 generation 校验失败且不触碰剪贴板。
 - staged runtime 不能接收用户查询，也不能发布没有 pending request 的结果。
-- 切换或删除时调用现有 `ResultRegistry::invalidate_plugin`，旧结果不能在新 generation 或删除后执行。
-- pending query 在切换和删除时以 `RuntimeDisabled` 结束，不能跨 generation 发布。
-- 剪贴板授权始终基于当前活动 entry 的权限；候选权限在切换前不生效。
+
+## Runtime callback ownership
+
+- 每个 ready、process-failed 和 close callback 捕获不可变的 `plugin_id + label + generation + slot_kind(active|staged)`。
+- callback 在改变 ready/disabled/pending/catalog 或 ResultRegistry 前必须取得 admission，并确认该精确 tuple 仍拥有对应 active 或 staged slot。staged ready/failure/close 和无 ownership 的旧 callback 使用 read admission；会 disable 活动 generation、取消其 pending 或推进 Plugin domain epoch 的 active process-failed 使用 write admission。
+- staged process-failed 只把自己的 staged attempt 标为失败并唤醒 reload waiter；不能 disable 活动 generation，也不能 invalidate Plugin domain。
+- 旧 active runtime 在切换提交后延迟触发 process-failed/close 时，因为已不拥有 active slot，只能清理自己的 callback/runtime data，不能 disable、取消 pending 或 invalidate 新 generation。
+- staged rollback 后延迟到达的 ready/process-failed/close 同样只能清理自己，不能重新插入 staged slot或影响活动 entry。
+
+## 锁顺序与提交边界
+
+所有需要同时取得多个同步原语的路径遵守固定顺序：
+
+```text
+mutation lock（仅管理命令）
+  -> plugin admission gate
+    -> active/staged catalog
+      -> ready/disabled/timeout/pending 的单个状态锁
+        -> ResultRegistry
+```
+
+- 不同时持有两个 ready/disabled/timeout/pending 状态锁；取得 ResultRegistry 前释放这些细粒度状态锁，但 admission 继续持有。
+- `ResultRegistry::resolve` 在取得 admission 前完成并释放 registry lock，避免 registry -> admission 的反向嵌套。
+- 不在任何 catalog、状态或 ResultRegistry lock 下等待 runtime ready、执行文件 I/O、调用 clipboard 或关闭 WebView；clipboard 只在 admission read guard 下执行。
+- 重载提交点是 write admission 内的 Plugin domain epoch 推进和 active entry 切换；此前失败完整回滚 staged 状态，此后旧窗口/数据清理失败不回滚。
+- 删除提交点是 write admission 内成功完成的 handle-based 原子移动；移动前失败零状态和文件副作用，移动后内存移除不得失败，窗口/隔离目录清理失败不回滚。
+
+Plugin domain epoch 或 plugin generation 溢出时 fail closed：旧 token 不能重新变为有效，不执行剪贴板副作用；重载不切换到无法表示的新 generation。
 
 ## 安全边界
 
 - manifest 和 runtime 沿用普通文件及 reparse-point 拒绝规则；README 校验失败只把说明降级为空，不改变插件是否可运行。
-- 删除路径只来自后端已加载 entry，并在删除前再次验证其位于插件根直接下一层。
+- 删除路径只来自后端已加载 entry，并通过 no-follow handle、持久化 file identity 和原子 rename 重新认证；前端路径和仅基于字符串的 canonicalize 结果都不是删除授权。
+- 隔离目录位于插件根之外且与其同卷，名称由宿主生成；插件扫描永远不读取隔离目录。
 - staged label 由宿主生成，不接受插件输入。
 - Markdown 不执行 HTML、脚本、链接导航或外部资源加载。
 - 所有前端命令沿用 main-window caller guard；插件运行时 capability 不获得管理命令权限。
@@ -183,9 +226,13 @@ Rust：
 - 插件清单只暴露批准字段。
 - 非主窗口调用在任何状态和文件副作用前失败。
 - ID 改变、重复触发词、非法 manifest 和运行时未 ready 均回滚并保留旧路由。
-- 成功重载只在候选 ready 后切换，旧 pending/result 被清理。
-- 删除失败保留目录项；删除成功移除物理目录、路由和授权。
-- 路径替换、符号链接和伪造插件 ID 不能越过插件根。
+- 成功重载只在候选 ready 后切换，并推进 Plugin domain epoch。
+- 提交前签发的旧 Plugin token 在提交后晚发布时被拒绝且不能重建 result mapping。
+- 旧 `CopyText` action 在 resolve 后发生重载或删除时 generation 校验失败；mutation 与 clipboard read admission 的两种线性化均被覆盖。
+- 删除原子移动失败时文件、目录项、路由和授权零变化；移动成功后路由和授权消失。
+- 隔离目录递归清理失败仍返回删除成功，且下一次启动不会加载该插件。
+- 活动目录被 junction、symlink 或不同 file identity 的普通目录替换时移动被拒绝；伪造插件 ID 不能越过插件根。
+- staged rollback 后和 active 切换后的延迟 ready/process-failed/close callback 不能影响新活动 generation。
 - Research ID、验证模块和三个旧 command 不再出现在生产 wiring。
 
 前端：
@@ -194,6 +241,8 @@ Rust：
 - 设置保存 payload 只包含仍存在的设置字段。
 - 插件空态、README Markdown 和缺失说明渲染正确。
 - HTML、链接、图片不进入插件说明 DOM。
+- 进入设置页时插件清单独立 loading；加载失败显示错误和重试，不能显示“未安装插件”。
+- 离开并重新进入设置页后，上一 view epoch 的成功、失败和逐行 mutation 响应全部被忽略。
 - 单行重载/删除 pending、成功和失败状态互不影响其他插件或设置草稿。
 - 删除必须经过确认。
 - adapter 只调用新的三个插件 command，旧 command 完全移除。
