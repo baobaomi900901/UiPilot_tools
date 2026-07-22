@@ -17,8 +17,8 @@ use tauri::{
 };
 
 use crate::{
-    model::ResultItem,
-    result_registry::{ResultAction, ResultRegistry},
+    model::{ResultItem, SearchResponse},
+    result_registry::{QueryDomain, QueryToken, ResultAction, ResultRegistry},
 };
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
@@ -97,7 +97,8 @@ impl From<io::Error> for PluginSetupError {
 }
 
 pub(crate) struct PluginManager {
-    catalog: OnceLock<PluginCatalog>,
+    catalog: OnceLock<RwLock<PluginCatalog>>,
+    admission: RwLock<()>,
     ready: Arc<RuntimeReadiness>,
     disabled: Arc<RwLock<HashSet<String>>>,
     pending: RwLock<HashMap<String, PendingPluginQuery>>,
@@ -109,6 +110,7 @@ impl PluginManager {
     pub(crate) fn new() -> Self {
         Self {
             catalog: OnceLock::new(),
+            admission: RwLock::new(()),
             ready: Arc::new(RuntimeReadiness::default()),
             disabled: Arc::new(RwLock::new(HashSet::new())),
             pending: RwLock::new(HashMap::new()),
@@ -124,23 +126,167 @@ impl PluginManager {
     ) -> Result<(), PluginSetupError> {
         let catalog = PluginCatalog::load(&app_data_dir.join("plugins"), host_version)?;
         self.catalog
-            .set(catalog)
+            .set(RwLock::new(catalog))
             .map_err(|_| PluginSetupError::AlreadyLoaded)
     }
 
     pub(crate) fn route(&self, query: &str) -> Option<PluginRoute> {
-        self.catalog.get()?.route(query)
+        let _admission = self.admission.read().ok()?;
+        self.catalog.get()?.read().ok()?.route(query)
     }
 
     pub(crate) fn list_views(&self) -> Result<Vec<PluginView>, PluginManagementError> {
+        let _admission = self
+            .admission
+            .read()
+            .map_err(|_| PluginManagementError::Unavailable)?;
         self.catalog
             .get()
-            .map(PluginCatalog::views)
+            .and_then(|catalog| catalog.read().ok().map(|catalog| catalog.views()))
             .ok_or(PluginManagementError::Unavailable)
     }
 
+    pub(crate) fn begin_routed_query(
+        &self,
+        query: &str,
+        registry: &ResultRegistry,
+        invocation_id: &str,
+        query_sequence: u64,
+    ) -> PluginQueryStart {
+        let Ok(_admission) = self.admission.read() else {
+            return PluginQueryStart::Rejected;
+        };
+        let Some(route) = self
+            .catalog
+            .get()
+            .and_then(|catalog| catalog.read().ok()?.route(query))
+        else {
+            return PluginQueryStart::NoRoute;
+        };
+        let Some(token) = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)
+        else {
+            return PluginQueryStart::Rejected;
+        };
+        PluginQueryStart::Started { route, token }
+    }
+
+    pub(crate) fn publish_results(
+        &self,
+        registry: &ResultRegistry,
+        token: QueryToken,
+        route: &PluginRoute,
+        entries: Vec<(ResultItem, ResultAction)>,
+    ) -> Option<SearchResponse> {
+        let _admission = self.admission.read().ok()?;
+        let current = self
+            .catalog
+            .get()?
+            .read()
+            .ok()?
+            .entries
+            .iter()
+            .any(|entry| route_matches(entry, route));
+        if !current {
+            return None;
+        }
+        registry.publish_if_latest(
+            token,
+            entries,
+            || true,
+            |request_id, items| SearchResponse {
+                request_id,
+                items: items
+                    .into_iter()
+                    .map(|(result_id, mut item)| {
+                        item.result_id = result_id;
+                        item
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    pub(crate) fn copy_text<F>(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        copy: F,
+    ) -> Result<(), PluginCopyError>
+    where
+        F: FnOnce() -> Result<(), ()>,
+    {
+        let _admission = self
+            .admission
+            .read()
+            .map_err(|_| PluginCopyError::PermissionDenied)?;
+        let authorized = self
+            .catalog
+            .get()
+            .and_then(|catalog| {
+                let catalog = catalog.read().ok()?;
+                catalog
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.id == plugin_id
+                            && entry.generation == generation
+                            && entry
+                                .permissions
+                                .iter()
+                                .any(|permission| permission == "clipboard.writeText")
+                    })
+                    .map(|entry| entry.window_label.clone())
+            })
+            .is_some_and(|label| {
+                self.disabled
+                    .read()
+                    .is_ok_and(|disabled| !disabled.contains(&label))
+            });
+        if !authorized {
+            return Err(PluginCopyError::PermissionDenied);
+        }
+        copy().map_err(|_| PluginCopyError::SideEffectFailed)
+    }
+
+    #[cfg(test)]
+    fn install_catalog_for_test(&self, catalog: PluginCatalog) {
+        self.catalog
+            .set(RwLock::new(catalog))
+            .unwrap_or_else(|_| panic!("test catalog already installed"));
+    }
+
+    #[cfg(test)]
+    fn advance_generation_for_test(&self, registry: &ResultRegistry, plugin_id: &str) {
+        let _admission = self.admission.write().expect("plugin admission poisoned");
+        let mut catalog = self
+            .catalog
+            .get()
+            .expect("test catalog missing")
+            .write()
+            .expect("plugin catalog poisoned");
+        let entry = catalog
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == plugin_id)
+            .expect("test plugin missing");
+        entry.generation = entry
+            .generation
+            .checked_add(1)
+            .expect("test generation overflow");
+        drop(catalog);
+        registry
+            .invalidate_domain(QueryDomain::Plugin)
+            .expect("test plugin epoch exhausted");
+    }
+
     pub(crate) fn authorizes_clipboard(&self, plugin_id: &str) -> bool {
+        let Ok(_admission) = self.admission.read() else {
+            return false;
+        };
         let Some(catalog) = self.catalog.get() else {
+            return false;
+        };
+        let Ok(catalog) = catalog.read() else {
             return false;
         };
         let Some(entry) = catalog.entries.iter().find(|entry| entry.id == plugin_id) else {
@@ -153,10 +299,16 @@ impl PluginManager {
     }
 
     pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
-        self.catalog.get().map_or_else(
-            || response(403, Vec::new(), None),
-            |catalog| catalog.asset_response(label, request_path),
-        )
+        let Ok(_admission) = self.admission.read() else {
+            return response(403, Vec::new(), None);
+        };
+        self.catalog
+            .get()
+            .and_then(|catalog| catalog.read().ok())
+            .map_or_else(
+                || response(403, Vec::new(), None),
+                |catalog| catalog.asset_response(label, request_path),
+            )
     }
 
     pub(crate) fn create_runtimes(
@@ -167,7 +319,12 @@ impl PluginManager {
         let Some(catalog) = self.catalog.get() else {
             return Ok(());
         };
-        for entry in &catalog.entries {
+        let entries = catalog
+            .read()
+            .map_err(|_| io::Error::other("plugin catalog unavailable"))?
+            .entries
+            .clone();
+        for entry in &entries {
             let Some(route) = self.route(&entry.feature.trigger) else {
                 continue;
             };
@@ -196,7 +353,6 @@ impl PluginManager {
             let label_for_ready = label.clone();
             let disabled_manager = manager.clone();
             let label_for_failure = label.clone();
-            let plugin_id = entry.id.clone();
             let failure_app = app.handle().clone();
             let window = WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))
                 .visible(false)
@@ -218,7 +374,7 @@ impl PluginManager {
             attach_process_failed_handler(&window, move || {
                 disabled_manager.disable_runtime(&label_for_failure);
                 let registry = failure_app.state::<ResultRegistry>();
-                registry.invalidate_plugin(&plugin_id);
+                let _ = registry.invalidate_domain(QueryDomain::Plugin);
             })?;
         }
         Ok(())
@@ -270,17 +426,40 @@ impl PluginManager {
         }
         let request_id = self.allocate_request_id();
         let (sender, receiver) = mpsc::channel();
-        self.pending
-            .write()
-            .map_err(|_| PluginQueryError::RuntimeDisabled)?
-            .insert(
-                request_id.clone(),
-                PendingPluginQuery {
-                    plugin_id: route.plugin_id.clone(),
-                    window_label: route.window_label.clone(),
-                    sender,
-                },
-            );
+        {
+            let _admission = self
+                .admission
+                .read()
+                .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+            let current = self
+                .catalog
+                .get()
+                .and_then(|catalog| {
+                    catalog
+                        .read()
+                        .ok()?
+                        .entries
+                        .iter()
+                        .any(|entry| route_matches(entry, &route))
+                        .then_some(())
+                })
+                .is_some();
+            if !current {
+                return Err(PluginQueryError::RuntimeDisabled);
+            }
+            self.pending
+                .write()
+                .map_err(|_| PluginQueryError::RuntimeDisabled)?
+                .insert(
+                    request_id.clone(),
+                    PendingPluginQuery {
+                        plugin_id: route.plugin_id.clone(),
+                        window_label: route.window_label.clone(),
+                        generation: route.generation,
+                        sender,
+                    },
+                );
+        }
         let request = PluginQueryRequest {
             protocol_version: 1,
             request_id: request_id.clone(),
@@ -320,14 +499,21 @@ impl PluginManager {
         label: &str,
         response: serde_json::Value,
     ) -> Result<(), PluginQueryError> {
+        let _admission = self
+            .admission
+            .read()
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?;
         let entry = self
             .catalog
             .get()
             .and_then(|catalog| {
                 catalog
+                    .read()
+                    .ok()?
                     .entries
                     .iter()
                     .find(|entry| entry.window_label == label)
+                    .cloned()
             })
             .ok_or(PluginQueryError::InvalidResponse)?;
         let serialized =
@@ -348,7 +534,10 @@ impl PluginManager {
             .map_err(|_| PluginQueryError::RuntimeDisabled)?
             .remove(&response.request_id)
             .ok_or(PluginQueryError::InvalidResponse)?;
-        if pending.plugin_id != entry.id || pending.window_label != label {
+        if pending.plugin_id != entry.id
+            || pending.window_label != label
+            || pending.generation != entry.generation
+        {
             let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
             return Err(PluginQueryError::InvalidResponse);
         }
@@ -366,12 +555,24 @@ impl PluginManager {
             }
             let action = match item.action {
                 PluginAction::CopyText { text } => {
-                    if text.len() > 4096 || !self.authorizes_clipboard(&entry.id) {
+                    let disabled = self
+                        .disabled
+                        .read()
+                        .map_err(|_| PluginQueryError::RuntimeDisabled)?
+                        .contains(label);
+                    if text.len() > 4096
+                        || disabled
+                        || !entry
+                            .permissions
+                            .iter()
+                            .any(|permission| permission == "clipboard.writeText")
+                    {
                         let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
                         return Err(PluginQueryError::InvalidResponse);
                     }
                     ResultAction::CopyText {
                         plugin_id: entry.id.clone(),
+                        generation: entry.generation,
                         text,
                     }
                 }
@@ -482,6 +683,7 @@ fn wait_until_ready(
 struct PendingPluginQuery {
     plugin_id: String,
     window_label: String,
+    generation: u64,
     sender: mpsc::Sender<Result<Vec<(ResultItem, ResultAction)>, PluginQueryError>>,
 }
 
@@ -495,6 +697,21 @@ pub(crate) enum PluginQueryError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PluginManagementError {
     Unavailable,
+}
+
+pub(crate) enum PluginQueryStart {
+    NoRoute,
+    Rejected,
+    Started {
+        route: PluginRoute,
+        token: QueryToken,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginCopyError {
+    PermissionDenied,
+    SideEffectFailed,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -541,6 +758,7 @@ pub(crate) struct PluginCatalogEntry {
     pub(crate) root: PathBuf,
     pub(crate) window_label: String,
     pub(crate) description: Option<String>,
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -562,6 +780,7 @@ pub(crate) struct PluginFeature {
 pub(crate) struct PluginRoute {
     pub(crate) plugin_id: String,
     pub(crate) window_label: String,
+    pub(crate) generation: u64,
     pub(crate) input: String,
 }
 
@@ -755,6 +974,7 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
         permissions: manifest.permissions,
         root: root.to_path_buf(),
         description: read_description(root),
+        generation: 1,
     })
 }
 
@@ -821,8 +1041,15 @@ fn route(entry: &PluginCatalogEntry, input: &str) -> PluginRoute {
     PluginRoute {
         plugin_id: entry.id.clone(),
         window_label: entry.window_label.clone(),
+        generation: entry.generation,
         input: input.to_string(),
     }
+}
+
+fn route_matches(entry: &PluginCatalogEntry, route: &PluginRoute) -> bool {
+    entry.id == route.plugin_id
+        && entry.window_label == route.window_label
+        && entry.generation == route.generation
 }
 
 fn asset_path(request_path: &str) -> Option<(PathBuf, &'static str)> {
@@ -1158,6 +1385,7 @@ mod tests {
         let route = loaded.route("/go body").unwrap();
         assert_eq!(route.plugin_id, "plugin");
         assert_eq!(route.window_label, "plugin-706c7567696e");
+        assert_eq!(route.generation, 1);
         assert_eq!(route.input, "body");
         assert_eq!(loaded.route("/go").unwrap().input, "");
         assert!(loaded.route("/go\tbody").is_none());
@@ -1239,6 +1467,168 @@ mod tests {
                     {"id":"zeta","version":"1.0.0","trigger":"/zeta","description":"Zeta docs"}
                 ])
             );
+        }
+    }
+
+    mod generation {
+        use std::{
+            sync::{mpsc, Arc},
+            time::Duration,
+        };
+
+        use super::{load, valid_manifest, TestRoot};
+        use crate::{
+            model::ResultItem,
+            plugins::{PluginCopyError, PluginManager, PluginQueryStart},
+            result_registry::ResultRegistry,
+        };
+
+        fn manager(root: &TestRoot) -> Arc<PluginManager> {
+            let manager = Arc::new(PluginManager::new());
+            manager.install_catalog_for_test(load(root));
+            manager
+        }
+
+        #[test]
+        fn old_route_and_token_cannot_publish_after_generation_commit() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            let registry = ResultRegistry::default();
+            registry.on_show("invocation".into());
+            let PluginQueryStart::Started { route, token } =
+                manager.begin_routed_query("/plugin 1+1", &registry, "invocation", 1)
+            else {
+                panic!("plugin route must start");
+            };
+
+            manager.advance_generation_for_test(&registry, "plugin");
+
+            assert!(manager
+                .publish_results(
+                    &registry,
+                    token,
+                    &route,
+                    vec![(
+                        ResultItem {
+                            result_id: String::new(),
+                            title: "late".into(),
+                            subtitle: None,
+                            icon: None,
+                        },
+                        crate::result_registry::ResultAction::CopyText {
+                            plugin_id: "plugin".into(),
+                            generation: 1,
+                            text: "late".into(),
+                        },
+                    )],
+                )
+                .is_none());
+        }
+
+        #[test]
+        fn clipboard_side_effect_holds_admission_and_old_action_fails_after_commit() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            let registry = ResultRegistry::default();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let copy_manager = Arc::clone(&manager);
+            let copy = std::thread::spawn(move || {
+                copy_manager.copy_text("plugin", 1, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+            entered_rx.recv().unwrap();
+
+            let (committed_tx, committed_rx) = mpsc::channel();
+            let commit_manager = Arc::clone(&manager);
+            let commit_registry = registry.clone();
+            let commit = std::thread::spawn(move || {
+                commit_manager.advance_generation_for_test(&commit_registry, "plugin");
+                committed_tx.send(()).unwrap();
+            });
+            assert_eq!(
+                committed_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(copy.join().unwrap(), Ok(()));
+            commit.join().unwrap();
+
+            let writes = std::cell::Cell::new(0);
+            assert_eq!(
+                manager.copy_text("plugin", 1, || {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                }),
+                Err(PluginCopyError::PermissionDenied)
+            );
+            assert_eq!(writes.get(), 0);
+        }
+
+        #[test]
+        fn already_resolved_copy_action_is_rejected_after_generation_commit() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            let registry = ResultRegistry::default();
+            registry.on_show("invocation".into());
+            let PluginQueryStart::Started { route, token } =
+                manager.begin_routed_query("/plugin 1+1", &registry, "invocation", 1)
+            else {
+                panic!("plugin route must start");
+            };
+            let (request_id, result_id) = manager
+                .publish_results(
+                    &registry,
+                    token,
+                    &route,
+                    vec![(
+                        ResultItem {
+                            result_id: String::new(),
+                            title: "2".into(),
+                            subtitle: None,
+                            icon: None,
+                        },
+                        crate::result_registry::ResultAction::CopyText {
+                            plugin_id: "plugin".into(),
+                            generation: 1,
+                            text: "2".into(),
+                        },
+                    )],
+                )
+                .map(|response| {
+                    (
+                        response.request_id,
+                        response.items.into_iter().next().unwrap().result_id,
+                    )
+                })
+                .unwrap();
+            let action = registry.resolve(&request_id, &result_id).unwrap();
+
+            manager.advance_generation_for_test(&registry, "plugin");
+
+            let crate::result_registry::ResultAction::CopyText {
+                plugin_id,
+                generation,
+                ..
+            } = action
+            else {
+                panic!("plugin result must resolve to CopyText");
+            };
+            let writes = std::cell::Cell::new(0);
+            assert_eq!(
+                manager.copy_text(&plugin_id, generation, || {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                }),
+                Err(PluginCopyError::PermissionDenied)
+            );
+            assert_eq!(writes.get(), 0);
         }
     }
 
@@ -1431,17 +1821,17 @@ mod tests {
         #[test]
         fn query_waits_for_runtime_ready_off_the_async_executor() {
             let source = std::fs::read_to_string(file!()).unwrap();
-            let production = source.split("#[cfg(test)]").next().unwrap();
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
             assert!(production.contains("wait_until_ready(ready, disabled, label)"));
             assert!(production.contains("tauri::async_runtime::spawn_blocking"));
             assert!(!production.contains(&["thread", "::sleep"].concat()));
         }
 
         #[test]
-        fn runtime_failure_invalidates_only_its_plugin_results() {
+        fn runtime_failure_invalidates_the_plugin_domain() {
             let source = std::fs::read_to_string(file!()).unwrap();
-            let production = source.split("#[cfg(test)]").next().unwrap();
-            assert!(production.contains("registry.invalidate_plugin(&plugin_id)"));
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(production.contains("registry.invalidate_domain(QueryDomain::Plugin)"));
         }
 
         #[test]
@@ -1478,7 +1868,7 @@ mod tests {
 
         fn manager(root: &TestRoot) -> PluginManager {
             let manager = PluginManager::new();
-            assert!(manager.catalog.set(load(root)).is_ok());
+            manager.install_catalog_for_test(load(root));
             manager
         }
 
@@ -1500,6 +1890,7 @@ mod tests {
                 PendingPluginQuery {
                     plugin_id: "plugin".into(),
                     window_label: "plugin-706c7567696e".into(),
+                    generation: 1,
                     sender,
                 },
             );

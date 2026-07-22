@@ -13,7 +13,10 @@ use crate::{
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
-    plugins::{PluginManagementError, PluginManager, PluginQueryError, PluginView},
+    plugins::{
+        PluginCopyError, PluginManagementError, PluginManager, PluginQueryError, PluginQueryStart,
+        PluginView,
+    },
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate, WindowPosition},
 };
@@ -230,31 +233,17 @@ pub(crate) async fn search_apps(
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let plugins = app.state::<Arc<PluginManager>>();
-    if let Some(route) = plugins.route(&query) {
-        let Some(token) = registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
-        else {
-            return Ok(None);
-        };
-        let entries = match plugins.query(window.app_handle(), route).await {
-            Ok(entries) => entries,
-            Err(PluginQueryError::Timeout) => Vec::new(),
-            Err(_) => return Err(CommandError::plugin_query_failed()),
-        };
-        return Ok(registry.publish_if_latest(
-            token,
-            entries,
-            || true,
-            |request_id, items| SearchResponse {
-                request_id,
-                items: items
-                    .into_iter()
-                    .map(|(result_id, mut item)| {
-                        item.result_id = result_id;
-                        item
-                    })
-                    .collect(),
-            },
-        ));
+    match plugins.begin_routed_query(&query, &registry, &invocation_id, query_sequence) {
+        PluginQueryStart::Started { route, token } => {
+            let entries = match plugins.query(window.app_handle(), route.clone()).await {
+                Ok(entries) => entries,
+                Err(PluginQueryError::Timeout) => Vec::new(),
+                Err(_) => return Err(CommandError::plugin_query_failed()),
+            };
+            return Ok(plugins.publish_results(&registry, token, &route, entries));
+        }
+        PluginQueryStart::Rejected => return Ok(None),
+        PluginQueryStart::NoRoute => {}
     }
     Ok(search_apps_with(
         &registry,
@@ -714,8 +703,11 @@ pub(crate) async fn execute_result(
                 .await
                 .map_err(|_| CommandError::file_open_failed())?
             },
-            authorize_plugin: |plugin_id: &str| plugins.authorizes_clipboard(plugin_id),
-            copy_text: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
+            copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
+                plugins.copy_text(plugin_id, generation, || {
+                    app.clipboard().write_text(text.to_owned()).map_err(|_| ())
+                })
+            },
             clear_and_hide: || clear_and_hide(&registry, &window),
             increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
         },
@@ -723,27 +715,25 @@ pub(crate) async fn execute_result(
     .await
 }
 
-struct ClipboardExecution<R, A, F, P, C, H, S> {
+struct ClipboardExecution<R, A, F, P, H, S> {
     resolve: R,
     execute: A,
     execute_file: F,
-    authorize_plugin: P,
-    copy_text: C,
+    copy_plugin: P,
     clear_and_hide: H,
     increment: S,
 }
 
-async fn execute_result_with_clipboard<R, A, F, Fut, P, C, H, S>(
+async fn execute_result_with_clipboard<R, A, F, Fut, P, H, S>(
     ids: (&str, &str),
-    execution: ClipboardExecution<R, A, F, P, C, H, S>,
+    execution: ClipboardExecution<R, A, F, P, H, S>,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
     F: FnOnce(OpenIndexedPath) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
-    P: FnOnce(&str) -> bool,
-    C: FnOnce(&str) -> Result<(), ()>,
+    P: FnOnce(&str, u64, &str) -> Result<(), PluginCopyError>,
     H: FnOnce() -> Result<(), CommandError>,
     S: FnOnce(&str) -> Result<(), ()>,
 {
@@ -752,8 +742,7 @@ where
         resolve,
         execute,
         execute_file,
-        authorize_plugin,
-        copy_text,
+        copy_plugin,
         clear_and_hide,
         increment,
     } = execution;
@@ -761,11 +750,16 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
-    if let ResultAction::CopyText { plugin_id, text } = &action {
-        if !authorize_plugin(plugin_id) {
-            return Err(CommandError::plugin_permission_denied());
-        }
-        copy_text(text).map_err(|_| CommandError::clipboard_write_failed())?;
+    if let ResultAction::CopyText {
+        plugin_id,
+        generation,
+        text,
+    } = &action
+    {
+        copy_plugin(plugin_id, *generation, text).map_err(|error| match error {
+            PluginCopyError::PermissionDenied => CommandError::plugin_permission_denied(),
+            PluginCopyError::SideEffectFailed => CommandError::clipboard_write_failed(),
+        })?;
         clear_and_hide()?;
         return Ok(ExecuteOutcome::TextCopied);
     }
@@ -2067,10 +2061,12 @@ mod tests {
     mod execute_plugin {
         use super::super::{execute_result_with_clipboard, ClipboardExecution};
         use super::*;
+        use crate::plugins::PluginCopyError;
 
         fn copy_action() -> ResultAction {
             ResultAction::CopyText {
                 plugin_id: "plugin".into(),
+                generation: 1,
                 text: "copy me".into(),
             }
         }
@@ -2092,10 +2088,8 @@ mod tests {
                         resolve: |_: &str, _: &str| Ok(copy_action()),
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
-                        authorize_plugin: |_: &str| false,
-                        copy_text: |_: &str| {
-                            clipboard.set(clipboard.get() + 1);
-                            Ok(())
+                        copy_plugin: |_: &str, _: u64, _: &str| {
+                            Err(PluginCopyError::PermissionDenied)
                         },
                         clear_and_hide: || {
                             hide.set(hide.get() + 1);
@@ -2126,11 +2120,10 @@ mod tests {
                             unreachable!()
                         },
                         execute_file: no_file_execution,
-                        authorize_plugin: |plugin_id: &str| {
+                        copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                             trace.borrow_mut().push("permission");
-                            plugin_id == "plugin"
-                        },
-                        copy_text: |text: &str| {
+                            assert_eq!(plugin_id, "plugin");
+                            assert_eq!(generation, 1);
                             trace.borrow_mut().push("clipboard");
                             assert_eq!(text, "copy me");
                             Ok(())
@@ -2163,8 +2156,9 @@ mod tests {
                         resolve: |_: &str, _: &str| Ok(copy_action()),
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
-                        authorize_plugin: |_: &str| true,
-                        copy_text: |_: &str| Err(()),
+                        copy_plugin: |_: &str, _: u64, _: &str| {
+                            Err(PluginCopyError::SideEffectFailed)
+                        },
                         clear_and_hide: || {
                             hide.set(hide.get() + 1);
                             Ok(())
@@ -2187,11 +2181,7 @@ mod tests {
                         resolve: |_: &str, _: &str| Err(error),
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
-                        authorize_plugin: |_: &str| {
-                            side_effects.set(side_effects.get() + 1);
-                            true
-                        },
-                        copy_text: |_: &str| {
+                        copy_plugin: |_: &str, _: u64, _: &str| {
                             side_effects.set(side_effects.get() + 1);
                             Ok(())
                         },

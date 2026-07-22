@@ -17,6 +17,7 @@ pub(crate) enum ResultAction {
     OpenIndexedPath(OpenIndexedPath),
     CopyText {
         plugin_id: String,
+        generation: u64,
         text: String,
     },
 }
@@ -210,27 +211,6 @@ impl ResultRegistry {
             .ok_or(RegistryError::UnknownResult)
     }
 
-    pub(crate) fn invalidate_plugin(&self, plugin_id: &str) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("result registry lock poisoned");
-        if state.current.as_ref().is_some_and(|current| {
-            current.actions.values().any(|action| {
-                matches!(
-                    action,
-                    ResultAction::CopyText {
-                        plugin_id: owner,
-                        ..
-                    } if owner == plugin_id
-                )
-            })
-        }) {
-            state.current = None;
-        }
-    }
-
     pub(crate) fn hide_and_clear(&self) {
         let mut state = self
             .inner
@@ -339,13 +319,6 @@ mod tests {
         }
     }
 
-    fn copy_action(plugin_id: &str) -> ResultAction {
-        ResultAction::CopyText {
-            plugin_id: plugin_id.into(),
-            text: "copy me".into(),
-        }
-    }
-
     fn file_action() -> ResultAction {
         ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
             0,
@@ -451,6 +424,7 @@ mod tests {
                     item("", "Plugin"),
                     ResultAction::CopyText {
                         plugin_id: "plugin".into(),
+                        generation: 1,
                         text: "copy".into(),
                     },
                 )],
@@ -463,6 +437,7 @@ mod tests {
             registry.resolve(&response.0, &response.1[0].0),
             Ok(ResultAction::CopyText {
                 plugin_id: "plugin".into(),
+                generation: 1,
                 text: "copy".into(),
             })
         );
@@ -787,31 +762,6 @@ mod tests {
             .is_some());
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
-            Err(RegistryError::StaleRequest)
-        );
-    }
-
-    #[test]
-    fn plugin_invalidation_clears_only_matching_plugin_results() {
-        let registry = ResultRegistry::default();
-        registry.on_show("invocation-1".into());
-        let token = registry
-            .begin_query(QueryDomain::Plugin, "invocation-1", 1)
-            .unwrap();
-        let response = publish_app(
-            &registry,
-            token,
-            vec![(item("", "2"), copy_action("plugin-b"))],
-        )
-        .unwrap();
-        let result_id = &response.items[0].result_id;
-
-        registry.invalidate_plugin("plugin-a");
-        assert!(registry.resolve(&response.request_id, result_id).is_ok());
-
-        registry.invalidate_plugin("plugin-b");
-        assert_eq!(
-            registry.resolve(&response.request_id, result_id),
             Err(RegistryError::StaleRequest)
         );
     }
