@@ -659,7 +659,6 @@ impl LifecycleCoordinator {
         self: &Arc<Self>,
         app: &AppHandle,
         settings: &SettingsStore,
-        cache: &crate::apps::AppCache,
         kind: HotkeyKind,
         update: SettingsUpdate,
     ) -> Result<(), ()> {
@@ -698,7 +697,7 @@ impl LifecycleCoordinator {
                     .map_err(|_| ())
                 },
             ),
-            || settings.update_user_settings(update, cache).map_err(|_| ()),
+            || settings.update_user_settings(update).map_err(|_| ()),
         )
     }
 

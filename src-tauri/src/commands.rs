@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
@@ -24,23 +24,12 @@ const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AppAliasTarget {
-    app_id: String,
-    display_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    icon: Option<String>,
-    aliases: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct SettingsView {
     hotkey: String,
     autostart: bool,
     file_preview_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     research_id: Option<String>,
-    applications: Vec<AppAliasTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -49,7 +38,6 @@ pub(crate) struct UserSettingsUpdate {
     hotkey: String,
     autostart: bool,
     research_id: Option<String>,
-    aliases: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -470,7 +458,6 @@ pub(crate) fn load_settings(
     app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     settings: State<'_, SettingsStore>,
-    cache: State<'_, Arc<AppCache>>,
 ) -> Result<SettingsView, CommandError> {
     require_main_window(&window)?;
     load_settings_ready_with(
@@ -479,7 +466,7 @@ pub(crate) fn load_settings(
                 .mark_frontend_ready(&app)
                 .map_err(|_| CommandError::window_failed())
         },
-        || load_settings_core(&settings, &cache),
+        || load_settings_core(&settings),
     )
 }
 
@@ -492,62 +479,31 @@ where
     Ok(load())
 }
 
-fn load_settings_core(settings: &SettingsStore, cache: &AppCache) -> SettingsView {
+fn load_settings_core(settings: &SettingsStore) -> SettingsView {
     let settings = settings.snapshot();
-    let applications = cache
-        .snapshot()
-        .into_iter()
-        .map(|application| {
-            let aliases = settings
-                .aliases
-                .get(&application.app_id)
-                .cloned()
-                .unwrap_or_default();
-            AppAliasTarget {
-                app_id: application.app_id,
-                display_name: application.display_name,
-                icon: application.icon,
-                aliases,
-            }
-        })
-        .collect();
     SettingsView {
         hotkey: settings.hotkey,
         autostart: settings.autostart,
         file_preview_enabled: settings.file_preview_enabled,
         research_id: settings.research_id,
-        applications,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SaveSettingsCache<'a>(&'a AppCache);
-
-impl<'a> SaveSettingsCache<'a> {
-    fn inner(self) -> &'a AppCache {
-        self.0
     }
 }
 
 fn prepare_settings_save(
     settings: UserSettingsUpdate,
-    cache: SaveSettingsCache<'_>,
 ) -> Result<(HotkeyKind, SettingsUpdate), CommandError> {
     let kind = HotkeyKind::parse(&settings.hotkey).map_err(|_| CommandError::settings_failed())?;
     let update = SettingsUpdate {
         hotkey: kind.canonical(),
         autostart: settings.autostart,
         research_id: settings.research_id,
-        aliases: settings.aliases,
     };
-    SettingsStore::validate_user_settings(&update, cache.inner())?;
+    SettingsStore::validate_user_settings(&update)?;
     Ok((kind, update))
 }
 
 async fn save_settings_with<R, E, W>(
     settings: UserSettingsUpdate,
-    _settings_store: &SettingsStore,
-    cache: SaveSettingsCache<'_>,
     reserve: R,
     worker: W,
 ) -> Result<(), CommandError>
@@ -555,7 +511,7 @@ where
     R: FnOnce() -> Result<CriticalReservation, E>,
     W: FnOnce(CriticalReservation, HotkeyKind, SettingsUpdate) -> Result<(), ()> + Send + 'static,
 {
-    let (kind, update) = prepare_settings_save(settings, cache)?;
+    let (kind, update) = prepare_settings_save(settings)?;
     save_settings_worker_with(reserve, move |reservation| {
         worker(reservation, kind, update)
     })
@@ -590,14 +546,10 @@ pub(crate) async fn save_settings(
     settings: UserSettingsUpdate,
     app: tauri::AppHandle,
     coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
-    settings_store: tauri::State<'_, SettingsStore>,
-    cache: tauri::State<'_, std::sync::Arc<AppCache>>,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
     save_settings_with(
         settings,
-        settings_store.inner(),
-        SaveSettingsCache(cache.inner()),
         || {
             let reservation = coordinator.reserve_critical()?;
             Ok::<_, ReservationError>(reservation)
@@ -608,11 +560,9 @@ pub(crate) async fn save_settings(
             move |reservation, kind, update| {
                 let _reservation = reservation;
                 let settings = app_for_worker.state::<SettingsStore>();
-                let cache = app_for_worker.state::<Arc<AppCache>>();
                 coordinator_for_worker.save_settings_transaction(
                     &app_for_worker,
                     &settings,
-                    cache.inner(),
                     kind,
                     update,
                 )
@@ -672,18 +622,13 @@ pub(crate) async fn set_file_preview_preference(
 fn save_settings_core(
     settings: UserSettingsUpdate,
     store: &SettingsStore,
-    cache: &AppCache,
 ) -> Result<(), CommandError> {
     store
-        .update_user_settings(
-            SettingsUpdate {
-                hotkey: settings.hotkey,
-                autostart: settings.autostart,
-                research_id: settings.research_id,
-                aliases: settings.aliases,
-            },
-            cache,
-        )
+        .update_user_settings(SettingsUpdate {
+            hotkey: settings.hotkey,
+            autostart: settings.autostart,
+            research_id: settings.research_id,
+        })
         .map_err(|_| CommandError::settings_failed())
 }
 
@@ -1053,11 +998,11 @@ mod tests {
         prepare_file_query, prepare_settings_save, publish_file_search, require_main_label,
         rescan_apps_with, save_settings_core, save_settings_with, save_settings_worker_with,
         search_apps_with, search_files_with, set_file_preview_preference_with, spawn_export_worker,
-        AppAliasTarget, CommandError, ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate,
-        SaveSettingsCache, SettingsView, UserSettingsUpdate,
+        CommandError, ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate,
+        UserSettingsUpdate,
     };
     use crate::{
-        apps::{AppCache, Application, ApplicationActionOutcome, ApplicationLaunchTarget},
+        apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
         file_index::{
             FileIndex, FileIndexStatus, FileResultDraft, FileResultKind, FileSearchBatch,
         },
@@ -1071,14 +1016,9 @@ mod tests {
 
     const APP_CURRENT: &str =
         "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const APP_EMPTY: &str = "app-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const APP_DUPLICATE_A: &str =
         "app-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const APP_DUPLICATE_B: &str =
-        "app-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const APP_ABSENT: &str = "app-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    const APP_UNKNOWN: &str =
-        "app-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
@@ -1121,44 +1061,6 @@ mod tests {
         }
     }
 
-    fn settings_applications() -> Vec<Application> {
-        vec![
-            Application {
-                app_id: APP_EMPTY.into(),
-                display_name: "Empty App".into(),
-                target: ApplicationLaunchTarget::Shortcut {
-                    shortcut: PathBuf::from(r"C:\Private\Empty.lnk"),
-                    executable: Some(PathBuf::from(r"C:\Private\Empty.exe")),
-                },
-                icon: None,
-                aliases: vec!["cache alias must not leak".into()],
-                use_count: 17,
-            },
-            Application {
-                app_id: APP_DUPLICATE_A.into(),
-                display_name: "Duplicate App".into(),
-                target: ApplicationLaunchTarget::Shortcut {
-                    shortcut: PathBuf::from(r"C:\Private\DuplicateA.lnk"),
-                    executable: Some(PathBuf::from(r"C:\Private\DuplicateA.exe")),
-                },
-                icon: Some("icon-a".into()),
-                aliases: Vec::new(),
-                use_count: 23,
-            },
-            Application {
-                app_id: APP_DUPLICATE_B.into(),
-                display_name: "Duplicate App".into(),
-                target: ApplicationLaunchTarget::Shortcut {
-                    shortcut: PathBuf::from(r"C:\Private\DuplicateB.lnk"),
-                    executable: None,
-                },
-                icon: None,
-                aliases: Vec::new(),
-                use_count: 31,
-            },
-        ]
-    }
-
     fn trusted_action() -> ResultAction {
         ResultAction::LaunchApplication {
             app_id: APP_CURRENT.into(),
@@ -1175,10 +1077,6 @@ mod tests {
             autostart: false,
             file_preview_enabled: true,
             research_id: research_id.map(str::to_owned),
-            aliases: BTreeMap::from([
-                (APP_DUPLICATE_A.into(), vec!["seed alias".into()]),
-                (APP_ABSENT.into(), vec!["absent alias".into()]),
-            ]),
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
         };
         fs::write(
@@ -1483,71 +1381,37 @@ mod tests {
     }
 
     #[test]
-    fn settings_load_projects_all_current_applications_in_cache_order() {
+    fn settings_load_uses_alias_free_wire_contract() {
         let dir = TestDir::new();
-        let store = settings_store(&dir, Some("study_01"));
-        let cache = AppCache::from_apps(settings_applications());
+        let store = settings_store(&dir, None);
 
-        let loaded = load_settings_core(&store, &cache);
         assert_eq!(
-            loaded,
-            SettingsView {
-                hotkey: "Alt+Space".into(),
-                autostart: false,
-                file_preview_enabled: true,
-                research_id: Some("study_01".into()),
-                applications: vec![
-                    AppAliasTarget {
-                        app_id: APP_EMPTY.into(),
-                        display_name: "Empty App".into(),
-                        icon: None,
-                        aliases: Vec::new(),
-                    },
-                    AppAliasTarget {
-                        app_id: APP_DUPLICATE_A.into(),
-                        display_name: "Duplicate App".into(),
-                        icon: Some("icon-a".into()),
-                        aliases: vec!["seed alias".into()],
-                    },
-                    AppAliasTarget {
-                        app_id: APP_DUPLICATE_B.into(),
-                        display_name: "Duplicate App".into(),
-                        icon: None,
-                        aliases: Vec::new(),
-                    },
-                ],
-            }
+            serde_json::to_value(load_settings_core(&store)).unwrap(),
+            serde_json::json!({
+                "hotkey": "Alt+Space",
+                "autostart": false,
+                "filePreviewEnabled": true
+            })
         );
-
-        let json = serde_json::to_string(&loaded).unwrap();
-        assert!(json.contains(r#""researchId":"study_01""#));
-        assert!(!json.contains(APP_ABSENT));
-        for private in ["shortcut", "executable", "path", "useCounts"] {
-            assert!(!json.contains(private), "settings view exposed {private}");
-        }
-        assert!(!json.contains(r#""researchId":null"#));
     }
 
     #[test]
     fn settings_research_id_json_contract_distinguishes_view_and_update() {
         let dir = TestDir::new();
         let store = settings_store(&dir, None);
-        let cache = AppCache::from_apps(settings_applications());
-        let view_json = serde_json::to_value(load_settings_core(&store, &cache)).unwrap();
+        let view_json = serde_json::to_value(load_settings_core(&store)).unwrap();
 
         assert!(!view_json.as_object().unwrap().contains_key("researchId"));
 
         for input in [
             serde_json::json!({
                 "hotkey": "Alt+Space",
-                "autostart": false,
-                "aliases": {}
+                "autostart": false
             }),
             serde_json::json!({
                 "hotkey": "Alt+Space",
                 "autostart": false,
-                "researchId": null,
-                "aliases": {}
+                "researchId": null
             }),
         ] {
             let update: UserSettingsUpdate = serde_json::from_value(input).unwrap();
@@ -1556,56 +1420,22 @@ mod tests {
     }
 
     #[test]
-    fn settings_task7_update_preserves_absent_alias_and_all_use_counts() {
+    fn settings_update_preserves_use_counts() {
         let dir = TestDir::new();
         let store = settings_store(&dir, Some("study_01"));
-        let cache = AppCache::from_apps(settings_applications());
-        let before = store.snapshot();
-        let loaded = load_settings_core(&store, &cache);
-        let aliases = loaded
-            .applications
-            .into_iter()
-            .map(|application| (application.app_id, application.aliases))
-            .collect();
+        let before = store.snapshot().use_counts;
 
         save_settings_core(
             UserSettingsUpdate {
-                hotkey: loaded.hotkey,
-                autostart: loaded.autostart,
-                research_id: loaded.research_id,
-                aliases,
+                hotkey: "Ctrl+Space".into(),
+                autostart: true,
+                research_id: Some("study_02".into()),
             },
             &store,
-            &cache,
         )
         .unwrap();
 
-        let final_settings = store.snapshot();
-        assert_eq!(final_settings.aliases[APP_DUPLICATE_A], ["seed alias"]);
-        assert_eq!(final_settings.aliases[APP_ABSENT], ["absent alias"]);
-        assert_eq!(final_settings.use_counts, before.use_counts);
-    }
-
-    #[test]
-    fn settings_save_rejects_forged_or_unknown_ids_without_state_change() {
-        let dir = TestDir::new();
-        let store = settings_store(&dir, Some("study_01"));
-        let cache = AppCache::from_apps(settings_applications());
-        let before = store.snapshot();
-
-        for key in ["forged", APP_UNKNOWN] {
-            let update = UserSettingsUpdate {
-                hotkey: "Alt+Space".into(),
-                autostart: false,
-                research_id: Some("study_01".into()),
-                aliases: BTreeMap::from([(key.into(), vec!["bad".into()])]),
-            };
-            assert_eq!(
-                save_settings_core(update, &store, &cache),
-                Err(CommandError::settings_failed())
-            );
-            assert_eq!(store.snapshot(), before);
-        }
+        assert_eq!(store.snapshot().use_counts, before);
     }
 
     #[test]
@@ -1624,7 +1454,6 @@ mod tests {
                     },
                     || {
                         trace.borrow_mut().push("settings-snapshot");
-                        trace.borrow_mut().push("cache-snapshot");
                         17
                     },
                 )
@@ -1634,12 +1463,7 @@ mod tests {
             if label == "main" {
                 assert_eq!(
                     *trace.borrow(),
-                    [
-                        "caller-guard",
-                        "frontend-ready",
-                        "settings-snapshot",
-                        "cache-snapshot"
-                    ]
+                    ["caller-guard", "frontend-ready", "settings-snapshot"]
                 );
             } else {
                 assert!(trace.borrow().is_empty());
@@ -2286,24 +2110,11 @@ mod tests {
         }
     }
 
-    fn user_settings(
-        hotkey: &str,
-        research_id: Option<&str>,
-        aliases: &[(&str, &[&str])],
-    ) -> UserSettingsUpdate {
+    fn user_settings(hotkey: &str, research_id: Option<&str>) -> UserSettingsUpdate {
         UserSettingsUpdate {
             hotkey: hotkey.into(),
             autostart: false,
             research_id: research_id.map(str::to_owned),
-            aliases: aliases
-                .iter()
-                .map(|(app_id, aliases)| {
-                    (
-                        (*app_id).into(),
-                        aliases.iter().map(|alias| (*alias).into()).collect(),
-                    )
-                })
-                .collect(),
         }
     }
 
@@ -2333,14 +2144,11 @@ mod tests {
     #[test]
     fn save_settings_preflight_rejects_invalid_input_before_worker_dispatch() {
         let dir = TestDir::new();
-        let settings_store = settings_store(&dir, Some("study_01"));
-        let cache = AppCache::from_apps(settings_applications());
+        let _settings_store = settings_store(&dir, Some("study_01"));
         for settings in [
-            user_settings("not a shortcut", None, &[]),
-            user_settings("doublectrl", None, &[]),
-            user_settings("Alt+Space", Some(" "), &[]),
-            user_settings("Alt+Space", None, &[("app-BAD", &["bad"])]),
-            user_settings("Alt+Space", None, &[(APP_UNKNOWN, &["unknown"])]),
+            user_settings("not a shortcut", None),
+            user_settings("doublectrl", None),
+            user_settings("Alt+Space", Some(" ")),
         ] {
             let coordinator = Arc::new(LifecycleCoordinator::default());
             let counts = Arc::new(SaveSideEffectCounts::default());
@@ -2350,8 +2158,6 @@ mod tests {
             assert_eq!(
                 tauri::async_runtime::block_on(save_settings_with(
                     settings,
-                    &settings_store,
-                    SaveSettingsCache(&cache),
                     move || {
                         reserve_counts.reservation.fetch_add(1, Ordering::Relaxed);
                         reserve_coordinator.reserve_critical().map_err(|_| ())
@@ -2386,19 +2192,11 @@ mod tests {
     fn save_settings_preflight_accepts_valid_input_without_persisting() {
         let dir = TestDir::new();
         let store = settings_store(&dir, Some("study_01"));
-        let cache = AppCache::from_apps(settings_applications());
         let before_memory = store.snapshot();
         let before_disk = fs::read(dir.path().join("settings.json")).unwrap();
 
-        let (kind, update) = prepare_settings_save(
-            user_settings(
-                "Control+Space",
-                Some("study_02"),
-                &[(APP_EMPTY, &["alias"])],
-            ),
-            SaveSettingsCache(&cache),
-        )
-        .unwrap();
+        let (kind, update) =
+            prepare_settings_save(user_settings("Control+Space", Some("study_02"))).unwrap();
 
         match &kind {
             HotkeyKind::Chord(shortcut) => {
@@ -2408,7 +2206,6 @@ mod tests {
         }
         assert_eq!(update.hotkey, "control+Space");
         assert_eq!(update.research_id.as_deref(), Some("study_02"));
-        assert_eq!(update.aliases[APP_EMPTY], ["alias"]);
         assert_eq!(store.snapshot(), before_memory);
         assert_eq!(
             fs::read(dir.path().join("settings.json")).unwrap(),
@@ -2418,17 +2215,9 @@ mod tests {
 
     #[test]
     fn save_settings_preflight_accepts_double_tap_without_shortcut_parse() {
-        let dir = TestDir::new();
-        let settings_store = settings_store(&dir, Some("study_01"));
-        let cache = AppCache::from_apps(settings_applications());
-        let (kind, update) = prepare_settings_save(
-            user_settings("DoubleCtrl", None, &[]),
-            SaveSettingsCache(&cache),
-        )
-        .unwrap();
+        let (kind, update) = prepare_settings_save(user_settings("DoubleCtrl", None)).unwrap();
         assert_eq!(kind, HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl));
         assert_eq!(update.hotkey, "DoubleCtrl");
-        let _ = settings_store;
     }
 
     #[test]
@@ -2445,18 +2234,15 @@ mod tests {
     }
 
     #[test]
-    fn save_settings_worker_state_uses_managed_singletons() {
+    fn save_settings_worker_state_uses_managed_store() {
         struct ManagedState {
             store: SettingsStore,
-            cache: Arc<AppCache>,
         }
 
         let dir = TestDir::new();
-        let cache = Arc::new(AppCache::from_apps(settings_applications()));
         let coordinator = Arc::new(LifecycleCoordinator::default());
         let managed = Arc::new(ManagedState {
             store: settings_store(&dir, Some("study_01")),
-            cache: Arc::clone(&cache),
         });
         let expected_store = &managed.store as *const SettingsStore as usize;
         let shortcut: Shortcut = "Alt+Space".parse().unwrap();
@@ -2464,10 +2250,8 @@ mod tests {
             hotkey: "Alt+Space".into(),
             autostart: false,
             research_id: Some("study_02".into()),
-            aliases: BTreeMap::new(),
         };
         let caller = thread::current().id();
-        let expected_cache = Arc::clone(&cache);
         let expected_coordinator = Arc::clone(&coordinator);
         let reserve_coordinator = Arc::clone(&coordinator);
         let worker_managed = Arc::clone(&managed);
@@ -2482,7 +2266,6 @@ mod tests {
                     &worker_managed.store as *const SettingsStore as usize,
                     expected_store
                 );
-                assert!(Arc::ptr_eq(&worker_managed.cache, &expected_cache));
                 assert!(Arc::ptr_eq(&worker_coordinator, &expected_coordinator));
                 assert_eq!(shortcut.to_string(), "alt+Space");
                 assert_eq!(update.hotkey, "Alt+Space");
@@ -2503,12 +2286,13 @@ mod tests {
             .map(|offset| command_start + offset)
             .unwrap();
         let command = &production[command_start..command_end];
-        for state_lookup in [
-            "app_for_worker.state::<SettingsStore>()",
-            "app_for_worker.state::<Arc<AppCache>>()",
-        ] {
-            assert_eq!(command.matches(state_lookup).count(), 1);
-        }
+        assert_eq!(
+            command
+                .matches("app_for_worker.state::<SettingsStore>()")
+                .count(),
+            1
+        );
+        assert!(!command.contains("AppCache"));
         assert_eq!(
             command.matches("Arc::clone(coordinator.inner())").count(),
             1
@@ -2529,8 +2313,6 @@ mod tests {
             "    settings: UserSettingsUpdate,\n",
             "    app: tauri::AppHandle,\n",
             "    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,\n",
-            "    settings_store: tauri::State<'_, SettingsStore>,\n",
-            "    cache: tauri::State<'_, std::sync::Arc<AppCache>>,\n",
             ") -> Result<(), CommandError> {\n",
         ]
         .concat();
@@ -2738,19 +2520,12 @@ mod tests {
         let commands_production = commands_source.split(&marker).next().unwrap();
         let wrapper = [
             "pub(crate) fn validate_user_",
-            "settings(\n",
-            "        update: &SettingsUpdate,\n",
-            "        cache: &AppCache,\n",
-            "    ) -> Result<(), SettingsError> {\n",
-            "        validate_user_settings_against(update, &cache.snapshot())\n",
+            "settings(update: &SettingsUpdate) -> Result<(), SettingsError> {\n",
+            "        validate_user_settings_update(update)\n",
             "    }",
         ]
         .concat();
-        let preflight = [
-            "SettingsStore::validate_user_",
-            "settings(&update, cache.inner())?;",
-        ]
-        .concat();
+        let preflight = ["SettingsStore::validate_user_", "settings(&update)?;"].concat();
         let reservation = ["coordinator.reserve_", "critical()?;"].concat();
 
         assert_eq!(settings_production.matches(&wrapper).count(), 1);
