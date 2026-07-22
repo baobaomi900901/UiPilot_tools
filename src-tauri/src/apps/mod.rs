@@ -122,6 +122,10 @@ impl RootKind {
             Self::CommonTopLevel => "common-top-level",
         }
     }
+
+    fn recurses(self) -> bool {
+        matches!(self, Self::User | Self::Common)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

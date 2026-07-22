@@ -220,6 +220,9 @@ fn collect_candidates(
             diagnostics.reparse_entries += 1;
             continue;
         }
+        if metadata.is_dir() && !root_kind.recurses() {
+            continue;
+        }
         let relative = match path.strip_prefix(root) {
             Ok(relative) => relative,
             Err(_) => {
@@ -394,6 +397,7 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
 mod tests {
     use std::{
         cell::Cell,
+        collections::HashSet,
         ffi::OsString,
         fs, io,
         os::windows::ffi::{OsStrExt, OsStringExt},
@@ -509,6 +513,32 @@ mod tests {
         }
     }
 
+    fn four_roots(
+        user: &Path,
+        common: &Path,
+        user_top_level: &Path,
+        common_top_level: &Path,
+    ) -> [StartMenuRoot; 4] {
+        [
+            StartMenuRoot {
+                kind: RootKind::User,
+                path: user.to_path_buf(),
+            },
+            StartMenuRoot {
+                kind: RootKind::Common,
+                path: common.to_path_buf(),
+            },
+            StartMenuRoot {
+                kind: RootKind::UserTopLevel,
+                path: user_top_level.to_path_buf(),
+            },
+            StartMenuRoot {
+                kind: RootKind::CommonTopLevel,
+                path: common_top_level.to_path_buf(),
+            },
+        ]
+    }
+
     #[test]
     fn every_known_folder_failure_has_the_fixed_hard_error() {
         for failed_at in 0..4 {
@@ -608,6 +638,87 @@ mod tests {
         assert_eq!(titles(&snapshot.applications), ["One", "Two"]);
         assert!(snapshot.applications.iter().all(|app| app.icon.is_none()));
         assert_eq!(snapshot.diagnostics.unmapped_executables, 2);
+    }
+
+    #[test]
+    fn top_level_roots_scan_direct_lnk_but_never_descend() {
+        let user = TempRoot::new("programs-user");
+        let common = TempRoot::new("programs-common");
+        let user_top = TempRoot::new("top-user");
+        let common_top = TempRoot::new("top-common");
+
+        fs::create_dir_all(user.child("Nested")).unwrap();
+        fs::create_dir_all(common.child("Nested")).unwrap();
+        fs::create_dir_all(user_top.child("Programs")).unwrap();
+        fs::create_dir_all(user_top.child("Other")).unwrap();
+        fs::create_dir_all(common_top.child("Programs")).unwrap();
+        fs::write(user.child(r"Nested\UserProgram.lnk"), []).unwrap();
+        fs::write(common.child(r"Nested\CommonProgram.lnk"), []).unwrap();
+        fs::write(user_top.child("UserTop.LNK"), []).unwrap();
+        fs::write(common_top.child("CommonTop.lnk"), []).unwrap();
+        fs::write(user_top.child(r"Programs\Hidden.lnk"), []).unwrap();
+        fs::write(user_top.child(r"Other\AlsoHidden.lnk"), []).unwrap();
+        fs::write(common_top.child(r"Programs\CommonHidden.lnk"), []).unwrap();
+        let non_unicode_directory = OsString::from_wide(&[0xD800]);
+        fs::create_dir(user_top.path().join(non_unicode_directory)).unwrap();
+        let non_unicode_shortcut = OsString::from_wide(&[0xD800, 0x002E, 0x006C, 0x006E, 0x006B]);
+        fs::write(user_top.path().join(non_unicode_shortcut), []).unwrap();
+
+        let snapshot = discover_from_roots(
+            four_roots(
+                user.path(),
+                common.path(),
+                user_top.path(),
+                common_top.path(),
+            ),
+            no_target,
+        )
+        .unwrap();
+
+        assert_eq!(
+            titles(&snapshot.applications),
+            ["CommonTop", "CommonProgram", "UserProgram", "UserTop"]
+        );
+        assert_eq!(snapshot.diagnostics.unmapped_executables, 4);
+        assert_eq!(snapshot.diagnostics.non_unicode_entries, 1);
+        assert!(snapshot.applications.iter().all(|application| matches!(
+            &application.target,
+            ApplicationLaunchTarget::Shortcut { .. }
+        )));
+    }
+
+    #[test]
+    fn same_filename_in_all_four_scopes_keeps_four_distinct_entries() {
+        let user = TempRoot::new("scope-user");
+        let common = TempRoot::new("scope-common");
+        let user_top = TempRoot::new("scope-user-top");
+        let common_top = TempRoot::new("scope-common-top");
+        for root in [&user, &common, &user_top, &common_top] {
+            fs::write(root.child("WeChat.lnk"), []).unwrap();
+        }
+
+        let snapshot = discover_from_roots(
+            four_roots(
+                user.path(),
+                common.path(),
+                user_top.path(),
+                common_top.path(),
+            ),
+            no_target,
+        )
+        .unwrap();
+        let ids: HashSet<_> = snapshot
+            .applications
+            .iter()
+            .map(|application| application.app_id.as_str())
+            .collect();
+
+        assert_eq!(snapshot.applications.len(), 4);
+        assert_eq!(ids.len(), 4);
+        assert!(snapshot
+            .applications
+            .iter()
+            .all(|application| application.display_name == "WeChat"));
     }
 
     #[test]
