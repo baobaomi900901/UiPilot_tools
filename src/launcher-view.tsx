@@ -458,7 +458,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         )}
       </aside>
       <footer className="file-toolbar">
-        <span>共 {file.total} 条结果</span>
+        <span>{file.indexStatus === 'building' ? `正在索引，已有 ${file.total} 条结果` : `共 ${file.total} 条结果`}</span>
         <Button onClick={() => core.setFileSort(file.sort === 'modifiedDesc' ? 'modifiedAsc' : 'modifiedDesc')}>
           {file.sort === 'modifiedDesc' ? '修改时间 ↓' : '修改时间 ↑'}
         </Button>

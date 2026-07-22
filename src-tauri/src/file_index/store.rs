@@ -1150,13 +1150,20 @@ impl Store {
                  AND v.volume_serial=e.volume_serial
                  AND v.filesystem_name=e.filesystem_name
                 WHERE v.committed_generation IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM candidate_entries c
+                    WHERE c.volume_guid_path=e.volume_guid_path
+                      AND c.volume_serial=e.volume_serial
+                      AND c.filesystem_name=e.filesystem_name
+                      AND c.relative_path=e.relative_path COLLATE BINARY
+                  )
                 UNION ALL
                 SELECT c.row_id,c.volume_guid_path,c.volume_serial,c.filesystem_name,c.relative_path,c.kind
                 FROM candidate_entries c JOIN volumes v
                   ON v.volume_guid_path=c.volume_guid_path
                  AND v.volume_serial=c.volume_serial
                  AND v.filesystem_name=c.filesystem_name
-                WHERE v.committed_generation IS NULL AND v.candidate_generation IS NOT NULL
+                WHERE v.candidate_generation IS NOT NULL
              ) visible
              WHERE row_id=?1
                AND volume_guid_path=?2 COLLATE BINARY
@@ -1856,10 +1863,17 @@ fn query_parts(
         SELECT e.*,0 AS candidate FROM entries e
         JOIN volumes v ON v.volume_guid_path=e.volume_guid_path AND v.volume_serial=e.volume_serial AND v.filesystem_name=e.filesystem_name
         WHERE v.committed_generation IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM candidate_entries c
+            WHERE c.volume_guid_path=e.volume_guid_path
+              AND c.volume_serial=e.volume_serial
+              AND c.filesystem_name=e.filesystem_name
+              AND c.relative_path=e.relative_path COLLATE BINARY
+          )
         UNION ALL
         SELECT c.*,1 AS candidate FROM candidate_entries c
         JOIN volumes v ON v.volume_guid_path=c.volume_guid_path AND v.volume_serial=c.volume_serial AND v.filesystem_name=c.filesystem_name
-        WHERE v.committed_generation IS NULL AND v.candidate_generation IS NOT NULL
+        WHERE v.candidate_generation IS NOT NULL
     ) e"
         .to_owned();
     let (identity_sql, mut values) = identity_predicate("e", identities);
@@ -2833,6 +2847,33 @@ mod tests {
         assert_eq!(trigram.strategy, QueryStrategy::Trigram);
         assert_eq!(trigram.total, 1);
         assert_eq!(trigram.entries[0].name, "UiPilot.xlsx");
+    }
+
+    #[test]
+    fn scanning_candidate_matches_are_visible_before_full_commit() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let volume = volume();
+        store
+            .seed_committed_for_test(&volume, [entry("find-old.txt", "other", 1)])
+            .unwrap();
+        let generation = store.begin_candidate_for_test(&volume, r"C:\").unwrap();
+        let mut folder = entry("云图", "folder", 2);
+        folder.kind = IndexedKind::Directory;
+        folder.size_bytes = None;
+        store
+            .append_candidate_for_test(&volume, generation, [folder])
+            .unwrap();
+
+        let result = store
+            .query_for_test(
+                &query("云图", FileCategory::Folder, FileSort::ModifiedDesc),
+                std::slice::from_ref(&volume),
+            )
+            .unwrap();
+
+        assert_eq!(result.status, FileIndexStatus::Building);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.entries[0].display_path, r"C:\Results\云图");
     }
 
     #[test]

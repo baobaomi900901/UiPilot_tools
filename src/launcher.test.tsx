@@ -2108,6 +2108,20 @@ describe('file mode ownership', () => {
     expect(core.getSnapshot().status).toBe('未找到文件')
   })
 
+  it('shows progressive indexing copy while building file results', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1', [], 'building'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('file-building-copy'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find 云图', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(core.getSnapshot().file?.indexStatus).toBe('building'))
+    expect(core.getSnapshot().status).toBe('正在索引，结果持续更新…')
+  })
+
   it('registers before empty search and listener failure performs zero file calls', async () => {
     const fake = fakeClient()
     const order: string[] = []
@@ -2642,6 +2656,23 @@ describe('file panel accessibility', () => {
     )
     expect(client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'all' }))
     expect(document.activeElement).toBe(input)
+    await mounted.unmount()
+  })
+
+  it('labels building totals as a streaming index instead of a static zero', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1', [], 'building'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('streaming-total')))
+    const control = core.getSnapshot().queryControl
+    await act(async () => core.text({ kind: 'ordinaryInput', control, value: '/find 云图', inputType: 'insertText' }))
+    await act(async () => core.keyDown('Enter', false))
+
+    await vi.waitFor(() => expect(mounted.host.querySelector('.file-toolbar')?.textContent).toContain('正在索引'))
+    expect(mounted.host.querySelector('.file-toolbar')?.textContent).toContain('已有 0 条结果')
     await mounted.unmount()
   })
 
