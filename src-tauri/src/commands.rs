@@ -2466,7 +2466,7 @@ mod tests {
             .find("pub(crate) async fn save_settings(")
             .unwrap();
         let command_end = production[command_start..]
-            .find("#[cfg(test)]\nfn save_settings_core")
+            .find("#[tauri::command]\npub(crate) async fn save_hotkey(")
             .map(|offset| command_start + offset)
             .unwrap();
         let command = &production[command_start..command_end];
@@ -2519,6 +2519,14 @@ mod tests {
         assert_eq!(commands_source.matches(&marker).count(), 1);
         let settings_production = settings_source.split(&marker).next().unwrap();
         let commands_production = commands_source.split(&marker).next().unwrap();
+        let save_start = commands_production
+            .find("pub(crate) async fn save_settings(")
+            .unwrap();
+        let save_end = commands_production[save_start..]
+            .find("#[tauri::command]\npub(crate) async fn save_hotkey(")
+            .map(|offset| save_start + offset)
+            .unwrap();
+        let save_command = &commands_production[save_start..save_end];
         let wrapper = [
             "pub(crate) fn validate_user_",
             "settings(\n",
@@ -2538,10 +2546,13 @@ mod tests {
 
         assert_eq!(settings_production.matches(&wrapper).count(), 1);
         assert_eq!(commands_production.matches(&preflight).count(), 1);
-        assert_eq!(commands_production.matches(&reservation).count(), 1);
+        assert_eq!(save_command.matches(&reservation).count(), 1);
         assert!(
             commands_production.find(&preflight).unwrap()
-                < commands_production.find(&reservation).unwrap()
+                < commands_production[save_start..save_end]
+                    .find(&reservation)
+                    .map(|offset| save_start + offset)
+                    .unwrap()
         );
     }
 

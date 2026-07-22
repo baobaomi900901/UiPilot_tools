@@ -393,13 +393,14 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 10);
+        assert_eq!(production.matches("commands::").count(), 11);
         for command in [
             "search_apps",
             "search_files",
             "execute_result",
             "load_settings",
             "save_settings",
+            "save_hotkey",
             "set_file_preview_preference",
             "rescan_apps",
             "export_validation_data",
