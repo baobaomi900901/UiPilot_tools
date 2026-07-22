@@ -8,6 +8,9 @@ use tauri::Manager;
 use lifecycle::ShowTarget;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+use plugins::{PluginManager, Version};
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod atomic_file;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -49,6 +52,9 @@ mod lifecycle;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod file_index;
 
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod plugins;
+
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
 
@@ -78,8 +84,10 @@ fn setup_production_lifecycle(
     app: &mut tauri::App,
     app_cache: &Arc<apps::AppCache>,
     coordinator: &Arc<lifecycle::LifecycleCoordinator>,
+    plugin_manager: &Arc<PluginManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
+    plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -177,6 +185,9 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let file_index = Arc::new(file_index::FileIndex::default());
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let plugin_manager = Arc::new(PluginManager::new());
+
     let builder = tauri::Builder::default();
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -205,6 +216,7 @@ pub fn run() {
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
+        .manage(Arc::clone(&plugin_manager))
         .manage(result_registry::ResultRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
@@ -231,7 +243,7 @@ pub fn run() {
             security_probe::setup(_app)?;
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
-            setup_production_lifecycle(_app, &app_cache, &coordinator)?;
+            setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -431,13 +443,21 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            production
+                .matches(".manage(Arc::clone(&plugin_manager))")
+                .count(),
+            1
+        );
         for fragment in [
             "let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());",
+            "let plugin_manager = Arc::new(PluginManager::new());",
             "tauri_plugin_single_instance::init(",
             "move |app, _args, _cwd|",
             "tauri_plugin_global_shortcut::Builder::new()",
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
-            "setup_production_lifecycle(_app, &app_cache, &coordinator)?;",
+            "setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;",
+            "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
             "lifecycle::install_session_end_hook",
             "tauri::tray::TrayIconBuilder::new()",
             "tauri::WindowEvent::Focused(focused)",
@@ -618,6 +638,7 @@ mod tests {
             "hotkey_hook",
             "lifecycle",
             "file_index",
+            "plugins",
         ] {
             assert!(
                 source.contains(&format!("{product_cfg}\nmod {module};")),
@@ -676,6 +697,7 @@ mod tests {
             ("settings.rs", include_str!("settings.rs")),
             ("validation_data.rs", include_str!("validation_data.rs")),
             ("validation_export.rs", include_str!("validation_export.rs")),
+            ("plugins.rs", include_str!("plugins.rs")),
         ];
 
         for (name, product_source) in product_sources {
@@ -723,5 +745,25 @@ mod tests {
             1
         );
         assert!(cache.contains(&format!("{test_only_allow}\n    pub(crate) fn refresh")));
+    }
+
+    #[test]
+    fn host_source_has_no_builtin_math_plugin() {
+        for (name, source) in [
+            ("lib.rs", include_str!("lib.rs")),
+            ("plugins.rs", include_str!("plugins.rs")),
+        ] {
+            for forbidden in [
+                ["/", "math"].concat(),
+                ["internal", ".", "math"].concat(),
+                ["Expr", "ession"].concat(),
+                ["calculate", "("].concat(),
+            ] {
+                assert!(
+                    !source.contains(&forbidden),
+                    "host source contains {forbidden}: {name}"
+                );
+            }
+        }
     }
 }
