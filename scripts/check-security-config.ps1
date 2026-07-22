@@ -119,6 +119,7 @@ $expectedPermissions = @(
   'allow-search-files',
   'allow-execute-result',
   'allow-load-settings',
+  'allow-save-hotkey',
   'allow-save-settings',
   'allow-set-file-preview-preference',
   'allow-rescan-apps',

@@ -474,9 +474,7 @@ mod tests {
     #[test]
     fn save_hotkey_command_is_declared_and_allowed() {
         assert!(include_str!("../build.rs").contains("\"save_hotkey\","));
-        assert!(
-            include_str!("../capabilities/main.json").contains("\"allow-save-hotkey\"")
-        );
+        assert!(include_str!("../capabilities/main.json").contains("\"allow-save-hotkey\""));
     }
 
     #[test]

@@ -21,8 +21,8 @@ use windows::Win32::{
 };
 
 use super::{
-    FileIndexStatus, FileSort, IndexChangeBatch, IndexEntry, IndexedKind, QuerySpec,
-    VolumeIdentity, FOLD_ALGORITHM_ID,
+    FileIndexStatus, FileSort, IndexChangeBatch, IndexEntry, IndexedKind, OpenIndexedPath,
+    QuerySpec, VolumeIdentity, FOLD_ALGORITHM_ID,
 };
 
 const APPLICATION_ID: i64 = 1_430_868_038;
@@ -235,6 +235,9 @@ pub(super) enum QueryStrategy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StoredEntry {
+    pub(super) row_id: i64,
+    pub(super) volume_identity: VolumeIdentity,
+    pub(super) relative_path: String,
     pub(super) display_path: String,
     pub(super) name: String,
     pub(super) kind: IndexedKind,
@@ -1130,6 +1133,51 @@ impl Store {
         self.query_with_hook(spec, identities, || {})
     }
 
+    pub(super) fn execution_row_matches(
+        &mut self,
+        action: &OpenIndexedPath,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let kind = match action.kind {
+            IndexedKind::File => "file",
+            IndexedKind::Directory => "directory",
+        };
+        let matches: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT e.row_id,e.volume_guid_path,e.volume_serial,e.filesystem_name,e.relative_path,e.kind
+                FROM entries e JOIN volumes v
+                  ON v.volume_guid_path=e.volume_guid_path
+                 AND v.volume_serial=e.volume_serial
+                 AND v.filesystem_name=e.filesystem_name
+                WHERE v.committed_generation IS NOT NULL
+                UNION ALL
+                SELECT c.row_id,c.volume_guid_path,c.volume_serial,c.filesystem_name,c.relative_path,c.kind
+                FROM candidate_entries c JOIN volumes v
+                  ON v.volume_guid_path=c.volume_guid_path
+                 AND v.volume_serial=c.volume_serial
+                 AND v.filesystem_name=c.filesystem_name
+                WHERE v.committed_generation IS NULL AND v.candidate_generation IS NOT NULL
+             ) visible
+             WHERE row_id=?1
+               AND volume_guid_path=?2 COLLATE BINARY
+               AND volume_serial=?3
+               AND filesystem_name=?4 COLLATE BINARY
+               AND relative_path=?5 COLLATE BINARY
+               AND kind=?6 COLLATE BINARY",
+            params![
+                action.row_id,
+                action.volume_identity.volume_guid_path,
+                action.volume_identity.volume_serial,
+                action.volume_identity.filesystem_name,
+                action.relative_path,
+                kind,
+            ],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(matches == 1)
+    }
+
     fn query_with_hook<F>(
         &mut self,
         spec: &QuerySpec,
@@ -1174,17 +1222,24 @@ impl Store {
             FileSort::ModifiedAsc => "ASC",
         };
         let item_sql = format!(
-            "SELECT e.display_path, e.name, e.kind, e.size_bytes, strftime('%Y-%m-%dT%H:%M:%fZ', e.modified_utc_ms / 1000.0, 'unixepoch') {from} WHERE {predicate} ORDER BY e.modified_utc_ms {order}, e.name COLLATE uipilot_name_ordinal_ci ASC, e.display_path COLLATE uipilot_path_ordinal_cs ASC LIMIT 200"
+            "SELECT e.row_id, e.volume_guid_path, e.volume_serial, e.filesystem_name, e.relative_path, e.display_path, e.name, e.kind, e.size_bytes, strftime('%Y-%m-%dT%H:%M:%fZ', e.modified_utc_ms / 1000.0, 'unixepoch') {from} WHERE {predicate} ORDER BY e.modified_utc_ms {order}, e.name COLLATE uipilot_name_ordinal_ci ASC, e.display_path COLLATE uipilot_path_ordinal_cs ASC LIMIT 200"
         );
         let mut statement = transaction.prepare(&item_sql)?;
         let entries = statement
             .query_map(params_from_iter(values.iter()), |row| {
-                let kind: String = row.get(2)?;
-                let size: Option<String> = row.get(3)?;
-                let modified_utc: Option<String> = row.get(4)?;
+                let kind: String = row.get(7)?;
+                let size: Option<String> = row.get(8)?;
+                let modified_utc: Option<String> = row.get(9)?;
                 Ok(StoredEntry {
-                    display_path: row.get(0)?,
-                    name: row.get(1)?,
+                    row_id: row.get(0)?,
+                    volume_identity: VolumeIdentity {
+                        volume_guid_path: row.get(1)?,
+                        volume_serial: row.get(2)?,
+                        filesystem_name: row.get(3)?,
+                    },
+                    relative_path: row.get(4)?,
+                    display_path: row.get(5)?,
+                    name: row.get(6)?,
                     kind: match kind.as_str() {
                         "file" => IndexedKind::File,
                         "directory" => IndexedKind::Directory,

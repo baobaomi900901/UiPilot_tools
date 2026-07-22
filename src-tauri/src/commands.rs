@@ -7,8 +7,8 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use crate::{
     apps::{self, AppCache, Application},
     file_index::{
-        fold_name, FileCategory, FileIndex, FileResultItem, FileSearchBatch, FileSearchResponse,
-        FileSort, QuerySpec,
+        fold_name, FileCategory, FileExecutionError, FileExecutionOutcome, FileIndex,
+        FileResultItem, FileSearchBatch, FileSearchResponse, FileSort, OpenIndexedPath, QuerySpec,
     },
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
@@ -85,6 +85,8 @@ pub(crate) enum ExecuteOutcome {
     ActivationRequested,
     ActivationRefusedLaunchRequested { message: &'static str },
     TextCopied,
+    FileRevealRequested,
+    FolderOpenRequested,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -218,6 +220,20 @@ impl CommandError {
         Self {
             code: "pluginPermissionDenied",
             message: "plugin permission denied",
+        }
+    }
+
+    fn file_not_found() -> Self {
+        Self {
+            code: "fileNotFound",
+            message: "indexed file no longer exists",
+        }
+    }
+
+    fn file_open_failed() -> Self {
+        Self {
+            code: "fileOpenFailed",
+            message: "indexed file could not be opened",
         }
     }
 }
@@ -450,7 +466,10 @@ fn publish_file_search(
     let entries = batch
         .items
         .into_iter()
-        .map(|item| (item, ResultAction::OpenIndexedPath))
+        .map(|item| {
+            let action = ResultAction::OpenIndexedPath(item.action.clone());
+            (item, action)
+        })
         .collect();
     registry.publish_if_latest(
         token,
@@ -758,7 +777,7 @@ fn save_settings_core(
 }
 
 #[tauri::command]
-pub(crate) fn execute_result(
+pub(crate) async fn execute_result(
     window: WebviewWindow,
     request_id: String,
     result_id: String,
@@ -766,15 +785,26 @@ pub(crate) fn execute_result(
     require_main_window(&window)?;
     let app = window.app_handle().clone();
     let registry = app.state::<ResultRegistry>();
+    let file_index = app.state::<Arc<FileIndex>>();
     let plugins = app.state::<Arc<PluginManager>>();
     let validation = app.state::<ValidationStore>();
     let settings = app.state::<SettingsStore>();
     let cache = app.state::<Arc<AppCache>>();
+    let worker_index = Arc::clone(file_index.inner());
     execute_result_with_clipboard(
         (&request_id, &result_id),
         ClipboardExecution {
             resolve: |request_id: &str, result_id: &str| registry.resolve(request_id, result_id),
             execute: |action: &ResultAction| apps::execute_application(action).map_err(|_| ()),
+            execute_file: move |action| async move {
+                tauri::async_runtime::spawn_blocking(move || {
+                    worker_index
+                        .execute_indexed_path(action)
+                        .map_err(map_file_execution_error)
+                })
+                .await
+                .map_err(|_| CommandError::file_open_failed())?
+            },
             authorize_plugin: |plugin_id: &str| plugins.authorizes_clipboard(plugin_id),
             copy_text: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
             clear_and_hide: || clear_and_hide(&registry, &window),
@@ -782,11 +812,13 @@ pub(crate) fn execute_result(
             increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
         },
     )
+    .await
 }
 
-struct ClipboardExecution<R, A, P, C, H, V, S> {
+struct ClipboardExecution<R, A, F, P, C, H, V, S> {
     resolve: R,
     execute: A,
+    execute_file: F,
     authorize_plugin: P,
     copy_text: C,
     clear_and_hide: H,
@@ -794,13 +826,15 @@ struct ClipboardExecution<R, A, P, C, H, V, S> {
     increment: S,
 }
 
-fn execute_result_with_clipboard<R, A, P, C, H, V, S>(
+async fn execute_result_with_clipboard<R, A, F, Fut, P, C, H, V, S>(
     ids: (&str, &str),
-    execution: ClipboardExecution<R, A, P, C, H, V, S>,
+    execution: ClipboardExecution<R, A, F, P, C, H, V, S>,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    F: FnOnce(OpenIndexedPath) -> Fut,
+    Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     P: FnOnce(&str) -> bool,
     C: FnOnce(&str) -> Result<(), ()>,
     H: FnOnce() -> Result<(), CommandError>,
@@ -811,6 +845,7 @@ where
     let ClipboardExecution {
         resolve,
         execute,
+        execute_file,
         authorize_plugin,
         copy_text,
         clear_and_hide,
@@ -829,16 +864,71 @@ where
         clear_and_hide()?;
         return Ok(ExecuteOutcome::TextCopied);
     }
-    execute_result_with(
+    execute_resolved_result_with(
         ids,
         |_, _| Ok(action),
         execute,
+        execute_file,
         clear_and_hide,
         record,
         increment,
     )
+    .await
 }
 
+fn map_file_execution_error(error: FileExecutionError) -> CommandError {
+    match error {
+        FileExecutionError::SearchUnavailable => CommandError::search_unavailable(),
+        FileExecutionError::Stale => CommandError::stale_request(),
+        FileExecutionError::NotFound => CommandError::file_not_found(),
+        FileExecutionError::OpenFailed => CommandError::file_open_failed(),
+    }
+}
+
+async fn execute_resolved_result_with<R, A, F, Fut, H, V, S>(
+    ids: (&str, &str),
+    resolve: R,
+    execute_application: A,
+    execute_file: F,
+    clear_and_hide: H,
+    record: V,
+    increment: S,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
+    A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    F: FnOnce(OpenIndexedPath) -> Fut,
+    Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
+    H: FnOnce() -> Result<(), CommandError>,
+    V: FnOnce(ValidationEvent) -> Result<(), ()>,
+    S: FnOnce(&str) -> Result<(), ()>,
+{
+    let action = resolve(ids.0, ids.1).map_err(|error| match error {
+        RegistryError::StaleRequest => CommandError::stale_request(),
+        RegistryError::UnknownResult => CommandError::unknown_result(),
+    })?;
+    match action {
+        ResultAction::LaunchApplication { .. } => execute_application_result_with(
+            &action,
+            execute_application,
+            clear_and_hide,
+            record,
+            increment,
+        ),
+        ResultAction::OpenIndexedPath(action) => {
+            let outcome = execute_file(action).await?;
+            let response = match outcome {
+                FileExecutionOutcome::FileRevealRequested => ExecuteOutcome::FileRevealRequested,
+                FileExecutionOutcome::FolderOpenRequested => ExecuteOutcome::FolderOpenRequested,
+            };
+            clear_and_hide()?;
+            Ok(response)
+        }
+        ResultAction::CopyText { .. } => Err(CommandError::application_entry_unavailable()),
+    }
+}
+
+#[cfg(test)]
 fn execute_result_with<R, A, H, V, S>(
     ids: (&str, &str),
     resolve: R,
@@ -859,12 +949,32 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
-    let app_id = match &action {
-        ResultAction::LaunchApplication { app_id, .. } => app_id.as_str(),
-        ResultAction::OpenIndexedPath => return Err(CommandError::application_entry_unavailable()),
-        ResultAction::CopyText { .. } => return Err(CommandError::application_entry_unavailable()),
+    if matches!(action, ResultAction::OpenIndexedPath(_)) {
+        return Err(CommandError::application_entry_unavailable());
+    }
+    if matches!(action, ResultAction::CopyText { .. }) {
+        return Err(CommandError::application_entry_unavailable());
+    }
+    execute_application_result_with(&action, execute, clear_and_hide, record, increment)
+}
+
+fn execute_application_result_with<A, H, V, S>(
+    action: &ResultAction,
+    execute: A,
+    clear_and_hide: H,
+    record: V,
+    increment: S,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
+    H: FnOnce() -> Result<(), CommandError>,
+    V: FnOnce(ValidationEvent) -> Result<(), ()>,
+    S: FnOnce(&str) -> Result<(), ()>,
+{
+    let ResultAction::LaunchApplication { app_id, .. } = action else {
+        return Err(CommandError::application_entry_unavailable());
     };
-    let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
+    let outcome = execute(action).map_err(|_| CommandError::application_entry_unavailable())?;
     let (response, event) = outcome_parts(outcome);
 
     let window_error = clear_and_hide().err();
@@ -1117,12 +1227,12 @@ mod tests {
 
     use super::{
         begin_modal_export_with, clear_and_hide_with, clear_validation_data_with,
-        execute_result_with, export_validation_data_guarded_with, export_validation_data_with,
-        load_settings_core, load_settings_ready_with, map_export_worker_result,
-        map_file_preview_worker_result, map_rescan_result, map_save_worker_result,
-        prepare_file_query, prepare_hotkey_save, prepare_settings_save, publish_file_search,
-        require_main_label, rescan_apps_with, save_settings_core, save_settings_with,
-        save_settings_worker_with, search_apps_with, search_files_with,
+        execute_resolved_result_with, execute_result_with, export_validation_data_guarded_with,
+        export_validation_data_with, load_settings_core, load_settings_ready_with,
+        map_export_worker_result, map_file_preview_worker_result, map_rescan_result,
+        map_save_worker_result, prepare_file_query, prepare_hotkey_save, prepare_settings_save,
+        publish_file_search, require_main_label, rescan_apps_with, save_settings_core,
+        save_settings_with, save_settings_worker_with, search_apps_with, search_files_with,
         set_file_preview_preference_with, spawn_export_worker, AppAliasTarget, CommandError,
         ExecuteOutcome, ExportOutcome, FilePreviewPreferenceUpdate, HotkeySettingsUpdate,
         SaveSettingsCache, SettingsView, UserSettingsUpdate,
@@ -1130,7 +1240,8 @@ mod tests {
     use crate::{
         apps::{AppCache, Application, ApplicationActionOutcome, ApplicationLaunchTarget},
         file_index::{
-            FileIndex, FileIndexStatus, FileResultDraft, FileResultKind, FileSearchBatch,
+            FileExecutionOutcome, FileIndex, FileIndexStatus, FileResultDraft, FileResultKind,
+            FileSearchBatch, IndexedKind, OpenIndexedPath, VolumeIdentity,
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
@@ -1238,6 +1349,16 @@ mod tests {
                 executable: Some(PathBuf::from(r"C:\Private\Current.exe")),
             },
         }
+    }
+
+    fn file_action(row_id: i64, relative_path: &str, kind: IndexedKind) -> OpenIndexedPath {
+        OpenIndexedPath::for_test(
+            0,
+            row_id,
+            VolumeIdentity::for_test(r"\\?\Volume{COMMANDS}\", 1, "ntfs"),
+            relative_path,
+            kind,
+        )
     }
 
     fn settings_store(dir: &TestDir, research_id: Option<&str>) -> SettingsStore {
@@ -1456,6 +1577,7 @@ mod tests {
             status: FileIndexStatus::Ready,
             items: vec![
                 FileResultDraft {
+                    action: file_action(1, "First.txt", IndexedKind::File),
                     name: "First.txt".into(),
                     kind: FileResultKind::File,
                     size_bytes: Some(1),
@@ -1463,6 +1585,7 @@ mod tests {
                     full_path: r"C:\Results\First.txt".into(),
                 },
                 FileResultDraft {
+                    action: file_action(2, "Folder", IndexedKind::Directory),
                     name: "Folder".into(),
                     kind: FileResultKind::Folder,
                     size_bytes: None,
@@ -1479,11 +1602,19 @@ mod tests {
         assert_eq!(response.items.len(), 2);
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(ResultAction::OpenIndexedPath(file_action(
+                1,
+                "First.txt",
+                IndexedKind::File
+            )))
         );
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[1].result_id),
-            Ok(ResultAction::OpenIndexedPath)
+            Ok(ResultAction::OpenIndexedPath(file_action(
+                2,
+                "Folder",
+                IndexedKind::Directory
+            )))
         );
     }
 
@@ -1495,7 +1626,10 @@ mod tests {
         let old = registry
             .publish_if_latest(
                 old_token,
-                vec![((), ResultAction::OpenIndexedPath)],
+                vec![(
+                    (),
+                    ResultAction::OpenIndexedPath(file_action(3, "old.txt", IndexedKind::File)),
+                )],
                 || true,
                 |request_id, items| (request_id, items),
             )
@@ -2030,7 +2164,13 @@ mod tests {
         let later_calls = Cell::new(0);
         let result = execute_result_with(
             ("request", "result"),
-            |_, _| Ok(ResultAction::OpenIndexedPath),
+            |_, _| {
+                Ok(ResultAction::OpenIndexedPath(file_action(
+                    4,
+                    "blocked.txt",
+                    IndexedKind::File,
+                )))
+            },
             |_| {
                 execute_calls.set(execute_calls.get() + 1);
                 Ok(ApplicationActionOutcome::LaunchRequested)
@@ -2520,11 +2660,13 @@ mod tests {
         assert_eq!(kind, HotkeyKind::DoubleTap(DoubleTapModifier::Ctrl));
         assert_eq!(view.hotkey, "DoubleCtrl");
 
-        assert!(serde_json::from_value::<HotkeySettingsUpdate>(serde_json::json!({
-            "hotkey": "DoubleCtrl",
-            "autostart": true
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<HotkeySettingsUpdate>(serde_json::json!({
+                "hotkey": "DoubleCtrl",
+                "autostart": true
+            }))
+            .is_err()
+        );
         assert_eq!(
             prepare_hotkey_save(HotkeySettingsUpdate {
                 hotkey: "doublectrl".into()
@@ -2656,16 +2798,23 @@ mod tests {
             }
         }
 
+        async fn no_file_execution(
+            _: OpenIndexedPath,
+        ) -> Result<FileExecutionOutcome, CommandError> {
+            unreachable!()
+        }
+
         #[test]
         fn copy_rechecks_permission_before_clipboard() {
             let clipboard = Cell::new(0);
             let hide = Cell::new(0);
             assert_eq!(
-                execute_result_with_clipboard(
+                tauri::async_runtime::block_on(execute_result_with_clipboard(
                     ("request", "result"),
                     ClipboardExecution {
                         resolve: |_: &str, _: &str| Ok(copy_action()),
                         execute: |_: &ResultAction| unreachable!(),
+                        execute_file: no_file_execution,
                         authorize_plugin: |_: &str| false,
                         copy_text: |_: &str| {
                             clipboard.set(clipboard.get() + 1);
@@ -2678,7 +2827,7 @@ mod tests {
                         record: |_: ValidationEvent| unreachable!(),
                         increment: |_: &str| unreachable!(),
                     },
-                ),
+                )),
                 Err(CommandError::plugin_permission_denied())
             );
             assert_eq!(clipboard.get(), 0);
@@ -2689,7 +2838,7 @@ mod tests {
         fn copy_success_hides_once_without_app_validation_or_use_count() {
             let trace = RefCell::new(Vec::new());
             assert_eq!(
-                execute_result_with_clipboard(
+                tauri::async_runtime::block_on(execute_result_with_clipboard(
                     ("request", "result"),
                     ClipboardExecution {
                         resolve: |_: &str, _: &str| {
@@ -2700,6 +2849,7 @@ mod tests {
                             trace.borrow_mut().push("launch");
                             unreachable!()
                         },
+                        execute_file: no_file_execution,
                         authorize_plugin: |plugin_id: &str| {
                             trace.borrow_mut().push("permission");
                             plugin_id == "plugin"
@@ -2722,7 +2872,7 @@ mod tests {
                             unreachable!()
                         },
                     },
-                ),
+                )),
                 Ok(ExecuteOutcome::TextCopied)
             );
             assert_eq!(
@@ -2735,11 +2885,12 @@ mod tests {
         fn clipboard_failure_keeps_registry_and_window_usable() {
             let hide = Cell::new(0);
             assert_eq!(
-                execute_result_with_clipboard(
+                tauri::async_runtime::block_on(execute_result_with_clipboard(
                     ("request", "result"),
                     ClipboardExecution {
                         resolve: |_: &str, _: &str| Ok(copy_action()),
                         execute: |_: &ResultAction| unreachable!(),
+                        execute_file: no_file_execution,
                         authorize_plugin: |_: &str| true,
                         copy_text: |_: &str| Err(()),
                         clear_and_hide: || {
@@ -2749,7 +2900,7 @@ mod tests {
                         record: |_: ValidationEvent| unreachable!(),
                         increment: |_: &str| unreachable!(),
                     },
-                ),
+                )),
                 Err(CommandError::clipboard_write_failed())
             );
             assert_eq!(hide.get(), 0);
@@ -2759,11 +2910,12 @@ mod tests {
         fn stale_or_unknown_copy_ids_stop_before_permission_and_clipboard() {
             for error in [RegistryError::StaleRequest, RegistryError::UnknownResult] {
                 let side_effects = Cell::new(0);
-                let result = execute_result_with_clipboard(
+                let result = tauri::async_runtime::block_on(execute_result_with_clipboard(
                     ("request", "result"),
                     ClipboardExecution {
                         resolve: |_: &str, _: &str| Err(error),
                         execute: |_: &ResultAction| unreachable!(),
+                        execute_file: no_file_execution,
                         authorize_plugin: |_: &str| {
                             side_effects.set(side_effects.get() + 1);
                             true
@@ -2779,7 +2931,7 @@ mod tests {
                         record: |_: ValidationEvent| unreachable!(),
                         increment: |_: &str| unreachable!(),
                     },
-                );
+                ));
                 assert_eq!(
                     result,
                     Err(match error {
@@ -2989,5 +3141,52 @@ mod tests {
         ] {
             assert!(guard < command.find(forbidden).unwrap());
         }
+    }
+
+    #[test]
+    fn execute_result_preserves_application_branch_and_isolates_file_branch() {
+        let volume = VolumeIdentity::for_test(r"\\?\Volume{EXECUTION}\", 41, "ntfs");
+        let file = ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+            7,
+            19,
+            volume,
+            r"docs\report.pdf",
+            IndexedKind::File,
+        ));
+        let application_calls = Cell::new(0);
+        let file_calls = Cell::new(0);
+        let hide_calls = Cell::new(0);
+        let later_application_calls = Cell::new(0);
+
+        let outcome = tauri::async_runtime::block_on(execute_resolved_result_with(
+            ("request", "result"),
+            |_, _| Ok(file),
+            |_| {
+                application_calls.set(application_calls.get() + 1);
+                Ok(ApplicationActionOutcome::LaunchRequested)
+            },
+            |_| {
+                file_calls.set(file_calls.get() + 1);
+                async { Ok(FileExecutionOutcome::FileRevealRequested) }
+            },
+            || {
+                hide_calls.set(hide_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_application_calls.set(later_application_calls.get() + 1);
+                Ok(())
+            },
+            |_| {
+                later_application_calls.set(later_application_calls.get() + 1);
+                Ok(())
+            },
+        ));
+
+        assert_eq!(outcome, Ok(ExecuteOutcome::FileRevealRequested));
+        assert_eq!(application_calls.get(), 0);
+        assert_eq!(file_calls.get(), 1);
+        assert_eq!(hide_calls.get(), 1);
+        assert_eq!(later_application_calls.get(), 0);
     }
 }

@@ -57,7 +57,7 @@ where
 {
     let target = match action {
         ResultAction::LaunchApplication { target, .. } => target,
-        ResultAction::OpenIndexedPath => {
+        ResultAction::OpenIndexedPath(_) => {
             return Err(ApplicationActionError::ApplicationEntryUnavailable)
         }
         ResultAction::CopyText { .. } => {
@@ -263,7 +263,13 @@ mod tests {
         let packaged_calls = Cell::new(0);
 
         let result = execute_application_with(
-            &ResultAction::OpenIndexedPath,
+            &ResultAction::OpenIndexedPath(crate::file_index::OpenIndexedPath::for_test(
+                0,
+                1,
+                crate::file_index::VolumeIdentity::for_test(r"\\?\Volume{FILE-ACTION}\", 1, "ntfs"),
+                "file.txt",
+                crate::file_index::IndexedKind::File,
+            )),
             |_| {
                 activation_calls.set(activation_calls.get() + 1);
                 NativeActivation::Activated

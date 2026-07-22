@@ -2543,4 +2543,30 @@ describe('file index refresh', () => {
       vi.useRealTimers()
     }
   })
+
+  it('file execute outcomes are path-free success', async () => {
+    for (const outcome of [
+      { status: 'fileRevealRequested' },
+      { status: 'folderOpenRequested' },
+    ] as const) {
+      const fake = fakeClient()
+      vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1'))
+      vi.mocked(fake.client.executeResult).mockResolvedValueOnce(outcome)
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown(`file-execute-${outcome.status}`))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find report', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(core.getSnapshot().file?.selected).toBeDefined())
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+      expect(core.getSnapshot().status).toBe('')
+      expect(JSON.stringify(outcome)).not.toMatch(/[A-Za-z]:\\|fullPath|path/i)
+      core.destroy()
+    }
+
+    expect(protocolSource).toContain("{ status: 'fileRevealRequested' }")
+    expect(protocolSource).toContain("{ status: 'folderOpenRequested' }")
+  })
 })

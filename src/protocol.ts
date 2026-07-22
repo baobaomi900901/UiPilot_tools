@@ -45,6 +45,8 @@ export type ExecuteOutcome =
   | { status: 'activationRequested' }
   | { status: 'activationRefusedLaunchRequested'; message: string }
   | { status: 'textCopied' }
+  | { status: 'fileRevealRequested' }
+  | { status: 'folderOpenRequested' }
 
 export type ExportOutcome = { status: 'cancelled' } | { status: 'exported' }
 
