@@ -10,6 +10,7 @@ import {
   type FileSearchResponse,
   type ExecuteOutcome,
   type ExportOutcome,
+  type HotkeySettingsView,
   type LauncherClient,
   type SearchResponse,
   type SettingsView,
@@ -33,6 +34,7 @@ export const client: LauncherClient = {
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   loadSettings: () => invoke<SettingsView>('load_settings'),
   saveSettings: (input) => invoke<void>('save_settings', input),
+  saveHotkey: (input) => invoke<HotkeySettingsView>('save_hotkey', input),
   setFilePreviewPreference: (input) =>
     invoke<void>(
       'set_file_preview_preference',

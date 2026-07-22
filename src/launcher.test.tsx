@@ -107,6 +107,7 @@ function fakeClient() {
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
     loadSettings: vi.fn(async () => emptySettings),
     saveSettings: vi.fn(async () => undefined),
+    saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
     rescanApps: vi.fn(async () => undefined),
     exportValidationData: vi.fn(async () => ({ status: 'cancelled' }) satisfies ExportOutcome),
     clearValidationData: vi.fn(async () => undefined),
@@ -1107,6 +1108,63 @@ describe('settings ownership', () => {
     core.setHotkeyCanonical('DoubleCtrl')
     expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl')
     expect(client.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('records hotkey through dedicated save without saving other drafts', async () => {
+    const { core, client } = await settingsCore()
+    const settings = core.getSnapshot().settings!
+    core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
+    core.setAutostart(true)
+
+    await core.saveHotkeyCanonical('DoubleCtrl')
+
+    expect(client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } })
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
+    expect(core.getSnapshot().settings!.autostart).toBe(true)
+  })
+
+  it('restores durable hotkey and preserves other drafts after dedicated save failure', async () => {
+    const { core, client } = await settingsCore()
+    const settings = core.getSnapshot().settings!
+    core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
+    vi.mocked(client.saveHotkey).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private backend text' })
+
+    await core.saveHotkeyCanonical('DoubleCtrl')
+
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('Alt+Space')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
+  })
+
+  it('keeps one settings operation while dedicated hotkey save is pending', async () => {
+    const { core, client } = await settingsCore()
+    const pendingHotkey = deferred<{ hotkey: string }>()
+    vi.mocked(client.saveHotkey).mockReturnValueOnce(pendingHotkey.promise)
+
+    const pending = core.saveHotkeyCanonical('DoubleCtrl')
+    void core.saveSettings()
+    void core.saveHotkeyCanonical('DoubleAlt')
+
+    expect(client.saveHotkey).toHaveBeenCalledOnce()
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    expect(core.getSnapshot().settings).toMatchObject({ operation: 'hotkey' })
+    pendingHotkey.resolve({ hotkey: 'DoubleCtrl' })
+    await pending
+  })
+
+  it('does not let stale dedicated hotkey response overwrite a newer settings view', async () => {
+    const { core, client, emit } = await settingsCore()
+    const pendingHotkey = deferred<{ hotkey: string }>()
+    vi.mocked(client.saveHotkey).mockReturnValueOnce(pendingHotkey.promise)
+
+    const pending = core.saveHotkeyCanonical('DoubleCtrl')
+    emit(shown('new-settings', 'settings'))
+    pendingHotkey.resolve({ hotkey: 'DoubleCtrl' })
+    await pending
+
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
   })
 
   it('save persists DoubleCtrl through save_settings payload', async () => {

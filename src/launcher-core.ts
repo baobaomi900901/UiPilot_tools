@@ -32,6 +32,7 @@ export interface LauncherCore {
   readonly requestHide: () => Promise<void>
   readonly setAutostart: (checked: boolean) => void
   readonly setHotkeyCanonical: (value: string) => void
+  readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
   readonly setFileSort: (sort: FileSort) => void
   readonly setFilePreviewEnabled: (enabled: boolean) => void
@@ -137,7 +138,7 @@ interface PreviewPreferenceOwner {
   enabled: boolean
 }
 
-type SettingsOperationKind = 'load' | 'save' | 'rescan' | 'export' | 'clear'
+type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'rescan' | 'export' | 'clear'
 
 interface SettingsOperation {
   token: number
@@ -1043,6 +1044,43 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     await reloadAfterMutation(operation)
   }
 
+  async function saveHotkeyCanonical(value: string): Promise<void> {
+    if (!settingsEditable() || !model.settings) return
+    const settings = model.settings
+    const previous = settings.hotkey.value
+    const operation = startSettingsOperation('hotkey')
+    if (!operation) return
+    setControlDraft(settings.hotkey.key, value)
+    settings.hotkey.value = value
+    publish(true)
+    try {
+      const result = await client.saveHotkey({ hotkey: { hotkey: value } })
+      if (!ownsSettingsOperation(operation)) return
+      if (!ownsSettingsView(operation)) {
+        model.settingsNeedsReload = true
+        releaseSettingsOperation(operation)
+        publish(true)
+        return
+      }
+      setControlDraft(settings.hotkey.key, result.hotkey)
+      settings.hotkey.value = result.hotkey
+      releaseSettingsOperation(operation)
+      publish(true)
+    } catch (error) {
+      if (!ownsSettingsOperation(operation)) return
+      const current = ownsSettingsView(operation)
+      releaseSettingsOperation(operation)
+      if (current) {
+        setControlDraft(settings.hotkey.key, previous)
+        settings.hotkey.value = previous
+        model.status = errorText(error)
+      } else {
+        model.settingsNeedsReload = true
+      }
+      publish(true)
+    }
+  }
+
   async function rescanApps(): Promise<void> {
     if (!settingsEditable()) return
     const operation = startSettingsOperation('rescan')
@@ -1373,6 +1411,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     requestHide,
     setAutostart,
     setHotkeyCanonical,
+    saveHotkeyCanonical,
     setFileCategory,
     setFileSort,
     setFilePreviewEnabled,

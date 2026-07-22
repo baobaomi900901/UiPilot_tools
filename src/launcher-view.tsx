@@ -113,7 +113,7 @@ function HotkeyRecorderInput({ core, value, disabled, id, name }: HotkeyRecorder
         repeat: event.repeat,
         nowMs: Date.now(),
       })
-      if (result.commit) core.setHotkeyCanonical(result.commit)
+      if (result.commit) void core.saveHotkeyCanonical(result.commit)
       return result.state
     })
   }

@@ -32,6 +32,14 @@ export interface UserSettingsUpdate {
   aliases: Record<string, string[]>
 }
 
+export interface HotkeySettingsUpdate {
+  hotkey: string
+}
+
+export interface HotkeySettingsView {
+  hotkey: string
+}
+
 export type ExecuteOutcome =
   | { status: 'launchRequested' }
   | { status: 'activationRequested' }
@@ -94,6 +102,7 @@ export interface LauncherClient {
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   loadSettings(): Promise<SettingsView>
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
+  saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
   setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
   rescanApps(): Promise<void>
   exportValidationData(): Promise<ExportOutcome>
@@ -125,7 +134,7 @@ export interface SettingsSnapshot {
   autostart: boolean
   applications: readonly ApplicationAliasView[]
   readOnly: boolean
-  operation?: 'load' | 'save' | 'rescan' | 'export' | 'clear'
+  operation?: 'load' | 'save' | 'hotkey' | 'rescan' | 'export' | 'clear'
   clearConfirmation: boolean
   needsReload: boolean
 }
