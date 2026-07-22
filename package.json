@@ -15,7 +15,8 @@
     "@tauri-apps/plugin-global-shortcut": "^2.3.2",
     "antd": "6.5.1",
     "react": "19.2.7",
-    "react-dom": "19.2.7"
+    "react-dom": "19.2.7",
+    "react-markdown": "^10.1.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",

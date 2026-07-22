@@ -29,6 +29,13 @@ export interface HotkeySettingsView {
   hotkey: string
 }
 
+export interface PluginView {
+  id: string
+  version: string
+  trigger: string
+  description: string | null
+}
+
 export type ExecuteOutcome =
   | { status: 'launchRequested' }
   | { status: 'activationRequested' }
@@ -49,6 +56,9 @@ export type CommandErrorCode =
   | 'searchUnavailable'
   | 'clipboardWriteFailed'
   | 'pluginPermissionDenied'
+  | 'pluginListFailed'
+  | 'pluginReloadFailed'
+  | 'pluginDeleteFailed'
   | 'fileNotFound'
   | 'fileOpenFailed'
 
@@ -86,6 +96,9 @@ export interface LauncherClient {
     querySequence: number
   }): Promise<FileSearchResponse | null>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  listPlugins(): Promise<PluginView[]>
+  reloadPlugin(input: { pluginId: string }): Promise<PluginView>
+  deletePlugin(input: { pluginId: string }): Promise<void>
   loadSettings(): Promise<SettingsView>
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
@@ -111,6 +124,20 @@ export interface SettingsSnapshot {
   readOnly: boolean
   operation?: 'load' | 'save' | 'hotkey'
   needsReload: boolean
+}
+
+export type PluginListStatus = 'idle' | 'loading' | 'ready' | 'error'
+export type PluginMutationKind = 'reload' | 'delete'
+
+export interface PluginItemSnapshot extends PluginView {
+  operation?: PluginMutationKind
+  error?: string
+}
+
+export interface PluginListSnapshot {
+  status: PluginListStatus
+  items: readonly PluginItemSnapshot[]
+  error?: string
 }
 
 export type FileCategory = 'all' | 'folder' | 'excel' | 'word' | 'ppt' | 'pdf' | 'image' | 'video' | 'audio' | 'archive'
@@ -176,6 +203,7 @@ export interface LauncherSnapshot {
   shownNotice?: string
   status: string
   settings?: SettingsSnapshot
+  plugins?: PluginListSnapshot
   file?: FileSnapshot
 }
 
@@ -216,6 +244,40 @@ function exactDenseArray(value: unknown[]): boolean {
   const keys = Object.getOwnPropertyNames(value)
   if (Object.getOwnPropertySymbols(value).length !== 0 || keys.length !== value.length + 1) return false
   return keys.every((key, index) => (index < value.length ? key === String(index) : key === 'length'))
+}
+
+function parsePluginView(value: unknown): PluginView | null {
+  const plugin = plainRecord(value)
+  if (!plugin || !exactKeys(plugin, ['description', 'id', 'trigger', 'version'])) return null
+  if (
+    typeof plugin.id !== 'string' ||
+    plugin.id.length === 0 ||
+    typeof plugin.version !== 'string' ||
+    plugin.version.length === 0 ||
+    typeof plugin.trigger !== 'string' ||
+    plugin.trigger.length === 0 ||
+    (plugin.description !== null && typeof plugin.description !== 'string')
+  ) {
+    return null
+  }
+  return plugin as unknown as PluginView
+}
+
+export function parsePluginViews(value: unknown): PluginView[] | null {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || !exactDenseArray(value)) return null
+  const ids = new Set<string>()
+  const plugins: PluginView[] = []
+  for (const valueItem of value) {
+    const plugin = parsePluginView(valueItem)
+    if (!plugin || ids.has(plugin.id)) return null
+    ids.add(plugin.id)
+    plugins.push(plugin)
+  }
+  return plugins
+}
+
+export function parsePlugin(value: unknown): PluginView | null {
+  return parsePluginView(value)
 }
 
 function canonicalU64(value: unknown): value is string {

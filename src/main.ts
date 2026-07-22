@@ -7,6 +7,8 @@ import { createLauncherCore } from './launcher-core'
 import { LauncherView } from './launcher-view'
 import {
   parseFileSearchResponse,
+  parsePlugin,
+  parsePluginViews,
   type FileSearchResponse,
   type ExecuteOutcome,
   type HotkeySettingsView,
@@ -31,6 +33,23 @@ export const client: LauncherClient = {
     return response === null ? null : parseFileSearchResponse(response)
   },
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
+  listPlugins: async () => {
+    const value = await invoke<unknown>('list_plugins')
+    const plugins = parsePluginViews(value)
+    if (!plugins) throw { code: 'pluginListFailed', message: 'plugin list failed' }
+    return plugins
+  },
+  reloadPlugin: async (input) => {
+    const value = await invoke<unknown>(
+      'reload_plugin',
+      Object.freeze({ pluginId: input.pluginId }),
+    )
+    const plugin = parsePlugin(value)
+    if (!plugin) throw { code: 'pluginReloadFailed', message: 'plugin reload failed' }
+    return plugin
+  },
+  deletePlugin: (input) =>
+    invoke<void>('delete_plugin', Object.freeze({ pluginId: input.pluginId })),
   loadSettings: () => invoke<SettingsView>('load_settings'),
   saveSettings: (input) => invoke<void>('save_settings', input),
   saveHotkey: (input) => invoke<HotkeySettingsView>('save_hotkey', input),

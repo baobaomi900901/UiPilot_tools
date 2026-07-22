@@ -14,6 +14,9 @@ import {
   type FileSort,
   type LauncherClient,
   type LauncherSnapshot,
+  type PluginListStatus,
+  type PluginMutationKind,
+  type PluginView,
   type ResultItem,
   type SettingsView,
   type UserSettingsUpdate,
@@ -38,6 +41,9 @@ export interface LauncherCore {
   readonly setFilePreviewEnabled: (enabled: boolean) => void
   readonly saveSettings: () => Promise<void>
   readonly reloadSettings: () => Promise<void>
+  readonly reloadPlugins: () => Promise<void>
+  readonly reloadPlugin: (pluginId: string) => Promise<void>
+  readonly deletePlugin: (pluginId: string) => Promise<void>
   readonly destroy: () => void
 }
 
@@ -85,6 +91,18 @@ interface Model {
   settingsNeedsReload: boolean
   settingsLoadError?: string
   file?: PrivateFileState
+  plugins: PrivatePluginList
+}
+
+interface PrivatePluginItem extends PluginView {
+  operation?: PluginMutationKind
+  error?: string
+}
+
+interface PrivatePluginList {
+  status: PluginListStatus
+  items: PrivatePluginItem[]
+  error?: string
 }
 
 interface CompositionOwner {
@@ -131,6 +149,18 @@ interface SettingsOperation {
   view: 'launcher' | 'settings'
 }
 
+interface PluginListOwner {
+  token: number
+  viewEpoch: number
+}
+
+interface PluginMutationOwner {
+  token: number
+  viewEpoch: number
+  pluginId: string
+  kind: PluginMutationKind
+}
+
 const ERROR_TEXT: Record<CommandErrorCode, string> = {
   invalidCaller: '操作不可用，请重试。',
   staleRequest: '搜索结果已过期，请重新搜索。',
@@ -145,6 +175,9 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   fileOpenFailed: '无法在资源管理器中打开。',
   clipboardWriteFailed: '无法复制到剪贴板。',
   pluginPermissionDenied: '插件无权写入剪贴板。',
+  pluginListFailed: '无法加载插件清单。',
+  pluginReloadFailed: '无法重新加载插件。',
+  pluginDeleteFailed: '无法删除插件。',
 }
 
 const NOTICE_TEXT = {
@@ -217,6 +250,22 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(model.file.selectedIndex < 0 ? {} : { selected: fileResults![model.file.selectedIndex] }),
       })
     : undefined
+  const plugins = Object.freeze({
+    status: model.plugins.status,
+    items: Object.freeze(
+      model.plugins.items.map((plugin) =>
+        Object.freeze({
+          id: plugin.id,
+          version: plugin.version,
+          trigger: plugin.trigger,
+          description: plugin.description,
+          ...(plugin.operation === undefined ? {} : { operation: plugin.operation }),
+          ...(plugin.error === undefined ? {} : { error: plugin.error }),
+        }),
+      ),
+    ),
+    ...(model.plugins.error === undefined ? {} : { error: model.plugins.error }),
+  })
   return Object.freeze({
     view: model.view,
     viewEpoch: model.viewEpoch,
@@ -233,6 +282,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
     status: model.status,
     ...(settings === undefined ? {} : { settings }),
+    ...(model.view === 'settings' ? { plugins } : {}),
     ...(file === undefined ? {} : { file }),
   })
 }
@@ -253,6 +303,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     hidePending: false,
     status: '',
     settingsNeedsReload: false,
+    plugins: { status: 'idle', items: [] },
   }
   const listeners = new Set<() => void>()
   let snapshot = projectSnapshot(model)
@@ -281,6 +332,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let compositionGeneration = 0
   let composition: CompositionOwner | undefined
   let settingsOperation: SettingsOperation | undefined
+  let pluginListOwner: PluginListOwner | undefined
+  const pluginMutationOwners = new Map<string, PluginMutationOwner>()
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -756,6 +809,140 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
   }
 
+  function ownsPluginList(owner: PluginListOwner): boolean {
+    return (
+      !destroyed &&
+      pluginListOwner?.token === owner.token &&
+      owner.viewEpoch === model.viewEpoch &&
+      model.view === 'settings'
+    )
+  }
+
+  function beginPluginList(): Promise<void> | undefined {
+    if (destroyed || model.view !== 'settings') return undefined
+    const owner = { token: ++token, viewEpoch: model.viewEpoch }
+    pluginListOwner = owner
+    model.plugins = { status: 'loading', items: [] }
+    publish(true)
+    let pending: Promise<PluginView[]>
+    try {
+      pending = client.listPlugins()
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    return pending.then(
+      (plugins) => {
+        if (!ownsPluginList(owner)) return
+        pluginListOwner = undefined
+        model.plugins = { status: 'ready', items: plugins.map((plugin) => ({ ...plugin })) }
+        publish(true)
+      },
+      (error: unknown) => {
+        if (!ownsPluginList(owner)) return
+        pluginListOwner = undefined
+        model.plugins = { status: 'error', items: [], error: errorText(error) }
+        publish(true)
+      },
+    )
+  }
+
+  async function reloadPlugins(): Promise<void> {
+    await beginPluginList()
+  }
+
+  function reconcilePluginsAfterStaleMutation(): void {
+    if (!destroyed && model.view === 'settings') void beginPluginList()
+  }
+
+  function ownsPluginMutation(owner: PluginMutationOwner): boolean {
+    return pluginMutationOwners.get(owner.pluginId)?.token === owner.token
+  }
+
+  function finishStalePluginMutation(owner: PluginMutationOwner): void {
+    if (!ownsPluginMutation(owner)) return
+    pluginMutationOwners.delete(owner.pluginId)
+    reconcilePluginsAfterStaleMutation()
+  }
+
+  async function reloadPlugin(pluginId: string): Promise<void> {
+    const plugin = model.plugins.items.find((item) => item.id === pluginId)
+    if (destroyed || model.view !== 'settings' || model.plugins.status !== 'ready' || !plugin || plugin.operation) return
+    const owner: PluginMutationOwner = {
+      token: ++token,
+      viewEpoch: model.viewEpoch,
+      pluginId,
+      kind: 'reload',
+    }
+    pluginMutationOwners.set(pluginId, owner)
+    plugin.operation = 'reload'
+    plugin.error = undefined
+    publish(true)
+    try {
+      const reloaded = await client.reloadPlugin({ pluginId })
+      if (!ownsPluginMutation(owner)) return
+      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
+        finishStalePluginMutation(owner)
+        return
+      }
+      pluginMutationOwners.delete(pluginId)
+      const index = model.plugins.items.findIndex((item) => item.id === pluginId)
+      if (index >= 0) model.plugins.items[index] = { ...reloaded }
+      publish(true)
+    } catch (error) {
+      if (!ownsPluginMutation(owner)) return
+      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
+        finishStalePluginMutation(owner)
+        return
+      }
+      pluginMutationOwners.delete(pluginId)
+      const current = model.plugins.items.find((item) => item.id === pluginId)
+      if (current) {
+        current.operation = undefined
+        current.error = errorText(error)
+      }
+      publish(true)
+    }
+  }
+
+  async function deletePlugin(pluginId: string): Promise<void> {
+    const plugin = model.plugins.items.find((item) => item.id === pluginId)
+    if (destroyed || model.view !== 'settings' || model.plugins.status !== 'ready' || !plugin || plugin.operation) return
+    const owner: PluginMutationOwner = {
+      token: ++token,
+      viewEpoch: model.viewEpoch,
+      pluginId,
+      kind: 'delete',
+    }
+    pluginMutationOwners.set(pluginId, owner)
+    plugin.operation = 'delete'
+    plugin.error = undefined
+    publish(true)
+    try {
+      await client.deletePlugin({ pluginId })
+      if (!ownsPluginMutation(owner)) return
+      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
+        finishStalePluginMutation(owner)
+        return
+      }
+      pluginMutationOwners.delete(pluginId)
+      model.plugins.items = model.plugins.items.filter((item) => item.id !== pluginId)
+      publish(true)
+    } catch (error) {
+      if (!ownsPluginMutation(owner)) return
+      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
+        finishStalePluginMutation(owner)
+        return
+      }
+      pluginMutationOwners.delete(pluginId)
+      const current = model.plugins.items.find((item) => item.id === pluginId)
+      if (current) {
+        current.operation = undefined
+        current.error = errorText(error)
+      }
+      publish(true)
+    }
+  }
+
   function shown(payload: unknown): void {
     if (destroyed) return
     const event = parseLauncherShown(payload)
@@ -787,6 +974,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       beginSearch()
     }
     publish(true)
+    if (event.target === 'settings') void beginPluginList()
   }
 
   function text(record: ClassifiedTextRecord): void {
@@ -1163,6 +1351,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     hideToken = ++token
     clearFileRefreshTimers()
     settingsOperation = undefined
+    pluginListOwner = undefined
+    pluginMutationOwners.clear()
     unlisten?.()
     unlisten = undefined
     fileListenerToken += 1
@@ -1278,6 +1468,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setFilePreviewEnabled,
     saveSettings,
     reloadSettings,
+    reloadPlugins,
+    reloadPlugin,
+    deletePlugin,
     destroy,
   }
 }

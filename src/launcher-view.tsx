@@ -5,6 +5,7 @@ import {
   ConfigProvider,
   Form,
   Input,
+  Popconfirm,
   Spin,
   Switch,
   Tooltip,
@@ -21,6 +22,7 @@ import {
   useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
+import ReactMarkdown from 'react-markdown'
 
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
@@ -83,6 +85,8 @@ const fileCategories: readonly { value: FileCategory; label: string }[] = [
   { value: 'audio', label: '音频' },
   { value: 'archive', label: '压缩包' },
 ]
+
+const pluginMarkdownElements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'li', 'em', 'strong', 'code', 'pre']
 
 function fileSize(kind: FileResultKind, sizeBytes: string | null): string {
   if (kind === 'folder' || sizeBytes === null) return '--'
@@ -478,6 +482,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   ) : null
 
   const settings = snapshot.settings
+  const plugins = snapshot.plugins
   const busy = settings?.operation !== undefined
   const locked = busy || settings?.readOnly === true
   const settingsView = (
@@ -490,34 +495,100 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           关闭
         </Button>
       </header>
-      {!settings ? (
-        <div className="settings-loading">
-          {snapshot.status ? <Button onClick={() => void core.reloadSettings()}>重新加载设置</Button> : <Spin size="small" />}
-        </div>
-      ) : (
-        <Form component="div" layout="vertical" className="settings-form">
-          <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
-            <HotkeyRecorderInput
-              core={core}
-              value={settings.hotkey.value}
-              id={`settings-hotkey-${settings.hotkey.key}`}
-              name={`settings-hotkey-${settings.hotkey.key}`}
-              disabled={locked}
-            />
-          </Form.Item>
-          <Checkbox checked={settings.autostart} disabled={locked} onChange={(event) => core.setAutostart(event.target.checked)}>
-            开机启动
-          </Checkbox>
-          <div className="settings-actions">
-            <Button type="primary" disabled={locked} loading={settings.operation === 'save'} onClick={() => void core.saveSettings()}>
-              保存
-            </Button>
-            <Button disabled={busy} loading={settings.operation === 'load'} onClick={() => void core.reloadSettings()}>
-              重新加载设置
-            </Button>
+      <div className="settings-form">
+        {!settings ? (
+          <div className="settings-loading">
+            {snapshot.status ? <Button onClick={() => void core.reloadSettings()}>重新加载设置</Button> : <Spin size="small" />}
           </div>
-        </Form>
-      )}
+        ) : (
+          <Form component="div" layout="vertical" className="settings-basic-form">
+            <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
+              <HotkeyRecorderInput
+                core={core}
+                value={settings.hotkey.value}
+                id={`settings-hotkey-${settings.hotkey.key}`}
+                name={`settings-hotkey-${settings.hotkey.key}`}
+                disabled={locked}
+              />
+            </Form.Item>
+            <Checkbox checked={settings.autostart} disabled={locked} onChange={(event) => core.setAutostart(event.target.checked)}>
+              开机启动
+            </Checkbox>
+            <div className="settings-actions">
+              <Button type="primary" disabled={locked} loading={settings.operation === 'save'} onClick={() => void core.saveSettings()}>
+                保存
+              </Button>
+              <Button disabled={busy} loading={settings.operation === 'load'} onClick={() => void core.reloadSettings()}>
+                重新加载设置
+              </Button>
+            </div>
+          </Form>
+        )}
+        <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
+          <div className="plugin-inventory-header">
+            <h2 id="plugin-inventory-title">插件</h2>
+            {plugins?.status === 'error' ? (
+              <Button size="small" onClick={() => void core.reloadPlugins()}>
+                重试
+              </Button>
+            ) : null}
+          </div>
+          {plugins?.status === 'loading' || plugins?.status === 'idle' ? (
+            <div className="plugin-list-state"><Spin size="small" /></div>
+          ) : plugins?.status === 'error' ? (
+            <div className="plugin-list-state plugin-list-error" role="alert">{plugins.error}</div>
+          ) : plugins?.items.length === 0 ? (
+            <div className="plugin-list-state">未安装插件</div>
+          ) : (
+            <div className="plugin-list">
+              {plugins?.items.map((plugin) => (
+                <article className="plugin-item" key={plugin.id}>
+                  <div className="plugin-item-main">
+                    <div className="plugin-title-line">
+                      <h3>{plugin.id}</h3>
+                      <span>{plugin.version}</span>
+                      <code>{plugin.trigger}</code>
+                    </div>
+                    <div className="plugin-description">
+                      <div className="plugin-description-label">说明</div>
+                      {plugin.description ? (
+                        <ReactMarkdown allowedElements={pluginMarkdownElements} unwrapDisallowed>
+                          {plugin.description}
+                        </ReactMarkdown>
+                      ) : (
+                        <p>暂无说明</p>
+                      )}
+                    </div>
+                    {plugin.error ? <div className="plugin-row-error" role="alert">{plugin.error}</div> : null}
+                  </div>
+                  <div className="plugin-actions">
+                    <Button
+                      size="small"
+                      loading={plugin.operation === 'reload'}
+                      disabled={plugin.operation !== undefined}
+                      onClick={() => void core.reloadPlugin(plugin.id)}
+                    >
+                      重新加载
+                    </Button>
+                    <Popconfirm
+                      title="删除此插件？"
+                      description="插件包将从插件目录移除。"
+                      okText="删除"
+                      cancelText="取消"
+                      onConfirm={() => void core.deletePlugin(plugin.id)}
+                      disabled={plugin.operation !== undefined}
+                    >
+                      <Button size="small" danger loading={plugin.operation === 'delete'} disabled={plugin.operation !== undefined}>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
     </section>
   )
 

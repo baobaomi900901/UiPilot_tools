@@ -24,6 +24,7 @@ import {
   parseFileIndexChanged,
   parseFileSearchResponse,
   parseLauncherShown,
+  parsePluginViews,
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
@@ -31,6 +32,7 @@ import {
   type FileSearchResponse,
   type LauncherClient,
   type LauncherShown,
+  type PluginView,
   type SearchResponse,
   type SettingsView,
 } from './protocol'
@@ -56,6 +58,27 @@ describe('retired validation settings contract', () => {
     ]) {
       expect(productionSources.every((source) => !source.includes(forbidden)), forbidden).toBe(true)
     }
+  })
+})
+
+describe('plugin protocol', () => {
+  const plugin: PluginView = {
+    id: 'internal.math',
+    version: '1.0.0',
+    trigger: '/math',
+    description: '# Math',
+  }
+
+  it('accepts only exact dense plain plugin arrays with unique IDs', () => {
+    expect(parsePluginViews([plugin])).toEqual([plugin])
+    expect(parsePluginViews([])).toEqual([])
+    expect(parsePluginViews([{ ...plugin, extra: true }])).toBeNull()
+    expect(parsePluginViews([{ ...plugin, description: undefined }])).toBeNull()
+    expect(parsePluginViews([plugin, { ...plugin }])).toBeNull()
+    expect(parsePluginViews(Object.assign([plugin], { extra: true }))).toBeNull()
+    const sparse = new Array(1)
+    expect(parsePluginViews(sparse)).toBeNull()
+    expect(parsePluginViews([Object.assign(Object.create({}), plugin)])).toBeNull()
   })
 })
 
@@ -119,6 +142,14 @@ function fakeClient() {
     searchFiles: vi.fn(async () => null),
     setFilePreviewPreference: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
+    listPlugins: vi.fn(async () => []),
+    reloadPlugin: vi.fn(async ({ pluginId }) => ({
+      id: pluginId,
+      version: '1.0.0',
+      trigger: `/${pluginId}`,
+      description: null,
+    })),
+    deletePlugin: vi.fn(async () => undefined),
     loadSettings: vi.fn(async () => emptySettings),
     saveSettings: vi.fn(async () => undefined),
     saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
@@ -1141,6 +1172,143 @@ describe('settings ownership', () => {
 
 })
 
+describe('plugin settings ownership', () => {
+  const pluginV1: PluginView = {
+    id: 'internal.math',
+    version: '1.0.0',
+    trigger: '/math',
+    description: '# Math',
+  }
+  const pluginV2: PluginView = { ...pluginV1, version: '2.0.0', description: '# Math 2' }
+
+  async function pluginCore(list: Promise<PluginView[]> | PluginView[] = [pluginV1]) {
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockReturnValueOnce(Promise.resolve(list))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('plugin-settings', 'settings'))
+    return { core, ...fake }
+  }
+
+  it('keeps list loading, error, empty, and retry independent from settings drafts', async () => {
+    const pending = deferred<PluginView[]>()
+    const { core, client } = await pluginCore(pending.promise)
+    expect(core.getSnapshot().plugins).toMatchObject({ status: 'loading', items: [] })
+    core.setAutostart(true)
+
+    pending.reject({ code: 'pluginListFailed', message: 'private backend text' })
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('error'))
+    expect(core.getSnapshot().plugins?.error).toBe('无法加载插件清单。')
+    expect(core.getSnapshot().settings?.autostart).toBe(true)
+
+    vi.mocked(client.listPlugins).mockResolvedValueOnce([])
+    await core.reloadPlugins()
+    expect(core.getSnapshot().plugins).toMatchObject({ status: 'ready', items: [] })
+    expect(core.getSnapshot().settings?.autostart).toBe(true)
+  })
+
+  it('updates only the active row for reload and removes it after confirmed delete', async () => {
+    const { core, client } = await pluginCore()
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    const reload = deferred<PluginView>()
+    vi.mocked(client.reloadPlugin).mockReturnValueOnce(reload.promise)
+    const reloading = core.reloadPlugin(pluginV1.id)
+    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'reload' })
+    reload.resolve(pluginV2)
+    await reloading
+    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ version: '2.0.0' })
+
+    const remove = deferred<void>()
+    vi.mocked(client.deletePlugin).mockReturnValueOnce(remove.promise)
+    const deleting = core.deletePlugin(pluginV1.id)
+    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'delete' })
+    remove.resolve()
+    await deleting
+    expect(core.getSnapshot().plugins?.items).toEqual([])
+  })
+
+  it('keeps plugin row mutation independent from ordinary settings save', async () => {
+    const { core, client } = await pluginCore()
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    const reload = deferred<PluginView>()
+    vi.mocked(client.reloadPlugin).mockReturnValueOnce(reload.promise)
+    const reloading = core.reloadPlugin(pluginV1.id)
+
+    await core.saveSettings()
+    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'reload' })
+    reload.resolve(pluginV2)
+    await reloading
+    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ version: '2.0.0' })
+  })
+
+  it('reconciles a stale reload after the new view first receives an old snapshot', async () => {
+    const { core, client, emit } = await pluginCore()
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    const mutation = deferred<PluginView>()
+    const enteredList = deferred<PluginView[]>()
+    const reconciliation = deferred<PluginView[]>()
+    vi.mocked(client.reloadPlugin).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.listPlugins)
+      .mockReturnValueOnce(enteredList.promise)
+      .mockReturnValueOnce(reconciliation.promise)
+    void core.reloadPlugin(pluginV1.id)
+
+    emit(shown('plugin-launcher', 'launcher'))
+    emit(shown('plugin-settings-next', 'settings'))
+    enteredList.resolve([pluginV1])
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('1.0.0'))
+    mutation.resolve(pluginV2)
+    await vi.waitFor(() => expect(client.listPlugins).toHaveBeenCalledTimes(3))
+    expect(core.getSnapshot().plugins?.status).toBe('loading')
+    reconciliation.resolve([pluginV2])
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0'))
+  })
+
+  it('reconciles a stale delete without applying the old row response directly', async () => {
+    const { core, client, emit } = await pluginCore()
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    const mutation = deferred<void>()
+    const enteredList = deferred<PluginView[]>()
+    const reconciliation = deferred<PluginView[]>()
+    vi.mocked(client.deletePlugin).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.listPlugins)
+      .mockReturnValueOnce(enteredList.promise)
+      .mockReturnValueOnce(reconciliation.promise)
+    void core.deletePlugin(pluginV1.id)
+
+    emit(shown('delete-launcher', 'launcher'))
+    emit(shown('delete-settings-next', 'settings'))
+    enteredList.resolve([pluginV1])
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items).toHaveLength(1))
+    mutation.resolve()
+    await vi.waitFor(() => expect(client.listPlugins).toHaveBeenCalledTimes(3))
+    expect(core.getSnapshot().plugins?.status).toBe('loading')
+    reconciliation.resolve([])
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items).toEqual([]))
+  })
+
+  it('drops a stale mutation error and reconciles the current view instead', async () => {
+    const { core, client, emit } = await pluginCore()
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    const mutation = deferred<PluginView>()
+    vi.mocked(client.reloadPlugin).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.listPlugins)
+      .mockResolvedValueOnce([pluginV1])
+      .mockResolvedValueOnce([pluginV1])
+    void core.reloadPlugin(pluginV1.id)
+    emit(shown('failure-launcher', 'launcher'))
+    emit(shown('failure-settings-next', 'settings'))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+
+    mutation.reject({ code: 'pluginReloadFailed', message: 'private old error' })
+    await vi.waitFor(() => expect(client.listPlugins).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    expect(core.getSnapshot().plugins?.items[0]?.error).toBeUndefined()
+    expect(document.body.textContent).not.toContain('private old error')
+  })
+})
+
 describe('execute and hide continuation', () => {
   it('coalesces a late activation-refused result into the next eligible launcher notice', async () => {
     const { core, client, emit } = await startedCore()
@@ -1572,7 +1740,7 @@ describe('React view and accessibility', () => {
   })
 
   it('keeps the React/AntD source boundary exact', () => {
-    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Spin', 'theme']) {
+    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Popconfirm', 'Spin', 'theme']) {
       expect(launcherViewSource).toContain(required)
     }
     for (const forbidden of [
@@ -1582,12 +1750,47 @@ describe('React view and accessibility', () => {
       'Select',
       'Card',
       'Modal',
-      'Popconfirm',
       'dangerouslySetInnerHTML',
       'appId',
     ]) {
       expect(launcherViewSource).not.toContain(forbidden)
     }
+  })
+
+  it('renders plugin metadata and safe markdown without links images or raw HTML', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce([
+      {
+        id: 'internal.math',
+        version: '1.0.0',
+        trigger: '/math',
+        description: '# Math\n\n- item\n\n**bold** `code` [link](https://example.com) ![pixel](https://example.com/p.png)\n\n<strong>raw</strong>',
+      },
+      { id: 'plain', version: '1.0.0', trigger: '/plain', description: null },
+    ])
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('plugin-markdown', 'settings')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.plugin-item')).toHaveLength(2))
+
+    expect(mounted.host.querySelector('.plugin-item h3')?.textContent).toBe('internal.math')
+    expect(mounted.host.querySelector('.plugin-description h1')?.textContent).toBe('Math')
+    expect(mounted.host.querySelector('.plugin-description li')?.textContent).toBe('item')
+    expect(mounted.host.querySelector('.plugin-description strong')?.textContent).toBe('bold')
+    expect(mounted.host.querySelector('.plugin-description code')?.textContent).toBe('code')
+    expect(mounted.host.querySelector('.plugin-description a')).toBeNull()
+    expect(mounted.host.querySelector('.plugin-description img')).toBeNull()
+    expect(
+      [...mounted.host.querySelectorAll('.plugin-description strong')].some((element) => element.textContent === 'raw'),
+    ).toBe(false)
+    expect(mounted.host.textContent).toContain('暂无说明')
+    expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent?.includes('重新加载'))).toBe(true)
+    expect(mounted.host.textContent?.replace(/\s/g, '')).toContain('删除')
+    await mounted.unmount()
+    core.destroy()
   })
 })
 
@@ -1640,17 +1843,29 @@ describe('real adapter and startup', () => {
     })
 
     tauriCapture.invoke.mockClear()
+    const plugin = { id: 'internal.math', version: '1.0.0', trigger: '/math', description: null }
+    tauriCapture.invoke.mockImplementation((command) => {
+      if (command === 'list_plugins') return Promise.resolve([plugin])
+      if (command === 'reload_plugin') return Promise.resolve(plugin)
+      return Promise.resolve(undefined)
+    })
     const update = { hotkey: 'Alt+Space', autostart: false }
     await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
+    await main.client.listPlugins()
+    await main.client.reloadPlugin({ pluginId: 'internal.math' })
+    await main.client.deletePlugin({ pluginId: 'internal.math' })
     await main.client.hideLauncher()
     const invokeRows = [
       ['search_apps', [{ query: 'calc', invocationId: 'inv-1', querySequence: 1 }]],
       ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
+      ['list_plugins', []],
+      ['reload_plugin', [{ pluginId: 'internal.math' }]],
+      ['delete_plugin', [{ pluginId: 'internal.math' }]],
       ['hide_launcher', []],
     ] as const
     expect(tauriCapture.invoke.mock.calls.map(([command, ...args]) => [command, args])).toEqual(invokeRows)
@@ -2659,7 +2874,7 @@ describe('file panel responsive layout', () => {
     expect(launcherViewSource).toContain("import {")
     expect(launcherViewSource).not.toContain('@ant-design/icons')
     const antdImport = launcherViewSource.slice(0, launcherViewSource.indexOf("} from 'antd'"))
-    for (const forbidden of ['AutoComplete', 'Select', 'Card', 'Modal', 'Popconfirm']) {
+    for (const forbidden of ['AutoComplete', 'Select', 'Card', 'Modal']) {
       expect(antdImport).not.toContain(forbidden)
     }
     expect(stylesSource).toContain('.file-workspace')
