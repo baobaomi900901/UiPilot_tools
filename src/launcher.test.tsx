@@ -2086,6 +2086,28 @@ describe('file mode ownership', () => {
     expect(fake.client.searchFiles).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps slash-command application misses from masking file empty results', async () => {
+    const fake = fakeClient()
+    const application = deferred<SearchResponse | null>()
+    vi.mocked(fake.client.searchApps).mockReturnValueOnce(application.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1', [], 'ready'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('file-command-copy'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find 云图', inputType: 'insertText' })
+    application.resolve({ requestId: 'app-miss', items: [] })
+    await application.promise
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().status).not.toBe('未找到应用')
+
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledOnce())
+    expect(fake.client.searchFiles).toHaveBeenCalledWith(expect.objectContaining({ query: '云图' }))
+    await vi.waitFor(() => expect(core.getSnapshot().file?.total).toBe('0'))
+    expect(core.getSnapshot().status).toBe('未找到文件')
+  })
+
   it('registers before empty search and listener failure performs zero file calls', async () => {
     const fake = fakeClient()
     const order: string[] = []
@@ -2604,6 +2626,48 @@ describe('file panel accessibility', () => {
     expect(core.getSnapshot().file?.selected?.fullPath).toBe(String.raw`C:\Private\B.txt`)
     await mounted.unmount()
   })
+
+  it('cycles file categories from the query input with Tab', async () => {
+    installMatchMedia(false)
+    const { mounted, client } = await startedFileView([fileItem(String.raw`C:\Private\A.txt`, 'a')])
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+
+    await act(async () =>
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })),
+    )
+    expect(client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'folder' }))
+
+    await act(async () =>
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })),
+    )
+    expect(client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'all' }))
+    expect(document.activeElement).toBe(input)
+    await mounted.unmount()
+  })
+
+  it('scrolls file selection inside the result list instead of the whole panel', async () => {
+    installMatchMedia(false)
+    const { mounted } = await startedFileView([
+      fileItem(String.raw`C:\Private\A.txt`, 'a'),
+      fileItem(String.raw`C:\Private\B.txt`, 'b'),
+    ])
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    await vi.waitFor(() => expect(mounted.host.querySelector('#file-results')).toBeTruthy())
+    const surface = mounted.host.querySelector<HTMLElement>('.launcher-surface')!
+    const results = mounted.host.querySelector<HTMLElement>('#file-results')!
+    const second = mounted.host.querySelector<HTMLElement>('#file-result-option-1')!
+    Object.defineProperty(results, 'clientHeight', { configurable: true, value: 40 })
+    Object.defineProperty(results, 'scrollTop', { configurable: true, value: 0, writable: true })
+    Object.defineProperty(surface, 'scrollTop', { configurable: true, value: 0, writable: true })
+    Object.defineProperty(second, 'offsetTop', { configurable: true, value: 96 })
+    Object.defineProperty(second, 'offsetHeight', { configurable: true, value: 32 })
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+
+    expect(results.scrollTop).toBe(88)
+    expect(surface.scrollTop).toBe(0)
+    await mounted.unmount()
+  })
 })
 
 describe('file panel responsive layout', () => {
@@ -2622,7 +2686,8 @@ describe('file panel responsive layout', () => {
     expect(stylesSource).toContain('@media (max-width: 600px)')
     expect(stylesSource).toContain('@media (forced-colors: active)')
     expect(stylesSource).toContain('overflow-wrap: anywhere')
-    expect(stylesSource).toContain('overflow-x: hidden')
+    expect(stylesSource).toContain('overflow: hidden')
+    expect(stylesSource).toContain('.file-workspace .ant-spin-container')
   })
 })
 

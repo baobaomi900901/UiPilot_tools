@@ -431,11 +431,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return value.startsWith('/find ') ? value.slice(6) : null
   }
 
-  function fileStatusText(status: FileIndexStatus): string {
+  function fileStatusText(status: FileIndexStatus, hasResults = true): string {
     if (status === 'building') return '索引正在建立或校准。'
     if (status === 'partial') return '部分位置无法访问。'
     if (status === 'rebuilding') return '索引正在重建。'
     if (status === 'unavailable') return '搜索暂不可用。'
+    if (!hasResults) return '未找到文件'
     return ''
   }
 
@@ -565,7 +566,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     file.selectedIndex = selectedIndex >= 0 ? selectedIndex : results.length ? 0 : -1
     model.requestId = response.requestId
     model.searchPending = false
-    model.status = fileStatusText(response.status)
+    model.status = fileStatusText(response.status, results.length > 0)
     publish(true)
   }
 
@@ -725,7 +726,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         }
       })
       model.selectedIndex = model.results.length ? 0 : -1
-      model.status = model.results.length ? '' : '未找到应用'
+      model.status = model.results.length || fileCommand(captured.query) !== null ? '' : '未找到应用'
     }
     publish(true)
   }

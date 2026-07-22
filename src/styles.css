@@ -82,7 +82,7 @@ label,
   gap: 8px;
   min-width: 0;
   min-height: 0;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 .file-workspace > .ant-input {
@@ -157,6 +157,13 @@ label,
 .result-list {
   min-height: 0;
   height: 100%;
+}
+
+.file-workspace > .ant-spin,
+.file-workspace .ant-spin-container {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .result-list {

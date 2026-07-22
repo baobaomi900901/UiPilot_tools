@@ -95,6 +95,19 @@ function fileModified(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
+function scrollFileResultIntoView(container: HTMLElement | null, selected: HTMLElement | undefined): void {
+  if (!container || !selected) return
+  const selectedTop = selected.offsetTop
+  const selectedBottom = selectedTop + selected.offsetHeight
+  const visibleTop = container.scrollTop
+  const visibleBottom = visibleTop + container.clientHeight
+  if (selectedTop < visibleTop) {
+    container.scrollTop = selectedTop
+  } else if (selectedBottom > visibleBottom) {
+    container.scrollTop = selectedBottom - container.clientHeight
+  }
+}
+
 interface HotkeyRecorderInputProps {
   core: LauncherCore
   value: string
@@ -216,7 +229,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   useLayoutEffect(() => {
     if (snapshot.view === 'launcher' && file && activeFileIndex >= 0) {
       const selected = fileOptionRefs.current.get(activeFileIndex)
-      selected?.scrollIntoView?.({ block: 'nearest' })
+      scrollFileResultIntoView(document.getElementById('file-results'), selected)
     }
   }, [activeFileIndex, file, snapshot.view])
 
@@ -238,6 +251,14 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       } else {
         core.setFilePreviewEnabled(!file.previewEnabled)
       }
+      return
+    }
+    if (event.key === 'Tab' && file && !composing(event)) {
+      event.preventDefault()
+      const current = fileCategories.findIndex((category) => category.value === file.category)
+      const offset = event.shiftKey ? -1 : 1
+      const nextIndex = (current + offset + fileCategories.length) % fileCategories.length
+      core.setFileCategory(fileCategories[nextIndex]!.value)
       return
     }
     if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
