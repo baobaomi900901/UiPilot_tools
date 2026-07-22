@@ -566,11 +566,6 @@ impl PluginCatalog {
         let Ok(body) = fs::read(&path) else {
             return response(404, Vec::new(), None);
         };
-        let body = if content_type.starts_with("text/html") {
-            inject_bridge(body)
-        } else {
-            body
-        };
         response(200, body, Some(content_type))
     }
 }
@@ -701,12 +696,6 @@ fn asset_path(request_path: &str) -> Option<(PathBuf, &'static str)> {
         _ => return None,
     };
     Some((relative, mime))
-}
-
-fn inject_bridge(mut body: Vec<u8>) -> Vec<u8> {
-    let mut injected = format!("<script>{PLUGIN_BRIDGE}</script>").into_bytes();
-    injected.append(&mut body);
-    injected
 }
 
 fn response(status: u16, body: Vec<u8>, content_type: Option<&str>) -> Response<Vec<u8>> {
@@ -1000,14 +989,9 @@ mod tests {
             );
             assert_eq!(header(&html, "content-type"), "text/html; charset=utf-8");
             let body = String::from_utf8(html.into_body()).unwrap();
-            assert!(body.contains("Object.freeze"));
-            assert!(body.contains("window.uipilot"));
-            assert!(body.contains("onQuery"));
-            assert!(body.contains("publishResults"));
-            assert!(body.contains("handler(request.input)"));
-            assert!(body.contains("requestId: activeRequest.requestId"));
-            assert!(body.contains("protocolVersion: 1"));
-            assert!(body.contains("uipilot-plugin-ready"));
+            assert_eq!(body, "<h1>one</h1>");
+            assert!(!body.contains("window.uipilot"));
+            assert!(!body.contains("publishResults"));
             assert!(!body.contains("<h1>two</h1>"));
 
             let script = catalog.asset_response("plugin-6f6e65", "/main.js");
@@ -1085,6 +1069,16 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn bridge_is_loaded_by_tauri_not_csp_blocked_html() {
+            let source = std::fs::read_to_string(file!()).unwrap();
+            assert!(source.contains(".initialization_script(PLUGIN_BRIDGE)"));
+            assert!(source.contains("handler(request.input)"));
+            assert!(source.contains("requestId: activeRequest.requestId"));
+            assert!(source.contains("protocolVersion: 1"));
+            assert!(source.contains("uipilot-plugin-ready"));
         }
     }
 
