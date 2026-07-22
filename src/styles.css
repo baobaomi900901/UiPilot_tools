@@ -156,7 +156,6 @@ input {
 
 .result-title,
 .result-subtitle,
-.application-heading > span,
 .status-region {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -188,8 +187,6 @@ input {
 }
 
 .settings-header,
-.application-heading,
-.alias-row,
 .settings-actions,
 .confirmation-actions {
   display: flex;
@@ -223,37 +220,6 @@ input {
   gap: 10px;
 }
 
-.application-list {
-  margin-top: 10px;
-  border-top: 1px solid #d9d9d9;
-}
-
-.application-row {
-  display: block;
-  min-width: 0;
-  padding: 10px 0;
-}
-
-.application-heading {
-  min-width: 0;
-  margin-bottom: 8px;
-}
-
-.application-heading > span:nth-child(2) {
-  flex: 1;
-  font-weight: 600;
-}
-
-.alias-list,
-.alias-row {
-  min-width: 0;
-}
-
-.alias-row .ant-input {
-  min-width: 0;
-  flex: 1;
-}
-
 .settings-actions {
   flex-wrap: wrap;
   padding-top: 10px;
@@ -282,8 +248,7 @@ input {
   }
 
   .result-list,
-  .settings-header,
-  .application-list {
+  .settings-header {
     border-color: #595959;
   }
 
@@ -306,7 +271,6 @@ input {
   .launcher-surface,
   .result-list,
   .settings-header,
-  .application-list,
   .app-mark {
     border-color: CanvasText;
   }

@@ -316,42 +316,6 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           <Checkbox checked={settings.autostart} disabled={locked} onChange={(event) => core.setAutostart(event.target.checked)}>
             开机启动
           </Checkbox>
-          <div className="application-list">
-            {settings.applications.map((application) => (
-              <section key={application.key} className="application-row">
-                <div className="application-heading">
-                  <span className="app-mark" aria-hidden="true" />
-                  <span>{application.displayName}</span>
-                  <Button disabled={locked} onClick={() => core.addAlias(application.key)}>
-                    添加别名
-                  </Button>
-                </div>
-                <div className="alias-list">
-                  {application.aliases.map((alias, index) => {
-                    const id = `settings-alias-${alias.key}`
-                    return (
-                      <Form.Item key={alias.key} label={`别名 ${index + 1}`} htmlFor={id}>
-                        <div className="alias-row">
-                          <BoundInput
-                            core={core}
-                            control={alias.key}
-                            value={alias.value}
-                            id={id}
-                            name={id}
-                            disabled={locked}
-                            onKeyDown={settingsKeyDown}
-                          />
-                          <Button disabled={locked} onClick={() => core.removeAlias(application.key, alias.key)}>
-                            删除
-                          </Button>
-                        </div>
-                      </Form.Item>
-                    )
-                  })}
-                </div>
-              </section>
-            ))}
-          </div>
           {settings.clearConfirmation ? (
             <Alert
               role="group"

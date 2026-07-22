@@ -10,26 +10,17 @@ export interface SearchResponse {
   items: ResultItem[]
 }
 
-export interface AppAliasTarget {
-  appId: string
-  displayName: string
-  icon?: string
-  aliases: string[]
-}
-
 export interface SettingsView {
   hotkey: string
   autostart: boolean
   filePreviewEnabled: boolean
   researchId?: string
-  applications: AppAliasTarget[]
 }
 
 export interface UserSettingsUpdate {
   hotkey: string
   autostart: boolean
   researchId?: string | null
-  aliases: Record<string, string[]>
 }
 
 export type ExecuteOutcome =
@@ -111,22 +102,15 @@ export interface ViewResult {
   icon?: string
 }
 
-export interface AliasControlView {
+export interface TextControlView {
   key: ControlKey
   value: string
 }
 
-export interface ApplicationAliasView {
-  key: ControlKey
-  displayName: string
-  aliases: readonly AliasControlView[]
-}
-
 export interface SettingsSnapshot {
-  hotkey: AliasControlView
-  researchId: AliasControlView
+  hotkey: TextControlView
+  researchId: TextControlView
   autostart: boolean
-  applications: readonly ApplicationAliasView[]
   readOnly: boolean
   operation?: 'load' | 'save' | 'rescan' | 'export' | 'clear'
   clearConfirmation: boolean

@@ -35,8 +35,6 @@ export interface LauncherCore {
   readonly setFileCategory: (category: FileCategory) => void
   readonly setFileSort: (sort: FileSort) => void
   readonly setFilePreviewEnabled: (enabled: boolean) => void
-  readonly addAlias: (application: ControlKey) => void
-  readonly removeAlias: (application: ControlKey, alias: ControlKey) => void
   readonly saveSettings: () => Promise<void>
   readonly reloadSettings: () => Promise<void>
   readonly rescanApps: () => Promise<void>
@@ -108,17 +106,10 @@ interface TextControl {
   draft: string
 }
 
-interface PrivateApplication {
-  key: ControlKey
-  displayName: string
-  aliases: TextControl[]
-}
-
 interface PrivateSettings {
   hotkey: TextControl
   researchId: TextControl
   autostart: boolean
-  applications: PrivateApplication[]
 }
 
 interface FileSearchOwner {
@@ -209,15 +200,6 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
         researchId: Object.freeze({ key: model.settings.researchId.key, value: model.settings.researchId.draft }),
         autostart: model.settings.autostart,
-        applications: Object.freeze(
-          model.settings.applications.map((application) =>
-            Object.freeze({
-              key: application.key,
-              displayName: application.displayName,
-              aliases: Object.freeze(application.aliases.map((alias) => Object.freeze({ key: alias.key, value: alias.draft }))),
-            }),
-          ),
-        ),
         readOnly: model.settingsNeedsReload,
         ...(model.settingsOperation === undefined ? {} : { operation: model.settingsOperation }),
         clearConfirmation: model.clearConfirmation,
@@ -314,7 +296,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let compositionGeneration = 0
   let composition: CompositionOwner | undefined
   let settingsOperation: SettingsOperation | undefined
-  const appIds = new Map<ControlKey, string>()
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -338,36 +319,20 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function settingsControls(settings: PrivateSettings): TextControl[] {
-    return [settings.hotkey, settings.researchId, ...settings.applications.flatMap((application) => application.aliases)]
+    return [settings.hotkey, settings.researchId]
   }
 
   function replaceSettings(view: SettingsView, previewGeneration: number): void {
     if (model.settings) {
       for (const control of settingsControls(model.settings)) retireControl(control.key)
     }
-    appIds.clear()
     if (previewGeneration === previewPreferenceDurableGeneration) {
       lastLoadedFilePreviewEnabled = view.filePreviewEnabled
     }
-    const totals = new Map<string, number>()
-    for (const application of view.applications) totals.set(application.displayName, (totals.get(application.displayName) ?? 0) + 1)
-    const seen = new Map<string, number>()
-    const applications = view.applications.map((application) => {
-      const key = controlKey++
-      appIds.set(key, application.appId)
-      const ordinal = (seen.get(application.displayName) ?? 0) + 1
-      seen.set(application.displayName, ordinal)
-      return {
-        key,
-        displayName: totals.get(application.displayName) === 1 ? application.displayName : `${application.displayName} (${ordinal})`,
-        aliases: (application.aliases.length ? application.aliases : ['']).map(newTextControl),
-      }
-    })
     model.settings = {
       hotkey: newTextControl(view.hotkey),
       researchId: newTextControl(view.researchId ?? ''),
       autostart: view.autostart,
-      applications,
     }
     model.settingsNeedsReload = false
     model.settingsLoadError = undefined
@@ -378,10 +343,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!model.settings) return undefined
     if (model.settings.hotkey.key === control) return model.settings.hotkey
     if (model.settings.researchId.key === control) return model.settings.researchId
-    for (const application of model.settings.applications) {
-      const alias = application.aliases.find((candidate) => candidate.key === control)
-      if (alias) return alias
-    }
     return undefined
   }
 
@@ -916,27 +877,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(changed || valueChanged || hadNotice)
   }
 
-  function addAlias(application: ControlKey): void {
-    if (!settingsEditable()) return
-    const target = model.settings!.applications.find((candidate) => candidate.key === application)
-    if (!target) return
-    target.aliases.push(newTextControl(''))
-    model.shownNotice = undefined
-    publish(true)
-  }
-
-  function removeAlias(application: ControlKey, alias: ControlKey): void {
-    if (!settingsEditable()) return
-    const target = model.settings!.applications.find((candidate) => candidate.key === application)
-    const index = target?.aliases.findIndex((candidate) => candidate.key === alias) ?? -1
-    if (!target || index < 0) return
-    retireControl(alias)
-    target.aliases.splice(index, 1)
-    if (!target.aliases.length) target.aliases.push(newTextControl(''))
-    model.shownNotice = undefined
-    publish(true)
-  }
-
   function startSettingsOperation(kind: SettingsOperationKind): SettingsOperation | undefined {
     if (destroyed || settingsOperation || (kind !== 'load' && !model.settings)) return undefined
     const operation = { token: ++token, kind, viewEpoch: model.viewEpoch, view: model.view }
@@ -965,17 +905,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function settingsUpdate(): UserSettingsUpdate {
     const settings = model.settings!
-    const aliases: Record<string, string[]> = {}
-    for (const application of settings.applications) {
-      const appId = appIds.get(application.key)
-      if (!appId) continue
-      aliases[appId] = application.aliases.map((alias) => alias.value).filter((value) => value !== '')
-    }
     return {
       hotkey: settings.hotkey.value,
       autostart: settings.autostart,
       ...(settings.researchId.value === '' ? {} : { researchId: settings.researchId.value }),
-      aliases,
     }
   }
 
@@ -1378,8 +1311,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setFileCategory,
     setFileSort,
     setFilePreviewEnabled,
-    addAlias,
-    removeAlias,
     saveSettings,
     reloadSettings,
     rescanApps,

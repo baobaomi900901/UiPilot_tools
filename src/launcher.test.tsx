@@ -74,17 +74,12 @@ const emptySettings: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
-  applications: [],
 }
 
 const settingsFixture: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
-  applications: [
-    { appId: 'private-app-id-a', displayName: '同名应用', aliases: ['alpha'] },
-    { appId: 'private-app-id-b', displayName: '同名应用', aliases: [] },
-  ],
 }
 
 function fakeClient() {
@@ -671,7 +666,7 @@ describe('R3 correlated composition boundary', () => {
 
   it('commits a settings draft locally and makes its same-value tail a no-op', async () => {
     const { core, client } = await startedSettingsCore()
-    const control = core.getSnapshot().settings!.applications[0]!.aliases[0]!.key
+    const control = core.getSnapshot().settings!.researchId.key
     core.text(r3({ kind: 'compositionStart', control }))
     core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
     const listener = vi.fn()
@@ -679,7 +674,7 @@ describe('R3 correlated composition boundary', () => {
 
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(listener).toHaveBeenCalledOnce()
-    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('\u6d4b\u8bd5')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('\u6d4b\u8bd5')
     expect(client.searchApps).not.toHaveBeenCalled()
     expect(client.saveSettings).not.toHaveBeenCalled()
 
@@ -691,7 +686,7 @@ describe('R3 correlated composition boundary', () => {
     expect(listener).not.toHaveBeenCalled()
 
     core.text(r3({ kind: 'ordinaryInput', control, value: '\u4e0d\u540c', inputType: 'insertReplacementText' }))
-    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('\u4e0d\u540c')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('\u4e0d\u540c')
     expect(listener).toHaveBeenCalledOnce()
     expect(client.searchApps).not.toHaveBeenCalled()
     expect(client.saveSettings).not.toHaveBeenCalled()
@@ -699,7 +694,7 @@ describe('R3 correlated composition boundary', () => {
 
   it('commits settings ordinary-before-end and cancel paths once with zero Rust calls', async () => {
     const { core, client } = await startedSettingsCore()
-    const control = core.getSnapshot().settings!.applications[0]!.aliases[0]!.key
+    const control = core.getSnapshot().settings!.researchId.key
     const listener = vi.fn()
     core.subscribe(listener)
 
@@ -713,7 +708,7 @@ describe('R3 correlated composition boundary', () => {
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(cancelled).not.toBe(beforeCancel)
     expect(core.getSnapshot()).toBe(cancelled)
-    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('alph')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('alph')
 
     listener.mockClear()
     core.text(r3({ kind: 'compositionStart', control }))
@@ -722,7 +717,7 @@ describe('R3 correlated composition boundary', () => {
     const ordinary = core.getSnapshot()
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(core.getSnapshot()).toBe(ordinary)
-    expect(core.getSnapshot().settings!.applications[0]!.aliases[0]!.value).toBe('ordinary-first')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('ordinary-first')
     expect(client.searchApps).not.toHaveBeenCalled()
     expect(client.saveSettings).not.toHaveBeenCalled()
   })
@@ -765,7 +760,7 @@ describe('R3 correlated composition boundary', () => {
     await vi.waitFor(() => expect(client.hideLauncher).toHaveBeenCalledOnce())
   })
 
-  it('rejects no-owner, wrong-control, stale, retired, and removed boundaries', async () => {
+  it('rejects no-owner, wrong-control, stale, and retired boundaries', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('ownership'))
     const control = core.getSnapshot().queryControl
@@ -792,16 +787,6 @@ describe('R3 correlated composition boundary', () => {
     core.text(r3({ kind: 'compositionInput', control, value: 'late', inputType: 'insertCompositionText' }))
     expect(core.getSnapshot()).toBe(retired)
     expect(client.searchApps).not.toHaveBeenCalled()
-
-    const settings = await startedSettingsCore()
-    const application = settings.core.getSnapshot().settings!.applications[0]!
-    const alias = application.aliases[0]!
-    settings.core.text(r3({ kind: 'compositionStart', control: alias.key }))
-    settings.core.text(r3({ kind: 'compositionInput', control: alias.key, value: 'removed', inputType: 'insertCompositionText' }))
-    settings.core.removeAlias(application.key, alias.key)
-    const removed = settings.core.getSnapshot()
-    settings.core.text(r3({ kind: 'compositionBoundary', control: alias.key }))
-    expect(settings.core.getSnapshot()).toBe(removed)
   })
 
   it('commits only the stored trusted draft, never a boundary sentinel', async () => {
@@ -953,94 +938,39 @@ describe('settings ownership', () => {
     return { core, ...fake }
   }
 
-  it('projects all current applications with local keys and saves the complete private map', async () => {
-    const { core, client } = await settingsCore()
-    const settings = core.getSnapshot().settings
-    expect(settings?.applications.map((application) => [application.displayName, application.aliases.map((alias) => alias.value)])).toEqual([
-      ['同名应用 (1)', ['alpha']],
-      ['同名应用 (2)', ['']],
-    ])
-    expect(settings?.applications[0]?.key).not.toBe(settings?.applications[1]?.key)
-    expect(JSON.stringify(core.getSnapshot())).not.toContain('private-app-id')
-
-    const second = settings!.applications[1]!
-    core.text({ kind: 'ordinaryInput', control: second.aliases[0]!.key, value: 'beta', inputType: 'insertText' })
-    await core.saveSettings()
-    expect(client.saveSettings).toHaveBeenCalledOnce()
-    expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: {
-        hotkey: 'Alt+Space',
-        autostart: false,
-        aliases: { 'private-app-id-a': ['alpha'], 'private-app-id-b': ['beta'] },
-      },
-    })
-  })
-
-  it('saves exact hotkey, autostart, research ID, and ordered aliases', async () => {
+  it('saves exact hotkey, autostart, and research ID', async () => {
     const { core, client } = await settingsCore()
     const settings = core.getSnapshot().settings!
     core.setHotkeyCanonical('Ctrl+Space')
     core.text({ kind: 'ordinaryInput', control: settings.researchId.key, value: 'research_1', inputType: 'insertText' })
     core.setAutostart(true)
-    const second = settings.applications[1]!
-    core.text({ kind: 'ordinaryInput', control: second.aliases[0]!.key, value: 'beta', inputType: 'insertText' })
-    core.addAlias(second.key)
-    const added = core.getSnapshot().settings!.applications[1]!.aliases[1]!
-    core.text({ kind: 'ordinaryInput', control: added.key, value: 'beta-two', inputType: 'insertText' })
     await core.saveSettings()
     expect(client.saveSettings).toHaveBeenCalledWith({
       settings: {
         hotkey: 'Ctrl+Space',
         autostart: true,
         researchId: 'research_1',
-        aliases: { 'private-app-id-a': ['alpha'], 'private-app-id-b': ['beta', 'beta-two'] },
       },
     })
   })
 
   it('preserves edits and fails closed after a save error', async () => {
     const { core, client } = await settingsCore()
-    const alias = core.getSnapshot().settings!.applications[1]!.aliases[0]!
-    core.text({ kind: 'ordinaryInput', control: alias.key, value: 'beta', inputType: 'insertText' })
+    const researchId = core.getSnapshot().settings!.researchId
+    core.text({ kind: 'ordinaryInput', control: researchId.key, value: 'research_1', inputType: 'insertText' })
     vi.mocked(client.saveSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private backend text' })
     await core.saveSettings()
     expect(client.loadSettings).toHaveBeenCalledTimes(1)
     expect(core.getSnapshot().settings).toMatchObject({ readOnly: true, needsReload: true })
-    expect(core.getSnapshot().settings!.applications[1]!.aliases[0]!.value).toBe('beta')
+    expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
     expect(core.getSnapshot().status).toBe('设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
 
-  it('retires removed active ownership before deletion', async () => {
-    const { core } = await settingsCore()
-    const application = core.getSnapshot().settings!.applications[0]!
-    const alias = application.aliases[0]!
-    core.text({ kind: 'compositionStart', control: alias.key })
-    core.text({ kind: 'compositionInput', control: alias.key, value: 'unfinished', inputType: 'insertCompositionText' })
-    core.removeAlias(application.key, alias.key)
-    const removed = core.getSnapshot()
-    core.text({ kind: 'compositionBoundary', control: alias.key })
-    core.text({ kind: 'compositionInput', control: alias.key, value: 'late', inputType: 'insertCompositionText' })
-    expect(core.getSnapshot()).toBe(removed)
-  })
-
-  it('preserves unrelated ownership and retires form controls before fresh replacement', async () => {
+  it('retires form controls before fresh replacement', async () => {
     const { core, client } = await settingsCore()
     const original = core.getSnapshot().settings!
-    const firstApplication = original.applications[0]!
-    const removed = firstApplication.aliases[0]!
-    const unrelated = original.applications[1]!.aliases[0]!
-    core.text({ kind: 'compositionStart', control: unrelated.key })
-    core.text({ kind: 'compositionInput', control: unrelated.key, value: 'owned', inputType: 'insertCompositionText' })
-    core.removeAlias(firstApplication.key, removed.key)
-    core.text({ kind: 'compositionBoundary', control: unrelated.key })
-    expect(core.getSnapshot().settings!.applications[1]!.aliases[0]!.value).toBe('owned')
-
-    const oldKeys = [
-      original.hotkey.key,
-      original.researchId.key,
-      ...original.applications.flatMap((application) => [application.key, ...application.aliases.map((alias) => alias.key)]),
-    ]
+    const oldKeys = [original.hotkey.key, original.researchId.key]
     core.text({ kind: 'compositionStart', control: original.researchId.key })
     core.text({ kind: 'compositionInput', control: original.researchId.key, value: 'uncommitted', inputType: 'insertCompositionText' })
     vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -1050,19 +980,9 @@ describe('settings ownership', () => {
     core.text({ kind: 'compositionBoundary', control: original.researchId.key })
     core.text({ kind: 'compositionInput', control: original.researchId.key, value: 'late', inputType: 'insertCompositionText' })
     expect(core.getSnapshot()).toBe(replacedSnapshot)
-    const newKeys = [
-      replacement.hotkey.key,
-      replacement.researchId.key,
-      ...replacement.applications.flatMap((application) => [application.key, ...application.aliases.map((alias) => alias.key)]),
-    ]
+    const newKeys = [replacement.hotkey.key, replacement.researchId.key]
     expect(Math.min(...newKeys)).toBeGreaterThan(Math.max(...oldKeys))
 
-    const removeStart = launcherCoreSource.indexOf('function removeAlias')
-    const removeRetire = launcherCoreSource.indexOf('retireControl(alias)', removeStart)
-    const removeDelete = launcherCoreSource.indexOf('.splice(', removeStart)
-    expect(removeStart).toBeGreaterThanOrEqual(0)
-    expect(removeRetire).toBeGreaterThan(removeStart)
-    expect(removeDelete).toBeGreaterThan(removeRetire)
     const replaceStart = launcherCoreSource.indexOf('function replaceSettings')
     const replaceRetire = launcherCoreSource.indexOf('retireControl(control.key)', replaceStart)
     const replaceAssign = launcherCoreSource.indexOf('model.settings =', replaceStart)
@@ -1135,7 +1055,6 @@ describe('settings ownership', () => {
       settings: {
         hotkey: 'DoubleCtrl',
         autostart: false,
-        aliases: { 'private-app-id-a': ['alpha'], 'private-app-id-b': [] },
       },
     })
   })
@@ -1444,7 +1363,27 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('renders the settings projection without app IDs and closes only through the core hide owner', async () => {
+  it('does not render application aliases in settings', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({
+      hotkey: 'Alt+Space',
+      autostart: false,
+      filePreviewEnabled: true,
+      applications: [{ appId: 'legacy', displayName: 'LiveCaptions', aliases: ['caption'] }],
+    } as SettingsView)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-no-aliases', 'settings')))
+
+    expect(mounted.host.textContent).not.toContain('LiveCaptions')
+    expect(mounted.host.textContent).not.toContain('娣诲姞鍒悕')
+    expect(mounted.host.textContent).not.toContain('鍒悕 1')
+    await mounted.unmount()
+  })
+
+  it('renders settings controls and closes only through the core hide owner', async () => {
     installMatchMedia(true)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -1455,9 +1394,6 @@ describe('React view and accessibility', () => {
     const heading = mounted.host.querySelector<HTMLElement>('h1')!
     expect(heading.textContent).toBe('设置')
     expect(document.activeElement).toBe(heading)
-    expect(mounted.host.textContent).toContain('同名应用 (1)')
-    expect(mounted.host.textContent).toContain('同名应用 (2)')
-    expect(mounted.host.innerHTML).not.toContain('private-app-id')
     expect(mounted.host.querySelector('input[maxlength="64"][pattern="[A-Za-z0-9_-]{1,64}"]')).toBeTruthy()
     const close = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
     expect(close.getAttribute('aria-label')).toBe('关闭')
@@ -1659,7 +1595,7 @@ describe('real adapter and startup', () => {
     })
 
     tauriCapture.invoke.mockClear()
-    const update = { hotkey: 'Alt+Space', autostart: false, aliases: {} }
+    const update = { hotkey: 'Alt+Space', autostart: false }
     await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()
