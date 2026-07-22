@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, OnceLock, RwLock,
+        mpsc, Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     time::Duration,
 };
@@ -16,7 +16,10 @@ use tauri::{
     App, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
-use crate::{model::ResultItem, result_registry::ResultAction};
+use crate::{
+    model::ResultItem,
+    result_registry::{ResultAction, ResultRegistry},
+};
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
 const PLUGIN_BRIDGE: &str = r#"
@@ -33,7 +36,7 @@ const PLUGIN_BRIDGE: &str = r#"
   const deliver = (request) => handler ? run(request) : pending.push(request);
   const run = (request) => {
     activeRequest = request;
-    handler(request.input);
+    try { handler(request.input); } finally { activeRequest = null; }
   };
   const ready = () => {
     if (handler && listening) document.title = 'uipilot-plugin-ready';
@@ -94,8 +97,8 @@ impl From<io::Error> for PluginSetupError {
 
 pub(crate) struct PluginManager {
     catalog: OnceLock<PluginCatalog>,
-    ready: RwLock<HashSet<String>>,
-    disabled: RwLock<HashSet<String>>,
+    ready: Arc<RuntimeReadiness>,
+    disabled: Arc<RwLock<HashSet<String>>>,
     pending: RwLock<HashMap<String, PendingPluginQuery>>,
     timeouts: RwLock<HashMap<String, u8>>,
     next_request: AtomicU64,
@@ -105,8 +108,8 @@ impl PluginManager {
     pub(crate) fn new() -> Self {
         Self {
             catalog: OnceLock::new(),
-            ready: RwLock::new(HashSet::new()),
-            disabled: RwLock::new(HashSet::new()),
+            ready: Arc::new(RuntimeReadiness::default()),
+            disabled: Arc::new(RwLock::new(HashSet::new())),
             pending: RwLock::new(HashMap::new()),
             timeouts: RwLock::new(HashMap::new()),
             next_request: AtomicU64::new(0),
@@ -129,9 +132,16 @@ impl PluginManager {
     }
 
     pub(crate) fn authorizes_clipboard(&self, plugin_id: &str) -> bool {
-        self.catalog
-            .get()
-            .is_some_and(|catalog| catalog.authorizes_clipboard(plugin_id))
+        let Some(catalog) = self.catalog.get() else {
+            return false;
+        };
+        let Some(entry) = catalog.entries.iter().find(|entry| entry.id == plugin_id) else {
+            return false;
+        };
+        self.disabled
+            .read()
+            .is_ok_and(|disabled| !disabled.contains(&entry.window_label))
+            && catalog.authorizes_clipboard(plugin_id)
     }
 
     pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
@@ -178,6 +188,8 @@ impl PluginManager {
             let label_for_ready = label.clone();
             let disabled_manager = manager.clone();
             let label_for_failure = label.clone();
+            let plugin_id = entry.id.clone();
+            let failure_app = app.handle().clone();
             let window = WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))
                 .visible(false)
                 .focusable(false)
@@ -197,21 +209,22 @@ impl PluginManager {
                 .map_err(|error| io::Error::other(error.to_string()))?;
             attach_process_failed_handler(&window, move || {
                 disabled_manager.disable_runtime(&label_for_failure);
+                let registry = failure_app.state::<ResultRegistry>();
+                registry.invalidate_plugin(&plugin_id);
             })?;
         }
         Ok(())
     }
 
     pub(crate) fn mark_ready(&self, label: &str) {
-        if let Ok(mut ready) = self.ready.write() {
-            ready.insert(label.to_string());
-        }
+        self.ready.mark(label);
     }
 
     pub(crate) fn disable_runtime(&self, label: &str) {
         if let Ok(mut disabled) = self.disabled.write() {
             disabled.insert(label.to_string());
         }
+        self.ready.changed.notify_all();
         if let Ok(mut pending) = self.pending.write() {
             pending.retain(|_, query| {
                 if query.window_label == label {
@@ -236,6 +249,16 @@ impl PluginManager {
             .contains(&route.window_label)
         {
             return Err(PluginQueryError::RuntimeDisabled);
+        }
+        let ready = Arc::clone(&self.ready);
+        let disabled = Arc::clone(&self.disabled);
+        let label = route.window_label.clone();
+        let is_ready =
+            tauri::async_runtime::spawn_blocking(move || wait_until_ready(ready, disabled, label))
+                .await
+                .map_err(|_| PluginQueryError::RuntimeDisabled)??;
+        if !is_ready {
+            return Ok(Vec::new());
         }
         let request_id = self.allocate_request_id();
         let (sender, receiver) = mpsc::channel();
@@ -404,6 +427,50 @@ impl PluginManager {
     }
 }
 
+#[derive(Default)]
+struct RuntimeReadiness {
+    labels: Mutex<HashSet<String>>,
+    changed: Condvar,
+}
+
+impl RuntimeReadiness {
+    fn mark(&self, label: &str) {
+        if let Ok(mut labels) = self.labels.lock() {
+            labels.insert(label.to_string());
+            self.changed.notify_all();
+        }
+    }
+}
+
+fn wait_until_ready(
+    ready: Arc<RuntimeReadiness>,
+    disabled: Arc<RwLock<HashSet<String>>>,
+    label: String,
+) -> Result<bool, PluginQueryError> {
+    let labels = ready
+        .labels
+        .lock()
+        .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+    let (labels, _) = ready
+        .changed
+        .wait_timeout_while(labels, Duration::from_millis(500), |labels| {
+            !labels.contains(&label)
+                && disabled
+                    .read()
+                    .is_ok_and(|disabled| !disabled.contains(&label))
+        })
+        .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+    if disabled
+        .read()
+        .map_err(|_| PluginQueryError::RuntimeDisabled)?
+        .contains(&label)
+    {
+        Err(PluginQueryError::RuntimeDisabled)
+    } else {
+        Ok(labels.contains(&label))
+    }
+}
+
 struct PendingPluginQuery {
     plugin_id: String,
     window_label: String,
@@ -510,10 +577,15 @@ impl PluginCatalog {
             }
             Err(error) => return Err(error.into()),
         };
+        if !ordinary_directory(root) {
+            return Ok(Self {
+                entries: Vec::new(),
+            });
+        }
 
         for child in children {
             let child = child?;
-            if child.file_type()?.is_dir() {
+            if child.file_type()?.is_dir() && ordinary_directory(&child.path()) {
                 if let Some(entry) = load_entry(&child.path(), host_version) {
                     candidates.push(entry);
                 }
@@ -569,16 +641,19 @@ impl PluginCatalog {
         let Some((relative, content_type)) = asset_path(request_path) else {
             return response(415, Vec::new(), None);
         };
-        let path = entry.root.join(relative);
+        let path = entry.root.join(&relative);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             return response(404, Vec::new(), None);
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if !metadata.is_file() || !ordinary_file_below(&entry.root, &relative) {
             return response(403, Vec::new(), None);
         }
         let Ok(body) = fs::read(&path) else {
             return response(404, Vec::new(), None);
         };
+        if !ordinary_file_below(&entry.root, &relative) {
+            return response(403, Vec::new(), None);
+        }
         response(200, body, Some(content_type))
     }
 }
@@ -605,10 +680,10 @@ struct ManifestFeature {
 
 fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> {
     let manifest_path = root.join("plugin.json");
-    let manifest = fs::read_to_string(&manifest_path).ok()?;
-    if !manifest_path.is_file() {
+    if !ordinary_file(&manifest_path) {
         return None;
     }
+    let manifest = fs::read_to_string(&manifest_path).ok()?;
     let manifest: Manifest = serde_json::from_str(&manifest).ok()?;
     let version = Version::parse(&manifest.version)?;
     if manifest.manifest != 1
@@ -617,12 +692,16 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
         || !valid_id(&manifest.feature.id)
         || !valid_trigger(&manifest.feature.trigger)
         || manifest.runtime.contains(['/', '\\'])
+        || Path::new(&manifest.runtime)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("html")
     {
         return None;
     }
 
     let runtime = root.join(&manifest.runtime);
-    if !runtime.is_file() || has_bad_permissions(&manifest.permissions) {
+    if !ordinary_file(&runtime) || has_bad_permissions(&manifest.permissions) {
         return None;
     }
 
@@ -711,11 +790,56 @@ fn asset_path(request_path: &str) -> Option<(PathBuf, &'static str)> {
     Some((relative, mime))
 }
 
+fn ordinary_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !is_reparse_point(&metadata))
+}
+
+fn ordinary_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !is_reparse_point(&metadata))
+}
+
+fn ordinary_file_below(root: &Path, relative: &Path) -> bool {
+    if !ordinary_directory(root) {
+        return false;
+    }
+    let mut path = root.to_path_buf();
+    let mut components = relative.iter().peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if is_reparse_point(&metadata)
+            || (components.peek().is_some() && !metadata.is_dir())
+            || (components.peek().is_none() && !metadata.is_file())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 fn plugin_navigation_allowed(url: &tauri::Url) -> bool {
-    matches!(
-        (url.scheme(), url.host_str()),
-        ("uipilot-plugin", Some("localhost")) | ("http", Some("uipilot-plugin.localhost"))
-    )
+    url.port().is_none()
+        && matches!(
+            (url.scheme(), url.host_str()),
+            ("uipilot-plugin", Some("localhost")) | ("http", Some("uipilot-plugin.localhost"))
+        )
 }
 
 fn response(status: u16, body: Vec<u8>, content_type: Option<&str>) -> Response<Vec<u8>> {
@@ -897,6 +1021,18 @@ mod tests {
             assert!(load(&root).route("/unknown body").is_none());
             assert!(!load(&root).authorizes_clipboard("plugin"));
         }
+    }
+
+    #[test]
+    fn runtime_entry_must_be_html() {
+        let root = TestRoot::new();
+        root.write_plugin(
+            "plugin",
+            valid_manifest("plugin", "/plugin").replace("index.html", "index.js"),
+        );
+        fs::write(root.path.join("plugin").join("index.js"), "").unwrap();
+
+        assert!(load(&root).route("/plugin").is_none());
     }
 
     #[test]
@@ -1087,6 +1223,55 @@ mod tests {
                         403
                     );
                 }
+
+                let nested = root.path.join("one").join("nested");
+                if std::os::windows::fs::symlink_dir(root.path.join("two"), nested).is_ok() {
+                    assert_eq!(
+                        catalog
+                            .asset_response("plugin-6f6e65", "/nested/index.html")
+                            .status(),
+                        403
+                    );
+                }
+
+                let junction = root.path.join("one").join("junction");
+                let output = std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg("mklink")
+                    .arg("/J")
+                    .arg(&junction)
+                    .arg(root.path.join("two"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "junction creation failed");
+                assert_eq!(
+                    catalog
+                        .asset_response("plugin-6f6e65", "/junction/index.html")
+                        .status(),
+                    403
+                );
+                fs::remove_dir(junction).unwrap();
+
+                let plugin_root = root.path.join("one");
+                let parked_root = root.path.join("one-parked");
+                fs::rename(&plugin_root, &parked_root).unwrap();
+                let output = std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg("mklink")
+                    .arg("/J")
+                    .arg(&plugin_root)
+                    .arg(root.path.join("two"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "junction replacement failed");
+                assert_eq!(
+                    catalog
+                        .asset_response("plugin-6f6e65", "/index.html")
+                        .status(),
+                    403
+                );
+                fs::remove_dir(&plugin_root).unwrap();
+                fs::rename(parked_root, plugin_root).unwrap();
             }
         }
 
@@ -1107,15 +1292,25 @@ mod tests {
             assert!(bridge.contains("tauri.invoke('plugin:event|listen'"));
             assert!(bridge.contains("tauri.transformCallback"));
             assert!(bridge.contains("requestId: activeRequest.requestId"));
+            assert!(bridge.contains("finally { activeRequest = null; }"));
             assert!(bridge.contains("protocolVersion: 1"));
             assert!(bridge.contains("uipilot-plugin-ready"));
         }
 
         #[test]
-        fn query_path_does_not_block_waiting_for_webview_ready() {
+        fn query_waits_for_runtime_ready_off_the_async_executor() {
             let source = std::fs::read_to_string(file!()).unwrap();
-            assert!(!source.contains(&["wait_until_ready", "(&route.window_label)"].concat()));
-            assert!(!source.contains(&["thread", "::sleep"].concat()));
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(production.contains("wait_until_ready(ready, disabled, label)"));
+            assert!(production.contains("tauri::async_runtime::spawn_blocking"));
+            assert!(!production.contains(&["thread", "::sleep"].concat()));
+        }
+
+        #[test]
+        fn runtime_failure_invalidates_only_its_plugin_results() {
+            let source = std::fs::read_to_string(file!()).unwrap();
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(production.contains("registry.invalidate_plugin(&plugin_id)"));
         }
 
         #[test]
@@ -1130,6 +1325,7 @@ mod tests {
             }
             for url in [
                 "http://uipilot-plugin.localhost.evil/runtime.html",
+                "http://uipilot-plugin.localhost:1420/runtime.html",
                 "https://example.com/runtime.html",
             ] {
                 assert!(!super::super::plugin_navigation_allowed(
@@ -1140,11 +1336,13 @@ mod tests {
     }
 
     mod query {
-        use std::sync::mpsc;
+        use std::sync::{mpsc, Arc, RwLock};
 
         use serde_json::json;
 
-        use super::super::{PendingPluginQuery, PluginManager, PluginQueryError};
+        use super::super::{
+            wait_until_ready, PendingPluginQuery, PluginManager, PluginQueryError, RuntimeReadiness,
+        };
         use super::{load, valid_manifest, TestRoot};
 
         fn manager(root: &TestRoot) -> PluginManager {
@@ -1272,6 +1470,32 @@ mod tests {
                 manager.record_timeout("plugin-label");
             }
             assert!(manager.disabled.read().unwrap().contains("plugin-label"));
+        }
+
+        #[test]
+        fn disabled_runtime_loses_clipboard_authorization() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            assert!(manager.authorizes_clipboard("plugin"));
+
+            manager.disable_runtime("plugin-706c7567696e");
+
+            assert!(!manager.authorizes_clipboard("plugin"));
+        }
+
+        #[test]
+        fn readiness_wait_completes_after_runtime_marks_ready() {
+            let ready = Arc::new(RuntimeReadiness::default());
+            let disabled = Arc::new(RwLock::new(std::collections::HashSet::new()));
+            let marker = Arc::clone(&ready);
+            let worker = std::thread::spawn(move || marker.mark("plugin-label"));
+
+            assert_eq!(
+                wait_until_ready(ready, disabled, "plugin-label".into()),
+                Ok(true)
+            );
+            worker.join().unwrap();
         }
     }
 }

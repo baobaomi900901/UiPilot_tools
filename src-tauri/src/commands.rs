@@ -250,10 +250,11 @@ pub(crate) async fn search_apps(
         else {
             return Ok(None);
         };
-        let entries = plugins
-            .query(window.app_handle(), route)
-            .await
-            .map_err(|_| CommandError::plugin_query_failed())?;
+        let entries = match plugins.query(window.app_handle(), route).await {
+            Ok(entries) => entries,
+            Err(PluginQueryError::Timeout) => Vec::new(),
+            Err(_) => return Err(CommandError::plugin_query_failed()),
+        };
         return Ok(registry.publish_if_latest(
             token,
             entries,
@@ -2716,6 +2717,13 @@ mod tests {
                 }),
                 Err(CommandError::plugin_query_failed())
             );
+        }
+
+        #[test]
+        fn plugin_timeout_publishes_empty_results_silently() {
+            let source = include_str!("commands.rs");
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(production.contains("Err(PluginQueryError::Timeout) => Vec::new(),"));
         }
     }
 
