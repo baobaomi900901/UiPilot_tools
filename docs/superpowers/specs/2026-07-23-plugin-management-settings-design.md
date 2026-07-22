@@ -5,14 +5,14 @@
 本次变更包含两个同时交付的范围：
 
 1. 完整移除 Research ID、手动应用重扫、验证数据导出/清除 UI 及其专用代码。
-2. 在设置页增加插件清单，展示包内 Markdown 说明，并支持单插件事务式重新加载和物理删除。
+2. 在设置页增加插件清单，展示包内 Markdown 说明，并支持单插件事务式重新加载和可靠卸载。
 
 该功能面向内部开发者 MVP。插件仍由开发者直接放入
 `%APPDATA%\com.uipilot.launcher\plugins`，本次不增加安装器、插件市场或自动更新。
 
 ## 已确认决策
 
-- 删除插件会物理删除对应插件包目录，并在当前进程立即移除触发词和运行时。
+- 删除插件以原子移动为提交点，保证原插件根下的包路径消失，并在当前进程立即移除触发词和运行时；移入宿主隔离目录的内容允许延迟回收。
 - 插件说明固定来自插件根目录 `README.md`，不在 `plugin.json` 增加路径字段。
 - 说明使用安全 Markdown 渲染，支持标题、段落、列表、强调和代码；禁用 HTML、链接和图片。
 - 单插件重新加载在当前进程完成，任何失败都保留旧插件继续工作。
@@ -107,11 +107,13 @@ PluginView {
 
 每个活动 entry 记录宿主生成且单调递增的 `generation`、运行时 label，以及该活动包在加载或成功重载时取得的 Windows volume/file identity。generation 溢出时该插件的后续重载 fail closed，旧 generation 保持活动。
 
-插件变更由一个管理器内的 mutation lock 串行化。MVP 同一时刻只执行一次重载或删除，避免两个操作同时修改目录、admission、ready 状态和 WebView。
+插件变更由一个管理器内的 mutation lock 串行化。MVP 同一时刻只执行一次重载或删除，避免两个操作同时修改目录、admission、ready 状态和 WebView。reload 从 staged 创建到提交或回滚期间拥有 mutation lock，但固定 readiness deadline 保证它不会无限占用该锁。
 
 管理器同时维护仅在重载期间存在的 staged asset 映射和 staged ownership 映射。两张映射使用同一个 runtime identity（`plugin_id + label + generation`）并在同一个 manager 临界区创建、晋升或移除。每个 identity 唯一拥有自己的 generation data directory，该目录随 ownership 一起从 staged 晋升为 active。自定义协议可以为活动 runtime 和 staged runtime 提供资产，但查询路由只指向活动目录。
 
 管理器另有一个 plugin admission gate。查询发布、插件剪贴板副作用和 ready callback 取得 read admission；重载切换、回滚、删除提交及 process-failed/意外 close callback 取得 write admission。mutation lock 只负责串行化管理命令，不能代替 admission gate。
+
+staged runtime readiness 复用现有宿主等待语义，定义单一固定常量 `PLUGIN_RUNTIME_READY_TIMEOUT = 500ms`。该常量不暴露配置项，也不按插件覆盖。
 
 ## 事务式重新加载
 
@@ -121,16 +123,18 @@ PluginView {
 2. 从磁盘重新读取 manifest、运行时入口和 README。
 3. 要求新 manifest ID 与原 ID 一致，并验证版本、host 版本、权限、触发词及与其他活动插件的冲突。
 4. 为候选插件分配新的 generation 和临时 label，以同一个 runtime identity 注册 staged asset/ownership 映射并创建不可见、不可聚焦的临时 WebView。
-5. 等待该 runtime identity 的 ready callback 把 staged attempt 标记为 `ready=true`。此期间旧插件继续处理查询；ready 只表示可以尝试提交，不提前改变 ownership。
+5. 最多等待 `PLUGIN_RUNTIME_READY_TIMEOUT`，由该 runtime identity 的 ready callback 把 staged attempt 标记为 `ready=true`。等待期间旧插件继续处理查询；ready 只表示可以尝试提交，不提前改变 ownership。timed wait 期间不得持有 admission、active/staged catalog、ready/disabled/timeout/pending 状态锁或 ResultRegistry lock。
 6. 候选 ready 后取得 write admission；在 admission 和同一个 manager 临界区内最后重验该 identity 仍唯一拥有 staged asset/ownership slot、`ready=true`、`failed=false`，且对应 WebView 仍存在。任一条件不满足都不能晋升。
 7. 最终健康复核通过后，在同一个 manager 临界区把候选 asset entry 和 ownership 从 staged 两张映射原子移出并写入 active entry，同时移除旧 active ownership、取消旧 generation pending query并清理其 timeout/disabled/ready 状态。候选 identity 在任何时刻只属于 staged 或 active 之一，不能双重归属。
 8. 在仍持有 write admission、但不持有 manager 状态锁时调用 `ResultRegistry::invalidate_domain(QueryDomain::Plugin)`，使所有旧 Plugin token 失效。active entry 切换和 domain epoch 推进均完成后才释放 admission，对外发布事务提交。
 9. 提交成功后只关闭旧 active runtime；关闭完成后 best-effort 清理旧 generation data。promoted generation data 属于当前活动 WebView，必须保留到其后续被替换或删除。
-10. 候选完成切换前任一步失败时，取得 write admission 并在同一个 manager 临界区同时移除该 identity 的 staged asset/ownership 映射；释放 admission 后先关闭 staged runtime，再 best-effort 清理 staged generation data。活动目录和旧 active runtime 保持不变。
+10. 候选完成切换前任一步失败或 readiness deadline 到期时，进入同一 rollback 路径：取得 write admission 并在同一个 manager 临界区同时移除该 identity 的 staged asset/ownership 映射；释放 admission 后先关闭 staged runtime，再 best-effort 清理 staged generation data，返回 `pluginReloadFailed`。活动目录和旧 active runtime 保持不变，并在 rollback 完成后释放 mutation lock，使下一次管理操作可以立即开始。
 
 旧 generation 或回滚 staged generation 的数据清理失败，不改变已经确定的提交或回滚结果，也不暴露路径。任何路径都不得在 promoted runtime 仍活动时清理其 generation data。
 
-## 物理删除
+## 删除提交与隔离回收
+
+删除成功的精确契约是：提交后 `%APPDATA%\com.uipilot.launcher\plugins\<原插件目录>` 不存在，当前进程不再路由或授权该插件，宿主重启也不会重新加载它。删除成功不承诺插件全部字节在提交时已经从磁盘擦除；原子移入宿主隔离目录的内容可以暂存到本次操作或后续宿主启动的 best-effort 清理。
 
 删除流程：
 
@@ -140,7 +144,7 @@ PluginView {
 4. 使用目录 handle 的 Windows rename primitive，把该 entry 原子移动到隔离目录中的宿主生成唯一名称，不允许覆盖。移动是删除提交点。
 5. 移动失败时返回 `pluginDeleteFailed`；活动 entry、路由、授权、runtime 和原目录均保持不变，不能发生部分递归删除。
 6. 移动成功后，在仍持有 write admission 时取消该 generation pending query并移除活动 entry/ownership/路由/授权；释放 manager 状态锁后调用 `invalidate_domain(QueryDomain::Plugin)`，最后释放 admission。
-7. 提交后关闭被删除的 active runtime；关闭完成后 best-effort 清理该 generation data，并对隔离目录中的包做 best-effort 递归清理。任一清理失败仍算删除成功。因为包已在插件根之外，当前进程触发词立即失效且重启不会恢复。
+7. 提交后关闭被删除的 active runtime；关闭完成后 best-effort 清理该 generation data，并对隔离目录中的内容做 best-effort 递归清理。任一清理失败仍算删除成功；遗留隔离内容由后续宿主启动继续 best-effort 清理。因为原包路径已消失且内容位于插件根之外，当前进程触发词立即失效且重启不会恢复。
 
 删除不使用“先检查路径再 `remove_dir_all`”作为提交协议。文件 identity 与 handle-based rename 把路径替换检查和移动绑定到同一个已打开对象，关闭校验后替换的 TOCTOU 窗口。
 
@@ -206,7 +210,8 @@ mutation lock（仅管理命令）
 
 - 不同时持有两个 ready/disabled/timeout/pending 状态锁；取得 ResultRegistry 前释放这些细粒度状态锁，但 admission 继续持有。
 - `ResultRegistry::resolve` 在取得 admission 前完成并释放 registry lock，避免 registry -> admission 的反向嵌套。
-- 不在任何 catalog、状态或 ResultRegistry lock 下等待 runtime ready、执行文件 I/O、调用 clipboard 或关闭 WebView；clipboard 只在 admission read guard 下执行。
+- 不在任何 admission、catalog、状态或 ResultRegistry lock 下等待 runtime ready；等待只持有本次 reload 的 mutation ownership，并由固定 500ms deadline 结束。rollback 完成后必须释放 mutation lock。
+- 不在任何 catalog、状态或 ResultRegistry lock 下执行文件 I/O、调用 clipboard 或关闭 WebView；clipboard 只在 admission read guard 下执行。
 - 重载提交点是 write admission 内完成最终 staged 健康复核、将 staged asset/ownership 原子移动为 active，并推进 Plugin domain epoch；此前失败同时移除 staged 两张映射并回滚，此后旧窗口/旧 generation data 清理失败不回滚。
 - 删除提交点是 write admission 内成功完成的 handle-based 原子移动；移动前失败零状态和文件副作用，移动后内存移除不得失败，窗口/隔离目录清理失败不回滚。
 
@@ -229,6 +234,8 @@ Rust：
 - 插件清单只暴露批准字段。
 - 非主窗口调用在任何状态和文件副作用前失败。
 - ID 改变、重复触发词、非法 manifest 和运行时未 ready 均回滚并保留旧路由。
+- staged runtime 在固定 500ms deadline 内未 ready 时进入统一 rollback，返回 `pluginReloadFailed`；staged 两张映射和 staged data 按既定顺序清理。
+- readiness timeout rollback 完成后 mutation lock 已释放，紧接着发起的另一次重载或删除可以立即取得 mutation ownership，不发生永久阻塞。
 - staged runtime 上报 ready 后、reload 取得 write admission 前发生 process-failed 时，最终健康复核必须拒绝晋升，同时移除 staged asset/ownership 映射并保留旧 active generation。
 - 成功重载只在候选 ready 后切换，并推进 Plugin domain epoch。
 - promotion 临界区内 staged asset/ownership 同时移出并成为唯一 active ownership；任何观察点都不能看到同一 identity 同时属于 staged 和 active。
@@ -236,7 +243,7 @@ Rust：
 - 提交前签发的旧 Plugin token 在提交后晚发布时被拒绝且不能重建 result mapping。
 - 旧 `CopyText` action 在 resolve 后发生重载或删除时 generation 校验失败；mutation 与 clipboard read admission 的两种线性化均被覆盖。
 - 删除原子移动失败时文件、目录项、路由和授权零变化；移动成功后路由和授权消失。
-- 隔离目录递归清理失败仍返回删除成功，且下一次启动不会加载该插件。
+- 隔离目录递归清理失败仍返回删除成功，原插件根路径保持不存在且下一次启动不会加载该插件；遗留隔离内容可由后续宿主清理。
 - 活动目录被 junction、symlink 或不同 file identity 的普通目录替换时移动被拒绝；伪造插件 ID 不能越过插件根。
 - staged rollback 后和 active 切换后的延迟 ready/process-failed/close callback 不能影响新活动 generation。
 - reload 成功只在旧 runtime 关闭后尝试清理旧 generation data，promoted generation data 保持存在且可继续服务资产。
@@ -263,5 +270,5 @@ Rust：
 3. 制造非法 manifest 或无法 ready 的 runtime，重新加载失败；旧 `/math` 仍可计算并复制结果。
 4. 点击删除并取消，插件保持不变。
 5. 确认删除后，清单立即移除插件，`/math 1+1` 不再路由。
-6. 重启宿主后 `/math` 仍不存在，插件包目录已删除。
+6. 检查原路径 `%APPDATA%\com.uipilot.launcher\plugins\internal.math` 不存在；重启宿主后 `/math` 仍不存在。不要求隔离目录中的全部字节在删除提交时已经擦除。
 7. 设置页只保留普通设置操作和插件清单，不再出现 Research ID、重新扫描、导出或清除验证数据。
