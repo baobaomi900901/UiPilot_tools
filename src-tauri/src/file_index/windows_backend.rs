@@ -65,24 +65,42 @@ pub(super) const SCAN_BATCH_SIZE: usize = 512;
 pub(super) const DRIVE_FIXED_VALUE: u32 = 3;
 const ERROR_NO_MORE_FILES_CODE: u32 = 18;
 
-struct DirectoryStack(Vec<String>);
+struct DirectoryStack {
+    priority: Vec<String>,
+    ordinary: Vec<String>,
+}
 
 impl DirectoryStack {
     #[cfg(test)]
     fn root() -> Self {
-        Self(vec![String::new()])
+        Self {
+            priority: Vec::new(),
+            ordinary: vec![String::new()],
+        }
     }
 
     fn push(&mut self, relative_path: String) -> Result<(), BackendError> {
-        if self.0.len() == EVENT_CAPACITY {
+        if self.priority.len() + self.ordinary.len() == EVENT_CAPACITY {
             return Err(BackendError::Overflow);
         }
-        self.0.push(relative_path);
+        if scan_priority(&relative_path) == 0 {
+            self.ordinary.push(relative_path);
+        } else {
+            self.priority.push(relative_path);
+        }
         Ok(())
     }
 
     fn pop(&mut self) -> Option<String> {
-        self.0.pop()
+        self.priority.pop().or_else(|| self.ordinary.pop())
+    }
+}
+
+fn scan_priority(relative_path: &str) -> u8 {
+    if relative_path == "Users" || relative_path.starts_with(r"Users\") {
+        1
+    } else {
+        0
     }
 }
 
@@ -1531,7 +1549,10 @@ where
         &mut dyn FnMut(DirectoryRecord) -> Result<(), BackendError>,
     ) -> Result<(), BackendError>,
 {
-    let mut pending = DirectoryStack(vec![relative_root]);
+    let mut pending = DirectoryStack {
+        priority: Vec::new(),
+        ordinary: vec![relative_root],
+    };
     while let Some(relative_directory) = pending.pop() {
         if stopped() {
             return Err(BackendError::Stopped);
@@ -2151,7 +2172,7 @@ mod tests {
         DirectoryStack, EnumerationStep, EventBuffer, ExcludedPrefix, FixedVolume, IndexEntry,
         IndexedKind, NativeEntry, OpenFailure, PathUpdate, PinnedPathPolicy, RawVolume,
         ScanBatcher, StructuredEvent, VolumeIdentity, WatchCompletion, DRIVE_FIXED_VALUE,
-        EVENT_CAPACITY,
+        EVENT_CAPACITY, SCAN_BATCH_SIZE,
     };
 
     fn raw_volume(mount: &str, guid: &str, serial: u32, drive_type: u32) -> RawVolume {
@@ -2715,6 +2736,89 @@ mod tests {
         })
         .is_err());
         assert_eq!(visited.get(), 1);
+    }
+
+    #[test]
+    fn c_drive_scan_prioritizes_user_desktop_before_large_system_branches() {
+        let volume = collect_fixed_volumes_with([raw_volume(
+            "C:\\",
+            r"\\?\Volume{C}\",
+            7,
+            DRIVE_FIXED_VALUE,
+        )])
+        .unwrap()
+        .remove(0);
+        let first_batch = RefCell::new(None::<Vec<String>>);
+        let mut batcher = ScanBatcher::new(|batch: Vec<IndexEntry>| {
+            if first_batch.borrow().is_none() {
+                *first_batch.borrow_mut() =
+                    Some(batch.into_iter().map(|entry| entry.relative_path).collect());
+            }
+            Ok(())
+        });
+        let mut denied_prefixes = Vec::new();
+
+        scan_directories_with(
+            &volume,
+            &[],
+            || false,
+            &mut batcher,
+            &mut denied_prefixes,
+            |relative, visit| {
+                match relative {
+                    "" => {
+                        visit(DirectoryRecord {
+                            name: "Users".into(),
+                            attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                            size: 0,
+                            modified: 116_444_736_000_000_000,
+                        })?;
+                        visit(DirectoryRecord {
+                            name: "Windows".into(),
+                            attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                            size: 0,
+                            modified: 116_444_736_000_000_000,
+                        })?;
+                    }
+                    "Users" => visit(DirectoryRecord {
+                        name: "moby".into(),
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        size: 0,
+                        modified: 116_444_736_000_000_000,
+                    })?,
+                    r"Users\moby" => visit(DirectoryRecord {
+                        name: "Desktop".into(),
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        size: 0,
+                        modified: 116_444_736_000_000_000,
+                    })?,
+                    r"Users\moby\Desktop" => visit(DirectoryRecord {
+                        name: "云图".into(),
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        size: 0,
+                        modified: 116_444_736_000_000_000,
+                    })?,
+                    "Windows" => {
+                        for index in 0..SCAN_BATCH_SIZE {
+                            visit(DirectoryRecord {
+                                name: format!("system-{index}.dll"),
+                                attributes: 0,
+                                size: 1,
+                                modified: 116_444_736_000_000_000,
+                            })?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let first_batch = first_batch.into_inner().unwrap();
+        assert!(first_batch
+            .iter()
+            .any(|path| path == r"Users\moby\Desktop\云图"));
     }
 
     #[test]

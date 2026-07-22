@@ -3233,6 +3233,80 @@ mod tests {
     }
 
     #[test]
+    fn c_drive_scanner_batch_surfaces_desktop_candidate_before_full_commit() {
+        let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
+        let volume = VolumeIdentity {
+            volume_guid_path: r"\\?\VOLUME{SCANNER-SEAM}\".into(),
+            volume_serial: 1,
+            filesystem_name: "NTFS".into(),
+        };
+        store
+            .seed_committed_for_test(&volume, [candidate_entry("find-old.txt", 1)])
+            .unwrap();
+        let generation = store.begin_candidate_for_test(&volume, r"C:\").unwrap();
+
+        super::windows_backend::run_scanner_batches_with(
+            Path::new(r"C:\"),
+            std::collections::VecDeque::from([
+                super::windows_backend::NativeEntry::directory(
+                    "Users",
+                    windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0,
+                ),
+                super::windows_backend::NativeEntry::directory(
+                    "Windows",
+                    windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0,
+                ),
+                super::windows_backend::NativeEntry::directory(
+                    r"Users\moby",
+                    windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0,
+                ),
+                super::windows_backend::NativeEntry::directory(
+                    r"Users\moby\Desktop",
+                    windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0,
+                ),
+                super::windows_backend::NativeEntry::directory(
+                    r"Users\moby\Desktop\云图",
+                    windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0,
+                ),
+            ]),
+            |batch| {
+                let batch = batch.into_iter().map(|entry| TestEntry {
+                    relative_path: entry.relative_path,
+                    display_path: entry.display_path,
+                    name: entry.name,
+                    folded_name: entry.folded_name,
+                    kind: entry.kind,
+                    category: entry.category,
+                    size_bytes: entry.size_bytes,
+                    modified_utc_ms: entry.modified_utc_ms,
+                    generation,
+                });
+                store
+                    .append_candidate_for_test(&volume, generation, batch)
+                    .map_err(|_| super::windows_backend::BackendError::InvalidData)?;
+                let visible = store
+                    .query_for_test(
+                        &QuerySpec {
+                            folded_query: fold_name("云图"),
+                            category: FileCategory::Folder,
+                            sort: FileSort::ModifiedDesc,
+                        },
+                        std::slice::from_ref(&volume),
+                    )
+                    .map_err(|_| super::windows_backend::BackendError::InvalidData)?;
+                assert_eq!(visible.status, FileIndexStatus::Building);
+                assert_eq!(visible.total, 1);
+                assert_eq!(
+                    visible.entries[0].display_path,
+                    r"C:\Users\moby\Desktop\云图"
+                );
+                Err(super::windows_backend::BackendError::InvalidData)
+            },
+        )
+        .unwrap_err();
+    }
+
+    #[test]
     fn failed_candidate_is_cleared_without_a_third_generation() {
         let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
         let volume = volume();
