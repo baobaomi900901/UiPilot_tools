@@ -164,6 +164,8 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   searchUnavailable: '搜索暂不可用。',
   fileNotFound: '文件已不存在。',
   fileOpenFailed: '无法在资源管理器中打开。',
+  clipboardWriteFailed: '无法复制到剪贴板。',
+  pluginPermissionDenied: '插件无权写入剪贴板。',
 }
 
 const NOTICE_TEXT = {
