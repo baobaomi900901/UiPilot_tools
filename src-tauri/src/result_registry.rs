@@ -69,8 +69,8 @@ struct RegistryState {
     active_invocation_id: Option<String>,
     latest_query_sequence: u64,
     latest_query_domain: Option<QueryDomain>,
-    domain_epochs: [u64; 2],
-    domain_exhausted: [bool; 2],
+    domain_epochs: [u64; 3],
+    domain_exhausted: [bool; 3],
     current: Option<ResultSet>,
 }
 
@@ -211,7 +211,11 @@ impl ResultRegistry {
     }
 
     pub(crate) fn invalidate_plugin(&self, plugin_id: &str) {
-        let mut state = self.state.lock().expect("result registry lock poisoned");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
         if state.current.as_ref().is_some_and(|current| {
             current.actions.values().any(|action| {
                 matches!(
@@ -293,6 +297,7 @@ impl QueryDomain {
         match self {
             Self::Application => 0,
             Self::File => 1,
+            Self::Plugin => 2,
         }
     }
 }
