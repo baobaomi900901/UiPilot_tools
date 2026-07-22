@@ -15,7 +15,6 @@
     "allow-export-validation-data",
     "allow-clear-validation-data",
     "allow-hide-launcher",
-    "core:window:allow-start-dragging",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

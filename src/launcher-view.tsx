@@ -253,7 +253,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
 
   const launcher = (
-    <section className="launcher-view" aria-label="应用启动器" data-tauri-drag-region="true">
+    <section className="launcher-view" aria-label="应用启动器">
       <label className="visually-hidden" htmlFor={`launcher-query-${snapshot.queryControl}`}>
         搜索应用
       </label>
@@ -279,13 +279,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         onBindingFailed={reportFailed}
       />
       <Spin spinning={snapshot.searchPending} size="small">
-        <div
-          id="launcher-results"
-          className="result-list"
-          role="listbox"
-          aria-label="搜索结果"
-          data-tauri-drag-region="true"
-        >
+        <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
           {snapshot.results.map((item, index) => (
               <div
                 key={item.key}
@@ -334,7 +328,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
 
   const filePanel = file ? (
-    <section className="file-workspace" aria-label="文件搜索" data-tauri-drag-region="true">
+    <section className="file-workspace" aria-label="文件搜索">
       <label className="visually-hidden" htmlFor={`launcher-query-${snapshot.queryControl}`}>
         搜索文件
       </label>
@@ -384,13 +378,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         ))}
       </div>
       <Spin spinning={snapshot.searchPending} size="small">
-        <div
-          id="file-results"
-          className="result-list file-result-list"
-          role="listbox"
-          aria-label="文件结果"
-          data-tauri-drag-region="true"
-        >
+        <div id="file-results" className="result-list file-result-list" role="listbox" aria-label="文件结果">
           {file.results.map((item, index) => (
             <div
               key={item.key}
@@ -473,8 +461,8 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const busy = settings?.operation !== undefined
   const locked = busy || settings?.readOnly === true
   const settingsView = (
-    <section className="settings-view" aria-label="设置" data-tauri-drag-region="true">
-      <header className="settings-header" data-tauri-drag-region="true">
+    <section className="settings-view" aria-label="设置">
+      <header className="settings-header">
         <h1 ref={headingRef} tabIndex={-1}>
           设置
         </h1>
@@ -483,11 +471,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         </Button>
       </header>
       {!settings ? (
-        <div className="settings-loading" data-tauri-drag-region="true">
+        <div className="settings-loading">
           {snapshot.status ? <Button onClick={() => void core.reloadSettings()}>重新加载设置</Button> : <Spin size="small" />}
         </div>
       ) : (
-        <Form component="div" layout="vertical" className="settings-form" data-tauri-drag-region="true">
+        <Form component="div" layout="vertical" className="settings-form">
           <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
             <HotkeyRecorderInput
               core={core}
@@ -556,19 +544,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   return (
     <ConfigProvider theme={{ algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
       <App>
-        <main
-          className="launcher-surface"
-          data-color-scheme={dark ? 'dark' : 'light'}
-          data-tauri-drag-region="true"
-        >
+        <main className="launcher-surface" data-color-scheme={dark ? 'dark' : 'light'}>
           {snapshot.view === 'launcher' ? filePanel ?? launcher : settingsView}
-          <div
-            className="status-region"
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            data-tauri-drag-region="true"
-          >
+          <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
             {status}
           </div>
         </main>

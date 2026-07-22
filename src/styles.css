@@ -27,6 +27,31 @@ input {
   font: inherit;
 }
 
+.launcher-surface,
+.launcher-view,
+.file-workspace,
+.settings-view,
+.settings-header,
+.settings-loading,
+.status-region {
+  app-region: drag;
+}
+
+button,
+input,
+label,
+.result-list,
+.file-category-strip,
+.file-preview,
+.file-toolbar,
+.settings-form {
+  app-region: no-drag;
+}
+
+.result-list:empty {
+  app-region: drag;
+}
+
 .launcher-surface {
   display: grid;
   grid-template-rows: minmax(52px, 1fr) minmax(24px, auto);
