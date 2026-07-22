@@ -559,6 +559,7 @@ impl PluginCatalog {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    manifest: u32,
     id: String,
     version: String,
     #[serde(rename = "minHostVersion")]
@@ -583,7 +584,8 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
     }
     let manifest: Manifest = serde_json::from_str(&manifest).ok()?;
     let version = Version::parse(&manifest.version)?;
-    if Version::parse(&manifest.min_host_version)? > host_version
+    if manifest.manifest != 1
+        || Version::parse(&manifest.min_host_version)? > host_version
         || !valid_id(&manifest.id)
         || !valid_id(&manifest.feature.id)
         || !valid_trigger(&manifest.feature.trigger)
@@ -792,6 +794,7 @@ mod tests {
     fn valid_manifest(plugin_id: &str, trigger: &str) -> String {
         format!(
             r#"{{
+                "manifest":1,
                 "id":"{plugin_id}",
                 "version":"1.0.0",
                 "minHostVersion":"0.2.0",
@@ -828,6 +831,10 @@ mod tests {
         let cases = [
             valid_manifest("one", "/one")
                 .replace(r#""permissions""#, r#""extra":true,"permissions""#),
+            valid_manifest("manifest-missing", "/manifest-missing")
+                .replace(r#""manifest":1,"#, ""),
+            valid_manifest("manifest-wrong", "/manifest-wrong")
+                .replace(r#""manifest":1"#, r#""manifest":2"#),
             valid_manifest("two", "/two").replace(r#""1.0.0""#, r#""1.0""#),
             valid_manifest("three", "/three").replace(r#""0.2.0""#, r#""0.2""#),
             valid_manifest("four", "/four")
