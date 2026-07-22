@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
+pub(crate) const PLUGIN_RUNTIME_READY_TIMEOUT: Duration = Duration::from_millis(500);
 const PLUGIN_README_MAX_BYTES: u64 = 16 * 1024;
 const PLUGIN_BRIDGE: &str = r#"
 (() => {
@@ -97,25 +98,136 @@ impl From<io::Error> for PluginSetupError {
 }
 
 pub(crate) struct PluginManager {
-    catalog: OnceLock<RwLock<PluginCatalog>>,
+    state: OnceLock<RwLock<PluginManagerState>>,
+    config: OnceLock<PluginManagerConfig>,
+    mutation: Mutex<()>,
     admission: RwLock<()>,
-    ready: Arc<RuntimeReadiness>,
     disabled: Arc<RwLock<HashSet<String>>>,
     pending: RwLock<HashMap<String, PendingPluginQuery>>,
     timeouts: RwLock<HashMap<String, u8>>,
     next_request: AtomicU64,
+    next_quarantine: AtomicU64,
+}
+
+#[derive(Clone)]
+struct PluginManagerConfig {
+    app_data_dir: PathBuf,
+    plugin_root: PathBuf,
+    quarantine_root: PathBuf,
+    host_version: Version,
+}
+
+struct PluginManagerState {
+    active: PluginCatalog,
+    staged_assets: HashMap<RuntimeIdentity, PluginCatalogEntry>,
+    ownership: HashMap<RuntimeIdentity, RuntimeOwnership>,
+    latest_generations: HashMap<String, u64>,
+}
+
+#[derive(Clone)]
+struct RuntimeOwnership {
+    slot: RuntimeSlot,
+    attempt: Arc<RuntimeAttempt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeSlot {
+    Active,
+    Staged,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RuntimeIdentity {
+    pub(crate) plugin_id: String,
+    pub(crate) window_label: String,
+    pub(crate) generation: u64,
+}
+
+#[derive(Default)]
+struct RuntimeAttempt {
+    state: Mutex<RuntimeAttemptState>,
+    changed: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeAttemptState {
+    ready: bool,
+    failed: bool,
+}
+
+impl RuntimeAttempt {
+    fn mark_ready(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.failed {
+                state.ready = true;
+            }
+            self.changed.notify_all();
+        }
+    }
+
+    fn mark_failed(&self) -> bool {
+        if let Ok(mut state) = self.state.lock() {
+            if state.failed {
+                return false;
+            }
+            state.failed = true;
+            self.changed.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn snapshot(&self) -> Option<RuntimeAttemptState> {
+        self.state.lock().ok().map(|state| *state)
+    }
+
+    fn wait_until_settled(&self, timeout: Duration) -> Option<RuntimeAttemptState> {
+        let state = self.state.lock().ok()?;
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.ready && !state.failed)
+            .ok()?;
+        Some(*state)
+    }
+}
+
+impl PluginManagerState {
+    fn from_catalog(active: PluginCatalog) -> Self {
+        let mut ownership = HashMap::new();
+        let mut latest_generations = HashMap::new();
+        for entry in &active.entries {
+            let identity = entry.identity();
+            ownership.insert(
+                identity,
+                RuntimeOwnership {
+                    slot: RuntimeSlot::Active,
+                    attempt: Arc::new(RuntimeAttempt::default()),
+                },
+            );
+            latest_generations.insert(entry.id.clone(), entry.generation);
+        }
+        Self {
+            active,
+            staged_assets: HashMap::new(),
+            ownership,
+            latest_generations,
+        }
+    }
 }
 
 impl PluginManager {
     pub(crate) fn new() -> Self {
         Self {
-            catalog: OnceLock::new(),
+            state: OnceLock::new(),
+            config: OnceLock::new(),
+            mutation: Mutex::new(()),
             admission: RwLock::new(()),
-            ready: Arc::new(RuntimeReadiness::default()),
             disabled: Arc::new(RwLock::new(HashSet::new())),
             pending: RwLock::new(HashMap::new()),
             timeouts: RwLock::new(HashMap::new()),
             next_request: AtomicU64::new(0),
+            next_quarantine: AtomicU64::new(0),
         }
     }
 
@@ -124,15 +236,32 @@ impl PluginManager {
         app_data_dir: &Path,
         host_version: Version,
     ) -> Result<(), PluginSetupError> {
-        let catalog = PluginCatalog::load(&app_data_dir.join("plugins"), host_version)?;
-        self.catalog
-            .set(RwLock::new(catalog))
+        let plugin_root = app_data_dir.join("plugins");
+        let quarantine_root = app_data_dir.join("plugin-quarantine");
+        fs::create_dir_all(&quarantine_root)?;
+        if !ordinary_directory(&quarantine_root) {
+            return Err(PluginSetupError::Io(io::Error::other(
+                "plugin quarantine unavailable",
+            )));
+        }
+        cleanup_quarantine(&quarantine_root);
+        let catalog = PluginCatalog::load(&plugin_root, host_version)?;
+        self.config
+            .set(PluginManagerConfig {
+                app_data_dir: app_data_dir.to_path_buf(),
+                plugin_root,
+                quarantine_root,
+                host_version,
+            })
+            .map_err(|_| PluginSetupError::AlreadyLoaded)?;
+        self.state
+            .set(RwLock::new(PluginManagerState::from_catalog(catalog)))
             .map_err(|_| PluginSetupError::AlreadyLoaded)
     }
 
     pub(crate) fn route(&self, query: &str) -> Option<PluginRoute> {
         let _admission = self.admission.read().ok()?;
-        self.catalog.get()?.read().ok()?.route(query)
+        self.state.get()?.read().ok()?.active.route(query)
     }
 
     pub(crate) fn list_views(&self) -> Result<Vec<PluginView>, PluginManagementError> {
@@ -140,9 +269,9 @@ impl PluginManager {
             .admission
             .read()
             .map_err(|_| PluginManagementError::Unavailable)?;
-        self.catalog
+        self.state
             .get()
-            .and_then(|catalog| catalog.read().ok().map(|catalog| catalog.views()))
+            .and_then(|state| state.read().ok().map(|state| state.active.views()))
             .ok_or(PluginManagementError::Unavailable)
     }
 
@@ -157,9 +286,9 @@ impl PluginManager {
             return PluginQueryStart::Rejected;
         };
         let Some(route) = self
-            .catalog
+            .state
             .get()
-            .and_then(|catalog| catalog.read().ok()?.route(query))
+            .and_then(|state| state.read().ok()?.active.route(query))
         else {
             return PluginQueryStart::NoRoute;
         };
@@ -179,10 +308,11 @@ impl PluginManager {
     ) -> Option<SearchResponse> {
         let _admission = self.admission.read().ok()?;
         let current = self
-            .catalog
+            .state
             .get()?
             .read()
             .ok()?
+            .active
             .entries
             .iter()
             .any(|entry| route_matches(entry, route));
@@ -220,11 +350,12 @@ impl PluginManager {
             .read()
             .map_err(|_| PluginCopyError::PermissionDenied)?;
         let authorized = self
-            .catalog
+            .state
             .get()
-            .and_then(|catalog| {
-                let catalog = catalog.read().ok()?;
-                catalog
+            .and_then(|state| {
+                let state = state.read().ok()?;
+                state
+                    .active
                     .entries
                     .iter()
                     .find(|entry| {
@@ -250,78 +381,106 @@ impl PluginManager {
 
     #[cfg(test)]
     fn install_catalog_for_test(&self, catalog: PluginCatalog) {
-        self.catalog
-            .set(RwLock::new(catalog))
+        self.state
+            .set(RwLock::new(PluginManagerState::from_catalog(catalog)))
             .unwrap_or_else(|_| panic!("test catalog already installed"));
     }
 
     #[cfg(test)]
     fn advance_generation_for_test(&self, registry: &ResultRegistry, plugin_id: &str) {
         let _admission = self.admission.write().expect("plugin admission poisoned");
-        let mut catalog = self
-            .catalog
+        let mut state = self
+            .state
             .get()
             .expect("test catalog missing")
             .write()
             .expect("plugin catalog poisoned");
-        let entry = catalog
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == plugin_id)
-            .expect("test plugin missing");
-        entry.generation = entry
-            .generation
-            .checked_add(1)
-            .expect("test generation overflow");
-        drop(catalog);
+        let (id, generation) = {
+            let entry = state
+                .active
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == plugin_id)
+                .expect("test plugin missing");
+            entry.generation = entry
+                .generation
+                .checked_add(1)
+                .expect("test generation overflow");
+            (entry.id.clone(), entry.generation)
+        };
+        state.latest_generations.insert(id, generation);
+        drop(state);
         registry
             .invalidate_domain(QueryDomain::Plugin)
             .expect("test plugin epoch exhausted");
     }
 
+    #[cfg(test)]
     pub(crate) fn authorizes_clipboard(&self, plugin_id: &str) -> bool {
         let Ok(_admission) = self.admission.read() else {
             return false;
         };
-        let Some(catalog) = self.catalog.get() else {
+        let Some(state) = self.state.get() else {
             return false;
         };
-        let Ok(catalog) = catalog.read() else {
+        let Ok(state) = state.read() else {
             return false;
         };
-        let Some(entry) = catalog.entries.iter().find(|entry| entry.id == plugin_id) else {
+        let Some(entry) = state
+            .active
+            .entries
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+        else {
             return false;
         };
         self.disabled
             .read()
             .is_ok_and(|disabled| !disabled.contains(&entry.window_label))
-            && catalog.authorizes_clipboard(plugin_id)
+            && state.active.authorizes_clipboard(plugin_id)
     }
 
     pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
         let Ok(_admission) = self.admission.read() else {
             return response(403, Vec::new(), None);
         };
-        self.catalog
+        self.state
             .get()
-            .and_then(|catalog| catalog.read().ok())
+            .and_then(|state| state.read().ok())
             .map_or_else(
                 || response(403, Vec::new(), None),
-                |catalog| catalog.asset_response(label, request_path),
+                |state| {
+                    state
+                        .active
+                        .entries
+                        .iter()
+                        .find(|entry| entry.window_label == label)
+                        .or_else(|| {
+                            state
+                                .staged_assets
+                                .values()
+                                .find(|entry| entry.window_label == label)
+                        })
+                        .map_or_else(
+                            || response(403, Vec::new(), None),
+                            |entry| asset_response(entry, request_path),
+                        )
+                },
             )
     }
 
     pub(crate) fn create_runtimes(
-        &self,
+        self: &Arc<Self>,
         app: &App,
-        app_data_dir: &Path,
+        _app_data_dir: &Path,
     ) -> Result<(), PluginSetupError> {
-        let Some(catalog) = self.catalog.get() else {
+        let Some(state) = self.state.get() else {
             return Ok(());
         };
-        let entries = catalog
+        let entries = state
             .read()
             .map_err(|_| io::Error::other("plugin catalog unavailable"))?
+            .active
             .entries
             .clone();
         for entry in &entries {
@@ -334,64 +493,452 @@ impl PluginManager {
             {
                 continue;
             }
-            let _clipboard_allowed = self.authorizes_clipboard(&entry.id);
-            let label = entry.window_label.clone();
-            let runtime_name = entry
-                .runtime
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| io::Error::other("invalid plugin runtime"))?;
-            let url = tauri::Url::parse(&format!("uipilot-plugin://localhost/{runtime_name}"))
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let data_directory = app_data_dir
-                .join("plugin-runtime-data")
-                .join(&entry.window_label)
-                .join(entry.version.to_path_segment())
-                .join(&entry.feature.id);
-            let manager = app.state::<std::sync::Arc<PluginManager>>().inner().clone();
-            let ready_manager = manager.clone();
-            let label_for_ready = label.clone();
-            let disabled_manager = manager.clone();
-            let label_for_failure = label.clone();
-            let failure_app = app.handle().clone();
-            let window = WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))
-                .visible(false)
-                .focusable(false)
-                .skip_taskbar(true)
-                .incognito(true)
-                .data_directory(data_directory)
-                .initialization_script(PLUGIN_BRIDGE)
-                .on_navigation(plugin_navigation_allowed)
-                .on_new_window(|_, _| NewWindowResponse::Deny)
-                .on_download(|_, _| false)
-                .on_document_title_changed(move |_, title| {
-                    if title == "uipilot-plugin-ready" {
-                        ready_manager.mark_ready(&label_for_ready);
-                    }
-                })
-                .build()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            attach_process_failed_handler(&window, move || {
-                disabled_manager.disable_runtime(&label_for_failure);
-                let registry = failure_app.state::<ResultRegistry>();
-                let _ = registry.invalidate_domain(QueryDomain::Plugin);
-            })?;
+            self.create_runtime_window(app.handle(), entry)?;
         }
         Ok(())
     }
 
-    pub(crate) fn mark_ready(&self, label: &str) {
-        self.ready.mark(label);
+    fn create_runtime_window(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        entry: &PluginCatalogEntry,
+    ) -> Result<WebviewWindow, PluginSetupError> {
+        let config = self
+            .config
+            .get()
+            .ok_or_else(|| PluginSetupError::Io(io::Error::other("plugin manager unavailable")))?;
+        let identity = entry.identity();
+        let runtime_name = entry
+            .runtime
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("invalid plugin runtime"))?;
+        let url = tauri::Url::parse(&format!("uipilot-plugin://localhost/{runtime_name}"))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let data_directory = runtime_data_directory(&config.app_data_dir, &identity);
+        let ready_manager = Arc::clone(self);
+        let identity_for_ready = identity.clone();
+        let failed_manager = Arc::clone(self);
+        let identity_for_failure = identity.clone();
+        let failure_app = app.clone();
+        let window = WebviewWindowBuilder::new(
+            app,
+            entry.window_label.clone(),
+            WebviewUrl::CustomProtocol(url),
+        )
+        .visible(false)
+        .focusable(false)
+        .skip_taskbar(true)
+        .incognito(true)
+        .data_directory(data_directory)
+        .initialization_script(PLUGIN_BRIDGE)
+        .on_navigation(plugin_navigation_allowed)
+        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .on_download(|_, _| false)
+        .on_document_title_changed(move |_, title| {
+            if title == "uipilot-plugin-ready" {
+                ready_manager.runtime_ready(&identity_for_ready);
+            }
+        })
+        .build()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        attach_process_failed_handler(&window, move || {
+            let registry = failure_app.state::<ResultRegistry>();
+            failed_manager.runtime_failed(&identity_for_failure, &registry);
+        })?;
+        let destroyed_manager = Arc::clone(self);
+        let identity_for_destroyed = identity;
+        let destroyed_app = app.clone();
+        window.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let registry = destroyed_app.state::<ResultRegistry>();
+                destroyed_manager.runtime_failed(&identity_for_destroyed, &registry);
+            }
+        });
+        Ok(window)
     }
 
-    pub(crate) fn disable_runtime(&self, label: &str) {
-        if let Ok(mut disabled) = self.disabled.write() {
-            disabled.insert(label.to_string());
+    pub(crate) fn reload_plugin(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        registry: &ResultRegistry,
+        plugin_id: &str,
+    ) -> Result<PluginView, PluginManagementError> {
+        if !valid_id(plugin_id) {
+            return Err(PluginManagementError::Unavailable);
         }
-        self.ready.changed.notify_all();
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let config = self
+            .config
+            .get()
+            .cloned()
+            .ok_or(PluginManagementError::Unavailable)?;
+        let old = {
+            let _admission = self
+                .admission
+                .read()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            self.state
+                .get()
+                .and_then(|state| {
+                    state
+                        .read()
+                        .ok()?
+                        .active
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == plugin_id)
+                        .cloned()
+                })
+                .ok_or(PluginManagementError::Unavailable)?
+        };
+        let mut candidate = load_entry(&old.root, config.host_version)
+            .filter(|entry| entry.id == plugin_id)
+            .ok_or(PluginManagementError::Unavailable)?;
+        let attempt = Arc::new(RuntimeAttempt::default());
+        let identity = {
+            let _admission = self
+                .admission
+                .write()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            let mut state = self
+                .state
+                .get()
+                .ok_or(PluginManagementError::Unavailable)?
+                .write()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            let current = state
+                .active
+                .entries
+                .iter()
+                .find(|entry| entry.id == plugin_id)
+                .filter(|entry| entry.identity() == old.identity())
+                .ok_or(PluginManagementError::Unavailable)?;
+            if state.active.entries.iter().any(|entry| {
+                entry.id != plugin_id
+                    && (entry.id == candidate.id
+                        || entry.feature.trigger == candidate.feature.trigger)
+            }) {
+                return Err(PluginManagementError::Unavailable);
+            }
+            let generation = state
+                .latest_generations
+                .get(plugin_id)
+                .copied()
+                .unwrap_or(current.generation)
+                .checked_add(1)
+                .ok_or(PluginManagementError::Unavailable)?;
+            candidate.generation = generation;
+            candidate.window_label = window_label(plugin_id, generation);
+            let identity = candidate.identity();
+            state
+                .latest_generations
+                .insert(plugin_id.to_string(), generation);
+            state
+                .staged_assets
+                .insert(identity.clone(), candidate.clone());
+            state.ownership.insert(
+                identity.clone(),
+                RuntimeOwnership {
+                    slot: RuntimeSlot::Staged,
+                    attempt: Arc::clone(&attempt),
+                },
+            );
+            identity
+        };
+
+        let staged_window = match self.create_runtime_window(app, &candidate) {
+            Ok(window) => window,
+            Err(_) => {
+                self.rollback_staged(app, &config, &identity);
+                return Err(PluginManagementError::Unavailable);
+            }
+        };
+        let settled = attempt.wait_until_settled(PLUGIN_RUNTIME_READY_TIMEOUT);
+        if !settled.is_some_and(|state| state.ready && !state.failed) {
+            self.rollback_staged(app, &config, &identity);
+            return Err(PluginManagementError::Unavailable);
+        }
+
+        let old_identity = old.identity();
+        let committed = {
+            let _admission = self
+                .admission
+                .write()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            if app.get_webview_window(&identity.window_label).is_none() {
+                false
+            } else {
+                let mut state = self
+                    .state
+                    .get()
+                    .ok_or(PluginManagementError::Unavailable)?
+                    .write()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                let staged_asset_matches = state
+                    .staged_assets
+                    .get(&identity)
+                    .is_some_and(|entry| entry.identity() == identity);
+                let staged_owner_matches = state.ownership.get(&identity).is_some_and(|owner| {
+                    owner.slot == RuntimeSlot::Staged
+                        && Arc::ptr_eq(&owner.attempt, &attempt)
+                        && owner
+                            .attempt
+                            .snapshot()
+                            .is_some_and(|signal| signal.ready && !signal.failed)
+                });
+                let old_index =
+                    state.active.entries.iter().position(|entry| {
+                        entry.id == plugin_id && entry.identity() == old_identity
+                    });
+                if !staged_asset_matches || !staged_owner_matches || old_index.is_none() {
+                    false
+                } else {
+                    let old_index = old_index.expect("checked old plugin index");
+                    state.active.entries[old_index] = candidate.clone();
+                    state.staged_assets.remove(&identity);
+                    state.ownership.remove(&old_identity);
+                    state.ownership.insert(
+                        identity.clone(),
+                        RuntimeOwnership {
+                            slot: RuntimeSlot::Active,
+                            attempt: Arc::clone(&attempt),
+                        },
+                    );
+                    drop(state);
+                    if let Ok(mut pending) = self.pending.write() {
+                        pending.retain(|_, query| {
+                            if query.plugin_id == old_identity.plugin_id
+                                && query.generation == old_identity.generation
+                            {
+                                let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
+                    if let Ok(mut disabled) = self.disabled.write() {
+                        disabled.remove(&identity.window_label);
+                    }
+                    let _ = registry.invalidate_domain(QueryDomain::Plugin);
+                    true
+                }
+            }
+        };
+        if !committed {
+            drop(staged_window);
+            self.rollback_staged(app, &config, &identity);
+            return Err(PluginManagementError::Unavailable);
+        }
+
+        if let Some(window) = app.get_webview_window(&old_identity.window_label) {
+            let _ = window.close();
+        }
+        let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, &old_identity));
+        drop(staged_window);
+        Ok(plugin_view(&candidate))
+    }
+
+    pub(crate) fn delete_plugin(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        registry: &ResultRegistry,
+        plugin_id: &str,
+    ) -> Result<(), PluginManagementError> {
+        if !valid_id(plugin_id) {
+            return Err(PluginManagementError::Unavailable);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (app, registry);
+            return Err(PluginManagementError::Unavailable);
+        }
+        #[cfg(windows)]
+        {
+            let _mutation = self
+                .mutation
+                .lock()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            let config = self
+                .config
+                .get()
+                .cloned()
+                .ok_or(PluginManagementError::Unavailable)?;
+            let active = {
+                let _admission = self
+                    .admission
+                    .read()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                self.state
+                    .get()
+                    .and_then(|state| {
+                        state
+                            .read()
+                            .ok()?
+                            .active
+                            .entries
+                            .iter()
+                            .find(|entry| entry.id == plugin_id)
+                            .cloned()
+                    })
+                    .ok_or(PluginManagementError::Unavailable)?
+            };
+            if active.root.parent() != Some(config.plugin_root.as_path()) {
+                return Err(PluginManagementError::Unavailable);
+            }
+            let (package_handle, current_identity) = open_directory_handle(&active.root, true)
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            if current_identity != active.package_identity {
+                return Err(PluginManagementError::Unavailable);
+            }
+            let (_, quarantine_identity) = open_directory_handle(&config.quarantine_root, false)
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            if quarantine_identity.volume != current_identity.volume {
+                return Err(PluginManagementError::Unavailable);
+            }
+            let sequence = self.next_quarantine.fetch_add(1, Ordering::Relaxed);
+            let quarantine_path = config.quarantine_root.join(format!(
+                "removed-{}-{:016x}-{:016x}-{:08x}",
+                plugin_id,
+                active.generation,
+                sequence,
+                std::process::id()
+            ));
+            let identity = active.identity();
+            {
+                let _admission = self
+                    .admission
+                    .write()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                let mut state = self
+                    .state
+                    .get()
+                    .ok_or(PluginManagementError::Unavailable)?
+                    .write()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                let active_index = state.active.entries.iter().position(|entry| {
+                    entry.id == plugin_id
+                        && entry.identity() == identity
+                        && entry.package_identity == current_identity
+                });
+                let Some(active_index) = active_index else {
+                    return Err(PluginManagementError::Unavailable);
+                };
+                move_directory_handle(&package_handle, &quarantine_path)
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                state.active.entries.remove(active_index);
+                state.ownership.remove(&identity);
+                state.latest_generations.remove(plugin_id);
+                drop(state);
+                if let Ok(mut pending) = self.pending.write() {
+                    pending.retain(|_, query| {
+                        if query.plugin_id == plugin_id {
+                            let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                if let Ok(mut disabled) = self.disabled.write() {
+                    disabled.remove(&identity.window_label);
+                }
+                let _ = registry.invalidate_domain(QueryDomain::Plugin);
+            }
+            drop(package_handle);
+            if let Some(window) = app.get_webview_window(&identity.window_label) {
+                let _ = window.close();
+            }
+            let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, &identity));
+            let _ = fs::remove_dir_all(quarantine_path);
+            Ok(())
+        }
+    }
+
+    fn rollback_staged(
+        &self,
+        app: &AppHandle,
+        config: &PluginManagerConfig,
+        identity: &RuntimeIdentity,
+    ) {
+        if let Ok(_admission) = self.admission.write() {
+            if let Some(state) = self.state.get() {
+                if let Ok(mut state) = state.write() {
+                    state.staged_assets.remove(identity);
+                    if state
+                        .ownership
+                        .get(identity)
+                        .is_some_and(|owner| owner.slot == RuntimeSlot::Staged)
+                    {
+                        state.ownership.remove(identity);
+                    }
+                }
+            }
+        }
+        if let Some(window) = app.get_webview_window(&identity.window_label) {
+            let _ = window.close();
+        }
+        let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, identity));
+    }
+
+    fn runtime_ready(&self, identity: &RuntimeIdentity) {
+        let Ok(_admission) = self.admission.read() else {
+            return;
+        };
+        let attempt = self.state.get().and_then(|state| {
+            state
+                .read()
+                .ok()?
+                .ownership
+                .get(identity)
+                .map(|ownership| Arc::clone(&ownership.attempt))
+        });
+        if let Some(attempt) = attempt {
+            attempt.mark_ready();
+        }
+    }
+
+    fn runtime_failed(&self, identity: &RuntimeIdentity, registry: &ResultRegistry) {
+        let Ok(_admission) = self.admission.write() else {
+            return;
+        };
+        let ownership = self
+            .state
+            .get()
+            .and_then(|state| state.read().ok()?.ownership.get(identity).cloned());
+        let Some(ownership) = ownership else {
+            return;
+        };
+        if !ownership.attempt.mark_failed() || ownership.slot == RuntimeSlot::Staged {
+            return;
+        }
+        self.disable_runtime(identity);
+        let _ = registry.invalidate_domain(QueryDomain::Plugin);
+    }
+
+    fn disable_runtime(&self, identity: &RuntimeIdentity) {
+        if let Ok(mut disabled) = self.disabled.write() {
+            disabled.insert(identity.window_label.clone());
+        }
+        if let Some(attempt) = self.state.get().and_then(|state| {
+            state
+                .read()
+                .ok()?
+                .ownership
+                .get(identity)
+                .map(|ownership| Arc::clone(&ownership.attempt))
+        }) {
+            attempt.changed.notify_all();
+        }
         if let Ok(mut pending) = self.pending.write() {
             pending.retain(|_, query| {
-                if query.window_label == label {
+                if query.window_label == identity.window_label
+                    && query.generation == identity.generation
+                {
                     let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
                     false
                 } else {
@@ -414,13 +961,38 @@ impl PluginManager {
         {
             return Err(PluginQueryError::RuntimeDisabled);
         }
-        let ready = Arc::clone(&self.ready);
+        let attempt = {
+            let _admission = self
+                .admission
+                .read()
+                .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+            self.state
+                .get()
+                .and_then(|state| {
+                    let state = state.read().ok()?;
+                    if !state
+                        .active
+                        .entries
+                        .iter()
+                        .any(|entry| route_matches(entry, &route))
+                    {
+                        return None;
+                    }
+                    state
+                        .ownership
+                        .get(&route.identity())
+                        .filter(|ownership| ownership.slot == RuntimeSlot::Active)
+                        .map(|ownership| Arc::clone(&ownership.attempt))
+                })
+                .ok_or(PluginQueryError::RuntimeDisabled)?
+        };
         let disabled = Arc::clone(&self.disabled);
         let label = route.window_label.clone();
-        let is_ready =
-            tauri::async_runtime::spawn_blocking(move || wait_until_ready(ready, disabled, label))
-                .await
-                .map_err(|_| PluginQueryError::RuntimeDisabled)??;
+        let is_ready = tauri::async_runtime::spawn_blocking(move || {
+            wait_until_ready(attempt, disabled, label)
+        })
+        .await
+        .map_err(|_| PluginQueryError::RuntimeDisabled)??;
         if !is_ready {
             return Ok(Vec::new());
         }
@@ -432,12 +1004,13 @@ impl PluginManager {
                 .read()
                 .map_err(|_| PluginQueryError::RuntimeDisabled)?;
             let current = self
-                .catalog
+                .state
                 .get()
-                .and_then(|catalog| {
-                    catalog
+                .and_then(|state| {
+                    state
                         .read()
                         .ok()?
+                        .active
                         .entries
                         .iter()
                         .any(|entry| route_matches(entry, &route))
@@ -504,12 +1077,13 @@ impl PluginManager {
             .read()
             .map_err(|_| PluginQueryError::RuntimeDisabled)?;
         let entry = self
-            .catalog
+            .state
             .get()
-            .and_then(|catalog| {
-                catalog
+            .and_then(|state| {
+                state
                     .read()
                     .ok()?
+                    .active
                     .entries
                     .iter()
                     .find(|entry| entry.window_label == label)
@@ -621,11 +1195,26 @@ impl PluginManager {
     }
 
     fn record_timeout(&self, label: &str) {
-        if let Ok(mut timeouts) = self.timeouts.write() {
+        let should_disable = if let Ok(mut timeouts) = self.timeouts.write() {
             let count = timeouts.entry(label.to_string()).or_default();
             *count = count.saturating_add(1);
-            if *count >= 3 {
-                self.disable_runtime(label);
+            *count >= 3
+        } else {
+            false
+        };
+        if should_disable {
+            let identity = self.state.get().and_then(|state| {
+                state
+                    .read()
+                    .ok()?
+                    .active
+                    .entries
+                    .iter()
+                    .find(|entry| entry.window_label == label)
+                    .map(PluginCatalogEntry::identity)
+            });
+            if let Some(identity) = identity {
+                self.disable_runtime(&identity);
             }
         }
     }
@@ -636,47 +1225,34 @@ impl PluginManager {
     }
 }
 
-#[derive(Default)]
-struct RuntimeReadiness {
-    labels: Mutex<HashSet<String>>,
-    changed: Condvar,
-}
-
-impl RuntimeReadiness {
-    fn mark(&self, label: &str) {
-        if let Ok(mut labels) = self.labels.lock() {
-            labels.insert(label.to_string());
-            self.changed.notify_all();
-        }
-    }
-}
-
 fn wait_until_ready(
-    ready: Arc<RuntimeReadiness>,
+    attempt: Arc<RuntimeAttempt>,
     disabled: Arc<RwLock<HashSet<String>>>,
     label: String,
 ) -> Result<bool, PluginQueryError> {
-    let labels = ready
-        .labels
+    let state = attempt
+        .state
         .lock()
         .map_err(|_| PluginQueryError::RuntimeDisabled)?;
-    let (labels, _) = ready
+    let (state, _) = attempt
         .changed
-        .wait_timeout_while(labels, Duration::from_millis(500), |labels| {
-            !labels.contains(&label)
+        .wait_timeout_while(state, Duration::from_millis(500), |state| {
+            !state.ready
+                && !state.failed
                 && disabled
                     .read()
                     .is_ok_and(|disabled| !disabled.contains(&label))
         })
         .map_err(|_| PluginQueryError::RuntimeDisabled)?;
-    if disabled
-        .read()
-        .map_err(|_| PluginQueryError::RuntimeDisabled)?
-        .contains(&label)
+    if state.failed
+        || disabled
+            .read()
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?
+            .contains(&label)
     {
         Err(PluginQueryError::RuntimeDisabled)
     } else {
-        Ok(labels.contains(&label))
+        Ok(state.ready)
     }
 }
 
@@ -759,6 +1335,23 @@ pub(crate) struct PluginCatalogEntry {
     pub(crate) window_label: String,
     pub(crate) description: Option<String>,
     pub(crate) generation: u64,
+    package_identity: DirectoryIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    volume: u64,
+    file: u64,
+}
+
+impl PluginCatalogEntry {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity {
+            plugin_id: self.id.clone(),
+            window_label: self.window_label.clone(),
+            generation: self.generation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -772,7 +1365,6 @@ pub(crate) struct PluginView {
 
 #[derive(Clone)]
 pub(crate) struct PluginFeature {
-    pub(crate) id: String,
     pub(crate) trigger: String,
 }
 
@@ -782,6 +1374,16 @@ pub(crate) struct PluginRoute {
     pub(crate) window_label: String,
     pub(crate) generation: u64,
     pub(crate) input: String,
+}
+
+impl PluginRoute {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity {
+            plugin_id: self.plugin_id.clone(),
+            window_label: self.window_label.clone(),
+            generation: self.generation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -863,20 +1465,12 @@ impl PluginCatalog {
     }
 
     pub(crate) fn views(&self) -> Vec<PluginView> {
-        let mut views = self
-            .entries
-            .iter()
-            .map(|entry| PluginView {
-                id: entry.id.clone(),
-                version: entry.version.to_path_segment(),
-                trigger: entry.feature.trigger.clone(),
-                description: entry.description.clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut views = self.entries.iter().map(plugin_view).collect::<Vec<_>>();
         views.sort_by(|left, right| left.id.cmp(&right.id));
         views
     }
 
+    #[cfg(test)]
     pub(crate) fn authorizes_clipboard(&self, plugin_id: &str) -> bool {
         self.entries.iter().any(|entry| {
             entry.id == plugin_id
@@ -887,6 +1481,7 @@ impl PluginCatalog {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn asset_response(&self, label: &str, request_path: &str) -> Response<Vec<u8>> {
         let Some(entry) = self
             .entries
@@ -895,23 +1490,16 @@ impl PluginCatalog {
         else {
             return response(403, Vec::new(), None);
         };
-        let Some((relative, content_type)) = asset_path(request_path) else {
-            return response(415, Vec::new(), None);
-        };
-        let path = entry.root.join(&relative);
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            return response(404, Vec::new(), None);
-        };
-        if !metadata.is_file() || !ordinary_file_below(&entry.root, &relative) {
-            return response(403, Vec::new(), None);
-        }
-        let Ok(body) = fs::read(&path) else {
-            return response(404, Vec::new(), None);
-        };
-        if !ordinary_file_below(&entry.root, &relative) {
-            return response(403, Vec::new(), None);
-        }
-        response(200, body, Some(content_type))
+        asset_response(entry, request_path)
+    }
+}
+
+fn plugin_view(entry: &PluginCatalogEntry) -> PluginView {
+    PluginView {
+        id: entry.id.clone(),
+        version: entry.version.to_path_segment(),
+        trigger: entry.feature.trigger.clone(),
+        description: entry.description.clone(),
     }
 }
 
@@ -963,18 +1551,18 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
     }
 
     Some(PluginCatalogEntry {
-        window_label: window_label(&manifest.id),
+        window_label: window_label(&manifest.id, 1),
         id: manifest.id,
         version,
         runtime,
         feature: PluginFeature {
-            id: manifest.feature.id,
             trigger: manifest.feature.trigger,
         },
         permissions: manifest.permissions,
         root: root.to_path_buf(),
         description: read_description(root),
         generation: 1,
+        package_identity: directory_identity(root)?,
     })
 }
 
@@ -1029,12 +1617,39 @@ fn duplicates<'a>(values: impl Iterator<Item = &'a str>) -> HashSet<String> {
         .collect()
 }
 
-fn window_label(id: &str) -> String {
+fn window_label(id: &str, generation: u64) -> String {
     let mut label = String::from("plugin-");
     for byte in id.as_bytes() {
         label.push_str(&format!("{byte:02x}"));
     }
+    label.push_str(&format!("-g{generation:016x}"));
     label
+}
+
+fn runtime_data_directory(app_data_dir: &Path, identity: &RuntimeIdentity) -> PathBuf {
+    app_data_dir
+        .join("plugin-runtime-data")
+        .join(&identity.window_label)
+}
+
+fn asset_response(entry: &PluginCatalogEntry, request_path: &str) -> Response<Vec<u8>> {
+    let Some((relative, content_type)) = asset_path(request_path) else {
+        return response(415, Vec::new(), None);
+    };
+    let path = entry.root.join(&relative);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return response(404, Vec::new(), None);
+    };
+    if !metadata.is_file() || !ordinary_file_below(&entry.root, &relative) {
+        return response(403, Vec::new(), None);
+    }
+    let Ok(body) = fs::read(&path) else {
+        return response(404, Vec::new(), None);
+    };
+    if !ordinary_file_below(&entry.root, &relative) {
+        return response(403, Vec::new(), None);
+    }
+    response(200, body, Some(content_type))
 }
 
 fn route(entry: &PluginCatalogEntry, input: &str) -> PluginRoute {
@@ -1080,6 +1695,143 @@ fn ordinary_file(path: &Path) -> bool {
 fn ordinary_directory(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .is_ok_and(|metadata| metadata.is_dir() && !is_reparse_point(&metadata))
+}
+
+fn cleanup_quarantine(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if ordinary_directory(&path) {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct DirectoryHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for DirectoryHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_directory_handle(
+    path: &Path,
+    delete: bool,
+) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let desired = FILE_READ_ATTRIBUTES.0 | if delete { DELETE.0 } else { 0 };
+    let share = if delete {
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    };
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            desired,
+            share,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(io::Error::other)?;
+    let handle = DirectoryHandle(handle);
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut information) }.map_err(io::Error::other)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    {
+        return Err(io::Error::other("plugin directory unavailable"));
+    }
+    Ok((
+        handle,
+        DirectoryIdentity {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            file: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    open_directory_handle(path, false)
+        .ok()
+        .map(|(_, identity)| identity)
+}
+
+#[cfg(windows)]
+fn move_directory_handle(handle: &DirectoryHandle, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+        },
+    };
+
+    let name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| io::Error::other("plugin delete unavailable"))?;
+    let size = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| io::Error::other("plugin delete unavailable"))?;
+    let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*information).Anonymous = FILE_RENAME_INFO_0 {
+            ReplaceIfExists: false,
+        };
+        (*information).RootDirectory = HANDLE::default();
+        (*information).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            name.len(),
+        );
+        SetFileInformationByHandle(
+            handle.0,
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(size).map_err(|_| io::Error::other("plugin delete unavailable"))?,
+        )
+    }
+    .map_err(io::Error::other)
+}
+
+#[cfg(not(windows))]
+fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(DirectoryIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
 }
 
 fn ordinary_file_below(root: &Path, relative: &Path) -> bool {
@@ -1384,7 +2136,7 @@ mod tests {
 
         let route = loaded.route("/go body").unwrap();
         assert_eq!(route.plugin_id, "plugin");
-        assert_eq!(route.window_label, "plugin-706c7567696e");
+        assert_eq!(route.window_label, "plugin-706c7567696e-g0000000000000001");
         assert_eq!(route.generation, 1);
         assert_eq!(route.input, "body");
         assert_eq!(loaded.route("/go").unwrap().input, "");
@@ -1632,6 +2384,219 @@ mod tests {
         }
     }
 
+    mod ownership {
+        use std::sync::Arc;
+
+        use super::{load, valid_manifest, TestRoot};
+        use crate::{
+            plugins::{
+                window_label, PluginManager, RuntimeAttempt, RuntimeOwnership, RuntimeSlot,
+                PLUGIN_RUNTIME_READY_TIMEOUT,
+            },
+            result_registry::{QueryDomain, ResultRegistry},
+        };
+
+        fn manager(root: &TestRoot) -> Arc<PluginManager> {
+            let manager = Arc::new(PluginManager::new());
+            manager.install_catalog_for_test(load(root));
+            manager
+        }
+
+        #[test]
+        fn staged_assets_are_served_without_becoming_query_routes() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            let mut staged = manager.state.get().unwrap().read().unwrap().active.entries[0].clone();
+            staged.generation = 2;
+            staged.window_label = window_label("plugin", 2);
+            let identity = staged.identity();
+            let attempt = Arc::new(RuntimeAttempt::default());
+            {
+                let mut state = manager.state.get().unwrap().write().unwrap();
+                state.staged_assets.insert(identity.clone(), staged);
+                state.ownership.insert(
+                    identity.clone(),
+                    RuntimeOwnership {
+                        slot: RuntimeSlot::Staged,
+                        attempt,
+                    },
+                );
+            }
+
+            assert_eq!(manager.route("/plugin").unwrap().generation, 1);
+            assert_eq!(
+                manager
+                    .asset_response(&identity.window_label, "/index.html")
+                    .status(),
+                200
+            );
+        }
+
+        #[test]
+        fn callbacks_resolve_current_slot_and_ignore_removed_identity() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            let old = manager.route("/plugin").unwrap().identity();
+            let mut promoted_entry =
+                manager.state.get().unwrap().read().unwrap().active.entries[0].clone();
+            promoted_entry.generation = 2;
+            promoted_entry.window_label = window_label("plugin", 2);
+            let promoted = promoted_entry.identity();
+            let attempt = Arc::new(RuntimeAttempt::default());
+            {
+                let mut state = manager.state.get().unwrap().write().unwrap();
+                state
+                    .staged_assets
+                    .insert(promoted.clone(), promoted_entry.clone());
+                state.ownership.insert(
+                    promoted.clone(),
+                    RuntimeOwnership {
+                        slot: RuntimeSlot::Staged,
+                        attempt: Arc::clone(&attempt),
+                    },
+                );
+            }
+            manager.runtime_ready(&promoted);
+            assert_eq!(attempt.snapshot().unwrap().ready, true);
+            {
+                let _admission = manager.admission.write().unwrap();
+                let mut state = manager.state.get().unwrap().write().unwrap();
+                state.active.entries[0] = promoted_entry;
+                state.staged_assets.remove(&promoted);
+                state.ownership.remove(&old);
+                state.ownership.insert(
+                    promoted.clone(),
+                    RuntimeOwnership {
+                        slot: RuntimeSlot::Active,
+                        attempt,
+                    },
+                );
+            }
+
+            let registry = ResultRegistry::default();
+            registry.on_show("invocation".into());
+            let old_token = registry
+                .begin_query(QueryDomain::Plugin, "invocation", 1)
+                .unwrap();
+            manager.runtime_failed(&old, &registry);
+            assert!(!manager.disabled.read().unwrap().contains(&old.window_label));
+            manager.runtime_failed(&promoted, &registry);
+            assert!(manager
+                .disabled
+                .read()
+                .unwrap()
+                .contains(&promoted.window_label));
+            assert!(registry
+                .publish_if_latest(old_token, Vec::<((), _)>::new(), || true, |_, _| ())
+                .is_none());
+        }
+
+        #[test]
+        fn generation_labels_are_unique_and_overflow_is_rejected() {
+            assert_ne!(window_label("plugin", 1), window_label("plugin", 2));
+            assert_eq!(u64::MAX.checked_add(1), None);
+        }
+
+        #[test]
+        fn readiness_timeout_is_fixed_and_does_not_wedge_the_mutation_lock() {
+            assert_eq!(
+                PLUGIN_RUNTIME_READY_TIMEOUT,
+                std::time::Duration::from_millis(500)
+            );
+            let attempt = RuntimeAttempt::default();
+            assert_eq!(
+                attempt.wait_until_settled(std::time::Duration::from_millis(1)),
+                Some(Default::default())
+            );
+            let manager = PluginManager::new();
+            assert!(manager.mutation.try_lock().is_ok());
+        }
+    }
+
+    #[cfg(windows)]
+    mod delete {
+        use std::fs;
+
+        use super::{load, valid_manifest, TestRoot};
+        use crate::plugins::{move_directory_handle, open_directory_handle};
+
+        #[test]
+        fn no_follow_handle_move_removes_original_path_and_preserves_identity() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let original = root.path.join("plugin");
+            let quarantine = root.path.join("quarantine");
+            fs::create_dir(&quarantine).unwrap();
+            let destination = quarantine.join("removed");
+            let expected = load(&root).entries[0].package_identity;
+            let (handle, current) = open_directory_handle(&original, true).unwrap();
+            assert_eq!(current, expected);
+
+            move_directory_handle(&handle, &destination).unwrap();
+            drop(handle);
+
+            assert!(!original.exists());
+            assert_eq!(
+                open_directory_handle(&destination, false).unwrap().1,
+                expected
+            );
+        }
+
+        #[test]
+        fn replacement_and_reparse_directories_fail_identity_validation() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let original = root.path.join("plugin");
+            let parked = root.path.join("parked");
+            let expected = load(&root).entries[0].package_identity;
+            fs::rename(&original, &parked).unwrap();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            assert_ne!(open_directory_handle(&original, true).unwrap().1, expected);
+
+            fs::remove_dir_all(&original).unwrap();
+            if std::os::windows::fs::symlink_dir(&parked, &original).is_ok() {
+                assert!(open_directory_handle(&original, true).is_err());
+            }
+        }
+
+        #[test]
+        fn move_failure_leaves_original_path_and_contents_untouched() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let original = root.path.join("plugin");
+            let (handle, _) = open_directory_handle(&original, true).unwrap();
+            let missing_parent = root.path.join("missing").join("removed");
+
+            assert!(move_directory_handle(&handle, &missing_parent).is_err());
+            drop(handle);
+
+            assert!(original.join("plugin.json").is_file());
+            assert!(original.join("index.html").is_file());
+        }
+
+        #[test]
+        fn destination_collision_is_non_overwriting() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let original = root.path.join("plugin");
+            let destination = root.path.join("occupied");
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("owner.txt"), "foreign").unwrap();
+            let (handle, _) = open_directory_handle(&original, true).unwrap();
+
+            assert!(move_directory_handle(&handle, &destination).is_err());
+            drop(handle);
+
+            assert!(original.exists());
+            assert_eq!(
+                fs::read_to_string(destination.join("owner.txt")).unwrap(),
+                "foreign"
+            );
+        }
+    }
+
     mod asset {
         use std::fs;
 
@@ -1657,7 +2622,7 @@ mod tests {
             fs::write(root.path.join("one").join("main.js"), "window.answer=1;").unwrap();
             let catalog = load(&root);
 
-            let html = catalog.asset_response("plugin-6f6e65", "/index.html");
+            let html = catalog.asset_response("plugin-6f6e65-g0000000000000001", "/index.html");
             assert_eq!(html.status(), 200);
             assert_eq!(
                 header(&html, "content-security-policy"),
@@ -1670,7 +2635,7 @@ mod tests {
             assert!(!body.contains("publishResults"));
             assert!(!body.contains("<h1>two</h1>"));
 
-            let script = catalog.asset_response("plugin-6f6e65", "/main.js");
+            let script = catalog.asset_response("plugin-6f6e65-g0000000000000001", "/main.js");
             assert_eq!(script.status(), 200);
             assert_eq!(
                 header(&script, "content-type"),
@@ -1685,11 +2650,11 @@ mod tests {
             root.write_plugin("one", valid_manifest("one", "/one"));
             fs::write(root.path.join("one").join("style.css"), "").unwrap();
             let catalog = load(&root);
-            let label = "plugin-6f6e65";
+            let label = "plugin-6f6e65-g0000000000000001";
 
             assert_eq!(
                 catalog
-                    .asset_response("plugin-74776f", "/index.html")
+                    .asset_response("plugin-74776f-g0000000000000001", "/index.html")
                     .status(),
                 403
             );
@@ -1723,7 +2688,7 @@ mod tests {
 
             assert_eq!(
                 catalog
-                    .asset_response("plugin-6f6e65", "/../two/index.html")
+                    .asset_response("plugin-6f6e65-g0000000000000001", "/../two/index.html",)
                     .status(),
                 415
             );
@@ -1739,7 +2704,7 @@ mod tests {
                 {
                     assert_eq!(
                         catalog
-                            .asset_response("plugin-6f6e65", "/linked.html")
+                            .asset_response("plugin-6f6e65-g0000000000000001", "/linked.html",)
                             .status(),
                         403
                     );
@@ -1749,7 +2714,10 @@ mod tests {
                 if std::os::windows::fs::symlink_dir(root.path.join("two"), nested).is_ok() {
                     assert_eq!(
                         catalog
-                            .asset_response("plugin-6f6e65", "/nested/index.html")
+                            .asset_response(
+                                "plugin-6f6e65-g0000000000000001",
+                                "/nested/index.html",
+                            )
                             .status(),
                         403
                     );
@@ -1767,7 +2735,7 @@ mod tests {
                 assert!(output.status.success(), "junction creation failed");
                 assert_eq!(
                     catalog
-                        .asset_response("plugin-6f6e65", "/junction/index.html")
+                        .asset_response("plugin-6f6e65-g0000000000000001", "/junction/index.html",)
                         .status(),
                     403
                 );
@@ -1787,7 +2755,7 @@ mod tests {
                 assert!(output.status.success(), "junction replacement failed");
                 assert_eq!(
                     catalog
-                        .asset_response("plugin-6f6e65", "/index.html")
+                        .asset_response("plugin-6f6e65-g0000000000000001", "/index.html",)
                         .status(),
                     403
                 );
@@ -1822,7 +2790,7 @@ mod tests {
         fn query_waits_for_runtime_ready_off_the_async_executor() {
             let source = std::fs::read_to_string(file!()).unwrap();
             let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            assert!(production.contains("wait_until_ready(ready, disabled, label)"));
+            assert!(production.contains("wait_until_ready(attempt, disabled, label)"));
             assert!(production.contains("tauri::async_runtime::spawn_blocking"));
             assert!(!production.contains(&["thread", "::sleep"].concat()));
         }
@@ -1862,9 +2830,11 @@ mod tests {
         use serde_json::json;
 
         use super::super::{
-            wait_until_ready, PendingPluginQuery, PluginManager, PluginQueryError, RuntimeReadiness,
+            wait_until_ready, PendingPluginQuery, PluginManager, PluginQueryError, RuntimeAttempt,
         };
         use super::{load, valid_manifest, TestRoot};
+
+        const LABEL: &str = "plugin-706c7567696e-g0000000000000001";
 
         fn manager(root: &TestRoot) -> PluginManager {
             let manager = PluginManager::new();
@@ -1889,7 +2859,7 @@ mod tests {
                 request_id.into(),
                 PendingPluginQuery {
                     plugin_id: "plugin".into(),
-                    window_label: "plugin-706c7567696e".into(),
+                    window_label: LABEL.into(),
                     generation: 1,
                     sender,
                 },
@@ -1902,11 +2872,11 @@ mod tests {
             let root = TestRoot::new();
             root.write_plugin("plugin", valid_manifest("plugin", "/go"));
             let manager = manager(&root);
-            manager.record_timeout("plugin-706c7567696e");
+            manager.record_timeout(LABEL);
             let receiver = wait_for(&manager, "request");
             manager
                 .publish_response(
-                    "plugin-706c7567696e",
+                    LABEL,
                     json!({"protocolVersion":1,"requestId":"request","items":[]}),
                 )
                 .unwrap();
@@ -1921,7 +2891,7 @@ mod tests {
                 .collect::<Vec<_>>();
             manager
                 .publish_response(
-                    "plugin-706c7567696e",
+                    LABEL,
                     json!({"protocolVersion":1,"requestId":"request-2","items":items}),
                 )
                 .unwrap();
@@ -1936,7 +2906,7 @@ mod tests {
             let receiver = wait_for(&manager, "request");
             assert_eq!(
                 manager.publish_response(
-                    "plugin-706c7567696e",
+                    LABEL,
                     json!({"protocolVersion":2,"requestId":"request","items":[]}),
                 ),
                 Err(PluginQueryError::InvalidResponse)
@@ -1947,7 +2917,7 @@ mod tests {
             ));
             assert_eq!(
                 manager.publish_response(
-                    "plugin-706c7567696e",
+                    LABEL,
                     json!({"protocolVersion":1,"requestId":"request","items":[]}),
                 ),
                 Err(PluginQueryError::InvalidResponse)
@@ -1975,7 +2945,7 @@ mod tests {
             ] {
                 let receiver = wait_for(&manager, request_id);
                 assert_eq!(
-                    manager.publish_response("plugin-706c7567696e", response),
+                    manager.publish_response(LABEL, response),
                     Err(PluginQueryError::InvalidResponse)
                 );
                 assert!(matches!(
@@ -1987,11 +2957,13 @@ mod tests {
 
         #[test]
         fn three_timeouts_disable_runtime_until_restart() {
-            let manager = PluginManager::new();
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
             for _ in 0..3 {
-                manager.record_timeout("plugin-label");
+                manager.record_timeout(LABEL);
             }
-            assert!(manager.disabled.read().unwrap().contains("plugin-label"));
+            assert!(manager.disabled.read().unwrap().contains(LABEL));
         }
 
         #[test]
@@ -2001,17 +2973,18 @@ mod tests {
             let manager = manager(&root);
             assert!(manager.authorizes_clipboard("plugin"));
 
-            manager.disable_runtime("plugin-706c7567696e");
+            let identity = manager.route("/plugin").unwrap().identity();
+            manager.disable_runtime(&identity);
 
             assert!(!manager.authorizes_clipboard("plugin"));
         }
 
         #[test]
         fn readiness_wait_completes_after_runtime_marks_ready() {
-            let ready = Arc::new(RuntimeReadiness::default());
+            let ready = Arc::new(RuntimeAttempt::default());
             let disabled = Arc::new(RwLock::new(std::collections::HashSet::new()));
             let marker = Arc::clone(&ready);
-            let worker = std::thread::spawn(move || marker.mark("plugin-label"));
+            let worker = std::thread::spawn(move || marker.mark_ready());
 
             assert_eq!(
                 wait_until_ready(ready, disabled, "plugin-label".into()),

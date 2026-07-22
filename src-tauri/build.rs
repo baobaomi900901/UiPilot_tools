@@ -5,6 +5,8 @@ fn main() {
             "publish_plugin_results",
             "execute_result",
             "list_plugins",
+            "reload_plugin",
+            "delete_plugin",
             "load_settings",
             "save_settings",
             "save_hotkey",

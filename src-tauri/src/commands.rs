@@ -153,6 +153,20 @@ impl CommandError {
         }
     }
 
+    fn plugin_reload_failed() -> Self {
+        Self {
+            code: "pluginReloadFailed",
+            message: "plugin reload failed",
+        }
+    }
+
+    fn plugin_delete_failed() -> Self {
+        Self {
+            code: "pluginDeleteFailed",
+            message: "plugin delete failed",
+        }
+    }
+
     fn clipboard_write_failed() -> Self {
         Self {
             code: "clipboardWriteFailed",
@@ -218,6 +232,48 @@ pub(crate) fn list_plugins(
     plugins: State<'_, Arc<PluginManager>>,
 ) -> Result<Vec<PluginView>, CommandError> {
     list_plugins_with_label(window.label(), || plugins.list_views())
+}
+
+fn reload_plugin_with_label<R>(label: &str, reload: R) -> Result<PluginView, CommandError>
+where
+    R: FnOnce() -> Result<PluginView, PluginManagementError>,
+{
+    require_main_label(label)?;
+    reload().map_err(|_| CommandError::plugin_reload_failed())
+}
+
+#[tauri::command]
+pub(crate) async fn reload_plugin(
+    window: WebviewWindow,
+    app: AppHandle,
+    plugins: State<'_, Arc<PluginManager>>,
+    registry: State<'_, ResultRegistry>,
+    plugin_id: String,
+) -> Result<PluginView, CommandError> {
+    reload_plugin_with_label(window.label(), || {
+        plugins.reload_plugin(&app, &registry, &plugin_id)
+    })
+}
+
+fn delete_plugin_with_label<D>(label: &str, delete: D) -> Result<(), CommandError>
+where
+    D: FnOnce() -> Result<(), PluginManagementError>,
+{
+    require_main_label(label)?;
+    delete().map_err(|_| CommandError::plugin_delete_failed())
+}
+
+#[tauri::command]
+pub(crate) async fn delete_plugin(
+    window: WebviewWindow,
+    app: AppHandle,
+    plugins: State<'_, Arc<PluginManager>>,
+    registry: State<'_, ResultRegistry>,
+    plugin_id: String,
+) -> Result<(), CommandError> {
+    delete_plugin_with_label(window.label(), || {
+        plugins.delete_plugin(&app, &registry, &plugin_id)
+    })
 }
 
 #[tauri::command]
@@ -1064,6 +1120,8 @@ mod tests {
             "search_files",
             "execute_result",
             "list_plugins",
+            "reload_plugin",
+            "delete_plugin",
             "load_settings",
             "save_settings",
             "save_hotkey",
@@ -2208,7 +2266,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use super::super::{
-            list_plugins_with_label, publish_plugin_results_with_label, CommandError,
+            delete_plugin_with_label, list_plugins_with_label, publish_plugin_results_with_label,
+            reload_plugin_with_label, CommandError,
         };
         use crate::plugins::{PluginManagementError, PluginQueryError, PluginView};
 
@@ -2237,6 +2296,42 @@ mod tests {
             assert_eq!(
                 list_plugins_with_label("main", || Err(PluginManagementError::Unavailable)),
                 Err(CommandError::plugin_list_failed())
+            );
+        }
+
+        #[test]
+        fn reload_guard_and_fixed_error_mapping_precede_manager_access() {
+            let calls = AtomicUsize::new(0);
+            assert_eq!(
+                reload_plugin_with_label("secondary", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err(PluginManagementError::Unavailable)
+                }),
+                Err(CommandError::invalid_caller())
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+            assert_eq!(
+                reload_plugin_with_label("main", || Err(PluginManagementError::Unavailable)),
+                Err(CommandError::plugin_reload_failed())
+            );
+        }
+
+        #[test]
+        fn delete_guard_and_fixed_error_mapping_precede_manager_access() {
+            let calls = AtomicUsize::new(0);
+            assert_eq!(
+                delete_plugin_with_label("secondary", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err(PluginManagementError::Unavailable)
+                }),
+                Err(CommandError::invalid_caller())
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+            assert_eq!(
+                delete_plugin_with_label("main", || Err(PluginManagementError::Unavailable)),
+                Err(CommandError::plugin_delete_failed())
             );
         }
 

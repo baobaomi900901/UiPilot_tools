@@ -217,6 +217,8 @@ pub fn run() {
             commands::search_files,
             commands::execute_result,
             commands::list_plugins,
+            commands::reload_plugin,
+            commands::delete_plugin,
             commands::load_settings,
             commands::save_settings,
             commands::save_hotkey,
@@ -421,13 +423,15 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 10);
+        assert_eq!(production.matches("commands::").count(), 12);
         for command in [
             "search_apps",
             "publish_plugin_results",
             "search_files",
             "execute_result",
             "list_plugins",
+            "reload_plugin",
+            "delete_plugin",
             "load_settings",
             "save_settings",
             "save_hotkey",
@@ -843,7 +847,8 @@ mod tests {
             assert!(lib.contains(fragment), "missing runtime wiring: {fragment}");
         }
         for fragment in [
-            "WebviewWindowBuilder::new(app, label, WebviewUrl::CustomProtocol(url))",
+            "WebviewWindowBuilder::new(",
+            "WebviewUrl::CustomProtocol(url)",
             ".visible(false)",
             ".focusable(false)",
             ".skip_taskbar(true)",

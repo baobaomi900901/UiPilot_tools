@@ -8,6 +8,8 @@
     "allow-search-files",
     "allow-execute-result",
     "allow-list-plugins",
+    "allow-reload-plugin",
+    "allow-delete-plugin",
     "allow-load-settings",
     "allow-save-settings",
     "allow-save-hotkey",
