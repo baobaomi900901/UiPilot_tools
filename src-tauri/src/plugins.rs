@@ -6,7 +6,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc, OnceLock, RwLock,
     },
-    thread,
     time::Duration,
 };
 
@@ -213,29 +212,6 @@ impl PluginManager {
         }
     }
 
-    fn wait_until_ready(&self, label: &str) -> Result<(), PluginQueryError> {
-        for _ in 0..50 {
-            if self
-                .disabled
-                .read()
-                .map_err(|_| PluginQueryError::RuntimeDisabled)?
-                .contains(label)
-            {
-                return Err(PluginQueryError::RuntimeDisabled);
-            }
-            if self
-                .ready
-                .read()
-                .map_err(|_| PluginQueryError::RuntimeDisabled)?
-                .contains(label)
-            {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        Err(PluginQueryError::Timeout)
-    }
-
     pub(crate) fn disable_runtime(&self, label: &str) {
         if let Ok(mut disabled) = self.disabled.write() {
             disabled.insert(label.to_string());
@@ -265,7 +241,6 @@ impl PluginManager {
         {
             return Err(PluginQueryError::RuntimeDisabled);
         }
-        self.wait_until_ready(&route.window_label)?;
         let request_id = self.allocate_request_id();
         let (sender, receiver) = mpsc::channel();
         self.pending
@@ -1119,6 +1094,13 @@ mod tests {
             assert!(bridge.contains("protocolVersion: 1"));
             assert!(bridge.contains("uipilot-plugin-ready"));
         }
+
+        #[test]
+        fn query_path_does_not_block_waiting_for_webview_ready() {
+            let source = std::fs::read_to_string(file!()).unwrap();
+            assert!(!source.contains(&["wait_until_ready", "(&route.window_label)"].concat()));
+            assert!(!source.contains(&["thread", "::sleep"].concat()));
+        }
     }
 
     mod query {
@@ -1245,16 +1227,5 @@ mod tests {
             assert!(manager.disabled.read().unwrap().contains("plugin-label"));
         }
 
-        #[test]
-        fn query_waits_until_runtime_is_ready() {
-            let manager = std::sync::Arc::new(PluginManager::new());
-            let marker = manager.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                marker.mark_ready("plugin-label");
-            });
-
-            assert_eq!(manager.wait_until_ready("plugin-label"), Ok(()));
-        }
     }
 }
