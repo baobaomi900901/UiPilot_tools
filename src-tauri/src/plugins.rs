@@ -29,7 +29,11 @@ const PLUGIN_BRIDGE: &str = r#"
   let pending = [];
   let activeRequest = null;
   let listening = false;
-  const internals = window.__TAURI_INTERNALS__;
+  const internals = () => window.__TAURI_INTERNALS__;
+  const waitForInternals = () => new Promise((resolve) => {
+    const tick = () => internals() ? resolve(internals()) : setTimeout(tick, 0);
+    tick();
+  });
   const deliver = (request) => handler ? run(request) : pending.push(request);
   const run = (request) => {
     activeRequest = request;
@@ -47,7 +51,7 @@ const PLUGIN_BRIDGE: &str = r#"
     },
     publishResults(response) {
       if (!activeRequest) return Promise.reject(new Error('no active request'));
-      return internals.invoke('publish_plugin_results', {
+      return internals().invoke('publish_plugin_results', {
         response: {
           protocolVersion: 1,
           requestId: activeRequest.requestId,
@@ -56,16 +60,16 @@ const PLUGIN_BRIDGE: &str = r#"
       });
     }
   });
-  internals.invoke('plugin:event|listen', {
+  Object.defineProperty(window, 'uipilot', { value: api, configurable: false, writable: false });
+  Object.freeze(window.uipilot);
+  waitForInternals().then((tauri) => tauri.invoke('plugin:event|listen', {
     event: 'uipilot-plugin-query',
     target: { kind: 'Any' },
-    handler: internals.transformCallback((event) => deliver(event.payload)),
-  }).then(() => {
+    handler: tauri.transformCallback((event) => deliver(event.payload)),
+  })).then(() => {
     listening = true;
     ready();
   });
-  Object.defineProperty(window, 'uipilot', { value: api, configurable: false, writable: false });
-  Object.freeze(window.uipilot);
 })();
 "#;
 
@@ -1105,9 +1109,12 @@ mod tests {
             let source = std::fs::read_to_string(file!()).unwrap();
             let bridge = super::super::PLUGIN_BRIDGE;
             assert!(source.contains(".initialization_script(PLUGIN_BRIDGE)"));
+            assert!(bridge.find("Object.defineProperty(window, 'uipilot'").unwrap() < bridge.find("plugin:event|listen").unwrap());
             assert!(bridge.contains("handler(request.input)"));
-            assert!(bridge.contains("internals.invoke('plugin:event|listen'"));
-            assert!(bridge.contains("internals.transformCallback"));
+            assert!(bridge.contains("const internals = () => window.__TAURI_INTERNALS__"));
+            assert!(bridge.contains("waitForInternals().then((tauri) =>"));
+            assert!(bridge.contains("tauri.invoke('plugin:event|listen'"));
+            assert!(bridge.contains("tauri.transformCallback"));
             assert!(bridge.contains("requestId: activeRequest.requestId"));
             assert!(bridge.contains("protocolVersion: 1"));
             assert!(bridge.contains("uipilot-plugin-ready"));
