@@ -227,6 +227,7 @@ pub fn run() {
         .manage(result_registry::ResultRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
+            commands::publish_plugin_results,
             commands::search_files,
             commands::execute_result,
             commands::load_settings,
@@ -401,9 +402,10 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 10);
+        assert_eq!(production.matches("commands::").count(), 11);
         for command in [
             "search_apps",
+            "publish_plugin_results",
             "search_files",
             "execute_result",
             "load_settings",
@@ -761,8 +763,8 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("plugins.rs", include_str!("plugins.rs")),
         ] {
-            for forbidden in [
-                ["/", "math"].concat(),
+        for forbidden in [
+            ["/", "math"].concat(),
                 ["internal", ".", "math"].concat(),
                 ["Expr", "ession"].concat(),
                 ["calculate", "("].concat(),
@@ -772,6 +774,18 @@ mod tests {
                     "host source contains {forbidden}: {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn plugin_runtime_capability_is_narrow() {
+        let capability = include_str!("../capabilities/plugin-runtime.json");
+        assert!(capability.contains("\"windows\": [\"plugin-*\"]"));
+        assert!(capability.contains("\"allow-publish-plugin-results\""));
+        assert!(capability.contains("\"core:event:allow-listen\""));
+        assert!(capability.contains("\"core:event:allow-unlisten\""));
+        for forbidden in ["\"*\"", "clipboard", "allow-search-apps", "main"] {
+            assert!(!capability.contains(forbidden));
         }
     }
 

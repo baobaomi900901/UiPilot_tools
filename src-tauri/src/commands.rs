@@ -12,6 +12,7 @@ use crate::{
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, FocusDecision, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
+    plugins::{PluginManager, PluginQueryError},
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate},
     validation_data::{ValidationEvent, ValidationStore},
@@ -184,6 +185,13 @@ impl CommandError {
             message: "file search is unavailable",
         }
     }
+
+    fn plugin_query_failed() -> Self {
+        Self {
+            code: "pluginQueryFailed",
+            message: "plugin query failed",
+        }
+    }
 }
 
 impl From<SettingsError> for CommandError {
@@ -209,16 +217,42 @@ fn require_main_window(window: &WebviewWindow) -> Result<(), CommandError> {
 }
 
 #[tauri::command]
-pub(crate) fn search_apps(
+pub(crate) async fn search_apps(
     window: WebviewWindow,
     registry: State<'_, ResultRegistry>,
     cache: State<'_, Arc<AppCache>>,
     settings: State<'_, SettingsStore>,
+    plugins: State<'_, Arc<PluginManager>>,
     query: String,
     invocation_id: String,
     query_sequence: u64,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
+    if let Some(route) = plugins.route(&query) {
+        let Some(token) = registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
+        else {
+            return Ok(None);
+        };
+        let entries = plugins
+            .query(window.app_handle(), route)
+            .await
+            .map_err(|_| CommandError::plugin_query_failed())?;
+        return Ok(registry.publish_if_latest(
+            token,
+            entries,
+            || true,
+            |request_id, items| SearchResponse {
+                request_id,
+                items: items
+                    .into_iter()
+                    .map(|(result_id, mut item)| {
+                        item.result_id = result_id;
+                        item
+                    })
+                    .collect(),
+            },
+        ));
+    }
     Ok(search_apps_with(
         &registry,
         &query,
@@ -227,6 +261,28 @@ pub(crate) fn search_apps(
         || cache.snapshot(),
         |applications| settings.decorate_applications(applications),
     ))
+}
+
+#[tauri::command]
+pub(crate) fn publish_plugin_results(
+    window: WebviewWindow,
+    plugins: State<'_, Arc<PluginManager>>,
+    response: serde_json::Value,
+) -> Result<(), CommandError> {
+    publish_plugin_results_with_label(window.label(), || plugins.publish_response(window.label(), response))
+}
+
+fn publish_plugin_results_with_label<P>(
+    label: &str,
+    publish: P,
+) -> Result<(), CommandError>
+where
+    P: FnOnce() -> Result<(), PluginQueryError>,
+{
+    if !label.starts_with("plugin-") {
+        return Err(CommandError::invalid_caller());
+    }
+    publish().map_err(|_| CommandError::plugin_query_failed())
 }
 
 fn search_apps_with<S, D>(
@@ -658,6 +714,7 @@ where
     let app_id = match &action {
         ResultAction::LaunchApplication { app_id, .. } => app_id.as_str(),
         ResultAction::OpenIndexedPath => return Err(CommandError::application_entry_unavailable()),
+        ResultAction::CopyText { .. } => return Err(CommandError::application_entry_unavailable()),
     };
     let outcome = execute(&action).map_err(|_| CommandError::application_entry_unavailable())?;
     let (response, event) = outcome_parts(outcome);
@@ -2406,6 +2463,36 @@ mod tests {
         let command = &production[production.find(&expected).unwrap()..];
         let first_statement = command[command.find('{').unwrap() + 1..].trim_start();
         assert!(first_statement.starts_with("require_main_window(&window)?;"));
+    }
+
+    mod plugin {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::super::{publish_plugin_results_with_label, CommandError};
+        use crate::plugins::PluginQueryError;
+
+        #[test]
+        fn publish_rejects_non_plugin_label_before_state_access() {
+            let calls = AtomicUsize::new(0);
+            assert_eq!(
+                publish_plugin_results_with_label("main", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }),
+                Err(CommandError::invalid_caller())
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn publish_maps_plugin_validation_failure_to_fixed_error() {
+            assert_eq!(
+                publish_plugin_results_with_label("plugin-abc", || {
+                    Err(PluginQueryError::InvalidResponse)
+                }),
+                Err(CommandError::plugin_query_failed())
+            );
+        }
     }
 
     #[test]

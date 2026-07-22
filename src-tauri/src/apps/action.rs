@@ -60,6 +60,9 @@ where
         ResultAction::OpenIndexedPath => {
             return Err(ApplicationActionError::ApplicationEntryUnavailable)
         }
+        ResultAction::CopyText { .. } => {
+            return Err(ApplicationActionError::ApplicationEntryUnavailable)
+        }
     };
     let (shortcut, executable) = match target {
         ApplicationLaunchTarget::Shortcut {

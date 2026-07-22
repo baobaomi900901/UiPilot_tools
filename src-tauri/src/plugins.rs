@@ -2,13 +2,23 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
-    sync::{OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, OnceLock, RwLock,
+    },
+    time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use tauri::{
     http::Response,
     webview::{NewWindowResponse, WebviewWindow},
-    App, Manager, WebviewUrl, WebviewWindowBuilder,
+    App, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
+};
+
+use crate::{
+    model::ResultItem,
+    result_registry::ResultAction,
 };
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
@@ -62,6 +72,9 @@ pub(crate) struct PluginManager {
     catalog: OnceLock<PluginCatalog>,
     ready: RwLock<HashSet<String>>,
     disabled: RwLock<HashSet<String>>,
+    pending: RwLock<HashMap<String, PendingPluginQuery>>,
+    timeouts: RwLock<HashMap<String, u8>>,
+    next_request: AtomicU64,
 }
 
 impl PluginManager {
@@ -70,6 +83,9 @@ impl PluginManager {
             catalog: OnceLock::new(),
             ready: RwLock::new(HashSet::new()),
             disabled: RwLock::new(HashSet::new()),
+            pending: RwLock::new(HashMap::new()),
+            timeouts: RwLock::new(HashMap::new()),
+            next_request: AtomicU64::new(0),
         }
     }
 
@@ -173,7 +189,230 @@ impl PluginManager {
         if let Ok(mut disabled) = self.disabled.write() {
             disabled.insert(label.to_string());
         }
+        if let Ok(mut pending) = self.pending.write() {
+            pending.retain(|_, query| {
+                if query.window_label == label {
+                    let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
+
+    pub(crate) async fn query(
+        &self,
+        app: &AppHandle,
+        route: PluginRoute,
+    ) -> Result<Vec<(ResultItem, ResultAction)>, PluginQueryError> {
+        if self
+            .disabled
+            .read()
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?
+            .contains(&route.window_label)
+        {
+            return Err(PluginQueryError::RuntimeDisabled);
+        }
+        let request_id = self.allocate_request_id();
+        let (sender, receiver) = mpsc::channel();
+        self.pending
+            .write()
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?
+            .insert(
+                request_id.clone(),
+                PendingPluginQuery {
+                    plugin_id: route.plugin_id.clone(),
+                    window_label: route.window_label.clone(),
+                    sender,
+                },
+            );
+        let request = PluginQueryRequest {
+            protocol_version: 1,
+            request_id: request_id.clone(),
+            input: route.input,
+        };
+        let Some(window) = app.get_webview_window(&route.window_label) else {
+            self.remove_pending(&request_id);
+            return Err(PluginQueryError::RuntimeDisabled);
+        };
+        window
+            .emit("uipilot-plugin-query", request)
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+
+        let label = route.window_label.clone();
+        let received = tauri::async_runtime::spawn_blocking(move || {
+            receiver.recv_timeout(Duration::from_millis(500))
+        })
+        .await
+        .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+        match received {
+            Ok(Ok(items)) => {
+                self.reset_timeouts(&label);
+                Ok(items)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.remove_pending(&request_id);
+                self.record_timeout(&label);
+                Err(PluginQueryError::Timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PluginQueryError::RuntimeDisabled),
+        }
+    }
+
+    pub(crate) fn publish_response(
+        &self,
+        label: &str,
+        response: serde_json::Value,
+    ) -> Result<(), PluginQueryError> {
+        let entry = self
+            .catalog
+            .get()
+            .and_then(|catalog| catalog.entries.iter().find(|entry| entry.window_label == label))
+            .ok_or(PluginQueryError::InvalidResponse)?;
+        let serialized = serde_json::to_vec(&response).map_err(|_| PluginQueryError::InvalidResponse)?;
+        if serialized.len() > 128 * 1024 {
+            return self.reject_response(response);
+        }
+        let response: PluginQueryResponse = match serde_json::from_value(response.clone()) {
+            Ok(response) => response,
+            Err(_) => return self.reject_response(response),
+        };
+        if response.protocol_version != 1 || response.items.len() > 20 {
+            return self.reject_request(&response.request_id);
+        }
+        let pending = self
+            .pending
+            .write()
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?
+            .remove(&response.request_id)
+            .ok_or(PluginQueryError::InvalidResponse)?;
+        if pending.plugin_id != entry.id || pending.window_label != label {
+            let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
+            return Err(PluginQueryError::InvalidResponse);
+        }
+        let mut items = Vec::with_capacity(response.items.len());
+        for item in response.items {
+            if item.title.is_empty()
+                || item.title.chars().count() > 200
+                || item.subtitle.as_ref().is_some_and(|value| value.chars().count() > 500)
+            {
+                let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
+                return Err(PluginQueryError::InvalidResponse);
+            }
+            let action = match item.action {
+                PluginAction::CopyText { text } => {
+                    if text.len() > 4096 || !self.authorizes_clipboard(&entry.id) {
+                        let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
+                        return Err(PluginQueryError::InvalidResponse);
+                    }
+                    ResultAction::CopyText {
+                        plugin_id: entry.id.clone(),
+                        text,
+                    }
+                }
+            };
+            items.push((
+                ResultItem {
+                    result_id: String::new(),
+                    title: item.title,
+                    subtitle: item.subtitle,
+                    icon: None,
+                },
+                action,
+            ));
+        }
+        pending
+            .sender
+            .send(Ok(items))
+            .map_err(|_| PluginQueryError::RuntimeDisabled)?;
+        self.reset_timeouts(label);
+        Ok(())
+    }
+
+    fn reject_response(&self, response: serde_json::Value) -> Result<(), PluginQueryError> {
+        if let Some(request_id) = response.get("requestId").and_then(|value| value.as_str()) {
+            self.reject_request(request_id)
+        } else {
+            Err(PluginQueryError::InvalidResponse)
+        }
+    }
+
+    fn reject_request(&self, request_id: &str) -> Result<(), PluginQueryError> {
+        if let Some(pending) = self.remove_pending(request_id) {
+            let _ = pending.sender.send(Err(PluginQueryError::InvalidResponse));
+        }
+        Err(PluginQueryError::InvalidResponse)
+    }
+
+    fn remove_pending(&self, request_id: &str) -> Option<PendingPluginQuery> {
+        self.pending.write().ok()?.remove(request_id)
+    }
+
+    fn reset_timeouts(&self, label: &str) {
+        if let Ok(mut timeouts) = self.timeouts.write() {
+            timeouts.remove(label);
+        }
+    }
+
+    fn record_timeout(&self, label: &str) {
+        if let Ok(mut timeouts) = self.timeouts.write() {
+            let count = timeouts.entry(label.to_string()).or_default();
+            *count = count.saturating_add(1);
+            if *count >= 3 {
+                self.disable_runtime(label);
+            }
+        }
+    }
+
+    fn allocate_request_id(&self) -> String {
+        let previous = self.next_request.fetch_add(1, Ordering::Relaxed);
+        format!("plugin-request-{:016x}", previous + 1)
+    }
+}
+
+struct PendingPluginQuery {
+    plugin_id: String,
+    window_label: String,
+    sender: mpsc::Sender<Result<Vec<(ResultItem, ResultAction)>, PluginQueryError>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PluginQueryError {
+    Timeout,
+    RuntimeDisabled,
+    InvalidResponse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginQueryRequest {
+    protocol_version: u32,
+    request_id: String,
+    input: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginQueryResponse {
+    protocol_version: u32,
+    request_id: String,
+    items: Vec<PluginResult>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginResult {
+    title: String,
+    subtitle: Option<String>,
+    action: PluginAction,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum PluginAction {
+    CopyText { text: String },
 }
 
 pub(crate) struct PluginCatalog {
@@ -817,6 +1056,131 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    mod query {
+        use std::sync::mpsc;
+
+        use serde_json::json;
+
+        use super::{load, valid_manifest, TestRoot};
+        use super::super::{PendingPluginQuery, PluginManager, PluginQueryError};
+
+        fn manager(root: &TestRoot) -> PluginManager {
+            let manager = PluginManager::new();
+            assert!(manager.catalog.set(load(root)).is_ok());
+            manager
+        }
+
+        fn wait_for(manager: &PluginManager, request_id: &str) -> mpsc::Receiver<Result<Vec<(crate::model::ResultItem, crate::result_registry::ResultAction)>, PluginQueryError>> {
+            let (sender, receiver) = mpsc::channel();
+            manager.pending.write().unwrap().insert(
+                request_id.into(),
+                PendingPluginQuery {
+                    plugin_id: "plugin".into(),
+                    window_label: "plugin-706c7567696e".into(),
+                    sender,
+                },
+            );
+            receiver
+        }
+
+        #[test]
+        fn valid_zero_and_twenty_items_publish_and_reset_timeouts() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/go"));
+            let manager = manager(&root);
+            manager.record_timeout("plugin-706c7567696e");
+            let receiver = wait_for(&manager, "request");
+            manager
+                .publish_response(
+                    "plugin-706c7567696e",
+                    json!({"protocolVersion":1,"requestId":"request","items":[]}),
+                )
+                .unwrap();
+            assert_eq!(receiver.recv().unwrap().unwrap().len(), 0);
+            assert!(manager.timeouts.read().unwrap().is_empty());
+
+            let receiver = wait_for(&manager, "request-2");
+            let items = (0..20)
+                .map(|index| {
+                    json!({"title":format!("Item {index}"),"subtitle":null,"action":{"type":"copyText","text":"copy"}})
+                })
+                .collect::<Vec<_>>();
+            manager
+                .publish_response(
+                    "plugin-706c7567696e",
+                    json!({"protocolVersion":1,"requestId":"request-2","items":items}),
+                )
+                .unwrap();
+            assert_eq!(receiver.recv().unwrap().unwrap().len(), 20);
+        }
+
+        #[test]
+        fn invalid_responses_notify_waiter_and_duplicate_is_rejected() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/go"));
+            let manager = manager(&root);
+            let receiver = wait_for(&manager, "request");
+            assert_eq!(
+                manager.publish_response(
+                    "plugin-706c7567696e",
+                    json!({"protocolVersion":2,"requestId":"request","items":[]}),
+                ),
+                Err(PluginQueryError::InvalidResponse)
+            );
+            assert!(matches!(
+                receiver.recv().unwrap(),
+                Err(PluginQueryError::InvalidResponse)
+            ));
+            assert_eq!(
+                manager.publish_response(
+                    "plugin-706c7567696e",
+                    json!({"protocolVersion":1,"requestId":"request","items":[]}),
+                ),
+                Err(PluginQueryError::InvalidResponse)
+            );
+        }
+
+        #[test]
+        fn count_size_unknown_key_and_text_limits_fail_as_one_response() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/go"));
+            let manager = manager(&root);
+            for (request_id, response) in [
+                (
+                    "too-many",
+                    json!({"protocolVersion":1,"requestId":"too-many","items":(0..21).map(|_| json!({"title":"x","subtitle":null,"action":{"type":"copyText","text":"x"}})).collect::<Vec<_>>()}),
+                ),
+                (
+                    "unknown",
+                    json!({"protocolVersion":1,"requestId":"unknown","items":[],"extra":true}),
+                ),
+                (
+                    "text",
+                    json!({"protocolVersion":1,"requestId":"text","items":[{"title":"x","subtitle":null,"action":{"type":"copyText","text":"x".repeat(4097)}}]}),
+                ),
+            ] {
+                let receiver = wait_for(&manager, request_id);
+                assert_eq!(
+                    manager.publish_response("plugin-706c7567696e", response),
+                    Err(PluginQueryError::InvalidResponse)
+                );
+                assert!(matches!(
+                    receiver.recv().unwrap(),
+                    Err(PluginQueryError::InvalidResponse)
+                ));
+            }
+        }
+
+        #[test]
+        fn three_timeouts_disable_runtime_until_restart() {
+            let manager = PluginManager::new();
+            for _ in 0..3 {
+                manager.record_timeout("plugin-label");
+            }
+            assert!(manager.disabled.read().unwrap().contains("plugin-label"));
         }
     }
 }

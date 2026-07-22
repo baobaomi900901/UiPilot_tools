@@ -15,12 +15,14 @@ pub(crate) enum ResultAction {
         target: ApplicationLaunchTarget,
     },
     OpenIndexedPath,
+    CopyText { plugin_id: String, text: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryDomain {
     Application,
     File,
+    Plugin,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,6 +309,35 @@ mod tests {
         assert_eq!(
             registry.resolve(&file_response.0, &file_response.1[0].0),
             Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn query_domains_accept_plugin_domain() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let plugin = registry.begin_query(QueryDomain::Plugin, "inv-1", 1).unwrap();
+        let response = registry
+            .publish_if_latest(
+                plugin,
+                vec![(
+                    item("", "Plugin"),
+                    ResultAction::CopyText {
+                        plugin_id: "plugin".into(),
+                        text: "copy".into(),
+                    },
+                )],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        assert_eq!(response.0, "req-0000000000000001");
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[0].0),
+            Ok(ResultAction::CopyText {
+                plugin_id: "plugin".into(),
+                text: "copy".into(),
+            })
         );
     }
 
