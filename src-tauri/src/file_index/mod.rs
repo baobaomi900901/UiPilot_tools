@@ -4,8 +4,8 @@ use std::{
     os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, Weak,
     },
 };
 
@@ -15,7 +15,16 @@ use std::{sync::mpsc, thread};
 use icu_casemap::CaseMapper;
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
-use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, WPARAM},
+    Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+    UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE},
+};
+
+use crate::{
+    lifecycle::{FileIndexPhase, LifecycleCoordinator},
+    result_registry::{QueryDomain, ResultRegistry},
+};
 
 mod store;
 mod windows_backend;
@@ -169,10 +178,9 @@ mod tests {
         state.index_revision_high_water = u64::MAX;
         assert_eq!(
             state.advance_revision_locked(&publication_generation),
-            Err(AdmissionError::Unavailable)
+            Err(AdmissionError::CounterExhausted)
         );
-        assert!(state.fatal_unavailable);
-        assert!(!state.admission_open);
+        assert!(!state.fatal_unavailable);
         assert_eq!(
             Store::open(&database, "identity-a")
                 .unwrap()
@@ -257,7 +265,11 @@ mod tests {
             begin_lazy_init_locked(&mut state, 0, &publication_generation),
             Err(AdmissionError::OwnerExhausted)
         );
-        assert!(state.fatal_unavailable);
+        assert!(!state.fatal_unavailable);
+        let index = Arc::new(FileIndex::default());
+        index.state.lock().unwrap().lazy_owner_high_water = u64::MAX;
+        assert!(index.begin_search(0).is_err());
+        assert!(index.state.lock().unwrap().fatal_unavailable);
     }
 
     #[test]
@@ -281,7 +293,7 @@ mod tests {
 
         let trusted = dir.path().join("trusted");
         fs::create_dir_all(&trusted).unwrap();
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         index
             .search_with(
                 Path::new(r"C:\untrusted-alias"),
@@ -330,7 +342,7 @@ mod tests {
 
     #[test]
     fn store_failure_latches_and_second_query_performs_zero_store_work() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let dir = TestDir::new();
         fs::create_dir_all(dir.path()).unwrap();
         let database = dir.path().join("file-index.sqlite3");
@@ -388,12 +400,27 @@ mod tests {
 
     #[test]
     fn query_failure_latches_and_observer_performs_zero_authentication() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let dir = TestDir::new();
         let open_calls = Cell::new(0);
         let query_calls = Cell::new(0);
         let first_stop = Arc::new(AtomicBool::new(false));
         let second_stop = Arc::new(AtomicBool::new(false));
+        let integrity_stop = Arc::new(AtomicBool::new(false));
+        let integrity_effects = Arc::new(AtomicU64::new(0));
+        let integrity_thread_stop = Arc::clone(&integrity_stop);
+        let integrity_thread_effects = Arc::clone(&integrity_effects);
+        let integrity_join = thread::spawn(move || {
+            while !integrity_thread_stop.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            let _ = &integrity_thread_effects;
+        });
+        *index.integrity_worker.lock().unwrap() = Some(super::IntegrityWorkerRecord {
+            runtime_epoch: 0,
+            stop: Arc::clone(&integrity_stop),
+            join: Some(integrity_join),
+        });
         let first_identity = volume();
         let mut second_identity = volume();
         second_identity.volume_serial = 43;
@@ -407,6 +434,7 @@ mod tests {
                     identity,
                     super::WorkerRecord {
                         owner,
+                        runtime_epoch: index.runtime_epoch(),
                         mount_point: PathBuf::from(mount),
                         stop,
                         generation: Arc::new(AtomicU64::new(1)),
@@ -446,7 +474,21 @@ mod tests {
             .is_err());
         assert!(first_stop.load(Ordering::Acquire));
         assert!(second_stop.load(Ordering::Acquire));
+        assert!(integrity_stop.load(Ordering::Acquire));
         assert!(index.coordinator.stop.load(Ordering::Acquire));
+        while index
+            .integrity_worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|worker| worker.join.as_ref())
+            .is_some_and(|join| !join.is_finished())
+        {
+            thread::yield_now();
+        }
+        index.reap_finished_integrity();
+        assert!(index.integrity_worker.lock().unwrap().is_none());
+        assert_eq!(integrity_effects.load(Ordering::Acquire), 0);
         {
             let coordinator = index.coordinator.state.lock().unwrap();
             assert!(coordinator.pending_root.is_none());
@@ -466,9 +508,9 @@ mod tests {
         assert_eq!(second.status, FileIndexStatus::Unavailable);
         assert_eq!(open_calls.get(), 1);
         assert_eq!(query_calls.get(), 1);
-        assert!(!Arc::new(index).schedule_calibration());
+        assert!(!index.schedule_calibration());
 
-        let observer = FileIndex::default();
+        let observer = Arc::new(FileIndex::default());
         {
             let mut state = observer.state.lock().unwrap();
             state.mode = LifecycleMode::Opening { owner: 1 };
@@ -625,6 +667,149 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_does_not_claim_calibration_after_phase_store() {
+        let (index, lifecycle) = active_task7_index();
+        {
+            let mut coordinator = index.coordinator.state.lock().unwrap();
+            coordinator.pending_root = Some(PathBuf::from(r"C:\app-data"));
+            coordinator.pending_runtime_epoch = Some(0);
+            coordinator.thread_started = true;
+        }
+
+        let claimed = index.claim_calibration_run_with(|| {
+            lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+        });
+
+        assert!(claimed.is_none());
+        assert_eq!(index.db_work_count_for_test(), 0);
+        let coordinator = index.coordinator.state.lock().unwrap();
+        assert!(!coordinator.running);
+        assert_eq!(
+            coordinator.pending_root,
+            Some(PathBuf::from(r"C:\app-data"))
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_pending_from_an_old_runtime_epoch() {
+        let (index, _) = active_task7_index();
+        {
+            let mut coordinator = index.coordinator.state.lock().unwrap();
+            coordinator.pending_root = Some(PathBuf::from(r"C:\app-data"));
+            coordinator.pending_runtime_epoch = Some(1);
+        }
+
+        assert!(index.claim_calibration_run_with(|| {}).is_none());
+        assert_eq!(index.db_work_count_for_test(), 0);
+        assert!(!index.coordinator.state.lock().unwrap().running);
+    }
+
+    #[test]
+    fn integrity_schedule_after_phase_store_creates_no_coordinator_owner() {
+        let (index, lifecycle) = active_task7_index();
+        index.state.lock().unwrap().integrity_pending = true;
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+
+        assert!(!index.schedule_integrity());
+        assert!(index.coordinator.join.lock().unwrap().is_none());
+        assert!(!index.coordinator.state.lock().unwrap().thread_started);
+        assert_eq!(index.db_work_count_for_test(), 0);
+    }
+
+    #[test]
+    fn integrity_worker_runs_once_and_records_timestamp() {
+        let directory = TestDir::new();
+        fs::create_dir_all(directory.path()).unwrap();
+        let database = authenticate_app_data_root(directory.path()).unwrap();
+        let root = database.parent().unwrap().to_path_buf();
+        let store = Store::open(&database, "identity-a").unwrap();
+        let (index, _) = active_task7_index();
+        {
+            let mut state = index.state.lock().unwrap();
+            state.store = Some(store);
+            state.authenticated_app_data_root = Some(root);
+            state.integrity_pending = true;
+        }
+
+        assert!(index.drive_integrity());
+        assert!(!index.drive_integrity());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let finished = index
+                .integrity_worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|worker| worker.join.as_ref())
+                .is_some_and(thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            assert!(Instant::now() < deadline, "integrity worker did not finish");
+            thread::yield_now();
+        }
+        index.reap_finished_integrity();
+
+        assert!(index.integrity_worker.lock().unwrap().is_none());
+        assert_eq!(index.db_work_count_for_test(), 0);
+        let state = index.state.lock().unwrap();
+        assert!(state.integrity_started);
+        assert!(!state.integrity_pending);
+        drop(state);
+        let timestamp = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT last_integrity_check_utc FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert!(timestamp.is_some());
+        drop(index);
+    }
+
+    #[test]
+    fn integrity_timestamp_rejects_phase_or_authenticated_path_changes() {
+        let directory = TestDir::new();
+        fs::create_dir_all(directory.path()).unwrap();
+        let database = authenticate_app_data_root(directory.path()).unwrap();
+        drop(Store::open(&database, "identity-a").unwrap());
+        let root = database.parent().unwrap().to_path_buf();
+        let (index, lifecycle) = active_task7_index();
+        let stop = Arc::new(AtomicBool::new(false));
+        *index.integrity_worker.lock().unwrap() = Some(super::IntegrityWorkerRecord {
+            runtime_epoch: 0,
+            stop: Arc::clone(&stop),
+            join: None,
+        });
+
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+        assert!(matches!(
+            index.record_integrity_timestamp(&root, &database, 0, &stop),
+            Err(StoreError::InvalidData)
+        ));
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Running, 1);
+        let other_root = directory.path().join("replacement");
+        fs::create_dir_all(&other_root).unwrap();
+        assert!(matches!(
+            index.record_integrity_timestamp(&other_root, &database, 0, &stop),
+            Err(StoreError::InvalidData)
+        ));
+
+        let timestamp = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT last_integrity_check_utc FROM metadata WHERE singleton=1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(timestamp, None);
+        index.integrity_worker.lock().unwrap().take();
+        drop(index);
+    }
+
+    #[test]
     fn inventory_change_during_running_calibration_remains_pending() {
         let index = Arc::new(FileIndex::default());
         {
@@ -743,7 +928,7 @@ mod tests {
 
     #[test]
     fn repeated_inventory_does_not_authenticate_quarantined_volume() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let ready = volume();
         let mut pending_identity = volume();
         pending_identity.volume_serial = 43;
@@ -807,7 +992,7 @@ mod tests {
 
     #[test]
     fn brand_new_candidate_opens_provisionally_but_remount_stays_quarantined() {
-        fn install_worker(index: &FileIndex, volume: &super::FixedVolume) -> u64 {
+        fn install_worker(index: &Arc<FileIndex>, volume: &super::FixedVolume) -> u64 {
             let owner = match index.prepare_worker(volume).unwrap() {
                 super::WorkerPreparation::Start { owner } => owner,
                 super::WorkerPreparation::Existing => panic!("worker must be new"),
@@ -816,6 +1001,7 @@ mod tests {
                 volume,
                 super::WorkerRecord {
                     owner,
+                    runtime_epoch: index.runtime_epoch(),
                     mount_point: volume.mount_point.clone(),
                     stop: Arc::new(AtomicBool::new(false)),
                     generation: Arc::new(AtomicU64::new(0)),
@@ -826,7 +1012,7 @@ mod tests {
             owner
         }
 
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let ready = volume();
         let mut new_identity = volume();
         new_identity.volume_serial = 43;
@@ -851,7 +1037,9 @@ mod tests {
             state.quarantined_volumes.insert(new_identity.clone());
         }
         let owner = install_worker(&index, &new_volume);
-        let (generation, has_committed) = index.begin_worker_candidate(&new_volume, owner).unwrap();
+        let (generation, has_committed) = index
+            .begin_worker_candidate(&new_volume, owner, index.runtime_epoch())
+            .unwrap();
         assert!(!has_committed);
         {
             let mut state = index.state.lock().unwrap();
@@ -881,7 +1069,7 @@ mod tests {
             assert_eq!(visible.total, 2);
             assert_eq!(visible.index_revision, 2);
         }
-        index.mark_fixed_volume_dirty(&new_volume).unwrap();
+        index.mark_fixed_volume_dirty_for_test(&new_volume).unwrap();
         {
             let mut state = index.state.lock().unwrap();
             let identities = state.authenticated_volumes.clone();
@@ -896,7 +1084,7 @@ mod tests {
             assert_eq!(visible.index_revision, 3);
         }
 
-        let first = FileIndex::default();
+        let first = Arc::new(FileIndex::default());
         let first_owner = {
             let mut state = first.state.lock().unwrap();
             state.store = Some(Store::open_in_memory_for_test("identity-a").unwrap());
@@ -908,11 +1096,11 @@ mod tests {
             install_worker(&first, &new_volume)
         };
         first
-            .begin_worker_candidate(&new_volume, first_owner)
+            .begin_worker_candidate(&new_volume, first_owner, first.runtime_epoch())
             .unwrap();
         assert_eq!(first.state.lock().unwrap().index_revision_high_water, 0);
 
-        let remount = FileIndex::default();
+        let remount = Arc::new(FileIndex::default());
         let mut remount_store = Store::open_in_memory_for_test("identity-a").unwrap();
         remount_store
             .seed_committed_for_test(&new_identity, [candidate_entry("find-old-mount.txt", 1)])
@@ -928,7 +1116,7 @@ mod tests {
         let remount_owner = install_worker(&remount, &new_volume);
         assert!(
             remount
-                .begin_worker_candidate(&new_volume, remount_owner)
+                .begin_worker_candidate(&new_volume, remount_owner, remount.runtime_epoch())
                 .unwrap()
                 .1
         );
@@ -939,7 +1127,7 @@ mod tests {
 
     #[test]
     fn successful_remount_commit_restores_visibility_in_same_gate() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let remounted = super::FixedVolume {
             identity: identity.clone(),
@@ -966,6 +1154,7 @@ mod tests {
             &remounted,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: remounted.mount_point.clone(),
                 stop: Arc::new(AtomicBool::new(false)),
                 generation: Arc::clone(&generation_owner),
@@ -973,7 +1162,9 @@ mod tests {
                 failed: false,
             },
         );
-        let (generation, has_committed) = index.begin_worker_candidate(&remounted, owner).unwrap();
+        let (generation, has_committed) = index
+            .begin_worker_candidate(&remounted, owner, index.runtime_epoch())
+            .unwrap();
         assert!(has_committed);
         generation_owner.store(generation, Ordering::Release);
         let mut current = candidate_entry("find-current.txt", generation);
@@ -1038,6 +1229,7 @@ mod tests {
             &fixed,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: fixed.mount_point.clone(),
                 stop,
                 generation: Arc::new(AtomicU64::new(0)),
@@ -1046,7 +1238,7 @@ mod tests {
             },
         );
 
-        index.handle_worker_failure(&fixed, owner);
+        index.handle_worker_failure_for_test(&fixed, owner);
         let mut state = index.state.lock().unwrap();
         assert!(!state.fatal_unavailable);
         assert!(state.admission_open);
@@ -1091,7 +1283,7 @@ mod tests {
     #[test]
     fn volume_workers_are_unique_replaced_and_owner_checked() {
         fn install(
-            index: &FileIndex,
+            index: &Arc<FileIndex>,
             volume: &super::FixedVolume,
             order: &Arc<Mutex<Vec<String>>>,
         ) -> (bool, u64) {
@@ -1122,6 +1314,7 @@ mod tests {
                 volume,
                 super::WorkerRecord {
                     owner,
+                    runtime_epoch: index.runtime_epoch(),
                     mount_point: volume.mount_point.clone(),
                     stop,
                     generation: Arc::new(AtomicU64::new(7)),
@@ -1133,7 +1326,7 @@ mod tests {
             (true, owner)
         }
 
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let order = Arc::new(Mutex::new(Vec::new()));
         let c = super::FixedVolume {
@@ -1174,14 +1367,18 @@ mod tests {
             state.authenticated_mounts = vec![(identity.clone(), r"D:\".into())];
             state.quarantined_volumes.insert(identity.clone());
         }
-        assert!(index.complete_volume_calibration(&c, old_owner).is_err());
+        assert!(index
+            .complete_volume_calibration(&c, old_owner, index.runtime_epoch())
+            .is_err());
         assert!(index
             .state
             .lock()
             .unwrap()
             .quarantined_volumes
             .contains(&identity));
-        index.complete_volume_calibration(&d, new_owner).unwrap();
+        index
+            .complete_volume_calibration(&d, new_owner, index.runtime_epoch())
+            .unwrap();
         assert!(!index
             .state
             .lock()
@@ -1209,9 +1406,11 @@ mod tests {
             state.mode = LifecycleMode::Active;
             state.admission_open = true;
         }
-        index.stop_detached_workers(&[]).unwrap();
+        index.stop_detached_workers_for_test(&[]).unwrap();
         assert!(index.workers.lock().unwrap().by_volume.is_empty());
-        assert!(index.begin_worker_candidate(&d, replacement_owner).is_err());
+        assert!(index
+            .begin_worker_candidate(&d, replacement_owner, index.runtime_epoch())
+            .is_err());
         let state = index.state.lock().unwrap();
         let store = state.store.as_ref().unwrap();
         assert_eq!(store.generation_state_for_test(&identity).1, None);
@@ -1234,7 +1433,7 @@ mod tests {
 
     #[test]
     fn detached_worker_clears_candidate_and_preserves_committed_rows() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let fixed = super::FixedVolume {
             identity: identity.clone(),
@@ -1274,6 +1473,7 @@ mod tests {
             &fixed,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: fixed.mount_point.clone(),
                 stop,
                 generation: Arc::new(AtomicU64::new(generation)),
@@ -1282,7 +1482,7 @@ mod tests {
             },
         );
 
-        index.stop_detached_workers(&[]).unwrap();
+        index.stop_detached_workers_for_test(&[]).unwrap();
         let mut state = index.state.lock().unwrap();
         let store = state.store.as_mut().unwrap();
         assert_eq!(store.generation_state_for_test(&identity).1, None);
@@ -1302,7 +1502,7 @@ mod tests {
 
     #[test]
     fn stale_remount_worker_failure_cleans_candidate_on_current_mount() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let stale = super::FixedVolume {
             identity: identity.clone(),
@@ -1337,6 +1537,7 @@ mod tests {
             &stale,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: stale.mount_point.clone(),
                 stop: Arc::clone(&stop),
                 generation: Arc::new(AtomicU64::new(generation)),
@@ -1358,8 +1559,10 @@ mod tests {
             state.store.as_ref().unwrap().index_revision_for_test()
         };
 
-        index.mark_fixed_volume_dirty(&stale).unwrap();
-        assert!(index.complete_volume_calibration(&stale, owner).is_err());
+        index.mark_fixed_volume_dirty_for_test(&stale).unwrap();
+        assert!(index
+            .complete_volume_calibration(&stale, owner, index.runtime_epoch())
+            .is_err());
 
         let mut state = index.state.lock().unwrap();
         assert!(state.quarantined_volumes.contains(&identity));
@@ -1412,6 +1615,7 @@ mod tests {
             &fixed,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: fixed.mount_point.clone(),
                 stop: Arc::new(AtomicBool::new(false)),
                 generation: Arc::new(AtomicU64::new(1)),
@@ -1468,6 +1672,7 @@ mod tests {
             &fixed,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: fixed.mount_point.clone(),
                 stop: Arc::new(AtomicBool::new(false)),
                 generation: Arc::new(AtomicU64::new(generation)),
@@ -1506,7 +1711,7 @@ mod tests {
 
     #[test]
     fn query_reauthentication_excludes_detached_or_reused_volumes() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let attached = volume();
         let mut store = Store::open_in_memory_for_test("identity-a").unwrap();
         store
@@ -1795,12 +2000,11 @@ mod tests {
         };
         assert_eq!(
             state.advance_revision_locked(&publication_generation),
-            Err(AdmissionError::Unavailable)
+            Err(AdmissionError::CounterExhausted)
         );
         assert_eq!(state.index_revision_high_water, u64::MAX);
-        assert_eq!(publication_generation.load(Ordering::Acquire), 8);
-        assert!(state.fatal_unavailable);
-        assert!(!state.admission_open);
+        assert_eq!(publication_generation.load(Ordering::Acquire), 7);
+        assert!(!state.fatal_unavailable);
     }
 
     #[test]
@@ -1851,6 +2055,7 @@ mod tests {
                 identity.clone(),
                 super::WorkerRecord {
                     owner: 1,
+                    runtime_epoch: index.runtime_epoch(),
                     mount_point: PathBuf::from(r"C:\"),
                     stop: Arc::clone(&current_stop),
                     generation: Arc::new(AtomicU64::new(1)),
@@ -1862,6 +2067,7 @@ mod tests {
                 other_identity.clone(),
                 super::WorkerRecord {
                     owner: 2,
+                    runtime_epoch: index.runtime_epoch(),
                     mount_point: PathBuf::from(r"D:\"),
                     stop: Arc::clone(&other_stop),
                     generation: Arc::new(AtomicU64::new(1)),
@@ -1873,7 +2079,7 @@ mod tests {
         let old_generation = index.publication_generation.load(Ordering::Acquire);
 
         assert!(matches!(
-            index.mark_fixed_volume_dirty(&fixed),
+            index.mark_fixed_volume_dirty_for_test(&fixed),
             Err(FileIndexError::Unavailable)
         ));
 
@@ -1895,6 +2101,99 @@ mod tests {
         assert!(!index.finish_volume_attempt(&identity, false, Instant::now(), 0, 0));
         assert!(!index.schedule_calibration());
         assert_eq!(index.workers.lock().unwrap().by_volume.len(), 2);
+    }
+
+    #[test]
+    fn exhaustion_invalidates_file_domain_and_posts_close_exactly_once_without_locks() {
+        let (index, _) = active_task7_index();
+        index.install_main_window_hwnd(42).unwrap();
+        index.registry.on_show("fatal-close".into());
+        let application = index
+            .registry
+            .begin_query(QueryDomain::Application, "fatal-close", 1)
+            .unwrap();
+        let application = index
+            .registry
+            .publish_if_latest(
+                application,
+                vec![((), ResultAction::OpenIndexedPath)],
+                || true,
+                |request, items| (request, items[0].0.clone()),
+            )
+            .unwrap();
+        {
+            let mut state = index.state.lock().unwrap();
+            assert!(index.latch_exhaustion_locked(&mut state));
+        }
+        let posts = Cell::new(0);
+        index.consume_fatal_effects_with(|hwnd| {
+            assert_eq!(hwnd, 42);
+            assert!(index.state.try_lock().is_ok());
+            posts.set(posts.get() + 1);
+            true
+        });
+        index.consume_fatal_effects_with(|_| {
+            posts.set(posts.get() + 1);
+            true
+        });
+        assert_eq!(posts.get(), 1);
+        assert_eq!(
+            index.registry.resolve(&application.0, &application.1),
+            Ok(ResultAction::OpenIndexedPath)
+        );
+
+        let cleared = Arc::new(FileIndex::default());
+        cleared.install_main_window_hwnd(84).unwrap();
+        cleared.clear_main_window_hwnd(84);
+        {
+            let mut state = cleared.state.lock().unwrap();
+            assert!(cleared.latch_exhaustion_locked(&mut state));
+        }
+        let cleared_posts = Cell::new(0);
+        cleared.consume_fatal_effects_with(|_| {
+            cleared_posts.set(cleared_posts.get() + 1);
+            true
+        });
+        assert_eq!(cleared_posts.get(), 0);
+        let cleared_state = cleared.state.lock().unwrap();
+        assert!(cleared_state.hide_requested);
+        assert!(!cleared_state.hide_issued);
+        drop(cleared_state);
+
+        let retry = Arc::new(FileIndex::default());
+        {
+            let mut state = retry.state.lock().unwrap();
+            assert!(retry.latch_exhaustion_locked(&mut state));
+        }
+        let retry_posts = Cell::new(0);
+        retry.consume_fatal_effects_with(|_| {
+            retry_posts.set(retry_posts.get() + 1);
+            true
+        });
+        assert_eq!(retry_posts.get(), 0);
+        assert!(retry.state.lock().unwrap().hide_requested);
+        retry.install_main_window_hwnd(126).unwrap();
+        retry.consume_fatal_effects_with(|_| {
+            retry_posts.set(retry_posts.get() + 1);
+            false
+        });
+        {
+            let state = retry.state.lock().unwrap();
+            assert!(state.hide_requested);
+            assert!(!state.hide_issued);
+        }
+        retry.consume_fatal_effects_with(|_| {
+            retry_posts.set(retry_posts.get() + 1);
+            true
+        });
+        retry.consume_fatal_effects_with(|_| {
+            retry_posts.set(retry_posts.get() + 1);
+            true
+        });
+        assert_eq!(retry_posts.get(), 2);
+        let retry_state = retry.state.lock().unwrap();
+        assert!(!retry_state.hide_requested);
+        assert!(retry_state.hide_issued);
     }
 
     #[test]
@@ -1934,7 +2233,7 @@ mod tests {
 
     #[test]
     fn store_writer_revision_max_noop_does_not_latch() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let fixed = super::FixedVolume {
             identity: identity.clone(),
@@ -1955,7 +2254,7 @@ mod tests {
             state.authenticated_mounts = vec![(identity, r"C:\".into())];
         }
 
-        index.mark_fixed_volume_dirty(&fixed).unwrap();
+        index.mark_fixed_volume_dirty_for_test(&fixed).unwrap();
 
         let state = index.state.lock().unwrap();
         assert!(!state.fatal_unavailable);
@@ -1969,7 +2268,7 @@ mod tests {
 
     #[test]
     fn ordinary_volume_transaction_failure_keeps_single_backoff_owner() {
-        let index = FileIndex::default();
+        let index = Arc::new(FileIndex::default());
         let identity = volume();
         let fixed = super::FixedVolume {
             identity: identity.clone(),
@@ -1996,6 +2295,7 @@ mod tests {
             &fixed,
             super::WorkerRecord {
                 owner,
+                runtime_epoch: index.runtime_epoch(),
                 mount_point: fixed.mount_point.clone(),
                 stop: Arc::new(AtomicBool::new(false)),
                 generation: Arc::new(AtomicU64::new(1)),
@@ -2004,7 +2304,7 @@ mod tests {
             },
         );
 
-        index.handle_worker_failure(&fixed, owner);
+        index.handle_worker_failure_for_test(&fixed, owner);
 
         let state = index.state.lock().unwrap();
         assert!(!state.fatal_unavailable);
@@ -2531,13 +2831,16 @@ mod tests {
             .unwrap();
         let reader_database = database.clone();
         let (read_tx, read_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let reader = thread::spawn(move || {
-            read_rx.recv().unwrap();
             let mut reader = Store::open(&reader_database, "identity-a").unwrap();
+            ready_tx.send(()).unwrap();
+            read_rx.recv().unwrap();
             let snapshot = reader.query_for_test(&query(), &[volume()]).unwrap();
             done_tx.send(snapshot).unwrap();
         });
+        ready_rx.recv().unwrap();
         let revision = writer
             .apply_live_streaming(&volume(), 1, std::slice::from_ref(&volume()), |apply| {
                 apply(super::IndexChangeBatch {
@@ -2968,6 +3271,598 @@ mod tests {
         );
         assert!(empty_candidate.candidate_rows_for_test(&volume).is_empty());
     }
+
+    fn active_task7_index() -> (Arc<FileIndex>, Arc<crate::lifecycle::LifecycleCoordinator>) {
+        let lifecycle = Arc::new(crate::lifecycle::LifecycleCoordinator::default());
+        let index = Arc::new(FileIndex::new(
+            Arc::clone(&lifecycle),
+            ResultRegistry::default(),
+        ));
+        {
+            let mut state = index.state.lock().unwrap();
+            state.mode = LifecycleMode::Active;
+            state.admission_open = true;
+            state.store = Some(Store::open_in_memory_for_test("identity-a").unwrap());
+        }
+        (index, lifecycle)
+    }
+
+    #[test]
+    fn admission_rejects_every_kind_after_phase_store() {
+        let (index, lifecycle) = active_task7_index();
+        let reservation = index.reserve_db_work_for_test(0).unwrap();
+        assert_eq!(index.db_work_count_for_test(), 1);
+        drop(reservation);
+        assert_eq!(index.db_work_count_for_test(), 0);
+
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+        assert!(matches!(
+            index.reserve_db_work_for_test(0),
+            Err(AdmissionError::Lifecycle)
+        ));
+        assert_eq!(index.db_work_count_for_test(), 0);
+
+        let lazy = Arc::new(FileIndex::new(
+            Arc::new(crate::lifecycle::LifecycleCoordinator::default()),
+            ResultRegistry::default(),
+        ));
+        assert_eq!(
+            lazy.begin_lazy_for_test(0),
+            Ok(LazyInitDecision::Start { owner: 1 })
+        );
+        assert_eq!(
+            lazy.begin_lazy_for_test(0),
+            Ok(LazyInitDecision::ObserveBuilding)
+        );
+        assert_eq!(lazy.db_work_count_for_test(), 0);
+    }
+
+    #[test]
+    fn late_worker_placeholder_is_cancelled_before_path_or_database_work() {
+        let (index, lifecycle) = active_task7_index();
+        let fixed = super::FixedVolume {
+            identity: volume(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        {
+            let mut state = index.state.lock().unwrap();
+            state.authenticated_volumes = vec![fixed.identity.clone()];
+            state.authenticated_mounts = vec![(fixed.identity.clone(), r"C:\".to_owned())];
+        }
+        let start = match index.reserve_and_prepare_worker(&fixed).unwrap() {
+            super::WorkerStartDecision::Start(start) => start,
+            super::WorkerStartDecision::Existing => panic!("first worker must reserve an owner"),
+        };
+        assert_eq!(index.db_work_count_for_test(), 1);
+        assert_eq!(start.runtime_epoch, 0);
+        assert_eq!(start.generation.load(Ordering::Acquire), 0);
+        assert!(!start.stop.load(Ordering::Acquire));
+
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+        assert!(index.start_cleaning_until(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
+        assert!(start.stop.load(Ordering::Acquire));
+
+        let touched = Arc::new(AtomicU64::new(0));
+        let worker_index = Arc::clone(&index);
+        let worker_volume = fixed.clone();
+        let worker_touched = Arc::clone(&touched);
+        let worker_stop = Arc::clone(&start.stop);
+        let runtime_epoch = start.runtime_epoch;
+        let owner = start.owner;
+        let reservation = start.reservation;
+        let join = std::thread::spawn(move || {
+            if !worker_stop.load(Ordering::Acquire)
+                && worker_index.worker_start_authorized(
+                    &worker_volume,
+                    owner,
+                    runtime_epoch,
+                    &reservation,
+                )
+            {
+                worker_touched.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        match index.attach_worker_join(&fixed, owner, runtime_epoch, join) {
+            Ok(()) => {
+                if let Some(worker) = index.remove_worker_if_owner(&fixed.identity, owner) {
+                    super::stop_and_join_worker(worker);
+                }
+            }
+            Err(join) => join.join().unwrap(),
+        }
+        assert_eq!(touched.load(Ordering::Acquire), 0);
+        assert_eq!(index.db_work_count_for_test(), 0);
+    }
+
+    #[test]
+    fn recovery_reporters_never_join_themselves() {
+        let (index, _) = active_task7_index();
+        let fixed = super::FixedVolume {
+            identity: volume(),
+            mount_point: PathBuf::from(r"C:\"),
+        };
+        let reservation = index.reserve_db_work_for_test(0).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_index = Arc::clone(&index);
+        let worker_start = Arc::clone(&start);
+        let worker_release = Arc::clone(&release);
+        let (reported_tx, reported_rx) = mpsc::sync_channel(1);
+        let join = thread::spawn(move || {
+            worker_start.wait();
+            reported_tx
+                .send(worker_index.request_recovery(&reservation))
+                .unwrap();
+            worker_release.wait();
+            drop(reservation);
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        index.install_worker(
+            &fixed,
+            super::WorkerRecord {
+                owner: 1,
+                runtime_epoch: 0,
+                mount_point: fixed.mount_point.clone(),
+                stop: Arc::clone(&stop),
+                generation: Arc::new(AtomicU64::new(1)),
+                join: Some(join),
+                failed: false,
+            },
+        );
+        start.wait();
+        assert!(reported_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(stop.load(Ordering::Acquire));
+        release.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !index.workers.lock().unwrap().by_volume.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "coordinator did not reap reporter"
+            );
+            index.coordinator.signal.notify_all();
+            thread::yield_now();
+        }
+        assert_eq!(index.db_work_count_for_test(), 0);
+    }
+
+    #[test]
+    fn recovery_transition_releases_gate_before_domain_invalidation() {
+        let (index, _) = active_task7_index();
+        let registry = index.registry.clone();
+        registry.on_show("recovery-domain".into());
+        let application = registry
+            .begin_query(QueryDomain::Application, "recovery-domain", 1)
+            .unwrap();
+        let application = registry
+            .publish_if_latest(
+                application,
+                vec![((), ResultAction::OpenIndexedPath)],
+                || true,
+                |request, items| (request, items[0].0.clone()),
+            )
+            .unwrap();
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        let observed_unlocked = Cell::new(false);
+        assert!(index.transition_recovery(&reporter, || {
+            observed_unlocked.set(index.state.try_lock().is_ok());
+            registry.invalidate_domain(QueryDomain::File)
+        }));
+        assert_eq!(
+            registry.resolve(&application.0, &application.1),
+            Ok(ResultAction::OpenIndexedPath)
+        );
+        assert!(observed_unlocked.get());
+    }
+
+    #[test]
+    fn recovery_quiesces_before_destructive_operations() {
+        let (index, _) = active_task7_index();
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        let destructive = Cell::new(0);
+        let reopen = Cell::new(0);
+        assert!(!index.drive_recovery_with(
+            std::time::Instant::now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(Vec::new()),
+            |_| {
+                destructive.set(destructive.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                reopen.set(reopen.get() + 1);
+                Store::open_in_memory_for_test("identity-a")
+                    .map_err(|_| FileIndexError::Unavailable)
+            },
+        ));
+        assert_eq!(destructive.get(), 0);
+        drop(reporter);
+        assert!(index.drive_recovery_with(
+            std::time::Instant::now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(Vec::new()),
+            |_| {
+                destructive.set(destructive.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                reopen.set(reopen.get() + 1);
+                Store::open_in_memory_for_test("identity-a")
+                    .map_err(|_| FileIndexError::Unavailable)
+            },
+        ));
+        assert_eq!(destructive.get(), 3);
+        assert_eq!(reopen.get(), 1);
+    }
+
+    #[test]
+    fn recovery_reopens_once_with_monotonic_revision() {
+        let (index, _) = active_task7_index();
+        let before = index.revision_for_test();
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        drop(reporter);
+        let reopen = Cell::new(0);
+        assert!(index.drive_recovery_with(
+            std::time::Instant::now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(Vec::new()),
+            |_| Ok(()),
+            |_, _| {
+                reopen.set(reopen.get() + 1);
+                Store::open_in_memory_for_test("identity-a")
+                    .map_err(|_| FileIndexError::Unavailable)
+            },
+        ));
+        assert_eq!(reopen.get(), 1);
+        assert!(index.revision_for_test() > before);
+        assert!(index.admission_open_for_test());
+    }
+
+    #[test]
+    fn recovery_first_use_corruption_is_consumed_by_owned_coordinator() {
+        let lifecycle = Arc::new(crate::lifecycle::LifecycleCoordinator::default());
+        let index = Arc::new(FileIndex::new(lifecycle, ResultRegistry::default()));
+        let dir = TestDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("file-index.sqlite3"),
+            b"not a sqlite database",
+        )
+        .unwrap();
+
+        assert!(index
+            .search_with(
+                dir.path(),
+                query(),
+                0,
+                authenticate_app_data_root,
+                open_store,
+                |_, _| panic!("corrupt first open must not query"),
+            )
+            .is_err());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            {
+                let state = index.state.lock().unwrap();
+                if state.recovery_owner.is_none() && state.admission_open && state.store.is_some() {
+                    assert_eq!(
+                        state.authenticated_app_data_root.as_deref(),
+                        Some(fs::canonicalize(dir.path()).unwrap().as_path())
+                    );
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned coordinator did not consume recovery"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(index);
+    }
+
+    #[test]
+    fn recovery_waits_for_integrity_join_after_db_reservation_drops() {
+        let (index, _) = active_task7_index();
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        let integrity_reservation = index.reserve_db_work_for_test(0).unwrap();
+        let release = Arc::new(Barrier::new(2));
+        let worker_release = Arc::clone(&release);
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = thread::spawn(move || {
+            drop(integrity_reservation);
+            worker_release.wait();
+        });
+        *index.integrity_worker.lock().unwrap() = Some(super::IntegrityWorkerRecord {
+            runtime_epoch: 0,
+            stop,
+            join: Some(join),
+        });
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        drop(reporter);
+        let deletes = Cell::new(0);
+        assert!(!index.drive_recovery_with(
+            Instant::now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(Vec::new()),
+            |_| {
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+            |_, _| Store::open_in_memory_for_test("identity-a")
+                .map_err(|_| FileIndexError::Unavailable),
+        ));
+        assert_eq!(deletes.get(), 0);
+        release.wait();
+        while index
+            .integrity_worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|worker| worker.join.as_ref())
+            .is_some_and(|join| !join.is_finished())
+        {
+            thread::yield_now();
+        }
+        assert!(index.drive_recovery_with(
+            Instant::now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(Vec::new()),
+            |_| {
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+            |_, _| Store::open_in_memory_for_test("identity-a")
+                .map_err(|_| FileIndexError::Unavailable),
+        ));
+        assert_eq!(deletes.get(), 3);
+    }
+
+    #[test]
+    fn recovery_final_publish_uses_current_inventory_and_clears_old_ownership() {
+        let (index, _) = active_task7_index();
+        let old = volume();
+        let mut current_identity = volume();
+        current_identity.volume_serial = old.volume_serial + 1;
+        let current = super::FixedVolume {
+            identity: current_identity.clone(),
+            mount_point: PathBuf::from(r"D:\"),
+        };
+        {
+            let mut state = index.state.lock().unwrap();
+            state.inventory_previous_authenticated = Some(vec![old.clone()]);
+            state.pending_inventory_transitions.insert(old.clone());
+            state.authenticated_volumes = vec![old.clone()];
+            state.authenticated_mounts = vec![(old.clone(), r"C:\".to_owned())];
+            state.authenticated_app_data_root = Some(PathBuf::from(r"C:\app-data"));
+        }
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        drop(reporter);
+        assert!(index.drive_recovery_with(
+            Instant::now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(vec![current.clone()]),
+            |_| Ok(()),
+            |_, _| Store::open_in_memory_for_test("identity-a")
+                .map_err(|_| FileIndexError::Unavailable),
+        ));
+        let state = index.state.lock().unwrap();
+        assert!(state.inventory_previous_authenticated.is_none());
+        assert!(state.pending_inventory_transitions.is_empty());
+        assert!(state.authenticated_volumes.is_empty());
+        assert_eq!(
+            state.authenticated_mounts,
+            vec![(current_identity.clone(), r"D:\".to_owned())]
+        );
+        assert_eq!(
+            state.quarantined_volumes,
+            std::collections::HashSet::from([current_identity.clone()])
+        );
+        drop(state);
+        let coordinator = index.coordinator.state.lock().unwrap();
+        assert_eq!(
+            coordinator.volumes.keys().cloned().collect::<Vec<_>>(),
+            vec![current_identity]
+        );
+        assert_eq!(coordinator.active_root, Some(PathBuf::from(r"C:\app-data")));
+    }
+
+    #[test]
+    fn recovery_deadline_at_final_publish_latches_without_recursive_coordinator_lock() {
+        let (index, _) = active_task7_index();
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        drop(reporter);
+        let deadline = index.state.lock().unwrap().recovery_deadline.unwrap();
+        let inventory_seen = Cell::new(false);
+        let after_inventory = Cell::new(0usize);
+        let now = || {
+            if !inventory_seen.get() {
+                deadline - Duration::from_nanos(1)
+            } else {
+                let call = after_inventory.get() + 1;
+                after_inventory.set(call);
+                if call < 3 {
+                    deadline - Duration::from_nanos(1)
+                } else {
+                    deadline
+                }
+            }
+        };
+        assert!(!index.drive_recovery_with(
+            now,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || {
+                inventory_seen.set(true);
+                Ok(Vec::new())
+            },
+            |_| Ok(()),
+            |_, _| Store::open_in_memory_for_test("identity-a")
+                .map_err(|_| FileIndexError::Unavailable),
+        ));
+        let state = index.state.lock().unwrap();
+        assert!(state.fatal_unavailable);
+        assert!(state.recovery_owner.is_none());
+        assert!(state.store.is_none());
+        drop(state);
+        assert!(index.coordinator.state.try_lock().is_ok());
+    }
+
+    #[test]
+    fn recovery_timeout_wins_over_outstanding_db_work_without_closing_store() {
+        let (index, _) = active_task7_index();
+        let reporter = index.reserve_db_work_for_test(0).unwrap();
+        let blocker = index.reserve_db_work_for_test(0).unwrap();
+        assert!(index.transition_recovery(&reporter, || {
+            index.registry.invalidate_domain(QueryDomain::File)
+        }));
+        drop(reporter);
+        let deadline = index.state.lock().unwrap().recovery_deadline.unwrap();
+        let deletes = Cell::new(0);
+        let opens = Cell::new(0);
+        assert!(!index.drive_recovery_with(
+            || deadline,
+            || Ok(PathBuf::from("file-index.sqlite3")),
+            || Ok(Vec::new()),
+            |_| {
+                deletes.set(deletes.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                opens.set(opens.get() + 1);
+                Store::open_in_memory_for_test("identity-a")
+                    .map_err(|_| FileIndexError::Unavailable)
+            },
+        ));
+        let state = index.state.lock().unwrap();
+        assert!(state.fatal_unavailable);
+        assert!(!state.admission_open);
+        assert!(state.store.is_some());
+        assert!(state.recovery_owner.is_none());
+        drop(state);
+        assert_eq!(deletes.get(), 0);
+        assert_eq!(opens.get(), 0);
+        drop(blocker);
+        assert_eq!(index.db_work_count_for_test(), 0);
+        assert!(!index.drive_recovery());
+    }
+
+    #[test]
+    fn recovery_create_schema_and_seed_revalidate_cleaning_at_every_stage() {
+        for cancelled_stage in 1..=7usize {
+            let (index, lifecycle) = active_task7_index();
+            let reporter = index.reserve_db_work_for_test(0).unwrap();
+            assert!(index.transition_recovery(&reporter, || {
+                index.registry.invalidate_domain(QueryDomain::File)
+            }));
+            drop(reporter);
+            let directory = TestDir::new();
+            fs::create_dir_all(directory.path()).unwrap();
+            let database = directory.path().join("file-index.sqlite3");
+            let authorizations = Cell::new(0usize);
+            let later_stage = Cell::new(false);
+            assert!(!index.drive_recovery_with(
+                Instant::now,
+                || Ok(database.clone()),
+                || Ok(Vec::new()),
+                |_| Ok(()),
+                |path, authorize| {
+                    Store::open_authorized(path, "identity-a", || {
+                        let call = authorizations.get() + 1;
+                        authorizations.set(call);
+                        if call == cancelled_stage {
+                            lifecycle.set_file_index_mirror_for_test(
+                                crate::lifecycle::FileIndexPhase::Cleaning,
+                                1,
+                            );
+                        } else if call > cancelled_stage {
+                            later_stage.set(true);
+                        }
+                        authorize()
+                    })
+                    .map_err(super::map_store_error)
+                },
+            ));
+            assert_eq!(authorizations.get(), cancelled_stage);
+            assert!(!later_stage.get());
+            assert!(!index.state.lock().unwrap().fatal_unavailable);
+            drop(index);
+        }
+    }
+
+    #[test]
+    fn cleaning_pause_return_running_and_terminal_are_linearized() {
+        let (index, lifecycle) = active_task7_index();
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+        assert!(index.start_cleaning_for_test(1));
+        assert!(!index.admission_open_for_test());
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Running, 1);
+        assert!(index.return_running_for_test(1));
+        assert!(index.complete_pause_for_test());
+        assert_eq!(index.mode_for_test(), LifecycleMode::Uninitialized);
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Terminal, 1);
+        index.terminal_for_test(1);
+        assert_eq!(index.mode_for_test(), LifecycleMode::Terminal);
+        assert!(!index.return_running_for_test(1));
+    }
+
+    #[test]
+    fn cleaning_attempt_handover_cannot_wedge() {
+        let (index, lifecycle) = active_task7_index();
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 1);
+        assert!(index.start_cleaning_for_test(1));
+        let epoch = index.runtime_epoch();
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 2);
+        assert!(index.start_cleaning_for_test(2));
+        assert_eq!(index.runtime_epoch(), epoch);
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Running, 2);
+        assert!(index.return_running_for_test(2));
+        assert!(index.complete_pause_for_test());
+        assert_eq!(index.mode_for_test(), LifecycleMode::Uninitialized);
+    }
+
+    #[test]
+    fn cleaning_without_a_started_file_session_is_vacuously_clean() {
+        let lifecycle = Arc::new(crate::lifecycle::LifecycleCoordinator::default());
+        let index = Arc::new(FileIndex::new(
+            Arc::clone(&lifecycle),
+            ResultRegistry::default(),
+        ));
+        lifecycle.set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 11);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(index.start_cleaning_until(11, deadline));
+        let waits = Cell::new(0);
+        assert!(index.mark_clean_close_with(11, Instant::now, || { waits.set(waits.get() + 1) }));
+        assert_eq!(waits.get(), 0);
+
+        let blocked_lifecycle = Arc::new(crate::lifecycle::LifecycleCoordinator::default());
+        let blocked = Arc::new(FileIndex::new(
+            Arc::clone(&blocked_lifecycle),
+            ResultRegistry::default(),
+        ));
+        blocked.state.lock().unwrap().session_started = true;
+        blocked_lifecycle
+            .set_file_index_mirror_for_test(crate::lifecycle::FileIndexPhase::Cleaning, 12);
+        assert!(blocked.start_cleaning_until(12, deadline));
+        assert!(!blocked.mark_clean_close_with(12, Instant::now, || {
+            panic!("unreachable clean-close state must reject without waiting")
+        }));
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -3071,6 +3966,7 @@ pub(crate) enum FileIndexStatus {
     Building,
     Ready,
     Partial,
+    Rebuilding,
     Unavailable,
 }
 
@@ -3123,14 +4019,22 @@ pub(crate) struct FileSearchBatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Availability {
     Normal,
+    Rebuilding,
     Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleMode {
     Uninitialized,
-    Opening { owner: u64 },
+    Opening {
+        owner: u64,
+    },
     Active,
+    Pausing {
+        attempt_epoch: u64,
+        resume_requested: bool,
+    },
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3145,6 +4049,14 @@ enum AdmissionError {
     EpochMismatch,
     OwnerExhausted,
     WrongMode,
+    Lifecycle,
+    CounterExhausted,
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionKind {
+    LazyInit,
+    DbWork,
 }
 
 struct IndexState {
@@ -3155,6 +4067,10 @@ struct IndexState {
     fatal_unavailable: bool,
     runtime_epoch: u64,
     index_revision_high_water: u64,
+    db_work: usize,
+    recovery_owner: Option<u64>,
+    recovery_deadline: Option<std::time::Instant>,
+    pause_deadline: Option<std::time::Instant>,
     inventory_observation: u64,
     authenticated_volumes: Vec<VolumeIdentity>,
     authenticated_mounts: Vec<(VolumeIdentity, String)>,
@@ -3163,6 +4079,15 @@ struct IndexState {
     quarantined_volumes: HashSet<VolumeIdentity>,
     authenticated_app_data_root: Option<PathBuf>,
     store: Option<Store>,
+    retained_store: Option<Store>,
+    session_started: bool,
+    prior_integrity: Option<store::PriorIntegrityMetadata>,
+    integrity_started: bool,
+    integrity_pending: bool,
+    clean_close_permit_issued: bool,
+    hide_requested: bool,
+    hide_dispatching: bool,
+    hide_issued: bool,
 }
 
 impl Default for IndexState {
@@ -3175,6 +4100,10 @@ impl Default for IndexState {
             fatal_unavailable: false,
             runtime_epoch: 0,
             index_revision_high_water: 0,
+            db_work: 0,
+            recovery_owner: None,
+            recovery_deadline: None,
+            pause_deadline: None,
             inventory_observation: 0,
             authenticated_volumes: Vec::new(),
             authenticated_mounts: Vec::new(),
@@ -3183,6 +4112,15 @@ impl Default for IndexState {
             quarantined_volumes: HashSet::new(),
             authenticated_app_data_root: None,
             store: None,
+            retained_store: None,
+            session_started: false,
+            prior_integrity: None,
+            integrity_started: false,
+            integrity_pending: false,
+            clean_close_permit_issued: false,
+            hide_requested: false,
+            hide_dispatching: false,
+            hide_issued: false,
         }
     }
 }
@@ -3193,8 +4131,7 @@ impl IndexState {
         publication_generation: &AtomicU64,
     ) -> Result<u64, AdmissionError> {
         let Some(next) = self.index_revision_high_water.checked_add(1) else {
-            self.latch_unavailable(publication_generation);
-            return Err(AdmissionError::Unavailable);
+            return Err(AdmissionError::CounterExhausted);
         };
         let persisted = self
             .store
@@ -3213,8 +4150,9 @@ impl IndexState {
         Ok(next)
     }
 
-    fn latch_unavailable(&mut self, publication_generation: &AtomicU64) {
-        if !self.fatal_unavailable {
+    fn latch_unavailable(&mut self, publication_generation: &AtomicU64) -> bool {
+        let newly_fatal = !self.fatal_unavailable;
+        if newly_fatal {
             let _ = publication_generation.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -3231,13 +4169,15 @@ impl IndexState {
         self.quarantined_volumes.clear();
         self.authenticated_app_data_root = None;
         self.store = None;
+        self.retained_store = None;
+        newly_fatal
     }
 }
 
 fn begin_lazy_init_locked(
     state: &mut IndexState,
     expected_runtime_epoch: u64,
-    publication_generation: &AtomicU64,
+    _publication_generation: &AtomicU64,
 ) -> Result<LazyInitDecision, AdmissionError> {
     if state.fatal_unavailable || state.availability == Availability::Unavailable {
         return Err(AdmissionError::Unavailable);
@@ -3248,7 +4188,6 @@ fn begin_lazy_init_locked(
     match state.mode {
         LifecycleMode::Uninitialized => {
             let Some(owner) = state.lazy_owner_high_water.checked_add(1) else {
-                state.latch_unavailable(publication_generation);
                 return Err(AdmissionError::OwnerExhausted);
             };
             state.lazy_owner_high_water = owner;
@@ -3257,13 +4196,16 @@ fn begin_lazy_init_locked(
             Ok(LazyInitDecision::Start { owner })
         }
         LifecycleMode::Opening { .. } => Ok(LazyInitDecision::ObserveBuilding),
-        LifecycleMode::Active => Err(AdmissionError::WrongMode),
+        LifecycleMode::Active | LifecycleMode::Pausing { .. } | LifecycleMode::Terminal => {
+            Err(AdmissionError::WrongMode)
+        }
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileIndexError {
     Unavailable,
+    RecoveryRequired,
 }
 
 fn validate_index_path_shape(
@@ -3323,19 +4265,15 @@ fn authenticate_app_data_root(app_data_dir: &Path) -> Result<PathBuf, FileIndexE
 
 fn open_store(database: &Path) -> Result<(Store, u64, Option<u64>), FileIndexError> {
     let identity = ordinal_sort_identity().map_err(|_| FileIndexError::Unavailable)?;
-    let mut store = Store::open(database, &identity).map_err(|_| FileIndexError::Unavailable)?;
+    let mut store = Store::open(database, &identity).map_err(map_store_error)?;
     let identity_change = store
         .ensure_sort_identity(&identity)
-        .map_err(|_| FileIndexError::Unavailable)?;
+        .map_err(map_store_error)?;
     let mut revision = match identity_change {
         Some((_, revision)) => revision,
-        None => store
-            .index_revision()
-            .map_err(|_| FileIndexError::Unavailable)?,
+        None => store.index_revision().map_err(map_store_error)?,
     };
-    let recovered = store
-        .recover_candidates()
-        .map_err(|_| FileIndexError::Unavailable)?;
+    let recovered = store.recover_candidates().map_err(map_store_error)?;
     if let Some(recovered) = recovered {
         revision = recovered;
     }
@@ -3350,11 +4288,96 @@ fn open_store(database: &Path) -> Result<(Store, u64, Option<u64>), FileIndexErr
 }
 
 pub(crate) struct FileIndex {
-    state: Mutex<IndexState>,
+    state: Arc<Mutex<IndexState>>,
+    lifecycle: Arc<LifecycleCoordinator>,
+    registry: ResultRegistry,
+    main_window_hwnd: AtomicIsize,
     coordinator: Arc<CoordinatorControl>,
     workers: Mutex<WorkerRegistry>,
+    integrity_worker: Mutex<Option<IntegrityWorkerRecord>>,
     publication_runtime_epoch: AtomicU64,
     publication_generation: AtomicU64,
+}
+
+fn map_store_error(error: StoreError) -> FileIndexError {
+    match error {
+        StoreError::Corrupt => FileIndexError::RecoveryRequired,
+        StoreError::Sqlite
+        | StoreError::InvalidData
+        | StoreError::Platform
+        | StoreError::RevisionExhausted => FileIndexError::Unavailable,
+    }
+}
+
+struct DbWorkReservation {
+    state: Arc<Mutex<IndexState>>,
+    coordinator: Arc<CoordinatorControl>,
+    runtime_epoch: u64,
+    released: bool,
+}
+
+enum SearchAdmission {
+    Work {
+        owner: Option<u64>,
+        reservation: DbWorkReservation,
+    },
+    Immediate(FileSearchBatch),
+}
+
+struct CleanCloseMarkerPermit {
+    attempt_epoch: u64,
+    state: Weak<Mutex<IndexState>>,
+    lifecycle: Arc<LifecycleCoordinator>,
+}
+
+impl CleanCloseMarkerPermit {
+    fn is_authorized(&self) -> bool {
+        if self.lifecycle.file_index_phase() != FileIndexPhase::Cleaning
+            || self.lifecycle.file_index_attempt_epoch() != self.attempt_epoch
+        {
+            return false;
+        }
+        self.state.upgrade().is_some_and(|state| {
+            let state = state.lock().expect("file index lock poisoned");
+            state.mode
+                == (LifecycleMode::Pausing {
+                    attempt_epoch: self.attempt_epoch,
+                    resume_requested: false,
+                })
+                && state.clean_close_permit_issued
+        })
+    }
+}
+
+enum CleanCloseReadiness {
+    Permit(Store, CleanCloseMarkerPermit),
+    Vacuous,
+    Wait,
+    Reject,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryBoundary {
+    Authorized,
+    Waiting,
+    Cancelled,
+    TimedOut,
+}
+
+impl Drop for DbWorkReservation {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        state.db_work = state
+            .db_work
+            .checked_sub(1)
+            .expect("file index DB-work reservation underflow");
+        self.released = true;
+        drop(state);
+        self.coordinator.signal.notify_all();
+    }
 }
 
 struct IndexChangeBatch {
@@ -3501,6 +4524,7 @@ struct CoordinatorState {
     running: bool,
     calibrated: bool,
     pending_root: Option<PathBuf>,
+    pending_runtime_epoch: Option<u64>,
     active_root: Option<PathBuf>,
     wakes: u64,
     volumes: HashMap<VolumeIdentity, VolumeRuntime>,
@@ -3522,6 +4546,7 @@ struct WorkerRegistry {
 
 struct WorkerRecord {
     owner: u64,
+    runtime_epoch: u64,
     mount_point: PathBuf,
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
@@ -3529,9 +4554,23 @@ struct WorkerRecord {
     failed: bool,
 }
 
+#[cfg(test)]
 enum WorkerPreparation {
     Existing,
     Start { owner: u64 },
+}
+
+struct WorkerStart {
+    owner: u64,
+    runtime_epoch: u64,
+    stop: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    reservation: DbWorkReservation,
+}
+
+enum WorkerStartDecision {
+    Existing,
+    Start(WorkerStart),
 }
 
 #[cfg(not(test))]
@@ -3547,6 +4586,7 @@ struct ScanReplayContext<'a> {
     generation: u64,
     has_committed: bool,
     owner: u64,
+    runtime_epoch: u64,
 }
 
 #[cfg(not(test))]
@@ -3597,19 +4637,1176 @@ fn send_scan_message(
 
 impl Default for FileIndex {
     fn default() -> Self {
+        Self::new(
+            Arc::new(LifecycleCoordinator::default()),
+            ResultRegistry::default(),
+        )
+    }
+}
+
+struct IntegrityWorkerRecord {
+    runtime_epoch: u64,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FileIndex {
+    pub(crate) fn new(lifecycle: Arc<LifecycleCoordinator>, registry: ResultRegistry) -> Self {
         Self {
-            state: Mutex::new(IndexState::default()),
+            state: Arc::new(Mutex::new(IndexState::default())),
+            lifecycle,
+            registry,
+            main_window_hwnd: AtomicIsize::new(0),
             coordinator: Arc::new(CoordinatorControl::default()),
             workers: Mutex::new(WorkerRegistry::default()),
+            integrity_worker: Mutex::new(None),
             publication_runtime_epoch: AtomicU64::new(0),
             publication_generation: AtomicU64::new(0),
         }
     }
-}
 
-impl FileIndex {
+    pub(crate) fn install_main_window_hwnd(&self, hwnd: isize) -> Result<(), FileIndexError> {
+        if hwnd == 0 {
+            return Err(FileIndexError::Unavailable);
+        }
+        self.main_window_hwnd
+            .compare_exchange(0, hwnd, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| FileIndexError::Unavailable)
+    }
+
+    pub(crate) fn clear_main_window_hwnd(&self, hwnd: isize) {
+        let _ =
+            self.main_window_hwnd
+                .compare_exchange(hwnd, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn post_close_after_fatal(hwnd: isize) -> bool {
+        unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut std::ffi::c_void)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .is_ok()
+        }
+    }
+
+    pub(crate) fn fail_closed_exhaustion(&self) {
+        let newly_fatal = {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            self.latch_exhaustion_locked(&mut state)
+        };
+        if newly_fatal {
+            self.consume_fatal_effects();
+        }
+    }
+
+    fn latch_exhaustion_locked(&self, state: &mut IndexState) -> bool {
+        let newly_fatal = self.latch_process_fatal(state);
+        if newly_fatal {
+            state.hide_requested = true;
+        }
+        newly_fatal
+    }
+
+    fn consume_fatal_effects(&self) {
+        self.consume_fatal_effects_with(Self::post_close_after_fatal);
+    }
+
+    fn consume_fatal_effects_with<P>(&self, post: P)
+    where
+        P: FnOnce(isize) -> bool,
+    {
+        {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            if !state.hide_requested || state.hide_dispatching || state.hide_issued {
+                return;
+            }
+            state.hide_dispatching = true;
+        }
+        let _ = self.registry.invalidate_domain(QueryDomain::File);
+        let hwnd = self.main_window_hwnd.load(Ordering::Acquire);
+        let posted = hwnd != 0 && post(hwnd);
+        {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            state.hide_dispatching = false;
+            if posted && !state.hide_issued {
+                state.hide_issued = true;
+                state.hide_requested = false;
+            }
+        }
+    }
+
     pub(crate) fn runtime_epoch(&self) -> u64 {
         self.publication_runtime_epoch.load(Ordering::Acquire)
+    }
+
+    fn admit_locked(
+        &self,
+        state: &IndexState,
+        kind: AdmissionKind,
+        expected_runtime_epoch: u64,
+    ) -> Result<(), AdmissionError> {
+        if self.lifecycle.file_index_phase() != FileIndexPhase::Running {
+            return Err(AdmissionError::Lifecycle);
+        }
+        if state.fatal_unavailable || state.availability == Availability::Unavailable {
+            return Err(AdmissionError::Unavailable);
+        }
+        if state.runtime_epoch != expected_runtime_epoch {
+            return Err(AdmissionError::EpochMismatch);
+        }
+        match kind {
+            AdmissionKind::LazyInit
+                if matches!(
+                    state.mode,
+                    LifecycleMode::Uninitialized | LifecycleMode::Opening { .. }
+                ) =>
+            {
+                Ok(())
+            }
+            AdmissionKind::DbWork
+                if state.mode == LifecycleMode::Active && state.admission_open =>
+            {
+                Ok(())
+            }
+            AdmissionKind::LazyInit | AdmissionKind::DbWork => Err(AdmissionError::WrongMode),
+        }
+    }
+
+    fn reserve_db_work(
+        &self,
+        expected_runtime_epoch: u64,
+    ) -> Result<DbWorkReservation, AdmissionError> {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        self.admit_locked(&state, AdmissionKind::DbWork, expected_runtime_epoch)?;
+        let result = self.reserve_db_work_locked(&mut state, expected_runtime_epoch);
+        let consume_fatal = state.hide_requested;
+        drop(state);
+        if consume_fatal {
+            self.consume_fatal_effects();
+        }
+        result
+    }
+
+    fn reserve_db_work_locked(
+        &self,
+        state: &mut IndexState,
+        expected_runtime_epoch: u64,
+    ) -> Result<DbWorkReservation, AdmissionError> {
+        let Some(next) = state.db_work.checked_add(1) else {
+            self.latch_exhaustion_locked(state);
+            return Err(AdmissionError::CounterExhausted);
+        };
+        state.db_work = next;
+        Ok(DbWorkReservation {
+            state: Arc::clone(&self.state),
+            coordinator: Arc::clone(&self.coordinator),
+            runtime_epoch: expected_runtime_epoch,
+            released: false,
+        })
+    }
+
+    fn begin_search(&self, expected_runtime_epoch: u64) -> Result<SearchAdmission, FileIndexError> {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if self.lifecycle.file_index_phase() != FileIndexPhase::Running {
+            return Ok(SearchAdmission::Immediate(empty_batch(
+                expected_runtime_epoch,
+                self.publication_generation.load(Ordering::Acquire),
+                state.index_revision_high_water,
+                FileIndexStatus::Unavailable,
+            )));
+        }
+        if state.runtime_epoch != expected_runtime_epoch {
+            return Err(FileIndexError::Unavailable);
+        }
+        if state.fatal_unavailable {
+            return Ok(SearchAdmission::Immediate(empty_batch(
+                expected_runtime_epoch,
+                self.publication_generation.load(Ordering::Acquire),
+                state.index_revision_high_water,
+                FileIndexStatus::Unavailable,
+            )));
+        }
+        if state.availability == Availability::Rebuilding {
+            return Ok(SearchAdmission::Immediate(empty_batch(
+                expected_runtime_epoch,
+                self.publication_generation.load(Ordering::Acquire),
+                state.index_revision_high_water,
+                FileIndexStatus::Rebuilding,
+            )));
+        }
+        let owner = match state.mode {
+            LifecycleMode::Active => {
+                self.admit_locked(&state, AdmissionKind::DbWork, expected_runtime_epoch)
+                    .map_err(|_| FileIndexError::Unavailable)?;
+                None
+            }
+            LifecycleMode::Uninitialized | LifecycleMode::Opening { .. } => {
+                self.admit_locked(&state, AdmissionKind::LazyInit, expected_runtime_epoch)
+                    .map_err(|_| FileIndexError::Unavailable)?;
+                match begin_lazy_init_locked(
+                    &mut state,
+                    expected_runtime_epoch,
+                    &self.publication_generation,
+                ) {
+                    Err(AdmissionError::OwnerExhausted) => {
+                        let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                        drop(state);
+                        if newly_fatal {
+                            self.consume_fatal_effects();
+                        }
+                        return Err(FileIndexError::Unavailable);
+                    }
+                    Err(_) => return Err(FileIndexError::Unavailable),
+                    Ok(LazyInitDecision::Start { owner }) => Some(owner),
+                    Ok(LazyInitDecision::ObserveBuilding) => {
+                        return Ok(SearchAdmission::Immediate(empty_batch(
+                            expected_runtime_epoch,
+                            self.publication_generation.load(Ordering::Acquire),
+                            state.index_revision_high_water,
+                            FileIndexStatus::Building,
+                        )));
+                    }
+                }
+            }
+            LifecycleMode::Pausing { .. } | LifecycleMode::Terminal => {
+                return Ok(SearchAdmission::Immediate(empty_batch(
+                    expected_runtime_epoch,
+                    self.publication_generation.load(Ordering::Acquire),
+                    state.index_revision_high_water,
+                    FileIndexStatus::Unavailable,
+                )));
+            }
+        };
+        let reservation = self
+            .reserve_db_work_locked(&mut state, expected_runtime_epoch)
+            .map_err(|_| FileIndexError::Unavailable);
+        let consume_fatal = state.hide_requested;
+        drop(state);
+        if consume_fatal {
+            self.consume_fatal_effects();
+        }
+        Ok(SearchAdmission::Work {
+            owner,
+            reservation: reservation?,
+        })
+    }
+
+    #[cfg(test)]
+    fn reserve_db_work_for_test(
+        &self,
+        expected_runtime_epoch: u64,
+    ) -> Result<DbWorkReservation, AdmissionError> {
+        self.reserve_db_work(expected_runtime_epoch)
+    }
+
+    #[cfg(test)]
+    fn db_work_count_for_test(&self) -> usize {
+        self.state.lock().expect("file index lock poisoned").db_work
+    }
+
+    #[cfg(test)]
+    fn begin_lazy_for_test(
+        &self,
+        expected_runtime_epoch: u64,
+    ) -> Result<LazyInitDecision, AdmissionError> {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        self.admit_locked(&state, AdmissionKind::LazyInit, expected_runtime_epoch)?;
+        begin_lazy_init_locked(
+            &mut state,
+            expected_runtime_epoch,
+            &self.publication_generation,
+        )
+    }
+
+    fn transition_recovery<I>(self: &Arc<Self>, reporter: &DbWorkReservation, invalidate: I) -> bool
+    where
+        I: FnOnce() -> Result<(), crate::result_registry::DomainEpochExhausted>,
+    {
+        if !Arc::ptr_eq(&self.state, &reporter.state) {
+            return false;
+        }
+        let recovery_owner = {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            if self
+                .admit_locked(&state, AdmissionKind::DbWork, reporter.runtime_epoch)
+                .is_err()
+                || state.recovery_owner.is_some()
+            {
+                return false;
+            }
+            let Some(runtime_epoch) = state.runtime_epoch.checked_add(1) else {
+                let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                drop(state);
+                if newly_fatal {
+                    self.consume_fatal_effects();
+                }
+                return false;
+            };
+            let Some(revision) = state.index_revision_high_water.checked_add(1) else {
+                let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                drop(state);
+                if newly_fatal {
+                    self.consume_fatal_effects();
+                }
+                return false;
+            };
+            state.index_revision_high_water = revision;
+            state.recovery_owner = Some(runtime_epoch);
+            state.recovery_deadline = Some(
+                std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(5))
+                    .expect("five second recovery deadline overflowed"),
+            );
+            state.runtime_epoch = runtime_epoch;
+            state.availability = Availability::Rebuilding;
+            state.admission_open = false;
+            self.publication_runtime_epoch
+                .store(runtime_epoch, Ordering::Release);
+            runtime_epoch
+        };
+
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            for worker in workers.by_volume.values_mut() {
+                worker.stop.store(true, Ordering::Release);
+            }
+        }
+        if let Some(worker) = self
+            .integrity_worker
+            .lock()
+            .expect("file index integrity join lock poisoned")
+            .as_ref()
+        {
+            worker.stop.store(true, Ordering::Release);
+        }
+        {
+            let mut coordinator = self
+                .coordinator
+                .state
+                .lock()
+                .expect("file index coordinator lock poisoned");
+            coordinator.pending_root = None;
+            coordinator.pending_runtime_epoch = None;
+            coordinator.calibrated = false;
+            for runtime in coordinator.volumes.values_mut() {
+                runtime.cancel_pending();
+            }
+        }
+        if invalidate().is_err() {
+            let still_owner = self
+                .state
+                .lock()
+                .expect("file index lock poisoned")
+                .recovery_owner
+                == Some(recovery_owner);
+            if still_owner {
+                self.fail_closed_exhaustion();
+            }
+            return false;
+        }
+        self.coordinator.signal.notify_all();
+        true
+    }
+
+    fn request_recovery(self: &Arc<Self>, reporter: &DbWorkReservation) -> bool {
+        let won = self.transition_recovery(reporter, || {
+            self.registry.invalidate_domain(QueryDomain::File)
+        });
+        if won {
+            self.ensure_coordinator_thread();
+            self.coordinator.signal.notify_all();
+        }
+        won
+    }
+
+    fn classify_recovery_boundary(
+        &self,
+        state: &IndexState,
+        owner: u64,
+        now: std::time::Instant,
+    ) -> RecoveryBoundary {
+        if state.recovery_owner != Some(owner)
+            || state.runtime_epoch != owner
+            || state.mode != LifecycleMode::Active
+            || state.fatal_unavailable
+            || self.lifecycle.file_index_phase() != FileIndexPhase::Running
+        {
+            return RecoveryBoundary::Cancelled;
+        }
+        if state
+            .recovery_deadline
+            .is_none_or(|deadline| now >= deadline)
+        {
+            return RecoveryBoundary::TimedOut;
+        }
+        if state.db_work != 0 {
+            return RecoveryBoundary::Waiting;
+        }
+        RecoveryBoundary::Authorized
+    }
+
+    fn recovery_boundary_locked(
+        &self,
+        state: &mut IndexState,
+        owner: u64,
+        now: std::time::Instant,
+    ) -> RecoveryBoundary {
+        let boundary = self.classify_recovery_boundary(state, owner, now);
+        if boundary == RecoveryBoundary::TimedOut {
+            state.recovery_owner = None;
+            state.recovery_deadline = None;
+            self.latch_recovery_timeout(state);
+        }
+        boundary
+    }
+
+    fn recovery_boundary(&self, owner: u64, now: std::time::Instant) -> RecoveryBoundary {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        self.recovery_boundary_locked(&mut state, owner, now)
+    }
+
+    fn fail_recovery_if_authorized(&self, owner: u64, now: std::time::Instant) {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if self.recovery_boundary_locked(&mut state, owner, now) == RecoveryBoundary::Authorized {
+            state.recovery_owner = None;
+            state.recovery_deadline = None;
+            self.latch_process_fatal(&mut state);
+        }
+    }
+
+    fn drive_recovery_with<N, R, V, D, O>(
+        &self,
+        mut now: N,
+        mut reauthenticate: R,
+        mut inventory: V,
+        mut delete: D,
+        mut open: O,
+    ) -> bool
+    where
+        N: FnMut() -> std::time::Instant,
+        R: FnMut() -> Result<PathBuf, FileIndexError>,
+        V: FnMut() -> Result<Vec<FixedVolume>, FileIndexError>,
+        D: FnMut(&Path) -> Result<(), FileIndexError>,
+        O: FnMut(&Path, &mut dyn FnMut() -> bool) -> Result<Store, FileIndexError>,
+    {
+        let owner = {
+            let state = self.state.lock().expect("file index lock poisoned");
+            let Some(owner) = state.recovery_owner else {
+                return false;
+            };
+            owner
+        };
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        self.reap_finished_workers();
+        self.reap_finished_integrity();
+        if !self
+            .workers
+            .lock()
+            .expect("file index worker lock poisoned")
+            .by_volume
+            .is_empty()
+            || self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned")
+                .is_some()
+            || self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized
+        {
+            return false;
+        }
+
+        let database = match reauthenticate() {
+            Ok(database)
+                if self.recovery_boundary(owner, now()) == RecoveryBoundary::Authorized =>
+            {
+                database
+            }
+            _ => return false,
+        };
+        let retained = {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            if self.recovery_boundary_locked(&mut state, owner, now())
+                != RecoveryBoundary::Authorized
+            {
+                return false;
+            }
+            state.store.take()
+        };
+        drop(retained);
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+
+        for path in [
+            database.clone(),
+            PathBuf::from(format!("{}-wal", database.display())),
+            PathBuf::from(format!("{}-shm", database.display())),
+        ] {
+            if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized
+                || reauthenticate().ok().as_deref() != Some(database.as_path())
+            {
+                return false;
+            }
+            if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+                return false;
+            }
+            if delete(&path).is_err() {
+                self.fail_recovery_if_authorized(owner, now());
+                return false;
+            }
+            if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+                return false;
+            }
+        }
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let mut authorize_open =
+            || self.recovery_boundary(owner, now()) == RecoveryBoundary::Authorized;
+        let mut store = match open(&database, &mut authorize_open) {
+            Ok(store) => store,
+            Err(_) => {
+                self.fail_recovery_if_authorized(owner, now());
+                return false;
+            }
+        };
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let high_water = self
+            .state
+            .lock()
+            .expect("file index lock poisoned")
+            .index_revision_high_water;
+        let mut authorize_high_water =
+            || self.recovery_boundary(owner, now()) == RecoveryBoundary::Authorized;
+        if store
+            .persist_index_revision_authorized(high_water, &mut authorize_high_water)
+            .is_err()
+        {
+            self.fail_recovery_if_authorized(owner, now());
+            return false;
+        }
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let Some(building_revision) = high_water.checked_add(1) else {
+            self.fail_closed_exhaustion();
+            return false;
+        };
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let mut authorize_building =
+            || self.recovery_boundary(owner, now()) == RecoveryBoundary::Authorized;
+        if store
+            .persist_index_revision_authorized(building_revision, &mut authorize_building)
+            .is_err()
+        {
+            self.fail_recovery_if_authorized(owner, now());
+            return false;
+        }
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let volumes = match inventory() {
+            Ok(volumes) => volumes,
+            Err(_) => {
+                self.fail_recovery_if_authorized(owner, now());
+                return false;
+            }
+        };
+        if self.recovery_boundary(owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let mounts = match volumes
+            .iter()
+            .map(|volume| {
+                volume
+                    .mount_point
+                    .to_str()
+                    .map(|mount| (volume.identity.clone(), mount.to_owned()))
+                    .ok_or(FileIndexError::Unavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(mounts) => mounts,
+            Err(_) => {
+                self.fail_recovery_if_authorized(owner, now());
+                return false;
+            }
+        };
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if self.recovery_boundary_locked(&mut state, owner, now()) != RecoveryBoundary::Authorized {
+            return false;
+        }
+        let mut coordinator = self
+            .coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned");
+        let final_now = now();
+        let final_boundary = self.classify_recovery_boundary(&state, owner, final_now);
+        if final_boundary != RecoveryBoundary::Authorized {
+            drop(coordinator);
+            if final_boundary == RecoveryBoundary::TimedOut {
+                state.recovery_owner = None;
+                state.recovery_deadline = None;
+                self.latch_recovery_timeout(&mut state);
+            }
+            drop(state);
+            return false;
+        }
+        state.prior_integrity = Some(store.prior_integrity_metadata());
+        state.session_started = true;
+        state.store = Some(store);
+        state.index_revision_high_water = building_revision;
+        state.recovery_owner = None;
+        state.recovery_deadline = None;
+        state.availability = Availability::Normal;
+        state.admission_open = true;
+        state.authenticated_volumes.clear();
+        state.authenticated_mounts = mounts;
+        state.inventory_previous_authenticated = None;
+        state.pending_inventory_transitions.clear();
+        state.quarantined_volumes = volumes
+            .iter()
+            .map(|volume| volume.identity.clone())
+            .collect();
+        let runtime_epoch = state.runtime_epoch;
+        let pending_at = now();
+        coordinator.volumes.clear();
+        for volume in &volumes {
+            let runtime = coordinator
+                .volumes
+                .entry(volume.identity.clone())
+                .or_default();
+            runtime.calibration = Calibration::Pending {
+                deadline: pending_at,
+                runtime_epoch,
+            };
+            runtime.consecutive_failures = 0;
+        }
+        coordinator.active_root = state.authenticated_app_data_root.clone();
+        coordinator.pending_root = coordinator.active_root.clone();
+        coordinator.pending_runtime_epoch =
+            coordinator.pending_root.as_ref().map(|_| runtime_epoch);
+        coordinator.calibrated = volumes.is_empty();
+        drop(coordinator);
+        drop(state);
+        self.coordinator.signal.notify_all();
+        true
+    }
+
+    fn drive_recovery(&self) -> bool {
+        let root = self
+            .state
+            .lock()
+            .expect("file index lock poisoned")
+            .authenticated_app_data_root
+            .clone();
+        let Some(root) = root else {
+            let owner = self
+                .state
+                .lock()
+                .expect("file index lock poisoned")
+                .recovery_owner;
+            if let Some(owner) = owner {
+                let _ = self.recovery_boundary(owner, std::time::Instant::now());
+            }
+            return false;
+        };
+        self.drive_recovery_with(
+            std::time::Instant::now,
+            || authenticate_app_data_root(&root),
+            || {
+                #[cfg(not(test))]
+                {
+                    fixed_volumes().map_err(|_| FileIndexError::Unavailable)
+                }
+                #[cfg(test)]
+                {
+                    Ok(Vec::new())
+                }
+            },
+            |path| match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    validate_index_path(&metadata, false)?;
+                    fs::remove_file(path).map_err(|_| FileIndexError::Unavailable)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(FileIndexError::Unavailable),
+            },
+            |path, authorize| {
+                Store::open_authorized(
+                    path,
+                    &ordinal_sort_identity().map_err(|_| FileIndexError::Unavailable)?,
+                    authorize,
+                )
+                .map_err(map_store_error)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn revision_for_test(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("file index lock poisoned")
+            .index_revision_high_water
+    }
+
+    #[cfg(test)]
+    fn admission_open_for_test(&self) -> bool {
+        self.state
+            .lock()
+            .expect("file index lock poisoned")
+            .admission_open
+    }
+
+    pub(crate) fn start_cleaning_until(
+        self: &Arc<Self>,
+        attempt_epoch: u64,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let increment_runtime = {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            if self.lifecycle.file_index_phase() != FileIndexPhase::Cleaning
+                || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
+            {
+                return false;
+            }
+            match state.mode {
+                LifecycleMode::Terminal => return false,
+                LifecycleMode::Pausing {
+                    attempt_epoch: current,
+                    ..
+                } if attempt_epoch <= current => return attempt_epoch == current,
+                LifecycleMode::Pausing { .. } => {
+                    state.mode = LifecycleMode::Pausing {
+                        attempt_epoch,
+                        resume_requested: false,
+                    };
+                    state.pause_deadline = Some(deadline);
+                    false
+                }
+                LifecycleMode::Uninitialized
+                | LifecycleMode::Opening { .. }
+                | LifecycleMode::Active => {
+                    let Some(runtime_epoch) = state.runtime_epoch.checked_add(1) else {
+                        let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                        drop(state);
+                        if newly_fatal {
+                            self.consume_fatal_effects();
+                        }
+                        return false;
+                    };
+                    state.runtime_epoch = runtime_epoch;
+                    state.mode = LifecycleMode::Pausing {
+                        attempt_epoch,
+                        resume_requested: false,
+                    };
+                    state.admission_open = false;
+                    state.recovery_owner = None;
+                    state.recovery_deadline = None;
+                    state.pause_deadline = Some(deadline);
+                    state.retained_store = state.store.take();
+                    state.clean_close_permit_issued = false;
+                    self.publication_runtime_epoch
+                        .store(runtime_epoch, Ordering::Release);
+                    true
+                }
+            }
+        };
+        if increment_runtime {
+            if let Some(worker) = self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned")
+                .as_ref()
+            {
+                worker.stop.store(true, Ordering::Release);
+            }
+            let mut workers = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            for worker in workers.by_volume.values_mut() {
+                worker.stop.store(true, Ordering::Release);
+            }
+            drop(workers);
+            let mut coordinator = self
+                .coordinator
+                .state
+                .lock()
+                .expect("file index coordinator lock poisoned");
+            coordinator.pending_root = None;
+            coordinator.pending_runtime_epoch = None;
+            for runtime in coordinator.volumes.values_mut() {
+                runtime.cancel_pending();
+            }
+        }
+        if self.registry.invalidate_domain(QueryDomain::File).is_err() {
+            self.fail_closed_exhaustion();
+            return false;
+        }
+        #[cfg(not(test))]
+        self.ensure_coordinator_thread();
+        self.coordinator.signal.notify_all();
+        true
+    }
+
+    pub(crate) fn return_running(self: &Arc<Self>, attempt_epoch: u64) -> bool {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if self.lifecycle.file_index_phase() != FileIndexPhase::Running
+            || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
+        {
+            return false;
+        }
+        let LifecycleMode::Pausing {
+            attempt_epoch: current,
+            ..
+        } = state.mode
+        else {
+            return false;
+        };
+        if attempt_epoch < current {
+            return false;
+        }
+        state.mode = LifecycleMode::Pausing {
+            attempt_epoch,
+            resume_requested: true,
+        };
+        drop(state);
+        self.coordinator.signal.notify_all();
+        true
+    }
+
+    fn complete_pause_if_ready(&self) -> bool {
+        self.reap_finished_integrity();
+        let (attempt_epoch, workers) = {
+            let state = self.state.lock().expect("file index lock poisoned");
+            let LifecycleMode::Pausing {
+                attempt_epoch,
+                resume_requested: true,
+            } = state.mode
+            else {
+                return false;
+            };
+            if state.db_work != 0
+                || self.lifecycle.file_index_phase() != FileIndexPhase::Running
+                || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
+            {
+                return false;
+            }
+            if self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned")
+                .is_some()
+            {
+                return false;
+            }
+            let mut workers = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            if workers
+                .by_volume
+                .values()
+                .any(|worker| worker.join.as_ref().is_some_and(|join| !join.is_finished()))
+            {
+                return false;
+            }
+            if self
+                .coordinator
+                .state
+                .lock()
+                .expect("file index coordinator lock poisoned")
+                .running
+            {
+                return false;
+            }
+            let workers = workers
+                .by_volume
+                .drain()
+                .map(|(_, worker)| worker)
+                .collect::<Vec<_>>();
+            (attempt_epoch, workers)
+        };
+        for worker in workers {
+            stop_and_join_worker(worker);
+        }
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if state.db_work != 0
+            || state.mode
+                != (LifecycleMode::Pausing {
+                    attempt_epoch,
+                    resume_requested: true,
+                })
+            || self.lifecycle.file_index_phase() != FileIndexPhase::Running
+            || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
+        {
+            return false;
+        }
+        state.retained_store = None;
+        if !state.fatal_unavailable {
+            state.availability = Availability::Normal;
+        }
+        state.mode = if state.fatal_unavailable {
+            LifecycleMode::Active
+        } else {
+            LifecycleMode::Uninitialized
+        };
+        state.admission_open = false;
+        let mut coordinator = self
+            .coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned");
+        coordinator.pending_root = None;
+        coordinator.pending_runtime_epoch = None;
+        coordinator.active_root = None;
+        coordinator.volumes.clear();
+        true
+    }
+
+    fn clean_close_readiness(
+        &self,
+        attempt_epoch: u64,
+        now: std::time::Instant,
+    ) -> CleanCloseReadiness {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        if state.mode
+            != (LifecycleMode::Pausing {
+                attempt_epoch,
+                resume_requested: false,
+            })
+            || self.lifecycle.file_index_phase() != FileIndexPhase::Cleaning
+            || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
+            || state.db_work != 0
+            || state.store.is_some()
+            || state.clean_close_permit_issued
+            || state.pause_deadline.is_none_or(|deadline| now >= deadline)
+        {
+            return CleanCloseReadiness::Reject;
+        }
+        if !self
+            .workers
+            .lock()
+            .expect("file index worker lock poisoned")
+            .by_volume
+            .is_empty()
+            || self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned")
+                .is_some()
+            || self
+                .coordinator
+                .state
+                .lock()
+                .expect("file index coordinator lock poisoned")
+                .running
+        {
+            return CleanCloseReadiness::Wait;
+        }
+        if let Some(store) = state.retained_store.take() {
+            state.clean_close_permit_issued = true;
+            CleanCloseReadiness::Permit(
+                store,
+                CleanCloseMarkerPermit {
+                    attempt_epoch,
+                    state: Arc::downgrade(&self.state),
+                    lifecycle: Arc::clone(&self.lifecycle),
+                },
+            )
+        } else if state.session_started {
+            CleanCloseReadiness::Reject
+        } else {
+            CleanCloseReadiness::Vacuous
+        }
+    }
+
+    #[cfg(test)]
+    fn take_clean_close_marker(
+        &self,
+        attempt_epoch: u64,
+    ) -> Option<(Store, CleanCloseMarkerPermit)> {
+        match self.clean_close_readiness(attempt_epoch, std::time::Instant::now()) {
+            CleanCloseReadiness::Permit(store, permit) => Some((store, permit)),
+            CleanCloseReadiness::Vacuous
+            | CleanCloseReadiness::Wait
+            | CleanCloseReadiness::Reject => None,
+        }
+    }
+
+    pub(crate) fn mark_clean_close(&self, attempt_epoch: u64) -> bool {
+        self.mark_clean_close_with(attempt_epoch, std::time::Instant::now, || {
+            std::thread::sleep(std::time::Duration::from_millis(10))
+        })
+    }
+
+    fn mark_clean_close_with<N, W>(&self, attempt_epoch: u64, mut now: N, mut wait: W) -> bool
+    where
+        N: FnMut() -> std::time::Instant,
+        W: FnMut(),
+    {
+        let deadline = {
+            let state = self.state.lock().expect("file index lock poisoned");
+            if !matches!(
+                state.mode,
+                LifecycleMode::Pausing {
+                    attempt_epoch: current,
+                    ..
+                } if current == attempt_epoch
+            ) || self.lifecycle.file_index_phase() != FileIndexPhase::Cleaning
+                || self.lifecycle.file_index_attempt_epoch() != attempt_epoch
+            {
+                return false;
+            }
+            state.pause_deadline.unwrap_or_else(&mut now)
+        };
+        loop {
+            self.reap_finished_workers();
+            let current = now();
+            match self.clean_close_readiness(attempt_epoch, current) {
+                CleanCloseReadiness::Permit(store, permit) => {
+                    return store.write_clean_close(permit).is_ok();
+                }
+                CleanCloseReadiness::Vacuous => return true,
+                CleanCloseReadiness::Reject => return false,
+                CleanCloseReadiness::Wait if current < deadline => wait(),
+                CleanCloseReadiness::Wait => return false,
+            }
+        }
+    }
+
+    fn reap_finished_workers(&self) {
+        let workers = {
+            let mut registry = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            let finished = registry
+                .by_volume
+                .iter()
+                .filter(|(_, worker)| {
+                    worker
+                        .join
+                        .as_ref()
+                        .is_none_or(std::thread::JoinHandle::is_finished)
+                })
+                .map(|(identity, _)| identity.clone())
+                .collect::<Vec<_>>();
+            finished
+                .into_iter()
+                .filter_map(|identity| registry.by_volume.remove(&identity))
+                .collect::<Vec<_>>()
+        };
+        for worker in workers {
+            stop_and_join_worker(worker);
+        }
+    }
+
+    pub(crate) fn enter_terminal(&self) {
+        let mut should_invalidate = false;
+        {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            if self.lifecycle.file_index_phase() != FileIndexPhase::Terminal {
+                return;
+            }
+            if state.mode != LifecycleMode::Terminal {
+                if !matches!(state.mode, LifecycleMode::Pausing { .. }) {
+                    if let Some(runtime_epoch) = state.runtime_epoch.checked_add(1) {
+                        state.runtime_epoch = runtime_epoch;
+                        self.publication_runtime_epoch
+                            .store(runtime_epoch, Ordering::Release);
+                    } else {
+                        state.latch_unavailable(&self.publication_generation);
+                    }
+                }
+                state.mode = LifecycleMode::Terminal;
+                state.admission_open = false;
+                state.recovery_owner = None;
+                state.recovery_deadline = None;
+                state.store = None;
+                state.retained_store = None;
+                should_invalidate = true;
+            }
+        }
+        if should_invalidate {
+            self.coordinator.stop.store(true, Ordering::Release);
+            if let Some(worker) = self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned")
+                .as_ref()
+            {
+                worker.stop.store(true, Ordering::Release);
+            }
+            {
+                let mut workers = self
+                    .workers
+                    .lock()
+                    .expect("file index worker lock poisoned");
+                for worker in workers.by_volume.values_mut() {
+                    worker.stop.store(true, Ordering::Release);
+                }
+            }
+            {
+                let mut coordinator = self
+                    .coordinator
+                    .state
+                    .lock()
+                    .expect("file index coordinator lock poisoned");
+                coordinator.pending_root = None;
+                coordinator.pending_runtime_epoch = None;
+                coordinator.active_root = None;
+                coordinator.volumes.clear();
+                coordinator.calibrated = true;
+            }
+            let _ = self.registry.invalidate_domain(QueryDomain::File);
+            self.coordinator.signal.notify_all();
+        }
+        self.main_window_hwnd.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn start_cleaning_for_test(self: &Arc<Self>, attempt_epoch: u64) -> bool {
+        self.start_cleaning_until(
+            attempt_epoch,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+    }
+
+    #[cfg(test)]
+    fn return_running_for_test(self: &Arc<Self>, attempt_epoch: u64) -> bool {
+        self.return_running(attempt_epoch)
+    }
+
+    #[cfg(test)]
+    fn complete_pause_for_test(&self) -> bool {
+        self.complete_pause_if_ready()
+    }
+
+    #[cfg(test)]
+    fn terminal_for_test(&self, _attempt_epoch: u64) {
+        self.enter_terminal();
+    }
+
+    #[cfg(test)]
+    fn mode_for_test(&self) -> LifecycleMode {
+        self.state.lock().expect("file index lock poisoned").mode
     }
 
     pub(crate) fn authorizes_publication(
@@ -3623,41 +5820,142 @@ impl FileIndex {
             && generation == expected_generation
     }
 
-    fn prepare_worker(&self, volume: &FixedVolume) -> Result<WorkerPreparation, FileIndexError> {
-        let (replaced, owner) = {
-            let mut workers = self
-                .workers
-                .lock()
-                .expect("file index worker lock poisoned");
-            if workers
-                .by_volume
-                .get(&volume.identity)
-                .is_some_and(|worker| {
-                    !worker.failed
-                        && !worker.stop.load(Ordering::Acquire)
-                        && worker.mount_point == volume.mount_point
-                        && worker.join.as_ref().is_some_and(|join| !join.is_finished())
-                })
-            {
-                return Ok(WorkerPreparation::Existing);
+    #[cfg(test)]
+    fn prepare_worker(
+        self: &Arc<Self>,
+        volume: &FixedVolume,
+    ) -> Result<WorkerPreparation, FileIndexError> {
+        match self.reserve_and_prepare_worker(volume)? {
+            WorkerStartDecision::Existing => Ok(WorkerPreparation::Existing),
+            WorkerStartDecision::Start(start) => {
+                let owner = start.owner;
+                drop(start.reservation);
+                Ok(WorkerPreparation::Start { owner })
             }
-            let Some(owner) = workers.next_owner.checked_add(1) else {
-                drop(workers);
-                let mut state = self.state.lock().expect("file index lock poisoned");
-                self.latch_process_fatal(&mut state);
-                return Err(FileIndexError::Unavailable);
-            };
-            let replaced = workers.by_volume.remove(&volume.identity);
-            workers.next_owner = owner;
-            (replaced, owner)
-        };
-        if let Some(replaced) = replaced {
-            stop_and_join_worker(replaced);
-            self.mark_fixed_volume_dirty(volume)?;
         }
-        Ok(WorkerPreparation::Start { owner })
     }
 
+    fn reserve_and_prepare_worker(
+        self: &Arc<Self>,
+        volume: &FixedVolume,
+    ) -> Result<WorkerStartDecision, FileIndexError> {
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        let runtime_epoch = state.runtime_epoch;
+        self.admit_locked(&state, AdmissionKind::DbWork, runtime_epoch)
+            .map_err(|_| FileIndexError::Unavailable)?;
+        let mut workers = self
+            .workers
+            .lock()
+            .expect("file index worker lock poisoned");
+        if workers
+            .by_volume
+            .get(&volume.identity)
+            .is_some_and(|worker| {
+                worker.runtime_epoch == runtime_epoch
+                    && !worker.failed
+                    && !worker.stop.load(Ordering::Acquire)
+                    && worker.mount_point == volume.mount_point
+                    && worker.join.as_ref().is_none_or(|join| !join.is_finished())
+            })
+        {
+            return Ok(WorkerStartDecision::Existing);
+        }
+        let Some(owner) = workers.next_owner.checked_add(1) else {
+            drop(workers);
+            let newly_fatal = self.latch_exhaustion_locked(&mut state);
+            drop(state);
+            if newly_fatal {
+                self.consume_fatal_effects();
+            }
+            return Err(FileIndexError::Unavailable);
+        };
+        let Some(next_db_work) = state.db_work.checked_add(1) else {
+            drop(workers);
+            let newly_fatal = self.latch_exhaustion_locked(&mut state);
+            drop(state);
+            if newly_fatal {
+                self.consume_fatal_effects();
+            }
+            return Err(FileIndexError::Unavailable);
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let replaced = workers.by_volume.insert(
+            volume.identity.clone(),
+            WorkerRecord {
+                owner,
+                runtime_epoch,
+                mount_point: volume.mount_point.clone(),
+                stop: Arc::clone(&stop),
+                generation: Arc::clone(&generation),
+                join: None,
+                failed: false,
+            },
+        );
+        if let Some(replaced) = replaced.as_ref() {
+            replaced.stop.store(true, Ordering::Release);
+        }
+        workers.next_owner = owner;
+        state.db_work = next_db_work;
+        let reservation = DbWorkReservation {
+            state: Arc::clone(&self.state),
+            coordinator: Arc::clone(&self.coordinator),
+            runtime_epoch,
+            released: false,
+        };
+        drop(workers);
+        drop(state);
+
+        if let Some(replaced) = replaced {
+            let stale_volume = FixedVolume {
+                identity: volume.identity.clone(),
+                mount_point: replaced.mount_point.clone(),
+            };
+            stop_and_join_worker(replaced);
+            if self
+                .mark_fixed_volume_dirty(&stale_volume, &reservation)
+                .is_err()
+            {
+                let _ = self.remove_worker_if_owner(&volume.identity, owner);
+                drop(reservation);
+                return Err(FileIndexError::Unavailable);
+            }
+        }
+        Ok(WorkerStartDecision::Start(WorkerStart {
+            owner,
+            runtime_epoch,
+            stop,
+            generation,
+            reservation,
+        }))
+    }
+
+    fn attach_worker_join(
+        &self,
+        volume: &FixedVolume,
+        owner: u64,
+        runtime_epoch: u64,
+        join: std::thread::JoinHandle<()>,
+    ) -> Result<(), std::thread::JoinHandle<()>> {
+        let mut workers = self
+            .workers
+            .lock()
+            .expect("file index worker lock poisoned");
+        let Some(worker) = workers.by_volume.get_mut(&volume.identity) else {
+            return Err(join);
+        };
+        if worker.owner != owner
+            || worker.runtime_epoch != runtime_epoch
+            || worker.mount_point != volume.mount_point
+            || worker.join.is_some()
+        {
+            return Err(join);
+        }
+        worker.join = Some(join);
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn install_worker(&self, volume: &FixedVolume, worker: WorkerRecord) {
         self.workers
             .lock()
@@ -3666,7 +5964,11 @@ impl FileIndex {
             .insert(volume.identity.clone(), worker);
     }
 
-    fn stop_detached_workers(&self, volumes: &[FixedVolume]) -> Result<(), FileIndexError> {
+    fn stop_detached_workers(
+        self: &Arc<Self>,
+        volumes: &[FixedVolume],
+        reservation: &DbWorkReservation,
+    ) -> Result<(), FileIndexError> {
         let removed = {
             let mut workers = self
                 .workers
@@ -3694,7 +5996,7 @@ impl FileIndex {
                 mount_point: worker.mount_point.clone(),
             };
             stop_and_join_worker(worker);
-            self.mark_fixed_volume_dirty(&volume)?;
+            self.mark_fixed_volume_dirty(&volume, reservation)?;
         }
         Ok(())
     }
@@ -3707,6 +6009,7 @@ impl FileIndex {
             .get(&volume.identity)
             .is_some_and(|worker| {
                 worker.owner == owner
+                    && worker.runtime_epoch == self.runtime_epoch()
                     && worker.mount_point == volume.mount_point
                     && !worker.failed
                     && !worker.stop.load(Ordering::Acquire)
@@ -3714,6 +6017,46 @@ impl FileIndex {
                         worker.generation.load(Ordering::Acquire) == generation
                     })
             })
+    }
+
+    fn worker_write_authorized_locked(
+        &self,
+        state: &IndexState,
+        volume: &FixedVolume,
+        owner: u64,
+        generation: Option<u64>,
+    ) -> bool {
+        self.lifecycle.file_index_phase() == FileIndexPhase::Running
+            && state.mode == LifecycleMode::Active
+            && state.admission_open
+            && !state.fatal_unavailable
+            && state.runtime_epoch == self.runtime_epoch()
+            && Self::authenticated_mount_matches(state, volume)
+            && self.worker_is_current(volume, owner, generation)
+    }
+
+    fn worker_runtime_authorized(
+        &self,
+        volume: &FixedVolume,
+        owner: u64,
+        generation: Option<u64>,
+        runtime_epoch: u64,
+    ) -> bool {
+        let state = self.state.lock().expect("file index lock poisoned");
+        state.runtime_epoch == runtime_epoch
+            && self.worker_write_authorized_locked(&state, volume, owner, generation)
+    }
+
+    fn worker_start_authorized(
+        &self,
+        volume: &FixedVolume,
+        owner: u64,
+        runtime_epoch: u64,
+        reservation: &DbWorkReservation,
+    ) -> bool {
+        Arc::ptr_eq(&self.state, &reservation.state)
+            && reservation.runtime_epoch == runtime_epoch
+            && self.worker_runtime_authorized(volume, owner, None, runtime_epoch)
     }
 
     fn authenticated_mount_matches(state: &IndexState, volume: &FixedVolume) -> bool {
@@ -3765,14 +6108,15 @@ impl FileIndex {
             .lock()
             .expect("file index coordinator lock poisoned");
         coordinator.pending_root = None;
+        coordinator.pending_runtime_epoch = None;
         coordinator.active_root = None;
         coordinator.calibrated = true;
         coordinator.volumes.clear();
         self.coordinator.signal.notify_one();
     }
 
-    fn latch_process_fatal(&self, state: &mut IndexState) {
-        state.latch_unavailable(&self.publication_generation);
+    fn latch_process_fatal(&self, state: &mut IndexState) -> bool {
+        let newly_fatal = state.latch_unavailable(&self.publication_generation);
         {
             let mut workers = self
                 .workers
@@ -3782,7 +6126,56 @@ impl FileIndex {
                 worker.stop.store(true, Ordering::Release);
             }
         }
+        if let Some(worker) = self
+            .integrity_worker
+            .lock()
+            .expect("file index integrity join lock poisoned")
+            .as_ref()
+        {
+            worker.stop.store(true, Ordering::Release);
+        }
         self.clear_calibration_retries();
+        newly_fatal
+    }
+
+    fn latch_recovery_timeout(&self, state: &mut IndexState) -> bool {
+        let newly_fatal = !state.fatal_unavailable;
+        if newly_fatal
+            && self
+                .publication_generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    generation.checked_add(1)
+                })
+                .is_err()
+        {
+            self.publication_generation
+                .store(u64::MAX, Ordering::Release);
+        }
+        state.fatal_unavailable = true;
+        state.availability = Availability::Unavailable;
+        state.admission_open = false;
+        state.inventory_previous_authenticated = None;
+        state.pending_inventory_transitions.clear();
+        state.quarantined_volumes.clear();
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .expect("file index worker lock poisoned");
+            for worker in workers.by_volume.values_mut() {
+                worker.stop.store(true, Ordering::Release);
+            }
+        }
+        if let Some(worker) = self
+            .integrity_worker
+            .lock()
+            .expect("file index integrity join lock poisoned")
+            .as_ref()
+        {
+            worker.stop.store(true, Ordering::Release);
+        }
+        self.clear_calibration_retries();
+        newly_fatal
     }
 
     fn finish_store_write<T>(
@@ -3793,20 +6186,32 @@ impl FileIndex {
         match result {
             Ok(value) => Ok(value),
             Err(StoreError::RevisionExhausted) => {
-                self.latch_process_fatal(state);
+                self.latch_exhaustion_locked(state);
                 Err(FileIndexError::Unavailable)
             }
+            Err(StoreError::Corrupt) => Err(FileIndexError::RecoveryRequired),
             Err(_) => Err(FileIndexError::Unavailable),
         }
     }
 
-    fn mark_fixed_volume_dirty(&self, volume: &FixedVolume) -> Result<(), FileIndexError> {
+    fn mark_fixed_volume_dirty(
+        self: &Arc<Self>,
+        volume: &FixedVolume,
+        reservation: &DbWorkReservation,
+    ) -> Result<(), FileIndexError> {
+        if !Arc::ptr_eq(&self.state, &reservation.state) {
+            return Err(FileIndexError::Unavailable);
+        }
         let worker_mount = volume
             .mount_point
             .to_str()
             .ok_or(FileIndexError::Unavailable)?;
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if state.fatal_unavailable || !state.admission_open {
+        if state.runtime_epoch != reservation.runtime_epoch
+            || self
+                .admit_locked(&state, AdmissionKind::DbWork, reservation.runtime_epoch)
+                .is_err()
+        {
             return Err(FileIndexError::Unavailable);
         }
         let mount = state
@@ -3820,13 +6225,31 @@ impl FileIndex {
             return Err(FileIndexError::Unavailable);
         };
         let result = store.mark_volume_dirty(&volume.identity, &mount, &identities);
-        let revision = self.finish_store_write(&mut state, result)?;
+        let revision = match result {
+            Ok(revision) => revision,
+            Err(StoreError::Corrupt) => {
+                drop(state);
+                let _ = self.request_recovery(reservation);
+                return Err(FileIndexError::RecoveryRequired);
+            }
+            Err(StoreError::RevisionExhausted) => {
+                let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                drop(state);
+                if newly_fatal {
+                    self.consume_fatal_effects();
+                }
+                return Err(FileIndexError::Unavailable);
+            }
+            Err(StoreError::Sqlite | StoreError::InvalidData | StoreError::Platform) => {
+                return Err(FileIndexError::Unavailable);
+            }
+        };
         state.index_revision_high_water = revision;
         Ok(())
     }
 
     fn finish_worker_start(
-        &self,
+        self: &Arc<Self>,
         volume: &FixedVolume,
         owner: u64,
         completed_receiver: std::sync::mpsc::Receiver<bool>,
@@ -3842,7 +6265,10 @@ impl FileIndex {
             Err(_) => {
                 if let Some(worker) = self.remove_worker_if_owner(&volume.identity, owner) {
                     stop_and_join_worker(worker);
-                    self.mark_fixed_volume_dirty(volume)?;
+                    let reservation = self
+                        .reserve_db_work(self.runtime_epoch())
+                        .map_err(|_| FileIndexError::Unavailable)?;
+                    self.mark_fixed_volume_dirty(volume, &reservation)?;
                 }
                 Err(FileIndexError::Unavailable)
             }
@@ -3853,10 +6279,11 @@ impl FileIndex {
         &self,
         volume: &FixedVolume,
         owner: u64,
+        runtime_epoch: u64,
     ) -> Result<(u64, bool), FileIndexError> {
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(volume, owner, None)
-            || !Self::authenticated_mount_matches(&state, volume)
+        if state.runtime_epoch != runtime_epoch
+            || !self.worker_write_authorized_locked(&state, volume, owner, None)
         {
             return Err(FileIndexError::Unavailable);
         }
@@ -3900,9 +6327,7 @@ impl FileIndex {
         ) -> Result<(), StoreError>,
     {
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(volume, owner, Some(generation))
-            || !Self::authenticated_mount_matches(&state, volume)
-        {
+        if !self.worker_write_authorized_locked(&state, volume, owner, Some(generation)) {
             return Err(FileIndexError::Unavailable);
         }
         let before_authenticated = state.authenticated_volumes.clone();
@@ -3932,18 +6357,24 @@ impl FileIndex {
         spec: QuerySpec,
         expected_runtime_epoch: u64,
     ) -> Result<FileSearchBatch, FileIndexError> {
+        let admission = match self.begin_search(expected_runtime_epoch)? {
+            SearchAdmission::Immediate(batch) => return Ok(batch),
+            admission @ SearchAdmission::Work { .. } => admission,
+        };
         #[cfg(not(test))]
         self.refresh_query_volumes_with(|| {
             fixed_volumes().map_err(|_| FileIndexError::Unavailable)
         })?;
-        let batch = self.search_with(
+        let batch = self.search_admitted_with(
             app_data_dir,
             spec,
-            expected_runtime_epoch,
+            admission,
             authenticate_app_data_root,
             open_store,
             |store, spec| store.query(spec, &[]),
         )?;
+        #[cfg(not(test))]
+        self.schedule_integrity();
         self.schedule_calibration();
         Ok(batch)
     }
@@ -4095,11 +6526,40 @@ impl FileIndex {
         self.reconcile_inventory_locked(&mut state).map(Some)
     }
 
+    #[cfg(test)]
     fn search_with<A, O, Q>(
-        &self,
+        self: &Arc<Self>,
         app_data_dir: &Path,
         spec: QuerySpec,
         expected_runtime_epoch: u64,
+        authenticate_root: A,
+        open: O,
+        query_store: Q,
+    ) -> Result<FileSearchBatch, FileIndexError>
+    where
+        A: FnMut(&Path) -> Result<PathBuf, FileIndexError>,
+        O: FnMut(&Path) -> Result<(Store, u64, Option<u64>), FileIndexError>,
+        Q: FnMut(&mut Store, &QuerySpec) -> Result<StoreQueryResult, StoreError>,
+    {
+        let admission = match self.begin_search(expected_runtime_epoch)? {
+            SearchAdmission::Immediate(batch) => return Ok(batch),
+            admission @ SearchAdmission::Work { .. } => admission,
+        };
+        self.search_admitted_with(
+            app_data_dir,
+            spec,
+            admission,
+            authenticate_root,
+            open,
+            query_store,
+        )
+    }
+
+    fn search_admitted_with<A, O, Q>(
+        self: &Arc<Self>,
+        app_data_dir: &Path,
+        spec: QuerySpec,
+        admission: SearchAdmission,
         mut authenticate_root: A,
         mut open: O,
         mut query_store: Q,
@@ -4109,64 +6569,52 @@ impl FileIndex {
         O: FnMut(&Path) -> Result<(Store, u64, Option<u64>), FileIndexError>,
         Q: FnMut(&mut Store, &QuerySpec) -> Result<StoreQueryResult, StoreError>,
     {
-        let owner = {
-            let mut state = self.state.lock().expect("file index lock poisoned");
-            if state.runtime_epoch != expected_runtime_epoch {
-                return Err(FileIndexError::Unavailable);
-            }
-            if state.fatal_unavailable {
-                return Ok(empty_batch(
-                    expected_runtime_epoch,
-                    self.publication_generation.load(Ordering::Acquire),
-                    state.index_revision_high_water,
-                    FileIndexStatus::Unavailable,
-                ));
-            }
-            match state.mode {
-                LifecycleMode::Active if state.admission_open => None,
-                LifecycleMode::Active => return Err(FileIndexError::Unavailable),
-                _ => match match begin_lazy_init_locked(
-                    &mut state,
-                    expected_runtime_epoch,
-                    &self.publication_generation,
-                ) {
-                    Ok(decision) => decision,
-                    Err(_) => {
-                        if state.fatal_unavailable {
-                            self.latch_process_fatal(&mut state);
-                        }
-                        return Err(FileIndexError::Unavailable);
-                    }
-                } {
-                    LazyInitDecision::Start { owner } => Some(owner),
-                    LazyInitDecision::ObserveBuilding => {
-                        return Ok(empty_batch(
-                            expected_runtime_epoch,
-                            self.publication_generation.load(Ordering::Acquire),
-                            state.index_revision_high_water,
-                            FileIndexStatus::Building,
-                        ))
-                    }
-                },
-            }
+        let SearchAdmission::Work { owner, reservation } = admission else {
+            unreachable!("immediate search admission was already returned")
         };
+        let expected_runtime_epoch = reservation.runtime_epoch;
 
         if let Some(owner) = owner {
-            let opened = authenticate_root(app_data_dir).and_then(|path| {
+            let authenticated = authenticate_root(app_data_dir).and_then(|path| {
                 let root = path
                     .parent()
                     .ok_or(FileIndexError::Unavailable)?
                     .to_path_buf();
-                open(&path).map(|opened| (opened, root))
+                {
+                    let mut state = self.state.lock().expect("file index lock poisoned");
+                    if state.mode != (LifecycleMode::Opening { owner })
+                        || state.runtime_epoch != expected_runtime_epoch
+                        || self.lifecycle.file_index_phase() != FileIndexPhase::Running
+                    {
+                        return Err(FileIndexError::Unavailable);
+                    }
+                    state.authenticated_app_data_root = Some(root.clone());
+                }
+                Ok((path, root))
             });
+            let opened =
+                authenticated.and_then(|(path, root)| open(&path).map(|opened| (opened, root)));
             let mut state = self.state.lock().expect("file index lock poisoned");
             if state.mode != (LifecycleMode::Opening { owner })
                 || state.runtime_epoch != expected_runtime_epoch
             {
+                if let Ok(((store, _, _), _)) = opened {
+                    state.session_started = true;
+                    if matches!(state.mode, LifecycleMode::Pausing { .. })
+                        && state.retained_store.is_none()
+                    {
+                        state.prior_integrity = Some(store.prior_integrity_metadata());
+                        state.retained_store = Some(store);
+                    }
+                }
+                drop(state);
+                drop(reservation);
                 return Err(FileIndexError::Unavailable);
             }
             match opened {
                 Ok(((store, revision, previous_revision), authenticated_root)) => {
+                    state.session_started = true;
+                    state.prior_integrity = Some(store.prior_integrity_metadata());
                     state.store = Some(store);
                     state.authenticated_app_data_root = Some(authenticated_root);
                     if let Some(previous) = previous_revision {
@@ -4174,6 +6622,8 @@ impl FileIndex {
                         let advanced = state.advance_revision_locked(&self.publication_generation);
                         if advanced.is_err() || advanced.ok() != Some(revision) {
                             self.latch_process_fatal(&mut state);
+                            drop(state);
+                            drop(reservation);
                             return Err(FileIndexError::Unavailable);
                         }
                     } else {
@@ -4183,9 +6633,19 @@ impl FileIndex {
                     state.availability = Availability::Normal;
                     state.admission_open = true;
                 }
-                Err(error) => {
+                Err(FileIndexError::RecoveryRequired) => {
+                    state.mode = LifecycleMode::Active;
+                    state.admission_open = true;
+                    drop(state);
+                    let _ = self.request_recovery(&reservation);
+                    drop(reservation);
+                    return Err(FileIndexError::Unavailable);
+                }
+                Err(FileIndexError::Unavailable) => {
                     self.latch_process_fatal(&mut state);
-                    return Err(error);
+                    drop(state);
+                    drop(reservation);
+                    return Err(FileIndexError::Unavailable);
                 }
             }
         }
@@ -4194,7 +6654,24 @@ impl FileIndex {
         if state.runtime_epoch != expected_runtime_epoch || !state.admission_open {
             return Err(FileIndexError::Unavailable);
         }
-        let mount_changed = self.reconcile_inventory_locked(&mut state)?;
+        let mount_changed = match self.reconcile_inventory_locked(&mut state) {
+            Ok(changed) => changed,
+            Err(FileIndexError::RecoveryRequired) => {
+                drop(state);
+                let _ = self.request_recovery(&reservation);
+                drop(reservation);
+                return Err(FileIndexError::Unavailable);
+            }
+            Err(error) => {
+                let consume_fatal = state.hide_requested;
+                drop(state);
+                drop(reservation);
+                if consume_fatal {
+                    self.consume_fatal_effects();
+                }
+                return Err(error);
+            }
+        };
         let identities = state.authenticated_volumes.clone();
         let result = match state.store.as_mut() {
             Some(store) if identities.is_empty() => query_store(store, &spec),
@@ -4203,11 +6680,57 @@ impl FileIndex {
         };
         let result = match result {
             Ok(result) => result,
-            Err(_) => {
+            Err(StoreError::Corrupt) => {
+                drop(state);
+                let _ = self.request_recovery(&reservation);
+                drop(reservation);
+                return Err(FileIndexError::Unavailable);
+            }
+            Err(StoreError::RevisionExhausted) => {
+                let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                drop(state);
+                drop(reservation);
+                if newly_fatal {
+                    self.consume_fatal_effects();
+                }
+                return Err(FileIndexError::Unavailable);
+            }
+            Err(StoreError::Sqlite | StoreError::InvalidData | StoreError::Platform) => {
                 self.latch_process_fatal(&mut state);
+                drop(state);
+                drop(reservation);
                 return Err(FileIndexError::Unavailable);
             }
         };
+        if !state.integrity_started && !state.integrity_pending {
+            let due = state
+                .store
+                .as_ref()
+                .ok_or(FileIndexError::Unavailable)?
+                .integrity_check_due_now();
+            let due = match due {
+                Ok(due) => due,
+                Err(StoreError::Corrupt) => {
+                    drop(state);
+                    let _ = self.request_recovery(&reservation);
+                    drop(reservation);
+                    return Err(FileIndexError::Unavailable);
+                }
+                Err(StoreError::RevisionExhausted) => {
+                    let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                    drop(state);
+                    drop(reservation);
+                    if newly_fatal {
+                        self.consume_fatal_effects();
+                    }
+                    return Err(FileIndexError::Unavailable);
+                }
+                Err(StoreError::Sqlite | StoreError::InvalidData | StoreError::Platform) => false,
+            };
+            if due {
+                state.integrity_pending = true;
+            }
+        }
         state.index_revision_high_water = result.index_revision;
         let batch = FileSearchBatch {
             runtime_epoch: expected_runtime_epoch,
@@ -4231,6 +6754,7 @@ impl FileIndex {
                 .collect(),
         };
         drop(state);
+        drop(reservation);
         if mount_changed {
             let mut coordinator = self
                 .coordinator
@@ -4240,6 +6764,189 @@ impl FileIndex {
             coordinator.calibrated = false;
         }
         Ok(batch)
+    }
+
+    fn schedule_integrity(self: &Arc<Self>) -> bool {
+        let state = self.state.lock().expect("file index lock poisoned");
+        if !state.integrity_pending
+            || self
+                .admit_locked(&state, AdmissionKind::DbWork, state.runtime_epoch)
+                .is_err()
+            || !self.ensure_running_coordinator_thread_locked(&state)
+        {
+            return false;
+        }
+        drop(state);
+        self.coordinator.signal.notify_all();
+        true
+    }
+
+    fn drive_integrity(self: &Arc<Self>) -> bool {
+        self.reap_finished_integrity();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (root, database, reservation, runtime_epoch) = {
+            let mut state = self.state.lock().expect("file index lock poisoned");
+            if !state.integrity_pending
+                || state.integrity_started
+                || self
+                    .admit_locked(&state, AdmissionKind::DbWork, state.runtime_epoch)
+                    .is_err()
+            {
+                return false;
+            }
+            let mut slot = self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned");
+            if slot.is_some() {
+                return false;
+            }
+            let Some(root) = state.authenticated_app_data_root.clone() else {
+                return false;
+            };
+            let runtime_epoch = state.runtime_epoch;
+            let reservation = match self.reserve_db_work_locked(&mut state, runtime_epoch) {
+                Ok(reservation) => reservation,
+                Err(_) => return false,
+            };
+            state.integrity_pending = false;
+            state.integrity_started = true;
+            *slot = Some(IntegrityWorkerRecord {
+                runtime_epoch,
+                stop: Arc::clone(&stop),
+                join: None,
+            });
+            (
+                root.clone(),
+                root.join("file-index.sqlite3"),
+                reservation,
+                runtime_epoch,
+            )
+        };
+        let owner = Arc::clone(self);
+        let worker_stop = Arc::clone(&stop);
+        let join = std::thread::spawn(move || {
+            if worker_stop.load(Ordering::Acquire)
+                || !owner.integrity_worker_authorized(runtime_epoch, &worker_stop)
+                || authenticate_app_data_root(&root).ok().as_deref() != Some(database.as_path())
+            {
+                return;
+            }
+            let result = Store::run_integrity_check_at(&database);
+            match result {
+                Ok(true) => {
+                    let authorized = {
+                        let state = owner.state.lock().expect("file index lock poisoned");
+                        owner
+                            .admit_locked(&state, AdmissionKind::DbWork, runtime_epoch)
+                            .is_ok()
+                            && !worker_stop.load(Ordering::Acquire)
+                            && owner.integrity_worker_matches(runtime_epoch, &worker_stop)
+                    };
+                    if authorized {
+                        match owner.record_integrity_timestamp(
+                            &root,
+                            &database,
+                            runtime_epoch,
+                            &worker_stop,
+                        ) {
+                            Err(StoreError::Corrupt) => {
+                                let _ = owner.request_recovery(&reservation);
+                            }
+                            Err(StoreError::RevisionExhausted) => owner.fail_closed_exhaustion(),
+                            Ok(())
+                            | Err(
+                                StoreError::Sqlite | StoreError::InvalidData | StoreError::Platform,
+                            ) => {}
+                        }
+                    }
+                }
+                Ok(false) | Err(StoreError::Corrupt) => {
+                    let _ = owner.request_recovery(&reservation);
+                }
+                Err(StoreError::RevisionExhausted) => owner.fail_closed_exhaustion(),
+                Err(StoreError::Sqlite | StoreError::InvalidData | StoreError::Platform) => {}
+            }
+            drop(reservation);
+            owner.coordinator.signal.notify_all();
+        });
+        let mut slot = self
+            .integrity_worker
+            .lock()
+            .expect("file index integrity join lock poisoned");
+        let Some(worker) = slot.as_mut() else {
+            drop(slot);
+            stop.store(true, Ordering::Release);
+            let _ = join.join();
+            return false;
+        };
+        if worker.runtime_epoch != runtime_epoch
+            || !Arc::ptr_eq(&worker.stop, &stop)
+            || worker.join.is_some()
+        {
+            drop(slot);
+            stop.store(true, Ordering::Release);
+            let _ = join.join();
+            return false;
+        }
+        worker.join = Some(join);
+        true
+    }
+
+    fn integrity_worker_matches(&self, runtime_epoch: u64, stop: &Arc<AtomicBool>) -> bool {
+        self.integrity_worker
+            .lock()
+            .expect("file index integrity join lock poisoned")
+            .as_ref()
+            .is_some_and(|worker| {
+                worker.runtime_epoch == runtime_epoch && Arc::ptr_eq(&worker.stop, stop)
+            })
+    }
+
+    fn integrity_worker_authorized(&self, runtime_epoch: u64, stop: &Arc<AtomicBool>) -> bool {
+        let state = self.state.lock().expect("file index lock poisoned");
+        self.admit_locked(&state, AdmissionKind::DbWork, runtime_epoch)
+            .is_ok()
+            && !stop.load(Ordering::Acquire)
+            && self.integrity_worker_matches(runtime_epoch, stop)
+    }
+
+    fn record_integrity_timestamp(
+        &self,
+        root: &Path,
+        database: &Path,
+        runtime_epoch: u64,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<(), StoreError> {
+        Store::record_integrity_check_at_authorized(database, || {
+            self.integrity_worker_authorized(runtime_epoch, stop)
+                && authenticate_app_data_root(root).ok().as_deref() == Some(database)
+        })
+    }
+
+    fn reap_finished_integrity(&self) {
+        let worker = {
+            let mut slot = self
+                .integrity_worker
+                .lock()
+                .expect("file index integrity join lock poisoned");
+            if slot
+                .as_ref()
+                .and_then(|worker| worker.join.as_ref())
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut worker) = worker {
+            if let Some(join) = worker.join.take() {
+                if join.thread().id() != std::thread::current().id() {
+                    let _ = join.join();
+                }
+            }
+        }
     }
 
     fn schedule_calibration(self: &Arc<Self>) -> bool {
@@ -4270,20 +6977,94 @@ impl FileIndex {
         }
         #[cfg(not(test))]
         if start_thread {
-            let index = Arc::downgrade(self);
-            let coordinator = Arc::clone(&self.coordinator);
-            let join = thread::spawn({
-                let coordinator = Arc::clone(&coordinator);
-                move || Self::coordinator_loop(index, coordinator)
-            });
-            *coordinator
-                .join
-                .lock()
-                .expect("file index coordinator join lock poisoned") = Some(join);
+            let state = self.state.lock().expect("file index lock poisoned");
+            let _ = self.ensure_running_coordinator_thread_locked(&state);
         }
         #[cfg(test)]
         let _ = start_thread;
         true
+    }
+
+    fn ensure_coordinator_thread(self: &Arc<Self>) {
+        let finished = {
+            let mut slot = self
+                .coordinator
+                .join
+                .lock()
+                .expect("file index coordinator join lock poisoned");
+            if slot
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(join) = finished {
+            if join.thread().id() != std::thread::current().id() {
+                let _ = join.join();
+            }
+        }
+        let control_pending = self.control_pending();
+        let mut slot = self
+            .coordinator
+            .join
+            .lock()
+            .expect("file index coordinator join lock poisoned");
+        if slot.is_some() || (self.coordinator.stop.load(Ordering::Acquire) && !control_pending) {
+            return;
+        }
+        self.coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned")
+            .thread_started = true;
+        let index = Arc::downgrade(self);
+        let coordinator = Arc::clone(&self.coordinator);
+        *slot = Some(std::thread::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            move || Self::coordinator_loop(index, coordinator)
+        }));
+    }
+
+    fn ensure_running_coordinator_thread_locked(self: &Arc<Self>, state: &IndexState) -> bool {
+        if self
+            .admit_locked(state, AdmissionKind::DbWork, state.runtime_epoch)
+            .is_err()
+            || self.coordinator.stop.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let mut slot = self
+            .coordinator
+            .join
+            .lock()
+            .expect("file index coordinator join lock poisoned");
+        if slot.is_some() {
+            return true;
+        }
+        let mut coordinator_state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned");
+        coordinator_state.thread_started = true;
+        let index = Arc::downgrade(self);
+        let coordinator = Arc::clone(&self.coordinator);
+        *slot = Some(std::thread::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            move || Self::coordinator_loop(index, coordinator)
+        }));
+        true
+    }
+
+    fn control_pending(&self) -> bool {
+        let state = self.state.lock().expect("file index lock poisoned");
+        matches!(state.mode, LifecycleMode::Pausing { .. })
+            || state.recovery_owner.is_some()
+            || state.integrity_pending
+            || state.hide_requested
     }
 
     fn mark_calibration_pending(&self, app_data_root: PathBuf) -> (bool, bool) {
@@ -4300,10 +7081,12 @@ impl FileIndex {
     {
         before_linearization();
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if state.mode != LifecycleMode::Active
+        if self.lifecycle.file_index_phase() != FileIndexPhase::Running
+            || state.mode != LifecycleMode::Active
             || state.fatal_unavailable
             || !state.admission_open
             || state.store.is_none()
+            || self.runtime_epoch() != state.runtime_epoch
         {
             return (false, false);
         }
@@ -4322,45 +7105,94 @@ impl FileIndex {
         let start_thread = !coordinator.thread_started;
         let Some(wakes) = coordinator.wakes.checked_add(1) else {
             drop(coordinator);
-            self.latch_process_fatal(&mut state);
+            let newly_fatal = self.latch_exhaustion_locked(&mut state);
+            drop(state);
+            if newly_fatal {
+                self.consume_fatal_effects();
+            }
             return (false, false);
         };
         coordinator.thread_started = true;
         coordinator.pending_root = Some(app_data_root);
+        coordinator.pending_runtime_epoch = Some(state.runtime_epoch);
         coordinator.wakes = wakes;
         self.coordinator.signal.notify_one();
         (true, start_thread)
     }
 
-    #[cfg(not(test))]
     fn coordinator_loop(index: std::sync::Weak<Self>, coordinator: Arc<CoordinatorControl>) {
-        loop {
-            let app_data_root = {
+        'coordinator: loop {
+            let Some(owner) = index.upgrade() else {
+                coordinator
+                    .state
+                    .lock()
+                    .expect("file index coordinator lock poisoned")
+                    .thread_started = false;
+                return;
+            };
+            owner.consume_fatal_effects();
+            owner.reap_finished_workers();
+            owner.reap_finished_integrity();
+            if owner.complete_pause_if_ready() || owner.drive_recovery() || owner.drive_integrity()
+            {
+                drop(owner);
+                continue;
+            }
+            if coordinator.stop.load(Ordering::Acquire) {
+                if !owner.control_pending() {
+                    coordinator
+                        .state
+                        .lock()
+                        .expect("file index coordinator lock poisoned")
+                        .thread_started = false;
+                    return;
+                }
+                drop(owner);
+                let state = coordinator
+                    .state
+                    .lock()
+                    .expect("file index coordinator lock poisoned");
+                let _ = coordinator
+                    .signal
+                    .wait_timeout(state, std::time::Duration::from_millis(50))
+                    .expect("file index coordinator lock poisoned");
+                continue;
+            }
+            drop(owner);
+            {
                 let mut state = coordinator
                     .state
                     .lock()
                     .expect("file index coordinator lock poisoned");
                 while state.pending_root.is_none() {
                     if coordinator.stop.load(Ordering::Acquire) {
-                        return;
+                        drop(state);
+                        continue 'coordinator;
                     }
                     let now = std::time::Instant::now();
-                    let deadline = state
+                    let pending = state
                         .volumes
                         .values()
                         .filter_map(|runtime| match runtime.calibration {
-                            Calibration::Pending { deadline, .. } => Some(deadline),
+                            Calibration::Pending {
+                                deadline,
+                                runtime_epoch,
+                            } => Some((deadline, runtime_epoch)),
                             Calibration::Idle | Calibration::Running { .. } => None,
                         })
-                        .min();
-                    if deadline.is_some_and(|deadline| deadline <= now) {
+                        .min_by_key(|(deadline, _)| *deadline);
+                    if pending.is_some_and(|(deadline, _)| deadline <= now) {
                         state.pending_root = state.active_root.clone();
+                        state.pending_runtime_epoch = state
+                            .pending_root
+                            .as_ref()
+                            .and_then(|_| pending.map(|(_, runtime_epoch)| runtime_epoch));
                         if state.pending_root.is_some() {
                             break;
                         }
                     }
-                    let timeout = deadline
-                        .map(|deadline| deadline.saturating_duration_since(now))
+                    let timeout = pending
+                        .map(|(deadline, _)| deadline.saturating_duration_since(now))
                         .unwrap_or(std::time::Duration::from_millis(250));
                     let waited = coordinator
                         .signal
@@ -4368,16 +7200,35 @@ impl FileIndex {
                         .expect("file index coordinator lock poisoned");
                     state = waited.0;
                     if coordinator.stop.load(Ordering::Acquire) || index.strong_count() == 0 {
-                        return;
+                        drop(state);
+                        continue 'coordinator;
+                    }
+                    if state.pending_root.is_none() {
+                        drop(state);
+                        continue 'coordinator;
                     }
                 }
-                state.running = true;
-                state.pending_root.take().expect("pending root disappeared")
-            };
+            }
             let Some(owner) = index.upgrade() else {
+                coordinator
+                    .state
+                    .lock()
+                    .expect("file index coordinator lock poisoned")
+                    .thread_started = false;
                 return;
             };
-            let completed = owner.run_calibration(&app_data_root);
+            let Some((_app_data_root, reservation)) = owner.claim_calibration_run_with(|| {})
+            else {
+                drop(owner);
+                continue;
+            };
+            #[cfg(not(test))]
+            let completed = owner.run_calibration(&_app_data_root, reservation);
+            #[cfg(test)]
+            let completed = {
+                drop(reservation);
+                false
+            };
             drop(owner);
             Self::finish_calibration_run(&coordinator, completed);
         }
@@ -4434,7 +7285,11 @@ impl FileIndex {
     }
 
     #[cfg(not(test))]
-    fn run_calibration(self: &Arc<Self>, app_data_root: &Path) -> bool {
+    fn run_calibration(
+        self: &Arc<Self>,
+        app_data_root: &Path,
+        preflight_reservation: DbWorkReservation,
+    ) -> bool {
         let expected_observation = self
             .state
             .lock()
@@ -4454,9 +7309,16 @@ impl FileIndex {
                 let _ = self.mark_calibration_pending(app_data_root.to_path_buf());
                 return false;
             }
-            Err(_) => return false,
+            Err(FileIndexError::RecoveryRequired) => {
+                let _ = self.request_recovery(&preflight_reservation);
+                return false;
+            }
+            Err(FileIndexError::Unavailable) => return false,
         }
-        if self.stop_detached_workers(&volumes).is_err() {
+        if self
+            .stop_detached_workers(&volumes, &preflight_reservation)
+            .is_err()
+        {
             return false;
         }
         let runtime_epoch = self.runtime_epoch();
@@ -4490,6 +7352,7 @@ impl FileIndex {
                 }
             });
         }
+        drop(preflight_reservation);
         let mut completed = true;
         for volume in volumes {
             let failures_before = {
@@ -4551,27 +7414,46 @@ impl FileIndex {
         volume: FixedVolume,
         exclusions: Vec<ExcludedPrefix>,
     ) -> Result<(), FileIndexError> {
-        let owner_id = match self.prepare_worker(&volume)? {
-            WorkerPreparation::Existing => return Ok(()),
-            WorkerPreparation::Start { owner } => owner,
+        let start = match self.reserve_and_prepare_worker(&volume)? {
+            WorkerStartDecision::Existing => return Ok(()),
+            WorkerStartDecision::Start(start) => start,
         };
+        let WorkerStart {
+            owner: owner_id,
+            runtime_epoch,
+            stop,
+            generation: generation_owner,
+            reservation,
+        } = start;
         let owner = Arc::downgrade(self);
-        let stop = Arc::new(AtomicBool::new(false));
-        let generation_owner = Arc::new(AtomicU64::new(0));
         let worker_stop = Arc::clone(&stop);
         let worker_generation = Arc::clone(&generation_owner);
         let (completed_sender, completed_receiver) = mpsc::sync_channel(1);
         let (start_sender, start_receiver) = mpsc::sync_channel(0);
         let worker_volume = volume.clone();
         let join = thread::spawn(move || {
+            let reservation = reservation;
             if start_receiver.recv().is_err() {
                 return;
             }
+            let Some(index) = owner.upgrade() else {
+                let _ = completed_sender.send(false);
+                return;
+            };
+            if worker_stop.load(Ordering::Acquire)
+                || !index.worker_start_authorized(
+                    &worker_volume,
+                    owner_id,
+                    runtime_epoch,
+                    &reservation,
+                )
+            {
+                let _ = completed_sender.send(false);
+                return;
+            }
+            drop(index);
             let result = (|| {
                 let index = owner.upgrade().ok_or(FileIndexError::Unavailable)?;
-                if !index.worker_is_current(&worker_volume, owner_id, None) {
-                    return Err(FileIndexError::Unavailable);
-                }
                 let mut watcher =
                     Watcher::arm(&worker_volume).map_err(|_| FileIndexError::Unavailable)?;
                 let generation = index.calibrate_volume(
@@ -4580,9 +7462,10 @@ impl FileIndex {
                     &mut watcher,
                     owner_id,
                     &worker_stop,
+                    runtime_epoch,
                 )?;
                 worker_generation.store(generation, Ordering::Release);
-                index.complete_volume_calibration(&worker_volume, owner_id)?;
+                index.complete_volume_calibration(&worker_volume, owner_id, runtime_epoch)?;
                 drop(index);
                 let _ = completed_sender.send(true);
                 loop {
@@ -4605,28 +7488,29 @@ impl FileIndex {
                         &exclusions,
                         generation,
                         owner_id,
+                        runtime_epoch,
                         &events,
                     )?;
                 }
             })();
-            if result.is_err() {
+            if result == Err(FileIndexError::RecoveryRequired) {
                 if let Some(index) = owner.upgrade() {
-                    index.handle_worker_failure(&worker_volume, owner_id);
+                    let _ = index.request_recovery(&reservation);
+                }
+                let _ = completed_sender.send(false);
+            } else if result.is_err() {
+                if let Some(index) = owner.upgrade() {
+                    index.consume_fatal_effects();
+                    index.handle_worker_failure(&worker_volume, owner_id, &reservation);
                 }
                 let _ = completed_sender.send(false);
             }
         });
-        self.install_worker(
-            &volume,
-            WorkerRecord {
-                owner: owner_id,
-                mount_point: volume.mount_point.clone(),
-                stop,
-                generation: generation_owner,
-                join: Some(join),
-                failed: false,
-            },
-        );
+        if let Err(join) = self.attach_worker_join(&volume, owner_id, runtime_epoch, join) {
+            drop(start_sender);
+            let _ = join.join();
+            return Err(FileIndexError::Unavailable);
+        }
         if start_sender.send(()).is_err() {
             if let Some(worker) = self.remove_worker_if_owner(&volume.identity, owner_id) {
                 stop_and_join_worker(worker);
@@ -4644,11 +7528,15 @@ impl FileIndex {
         watcher: &mut Watcher,
         owner: u64,
         worker_stop: &AtomicBool,
+        runtime_epoch: u64,
     ) -> Result<u64, FileIndexError> {
-        if worker_stop.load(Ordering::Acquire) || !self.worker_is_current(volume, owner, None) {
+        if worker_stop.load(Ordering::Acquire)
+            || !self.worker_runtime_authorized(volume, owner, None, runtime_epoch)
+        {
             return Err(FileIndexError::Unavailable);
         }
-        let (generation, has_committed) = self.begin_worker_candidate(volume, owner)?;
+        let (generation, has_committed) =
+            self.begin_worker_candidate(volume, owner, runtime_epoch)?;
         let scanner_stop = Arc::new(AtomicBool::new(false));
         let (scan_sender, scan_receiver) = mpsc::sync_channel(1);
         let scan_volume_identity = volume.clone();
@@ -4671,15 +7559,17 @@ impl FileIndex {
         let mut replay = EventBuffer::new();
         let mut final_batch = None;
         let scan = loop {
-            if worker_stop.load(Ordering::Acquire) || !self.worker_is_current(volume, owner, None) {
+            if worker_stop.load(Ordering::Acquire)
+                || !self.worker_runtime_authorized(volume, owner, None, runtime_epoch)
+            {
                 return Err(FileIndexError::Unavailable);
             }
             match scan_receiver.try_recv() {
                 Ok(ScanMessage::Batch(batch)) => {
                     if let Some(previous) = final_batch.replace(batch) {
                         let mut state = self.state.lock().expect("file index lock poisoned");
-                        if !self.worker_is_current(volume, owner, None)
-                            || !Self::authenticated_mount_matches(&state, volume)
+                        if state.runtime_epoch != runtime_epoch
+                            || !self.worker_write_authorized_locked(&state, volume, owner, None)
                         {
                             return Err(FileIndexError::Unavailable);
                         }
@@ -4714,6 +7604,7 @@ impl FileIndex {
                         generation,
                         has_committed,
                         owner,
+                        runtime_epoch,
                     },
                     &mut replay,
                     &events,
@@ -4732,6 +7623,7 @@ impl FileIndex {
                     generation,
                     has_committed,
                     owner,
+                    runtime_epoch,
                 },
                 &mut replay,
                 &events,
@@ -4741,7 +7633,9 @@ impl FileIndex {
             .last_sequence()
             .map(|cutoff| replay.take_through(cutoff))
             .unwrap_or_default();
-        if worker_stop.load(Ordering::Acquire) || !self.worker_is_current(volume, owner, None) {
+        if worker_stop.load(Ordering::Acquire)
+            || !self.worker_runtime_authorized(volume, owner, None, runtime_epoch)
+        {
             return Err(FileIndexError::Unavailable);
         }
         self.commit_worker_candidate(
@@ -4757,6 +7651,7 @@ impl FileIndex {
                     exclusions,
                     || {
                         worker_stop.load(Ordering::Acquire)
+                            || self.lifecycle.file_index_phase() != FileIndexPhase::Running
                             || !self.worker_is_current(volume, owner, None)
                     },
                     |batch| apply(batch).map_err(|_| BackendError::Platform),
@@ -4774,7 +7669,12 @@ impl FileIndex {
         replay: &mut EventBuffer,
         events: &[windows_backend::StructuredEvent],
     ) -> Result<(), FileIndexError> {
-        if !self.worker_is_current(context.volume, context.owner, None) {
+        if !self.worker_runtime_authorized(
+            context.volume,
+            context.owner,
+            None,
+            context.runtime_epoch,
+        ) {
             return Err(FileIndexError::Unavailable);
         }
         let events =
@@ -4786,8 +7686,8 @@ impl FileIndex {
             return Ok(());
         }
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(context.volume, context.owner, None)
-            || !Self::authenticated_mount_matches(&state, context.volume)
+        if state.runtime_epoch != context.runtime_epoch
+            || !self.worker_write_authorized_locked(&state, context.volume, context.owner, None)
         {
             return Err(FileIndexError::Unavailable);
         }
@@ -4802,7 +7702,10 @@ impl FileIndex {
                     context.volume,
                     &events,
                     context.exclusions,
-                    || !self.worker_is_current(context.volume, context.owner, None),
+                    || {
+                        self.lifecycle.file_index_phase() != FileIndexPhase::Running
+                            || !self.worker_is_current(context.volume, context.owner, None)
+                    },
                     |batch| apply(batch).map_err(|_| BackendError::Platform),
                 )
                 .map_err(|_| StoreError::InvalidData)
@@ -4820,9 +7723,10 @@ impl FileIndex {
         exclusions: &[ExcludedPrefix],
         generation: u64,
         owner: u64,
+        runtime_epoch: u64,
         events: &[windows_backend::StructuredEvent],
     ) -> Result<(), FileIndexError> {
-        if !self.worker_is_current(volume, owner, Some(generation)) {
+        if !self.worker_runtime_authorized(volume, owner, Some(generation), runtime_epoch) {
             return Err(FileIndexError::Unavailable);
         }
         let events = filter_replay_events(&volume.identity, events, exclusions);
@@ -4830,10 +7734,8 @@ impl FileIndex {
             return Ok(());
         }
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(volume, owner, Some(generation))
-            || !Self::authenticated_mount_matches(&state, volume)
-            || state.fatal_unavailable
-            || !state.admission_open
+        if state.runtime_epoch != runtime_epoch
+            || !self.worker_write_authorized_locked(&state, volume, owner, Some(generation))
         {
             return Err(FileIndexError::Unavailable);
         }
@@ -4845,7 +7747,10 @@ impl FileIndex {
                     volume,
                     &events,
                     exclusions,
-                    || !self.worker_is_current(volume, owner, Some(generation)),
+                    || {
+                        self.lifecycle.file_index_phase() != FileIndexPhase::Running
+                            || !self.worker_is_current(volume, owner, Some(generation))
+                    },
                     |batch| apply(batch).map_err(|_| BackendError::Platform),
                 )
                 .map_err(|_| StoreError::InvalidData)
@@ -4859,6 +7764,7 @@ impl FileIndex {
         &self,
         volume: &FixedVolume,
         owner: u64,
+        runtime_epoch: u64,
     ) -> Result<(), FileIndexError> {
         let generation = self
             .workers
@@ -4868,6 +7774,7 @@ impl FileIndex {
             .get(&volume.identity)
             .filter(|worker| {
                 worker.owner == owner
+                    && worker.runtime_epoch == runtime_epoch
                     && worker.mount_point == volume.mount_point
                     && !worker.failed
                     && !worker.stop.load(Ordering::Acquire)
@@ -4875,12 +7782,12 @@ impl FileIndex {
             .map(|worker| worker.generation.load(Ordering::Acquire))
             .filter(|generation| *generation != 0)
             .ok_or(FileIndexError::Unavailable)?;
-        if !self.worker_is_current(volume, owner, Some(generation)) {
+        if !self.worker_runtime_authorized(volume, owner, Some(generation), runtime_epoch) {
             return Err(FileIndexError::Unavailable);
         }
         let mut state = self.state.lock().expect("file index lock poisoned");
-        if !self.worker_is_current(volume, owner, Some(generation))
-            || !Self::authenticated_mount_matches(&state, volume)
+        if state.runtime_epoch != runtime_epoch
+            || !self.worker_write_authorized_locked(&state, volume, owner, Some(generation))
         {
             return Err(FileIndexError::Unavailable);
         }
@@ -4888,7 +7795,12 @@ impl FileIndex {
         Ok(())
     }
 
-    fn handle_worker_failure(&self, volume: &FixedVolume, owner: u64) {
+    fn handle_worker_failure(
+        self: &Arc<Self>,
+        volume: &FixedVolume,
+        owner: u64,
+        reservation: &DbWorkReservation,
+    ) {
         let completed_generation = self
             .workers
             .lock()
@@ -4901,7 +7813,7 @@ impl FileIndex {
         if !self.mark_worker_stopped(&volume.identity, owner) {
             return;
         }
-        let _ = self.mark_fixed_volume_dirty(volume);
+        let _ = self.mark_fixed_volume_dirty(volume, reservation);
         let mut state = self.state.lock().expect("file index lock poisoned");
         if state.fatal_unavailable || !state.admission_open || state.store.is_none() {
             return;
@@ -4942,6 +7854,80 @@ impl FileIndex {
             pending_signals: usize::from(coordinator.pending_root.is_some()),
             wakes: coordinator.wakes,
             thread_starts: usize::from(coordinator.thread_started),
+        }
+    }
+
+    fn claim_calibration_run_with<F>(&self, before_state: F) -> Option<(PathBuf, DbWorkReservation)>
+    where
+        F: FnOnce(),
+    {
+        before_state();
+        let mut state = self.state.lock().expect("file index lock poisoned");
+        self.admit_locked(&state, AdmissionKind::DbWork, state.runtime_epoch)
+            .ok()?;
+        let mut coordinator = self
+            .coordinator
+            .state
+            .lock()
+            .expect("file index coordinator lock poisoned");
+        if coordinator.running || self.coordinator.stop.load(Ordering::Acquire) {
+            return None;
+        }
+        if coordinator.pending_runtime_epoch != Some(state.runtime_epoch) {
+            return None;
+        }
+        let app_data_root = coordinator.pending_root.clone()?;
+        let Some(next_db_work) = state.db_work.checked_add(1) else {
+            drop(coordinator);
+            let newly_fatal = self.latch_exhaustion_locked(&mut state);
+            drop(state);
+            if newly_fatal {
+                self.consume_fatal_effects();
+            }
+            return None;
+        };
+        let runtime_epoch = state.runtime_epoch;
+        state.db_work = next_db_work;
+        coordinator.running = true;
+        coordinator.pending_root = None;
+        coordinator.pending_runtime_epoch = None;
+        Some((
+            app_data_root,
+            DbWorkReservation {
+                state: Arc::clone(&self.state),
+                coordinator: Arc::clone(&self.coordinator),
+                runtime_epoch,
+                released: false,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    fn mark_fixed_volume_dirty_for_test(
+        self: &Arc<Self>,
+        volume: &FixedVolume,
+    ) -> Result<(), FileIndexError> {
+        let reservation = self
+            .reserve_db_work(self.runtime_epoch())
+            .map_err(|_| FileIndexError::Unavailable)?;
+        self.mark_fixed_volume_dirty(volume, &reservation)
+    }
+
+    #[cfg(test)]
+    fn stop_detached_workers_for_test(
+        self: &Arc<Self>,
+        volumes: &[FixedVolume],
+    ) -> Result<(), FileIndexError> {
+        let reservation = self
+            .reserve_db_work(self.runtime_epoch())
+            .map_err(|_| FileIndexError::Unavailable)?;
+        self.stop_detached_workers(volumes, &reservation)
+    }
+
+    #[cfg(test)]
+    fn handle_worker_failure_for_test(self: &Arc<Self>, volume: &FixedVolume, owner: u64) {
+        if let Ok(reservation) = self.reserve_db_work(self.runtime_epoch()) {
+            self.handle_worker_failure(volume, owner, &reservation);
         }
     }
 }
@@ -5001,6 +7987,19 @@ impl Drop for FileIndex {
             .collect::<Vec<_>>();
         for worker in workers {
             stop_and_join_worker(worker);
+        }
+        if let Some(mut worker) = self
+            .integrity_worker
+            .get_mut()
+            .expect("file index integrity join lock poisoned")
+            .take()
+        {
+            worker.stop.store(true, Ordering::Release);
+            if let Some(join) = worker.join.take() {
+                if join.thread().id() != std::thread::current().id() {
+                    let _ = join.join();
+                }
+            }
         }
     }
 }

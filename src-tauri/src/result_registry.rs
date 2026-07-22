@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
 };
 
@@ -45,10 +45,15 @@ pub(crate) struct QueryToken {
     generation: u64,
     query_sequence: u64,
     domain: QueryDomain,
+    domain_epoch: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomainEpochExhausted;
 
 struct ResultSet {
     request_id: String,
+    domain: QueryDomain,
     actions: HashMap<String, ResultAction>,
 }
 
@@ -59,26 +64,39 @@ struct RegistryState {
     active_invocation_id: Option<String>,
     latest_query_sequence: u64,
     latest_query_domain: Option<QueryDomain>,
+    domain_epochs: [u64; 2],
+    domain_exhausted: [bool; 2],
     current: Option<ResultSet>,
 }
 
-pub(crate) struct ResultRegistry {
+struct RegistryInner {
     next_id: AtomicU64,
     state: Mutex<RegistryState>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResultRegistry {
+    inner: Arc<RegistryInner>,
 }
 
 impl Default for ResultRegistry {
     fn default() -> Self {
         Self {
-            next_id: AtomicU64::new(0),
-            state: Mutex::new(RegistryState::default()),
+            inner: Arc::new(RegistryInner {
+                next_id: AtomicU64::new(0),
+                state: Mutex::new(RegistryState::default()),
+            }),
         }
     }
 }
 
 impl ResultRegistry {
     pub(crate) fn on_show(&self, invocation_id: String) {
-        let mut state = self.state.lock().expect("result registry lock poisoned");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
         state.generation = state
             .generation
             .checked_add(1)
@@ -96,10 +114,15 @@ impl ResultRegistry {
         invocation_id: &str,
         query_sequence: u64,
     ) -> Option<QueryToken> {
-        let mut state = self.state.lock().expect("result registry lock poisoned");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
         if !state.active
             || state.active_invocation_id.as_deref() != Some(invocation_id)
             || query_sequence <= state.latest_query_sequence
+            || state.domain_exhausted[domain.index()]
         {
             return None;
         }
@@ -107,10 +130,12 @@ impl ResultRegistry {
         state.latest_query_sequence = query_sequence;
         state.latest_query_domain = Some(domain);
         state.current = None;
+        let domain_epoch = state.domain_epochs[domain.index()];
         Some(QueryToken {
             generation: state.generation,
             query_sequence,
             domain,
+            domain_epoch,
         })
     }
 
@@ -125,11 +150,17 @@ impl ResultRegistry {
         A: FnOnce() -> bool,
         F: FnOnce(String, Vec<(String, T)>) -> R,
     {
-        let mut state = self.state.lock().expect("result registry lock poisoned");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
         if !state.active
             || token.generation != state.generation
             || token.query_sequence != state.latest_query_sequence
             || Some(token.domain) != state.latest_query_domain
+            || state.domain_exhausted[token.domain.index()]
+            || token.domain_epoch != state.domain_epochs[token.domain.index()]
             || !authorize()
         {
             return None;
@@ -146,6 +177,7 @@ impl ResultRegistry {
 
         state.current = Some(ResultSet {
             request_id: request_id.clone(),
+            domain: token.domain,
             actions,
         });
         Some(response(request_id, items))
@@ -156,7 +188,11 @@ impl ResultRegistry {
         request_id: &str,
         result_id: &str,
     ) -> Result<ResultAction, RegistryError> {
-        let state = self.state.lock().expect("result registry lock poisoned");
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
         let current = state.current.as_ref().ok_or(RegistryError::StaleRequest)?;
         if current.request_id != request_id {
             return Err(RegistryError::StaleRequest);
@@ -170,7 +206,11 @@ impl ResultRegistry {
     }
 
     pub(crate) fn hide_and_clear(&self) {
-        let mut state = self.state.lock().expect("result registry lock poisoned");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
         state.generation = state
             .generation
             .checked_add(1)
@@ -182,8 +222,41 @@ impl ResultRegistry {
         state.current = None;
     }
 
+    pub(crate) fn invalidate_domain(
+        &self,
+        domain: QueryDomain,
+    ) -> Result<(), DomainEpochExhausted> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        let epoch = &mut state.domain_epochs[domain.index()];
+        let Some(next) = epoch.checked_add(1) else {
+            state.domain_exhausted[domain.index()] = true;
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.domain == domain)
+            {
+                state.current = None;
+            }
+            return Err(DomainEpochExhausted);
+        };
+        *epoch = next;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.domain == domain)
+        {
+            state.current = None;
+        }
+        Ok(())
+    }
+
     fn allocate_id(&self, prefix: &str) -> String {
         let previous = self
+            .inner
             .next_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -193,9 +266,18 @@ impl ResultRegistry {
     }
 }
 
+impl QueryDomain {
+    const fn index(self) -> usize {
+        match self {
+            Self::Application => 0,
+            Self::File => 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, path::PathBuf};
+    use std::{cell::Cell, path::PathBuf, sync::atomic::Ordering};
 
     use serde_json::Value;
 
@@ -339,6 +421,87 @@ mod tests {
             .unwrap();
         assert_eq!(current.0, "req-0000000000000001");
         assert_eq!(current.1[0].0, "item-0000000000000002");
+    }
+
+    #[test]
+    fn clones_share_allocator_mapping_and_narrow_domain_epoch() {
+        let registry = ResultRegistry::default();
+        let recovery = registry.clone();
+        registry.on_show("inv-1".into());
+        let stale_file = registry.begin_query(QueryDomain::File, "inv-1", 1).unwrap();
+        let application = registry
+            .begin_query(QueryDomain::Application, "inv-1", 2)
+            .unwrap();
+        let application_response = publish_app(
+            &registry,
+            application,
+            vec![(item("", "Application"), action("application"))],
+        )
+        .unwrap();
+
+        recovery.invalidate_domain(QueryDomain::File).unwrap();
+        assert!(recovery
+            .publish_if_latest(
+                stale_file,
+                vec![(FileDraft { name: "Stale" }, ResultAction::OpenIndexedPath)],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .is_none());
+        assert_eq!(
+            recovery.resolve(
+                &application_response.request_id,
+                &application_response.items[0].result_id,
+            ),
+            Ok(action("application"))
+        );
+
+        let next = recovery.begin_query(QueryDomain::File, "inv-1", 3).unwrap();
+        let response = registry
+            .publish_if_latest(
+                next,
+                vec![(FileDraft { name: "Current" }, ResultAction::OpenIndexedPath)],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        assert_eq!(response.0, "req-0000000000000003");
+        assert_eq!(response.1[0].0, "item-0000000000000004");
+    }
+
+    #[test]
+    fn exhausted_file_epoch_is_permanent_and_allocates_nothing() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        registry.inner.state.lock().unwrap().domain_epochs[QueryDomain::File.index()] = u64::MAX;
+        let token = registry.begin_query(QueryDomain::File, "inv-1", 1).unwrap();
+
+        assert_eq!(
+            registry.invalidate_domain(QueryDomain::File),
+            Err(super::DomainEpochExhausted)
+        );
+        assert!(registry
+            .publish_if_latest(
+                token,
+                vec![(FileDraft { name: "Stale" }, ResultAction::OpenIndexedPath)],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .is_none());
+        assert!(registry
+            .begin_query(QueryDomain::File, "inv-1", 2)
+            .is_none());
+        assert_eq!(registry.inner.next_id.load(Ordering::Acquire), 0);
+
+        let application = registry
+            .begin_query(QueryDomain::Application, "inv-1", 2)
+            .unwrap();
+        assert!(publish_app(
+            &registry,
+            application,
+            vec![(item("", "Application"), action("application"))],
+        )
+        .is_some());
     }
 
     #[test]

@@ -159,6 +159,10 @@ fn setup_production_lifecycle(
 
     lifecycle::install_session_end_hook(app.handle(), &window)
         .map_err(|_| lifecycle_setup_error())?;
+    let hwnd = window.hwnd().map_err(|_| lifecycle_setup_error())?;
+    app.state::<Arc<file_index::FileIndex>>()
+        .install_main_window_hwnd(hwnd.0 as isize)
+        .map_err(|_| lifecycle_setup_error())?;
     let _ = coordinator.reconcile_runtime_settings(app.handle(), &persisted_settings);
     let _ = apps::start_initial_refresh(Arc::clone(app_cache))?;
     coordinator
@@ -175,7 +179,13 @@ pub fn run() {
     let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
-    let file_index = Arc::new(file_index::FileIndex::default());
+    let result_registry = result_registry::ResultRegistry::default();
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let file_index = Arc::new(file_index::FileIndex::new(
+        Arc::clone(&coordinator),
+        result_registry.clone(),
+    ));
 
     let builder = tauri::Builder::default();
 
@@ -205,7 +215,7 @@ pub fn run() {
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
-        .manage(result_registry::ResultRegistry::default())
+        .manage(result_registry)
         .invoke_handler(tauri::generate_handler![
             commands::search_apps,
             commands::search_files,
@@ -397,10 +407,29 @@ mod tests {
         ] {
             assert!(production.contains(&format!("commands::{command}")));
         }
+        let production_root = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
         assert_eq!(
-            production
+            production_root
+                .matches("result_registry::ResultRegistry::default()")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production_root
                 .matches("manage(result_registry::ResultRegistry::default())")
                 .count(),
+            0
+        );
+        assert!(production_root
+            .contains("let result_registry = result_registry::ResultRegistry::default();"));
+        assert!(production_root.contains(
+            "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registry.clone(),\n    ));"
+        ));
+        assert_eq!(
+            production_root.matches(".manage(result_registry)").count(),
             1
         );
 
@@ -454,6 +483,13 @@ mod tests {
             );
         }
         assert_eq!(production.matches(".mark_setup_ready(").count(), 1);
+        let hook = production
+            .find("lifecycle::install_session_end_hook")
+            .unwrap();
+        let hwnd = production.find(".install_main_window_hwnd(").unwrap();
+        let ready = production.find(".mark_setup_ready(").unwrap();
+        assert!(hook < hwnd && hwnd < ready);
+        assert_eq!(production.matches(".install_main_window_hwnd(").count(), 1);
         assert_eq!(
             production
                 .matches("request_show(app, ShowTarget::Launcher)")
