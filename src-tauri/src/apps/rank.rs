@@ -151,6 +151,19 @@ mod tests {
     }
 
     #[test]
+    fn enterprise_wechat_exact_match_precedes_uninstaller_contains_match() {
+        let applications = vec![
+            application("main", "企业微信", &[], 0),
+            application("uninstaller", "卸载企业微信", &[], 100),
+        ];
+
+        assert_eq!(
+            ids(&rank(&applications, "企业微信")),
+            ["main", "uninstaller"]
+        );
+    }
+
+    #[test]
     fn equal_match_class_prefers_alias_then_use_count() {
         let applications = vec![
             application("display", "vscode", &[], 100),

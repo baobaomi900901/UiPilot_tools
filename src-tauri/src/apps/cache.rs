@@ -134,6 +134,7 @@ mod tests {
     fn failed_refresh_preserves_last_good_snapshot() {
         for error in [
             DiscoveryError::KnownFolderQuery,
+            DiscoveryError::RootUnavailable,
             DiscoveryError::AppsFolderEnumeration,
         ] {
             let cache = AppCache::from_apps(vec![application("Existing")]);

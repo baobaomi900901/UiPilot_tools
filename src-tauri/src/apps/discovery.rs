@@ -1006,22 +1006,42 @@ mod tests {
             .to_owned();
         let sentinel_seen = Cell::new(false);
 
-        let snapshot = discover_from_roots(roots(&user, &common), |path| {
-            if path.file_name() == Some(sentinel_name.as_os_str()) {
-                sentinel_seen.set(true);
-                panic!("scanner reached the outside sentinel");
-            }
-            no_target(path)
-        })
+        let snapshot = discover_from_roots(
+            [
+                StartMenuRoot {
+                    kind: RootKind::User,
+                    path: user.clone(),
+                },
+                StartMenuRoot {
+                    kind: RootKind::Common,
+                    path: common.clone(),
+                },
+                StartMenuRoot {
+                    kind: RootKind::UserTopLevel,
+                    path: user.clone(),
+                },
+                StartMenuRoot {
+                    kind: RootKind::CommonTopLevel,
+                    path: common.clone(),
+                },
+            ],
+            |path| {
+                if path.file_name() == Some(sentinel_name.as_os_str()) {
+                    sentinel_seen.set(true);
+                    panic!("scanner reached the outside sentinel");
+                }
+                no_target(path)
+            },
+        )
         .unwrap();
 
-        assert_eq!(snapshot.diagnostics.reparse_entries, 1);
+        assert_eq!(snapshot.diagnostics.reparse_entries, 2);
         assert!(!sentinel_seen.get());
 
         let root_error = discover_from_roots(
             [
                 StartMenuRoot {
-                    kind: RootKind::User,
+                    kind: RootKind::UserTopLevel,
                     path: user.join("outside-link"),
                 },
                 StartMenuRoot {
