@@ -1154,6 +1154,7 @@ describe('settings ownership', () => {
 
     expect(core.getSnapshot().settings!.hotkey.value).toBe('Alt+Space')
     expect(core.getSnapshot().settings!.researchId.value).toBe('research_1')
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
 

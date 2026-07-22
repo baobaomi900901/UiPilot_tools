@@ -1071,6 +1071,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const current = ownsSettingsView(operation)
       releaseSettingsOperation(operation)
       if (current) {
+        model.settingsNeedsReload = true
         setControlDraft(settings.hotkey.key, previous)
         settings.hotkey.value = previous
         model.status = errorText(error)
