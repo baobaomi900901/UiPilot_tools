@@ -144,6 +144,14 @@ function fileItem(
   }
 }
 
+function folderItem(fullPath = String.raw`C:\Private\Reports`, resultId = 'folder-result-1'): FileResultItem {
+  return {
+    ...fileItem(fullPath, resultId),
+    kind: 'folder',
+    sizeBytes: null,
+  }
+}
+
 function fileResponse(
   revision: string,
   items: FileResultItem[] = [fileItem()],
@@ -233,6 +241,22 @@ async function startedSettingsCore() {
   await core.start()
   fake.emit(shown('settings-r3', 'settings'))
   return { core, ...fake }
+}
+
+async function startedFileView(items: FileResultItem[] = [fileItem()]) {
+  const fake = fakeClient()
+  vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1', items))
+  const core = createLauncherCore(fake.client)
+  await core.start()
+  const mounted = await mountLauncherView(core)
+  await act(async () => fake.emit(shown('file-panel')))
+  const control = core.getSnapshot().queryControl
+  await act(async () =>
+    core.text({ kind: 'ordinaryInput', control, value: '/find quarterly', inputType: 'insertText' }),
+  )
+  await act(async () => core.keyDown('Enter', false))
+  await vi.waitFor(() => expect(core.getSnapshot().file?.results.length).toBe(items.length))
+  return { core, mounted, ...fake }
 }
 
 type R3TextRecord =
@@ -2568,5 +2592,123 @@ describe('file index refresh', () => {
 
     expect(protocolSource).toContain("{ status: 'fileRevealRequested' }")
     expect(protocolSource).toContain("{ status: 'folderOpenRequested' }")
+  })
+})
+
+describe('file panel accessibility', () => {
+  it('renders file categories results and preview without leaking private result ids', async () => {
+    installMatchMedia(false)
+    const first = fileItem(String.raw`C:\Private\Quarterly Report.pdf`, 'secret-file-id')
+    const second = folderItem(String.raw`C:\Private\Reports`, 'secret-folder-id')
+    const { core, mounted, client } = await startedFileView([first, second])
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    expect(mounted.host.querySelector('.file-workspace')).toBeTruthy()
+    expect(input.getAttribute('aria-controls')).toBe('file-results')
+    expect(input.getAttribute('aria-expanded')).toBe('true')
+    expect(document.activeElement).toBe(input)
+
+    const tabs = [...mounted.host.querySelectorAll<HTMLElement>('[role="tab"]')]
+    expect(tabs.map((tab) => tab.textContent?.replaceAll(' ', ''))).toEqual([
+      '全部',
+      '文件夹',
+      'Excel',
+      'Word',
+      'PPT',
+      'PDF',
+      '图片',
+      '视频',
+      '音频',
+      '压缩包',
+    ])
+    expect(tabs.filter((tab) => tab.tabIndex === 0)).toHaveLength(1)
+    await act(async () => tabs[5]!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    expect(client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'pdf' }))
+
+    const options = [...mounted.host.querySelectorAll<HTMLElement>('#file-results [role="option"]')]
+    expect(options).toHaveLength(2)
+    expect(options[0]!.id).toBe('file-result-option-0')
+    expect(options[0]!.tabIndex).toBe(-1)
+    expect(input.getAttribute('aria-activedescendant')).toBe(options[0]!.id)
+    expect(mounted.host.innerHTML).not.toContain('secret-file-id')
+    expect(mounted.host.innerHTML).not.toContain('secret-folder-id')
+
+    await act(async () => options[1]!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })))
+    expect(document.activeElement).toBe(input)
+    expect(core.getSnapshot().file?.selected?.fullPath).toBe(String.raw`C:\Private\Reports`)
+    expect(mounted.host.querySelector('.file-preview')?.textContent).toContain(String.raw`C:\Private\Reports`)
+    expect(mounted.host.querySelector('.file-preview')?.textContent).toContain('--')
+    await mounted.unmount()
+  })
+
+  it('keeps the query input as the only result focus owner and executes selected files from rows', async () => {
+    installMatchMedia(false)
+    const { core, mounted, client } = await startedFileView([
+      fileItem(String.raw`C:\Private\A.txt`, 'a'),
+      fileItem(String.raw`C:\Private\B.txt`, 'b'),
+    ])
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    expect(document.activeElement).toBe(input)
+    expect(input.getAttribute('aria-activedescendant')).toBe('file-result-option-1')
+
+    const second = mounted.host.querySelector<HTMLElement>('#file-result-option-1')!
+    await act(async () => second.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })))
+    expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'file-request-1', resultId: 'b' })
+    expect(core.getSnapshot().file?.selected?.fullPath).toBe(String.raw`C:\Private\B.txt`)
+    await mounted.unmount()
+  })
+})
+
+describe('file panel responsive layout', () => {
+  it('keeps the file UI in one scoped responsive surface without extra component families', () => {
+    expect(launcherViewSource).toContain('className="file-workspace"')
+    expect(launcherViewSource).toContain("import {")
+    expect(launcherViewSource).not.toContain('@ant-design/icons')
+    const antdImport = launcherViewSource.slice(0, launcherViewSource.indexOf("} from 'antd'"))
+    for (const forbidden of ['AutoComplete', 'Select', 'Card', 'Modal', 'Popconfirm']) {
+      expect(antdImport).not.toContain(forbidden)
+    }
+    expect(stylesSource).toContain('.file-workspace')
+    expect(stylesSource).toContain('grid-template-areas')
+    expect(stylesSource).toContain('.file-category-strip')
+    expect(stylesSource).toContain('.file-preview')
+    expect(stylesSource).toContain('@media (max-width: 600px)')
+    expect(stylesSource).toContain('@media (forced-colors: active)')
+    expect(stylesSource).toContain('overflow-wrap: anywhere')
+    expect(stylesSource).toContain('overflow-x: hidden')
+  })
+})
+
+describe('file preview preference', () => {
+  it('renders the preview switch as the single preference control and rolls pending state through the core', async () => {
+    installMatchMedia(false)
+    const pending = deferred<void>()
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    vi.mocked(fake.client.setFilePreviewPreference).mockReturnValueOnce(pending.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('file-preview')))
+    const control = core.getSnapshot().queryControl
+    await act(async () => core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' }))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(true))
+
+    const preview = mounted.host.querySelector<HTMLElement>('.file-preview')!
+    expect(preview.textContent).toContain('UiPilot.txt')
+    expect(preview.textContent).toContain('42')
+    const setting = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="设置暂不可用"]')!
+    expect(setting.disabled).toBe(true)
+    const checkbox = mounted.host.querySelector<HTMLInputElement>('[role="switch"][aria-label="文件预览"]')!
+    await act(async () => checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    expect(fake.client.setFilePreviewPreference).toHaveBeenCalledWith({ preference: { enabled: false } })
+    expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: true })
+    pending.resolve()
+    await pending.promise
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: false }),
+    )
+    await mounted.unmount()
   })
 })

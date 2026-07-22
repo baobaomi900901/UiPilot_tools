@@ -7,6 +7,8 @@ import {
   Form,
   Input,
   Spin,
+  Switch,
+  Tooltip,
   theme,
   type InputProps,
   type InputRef,
@@ -23,7 +25,7 @@ import {
 
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
-import type { ControlKey } from './protocol'
+import type { ControlKey, FileCategory, FileResultKind } from './protocol'
 import {
   formatHotkeyDisplay,
   reduceHotkeyRecorder,
@@ -68,6 +70,29 @@ function BoundInput({ core, control, value, onBound, onBindingFailed, ...props }
 
 function composing(event: ReactKeyboardEvent): boolean {
   return event.nativeEvent.isComposing
+}
+
+const fileCategories: readonly { value: FileCategory; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'folder', label: '文件夹' },
+  { value: 'excel', label: 'Excel' },
+  { value: 'word', label: 'Word' },
+  { value: 'ppt', label: 'PPT' },
+  { value: 'pdf', label: 'PDF' },
+  { value: 'image', label: '图片' },
+  { value: 'video', label: '视频' },
+  { value: 'audio', label: '音频' },
+  { value: 'archive', label: '压缩包' },
+]
+
+function fileSize(kind: FileResultKind, sizeBytes: string | null): string {
+  if (kind === 'folder' || sizeBytes === null) return '--'
+  return `${sizeBytes} B`
+}
+
+function fileModified(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
 interface HotkeyRecorderInputProps {
@@ -144,6 +169,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const queryRef = useRef<HTMLInputElement | null>(null)
   const headingRef = useRef<HTMLHeadingElement>(null)
   const optionRefs = useRef(new Map<number, HTMLElement>())
+  const fileOptionRefs = useRef(new Map<number, HTMLElement>())
   const ready = useRef(false)
 
   useEffect(() => {
@@ -164,8 +190,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }, [onReady])
   const reportQueryBound = useCallback(() => {
     queryRef.current = document.getElementById(`launcher-query-${snapshot.queryControl}`) as HTMLInputElement | null
+    if (snapshot.view === 'launcher' && snapshot.invocationId) queryRef.current?.focus()
     reportReady()
-  }, [reportReady, snapshot.queryControl])
+  }, [reportReady, snapshot.invocationId, snapshot.queryControl, snapshot.view])
 
   useLayoutEffect(() => {
     if (!snapshot.invocationId) return
@@ -182,6 +209,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (snapshot.view === 'launcher' && selected) optionRefs.current.get(selected.key)?.scrollIntoView({ block: 'nearest' })
   }, [snapshot.results, snapshot.selectedIndex, snapshot.view])
 
+  const file = snapshot.file
+  const activeFileIndex =
+    file?.selected === undefined ? -1 : file.results.findIndex((item) => item.fullPath === file.selected?.fullPath)
+
+  useLayoutEffect(() => {
+    if (snapshot.view === 'launcher' && file && activeFileIndex >= 0) {
+      const selected = fileOptionRefs.current.get(activeFileIndex)
+      selected?.scrollIntoView?.({ block: 'nearest' })
+    }
+  }, [activeFileIndex, file, snapshot.view])
+
   const status =
     snapshot.shownNotice ||
     snapshot.status ||
@@ -192,6 +230,16 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       : '')
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.altKey && (event.key.toLowerCase() === 's' || event.key.toLowerCase() === 'p')) {
+      if (composing(event) || !file) return
+      event.preventDefault()
+      if (event.key.toLowerCase() === 's') {
+        core.setFileSort(file.sort === 'modifiedDesc' ? 'modifiedAsc' : 'modifiedDesc')
+      } else {
+        core.setFilePreviewEnabled(!file.previewEnabled)
+      }
+      return
+    }
     if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
     const isComposing = composing(event)
     if (event.key === 'Escape' && !isComposing) event.preventDefault()
@@ -271,6 +319,143 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       </Spin>
     </section>
   )
+
+  const chooseFileResult = (index: number) => {
+    if (!file || activeFileIndex === index) return
+    const direction = index > activeFileIndex ? 'ArrowDown' : 'ArrowUp'
+    const steps = Math.abs(index - activeFileIndex)
+    for (let step = 0; step < steps; step += 1) core.keyDown(direction, false)
+  }
+
+  const filePanel = file ? (
+    <section className="file-workspace" aria-label="文件搜索">
+      <label className="visually-hidden" htmlFor={`launcher-query-${snapshot.queryControl}`}>
+        搜索文件
+      </label>
+      <BoundInput
+        core={core}
+        control={snapshot.queryControl}
+        value={snapshot.queryControlValue}
+        id={`launcher-query-${snapshot.queryControl}`}
+        name={`launcher-query-${snapshot.queryControl}`}
+        placeholder="搜索文件"
+        autoComplete="off"
+        spellCheck={false}
+        disabled={!snapshot.invocationId || snapshot.view !== 'launcher'}
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls="file-results"
+        aria-expanded={file.results.length > 0}
+        aria-activedescendant={activeFileIndex >= 0 ? `file-result-option-${activeFileIndex}` : undefined}
+        onKeyDown={queryKeyDown}
+        onBound={reportQueryBound}
+        onBindingFailed={reportFailed}
+      />
+      <div className="file-category-strip" role="tablist" aria-label="文件类型">
+        {fileCategories.map((category, index) => (
+          <Button
+            key={category.value}
+            role="tab"
+            tabIndex={file.category === category.value ? 0 : -1}
+            aria-selected={file.category === category.value}
+            type={file.category === category.value ? 'primary' : 'default'}
+            onClick={() => core.setFileCategory(category.value)}
+            onKeyDown={(event) => {
+              if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return
+              event.preventDefault()
+              const offset = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1
+              const nextIndex =
+                event.key === 'Home'
+                  ? 0
+                  : event.key === 'End'
+                    ? fileCategories.length - 1
+                    : (index + offset + fileCategories.length) % fileCategories.length
+              core.setFileCategory(fileCategories[nextIndex]!.value)
+            }}
+          >
+            {category.label}
+          </Button>
+        ))}
+      </div>
+      <Spin spinning={snapshot.searchPending} size="small">
+        <div id="file-results" className="result-list file-result-list" role="listbox" aria-label="文件结果">
+          {file.results.map((item, index) => (
+            <div
+              key={item.key}
+              id={`file-result-option-${index}`}
+              role="option"
+              tabIndex={-1}
+              aria-selected={activeFileIndex === index}
+              className={activeFileIndex === index ? 'result-row file-result-row is-selected' : 'result-row file-result-row'}
+              ref={(element) => {
+                if (element) fileOptionRefs.current.set(index, element)
+                else fileOptionRefs.current.delete(index)
+              }}
+              onMouseDown={(event) => {
+                event.preventDefault()
+                chooseFileResult(index)
+                queryRef.current?.focus()
+              }}
+              onDoubleClick={() => {
+                chooseFileResult(index)
+                core.keyDown('Enter', false)
+                queryRef.current?.focus()
+              }}
+            >
+              <span className="result-icon file-kind-mark" aria-hidden="true">
+                {item.kind === 'folder' ? '□' : '◇'}
+              </span>
+              <span className="result-copy">
+                <Tooltip title={item.name}>
+                  <span className="result-title">{item.name}</span>
+                </Tooltip>
+                <span className="result-subtitle">{item.fullPath}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      </Spin>
+      <aside className="file-preview" aria-label="文件预览">
+        {file.previewEnabled && file.selected ? (
+          <>
+            <Tooltip title={file.selected.name}>
+              <h2>{file.selected.name}</h2>
+            </Tooltip>
+            <dl>
+              <dt>类型</dt>
+              <dd>{file.selected.kind === 'folder' ? '文件夹' : '文件'}</dd>
+              <dt>大小</dt>
+              <dd>{fileSize(file.selected.kind, file.selected.sizeBytes)}</dd>
+              <dt>修改时间</dt>
+              <dd>{fileModified(file.selected.modifiedUtc)}</dd>
+              <dt>完整路径</dt>
+              <dd>{file.selected.fullPath}</dd>
+            </dl>
+          </>
+        ) : (
+          <p>预览已关闭</p>
+        )}
+      </aside>
+      <footer className="file-toolbar">
+        <span>共 {file.total} 条结果</span>
+        <Button onClick={() => core.setFileSort(file.sort === 'modifiedDesc' ? 'modifiedAsc' : 'modifiedDesc')}>
+          {file.sort === 'modifiedDesc' ? '修改时间 ↓' : '修改时间 ↑'}
+        </Button>
+        <Switch
+          aria-label="文件预览"
+          checked={file.previewEnabled}
+          loading={file.preferencePending}
+          disabled={file.preferencePending}
+          onChange={(checked) => core.setFilePreviewEnabled(checked)}
+        />
+        <Tooltip title="设置暂不可用">
+          <Button aria-label="设置暂不可用" disabled className="file-settings-placeholder">
+            ⚙
+          </Button>
+        </Tooltip>
+      </footer>
+    </section>
+  ) : null
 
   const settings = snapshot.settings
   const busy = settings?.operation !== undefined
@@ -396,7 +581,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     <ConfigProvider theme={{ algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
       <App>
         <main className="launcher-surface" data-color-scheme={dark ? 'dark' : 'light'}>
-          {snapshot.view === 'launcher' ? launcher : settingsView}
+          {snapshot.view === 'launcher' ? filePanel ?? launcher : settingsView}
           <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
             {status}
           </div>

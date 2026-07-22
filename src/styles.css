@@ -46,6 +46,87 @@ input {
   min-height: 0;
 }
 
+.file-workspace {
+  display: grid;
+  grid-template-areas:
+    "query query query"
+    "categories results preview"
+    "toolbar toolbar toolbar";
+  grid-template-columns: minmax(112px, 150px) minmax(0, 1fr) minmax(160px, 200px);
+  grid-template-rows: 44px minmax(0, 1fr) auto;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+}
+
+.file-workspace > .ant-input {
+  grid-area: query;
+}
+
+.file-category-strip {
+  grid-area: categories;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.file-result-list {
+  grid-area: results;
+}
+
+.file-preview {
+  grid-area: preview;
+  min-width: 0;
+  padding: 8px;
+  overflow-y: auto;
+  border: 1px solid #d9d9d9;
+}
+
+.file-preview h2 {
+  margin: 0 0 8px;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.file-preview dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 8px;
+  margin: 0;
+}
+
+.file-preview dt {
+  color: #595959;
+}
+
+.file-preview dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.file-toolbar {
+  grid-area: toolbar;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.file-toolbar > span:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.file-settings-placeholder {
+  width: 32px;
+  padding-inline: 0;
+}
+
 .launcher-view > .ant-spin,
 .launcher-view .ant-spin-container,
 .result-list {
@@ -283,7 +364,8 @@ input {
 
   .result-list,
   .settings-header,
-  .application-list {
+  .application-list,
+  .file-preview {
     border-color: #595959;
   }
 
@@ -297,8 +379,32 @@ input {
   }
 
   .result-subtitle,
+  .file-preview dt,
   .status-region {
     color: #d9d9d9;
+  }
+}
+
+@media (max-width: 600px) {
+  .file-workspace {
+    grid-template-areas:
+      "query"
+      "categories"
+      "results"
+      "preview"
+      "toolbar";
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 44px auto minmax(96px, 1fr) minmax(96px, auto) auto;
+  }
+
+  .file-category-strip {
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .file-toolbar {
+    flex-wrap: wrap;
   }
 }
 
@@ -307,6 +413,7 @@ input {
   .result-list,
   .settings-header,
   .application-list,
+  .file-preview,
   .app-mark {
     border-color: CanvasText;
   }
