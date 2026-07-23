@@ -18,7 +18,7 @@ use crate::{
         PluginView,
     },
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
-    settings::{SettingsError, SettingsStore, SettingsUpdate, WindowPosition},
+    settings::{SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WindowPosition},
 };
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
@@ -29,6 +29,7 @@ pub(crate) struct SettingsView {
     hotkey: String,
     autostart: bool,
     file_preview_enabled: bool,
+    theme: ThemePreference,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -36,6 +37,7 @@ pub(crate) struct SettingsView {
 pub(crate) struct UserSettingsUpdate {
     hotkey: String,
     autostart: bool,
+    theme: ThemePreference,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -54,6 +56,12 @@ pub(crate) struct HotkeySettingsView {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct FilePreviewPreferenceUpdate {
     enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ThemePreferenceUpdate {
+    theme: ThemePreference,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -530,6 +538,7 @@ fn load_settings_core(settings: &SettingsStore) -> SettingsView {
         hotkey: settings.hotkey,
         autostart: settings.autostart,
         file_preview_enabled: settings.file_preview_enabled,
+        theme: settings.theme,
     }
 }
 
@@ -540,6 +549,7 @@ fn prepare_settings_save(
     let update = SettingsUpdate {
         hotkey: kind.canonical(),
         autostart: settings.autostart,
+        theme: settings.theme,
     };
     Ok((kind, update))
 }
@@ -672,6 +682,54 @@ pub(crate) async fn save_hotkey(
     .await
 }
 
+async fn set_theme_preference_with<R, E, W>(
+    preference: ThemePreferenceUpdate,
+    reserve: R,
+    worker: W,
+) -> Result<(), CommandError>
+where
+    R: FnOnce() -> Result<CriticalReservation, E>,
+    W: FnOnce(CriticalReservation, ThemePreferenceUpdate) -> Result<(), ()> + Send + 'static,
+{
+    let reservation = reserve().map_err(|_| CommandError::settings_failed())?;
+    let result = tauri::async_runtime::spawn_blocking(move || worker(reservation, preference))
+        .await
+        .map_err(|_| ());
+    map_theme_preference_worker_result(result)
+}
+
+fn map_theme_preference_worker_result(
+    result: Result<Result<(), ()>, ()>,
+) -> Result<(), CommandError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(())) | Err(()) => Err(CommandError::settings_failed()),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn set_theme_preference(
+    window: tauri::WebviewWindow,
+    preference: ThemePreferenceUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let app_for_worker = app.clone();
+    set_theme_preference_with(
+        preference,
+        || coordinator.reserve_critical(),
+        move |reservation, preference| {
+            let _reservation = reservation;
+            app_for_worker
+                .state::<SettingsStore>()
+                .set_theme_preference(preference.theme)
+                .map_err(|_| ())
+        },
+    )
+    .await
+}
+
 async fn set_file_preview_preference_with<R, E, W>(
     preference: FilePreviewPreferenceUpdate,
     reserve: R,
@@ -727,6 +785,7 @@ fn save_settings_core(
         .update_user_settings(SettingsUpdate {
             hotkey: settings.hotkey,
             autostart: settings.autostart,
+            theme: settings.theme,
         })
         .map_err(|_| CommandError::settings_failed())
 }
@@ -1012,10 +1071,12 @@ mod tests {
     use super::{
         clear_and_hide_with, execute_resolved_result_with, execute_result_with, load_settings_core,
         load_settings_ready_with, map_file_preview_worker_result, map_save_worker_result,
-        prepare_file_query, prepare_hotkey_save, prepare_settings_save, publish_file_search,
-        require_main_label, save_settings_core, save_settings_with, save_settings_worker_with,
-        search_apps_with, search_files_with, set_file_preview_preference_with, CommandError,
-        ExecuteOutcome, FilePreviewPreferenceUpdate, HotkeySettingsUpdate, UserSettingsUpdate,
+        map_theme_preference_worker_result, prepare_file_query, prepare_hotkey_save,
+        prepare_settings_save, publish_file_search, require_main_label, save_settings_core,
+        save_settings_with, save_settings_worker_with, search_apps_with, search_files_with,
+        set_file_preview_preference_with, CommandError, ExecuteOutcome,
+        FilePreviewPreferenceUpdate, HotkeySettingsUpdate, ThemePreferenceUpdate,
+        UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -1026,7 +1087,7 @@ mod tests {
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
-        settings::{Settings, SettingsStore, SettingsUpdate},
+        settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference},
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
@@ -1100,6 +1161,7 @@ mod tests {
         let settings = Settings {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            theme: ThemePreference::System,
             file_preview_enabled: true,
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
@@ -1429,9 +1491,88 @@ mod tests {
             serde_json::json!({
                 "hotkey": "Alt+Space",
                 "autostart": false,
-                "filePreviewEnabled": true
+                "filePreviewEnabled": true,
+                "theme": "system"
             })
         );
+    }
+
+    #[test]
+    fn theme_preference_input_is_exact() {
+        assert_eq!(
+            serde_json::from_value::<ThemePreferenceUpdate>(serde_json::json!({
+                "theme": "dark"
+            }))
+            .unwrap()
+            .theme,
+            ThemePreference::Dark
+        );
+        assert!(
+            serde_json::from_value::<ThemePreferenceUpdate>(serde_json::json!({
+                "theme": "sepia"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ThemePreferenceUpdate>(serde_json::json!({
+                "theme": "dark",
+                "extra": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn theme_preference_maps_worker_and_storage_failures() {
+        assert_eq!(map_theme_preference_worker_result(Ok(Ok(()))), Ok(()));
+        assert_eq!(
+            map_theme_preference_worker_result(Ok(Err(()))),
+            Err(CommandError::settings_failed())
+        );
+        assert_eq!(
+            map_theme_preference_worker_result(Err(())),
+            Err(CommandError::settings_failed())
+        );
+
+        let dir = TestDir::new();
+        let store = settings_store(&dir);
+        let before = store.snapshot();
+        let current = dir.path().join("settings.json");
+        let before_disk = fs::read(&current).unwrap();
+        fs::remove_file(&current).unwrap();
+        fs::create_dir(&current).unwrap();
+        assert_eq!(
+            store.set_theme_preference(ThemePreference::Dark),
+            Err(crate::settings::SettingsError::Storage)
+        );
+        assert_eq!(store.snapshot(), before);
+        fs::remove_dir(&current).unwrap();
+        fs::write(&current, &before_disk).unwrap();
+        assert_eq!(fs::read(current).unwrap(), before_disk);
+    }
+
+    #[test]
+    fn theme_preference_command_is_narrow_and_guarded_first() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let marker = ["#[cfg(", "test", ")]\nmod tests"].concat();
+        let production = source.split(&marker).next().unwrap();
+        let start = production
+            .find("pub(crate) async fn set_theme_preference(")
+            .expect("set_theme_preference command missing");
+        let end = production[start..]
+            .find("async fn set_file_preview_preference_with")
+            .map(|offset| start + offset)
+            .expect("set_theme_preference command end missing");
+        let command = &production[start..end];
+        let first = command[command.find('{').unwrap() + 1..].trim_start();
+        assert!(first.starts_with("require_main_window(&window)?;"));
+        assert_eq!(command.matches(".state::<SettingsStore>()").count(), 1);
+        assert!(!command.contains("save_settings_transaction"));
+        assert!(!command.contains("reconcile_runtime_settings"));
+        let guard = command.find("require_main_window(&window)?;").unwrap();
+        for forbidden in ["reserve_critical", "state::<SettingsStore>"] {
+            assert!(guard < command.find(forbidden).unwrap());
+        }
     }
 
     #[test]
@@ -1461,12 +1602,14 @@ mod tests {
             UserSettingsUpdate {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
+                theme: ThemePreference::Dark,
             },
             &store,
         )
         .unwrap();
 
         assert_eq!(store.snapshot().use_counts, before);
+        assert_eq!(store.snapshot().theme, ThemePreference::Dark);
     }
 
     #[test]
@@ -1881,6 +2024,7 @@ mod tests {
         UserSettingsUpdate {
             hotkey: hotkey.into(),
             autostart: false,
+            theme: ThemePreference::System,
         }
     }
 
@@ -2041,6 +2185,7 @@ mod tests {
         let update = SettingsUpdate {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            theme: ThemePreference::System,
         };
         let caller = thread::current().id();
         let expected_coordinator = Arc::clone(&coordinator);

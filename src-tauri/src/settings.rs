@@ -21,11 +21,22 @@ pub(crate) struct WindowPosition {
     pub(crate) y: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ThemePreference {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
+    #[serde(default)]
+    pub(crate) theme: ThemePreference,
     #[serde(default = "default_file_preview_enabled")]
     pub(crate) file_preview_enabled: bool,
     #[serde(default)]
@@ -37,6 +48,7 @@ pub(crate) struct Settings {
 pub(crate) struct SettingsUpdate {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
+    pub(crate) theme: ThemePreference,
 }
 
 struct SettingsState {
@@ -62,6 +74,7 @@ impl Default for Settings {
         Self {
             hotkey: "Shift+Space".into(),
             autostart: false,
+            theme: ThemePreference::System,
             file_preview_enabled: default_file_preview_enabled(),
             use_counts: BTreeMap::new(),
             window_position: None,
@@ -143,6 +156,7 @@ impl SettingsStore {
         let mut candidate = state.value.clone();
         candidate.hotkey = update.hotkey;
         candidate.autostart = update.autostart;
+        candidate.theme = update.theme;
         self.persist(&mut state, candidate)
     }
 
@@ -173,6 +187,13 @@ impl SettingsStore {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
         candidate.file_preview_enabled = enabled;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_theme_preference(&self, theme: ThemePreference) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.theme = theme;
         self.persist(&mut state, candidate)
     }
 
@@ -333,6 +354,7 @@ mod tests {
         SettingsUpdate {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            theme: ThemePreference::System,
         }
     }
 
@@ -347,6 +369,72 @@ mod tests {
     #[test]
     fn default_hotkey_is_shift_space() {
         assert_eq!(Settings::default().hotkey, "Shift+Space");
+    }
+
+    #[test]
+    fn theme_defaults_system_and_round_trips_all_values() {
+        let dir = TestDir::new("theme-legacy");
+        let legacy = serde_json::json!({
+            "hotkey": "Alt+Space",
+            "autostart": false,
+            "filePreviewEnabled": true,
+            "useCounts": {},
+            "windowPosition": null
+        });
+        fs::write(dir.current(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(store.snapshot().theme, ThemePreference::System);
+
+        for theme in [
+            ThemePreference::System,
+            ThemePreference::Dark,
+            ThemePreference::Light,
+        ] {
+            store.set_theme_preference(theme).unwrap();
+            assert_eq!(store.snapshot().theme, theme);
+            assert_eq!(
+                SettingsStore::load(dir.path()).unwrap().snapshot().theme,
+                theme
+            );
+        }
+    }
+
+    #[test]
+    fn theme_preference_updates_only_theme() {
+        let dir = TestDir::new("theme-isolated");
+        let initial = Settings {
+            hotkey: "DoubleCtrl".into(),
+            autostart: true,
+            file_preview_enabled: false,
+            window_position: Some(WindowPosition { x: 12, y: 34 }),
+            ..Settings::default()
+        };
+        write_settings(&dir.current(), &initial);
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let before = store.snapshot();
+        store.set_theme_preference(ThemePreference::Dark).unwrap();
+
+        assert_eq!(
+            store.snapshot(),
+            Settings {
+                theme: ThemePreference::Dark,
+                ..before
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_theme_rejects_the_candidate() {
+        let dir = TestDir::new("theme-invalid");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Alt+Space","autostart":false,"theme":"sepia"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(dir.path()).unwrap();
+
+        assert_eq!(store.snapshot(), Settings::default());
     }
 
     #[test]
@@ -491,6 +579,7 @@ mod tests {
             .update_user_settings(SettingsUpdate {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
+                theme: ThemePreference::Dark,
             })
             .unwrap();
 
@@ -498,6 +587,7 @@ mod tests {
         assert_eq!(value.use_counts[APP_A], 7);
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
+        assert_eq!(value.theme, ThemePreference::Dark);
     }
 
     #[test]
@@ -707,6 +797,7 @@ mod tests {
         let persisted = Settings {
             hotkey: "Ctrl+Space".into(),
             autostart: true,
+            theme: ThemePreference::System,
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             window_position: None,

@@ -124,12 +124,14 @@ const emptySettings: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
+  theme: 'system',
 }
 
 const settingsFixture: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
+  theme: 'system',
 }
 
 function fakeClient() {
@@ -149,6 +151,7 @@ function fakeClient() {
     searchApps: vi.fn(async () => null),
     searchFiles: vi.fn(async () => null),
     setFilePreviewPreference: vi.fn(async () => undefined),
+    setThemePreference: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
     listPlugins: vi.fn(async () => []),
     reloadPlugin: vi.fn(async ({ pluginId }) => ({
@@ -277,8 +280,9 @@ async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
   }
 }
 
-async function startedCore() {
+async function startedCore(settings: SettingsView = emptySettings) {
   const fake = fakeClient()
+  vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settings)
   const core = createLauncherCore(fake.client)
   await core.start()
   return { core, ...fake }
@@ -1008,9 +1012,9 @@ describe('native trust', () => {
 })
 
 describe('settings ownership', () => {
-  async function settingsCore() {
+  async function settingsCore(settings: SettingsView = settingsFixture) {
     const fake = fakeClient()
-    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settings)
     const core = createLauncherCore(fake.client)
     await core.start()
     fake.emit(shown('settings', 'settings'))
@@ -1161,9 +1165,64 @@ describe('settings ownership', () => {
       settings: {
         hotkey: 'Alt+Space',
         autostart: true,
+        theme: 'system',
       },
     })
     await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
+  })
+
+  it('publishes theme immediately and persists through the narrow command', async () => {
+    const { core, client } = await settingsCore()
+    const save = deferred<void>()
+    vi.mocked(client.setThemePreference).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: 'dark' })
+
+    core.setThemePreference('dark')
+
+    expect(core.getSnapshot().theme).toBe('dark')
+    expect(core.getSnapshot().settings).toMatchObject({ theme: 'dark', operation: 'theme' })
+    expect(client.setThemePreference).toHaveBeenCalledWith({ preference: { theme: 'dark' } })
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    save.resolve()
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+  })
+
+  it('rolls back a failed theme save without requiring restart', async () => {
+    const { core, client } = await settingsCore()
+    vi.mocked(client.setThemePreference).mockRejectedValueOnce({
+      code: 'settingsFailed',
+      message: 'private theme failure',
+    })
+
+    core.setThemePreference('dark')
+
+    await vi.waitFor(() => expect(core.getSnapshot().theme).toBe('system'))
+    expect(core.getSnapshot().settings).toMatchObject({
+      theme: 'system',
+      needsReload: false,
+      readOnly: false,
+    })
+    expect(core.getSnapshot().status).toBe('无法保存风格设置。')
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private theme failure')
+  })
+
+  it('reconciles a stale theme mutation through the current settings epoch', async () => {
+    const { core, client, emit } = await settingsCore()
+    const save = deferred<void>()
+    vi.mocked(client.setThemePreference).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: 'dark' })
+
+    core.setThemePreference('dark')
+    emit(shown('theme-launcher-between'))
+    emit(shown('theme-settings-current', 'settings'))
+    save.resolve()
+
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({
+      theme: 'dark',
+      readOnly: false,
+      needsReload: false,
+    }))
   })
 
   it('owns the save operation before publishing an optimistic autostart value', async () => {
@@ -1178,7 +1237,9 @@ describe('settings ownership', () => {
     unsubscribe()
 
     expect(client.saveSettings).toHaveBeenCalledOnce()
-    expect(client.saveSettings).toHaveBeenCalledWith({ settings: { hotkey: 'Alt+Space', autostart: true } })
+    expect(client.saveSettings).toHaveBeenCalledWith({
+      settings: { hotkey: 'Alt+Space', autostart: true, theme: 'system' },
+    })
     await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
   })
 
@@ -1246,15 +1307,20 @@ describe('settings ownership', () => {
   })
 
   it('resets visible settings through one existing save command', async () => {
-    const { core, client } = await settingsCore()
-    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, hotkey: 'Shift+Space' })
+    const { core, client } = await settingsCore({ ...settingsFixture, theme: 'dark' })
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({
+      ...settingsFixture,
+      hotkey: 'Shift+Space',
+      theme: 'system',
+    })
 
     await core.resetSettings()
 
     expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: { hotkey: 'Shift+Space', autostart: false },
+      settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system' },
     })
     expect(client.saveSettings).toHaveBeenCalledOnce()
+    expect(client.setThemePreference).not.toHaveBeenCalled()
   })
 
   it('retires form controls before fresh replacement', async () => {
@@ -1646,6 +1712,70 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('follows system only for system theme and projects one effective scheme', async () => {
+    configCapture.values.length = 0
+    const scheme = installMatchMedia(false)
+    const { core, emit, client } = await startedCore(settingsFixture)
+    const mounted = await mountLauncherView(core)
+    expect(document.documentElement.dataset.colorScheme).toBe('light')
+    expect(mounted.host.querySelector('.launcher-surface')?.getAttribute('data-color-scheme')).toBe('light')
+
+    await act(async () => scheme.emit(true))
+    expect(document.documentElement.dataset.colorScheme).toBe('dark')
+    let config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown }
+    expect(config.algorithm).toBe(theme.darkAlgorithm)
+
+    await act(async () => emit(shown('settings-theme-force', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    const save = deferred<void>()
+    vi.mocked(client.setThemePreference).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: 'light' })
+    await act(async () => core.setThemePreference('light'))
+    await act(async () => scheme.emit(true))
+    expect(document.documentElement.dataset.colorScheme).toBe('light')
+    expect(mounted.host.querySelector('.launcher-surface')?.getAttribute('data-color-scheme')).toBe('light')
+    config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown }
+    expect(config.algorithm).toBe(theme.defaultAlgorithm)
+
+    await act(async () => save.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    await mounted.unmount()
+    expect(document.documentElement.hasAttribute('data-color-scheme')).toBe(false)
+  })
+
+  it('renders ordered theme options and selects Dark immediately', async () => {
+    installMatchMedia(false)
+    const { core, emit, client } = await startedCore(settingsFixture)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('settings-theme-select', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    const save = deferred<void>()
+    vi.mocked(client.setThemePreference).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: 'dark' })
+
+    const combobox = mounted.host.querySelector<HTMLElement>('[role="combobox"][aria-label="风格"]')
+    expect(combobox).toBeInstanceOf(HTMLElement)
+    await act(async () => {
+      combobox!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    })
+    const options = [...document.body.querySelectorAll<HTMLElement>('.ant-select-item-option')]
+    expect(options.map((option) => option.textContent)).toEqual(['跟随系统', 'Dark', 'Light'])
+    await act(async () => options[1]!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(client.setThemePreference).toHaveBeenCalledWith({ preference: { theme: 'dark' } })
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBe('theme'))
+    expect(
+      mounted.host
+        .querySelector('[role="combobox"][aria-label="风格"]')
+        ?.closest('.ant-select')
+        ?.classList.contains('ant-select-disabled'),
+    ).toBe(true)
+
+    await act(async () => save.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    await mounted.unmount()
+  })
+
   it('uses native app regions without invoking Tauri mouse capture', () => {
     expect(launcherViewSource).not.toContain('data-tauri-drag-region')
     expect(stylesSource).toMatch(
@@ -1727,8 +1857,9 @@ describe('React view and accessibility', () => {
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
     expect(stylesSource).toMatch(
-      /@media \(prefers-color-scheme: dark\)[\s\S]*\.result-list,\s*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
+      /\.launcher-surface\[data-color-scheme="dark"\][\s\S]*\.result-list,[\s\S]*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
     )
+    expect(stylesSource).not.toContain('@media (prefers-color-scheme: dark)')
     expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-form::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
@@ -1880,6 +2011,7 @@ describe('React view and accessibility', () => {
       hotkey: 'Alt+Space',
       autostart: false,
       filePreviewEnabled: true,
+      theme: 'system',
       applications: [{ appId: 'legacy', displayName: 'LiveCaptions', aliases: ['caption'] }],
     } as SettingsView)
     const core = createLauncherCore(fake.client)
@@ -2021,14 +2153,18 @@ describe('React view and accessibility', () => {
 
     expect(resetButton()).toBeTruthy()
     await act(async () => resetButton()!.click())
-    expect(document.body.textContent).toContain('快捷键将恢复为 Shift+Space，并关闭开机启动。')
+    expect(document.body.textContent).toContain(
+      '快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。',
+    )
     await act(async () => portalButton('取消')!.click())
     expect(fake.client.saveSettings).not.toHaveBeenCalled()
 
     await act(async () => resetButton()!.click())
     await act(async () => portalButton('恢复')!.click())
     await vi.waitFor(() =>
-      expect(fake.client.saveSettings).toHaveBeenCalledWith({ settings: { hotkey: 'Shift+Space', autostart: false } }),
+      expect(fake.client.saveSettings).toHaveBeenCalledWith({
+        settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system' },
+      }),
     )
     await vi.waitFor(() =>
       expect(core.getSnapshot().settings).toMatchObject({
@@ -2124,14 +2260,13 @@ describe('React view and accessibility', () => {
   })
 
   it('keeps the React/AntD source boundary exact', () => {
-    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Popconfirm', 'Spin', 'theme']) {
+    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Popconfirm', 'Select', 'Spin', 'theme']) {
       expect(launcherViewSource).toContain(required)
     }
     for (const forbidden of [
       '@tauri-apps/api',
       '@ant-design/icons',
       'AutoComplete',
-      'Select',
       'Card',
       'Modal',
       'dangerouslySetInnerHTML',
@@ -2233,11 +2368,12 @@ describe('real adapter and startup', () => {
       if (command === 'reload_plugin') return Promise.resolve(plugin)
       return Promise.resolve(undefined)
     })
-    const update = { hotkey: 'Alt+Space', autostart: false }
+    const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const }
     await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
+    await main.client.setThemePreference({ preference: { theme: 'dark' } })
     await main.client.listPlugins()
     await main.client.reloadPlugin({ pluginId: 'internal.math' })
     await main.client.deletePlugin({ pluginId: 'internal.math' })
@@ -2247,6 +2383,7 @@ describe('real adapter and startup', () => {
       ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
+      ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
       ['list_plugins', []],
       ['reload_plugin', [{ pluginId: 'internal.math' }]],
       ['delete_plugin', [{ pluginId: 'internal.math' }]],
@@ -3258,9 +3395,14 @@ describe('file panel responsive layout', () => {
     expect(launcherViewSource).toContain("import {")
     expect(launcherViewSource).not.toContain('@ant-design/icons')
     const antdImport = launcherViewSource.slice(0, launcherViewSource.indexOf("} from 'antd'"))
-    for (const forbidden of ['AutoComplete', 'Select', 'Card', 'Modal']) {
+    for (const forbidden of ['AutoComplete', 'Card', 'Modal']) {
       expect(antdImport).not.toContain(forbidden)
     }
+    const filePanelSource = launcherViewSource.slice(
+      launcherViewSource.indexOf('const filePanel'),
+      launcherViewSource.indexOf('const settings = snapshot.settings'),
+    )
+    expect(filePanelSource).not.toContain('<Select')
     expect(stylesSource).toContain('.file-workspace')
     expect(stylesSource).toContain('grid-template-areas')
     expect(stylesSource).toContain('.file-category-strip')

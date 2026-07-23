@@ -20,6 +20,7 @@ import {
   type ResultItem,
   type SettingsLoadStatus,
   type SettingsView,
+  type ThemePreference,
   type UserSettingsUpdate,
   type ViewResult,
 } from './protocol'
@@ -35,6 +36,7 @@ export interface LauncherCore {
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
   readonly requestHide: () => Promise<void>
   readonly setAutostart: (checked: boolean) => void
+  readonly setThemePreference: (theme: ThemePreference) => void
   readonly setHotkeyCanonical: (value: string) => void
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
@@ -74,6 +76,7 @@ interface Model {
   view: 'launcher' | 'settings'
   launcherMode: 'applications' | 'files'
   viewEpoch: number
+  theme: ThemePreference
   invocationId?: string
   queryControl: ControlKey
   query: string
@@ -142,14 +145,20 @@ interface PreviewPreferenceOwner {
   enabled: boolean
 }
 
-type SettingsOperationKind = 'load' | 'save' | 'hotkey'
+type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme'
 
 interface SettingsOperation {
   token: number
   kind: SettingsOperationKind
   owner:
-    | { scope: 'startup'; previewGeneration: number }
-    | { scope: 'view'; viewEpoch: number; view: 'launcher' | 'settings'; previewGeneration?: number }
+    | { scope: 'startup'; previewGeneration: number; themeGeneration: number }
+    | {
+        scope: 'view'
+        viewEpoch: number
+        view: 'launcher' | 'settings'
+        previewGeneration?: number
+        themeGeneration?: number
+      }
 }
 
 interface PluginListOwner {
@@ -190,6 +199,7 @@ const NOTICE_TEXT = {
 const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
 const FALLBACK_ERROR = '操作不可用，请重试。'
 const FILE_PREVIEW_ERROR = '无法保存文件预览设置。'
+const THEME_PREFERENCE_ERROR = '无法保存风格设置。'
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
 const ICON_PREFIX = 'data:image/png;base64,'
 const MAX_ICON_LENGTH = 65_536
@@ -222,6 +232,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ? Object.freeze({
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
         autostart: model.settings.autostart,
+        theme: model.theme,
         loadStatus: model.settingsLoadStatus,
         readOnly:
           model.settingsUncertain || model.settingsLoadStatus !== 'ready' || model.settingsOperation !== undefined,
@@ -274,6 +285,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   return Object.freeze({
     view: model.view,
     viewEpoch: model.viewEpoch,
+    theme: model.theme,
     ...(model.invocationId === undefined ? {} : { invocationId: model.invocationId }),
     queryControl: model.queryControl,
     query: model.query,
@@ -302,6 +314,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     view: 'launcher',
     launcherMode: 'applications',
     viewEpoch: 0,
+    theme: 'system',
     queryControl: 1,
     query: '',
     queryControlValue: '',
@@ -332,6 +345,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let previewPreferencePending: PreviewPreferenceOwner | undefined
   let previewPreferenceDurableGeneration = 0
   let lastLoadedFilePreviewEnabled = true
+  let themeDurableGeneration = 0
+  let durableTheme: ThemePreference = 'system'
   let token = 0
   let searchToken = 0
   let executeToken = 0
@@ -371,12 +386,23 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return [settings.hotkey]
   }
 
-  function replaceSettings(view: SettingsView, previewGeneration: number): void {
-    if (model.settings) {
-      for (const control of settingsControls(model.settings)) retireControl(control.key)
-    }
+  function applyLoadedPreferences(
+    view: SettingsView,
+    previewGeneration: number,
+    themeGeneration: number,
+  ): void {
     if (previewGeneration === previewPreferenceDurableGeneration) {
       lastLoadedFilePreviewEnabled = view.filePreviewEnabled
+    }
+    if (themeGeneration === themeDurableGeneration) {
+      durableTheme = view.theme
+      model.theme = view.theme
+    }
+  }
+
+  function replaceSettingsView(view: SettingsView): void {
+    if (model.settings) {
+      for (const control of settingsControls(model.settings)) retireControl(control.key)
     }
     model.settings = {
       hotkey: newTextControl(view.hotkey),
@@ -1076,6 +1102,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     void persistSettings(operation, settingsUpdate())
   }
 
+  function setThemePreference(theme: ThemePreference): void {
+    if (!settingsEditable() || model.theme === theme) return
+    const operation = startSettingsOperation('theme')
+    if (!operation) return
+    model.theme = theme
+    model.status = ''
+    publish(true)
+
+    let pending: Promise<void>
+    try {
+      pending = client.setThemePreference({ preference: { theme } })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      () => finishThemeMutation(operation, theme, false),
+      () => finishThemeMutation(operation, theme, true),
+    )
+  }
+
   function setHotkeyCanonical(value: string): void {
     if (!settingsEditable() || !model.settings) return
     const field = model.settings.hotkey
@@ -1125,6 +1171,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return {
       hotkey: settings.hotkey.value,
       autostart: settings.autostart,
+      theme: model.theme,
     }
   }
 
@@ -1137,6 +1184,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       viewEpoch: epoch,
       view: 'settings',
       previewGeneration: previewPreferenceDurableGeneration,
+      themeGeneration: themeDurableGeneration,
     })
     if (!operation) {
       pendingSettingsLoadEpoch = epoch
@@ -1164,11 +1212,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       operation.owner.scope === 'view' && operation.owner.previewGeneration !== undefined
         ? operation.owner.previewGeneration
         : previewPreferenceDurableGeneration
+    const themeGeneration =
+      operation.owner.scope === 'view' && operation.owner.themeGeneration !== undefined
+        ? operation.owner.themeGeneration
+        : themeDurableGeneration
     try {
       const view = await client.loadSettings()
       if (!ownsSettingsOperation(operation)) return
+      applyLoadedPreferences(view, previewGeneration, themeGeneration)
       if (ownsSettingsView(operation)) {
-        replaceSettings(view, previewGeneration)
+        replaceSettingsView(view)
         model.settingsLoadStatus = 'ready'
         model.settingsLoadError = undefined
       }
@@ -1202,6 +1255,33 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
   }
 
+  function finishThemeMutation(
+    operation: SettingsOperation,
+    theme: ThemePreference,
+    failed: boolean,
+  ): void {
+    if (!ownsSettingsOperation(operation)) return
+    if (failed) {
+      model.theme = durableTheme
+    } else {
+      durableTheme = theme
+      themeDurableGeneration += 1
+    }
+    releaseSettingsOperation(operation)
+    if (model.view !== 'settings') {
+      if (failed) model.status = THEME_PREFERENCE_ERROR
+      publish(true)
+      return
+    }
+    const reconciliation = requestSettingsLoad()
+    if (!failed) return
+    void reconciliation?.then(() => {
+      if (destroyed) return
+      model.status = THEME_PREFERENCE_ERROR
+      publish(true)
+    })
+  }
+
   async function persistSettings(operation: SettingsOperation, update: UserSettingsUpdate): Promise<void> {
     try {
       await client.saveSettings({ settings: update })
@@ -1219,9 +1299,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setControlDraft(model.settings.hotkey.key, 'Shift+Space')
     model.settings.hotkey.value = 'Shift+Space'
     model.settings.autostart = false
+    model.theme = 'system'
     model.shownNotice = undefined
     publish(true)
-    await persistSettings(operation, { hotkey: 'Shift+Space', autostart: false })
+    await persistSettings(operation, {
+      hotkey: 'Shift+Space',
+      autostart: false,
+      theme: 'system',
+    })
   }
 
   async function saveHotkeyCanonical(value: string): Promise<void> {
@@ -1366,13 +1451,20 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const operation = startSettingsOperation('load', {
       scope: 'startup',
       previewGeneration: previewPreferenceDurableGeneration,
+      themeGeneration: themeDurableGeneration,
     })
     if (!operation) return
     try {
       const settings = await client.loadSettings()
       if (!ownsSettingsOperation(operation)) return
-      if (model.view !== 'settings' && operation.owner.scope === 'startup') {
-        replaceSettings(settings, operation.owner.previewGeneration)
+      if (operation.owner.scope !== 'startup') return
+      applyLoadedPreferences(
+        settings,
+        operation.owner.previewGeneration,
+        operation.owner.themeGeneration,
+      )
+      if (model.view !== 'settings') {
+        replaceSettingsView(settings)
       }
       releaseSettingsOperation(operation)
       publish(true)
@@ -1504,6 +1596,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     keyDown,
     requestHide,
     setAutostart,
+    setThemePreference,
     setHotkeyCanonical,
     saveHotkeyCanonical,
     setFileCategory,

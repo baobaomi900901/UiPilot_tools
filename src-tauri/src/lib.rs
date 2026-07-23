@@ -223,6 +223,7 @@ pub fn run() {
             commands::save_settings,
             commands::save_hotkey,
             commands::set_file_preview_preference,
+            commands::set_theme_preference,
             commands::hide_launcher,
         ]);
 
@@ -423,7 +424,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 12);
+        assert_eq!(production.matches("commands::").count(), 13);
         for command in [
             "search_apps",
             "publish_plugin_results",
@@ -436,6 +437,7 @@ mod tests {
             "save_settings",
             "save_hotkey",
             "set_file_preview_preference",
+            "set_theme_preference",
             "hide_launcher",
         ] {
             assert!(production.contains(&format!("commands::{command}")));
@@ -484,6 +486,17 @@ mod tests {
     fn save_hotkey_command_is_declared_and_allowed() {
         assert!(include_str!("../build.rs").contains("\"save_hotkey\","));
         assert!(include_str!("../capabilities/main.json").contains("\"allow-save-hotkey\""));
+    }
+
+    #[test]
+    fn theme_preference_command_is_declared_and_main_only() {
+        assert!(include_str!("../build.rs").contains("\"set_theme_preference\","));
+        assert!(
+            include_str!("../capabilities/main.json").contains("\"allow-set-theme-preference\"")
+        );
+        assert!(
+            !include_str!("../capabilities/plugin-runtime.json").contains("set-theme-preference")
+        );
     }
 
     #[test]
