@@ -29,6 +29,20 @@ fn tap_key_from_vk(vk: u32) -> TapKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyAction {
+    Down,
+    Up,
+}
+
+fn key_action_from_message(message: u32) -> Option<KeyAction> {
+    match message {
+        0x0100 | 0x0104 => Some(KeyAction::Down),
+        0x0101 | 0x0105 => Some(KeyAction::Up),
+        _ => None,
+    }
+}
+
 #[cfg(all(not(test), not(feature = "test-instrumentation")))]
 unsafe extern "system" fn keyboard_hook_proc(
     code: i32,
@@ -36,19 +50,23 @@ unsafe extern "system" fn keyboard_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use std::time::Instant;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, KBDLLHOOKSTRUCT};
 
     if code >= 0 {
         let message = wparam.0 as u32;
-        if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+        if let Some(action) = key_action_from_message(message) {
             let info = *(lparam.0 as *const KBDLLHOOKSTRUCT);
             let key = tap_key_from_vk(info.vkCode);
-            let now = Instant::now();
             let mut state = hook_state().lock().expect("hook state lock poisoned");
             if let Some(inner) = state.as_mut() {
-                if let Some(matched) = inner.detector.on_key_down(key, now) {
+                let matched = match action {
+                    KeyAction::Down => inner.detector.on_key_down(key, Instant::now()),
+                    KeyAction::Up => {
+                        inner.detector.on_key_up(key);
+                        None
+                    }
+                };
+                if let Some(matched) = matched {
                     if matched == inner.target {
                         let callback = Arc::clone(&inner.on_match);
                         drop(state);
@@ -157,6 +175,15 @@ mod tests {
         assert_eq!(tap_key_from_vk(0xA2), TapKey::Ctrl);
         assert_eq!(tap_key_from_vk(0xA5), TapKey::Alt);
         assert_eq!(tap_key_from_vk(0x41), TapKey::Other);
+    }
+
+    #[test]
+    fn keyboard_messages_map_both_down_and_up_actions() {
+        assert_eq!(key_action_from_message(0x0100), Some(KeyAction::Down));
+        assert_eq!(key_action_from_message(0x0104), Some(KeyAction::Down));
+        assert_eq!(key_action_from_message(0x0101), Some(KeyAction::Up));
+        assert_eq!(key_action_from_message(0x0105), Some(KeyAction::Up));
+        assert_eq!(key_action_from_message(0), None);
     }
 
     #[test]

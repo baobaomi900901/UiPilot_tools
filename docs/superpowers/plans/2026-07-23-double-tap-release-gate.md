@@ -35,22 +35,24 @@
 
 ```rust
 #[test]
-fn held_ctrl_repeats_never_fire_without_release() {
-    let mut detector = DoubleTapDetector::default();
+fn held_modifier_repeats_never_fire_without_release() {
     let start = Instant::now();
-    assert_eq!(detector.on_key_down(TapKey::Ctrl, start), None);
-    for elapsed in [50, 100, 200, 399] {
-        assert_eq!(
-            detector.on_key_down(TapKey::Ctrl, start + Duration::from_millis(elapsed)),
-            None
-        );
+    for key in [TapKey::Ctrl, TapKey::Alt] {
+        let mut detector = DoubleTapDetector::default();
+        assert_eq!(detector.on_key_down(key, start), None);
+        for elapsed in [50, 100, 200, 399] {
+            assert_eq!(
+                detector.on_key_down(key, start + Duration::from_millis(elapsed)),
+                None
+            );
+        }
     }
 }
 ```
 
 - [ ] **Step 2: 运行 RED**
 
-Run: `cargo test double_tap::tests::held_ctrl_repeats_never_fire_without_release -- --exact`
+Run: `cargo test double_tap::tests::held_modifier_repeats_never_fire_without_release -- --exact`
 
 Expected: FAIL，第二次 keydown 当前返回 `Some(Ctrl)`。
 
@@ -85,7 +87,9 @@ assert_eq!(key_action_from_message(0), None);
 
 - [ ] **Step 5: 运行 GREEN 与回归**
 
-Run: `cargo test double_tap::tests hotkey_hook::tests`
+Run: `cargo test double_tap::tests`
+
+Run: `cargo test hotkey_hook::tests`
 
 Expected: detector 与 hook 单测全部 PASS。
 
