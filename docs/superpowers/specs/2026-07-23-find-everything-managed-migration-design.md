@@ -185,6 +185,9 @@ Everything private client (current user, hidden)
   leaf 的每个组件 identity：resolved prefix、volume serial、file id、attributes 和 reparse tag/policy。
 - `FileSearchBackend::runtime_identity()` 返回 `{ epoch, generation }`；search admission 接收并验证完整 expected
   backend identity，batch/context/action 捕获同一对值，不能只验证 epoch。
+- epoch 与 generation 均只允许 checked increment。任一下一次递增 overflow 时 runtime 进入进程生命周期内
+  terminal `RuntimeIdentityExhausted`/unavailable，停止启动、查询和执行；不得回绕、归零或在同一进程重建复用
+  旧 identity 的 backend。只有完整退出并销毁 registry/actions 后，新进程才建立新的内存 identity domain。
 - Iteration 3 先把现有 `file_index/windows_backend.rs` 的 `OwnedHandle`、组件遍历、reparse policy、identity
   读取和 Shell dispatch 迁移/泛化到共享 `file_search/windows/path_auth.rs`；旧 Indexed adapter 与 Everything
   action 共同委托，禁止复制 helper。执行时逐组件打开不共享 `FILE_SHARE_DELETE` 的 handle，
@@ -198,24 +201,70 @@ Everything private client (current user, hidden)
 - 不把 Everything result index、裸路径或 query id 当作长期执行凭证。
 - 每个 current file ResultSet 保存 server-owned `FileRefreshContext`：原始 `QuerySpec`、backend runtime epoch、
   backend generation、registry result-set generation、规范化 query key、invocation id 和 source query sequence。
-  普通用户新查询继续使用 `begin_query`；
-  轮询 request 只允许 `{ invocationId, expectedRequestId }`，采用 deny-unknown-fields，不接收 query/category/sort。
+  普通用户新查询继续使用 `begin_query`；轮询 request 只允许
+  `{ invocationId, expectedRequestId, acknowledgedInvalidationId? }`，采用 deny-unknown-fields，不接收
+  query/category/sort。
 - `refresh_files` 首句必须是 `require_main_window`；`begin_preserving_refresh` 再验证 active invocation、file domain
   和 exact requestId，从 current 返回 context，并捕获 generation/domain epoch/fingerprint，不修改 latest query、
   current 或任何 ID。response 是 `Unchanged | Replaced | BootstrapRequired | Stale | Invalidated` discriminated union；Stale
-  区分 invocation changed、request changed、domain invalidated 和 superseded。无 current 返回
-  `BootstrapRequired`，由前端执行有界普通 `search_files` bootstrap。
+  区分 invocation changed、request changed、domain invalidated 和 superseded。ResultRegistry 为 authoritative
+  invalidation 保存 invocation-scoped tombstone：invalidation id、prior request/result-set generation、observed
+  backend identity、status/reason、revision/exhausted。无 current 时，匹配 active invocation 与 prior request 的
+  未确认 tombstone 必须优先返回 Invalidated；只有该 invocation 从未发布 ResultSet 且没有 tombstone 时才返回
+  `BootstrapRequired { acknowledgedInvalidationId?, recovery }`，其中 recovery 仅为稳定的
+  `Recoverable | Terminal` 类别，瞬时 Ready 仍由全局 runtime admission 判断。registry 另保存 invocation-scoped last acknowledged
+  receipt：prior request、invalidation ID、首次 ack recovery 和完整 acknowledged snapshot（prior result-set
+  generation、observed backend identity、index revision、status/reason、revisionExhausted、terminal severity）。
 - backend 在 registry lock 外严格重放 token context 中的 `QuerySpec`，完成查询、双遍分页、逐组件 action 认证和
   fingerprint 构建。`ConcurrentMutation`、`TieGroupTooLarge` 和单次 deadline 是 soft query error，只丢 token
   并保留 current。
 - refresh 观察到的 `StaleRuntime`、客户端 restart、`Unavailable`、manifest/owner/protocol mismatch 必须调用
   token-conditional invalidation：原子验证 result-set/domain/request/query key 与 observed old backend identity；若
-  已由新 query 或新 runtime supersede，只返回 `Stale`，不得清空新集合。supervisor 确认的全局 transition 走
-  authoritative invalidation，并携带其观察到的当前 backend identity，防止迟到事件回滚较新 runtime。
-- 成功失效返回 `Invalidated { indexRevision, status, reason, revisionExhausted }`。registry 清空 current 并禁止旧
-  resolve；可递增时 bump revision，overflow 时保留最后 revision、置 exhausted，但仍用 typed response 强制前端
-  清空 requestId/results/selection、停止执行与 refresh timer。初次启动、building 首次 ready、退避恢复或任何
-  无 current 状态走 bounded bootstrap；有 current 后才 refresh。
+  已由新 query 或新 runtime supersede，只返回 `Stale`，不得清空新集合。supervisor 不直接访问 registry，而是
+  通过 bounded typed `FileLifecycleTransition` channel/callback 发送 observed backend identity、status 和 reason；
+  `FileSearchService`/command 层作为唯一 registry owner，在每个 search/refresh/execute/status 命令的 admission 后、
+  registry 读取前 drain/apply。只有 observed identity 仍 current 的 transition 才 authoritative invalidate。
+- active invocation 有 unacked tombstone 时，`begin_query` 在分配 token、调用 backend 或改变 current/revision 前
+  返回 typed `InvalidationPending`，携带当前 Invalidated payload；普通 `search_files`/new query 不得抢先发布。
+  前端把该 error 归一到 Invalidated 清空/refresh-CAS-ack 流程。execute drain 后在 tombstone 或无 current 时拒绝；
+  status 可报告但不消费。只有 current ID ack 成功且全局 runtime admission Ready、reason recoverable 后，普通
+  search 才能 begin；terminal reason 在任何 invocation 都不允许 begin/publish。
+- authoritative invalidate 在清空 current 的同一锁临界区写入 tombstone。下一次匹配旧 request 的 refresh 返回
+  `Invalidated { invalidationId, indexRevision, status, reason, revisionExhausted }`。launcher 必须先清空
+  requestId/results/selection、停止执行与 timer，再携带 `acknowledgedInvalidationId`；ack 验证成功后 registry 才
+  消费 tombstone并返回 BootstrapRequired；launcher 随后按 recovery class 等待 Ready 或保持 terminal unavailable，
+  不能把该响应直接解释为 SearchNow。ack 前重复 refresh 重复返回同一
+  Invalidated，避免响应丢失。launcher 清空展示状态后，只在不可执行、不可渲染的 pending-ack state 暂存 prior
+  request ID 与 current invalidation ID。新 show invocation 不可读取旧 tombstone，并在 ownership 切换时清理旧记录。
+- 同一 invocation/prior request 的多次 transition 合并，并以 `invalidationId` 作为 CAS 版本。完全相同的
+  transition 不递增 revision、不轮换 ID。status、reason、indexRevision、revisionExhausted、observed backend
+  identity 或 terminal severity 任一可观察 payload 改变时，原子更新 payload并生成新 opaque ID；runtime/revision
+  exhausted 与 manifest/owner/protocol mismatch terminal/sticky，不被 rebuilding 降级，exhausted 位逻辑 OR。每个
+  accepted non-identical transition 在 revision 可用时 checked increment 一次；revision 已 exhausted 时保持最后值，
+  但 payload/ID 仍更新。
+  ack 必须同时匹配 active invocation、prior request 和当前 ID；旧/重复 ack 若 tombstone 已更新，不得消费，必须
+  返回最新 Invalidated。只有当前 ID 的 ack 才消费并返回 BootstrapRequired。revision overflow 保留最后 revision，
+  typed tombstone 仍必须可交付。
+- current ID ack 消费 tombstone时保存 last acknowledged receipt，并返回带 acknowledged ID/recovery 的
+  BootstrapRequired。若 response 丢失，current/tombstone 仍空且相同 invocation/prior request/invalidation ID 的 ack
+  重试，必须从 receipt 返回与首次完全相同的响应；不递增 revision、不调用 backend、不触发 search。receipt 保留到
+  新 ResultSet 成功原子发布、invocation ownership 切换或进程结束。ack 后若出现新 authoritative transition，新
+  tombstone 优先；旧 ack 返回最新 Invalidated，receipt 不得吞掉新状态。
+- current 为空但 receipt 存在时，`apply_authoritative_transition` 以 acknowledged snapshot 为 provenance 基线。
+  规范化 transition 与 snapshot 完全相同则只保留 receipt，不递增 revision、不创建 tombstone；任一可观察字段
+  改变则执行 sticky severity merge、可用时 checked increment revision，并创建新 tombstone/新 invalidationId。
+  receipt 的 terminal severity 不被 rebuilding 降级；receipt 本身不可执行、不可展示，新 tombstone 始终优先。
+- `FileInvalidationReason` 固定为 `BackendRestarted | RuntimeUnavailable | Rebuilding | ManifestMismatch |
+  OwnerMismatch | ProtocolMismatch | RuntimeIdentityExhausted | RevisionExhausted`。前三项分别映射 rebuilding、
+  unavailable、rebuilding；其余全部映射 unavailable，并使用固定、非敏感前端文案。
+- recovery class 固定为：前三项 recoverable，ack 后等待 supervisor 重新 `Ready` 才允许有界退避 bootstrap；
+  `ManifestMismatch | OwnerMismatch | ProtocolMismatch | RuntimeIdentityExhausted | RevisionExhausted` 为当前进程
+  terminal/sticky，ack 后仍 unavailable，停止 timer/search/execute，不得 bootstrap。terminal 不存在同进程重新认证
+  transition；必须退出 UiPilot，并在需要时由外部重新安装/修复后启动新进程建立新信任域。
+- runtime status 与 terminal sticky reason 由 supervisor/service 全局保存，独立于 invocation、ResultSet 和 tombstone；
+  hide/show、new invocation 或 tombstone cleanup 不得解除。所有 bootstrap（首次、新 invocation、ack 后）都必须
+  通过 backend runtime admission：仅 `Ready` 且无 terminal sticky 才允许 search；Starting/Rebuilding/recoverable
+  状态等待 Ready；terminal 状态对任何 invocation 都拒绝 search/execute/timer。
 - `commit_refresh_if_current` 在一个 registry lock 临界区重新验证 token。fingerprint 不变时返回
   `Unchanged`，requestId/resultId/actions/revision 完全不变；变化时才分配新 IDs、由 registry checked increment
   revision 和新的 result-set generation，并一次原子替换 ResultSet；不得改写 batch/action 的 backend identity。
@@ -310,8 +359,11 @@ Rust 可以对候选结果再次执行现有 `fold_name(name).contains(folded_qu
 - 已发送 Query2 不依赖协议取消；结果到达后通过 query id 和 sequence 丢弃。
 - 1 秒是单个 Query2 page/request deadline；双遍、tie group 和重试共享 3 秒 transaction deadline。单页 timeout
   或 transaction deadline 作为 soft query error 保留可执行 current，并触发一次健康检查。
-- runtime restart、unavailable、manifest/owner/protocol mismatch 必须 invalidate file domain；恢复到 ready 且无
-  current 时由有界 `search_files` bootstrap，不得通过 `refresh_files` 恢复空 registry。
+- runtime restart、unavailable、manifest/owner/protocol mismatch 必须 invalidate file domain；若 prior ResultSet 已
+  生成 tombstone，即使 current 已空也必须先由旧 request 的 `refresh_files` 交付 Invalidated、前端清空并 ack。
+  `BootstrapRequired` 仅表示 registry 无 ResultSet，不是 SearchNow。无论 tombstone 是否存在、invocation 是否从未
+  发布 ResultSet，均须先通过全局 runtime admission；只有 Ready 且无 terminal sticky 才由有界 `search_files`
+  bootstrap。terminal reason 当前进程不恢复。
 - 客户端启动/DB loaded 使用独立的较长 deadline，不与搜索 deadline 混用。
 - 连续三次协议或进程故障后进入 `Unavailable`，仅在应用重启或退避窗口到期时重试。
 - 不允许搜索请求触发 Service 安装、UAC 或安装器操作。
@@ -402,8 +454,9 @@ Go 条件：干净 VM 和“已安装个人 Everything”的 VM 均通过安装/
 - 新建 `file_search` 抽象，现有 command 不再直接依赖 `FileIndex`。
 - 新建 backend-neutral `FileResultAction`。迁移期显式区分 Indexed 和 Everything action，禁止新 backend
   构造 `OpenIndexedPath`。
-- ResultRegistry 新增 server-owned `FileRefreshContext`、`ExecutionLease`、token-conditional/authoritative
-  invalidation、preserve-current transaction 和唯一 revision high-water；
+- ResultRegistry 新增 server-owned `FileRefreshContext`、`ExecutionLease`、invocation-scoped invalidation tombstone、
+  acknowledged receipt/full snapshot、typed InvalidationPending、token-conditional/authoritative invalidation、
+  preserve-current transaction 和唯一 revision high-water；
   不变 refresh 不清空、不换 ID，变化 refresh 只在新 actions 全部认证后原子 swap。soft query error 保留 current，
   lifecycle/security error invalidate 并清空。
 - 新建 `file_search/windows/path_auth.rs`，先从旧 `windows_backend.rs` 迁移/泛化 `OwnedHandle`、逐组件 pin/auth、
@@ -411,7 +464,8 @@ Go 条件：干净 VM 和“已安装个人 Everything”的 VM 均通过安装/
   `Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_UI_Shell`、`Win32_UI_Shell_Common` features。
 - `AuthenticatedPathAction` 只捕获 backend runtime epoch/generation；ResultSet 单独拥有 registry generation。
   父目录、junction/reparse 和 leaf identity 都进入 action，resolve lease 与 backend admission 分域验证。
-- `EverythingFileSearch` 接入 Query2 worker 和 runtime supervisor。
+- `EverythingFileSearch` 接入 Query2 worker 和 runtime supervisor；supervisor 仅通过 bounded typed transition channel
+  通知 `FileSearchService`/command registry owner，不直接持有 registry。
 - 保留 `FileSearchResponse`、query sequence、ResultRegistry 和 execute_result 契约。
 - 用 fake backend 迁移 command 和生命周期单元测试。
 - 开发构建可在旧后端与 Everything 后端间显式切换，生产默认仍不切换。
@@ -424,16 +478,34 @@ Go 条件：现有前端 `/find` 测试不需要改变产品行为即可通过�
 
 - `building/ready/partial/rebuilding/unavailable` 的新状态映射。
 - 安装缺失、Service 停止、客户端崩溃、DB rebuilding、IPC timeout 和协议不匹配提示。
-- `refresh_files` 只接受 invocation/current request ID，首句执行 main-window gate，从 current 取得 server-owned
+- `refresh_files` 只接受 invocation/current request ID 与可选 invalidation ack，首句执行 main-window gate，从 current 取得 server-owned
   QuerySpec/context；`build.rs` permission、`capabilities/main.json`、`lib.rs` invoke 注册、Rust command 和
   `protocol.ts`/`main.ts` client 接线必须完整。
+- `search_files` 在 unacked tombstone 下返回 typed InvalidationPending；`protocol.ts`/`main.ts`/`launcher-core.ts`
+  将其归一到 Invalidated 清空/ack 流程，不新增 command、permission 或 capability。
 - `launcher-core.ts` 无 current、building 首次 ready 和退避恢复时走 bounded `search_files` bootstrap；有 current
   后由单一 owner 在每轮 settle 后 1 秒调用 `refresh_files`，不重叠、不排队，离开 `/find` 取消 ownership。未变化
   in-flight/完成期间旧 ID 始终可执行且完全不变；变化 in-flight 期间旧 ID 可执行，原子提交后才 stale；soft
-  error 保留集合。refresh lifecycle error 仅在 token 仍 current 时返回 Invalidated；迟到错误返回 Stale。
+  error 保留集合。refresh lifecycle error 仅在 token 仍 current 时写 tombstone；迟到错误返回 Stale。两次 poll
+  之间的 authoritative invalidation 必须由下一次旧 request refresh 返回 Invalidated，前端清空并 ack 后进入
+  reason-specific 恢复策略。
+  其中 bootstrap 仅适用于 recoverable reason；terminal reason ack 后保持 unavailable 且不发搜索。
 - 测试正确 request ID 下篡改 query/category/sort、普通 query/refresh 竞态、hide/domain invalidation、两个显式
   并发 refresh、resolve 后 atomic replace、runtime restart、旧 refresh lifecycle error 与新 query/new-runtime
   publish 竞态、typed Invalidated 清空 UI，以及初始/普通/unchanged/changed/invalidate/overflow revision 序列。
+- 测试 tombstone ack 前重复交付、ack 后 BootstrapRequired、旧 invocation 隔离、多 transition 合并/terminal sticky、
+  revision overflow 可观察；epoch 与 generation 各从 `u64::MAX - 1` 验证最后成功递增和永久 fail-closed。
+- 测试 `Invalidated A -> 更严重 transition B -> ack A`：B 轮换 invalidationId，ack A 返回 B 且不消费，ack B 后
+  才 BootstrapRequired；若 B terminal，launcher 不 bootstrap。完全相同 transition 不轮换 ID、不递增 revision。
+- 测试 recoverable 三类 ack 后等待 Ready 再 bootstrap；terminal 五类 ack 后不启动 timer/search/execute，普通
+  rebuilding transition 不能解除 sticky，只有新进程重新验证可恢复。
+- 测试 terminal -> hide/show -> new invocation：旧 tombstone 清理不影响全局 terminal state，新 invocation 即使
+  从未发布 ResultSet也不能 bootstrap。
+- 测试 Invalidated 与 new query/search 并发且 search 先于 ack：InvalidationPending、backend 零调用、IDs/revision
+  不变；ack 后仅 recoverable+Ready query 可发布，terminal 永不发布。
+- 测试 ack response lost -> retry 返回完全相同的 acknowledged BootstrapRequired；receipt + duplicate transition
+  不重复通知/递增，receipt + changed/terminal transition 创建新 tombstone/ID；成功 publish、new invocation、
+  process end 清理 receipt。
 - 真实 hard-link 文件树覆盖同 file ID 多路径跨页/cutoff、其中一个 link rename/delete；慢 page、接近 3 秒 tie
   transaction、离开 `/find` 取消与无 timer backlog 均有测试。
 - canonical fingerprint 包含完整执行身份。同路径、同 metadata 但 file ID 或父组件 identity 变化必须原子
@@ -480,8 +552,16 @@ Go 条件：灰度期没有安装器冲突、Service 残留、用户 Everything 
 - 同一 file ID 的不同 hard-link 路径作为独立 entry 返回；entry rename/delete 能被双遍漂移检测。
 - 分页漂移不会提交部分结果；持续变化、资源超限或单次 timeout 保留当前 ResultSet；lifecycle/security error
   仅在 token 仍 current 时原子清空并返回 Invalidated；迟到错误不得清新集合，恢复时 bootstrap。
+- 两次 poll 之间 authoritative invalidation 后，匹配旧 request 的下一 refresh 必须得到 tombstone Invalidated 而非
+  BootstrapRequired；前端先清空、再 ack、最后 bootstrap。旧 invocation 不得收到 tombstone。
+- “最后 bootstrap”只适用于 recoverable reason；terminal reason ack 后保持 unavailable，当前进程不再搜索。
+- 首次/new invocation 也必须通过同一 runtime admission；terminal state 不因 invocation ownership 切换而消失。
+- tombstone payload 在 ack 前变化时必须轮换 invalidationId；旧 ack 返回最新 Invalidated，不能消费未观察状态。
+- unacked tombstone 是 command 级发布屏障：普通 search 返回 typed InvalidationPending，不能在 ack 前创建 current。
+- ack receipt 保证 response-loss 幂等并保留完整 provenance；新 transition 优先于 receipt，成功发布后清理。
 - 周期 refresh 始终单 in-flight；3 秒 transaction 不产生重叠请求或 timer backlog，离开 `/find` 后不发布。
 - `content_revision` 只由 registry 分配，完整状态序列单调；overflow 永久 fail-closed。
+- backend runtime epoch/generation 均 checked increment；任一 exhausted 后 terminal unavailable，旧 action 永久拒绝。
 - 文件定位和目录打开只通过 ResultRegistry action。
 
 ### 性能
@@ -533,6 +613,14 @@ Go 条件：灰度期没有安装器冲突、Service 残留、用户 Everything 
 | 按 file ID 合并 hard links | 合法目录条目丢失、rename 漂移漏检 | canonical-path + object identity 的统一 EntryKey，真实 hard-link 跨页/cutoff 测试 |
 | backend/registry generation 混用 | execute 无法验证或形成恒真检查 | registry ExecutionLease 与 backend runtime identity 分域；registry 不覆写 action 字段 |
 | 迟到 lifecycle error 清空新集合 | 新 query/new runtime 结果被旧 refresh 删除 | token-conditional invalidation；全局 transition 使用 authoritative observed identity |
+| authoritative 清空后前端仍显示旧结果 | 下一 refresh 因无 current 只得到 BootstrapRequired | invocation-scoped tombstone；Invalidated 重复交付，前端清空并 ack 后按 reason 恢复 |
+| supervisor 与 registry 所有权不清 | transition 无法安全落地或形成共享锁耦合 | bounded typed transition channel；command/service 是唯一 registry owner并在命令入口 drain |
+| backend identity 计数回绕 | 旧 action identity 被再次接受 | epoch/generation checked increment，任一 exhausted 后 terminal unavailable |
+| terminal reason 进入恢复循环 | 同进程反复 search/refresh 或弱化安全失败闭合 | BootstrapRequired 非 SearchNow；按 reason recovery class，terminal 仅新进程可恢复 |
+| new invocation 绕过 terminal | hide/show 清 tombstone 后把“从未发布”误当可搜索 | terminal state 全局持有；所有 bootstrap 统一经过 Ready/no-terminal admission |
+| new query 抢在 ack 前发布 | 清空/确认线性化被破坏，旧 ack 与新 current 冲突 | begin_query typed InvalidationPending；ack 前 backend/IDs/revision 不变 |
+| ack response 丢失卡死 | 重试变 Stale 或重复恢复 | invocation-scoped acknowledged receipt，重复 ack 返回相同 BootstrapRequired |
+| receipt 缺少 provenance | duplicate transition 反复通知或 changed terminal 被漏掉 | receipt 保存完整 snapshot；duplicate no-op，changed/sticky merge 创建新 tombstone |
 | refresh timer 重叠 | 长查询持续自我 supersede、队列积压 | settle 后单次定时、single in-flight ownership、离开 `/find` 取消 |
 | 仅 pin 叶子对象 | 父目录替换使 path-based Shell 操作错误对象 | 泛化逐组件 pinning，全部 handles 持有至 Shell API 返回 |
 | 删除旧索引时丢失 pin helper | Everything 执行安全边界退化 | Iteration 3 先迁入共享 path-auth 并让双 adapter 委托；Iteration 5 只删旧 adapter |
