@@ -78,6 +78,12 @@ node_modules/
 .worktrees/
 artifacts/systemindex-spike/
 artifacts/find-local-file-search/
+/third-party/everything/artifacts/
+/third-party/everything/Everything.exe
+/third-party/everything/.uipilot-everything-txn-*/
+/third-party/everything/artifacts/.uipilot-everything-txn-*/
+/src-tauri/resources/everything/.uipilot-everything-txn-*/
+!/src-tauri/resources/everything/Everything.exe
 
 # Jupyter Notebook
 .ipynb_checkpoints
