@@ -1026,7 +1026,7 @@ mod tests {
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
-        settings::{Settings, SettingsStore, SettingsUpdate},
+        settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference},
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
@@ -1100,6 +1100,7 @@ mod tests {
         let settings = Settings {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            theme: ThemePreference::System,
             file_preview_enabled: true,
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
