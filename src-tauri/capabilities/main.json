@@ -14,6 +14,7 @@
     "allow-save-settings",
     "allow-save-hotkey",
     "allow-set-file-preview-preference",
+    "allow-set-theme-preference",
     "allow-hide-launcher",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

@@ -48,6 +48,7 @@ pub(crate) struct Settings {
 pub(crate) struct SettingsUpdate {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
+    pub(crate) theme: ThemePreference,
 }
 
 struct SettingsState {
@@ -155,6 +156,7 @@ impl SettingsStore {
         let mut candidate = state.value.clone();
         candidate.hotkey = update.hotkey;
         candidate.autostart = update.autostart;
+        candidate.theme = update.theme;
         self.persist(&mut state, candidate)
     }
 
@@ -352,6 +354,7 @@ mod tests {
         SettingsUpdate {
             hotkey: "Alt+Space".into(),
             autostart: false,
+            theme: ThemePreference::System,
         }
     }
 
@@ -576,6 +579,7 @@ mod tests {
             .update_user_settings(SettingsUpdate {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
+                theme: ThemePreference::Dark,
             })
             .unwrap();
 
@@ -583,6 +587,7 @@ mod tests {
         assert_eq!(value.use_counts[APP_A], 7);
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
+        assert_eq!(value.theme, ThemePreference::Dark);
     }
 
     #[test]

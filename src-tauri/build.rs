@@ -10,6 +10,7 @@ fn main() {
             "load_settings",
             "save_settings",
             "save_hotkey",
+            "set_theme_preference",
             "hide_launcher",
         ]),
     ))
