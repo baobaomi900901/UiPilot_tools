@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-07-23
-- 状态：已按第二轮评审修订，等待复核
+- 状态：已按第三轮评审修订，等待复核
 - 基线：`main@21cc09b`
 - 分支：`codex/settings-instant-apply`
 - worktree：`D:\code\UiPilot_tools\.worktrees\settings-instant-apply`
@@ -22,6 +22,7 @@
 4. 将“重新加载设置”替换为“恢复初始化”；确认后一次恢复快捷键 `Alt+Space` 和关闭开机启动。
 5. 每次进入设置页都从后端加载受管的最后一次成功持久化快照，替代常驻的手动重新加载入口。
 6. 保存失败时不暴露后端错误，也不把不确定的运行时状态误判为可编辑。
+7. 保留启动加载对 `filePreviewEnabled` 的后台水合和现有 preview durable generation 防陈旧语义。
 
 ## 非目标
 
@@ -91,17 +92,21 @@ Rust 启动期 `reconcile_runtime_settings_with` 在快捷键注册、autostart 
 
 每次收到目标为 `settings` 的新 view epoch，都先把该 view 的 load state 设为 `loading`，并记录该 epoch 需要一次 authoritative settings load。若没有 `settingsOperation`，立即用新 token 发起 `load_settings`；若旧 mutation、普通 load 或启动 load 仍在途，则保留最新 epoch 的加载请求，待旧 operation 结束后启动。进入页面不能因为 operation 已占用而丢失这次加载。
 
-加载响应只在 operation token、view epoch 和当前 view 都匹配时应用。旧 epoch 的响应无论成功或失败都不得直接写入当前 settings、load error 或 status；它只释放自己的 operation，然后尝试启动最新当前 epoch 的待加载请求。当前不在 settings 时不启动加载，下一次进入会重新记录请求。
+用于 settings 页面字段投影的加载响应只在 operation token、view epoch 和当前 view 都匹配时应用。旧 epoch 的响应无论成功或失败都不得直接写入当前 settings、load error 或 status；它只释放自己的 operation，然后尝试启动最新当前 epoch 的待加载请求。当前不在 settings 时不启动页面加载，下一次进入会重新记录请求。startup 在非 settings 视图的后台偏好水合是下一节明确限定的独立 preview-generation 路径，不构成任何 settings 页面 owner 响应。
 
 ### 启动加载桥接
 
 `start()` 注册 shown listener 后仍可立即预加载设置，但该请求必须进入上述统一调度：
 
 1. 启动请求创建唯一 token 和 `startup` load owner，并占用 `settingsOperation`；不再维护能使 `reloadSettings()` 直接返回的独立 `startupSettingsPending` 短路。
-2. 启动请求在没有 settings view 请求介入时，可以更新后台设置快照；一旦其存活期间进入 settings，当前 epoch 必须记录为 `loading` 和最新待加载 epoch。
-3. 启动 owner 的成功值或错误都不是当前 settings epoch 的 owner 结果，不得直接调用 `replaceSettings`、写入当前 load error 或覆盖 status。
-4. 启动请求完成后释放自己的 operation，并为仍在显示的最新 settings epoch 启动新 token 的 authoritative load。若当前已离开 settings，则不启动；下次进入重新记录。
-5. 启动 pending 期间反复进入 settings B、离开、再进入 settings C，只保留 C；无论启动请求最终成功或失败，最终都只能由 C owner 的 load 更新 C。
+2. 启动请求开始时捕获 `previewPreferenceDurableGeneration`，该 generation 是 `filePreviewEnabled` 后台水合的独立 owner；settings 页面字段则继续由 settings view epoch + load token 拥有，两条所有权不能合并。
+3. 一旦启动请求存活期间进入 settings，当前 epoch 必须记录为 `loading` 和最新待加载 epoch。startup 值不是该 settings epoch 的页面 owner 结果，当前仍显示 settings 时不得用 startup 值调用页面 `replaceSettings`、写入当前 load error 或覆盖 status。
+4. startup 成功完成时若当前不是 settings，允许把返回的 snapshot 应用于后台 `PrivateSettings`，并把请求开始时捕获的 preview generation 传入现有 `replaceSettings` 等价路径。只有捕获 generation 仍等于当前 `previewPreferenceDurableGeneration` 时才更新 `lastLoadedFilePreviewEnabled`；较新的 `setFilePreviewPreference` 成功已递增 generation 时，旧 startup 响应不得覆盖它。后台应用不得清除 `settingsUncertain`、改变 settings view load state 或充当未来 settings epoch 的 owner 结果。
+5. startup 失败时不应用后台 snapshot；其错误也不是任何不匹配 settings epoch 的 owner 错误，不得写入该 epoch 的 load error 或 status。
+6. 启动请求完成后释放自己的 operation，并为仍在显示的最新 settings epoch 启动新 token 的 authoritative load。若当前已离开 settings，则不启动；下次进入重新记录并必须再次加载，不能把之前的 startup 后台 snapshot 当作该页面的 owner 响应。
+7. 启动 pending 期间反复进入 settings B、离开、再进入 settings C，只保留 C；无论启动请求最终成功或失败，最终 settings 页面都只能由 C owner 的 load 更新。
+
+因此，“startup 不得直接 `replaceSettings`”只约束当前正在显示且 owner 不匹配的 settings 页面。当前不是 settings 时允许后台应用成功 snapshot，以保留文件预览水合；这不授予 startup 对任何后续 settings epoch 的页面所有权。
 
 插件清单加载保持独立；设置加载失败不得被展示为插件空态，插件操作也不得阻塞设置写入。
 
@@ -167,6 +172,7 @@ mutation 失败与 lifecycle `settingsFailed` notice 使用同一个 `settingsUn
 - 新增最小的 `resetSettings` 前端操作，复用 `save_settings`。
 - 将原私有 `settingsNeedsReload` 拆成进程级 `settingsUncertain` 与当前 view 的 load state，并保留一个最新待加载 epoch。`shown()` 对任意 target 的有效 `settingsFailed` notice 设置同一 latch。
 - `start()` 的初始 `load_settings` 改用统一 load owner/operation 完成路径；删除或重新定义 `startupSettingsPending`，不得再用它静默吞掉 settings view 的加载请求。
+- startup load owner 继续捕获 preview durable generation；其后台成功路径保留 `filePreviewEnabled` generation guard，并与 settings epoch 页面所有权分开。
 
 Tauri/Rust：
 
@@ -194,6 +200,9 @@ Tauri/Rust：
 - 旧 load pending 时连续进入新 settings epoch，只保留最新 epoch 的加载请求；旧响应被丢弃后，新 owner load 必须启动。
 - 启动 load pending 时进入 settings B：B 立即为 `loading`，启动成功响应不得直接覆盖 B；启动 owner 释放后必须发起 B 的新-token load，只有 B owner 响应可应用。
 - 启动 load pending 后进入 settings B、离开并再进入 settings C：分别覆盖启动请求成功和失败；启动值/错误及 B 请求都不得落入 C，最终只应用 C owner load，并且不存在 `startupSettingsPending` 静默吞请求。
+- 启动 load pending 后进入 settings B、离开到 launcher 且不进入 C；startup 成功返回 `filePreviewEnabled: false` 时，后台水合使用启动时捕获的 preview generation，随后进入文件模式必须显示预览关闭。
+- 同一 B -> launcher 路径中，若较新的 `setFilePreviewPreference` 已成功并递增 durable generation，旧 startup 响应不得覆盖新偏好。
+- 完成上述后台水合后再进入 settings C，仍必须调用 C 的新-token authoritative load；startup 后台值不能满足 C 的页面加载，最终 settings 字段只应用 C owner 响应。
 - 插件清单草稿和逐行 operation 不受设置操作影响。
 
 ### Rust 与回归
