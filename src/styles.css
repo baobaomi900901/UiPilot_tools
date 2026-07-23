@@ -166,22 +166,28 @@ label,
   overflow: hidden;
 }
 
-.result-list {
+.result-list,
+.settings-form {
   --result-scrollbar-thumb: rgba(64, 64, 64, 0.48);
+}
 
+.result-list {
   overflow-y: auto;
   border-block: 1px solid #d9d9d9;
 }
 
-.result-list::-webkit-scrollbar {
+.result-list::-webkit-scrollbar,
+.settings-form::-webkit-scrollbar {
   width: 6px;
 }
 
-.result-list::-webkit-scrollbar-track {
+.result-list::-webkit-scrollbar-track,
+.settings-form::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.result-list::-webkit-scrollbar-thumb {
+.result-list::-webkit-scrollbar-thumb,
+.settings-form::-webkit-scrollbar-thumb {
   background: var(--result-scrollbar-thumb);
   border-radius: 3px;
 }
@@ -492,7 +498,8 @@ label,
     border-color: #595959;
   }
 
-  .result-list {
+  .result-list,
+  .settings-form {
     --result-scrollbar-thumb: rgba(217, 217, 217, 0.55);
   }
 
@@ -561,7 +568,8 @@ label,
     box-shadow: inset 3px 0 HighlightText;
   }
 
-  .result-list::-webkit-scrollbar-thumb {
+  .result-list::-webkit-scrollbar-thumb,
+  .settings-form::-webkit-scrollbar-thumb {
     background: ButtonText;
   }
 

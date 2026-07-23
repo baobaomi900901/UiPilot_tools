@@ -1453,18 +1453,18 @@ describe('React view and accessibility', () => {
   })
 
   it('keeps the slim result scrollbar visible without hover', () => {
-    expect(stylesSource).toMatch(/\.result-list\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
+    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar,\s*\.settings-form::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track,\s*\.settings-form::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
     expect(stylesSource).toMatch(
-      /\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
+      /\.result-list::-webkit-scrollbar-thumb,\s*\.settings-form::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
     expect(stylesSource).toMatch(
-      /@media \(prefers-color-scheme: dark\)[\s\S]*\.result-list\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
+      /@media \(prefers-color-scheme: dark\)[\s\S]*\.result-list,\s*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
     )
     expect(stylesSource).toMatch(
-      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
+      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-form::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
   })
 
