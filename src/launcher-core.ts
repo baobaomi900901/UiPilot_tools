@@ -1216,12 +1216,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!settingsEditable() || !model.settings) return
     const operation = startSettingsOperation('save')
     if (!operation) return
-    setControlDraft(model.settings.hotkey.key, 'Alt+Space')
-    model.settings.hotkey.value = 'Alt+Space'
+    setControlDraft(model.settings.hotkey.key, 'Shift+Space')
+    model.settings.hotkey.value = 'Shift+Space'
     model.settings.autostart = false
     model.shownNotice = undefined
     publish(true)
-    await persistSettings(operation, { hotkey: 'Alt+Space', autostart: false })
+    await persistSettings(operation, { hotkey: 'Shift+Space', autostart: false })
   }
 
   async function saveHotkeyCanonical(value: string): Promise<void> {

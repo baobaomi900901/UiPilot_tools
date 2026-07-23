@@ -1247,12 +1247,12 @@ describe('settings ownership', () => {
 
   it('resets visible settings through one existing save command', async () => {
     const { core, client } = await settingsCore()
-    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, hotkey: 'Shift+Space' })
 
     await core.resetSettings()
 
     expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: { hotkey: 'Alt+Space', autostart: false },
+      settings: { hotkey: 'Shift+Space', autostart: false },
     })
     expect(client.saveSettings).toHaveBeenCalledOnce()
   })
@@ -1998,10 +1998,12 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     const fake = fakeClient()
     const changedSettings = { ...settingsFixture, hotkey: 'DoubleCtrl', autostart: true }
+    const initializedSettings = { ...settingsFixture, hotkey: 'Shift+Space', autostart: false }
     vi.mocked(fake.client.loadSettings)
       .mockResolvedValueOnce(changedSettings)
       .mockResolvedValueOnce(changedSettings)
-      .mockResolvedValueOnce(settingsFixture)
+      .mockResolvedValueOnce(initializedSettings)
+      .mockResolvedValueOnce({ ...initializedSettings, hotkey: 'DoubleCtrl' })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2019,16 +2021,35 @@ describe('React view and accessibility', () => {
 
     expect(resetButton()).toBeTruthy()
     await act(async () => resetButton()!.click())
-    expect(document.body.textContent).toContain('快捷键将恢复为 Alt+Space，并关闭开机启动。')
+    expect(document.body.textContent).toContain('快捷键将恢复为 Shift+Space，并关闭开机启动。')
     await act(async () => portalButton('取消')!.click())
     expect(fake.client.saveSettings).not.toHaveBeenCalled()
 
     await act(async () => resetButton()!.click())
     await act(async () => portalButton('恢复')!.click())
     await vi.waitFor(() =>
-      expect(fake.client.saveSettings).toHaveBeenCalledWith({ settings: { hotkey: 'Alt+Space', autostart: false } }),
+      expect(fake.client.saveSettings).toHaveBeenCalledWith({ settings: { hotkey: 'Shift+Space', autostart: false } }),
     )
-    await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'ready', readOnly: false }))
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().settings).toMatchObject({
+        hotkey: { value: 'Shift+Space' },
+        autostart: false,
+        loadStatus: 'ready',
+        readOnly: false,
+      }),
+    )
+
+    const hotkey = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
+    if (!hotkey) throw new Error('settings hotkey input missing after reset')
+    expect(hotkey.disabled).toBe(false)
+    await act(async () => hotkey.focus())
+    await act(async () => {
+      hotkey.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
+      hotkey.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft', bubbles: true, cancelable: true }))
+      hotkey.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
+    })
+    await vi.waitFor(() => expect(fake.client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } }))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleCtrl'))
     await mounted.unmount()
   })
 

@@ -521,7 +521,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             <div className="settings-actions">
               <Popconfirm
                 title="恢复初始化设置？"
-                description="快捷键将恢复为 Alt+Space，并关闭开机启动。"
+                description="快捷键将恢复为 Shift+Space，并关闭开机启动。"
                 okText="恢复"
                 cancelText="取消"
                 onConfirm={() => void core.resetSettings()}

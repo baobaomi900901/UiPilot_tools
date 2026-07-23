@@ -60,7 +60,7 @@ pub(crate) enum SettingsError {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey: "Alt+Space".into(),
+            hotkey: "Shift+Space".into(),
             autostart: false,
             file_preview_enabled: default_file_preview_enabled(),
             use_counts: BTreeMap::new(),
@@ -345,6 +345,11 @@ mod tests {
     }
 
     #[test]
+    fn default_hotkey_is_shift_space() {
+        assert_eq!(Settings::default().hotkey, "Shift+Space");
+    }
+
+    #[test]
     fn missing_files_load_defaults() {
         let dir = TestDir::new("defaults");
 
@@ -585,7 +590,13 @@ mod tests {
         .unwrap();
 
         let store = SettingsStore::load(dir.path()).unwrap();
-        assert_eq!(store.snapshot(), Settings::default());
+        assert_eq!(
+            store.snapshot(),
+            Settings {
+                hotkey: "Alt+Space".into(),
+                ..Settings::default()
+            }
+        );
         store.update_user_settings(update()).unwrap();
 
         let persisted: serde_json::Value =
