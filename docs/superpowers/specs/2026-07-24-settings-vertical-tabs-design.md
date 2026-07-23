@@ -27,7 +27,7 @@
 
 ## 选定方案
 
-使用项目已经依赖的 Ant Design `Tabs`，配置 `tabPosition="left"` 和受控 `activeKey`。不自行实现 tablist、方向键和 ARIA 行为。
+使用项目已经依赖的 Ant Design `Tabs`，配置当前 Ant Design 6 API `tabPlacement="start"` 和受控 `activeKey`；在当前从左到右界面中，`start` 即左侧导航。不使用已弃用的 `tabPosition`，也不自行实现 tablist、方向键和 ARIA 行为。
 
 页面结构为：
 
