@@ -6,8 +6,8 @@ export interface ResultItem {
 }
 
 export interface SearchResponse {
-    requestId: string
-    items: ResultItem[]
+  requestId: string
+  items: ResultItem[]
 }
 
 export type ThemePreference = 'system' | 'dark' | 'light'
