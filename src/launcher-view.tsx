@@ -498,7 +498,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       <div className="settings-form">
         {!settings ? (
           <div className="settings-loading">
-            {snapshot.status ? <Button onClick={() => void core.reloadSettings()}>重新加载设置</Button> : <Spin size="small" />}
+            {snapshot.settingsLoadStatus === 'error' ? (
+              <Button onClick={() => void core.reloadSettings()}>重试</Button>
+            ) : (
+              <Spin size="small" />
+            )}
           </div>
         ) : (
           <Form component="div" layout="vertical" className="settings-basic-form">
@@ -515,12 +519,23 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               开机启动
             </Checkbox>
             <div className="settings-actions">
-              <Button type="primary" disabled={locked} loading={settings.operation === 'save'} onClick={() => void core.saveSettings()}>
-                保存
-              </Button>
-              <Button disabled={busy} loading={settings.operation === 'load'} onClick={() => void core.reloadSettings()}>
-                重新加载设置
-              </Button>
+              <Popconfirm
+                title="恢复初始化设置？"
+                description="快捷键将恢复为 Alt+Space，并关闭开机启动。"
+                okText="恢复"
+                cancelText="取消"
+                onConfirm={() => void core.resetSettings()}
+                disabled={locked}
+              >
+                <Button danger disabled={locked} loading={settings.operation === 'save'}>
+                  恢复初始化
+                </Button>
+              </Popconfirm>
+              {settings.loadStatus === 'error' ? (
+                <Button disabled={busy} loading={settings.operation === 'load'} onClick={() => void core.reloadSettings()}>
+                  重试
+                </Button>
+              ) : null}
             </div>
           </Form>
         )}

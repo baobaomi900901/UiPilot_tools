@@ -18,6 +18,7 @@ import {
   type PluginMutationKind,
   type PluginView,
   type ResultItem,
+  type SettingsLoadStatus,
   type SettingsView,
   type UserSettingsUpdate,
   type ViewResult,
@@ -39,7 +40,7 @@ export interface LauncherCore {
   readonly setFileCategory: (category: FileCategory) => void
   readonly setFileSort: (sort: FileSort) => void
   readonly setFilePreviewEnabled: (enabled: boolean) => void
-  readonly saveSettings: () => Promise<void>
+  readonly resetSettings: () => Promise<void>
   readonly reloadSettings: () => Promise<void>
   readonly reloadPlugins: () => Promise<void>
   readonly reloadPlugin: (pluginId: string) => Promise<void>
@@ -88,7 +89,8 @@ interface Model {
   status: string
   settings?: PrivateSettings
   settingsOperation?: SettingsOperationKind
-  settingsNeedsReload: boolean
+  settingsUncertain: boolean
+  settingsLoadStatus: SettingsLoadStatus
   settingsLoadError?: string
   file?: PrivateFileState
   plugins: PrivatePluginList
@@ -145,8 +147,9 @@ type SettingsOperationKind = 'load' | 'save' | 'hotkey'
 interface SettingsOperation {
   token: number
   kind: SettingsOperationKind
-  viewEpoch: number
-  view: 'launcher' | 'settings'
+  owner:
+    | { scope: 'startup'; previewGeneration: number }
+    | { scope: 'view'; viewEpoch: number; view: 'launcher' | 'settings'; previewGeneration?: number }
 }
 
 interface PluginListOwner {
@@ -219,9 +222,11 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ? Object.freeze({
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
         autostart: model.settings.autostart,
-        readOnly: model.settingsNeedsReload,
+        loadStatus: model.settingsLoadStatus,
+        readOnly:
+          model.settingsUncertain || model.settingsLoadStatus !== 'ready' || model.settingsOperation !== undefined,
         ...(model.settingsOperation === undefined ? {} : { operation: model.settingsOperation }),
-        needsReload: model.settingsNeedsReload,
+        needsReload: model.settingsUncertain,
       })
     : undefined
   const fileResults = model.file
@@ -280,9 +285,14 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     executePending: model.executePending,
     hidePending: model.hidePending,
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
-    status: model.status,
+    status:
+      model.view === 'settings' && model.settingsUncertain
+        ? NOTICE_TEXT.settingsFailed
+        : model.view === 'settings' && model.settingsLoadError
+          ? model.settingsLoadError
+          : model.status,
     ...(settings === undefined ? {} : { settings }),
-    ...(model.view === 'settings' ? { plugins } : {}),
+    ...(model.view === 'settings' ? { settingsLoadStatus: model.settingsLoadStatus, plugins } : {}),
     ...(file === undefined ? {} : { file }),
   })
 }
@@ -302,14 +312,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     executePending: false,
     hidePending: false,
     status: '',
-    settingsNeedsReload: false,
+    settingsUncertain: false,
+    settingsLoadStatus: 'loading',
     plugins: { status: 'idle', items: [] },
   }
   const listeners = new Set<() => void>()
   let snapshot = projectSnapshot(model)
   let destroyed = false
   let started = false
-  let startupSettingsPending = false
   let unlisten: (() => void) | undefined
   let fileUnlisten: (() => void) | undefined
   let fileListenerRegistration: Promise<boolean> | undefined
@@ -332,6 +342,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let compositionGeneration = 0
   let composition: CompositionOwner | undefined
   let settingsOperation: SettingsOperation | undefined
+  let pendingSettingsLoadEpoch: number | undefined
   let pluginListOwner: PluginListOwner | undefined
   const pluginMutationOwners = new Map<string, PluginMutationOwner>()
 
@@ -371,8 +382,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hotkey: newTextControl(view.hotkey),
       autostart: view.autostart,
     }
-    model.settingsNeedsReload = false
-    model.settingsLoadError = undefined
   }
 
   function findTextControl(control: ControlKey): TextControl | undefined {
@@ -416,7 +425,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     const field = findTextControl(control)
-    if (!field || model.settingsNeedsReload || settingsOperation) return
+    if (!field || model.settingsUncertain || model.settingsLoadStatus !== 'ready' || settingsOperation) return
     const visibleChanged = setControlDraft(control, value)
     if (field.value === value) {
       publish(visibleChanged)
@@ -428,7 +437,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function settingsEditable(): boolean {
-    return model.settings !== undefined && !model.settingsNeedsReload && settingsOperation === undefined
+    return (
+      model.settings !== undefined &&
+      !model.settingsUncertain &&
+      model.settingsLoadStatus === 'ready' &&
+      settingsOperation === undefined
+    )
   }
 
   function clearResults(): void {
@@ -947,6 +961,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    if (event.notice === 'settingsFailed') model.settingsUncertain = true
     if (composition) restoreControl(composition.control)
     composition = undefined
     leaveFileMode()
@@ -964,7 +979,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.status = ''
     clearResults()
     model.shownNotice = event.notice === null ? undefined : NOTICE_TEXT[event.notice]
-    if (event.target === 'settings' && event.notice === null && model.settingsLoadError) model.status = model.settingsLoadError
+    if (event.target === 'launcher') pendingSettingsLoadEpoch = undefined
+    else queueSettingsLoad()
     if (event.target === 'launcher' && event.notice === null && activationNoticePending) {
       activationNoticePending = false
       model.shownNotice = REFUSED_NOTICE
@@ -974,7 +990,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       beginSearch()
     }
     publish(true)
-    if (event.target === 'settings') void beginPluginList()
+    if (event.target === 'settings') {
+      void drainSettingsLoad()
+      void beginPluginList()
+    }
   }
 
   function text(record: ClassifiedTextRecord): void {
@@ -1049,9 +1068,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function setAutostart(checked: boolean): void {
     if (!settingsEditable() || model.settings!.autostart === checked) return
+    const operation = startSettingsOperation('save')
+    if (!operation) return
     model.settings!.autostart = checked
     model.shownNotice = undefined
     publish(true)
+    void persistSettings(operation, settingsUpdate())
   }
 
   function setHotkeyCanonical(value: string): void {
@@ -1065,9 +1087,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(changed || valueChanged || hadNotice)
   }
 
-  function startSettingsOperation(kind: SettingsOperationKind): SettingsOperation | undefined {
+  function startSettingsOperation(
+    kind: SettingsOperationKind,
+    owner: SettingsOperation['owner'] = { scope: 'view', viewEpoch: model.viewEpoch, view: model.view },
+  ): SettingsOperation | undefined {
     if (destroyed || settingsOperation || (kind !== 'load' && !model.settings)) return undefined
-    const operation = { token: ++token, kind, viewEpoch: model.viewEpoch, view: model.view }
+    const operation = { token: ++token, kind, owner }
     settingsOperation = operation
     model.settingsOperation = kind
     model.shownNotice = undefined
@@ -1081,7 +1106,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function ownsSettingsView(operation: SettingsOperation): boolean {
-    return ownsSettingsOperation(operation) && operation.viewEpoch === model.viewEpoch && operation.view === model.view
+    return (
+      ownsSettingsOperation(operation) &&
+      operation.owner.scope === 'view' &&
+      operation.owner.viewEpoch === model.viewEpoch &&
+      operation.owner.view === model.view
+    )
   }
 
   function releaseSettingsOperation(operation: SettingsOperation): void {
@@ -1098,20 +1128,51 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
   }
 
-  async function finishSettingsLoad(operation: SettingsOperation): Promise<void> {
+  function drainSettingsLoad(): Promise<void> | undefined {
+    const epoch = pendingSettingsLoadEpoch
+    if (destroyed || settingsOperation || model.view !== 'settings' || epoch !== model.viewEpoch) return undefined
+    pendingSettingsLoadEpoch = undefined
+    const operation = startSettingsOperation('load', {
+      scope: 'view',
+      viewEpoch: epoch,
+      view: 'settings',
+      previewGeneration: previewPreferenceDurableGeneration,
+    })
+    if (!operation) {
+      pendingSettingsLoadEpoch = epoch
+      return undefined
+    }
+    return finishSettingsLoad(operation)
+  }
+
+  function queueSettingsLoad(): boolean {
+    if (destroyed || model.view !== 'settings') return false
+    pendingSettingsLoadEpoch = model.viewEpoch
+    model.settingsLoadStatus = 'loading'
     model.settingsLoadError = undefined
-    const previewGeneration = previewPreferenceDurableGeneration
+    return true
+  }
+
+  function requestSettingsLoad(): Promise<void> | undefined {
+    if (!queueSettingsLoad()) return undefined
+    publish(true)
+    return drainSettingsLoad()
+  }
+
+  async function finishSettingsLoad(operation: SettingsOperation): Promise<void> {
+    const previewGeneration =
+      operation.owner.scope === 'view' && operation.owner.previewGeneration !== undefined
+        ? operation.owner.previewGeneration
+        : previewPreferenceDurableGeneration
     try {
       const view = await client.loadSettings()
       if (!ownsSettingsOperation(operation)) return
-      if (!ownsSettingsView(operation)) {
-        releaseSettingsOperation(operation)
-        publish(true)
-        return
+      if (ownsSettingsView(operation)) {
+        replaceSettings(view, previewGeneration)
+        model.settingsLoadStatus = 'ready'
+        model.settingsLoadError = undefined
       }
-      replaceSettings(view, previewGeneration)
       releaseSettingsOperation(operation)
-      model.status = ''
       publish(true)
     } catch (error) {
       if (!ownsSettingsOperation(operation)) return
@@ -1119,87 +1180,65 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       releaseSettingsOperation(operation)
       if (current) {
         model.settingsLoadError = errorText(error)
-        model.status = model.settingsLoadError
+        model.settingsLoadStatus = 'error'
       }
       publish(true)
     }
+    void drainSettingsLoad()
   }
 
   async function reloadSettings(): Promise<void> {
-    if (startupSettingsPending) return
-    const operation = startSettingsOperation('load')
-    if (!operation) return
-    await finishSettingsLoad(operation)
+    await requestSettingsLoad()
   }
 
-  async function reloadAfterMutation(operation: SettingsOperation): Promise<void> {
+  function finishSettingsMutation(operation: SettingsOperation, failed: boolean): void {
     if (!ownsSettingsOperation(operation)) return
-    if (!ownsSettingsView(operation)) {
-      model.settingsNeedsReload = true
-      releaseSettingsOperation(operation)
+    if (failed) model.settingsUncertain = true
+    releaseSettingsOperation(operation)
+    if (model.view === 'settings') {
+      void requestSettingsLoad()
+    } else {
       publish(true)
-      return
     }
-    model.settingsNeedsReload = true
-    publish(true)
-    await finishSettingsLoad(operation)
   }
 
-  async function saveSettings(): Promise<void> {
-    if (!settingsEditable()) return
-    const update = settingsUpdate()
-    const operation = startSettingsOperation('save')
-    if (!operation) return
+  async function persistSettings(operation: SettingsOperation, update: UserSettingsUpdate): Promise<void> {
     try {
       await client.saveSettings({ settings: update })
-    } catch (error) {
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      model.settingsNeedsReload = true
-      releaseSettingsOperation(operation)
-      if (current) model.status = errorText(error)
-      publish(true)
+    } catch {
+      finishSettingsMutation(operation, true)
       return
     }
-    await reloadAfterMutation(operation)
+    finishSettingsMutation(operation, false)
+  }
+
+  async function resetSettings(): Promise<void> {
+    if (!settingsEditable() || !model.settings) return
+    const operation = startSettingsOperation('save')
+    if (!operation) return
+    setControlDraft(model.settings.hotkey.key, 'Alt+Space')
+    model.settings.hotkey.value = 'Alt+Space'
+    model.settings.autostart = false
+    model.shownNotice = undefined
+    publish(true)
+    await persistSettings(operation, { hotkey: 'Alt+Space', autostart: false })
   }
 
   async function saveHotkeyCanonical(value: string): Promise<void> {
     if (!settingsEditable() || !model.settings) return
     const settings = model.settings
-    const previous = settings.hotkey.value
     const operation = startSettingsOperation('hotkey')
     if (!operation) return
     setControlDraft(settings.hotkey.key, value)
     settings.hotkey.value = value
     publish(true)
     try {
-      const result = await client.saveHotkey({ hotkey: { hotkey: value } })
-      if (!ownsSettingsOperation(operation)) return
-      if (!ownsSettingsView(operation)) {
-        model.settingsNeedsReload = true
-        releaseSettingsOperation(operation)
-        publish(true)
-        return
-      }
-      setControlDraft(settings.hotkey.key, result.hotkey)
-      settings.hotkey.value = result.hotkey
-      releaseSettingsOperation(operation)
-      publish(true)
-    } catch (error) {
-      if (!ownsSettingsOperation(operation)) return
-      const current = ownsSettingsView(operation)
-      releaseSettingsOperation(operation)
-      if (current) {
-        model.settingsNeedsReload = true
-        setControlDraft(settings.hotkey.key, previous)
-        settings.hotkey.value = previous
-        model.status = errorText(error)
-      } else {
-        model.settingsNeedsReload = true
-      }
-      publish(true)
+      await client.saveHotkey({ hotkey: { hotkey: value } })
+    } catch {
+      finishSettingsMutation(operation, true)
+      return
     }
+    finishSettingsMutation(operation, false)
   }
 
   function executeSelection(): void {
@@ -1324,23 +1363,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     unlisten = registered
-    startupSettingsPending = true
-    const previewGeneration = previewPreferenceDurableGeneration
+    const operation = startSettingsOperation('load', {
+      scope: 'startup',
+      previewGeneration: previewPreferenceDurableGeneration,
+    })
+    if (!operation) return
     try {
       const settings = await client.loadSettings()
-      if (!destroyed) {
-        replaceSettings(settings, previewGeneration)
-        publish(true)
+      if (!ownsSettingsOperation(operation)) return
+      if (model.view !== 'settings' && operation.owner.scope === 'startup') {
+        replaceSettings(settings, operation.owner.previewGeneration)
       }
+      releaseSettingsOperation(operation)
+      publish(true)
     } catch (error) {
-      if (!destroyed) {
-        model.settingsLoadError = errorText(error)
-        model.status = model.settingsLoadError
-        publish(true)
-      }
-    } finally {
-      startupSettingsPending = false
+      if (!ownsSettingsOperation(operation)) return
+      releaseSettingsOperation(operation)
+      if (model.view !== 'settings') model.status = errorText(error)
+      publish(true)
     }
+    void drainSettingsLoad()
   }
 
   function destroy(): void {
@@ -1351,6 +1393,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     hideToken = ++token
     clearFileRefreshTimers()
     settingsOperation = undefined
+    pendingSettingsLoadEpoch = undefined
     pluginListOwner = undefined
     pluginMutationOwners.clear()
     unlisten?.()
@@ -1466,7 +1509,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setFileCategory,
     setFileSort,
     setFilePreviewEnabled,
-    saveSettings,
+    resetSettings,
     reloadSettings,
     reloadPlugins,
     reloadPlugin,

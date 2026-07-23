@@ -101,6 +101,14 @@ vi.mock('antd', async () => {
 });
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+Object.defineProperty(globalThis, 'ResizeObserver', {
+  configurable: true,
+  value: class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  },
+})
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -282,6 +290,7 @@ async function startedSettingsCore() {
   const core = createLauncherCore(fake.client)
   await core.start()
   fake.emit(shown('settings-r3', 'settings'))
+  await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
   return { core, ...fake }
 }
 
@@ -389,7 +398,7 @@ describe('startup ownership', () => {
     await start
   })
 
-  it('blocks reload while startup hydration owns settings and permits retry after failure', async () => {
+  it('queues one current settings load while startup hydration owns the operation', async () => {
     const fake = fakeClient()
     const initial = deferred<SettingsView>()
     const retry = deferred<SettingsView>()
@@ -406,13 +415,10 @@ describe('startup ownership', () => {
 
     initial.reject({ code: 'settingsFailed', message: 'private' })
     await start
-    expect(core.getSnapshot().status).toBe('设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。')
-
-    const allowedRetry = core.reloadSettings()
-    expect(fake.client.loadSettings).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().status).toBe('')
     retry.resolve({ ...settingsFixture, autostart: true })
-    await allowedRetry
-    expect(core.getSnapshot().settings?.autostart).toBe(true)
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
     expect(core.getSnapshot().status).toBe('')
   })
 
@@ -1008,32 +1014,247 @@ describe('settings ownership', () => {
     const core = createLauncherCore(fake.client)
     await core.start()
     fake.emit(shown('settings', 'settings'))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
     return { core, ...fake }
   }
 
-  it('saves exact hotkey and autostart', async () => {
+  it('keeps a launcher-target settings failure latched after entering settings', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings)
+      .mockResolvedValueOnce(settingsFixture)
+      .mockResolvedValueOnce(settingsFixture)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+
+    fake.emit(shown('notice-launcher', 'launcher', 'settingsFailed'))
+    fake.emit(shown('notice-settings', 'settings'))
+
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
+  })
+
+  it('latches a settings-target lifecycle failure before applying its owner load', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings)
+      .mockResolvedValueOnce(settingsFixture)
+      .mockResolvedValueOnce(settingsFixture)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+
+    fake.emit(shown('notice-settings', 'settings', 'settingsFailed'))
+
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
+  })
+
+  it('does not let startup settings hydrate the settings view without its epoch owner', async () => {
+    const fake = fakeClient()
+    const startup = deferred<SettingsView>()
+    const current = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise).mockReturnValueOnce(current.promise)
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+
+    fake.emit(shown('settings-b', 'settings'))
+    expect(core.getSnapshot().settings).toBeUndefined()
+    startup.resolve({ ...settingsFixture, hotkey: 'DoubleCtrl', filePreviewEnabled: false })
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().settings).toBeUndefined()
+
+    current.resolve({ ...settingsFixture, hotkey: 'DoubleAlt' })
+    await starting
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleAlt'))
+  })
+
+  it('hydrates preview from startup after leaving settings for launcher', async () => {
+    const fake = fakeClient()
+    const startup = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+
+    fake.emit(shown('settings-b', 'settings'))
+    fake.emit(shown('launcher-after-b'))
+    startup.resolve({ ...settingsFixture, filePreviewEnabled: false })
+    await starting
+
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(false))
+  })
+
+  it('does not let startup preview hydration overwrite a newer durable preference', async () => {
+    const fake = fakeClient()
+    const startup = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+
+    fake.emit(shown('settings-b', 'settings'))
+    fake.emit(shown('launcher-after-b'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file).toBeDefined())
+    core.setFilePreviewEnabled(false)
+    await vi.waitFor(() =>
+      expect(core.getSnapshot().file).toMatchObject({ previewEnabled: false, preferencePending: false }),
+    )
+
+    startup.resolve({ ...settingsFixture, filePreviewEnabled: true })
+    await starting
+    expect(core.getSnapshot().file?.previewEnabled).toBe(false)
+  })
+
+  it('uses only settings C owner after startup succeeds across B and launcher', async () => {
+    const fake = fakeClient()
+    const startup = deferred<SettingsView>()
+    const current = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise).mockReturnValueOnce(current.promise)
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+
+    fake.emit(shown('settings-b', 'settings'))
+    fake.emit(shown('launcher-between'))
+    fake.emit(shown('settings-c', 'settings'))
+    startup.resolve({ ...settingsFixture, hotkey: 'DoubleCtrl' })
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    current.resolve({ ...settingsFixture, hotkey: 'DoubleAlt' })
+    await starting
+
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleAlt'))
+  })
+
+  it('uses only settings C owner after startup fails across B and launcher', async () => {
+    const fake = fakeClient()
+    const startup = deferred<SettingsView>()
+    const current = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise).mockReturnValueOnce(current.promise)
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+
+    fake.emit(shown('settings-b', 'settings'))
+    fake.emit(shown('launcher-between'))
+    fake.emit(shown('settings-c', 'settings'))
+    startup.reject({ code: 'settingsFailed', message: 'private startup error' })
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().status).not.toContain('private startup')
+    current.resolve({ ...settingsFixture, hotkey: 'DoubleAlt' })
+    await starting
+
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleAlt'))
+  })
+
+  it('persists autostart immediately and confirms with the authoritative snapshot', async () => {
     const { core, client } = await settingsCore()
-    core.setHotkeyCanonical('Ctrl+Space')
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, autostart: true })
     core.setAutostart(true)
-    await core.saveSettings()
     expect(client.saveSettings).toHaveBeenCalledWith({
       settings: {
-        hotkey: 'Ctrl+Space',
+        hotkey: 'Alt+Space',
         autostart: true,
       },
     })
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
   })
 
-  it('preserves edits and fails closed after a save error', async () => {
+  it('owns the save operation before publishing an optimistic autostart value', async () => {
     const { core, client } = await settingsCore()
-    core.setHotkeyCanonical('Ctrl+Space')
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, autostart: true })
+    const unsubscribe = core.subscribe(() => {
+      const settings = core.getSnapshot().settings
+      if (settings?.autostart === true && settings.operation === undefined) core.setAutostart(false)
+    })
+
+    core.setAutostart(true)
+    unsubscribe()
+
+    expect(client.saveSettings).toHaveBeenCalledOnce()
+    expect(client.saveSettings).toHaveBeenCalledWith({ settings: { hotkey: 'Alt+Space', autostart: true } })
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
+  })
+
+  it('marks a new settings epoch loading before publishing it to subscribers', async () => {
+    const { core, client, emit } = await settingsCore()
+    const currentLoad = deferred<SettingsView>()
+    vi.mocked(client.loadSettings).mockReturnValueOnce(currentLoad.promise)
+    const previousEpoch = core.getSnapshot().viewEpoch
+    const unsubscribe = core.subscribe(() => {
+      const snapshot = core.getSnapshot()
+      if (snapshot.viewEpoch > previousEpoch && snapshot.settings?.readOnly === false) core.setAutostart(true)
+    })
+
+    emit(shown('settings-publish-admission', 'settings'))
+    unsubscribe()
+
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'loading', readOnly: true, operation: 'load' })
+    currentLoad.resolve(settingsFixture)
+    await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'ready', readOnly: false }))
+  })
+
+  it('does not let a stale settings load clear the current launcher status', async () => {
+    const { core, client, emit } = await settingsCore()
+    const staleLoad = deferred<SettingsView>()
+    vi.mocked(client.loadSettings).mockReturnValueOnce(staleLoad.promise)
+
+    emit(shown('stale-status-settings', 'settings'))
+    emit(shown('stale-status-launcher', 'launcher'))
+    core.failInitialization()
+    expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
+
+    staleLoad.resolve(settingsFixture)
+
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
+  })
+
+  it('does not let a current settings load clear a newer hide failure', async () => {
+    const { core, client } = await settingsCore()
+    const currentLoad = deferred<SettingsView>()
+    vi.mocked(client.loadSettings).mockReturnValueOnce(currentLoad.promise)
+    vi.mocked(client.hideLauncher).mockRejectedValueOnce({ code: 'windowFailed', message: 'private hide failure' })
+
+    const loading = core.reloadSettings()
+    await core.requestHide()
+    expect(core.getSnapshot().status).toBe('窗口操作失败。')
+    currentLoad.resolve(settingsFixture)
+    await loading
+
+    expect(core.getSnapshot().status).toBe('窗口操作失败。')
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private hide failure')
+  })
+
+  it('applies the authoritative snapshot and fails closed after an autostart save error', async () => {
+    const { core, client } = await settingsCore()
     vi.mocked(client.saveSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private backend text' })
-    await core.saveSettings()
-    expect(client.loadSettings).toHaveBeenCalledTimes(1)
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, autostart: false })
+    core.setAutostart(true)
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
     expect(core.getSnapshot().settings).toMatchObject({ readOnly: true, needsReload: true })
-    expect(core.getSnapshot().settings!.hotkey.value).toBe('Ctrl+Space')
-    expect(core.getSnapshot().status).toBe('设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。')
+    expect(core.getSnapshot().settings!.autostart).toBe(false)
+    expect(core.getSnapshot().status).toBe('快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
+  })
+
+  it('resets visible settings through one existing save command', async () => {
+    const { core, client } = await settingsCore()
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+
+    await core.resetSettings()
+
+    expect(client.saveSettings).toHaveBeenCalledWith({
+      settings: { hotkey: 'Alt+Space', autostart: false },
+    })
+    expect(client.saveSettings).toHaveBeenCalledOnce()
   })
 
   it('retires form controls before fresh replacement', async () => {
@@ -1058,24 +1279,35 @@ describe('settings ownership', () => {
     expect(replaceAssign).toBeGreaterThan(replaceRetire)
   })
 
-  it('marks a stale save for explicit reload without a follow-up call', async () => {
+  it('reconciles a stale autostart save through the current settings epoch', async () => {
     const { core, client, emit } = await settingsCore()
     const save = deferred<void>()
     vi.mocked(client.saveSettings).mockReturnValueOnce(save.promise)
-    const pending = core.saveSettings()
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, autostart: true })
+    core.setAutostart(true)
+    emit(shown('launcher-between'))
     emit(shown('new-settings', 'settings'))
     save.resolve()
-    await pending
-    expect(client.loadSettings).toHaveBeenCalledTimes(1)
-    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: false, readOnly: false })
   })
 
-  it('clears a shown notice on a settings text edit', async () => {
-    const { core, emit } = await settingsCore()
-    emit(shown('settings-notice', 'settings', 'settingsFailed'))
-    expect(core.getSnapshot().shownNotice).toBe('快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。')
-    core.setHotkeyCanonical('Ctrl+Space')
-    expect(core.getSnapshot().shownNotice).toBeUndefined()
+  it('reconciles a stale autostart failure through the current settings epoch and stays uncertain', async () => {
+    const { core, client, emit } = await settingsCore()
+    const save = deferred<void>()
+    vi.mocked(client.saveSettings).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    core.setAutostart(true)
+    emit(shown('autostart-failure-launcher', 'launcher'))
+    emit(shown('autostart-failure-settings', 'settings'))
+
+    save.reject({ code: 'settingsFailed', message: 'private stale failure' })
+
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(false))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true, loadStatus: 'ready' })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private stale failure')
   })
 
   it('records hotkey via canonical setter without saving', async () => {
@@ -1085,16 +1317,15 @@ describe('settings ownership', () => {
     expect(client.saveSettings).not.toHaveBeenCalled()
   })
 
-  it('records hotkey through dedicated save without saving other drafts', async () => {
+  it('records hotkey through dedicated save without invoking full settings save', async () => {
     const { core, client } = await settingsCore()
-    core.setAutostart(true)
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, hotkey: 'DoubleCtrl' })
 
     await core.saveHotkeyCanonical('DoubleCtrl')
 
     expect(client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } })
     expect(client.saveSettings).not.toHaveBeenCalled()
-    expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl')
-    expect(core.getSnapshot().settings!.autostart).toBe(true)
+    await vi.waitFor(() => expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl'))
   })
 
   it('records DoubleCtrl from the settings hotkey input', async () => {
@@ -1116,15 +1347,16 @@ describe('settings ownership', () => {
     await mounted.unmount()
   })
 
-  it('restores durable hotkey and preserves other drafts after dedicated save failure', async () => {
+  it('restores the authoritative hotkey and latches uncertainty after dedicated save failure', async () => {
     const { core, client } = await settingsCore()
-    core.setAutostart(true)
     vi.mocked(client.saveHotkey).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private backend text' })
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
 
     await core.saveHotkeyCanonical('DoubleCtrl')
 
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
     expect(core.getSnapshot().settings!.hotkey.value).toBe('Alt+Space')
-    expect(core.getSnapshot().settings!.autostart).toBe(true)
+    expect(core.getSnapshot().settings!.autostart).toBe(false)
     expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
@@ -1135,7 +1367,7 @@ describe('settings ownership', () => {
     vi.mocked(client.saveHotkey).mockReturnValueOnce(pendingHotkey.promise)
 
     const pending = core.saveHotkeyCanonical('DoubleCtrl')
-    void core.saveSettings()
+    core.setAutostart(true)
     void core.saveHotkeyCanonical('DoubleAlt')
 
     expect(client.saveHotkey).toHaveBeenCalledOnce()
@@ -1145,29 +1377,63 @@ describe('settings ownership', () => {
     await pending
   })
 
-  it('does not let stale dedicated hotkey response overwrite a newer settings view', async () => {
+  it('reconciles stale dedicated hotkey success through the newer settings view', async () => {
     const { core, client, emit } = await settingsCore()
     const pendingHotkey = deferred<{ hotkey: string }>()
     vi.mocked(client.saveHotkey).mockReturnValueOnce(pendingHotkey.promise)
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, hotkey: 'DoubleCtrl' })
 
     const pending = core.saveHotkeyCanonical('DoubleCtrl')
     emit(shown('new-settings', 'settings'))
     pendingHotkey.resolve({ hotkey: 'DoubleCtrl' })
     await pending
 
-    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleCtrl'))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: false, readOnly: false })
   })
 
-  it('save persists DoubleCtrl through save_settings payload', async () => {
+  it('reconciles stale dedicated hotkey failure through the newer settings view and stays uncertain', async () => {
+    const { core, client, emit } = await settingsCore()
+    const pendingHotkey = deferred<{ hotkey: string }>()
+    vi.mocked(client.saveHotkey).mockReturnValueOnce(pendingHotkey.promise)
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+
+    const pending = core.saveHotkeyCanonical('DoubleCtrl')
+    emit(shown('hotkey-failure-launcher', 'launcher'))
+    emit(shown('hotkey-failure-settings', 'settings'))
+    pendingHotkey.reject({ code: 'settingsFailed', message: 'private stale hotkey failure' })
+    await pending
+
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('Alt+Space'))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true, loadStatus: 'ready' })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private stale hotkey failure')
+  })
+
+  it('retries an ordinary settings load error without setting uncertainty', async () => {
     const { core, client } = await settingsCore()
-    core.setHotkeyCanonical('DoubleCtrl')
-    await core.saveSettings()
-    expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: {
-        hotkey: 'DoubleCtrl',
-        autostart: false,
-      },
-    })
+    vi.mocked(client.loadSettings).mockRejectedValueOnce({ code: 'settingsFailed' })
+
+    await core.reloadSettings()
+    expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'error', needsReload: false, readOnly: true })
+
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    await core.reloadSettings()
+    expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'ready', needsReload: false, readOnly: false })
+  })
+
+  it('keeps uncertainty after a failed recovery load later retries successfully', async () => {
+    const { core, client } = await settingsCore()
+    vi.mocked(client.saveSettings).mockRejectedValueOnce({ code: 'settingsFailed' })
+    vi.mocked(client.loadSettings).mockRejectedValueOnce({ code: 'settingsFailed' })
+
+    core.setAutostart(true)
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('error'))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: true, readOnly: true })
+
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    await core.reloadSettings()
+    expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'ready', needsReload: true, readOnly: true })
   })
 
 })
@@ -1191,21 +1457,20 @@ describe('plugin settings ownership', () => {
     return { core, ...fake }
   }
 
-  it('keeps list loading, error, empty, and retry independent from settings drafts', async () => {
+  it('keeps list loading, error, empty, and retry independent from settings state', async () => {
     const pending = deferred<PluginView[]>()
     const { core, client } = await pluginCore(pending.promise)
     expect(core.getSnapshot().plugins).toMatchObject({ status: 'loading', items: [] })
-    core.setAutostart(true)
 
     pending.reject({ code: 'pluginListFailed', message: 'private backend text' })
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('error'))
     expect(core.getSnapshot().plugins?.error).toBe('无法加载插件清单。')
-    expect(core.getSnapshot().settings?.autostart).toBe(true)
+    expect(core.getSnapshot().settings?.autostart).toBe(false)
 
     vi.mocked(client.listPlugins).mockResolvedValueOnce([])
     await core.reloadPlugins()
     expect(core.getSnapshot().plugins).toMatchObject({ status: 'ready', items: [] })
-    expect(core.getSnapshot().settings?.autostart).toBe(true)
+    expect(core.getSnapshot().settings?.autostart).toBe(false)
   })
 
   it('ignores an older list response after reentering settings', async () => {
@@ -1248,14 +1513,15 @@ describe('plugin settings ownership', () => {
     expect(core.getSnapshot().plugins?.items).toEqual([])
   })
 
-  it('keeps plugin row mutation independent from ordinary settings save', async () => {
+  it('keeps plugin row mutation independent from an immediate settings save', async () => {
     const { core, client } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
     const reload = deferred<PluginView>()
     vi.mocked(client.reloadPlugin).mockReturnValueOnce(reload.promise)
     const reloading = core.reloadPlugin(pluginV1.id)
 
-    await core.saveSettings()
+    core.setAutostart(true)
+    await vi.waitFor(() => expect(client.saveSettings).toHaveBeenCalledOnce())
     expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'reload' })
     reload.resolve(pluginV2)
     await reloading
@@ -1639,6 +1905,9 @@ describe('React view and accessibility', () => {
     expect(heading.textContent).toBe('设置')
     expect(document.activeElement).toBe(heading)
     expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
+    expect(mounted.host.textContent).toContain('恢复初始化')
+    expect(mounted.host.textContent).not.toContain('保存')
+    expect(mounted.host.textContent).not.toContain('重新加载设置')
     const close = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
     expect(close.getAttribute('aria-label')).toBe('关闭')
     await act(async () => close.click())
@@ -1650,14 +1919,18 @@ describe('React view and accessibility', () => {
   it('shows fixed settings load failure and retry without a permanent spinner', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    vi.mocked(fake.client.loadSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'raw backend' })
+    vi.mocked(fake.client.loadSettings)
+      .mockResolvedValueOnce(settingsFixture)
+      .mockRejectedValueOnce({ code: 'settingsFailed', message: 'raw backend' })
     const core = createLauncherCore(fake.client)
     await core.start()
     fake.emit(shown('settings-failure', 'settings'))
     const mounted = await mountLauncherView(core)
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('error'))
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('设置未能确认完成')
     expect(mounted.host.querySelector('.ant-spin-spinning')).toBeNull()
-    expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent?.includes('重新加载设置'))).toBe(true)
+    expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent?.replace(/\s/g, '') === '重试')).toBe(true)
+    expect(mounted.host.textContent).not.toContain('重新加载设置')
     expect(mounted.host.textContent).not.toContain('raw backend')
     await mounted.unmount()
   })
@@ -1666,26 +1939,96 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     const fake = fakeClient()
     const initial = deferred<SettingsView>()
-    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(initial.promise).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.loadSettings)
+      .mockReturnValueOnce(initial.promise)
+      .mockRejectedValueOnce({ code: 'settingsFailed', message: 'private' })
+      .mockResolvedValueOnce(settingsFixture)
     const core = createLauncherCore(fake.client)
     const start = core.start()
     await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
     fake.emit(shown('settings-loading', 'settings'))
     const mounted = await mountLauncherView(core)
     const retryButton = () =>
-      [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.includes('重新加载设置'))
+      [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.replace(/\s/g, '') === '重试')
 
     expect(mounted.host.querySelector('.ant-spin-spinning')).toBeTruthy()
     expect(retryButton()).toBeUndefined()
 
     initial.reject({ code: 'settingsFailed', message: 'private' })
     await act(async () => start)
+    await vi.waitFor(() => expect(retryButton()).toBeTruthy())
     expect(mounted.host.querySelector('.ant-spin-spinning')).toBeNull()
     expect(retryButton()).toBeTruthy()
 
     await act(async () => retryButton()!.click())
     await vi.waitFor(() => expect(core.getSnapshot().settings).toBeDefined())
-    expect(fake.client.loadSettings).toHaveBeenCalledTimes(2)
+    expect(fake.client.loadSettings).toHaveBeenCalledTimes(3)
+    await mounted.unmount()
+  })
+
+  it('keeps showing loading without a snapshot when lifecycle uncertainty is already latched', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const startup = deferred<SettingsView>()
+    const current = deferred<SettingsView>()
+    vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise).mockReturnValueOnce(current.promise)
+    const core = createLauncherCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledOnce())
+    fake.emit(shown('settings-uncertain-loading', 'settings', 'settingsFailed'))
+    const mounted = await mountLauncherView(core)
+    const retryButton = () =>
+      [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent?.replace(/\s/g, '') === '重试',
+      )
+
+    expect(mounted.host.querySelector('.ant-spin-spinning')).toBeTruthy()
+    expect(retryButton()).toBeUndefined()
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('请重启 UiPilot')
+
+    startup.resolve(settingsFixture)
+    await starting
+    await vi.waitFor(() => expect(fake.client.loadSettings).toHaveBeenCalledTimes(2))
+    current.resolve(settingsFixture)
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
+    await mounted.unmount()
+  })
+
+  it('resets settings only after confirmation and persists the fixed defaults', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const changedSettings = { ...settingsFixture, hotkey: 'DoubleCtrl', autostart: true }
+    vi.mocked(fake.client.loadSettings)
+      .mockResolvedValueOnce(changedSettings)
+      .mockResolvedValueOnce(changedSettings)
+      .mockResolvedValueOnce(settingsFixture)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-reset', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
+
+    const resetButton = () =>
+      [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent?.replace(/\s/g, '') === '恢复初始化',
+      )
+    const portalButton = (label: string) =>
+      [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent?.replace(/\s/g, '') === label,
+      )
+
+    expect(resetButton()).toBeTruthy()
+    await act(async () => resetButton()!.click())
+    expect(document.body.textContent).toContain('快捷键将恢复为 Alt+Space，并关闭开机启动。')
+    await act(async () => portalButton('取消')!.click())
+    expect(fake.client.saveSettings).not.toHaveBeenCalled()
+
+    await act(async () => resetButton()!.click())
+    await act(async () => portalButton('恢复')!.click())
+    await vi.waitFor(() =>
+      expect(fake.client.saveSettings).toHaveBeenCalledWith({ settings: { hotkey: 'Alt+Space', autostart: false } }),
+    )
+    await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'ready', readOnly: false }))
     await mounted.unmount()
   })
 

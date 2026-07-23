@@ -118,9 +118,12 @@ export interface TextControlView {
   value: string
 }
 
+export type SettingsLoadStatus = 'loading' | 'ready' | 'error'
+
 export interface SettingsSnapshot {
   hotkey: TextControlView
   autostart: boolean
+  loadStatus: SettingsLoadStatus
   readOnly: boolean
   operation?: 'load' | 'save' | 'hotkey'
   needsReload: boolean
@@ -202,6 +205,7 @@ export interface LauncherSnapshot {
   hidePending: boolean
   shownNotice?: string
   status: string
+  settingsLoadStatus?: SettingsLoadStatus
   settings?: SettingsSnapshot
   plugins?: PluginListSnapshot
   file?: FileSnapshot
