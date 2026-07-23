@@ -6,6 +6,7 @@ import {
   Form,
   Input,
   Popconfirm,
+  Select,
   Spin,
   Switch,
   Tooltip,
@@ -26,7 +27,7 @@ import ReactMarkdown from 'react-markdown'
 
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
-import type { ControlKey, FileCategory, FileResultKind } from './protocol'
+import type { ControlKey, FileCategory, FileResultKind, ThemePreference } from './protocol'
 import {
   formatHotkeyDisplay,
   reduceHotkeyRecorder,
@@ -87,6 +88,21 @@ const fileCategories: readonly { value: FileCategory; label: string }[] = [
 ]
 
 const pluginMarkdownElements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'li', 'em', 'strong', 'code', 'pre']
+
+const themeOptions = [
+  { value: 'system', label: '跟随系统' },
+  { value: 'dark', label: 'Dark' },
+  { value: 'light', label: 'Light' },
+] satisfies { value: ThemePreference; label: string }[]
+
+function resolveColorScheme(
+  preference: ThemePreference,
+  systemDark: boolean,
+): 'light' | 'dark' {
+  if (preference === 'dark') return 'dark'
+  if (preference === 'light') return 'light'
+  return systemDark ? 'dark' : 'light'
+}
 
 function fileSize(kind: FileResultKind, sizeBytes: string | null): string {
   if (kind === 'folder' || sizeBytes === null) return '--'
@@ -181,7 +197,8 @@ function HotkeyRecorderInput({ core, value, disabled, id, name }: HotkeyRecorder
 export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.Element {
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
-  const [dark, setDark] = useState(scheme.matches)
+  const [systemDark, setSystemDark] = useState(scheme.matches)
+  const colorScheme = resolveColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
   const headingRef = useRef<HTMLHeadingElement>(null)
   const optionRefs = useRef(new Map<number, HTMLElement>())
@@ -189,10 +206,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const ready = useRef(false)
 
   useEffect(() => {
-    const update = (event: MediaQueryListEvent) => setDark(event.matches)
+    const update = (event: MediaQueryListEvent) => setSystemDark(event.matches)
     scheme.addEventListener('change', update)
     return () => scheme.removeEventListener('change', update)
   }, [scheme])
+
+  useLayoutEffect(() => {
+    document.documentElement.dataset.colorScheme = colorScheme
+    return () => {
+      delete document.documentElement.dataset.colorScheme
+    }
+  }, [colorScheme])
 
   const reportReady = useCallback(() => {
     if (ready.current) return
@@ -518,10 +542,19 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             <Checkbox checked={settings.autostart} disabled={locked} onChange={(event) => core.setAutostart(event.target.checked)}>
               开机启动
             </Checkbox>
+            <Form.Item label="风格">
+              <Select
+                aria-label="风格"
+                value={settings.theme}
+                disabled={locked}
+                options={themeOptions}
+                onChange={(value: ThemePreference) => core.setThemePreference(value)}
+              />
+            </Form.Item>
             <div className="settings-actions">
               <Popconfirm
                 title="恢复初始化设置？"
-                description="快捷键将恢复为 Shift+Space，并关闭开机启动。"
+                description="快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。"
                 okText="恢复"
                 cancelText="取消"
                 onConfirm={() => void core.resetSettings()}
@@ -608,9 +641,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   )
 
   return (
-    <ConfigProvider theme={{ algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
+    <ConfigProvider theme={{ algorithm: colorScheme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
       <App>
-        <main className="launcher-surface" data-color-scheme={dark ? 'dark' : 'light'}>
+        <main className="launcher-surface" data-color-scheme={colorScheme}>
           {snapshot.view === 'launcher' ? filePanel ?? launcher : settingsView}
           <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
             {status}

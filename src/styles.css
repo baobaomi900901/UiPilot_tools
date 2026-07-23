@@ -1,6 +1,7 @@
 :root {
   color: #171717;
   background: #ffffff;
+  color-scheme: light;
   font-family: "Segoe UI", system-ui, sans-serif;
   font-synthesis: none;
 }
@@ -483,41 +484,44 @@ label,
   outline-offset: 2px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root,
-  .launcher-surface {
-    color: #f5f5f5;
-    background: #202020;
-  }
+:root[data-color-scheme="dark"] {
+  color: #f5f5f5;
+  background: #202020;
+  color-scheme: dark;
+}
 
-  .result-list,
-  .settings-header,
-  .file-preview,
-  .plugin-inventory,
-  .plugin-item {
-    border-color: #595959;
-  }
+.launcher-surface[data-color-scheme="dark"] {
+  color: #f5f5f5;
+  background: #202020;
+}
 
-  .result-list,
-  .settings-form {
-    --result-scrollbar-thumb: rgba(217, 217, 217, 0.55);
-  }
+.launcher-surface[data-color-scheme="dark"] .result-list,
+.launcher-surface[data-color-scheme="dark"] .settings-header,
+.launcher-surface[data-color-scheme="dark"] .file-preview,
+.launcher-surface[data-color-scheme="dark"] .plugin-inventory,
+.launcher-surface[data-color-scheme="dark"] .plugin-item {
+  border-color: #595959;
+}
 
-  .result-row.is-selected {
-    background: #263b4d;
-    box-shadow: inset 3px 0 #69b1ff;
-  }
+.launcher-surface[data-color-scheme="dark"] .result-list,
+.launcher-surface[data-color-scheme="dark"] .settings-form {
+  --result-scrollbar-thumb: rgba(217, 217, 217, 0.55);
+}
 
-  .result-subtitle,
-  .file-preview dt,
-  .status-region,
-  .plugin-list-state,
-  .plugin-title-line span,
-  .plugin-title-line code,
-  .plugin-description-label,
-  .plugin-description {
-    color: #d9d9d9;
-  }
+.launcher-surface[data-color-scheme="dark"] .result-row.is-selected {
+  background: #263b4d;
+  box-shadow: inset 3px 0 #69b1ff;
+}
+
+.launcher-surface[data-color-scheme="dark"] .result-subtitle,
+.launcher-surface[data-color-scheme="dark"] .file-preview dt,
+.launcher-surface[data-color-scheme="dark"] .status-region,
+.launcher-surface[data-color-scheme="dark"] .plugin-list-state,
+.launcher-surface[data-color-scheme="dark"] .plugin-title-line span,
+.launcher-surface[data-color-scheme="dark"] .plugin-title-line code,
+.launcher-surface[data-color-scheme="dark"] .plugin-description-label,
+.launcher-surface[data-color-scheme="dark"] .plugin-description {
+  color: #d9d9d9;
 }
 
 @media (max-width: 600px) {

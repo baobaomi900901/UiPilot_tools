@@ -1712,6 +1712,70 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('follows system only for system theme and projects one effective scheme', async () => {
+    configCapture.values.length = 0
+    const scheme = installMatchMedia(false)
+    const { core, emit, client } = await startedCore(settingsFixture)
+    const mounted = await mountLauncherView(core)
+    expect(document.documentElement.dataset.colorScheme).toBe('light')
+    expect(mounted.host.querySelector('.launcher-surface')?.getAttribute('data-color-scheme')).toBe('light')
+
+    await act(async () => scheme.emit(true))
+    expect(document.documentElement.dataset.colorScheme).toBe('dark')
+    let config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown }
+    expect(config.algorithm).toBe(theme.darkAlgorithm)
+
+    await act(async () => emit(shown('settings-theme-force', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    const save = deferred<void>()
+    vi.mocked(client.setThemePreference).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: 'light' })
+    await act(async () => core.setThemePreference('light'))
+    await act(async () => scheme.emit(true))
+    expect(document.documentElement.dataset.colorScheme).toBe('light')
+    expect(mounted.host.querySelector('.launcher-surface')?.getAttribute('data-color-scheme')).toBe('light')
+    config = configCapture.values[configCapture.values.length - 1] as { algorithm?: unknown }
+    expect(config.algorithm).toBe(theme.defaultAlgorithm)
+
+    await act(async () => save.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    await mounted.unmount()
+    expect(document.documentElement.hasAttribute('data-color-scheme')).toBe(false)
+  })
+
+  it('renders ordered theme options and selects Dark immediately', async () => {
+    installMatchMedia(false)
+    const { core, emit, client } = await startedCore(settingsFixture)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('settings-theme-select', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    const save = deferred<void>()
+    vi.mocked(client.setThemePreference).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: 'dark' })
+
+    const combobox = mounted.host.querySelector<HTMLElement>('[role="combobox"][aria-label="风格"]')
+    expect(combobox).toBeInstanceOf(HTMLElement)
+    await act(async () => {
+      combobox!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    })
+    const options = [...document.body.querySelectorAll<HTMLElement>('.ant-select-item-option')]
+    expect(options.map((option) => option.textContent)).toEqual(['跟随系统', 'Dark', 'Light'])
+    await act(async () => options[1]!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(client.setThemePreference).toHaveBeenCalledWith({ preference: { theme: 'dark' } })
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBe('theme'))
+    expect(
+      mounted.host
+        .querySelector('[role="combobox"][aria-label="风格"]')
+        ?.closest('.ant-select')
+        ?.classList.contains('ant-select-disabled'),
+    ).toBe(true)
+
+    await act(async () => save.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    await mounted.unmount()
+  })
+
   it('uses native app regions without invoking Tauri mouse capture', () => {
     expect(launcherViewSource).not.toContain('data-tauri-drag-region')
     expect(stylesSource).toMatch(
@@ -1793,8 +1857,9 @@ describe('React view and accessibility', () => {
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
     expect(stylesSource).toMatch(
-      /@media \(prefers-color-scheme: dark\)[\s\S]*\.result-list,\s*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
+      /\.launcher-surface\[data-color-scheme="dark"\][\s\S]*\.result-list,[\s\S]*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
     )
+    expect(stylesSource).not.toContain('@media (prefers-color-scheme: dark)')
     expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-form::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
@@ -2088,7 +2153,9 @@ describe('React view and accessibility', () => {
 
     expect(resetButton()).toBeTruthy()
     await act(async () => resetButton()!.click())
-    expect(document.body.textContent).toContain('快捷键将恢复为 Shift+Space，并关闭开机启动。')
+    expect(document.body.textContent).toContain(
+      '快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。',
+    )
     await act(async () => portalButton('取消')!.click())
     expect(fake.client.saveSettings).not.toHaveBeenCalled()
 
@@ -2193,14 +2260,13 @@ describe('React view and accessibility', () => {
   })
 
   it('keeps the React/AntD source boundary exact', () => {
-    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Popconfirm', 'Spin', 'theme']) {
+    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Popconfirm', 'Select', 'Spin', 'theme']) {
       expect(launcherViewSource).toContain(required)
     }
     for (const forbidden of [
       '@tauri-apps/api',
       '@ant-design/icons',
       'AutoComplete',
-      'Select',
       'Card',
       'Modal',
       'dangerouslySetInnerHTML',
@@ -3329,9 +3395,14 @@ describe('file panel responsive layout', () => {
     expect(launcherViewSource).toContain("import {")
     expect(launcherViewSource).not.toContain('@ant-design/icons')
     const antdImport = launcherViewSource.slice(0, launcherViewSource.indexOf("} from 'antd'"))
-    for (const forbidden of ['AutoComplete', 'Select', 'Card', 'Modal']) {
+    for (const forbidden of ['AutoComplete', 'Card', 'Modal']) {
       expect(antdImport).not.toContain(forbidden)
     }
+    const filePanelSource = launcherViewSource.slice(
+      launcherViewSource.indexOf('const filePanel'),
+      launcherViewSource.indexOf('const settings = snapshot.settings'),
+    )
+    expect(filePanelSource).not.toContain('<Select')
     expect(stylesSource).toContain('.file-workspace')
     expect(stylesSource).toContain('grid-template-areas')
     expect(stylesSource).toContain('.file-category-strip')
