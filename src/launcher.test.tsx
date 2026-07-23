@@ -1800,7 +1800,7 @@ describe('React view and accessibility', () => {
       /\.launcher-surface,[\s\S]*\.status-region\s*\{[^}]*app-region:\s*drag;/,
     )
     expect(stylesSource).toMatch(
-      /button,[\s\S]*\.settings-form\s*\{[^}]*app-region:\s*no-drag;/,
+      /button,[\s\S]*\.settings-tabs,[\s\S]*\.settings-tab-panel\s*\{[^}]*app-region:\s*no-drag;/,
     )
     expect(stylesSource).toMatch(/\.result-list:empty\s*\{[^}]*app-region:\s*drag;/)
   })
@@ -1866,20 +1866,35 @@ describe('React view and accessibility', () => {
     }
   })
 
-  it('keeps the slim result scrollbar visible without hover', () => {
-    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar,\s*\.settings-form::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track,\s*\.settings-form::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
+  it('lays out settings tabs with a fixed left nav and right scroller', () => {
     expect(stylesSource).toMatch(
-      /\.result-list::-webkit-scrollbar-thumb,\s*\.settings-form::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
+      /\.settings-tabs\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*height:\s*100%;/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.settings-tabs \.ant-tabs-nav\s*\{[^}]*flex:\s*0 0 112px;[^}]*width:\s*112px;/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.settings-tabs \.ant-tabs-content-holder\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.settings-tab-panel\s*\{[^}]*height:\s*100%;[^}]*overflow-y:\s*auto;/s,
+    )
+  })
+
+  it('keeps the slim result scrollbar visible without hover', () => {
+    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar,\s*\.settings-tab-panel::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track,\s*\.settings-tab-panel::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
+    expect(stylesSource).toMatch(
+      /\.result-list::-webkit-scrollbar-thumb,\s*\.settings-tab-panel::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
     expect(stylesSource).toMatch(
-      /\.launcher-surface\[data-color-scheme="dark"\][\s\S]*\.result-list,[\s\S]*\.settings-form\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
+      /\.launcher-surface\[data-color-scheme="dark"\][\s\S]*\.result-list,[\s\S]*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
     )
     expect(stylesSource).not.toContain('@media (prefers-color-scheme: dark)')
     expect(stylesSource).toMatch(
-      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-form::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
+      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-tab-panel::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
   })
 

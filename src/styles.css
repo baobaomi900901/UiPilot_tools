@@ -45,7 +45,8 @@ label,
 .file-category-strip,
 .file-preview,
 .file-toolbar,
-.settings-form {
+.settings-tabs,
+.settings-tab-panel {
   app-region: no-drag;
 }
 
@@ -168,7 +169,7 @@ label,
 }
 
 .result-list,
-.settings-form {
+.settings-tab-panel {
   --result-scrollbar-thumb: rgba(64, 64, 64, 0.48);
 }
 
@@ -178,17 +179,17 @@ label,
 }
 
 .result-list::-webkit-scrollbar,
-.settings-form::-webkit-scrollbar {
+.settings-tab-panel::-webkit-scrollbar {
   width: 6px;
 }
 
 .result-list::-webkit-scrollbar-track,
-.settings-form::-webkit-scrollbar-track {
+.settings-tab-panel::-webkit-scrollbar-track {
   background: transparent;
 }
 
 .result-list::-webkit-scrollbar-thumb,
-.settings-form::-webkit-scrollbar-thumb {
+.settings-tab-panel::-webkit-scrollbar-thumb {
   background: var(--result-scrollbar-thumb);
   border-radius: 3px;
 }
@@ -325,11 +326,55 @@ label,
   font-size: 1.125rem;
 }
 
-.settings-form,
-.settings-loading {
+.settings-tabs {
   min-width: 0;
   min-height: 0;
-  padding: 10px 2px 4px;
+  height: 100%;
+  padding-top: 8px;
+  overflow: hidden;
+}
+
+.settings-tabs > .ant-tabs {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.settings-tabs .ant-tabs-nav {
+  flex: 0 0 112px;
+  width: 112px;
+  margin: 0;
+}
+
+.settings-tabs .ant-tabs-tab {
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.settings-tabs .ant-tabs-tab-btn {
+  width: 100%;
+  text-align: left;
+}
+
+.settings-tabs .ant-tabs-content,
+.settings-tabs .ant-tabs-tabpane {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.settings-tabs .ant-tabs-content-holder {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  border-inline-start: 1px solid #d9d9d9;
+}
+
+.settings-tab-panel {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 10px 12px 4px;
   overflow-y: auto;
 }
 
@@ -338,6 +383,8 @@ label,
   align-items: center;
   justify-content: center;
   gap: 10px;
+  min-width: 0;
+  min-height: 100%;
 }
 
 .settings-actions {
@@ -351,8 +398,6 @@ label,
 
 .plugin-inventory {
   min-width: 0;
-  padding-top: 12px;
-  border-top: 1px solid #d9d9d9;
 }
 
 .plugin-inventory-header,
@@ -498,13 +543,16 @@ label,
 .launcher-surface[data-color-scheme="dark"] .result-list,
 .launcher-surface[data-color-scheme="dark"] .settings-header,
 .launcher-surface[data-color-scheme="dark"] .file-preview,
-.launcher-surface[data-color-scheme="dark"] .plugin-inventory,
 .launcher-surface[data-color-scheme="dark"] .plugin-item {
   border-color: #595959;
 }
 
+.launcher-surface[data-color-scheme="dark"] .settings-tabs .ant-tabs-content-holder {
+  border-color: #595959;
+}
+
 .launcher-surface[data-color-scheme="dark"] .result-list,
-.launcher-surface[data-color-scheme="dark"] .settings-form {
+.launcher-surface[data-color-scheme="dark"] .settings-tab-panel {
   --result-scrollbar-thumb: rgba(217, 217, 217, 0.55);
 }
 
@@ -561,6 +609,7 @@ label,
   .launcher-surface,
   .result-list,
   .settings-header,
+  .settings-tabs .ant-tabs-content-holder,
   .file-preview,
   .app-mark {
     border-color: CanvasText;
@@ -573,7 +622,7 @@ label,
   }
 
   .result-list::-webkit-scrollbar-thumb,
-  .settings-form::-webkit-scrollbar-thumb {
+  .settings-tab-panel::-webkit-scrollbar-thumb {
     background: ButtonText;
   }
 
