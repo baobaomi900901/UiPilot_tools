@@ -280,6 +280,24 @@ async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
   }
 }
 
+function settingsTab(host: HTMLElement, label: '通用' | '插件'): HTMLElement {
+  const tab = [...host.querySelectorAll<HTMLElement>('[role="tab"]')].find(
+    (candidate) => candidate.textContent?.trim().endsWith(label),
+  )
+  if (!tab) throw new Error(`settings tab missing: ${label}`)
+  return tab
+}
+
+async function activateSettingsTab(host: HTMLElement, label: '通用' | '插件'): Promise<HTMLElement> {
+  const tab = settingsTab(host, label)
+  await act(async () => {
+    tab.focus()
+    tab.click()
+  })
+  await vi.waitFor(() => expect(tab.getAttribute('aria-selected')).toBe('true'))
+  return tab
+}
+
 async function startedCore(settings: SettingsView = emptySettings) {
   const fake = fakeClient()
   vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settings)
@@ -2025,7 +2043,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('renders settings controls and closes only through the core hide owner', async () => {
+  it('renders exactly two settings tabs, focuses general, and keeps the title unfocusable', async () => {
     installMatchMedia(true)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -2033,10 +2051,17 @@ describe('React view and accessibility', () => {
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('settings-view', 'settings')))
-    const heading = mounted.host.querySelector<HTMLElement>('h1')!
+    const heading = mounted.host.querySelector<HTMLElement>('.settings-header h1')!
     expect(heading.textContent).toBe('设置')
-    expect(document.activeElement).toBe(heading)
+    expect(heading.hasAttribute('tabindex')).toBe(false)
+    const tabs = [...mounted.host.querySelectorAll<HTMLElement>('[role="tab"]')]
+    expect(tabs).toEqual([settingsTab(mounted.host, '通用'), settingsTab(mounted.host, '插件')])
+    expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true')
+    expect(settingsTab(mounted.host, '插件').getAttribute('aria-selected')).toBe('false')
+    expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
+    expect(document.activeElement).not.toBe(heading)
     expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
+    expect(mounted.host.querySelector('.plugin-inventory')).toBeNull()
     expect(mounted.host.textContent).toContain('恢复初始化')
     expect(mounted.host.textContent).not.toContain('保存')
     expect(mounted.host.textContent).not.toContain('重新加载设置')
@@ -2046,6 +2071,139 @@ describe('React view and accessibility', () => {
     expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
     expect(core.getSnapshot().view).toBe('settings')
     await mounted.unmount()
+  })
+
+  it('switches settings panels without loading and resets to general for a new view epoch', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockResolvedValue([])
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-tabs-first', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+
+    const settingsLoads = vi.mocked(fake.client.loadSettings).mock.calls.length
+    const pluginLoads = vi.mocked(fake.client.listPlugins).mock.calls.length
+    const pluginTab = await activateSettingsTab(mounted.host, '插件')
+    expect(mounted.host.querySelector('.plugin-inventory')).toBeTruthy()
+    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeNull()
+    expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
+    expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads)
+
+    await act(async () => {
+      pluginTab.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'ArrowUp',
+          code: 'ArrowUp',
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    })
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true'))
+    expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
+    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
+    expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
+    expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads)
+
+    await activateSettingsTab(mounted.host, '插件')
+    await act(async () => fake.emit(shown('settings-tabs-launcher', 'launcher')))
+    await act(async () => fake.emit(shown('settings-tabs-second', 'settings')))
+    await vi.waitFor(() => expect(document.activeElement).toBe(settingsTab(mounted.host, '通用')))
+    expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true')
+    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
+    expect(mounted.host.querySelector('.plugin-inventory')).toBeNull()
+
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('keeps general and plugin loading failures inside their own tab panels', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings)
+      .mockResolvedValueOnce(settingsFixture)
+      .mockRejectedValueOnce({ code: 'settingsFailed', message: 'private settings error' })
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce([
+      { id: 'internal.math', version: '1.0.0', trigger: '/math', description: null },
+    ])
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-tab-error', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('error'))
+    expect(mounted.host.textContent?.replace(/\s/g, '')).toContain('重试')
+    expect(mounted.host.querySelector('.plugin-item')).toBeNull()
+
+    await activateSettingsTab(mounted.host, '插件')
+    expect(mounted.host.querySelector('.plugin-item h3')?.textContent).toBe('internal.math')
+    expect(mounted.host.textContent).not.toContain('private settings error')
+
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('keeps a plugin list failure out of the general settings panel', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockRejectedValueOnce({
+      code: 'pluginListFailed',
+      message: 'private plugin error',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('plugin-tab-error', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('error'))
+
+    const hotkey = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
+    expect(hotkey).toBeTruthy()
+    expect(hotkey?.disabled).toBe(false)
+    expect(mounted.host.textContent).not.toContain('无法加载插件清单。')
+
+    await activateSettingsTab(mounted.host, '插件')
+    expect(mounted.host.querySelector('[role="alert"]')?.textContent).toBe('无法加载插件清单。')
+    expect(mounted.host.textContent).not.toContain('private plugin error')
+
+    await activateSettingsTab(mounted.host, '通用')
+    expect(mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')?.disabled).toBe(false)
+
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('keeps a plugin reload running while its tab is hidden', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const plugin = { id: 'internal.math', version: '1.0.0', trigger: '/math', description: null }
+    const reload = deferred<PluginView>()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce([plugin])
+    vi.mocked(fake.client.reloadPlugin).mockReturnValueOnce(reload.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-hidden-plugin', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    await activateSettingsTab(mounted.host, '插件')
+
+    const reloadButton = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent?.trim() === '重新加载',
+    )!
+    await act(async () => reloadButton.click())
+    await activateSettingsTab(mounted.host, '通用')
+    reload.resolve({ ...plugin, version: '2.0.0' })
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0'))
+    expect(mounted.host.querySelector('.plugin-inventory')).toBeNull()
+
+    await activateSettingsTab(mounted.host, '插件')
+    expect(mounted.host.querySelector('.plugin-title-line span')?.textContent).toBe('2.0.0')
+
+    await mounted.unmount()
+    core.destroy()
   })
 
   it('shows fixed settings load failure and retry without a permanent spinner', async () => {
@@ -2260,7 +2418,19 @@ describe('React view and accessibility', () => {
   })
 
   it('keeps the React/AntD source boundary exact', () => {
-    for (const required of ['ConfigProvider', 'App', 'Input', 'Form', 'Checkbox', 'Button', 'Popconfirm', 'Select', 'Spin', 'theme']) {
+    for (const required of [
+      'ConfigProvider',
+      'App',
+      'Input',
+      'Form',
+      'Checkbox',
+      'Button',
+      'Popconfirm',
+      'Select',
+      'Spin',
+      'Tabs',
+      'theme',
+    ]) {
       expect(launcherViewSource).toContain(required)
     }
     for (const forbidden of [
@@ -2293,6 +2463,7 @@ describe('React view and accessibility', () => {
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('plugin-markdown', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('.plugin-item')).toHaveLength(2))
 
     expect(mounted.host.querySelector('.plugin-item h3')?.textContent).toBe('internal.math')

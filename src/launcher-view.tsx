@@ -9,6 +9,7 @@ import {
   Select,
   Spin,
   Switch,
+  Tabs,
   Tooltip,
   theme,
   type InputProps,
@@ -94,6 +95,21 @@ const themeOptions = [
   { value: 'dark', label: 'Dark' },
   { value: 'light', label: 'Light' },
 ] satisfies { value: ThemePreference; label: string }[]
+
+type SettingsTabKey = 'general' | 'plugins'
+
+interface SettingsTabSelection {
+  viewEpoch: number
+  key: SettingsTabKey
+}
+
+function settingsTabKey(target: EventTarget): SettingsTabKey | null {
+  if (!(target instanceof HTMLElement) || target.getAttribute('role') !== 'tab') return null
+  const controlledPanel = target.getAttribute('aria-controls')
+  if (controlledPanel?.endsWith('-panel-general')) return 'general'
+  if (controlledPanel?.endsWith('-panel-plugins')) return 'plugins'
+  return null
+}
 
 function resolveColorScheme(
   preference: ThemePreference,
@@ -200,7 +216,13 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const [systemDark, setSystemDark] = useState(scheme.matches)
   const colorScheme = resolveColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
-  const headingRef = useRef<HTMLHeadingElement>(null)
+  const settingsTabsRef = useRef<HTMLDivElement>(null)
+  const [settingsTabSelection, setSettingsTabSelection] = useState<SettingsTabSelection>({
+    viewEpoch: -1,
+    key: 'general',
+  })
+  const activeSettingsTab: SettingsTabKey =
+    settingsTabSelection.viewEpoch === snapshot.viewEpoch ? settingsTabSelection.key : 'general'
   const optionRefs = useRef(new Map<number, HTMLElement>())
   const fileOptionRefs = useRef(new Map<number, HTMLElement>())
   const ready = useRef(false)
@@ -240,7 +262,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       queryRef.current?.focus()
       queryRef.current?.select()
     } else {
-      headingRef.current?.focus()
+      settingsTabsRef.current
+        ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+        ?.focus()
     }
   }, [snapshot.invocationId, snapshot.view, snapshot.viewEpoch])
 
@@ -509,133 +533,168 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const plugins = snapshot.plugins
   const busy = settings?.operation !== undefined
   const locked = busy || settings?.readOnly === true
-  const settingsView = (
-    <section className="settings-view" aria-label="设置">
-      <header className="settings-header">
-        <h1 ref={headingRef} tabIndex={-1}>
-          设置
-        </h1>
-        <Button aria-label="关闭" disabled={snapshot.hidePending} onClick={() => void core.requestHide()}>
-          关闭
-        </Button>
-      </header>
-      <div className="settings-form">
-        {!settings ? (
-          <div className="settings-loading">
-            {snapshot.settingsLoadStatus === 'error' ? (
-              <Button onClick={() => void core.reloadSettings()}>重试</Button>
-            ) : (
-              <Spin size="small" />
-            )}
-          </div>
-        ) : (
-          <Form component="div" layout="vertical" className="settings-basic-form">
-            <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
-              <HotkeyRecorderInput
-                core={core}
-                value={settings.hotkey.value}
-                id={`settings-hotkey-${settings.hotkey.key}`}
-                name={`settings-hotkey-${settings.hotkey.key}`}
-                disabled={locked}
-              />
-            </Form.Item>
-            <Checkbox checked={settings.autostart} disabled={locked} onChange={(event) => core.setAutostart(event.target.checked)}>
-              开机启动
-            </Checkbox>
-            <Form.Item label="风格">
-              <Select
-                aria-label="风格"
-                value={settings.theme}
-                disabled={locked}
-                options={themeOptions}
-                onChange={(value: ThemePreference) => core.setThemePreference(value)}
-              />
-            </Form.Item>
-            <div className="settings-actions">
-              <Popconfirm
-                title="恢复初始化设置？"
-                description="快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。"
-                okText="恢复"
-                cancelText="取消"
-                onConfirm={() => void core.resetSettings()}
-                disabled={locked}
+  const generalSettingsPanel = (
+    <div className="settings-tab-panel settings-general-panel">
+      {!settings ? (
+        <div className="settings-loading">
+          {snapshot.settingsLoadStatus === 'error' ? (
+            <Button onClick={() => void core.reloadSettings()}>重试</Button>
+          ) : (
+            <Spin size="small" />
+          )}
+        </div>
+      ) : (
+        <Form component="div" layout="vertical" className="settings-basic-form">
+          <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
+            <HotkeyRecorderInput
+              core={core}
+              value={settings.hotkey.value}
+              id={`settings-hotkey-${settings.hotkey.key}`}
+              name={`settings-hotkey-${settings.hotkey.key}`}
+              disabled={locked}
+            />
+          </Form.Item>
+          <Checkbox
+            checked={settings.autostart}
+            disabled={locked}
+            onChange={(event) => core.setAutostart(event.target.checked)}
+          >
+            开机启动
+          </Checkbox>
+          <Form.Item label="风格">
+            <Select
+              aria-label="风格"
+              value={settings.theme}
+              disabled={locked}
+              options={themeOptions}
+              onChange={(value: ThemePreference) => core.setThemePreference(value)}
+            />
+          </Form.Item>
+          <div className="settings-actions">
+            <Popconfirm
+              title="恢复初始化设置？"
+              description="快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。"
+              okText="恢复"
+              cancelText="取消"
+              onConfirm={() => void core.resetSettings()}
+              disabled={locked}
+            >
+              <Button danger disabled={locked} loading={settings.operation === 'save'}>
+                恢复初始化
+              </Button>
+            </Popconfirm>
+            {settings.loadStatus === 'error' ? (
+              <Button
+                disabled={busy}
+                loading={settings.operation === 'load'}
+                onClick={() => void core.reloadSettings()}
               >
-                <Button danger disabled={locked} loading={settings.operation === 'save'}>
-                  恢复初始化
-                </Button>
-              </Popconfirm>
-              {settings.loadStatus === 'error' ? (
-                <Button disabled={busy} loading={settings.operation === 'load'} onClick={() => void core.reloadSettings()}>
-                  重试
-                </Button>
-              ) : null}
-            </div>
-          </Form>
-        )}
-        <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
-          <div className="plugin-inventory-header">
-            <h2 id="plugin-inventory-title">插件</h2>
-            {plugins?.status === 'error' ? (
-              <Button size="small" onClick={() => void core.reloadPlugins()}>
                 重试
               </Button>
             ) : null}
           </div>
-          {plugins?.status === 'loading' || plugins?.status === 'idle' ? (
-            <div className="plugin-list-state"><Spin size="small" /></div>
-          ) : plugins?.status === 'error' ? (
-            <div className="plugin-list-state plugin-list-error" role="alert">{plugins.error}</div>
-          ) : plugins?.items.length === 0 ? (
-            <div className="plugin-list-state">未安装插件</div>
-          ) : (
-            <div className="plugin-list">
-              {plugins?.items.map((plugin) => (
-                <article className="plugin-item" key={plugin.id}>
-                  <div className="plugin-item-main">
-                    <div className="plugin-title-line">
-                      <h3>{plugin.id}</h3>
-                      <span>{plugin.version}</span>
-                      <code>{plugin.trigger}</code>
-                    </div>
-                    <div className="plugin-description">
-                      <div className="plugin-description-label">说明</div>
-                      {plugin.description ? (
-                        <ReactMarkdown allowedElements={pluginMarkdownElements} unwrapDisallowed>
-                          {plugin.description}
-                        </ReactMarkdown>
-                      ) : (
-                        <p>暂无说明</p>
-                      )}
-                    </div>
-                    {plugin.error ? <div className="plugin-row-error" role="alert">{plugin.error}</div> : null}
+        </Form>
+      )}
+    </div>
+  )
+  const pluginSettingsPanel = (
+    <div className="settings-tab-panel settings-plugin-panel">
+      <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
+        <div className="plugin-inventory-header">
+          <h2 id="plugin-inventory-title">插件</h2>
+          {plugins?.status === 'error' ? (
+            <Button size="small" onClick={() => void core.reloadPlugins()}>
+              重试
+            </Button>
+          ) : null}
+        </div>
+        {plugins?.status === 'loading' || plugins?.status === 'idle' ? (
+          <div className="plugin-list-state"><Spin size="small" /></div>
+        ) : plugins?.status === 'error' ? (
+          <div className="plugin-list-state plugin-list-error" role="alert">{plugins.error}</div>
+        ) : plugins?.items.length === 0 ? (
+          <div className="plugin-list-state">未安装插件</div>
+        ) : (
+          <div className="plugin-list">
+            {plugins?.items.map((plugin) => (
+              <article className="plugin-item" key={plugin.id}>
+                <div className="plugin-item-main">
+                  <div className="plugin-title-line">
+                    <h3>{plugin.id}</h3>
+                    <span>{plugin.version}</span>
+                    <code>{plugin.trigger}</code>
                   </div>
-                  <div className="plugin-actions">
-                    <Button
-                      size="small"
-                      loading={plugin.operation === 'reload'}
-                      disabled={plugin.operation !== undefined}
-                      onClick={() => void core.reloadPlugin(plugin.id)}
-                    >
-                      重新加载
+                  <div className="plugin-description">
+                    <div className="plugin-description-label">说明</div>
+                    {plugin.description ? (
+                      <ReactMarkdown allowedElements={pluginMarkdownElements} unwrapDisallowed>
+                        {plugin.description}
+                      </ReactMarkdown>
+                    ) : (
+                      <p>暂无说明</p>
+                    )}
+                  </div>
+                  {plugin.error ? <div className="plugin-row-error" role="alert">{plugin.error}</div> : null}
+                </div>
+                <div className="plugin-actions">
+                  <Button
+                    size="small"
+                    loading={plugin.operation === 'reload'}
+                    disabled={plugin.operation !== undefined}
+                    onClick={() => void core.reloadPlugin(plugin.id)}
+                  >
+                    重新加载
+                  </Button>
+                  <Popconfirm
+                    title="删除此插件？"
+                    description="插件包将从插件目录移除。"
+                    okText="删除"
+                    cancelText="取消"
+                    onConfirm={() => void core.deletePlugin(plugin.id)}
+                    disabled={plugin.operation !== undefined}
+                  >
+                    <Button size="small" danger loading={plugin.operation === 'delete'} disabled={plugin.operation !== undefined}>
+                      删除
                     </Button>
-                    <Popconfirm
-                      title="删除此插件？"
-                      description="插件包将从插件目录移除。"
-                      okText="删除"
-                      cancelText="取消"
-                      onConfirm={() => void core.deletePlugin(plugin.id)}
-                      disabled={plugin.operation !== undefined}
-                    >
-                      <Button size="small" danger loading={plugin.operation === 'delete'} disabled={plugin.operation !== undefined}>
-                        删除
-                      </Button>
-                    </Popconfirm>
-                  </div>
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
+                  </Popconfirm>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+  const settingsView = (
+    <section className="settings-view" aria-label="设置">
+      <header className="settings-header">
+        <h1>设置</h1>
+        <Button aria-label="关闭" disabled={snapshot.hidePending} onClick={() => void core.requestHide()}>
+          关闭
+        </Button>
+      </header>
+      <div
+        ref={settingsTabsRef}
+        className="settings-tabs"
+        onFocusCapture={(event) => {
+          const key = settingsTabKey(event.target)
+          if (!key || key === activeSettingsTab) return
+          setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+        }}
+      >
+        <Tabs
+          activeKey={activeSettingsTab}
+          destroyOnHidden
+          items={[
+            { key: 'general', label: '通用', children: generalSettingsPanel },
+            { key: 'plugins', label: '插件', children: pluginSettingsPanel },
+          ]}
+          tabPlacement="start"
+          onChange={(key) => {
+            if (key !== 'general' && key !== 'plugins') return
+            setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+          }}
+        />
       </div>
     </section>
   )
