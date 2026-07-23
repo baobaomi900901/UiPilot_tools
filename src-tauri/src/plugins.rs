@@ -692,10 +692,9 @@ impl PluginManager {
                     state.active.entries.iter().position(|entry| {
                         entry.id == plugin_id && entry.identity() == old_identity
                     });
-                if !staged_asset_matches || !staged_owner_matches || old_index.is_none() {
+                if !staged_asset_matches || !staged_owner_matches {
                     false
-                } else {
-                    let old_index = old_index.expect("checked old plugin index");
+                } else if let Some(old_index) = old_index {
                     state.active.entries[old_index] = candidate.clone();
                     state.staged_assets.remove(&identity);
                     state.ownership.remove(&old_identity);
@@ -724,6 +723,8 @@ impl PluginManager {
                     }
                     let _ = registry.invalidate_domain(QueryDomain::Plugin);
                     true
+                } else {
+                    false
                 }
             }
         };
@@ -2470,7 +2471,7 @@ mod tests {
                 );
             }
             manager.runtime_ready(&promoted);
-            assert_eq!(attempt.snapshot().unwrap().ready, true);
+            assert!(attempt.snapshot().unwrap().ready);
             {
                 let _admission = manager.admission.write().unwrap();
                 let mut state = manager.state.get().unwrap().write().unwrap();
