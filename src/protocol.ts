@@ -6,19 +6,23 @@ export interface ResultItem {
 }
 
 export interface SearchResponse {
-  requestId: string
-  items: ResultItem[]
+    requestId: string
+    items: ResultItem[]
 }
+
+export type ThemePreference = 'system' | 'dark' | 'light'
 
 export interface SettingsView {
   hotkey: string
   autostart: boolean
   filePreviewEnabled: boolean
+  theme: ThemePreference
 }
 
 export interface UserSettingsUpdate {
   hotkey: string
   autostart: boolean
+  theme: ThemePreference
 }
 
 export interface HotkeySettingsUpdate {
@@ -103,6 +107,7 @@ export interface LauncherClient {
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
   setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
+  setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
   hideLauncher(): Promise<void>
 }
 
@@ -123,9 +128,10 @@ export type SettingsLoadStatus = 'loading' | 'ready' | 'error'
 export interface SettingsSnapshot {
   hotkey: TextControlView
   autostart: boolean
+  theme: ThemePreference
   loadStatus: SettingsLoadStatus
   readOnly: boolean
-  operation?: 'load' | 'save' | 'hotkey'
+  operation?: 'load' | 'save' | 'hotkey' | 'theme'
   needsReload: boolean
 }
 
@@ -193,6 +199,7 @@ export interface FileSnapshot {
 export interface LauncherSnapshot {
   view: 'launcher' | 'settings'
   viewEpoch: number
+  theme: ThemePreference
   invocationId?: string
   queryControl: ControlKey
   query: string

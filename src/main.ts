@@ -58,6 +58,11 @@ export const client: LauncherClient = {
       'set_file_preview_preference',
       Object.freeze({ preference: Object.freeze({ enabled: input.preference.enabled }) }),
     ),
+  setThemePreference: (input) =>
+    invoke<void>(
+      'set_theme_preference',
+      Object.freeze({ preference: Object.freeze({ theme: input.preference.theme }) }),
+    ),
   hideLauncher: () => invoke<void>('hide_launcher'),
 }
 
