@@ -1208,6 +1208,26 @@ describe('plugin settings ownership', () => {
     expect(core.getSnapshot().settings?.autostart).toBe(true)
   })
 
+  it('ignores an older list response after reentering settings', async () => {
+    const first = deferred<PluginView[]>()
+    const second = deferred<PluginView[]>()
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('list-first', 'settings'))
+    fake.emit(shown('list-launcher', 'launcher'))
+    fake.emit(shown('list-second', 'settings'))
+
+    second.resolve([pluginV2])
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0'))
+    first.resolve([pluginV1])
+    await first.promise
+    expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0')
+    expect(fake.client.listPlugins).toHaveBeenCalledTimes(2)
+  })
+
   it('updates only the active row for reload and removes it after confirmed delete', async () => {
     const { core, client } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
