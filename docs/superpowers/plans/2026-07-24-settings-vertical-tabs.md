@@ -51,7 +51,7 @@ Add these helpers below `mountLauncherView` in `src/launcher.test.tsx`:
 ```tsx
 function settingsTab(host: HTMLElement, label: '通用' | '插件'): HTMLElement {
   const tab = [...host.querySelectorAll<HTMLElement>('[role="tab"]')].find(
-    (candidate) => candidate.textContent?.trim() === label,
+    (candidate) => candidate.textContent?.trim().endsWith(label),
   )
   if (!tab) throw new Error(`settings tab missing: ${label}`)
   return tab
@@ -59,7 +59,10 @@ function settingsTab(host: HTMLElement, label: '通用' | '插件'): HTMLElement
 
 async function activateSettingsTab(host: HTMLElement, label: '通用' | '插件'): Promise<HTMLElement> {
   const tab = settingsTab(host, label)
-  await act(async () => tab.click())
+  await act(async () => {
+    tab.focus()
+    tab.click()
+  })
   await vi.waitFor(() => expect(tab.getAttribute('aria-selected')).toBe('true'))
   return tab
 }
@@ -112,7 +115,12 @@ it('switches settings panels without loading and resets to general for a new vie
 
   await act(async () => {
     pluginTab.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }),
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        code: 'ArrowUp',
+        bubbles: true,
+        cancelable: true,
+      }),
     )
   })
   await vi.waitFor(() => expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true'))
@@ -273,6 +281,14 @@ type SettingsTabKey = 'general' | 'plugins'
 interface SettingsTabSelection {
   viewEpoch: number
   key: SettingsTabKey
+}
+
+function settingsTabKey(target: EventTarget): SettingsTabKey | null {
+  if (!(target instanceof HTMLElement) || target.getAttribute('role') !== 'tab') return null
+  const controlledPanel = target.getAttribute('aria-controls')
+  if (controlledPanel?.endsWith('-panel-general')) return 'general'
+  if (controlledPanel?.endsWith('-panel-plugins')) return 'plugins'
+  return null
 }
 ```
 
@@ -466,7 +482,15 @@ const settingsView = (
         关闭
       </Button>
     </header>
-    <div ref={settingsTabsRef} className="settings-tabs">
+    <div
+      ref={settingsTabsRef}
+      className="settings-tabs"
+      onFocusCapture={(event) => {
+        const key = settingsTabKey(event.target)
+        if (!key || key === activeSettingsTab) return
+        setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+      }}
+    >
       <Tabs
         activeKey={activeSettingsTab}
         destroyOnHidden
@@ -759,7 +783,7 @@ git diff --check main...HEAD
 
 Expected:
 
-- Vitest: 3 files, at least 144 tests, zero failures.
+- Vitest: 3 files, at least 145 tests, zero failures.
 - Vite/TypeScript build: exit 0.
 - Rust: 376 or more passed, zero failed, with only the existing ignored/filtered tests.
 - `cargo check`, `cargo fmt --check`, and `git diff --check`: exit 0.

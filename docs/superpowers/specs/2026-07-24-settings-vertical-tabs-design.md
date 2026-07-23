@@ -110,7 +110,7 @@ Tab 选择只属于 React 视图，不进入 `LauncherCore` 或协议层。
 2. 仅当 `snapshot.view` 进入 `settings` 或 `snapshot.viewEpoch` 变化时，在 layout effect 中查找根节点内 `[role="tab"][aria-selected="true"]` 并调用 `focus()`。
 3. 普通设置、插件清单、主题或 mutation 状态更新不得重新抢夺焦点。
 4. 标题没有 `tabIndex`，也没有任何 ref 驱动的 `focus()`。
-5. Tab 点击、方向键切换、选中态和 ARIA 属性由 Ant Design `Tabs` 负责。
+5. Ant Design `Tabs` 负责方向键的 roving focus、点击、Tab DOM 和 ARIA 属性。当前版本的方向键只移动焦点，因此 Tabs 根节点通过 `onFocusCapture` 把新聚焦 Tab 的 `aria-controls` 映射回受控 `activeKey`，实现方向键自动切换页面；宿主不自行处理 Arrow/Home/End 键。
 6. 切换 Tab 后，焦点保持在 Tab 入口；不自动跳进右侧表单或插件操作按钮。
 
 这样既满足标题不可聚焦，也给键盘用户一个稳定且可操作的设置页入口。
