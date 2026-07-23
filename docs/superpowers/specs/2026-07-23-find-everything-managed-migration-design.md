@@ -100,9 +100,9 @@ NSIS per-machine Installer (elevated once)
 UiPilot.exe (current user)
   ├─ EverythingRuntimeSupervisor
   ├─ EverythingIpcWorker (dedicated Win32 message thread)
-  ├─ FileSearchRevisionTracker (response fingerprint)
   ├─ FileSearchService
-  └─ ResultRegistry
+  ├─ file_search/windows/path_auth (shared component pin/auth + Shell dispatch)
+  └─ ResultRegistry (file ResultSet + sole content_revision high-water)
 
 Everything private client (current user, hidden)
   └─ UiPilot private service pipe
@@ -135,18 +135,22 @@ Everything private client (current user, hidden)
 - LIST2 parser 返回并验证实际 `request_flags` 与 `sort_type`，然后解析长度、字段 offset 和 UTF-16 边界。
 - 超时或客户端重启后旧 query id 全部失效；迟到 reply 只丢弃。
 
-### `FileSearchRevisionTracker`
+### `ResultRegistry` revision 与主动刷新
 
 - Everything 1.4 Query2 没有供 UiPilot 复用的全局 DB-change 通知，不能只在客户端重启时更新 revision。
 - `launcher-core.ts` 将现有 building poll 扩展为：只要 launcher 处于 `/find`，每 1 秒执行一次有 deadline
   的 `refresh_files`。该 command 使用 preserve-current refresh transaction，不能调用会立即清空 current 的
   普通 `begin_query`；隐藏 launcher 或退出 `/find` 时现有 timer ownership 立即停止轮询。
-- backend 生成版本化 canonical fingerprint。preimage 固定包含 query/category/sort、status、total，以及
+- backend 生成版本化 canonical fingerprint，但不生成 revision。preimage 固定包含 query/category/sort、status、total，以及
   每个有序可见项的 canonical path、逐组件 identity chain、leaf volume serial/file id、kind、size 和
   modified FILETIME，全部使用长度前缀 little-endian 编码。明确排除 query sequence、requestId、resultId、
   Query2 reply id 和内存地址。
-- 同路径、同展示 metadata 但 file id 或任一路径组件 identity 改变必须提交新 action 并递增 revision。
-- `content_revision` checked overflow 时 file domain 永久 fail-closed、失效当前集合并进入 unavailable；不回绕。
+- `ResultRegistry` 的 file-domain high-water 是 `content_revision` 唯一 owner。初始发布、普通 query/category/sort
+  发布、changed refresh replace 和 lifecycle invalidate 各 checked increment 一次；Unchanged 不增，backend、
+  supervisor 和前端均不得另行分配或递增。
+- 同路径、同展示 metadata 但 file id 或任一路径组件 identity 改变必须提交新 action并由 registry 递增 revision。
+- `content_revision` checked overflow 时 registry 原子清空 current、标记 file domain permanently exhausted 并
+  进入 unavailable；不回绕、不从 backend high-water 恢复。
 - query、category 或 sort 变化时建立新的 fingerprint key。生产切换后删除 `file-index://changed` listener、
   `FileIndexChanged` 协议和旧 index event；不新增 monitor lifecycle command 或 capability。
 
@@ -172,19 +176,35 @@ Everything private client (current user, hidden)
 - WebView 继续只提交 `resultId`、invocation id 和 query sequence。
 - 文件 action 改为 backend-neutral 枚举。迁移期包含 `Indexed(OpenIndexedPath)` 和
   `Everything(AuthenticatedPathAction)`；旧引擎删除后同时删除 `Indexed` variant 和 `OpenIndexedPath`。
-- `AuthenticatedPathAction` 保存 publication generation、最终 canonical path/kind，以及从 volume root 到
+- `AuthenticatedPathAction` 保存认证时的 runtime epoch、publication generation、最终 canonical path/kind，以及从 volume root 到
   leaf 的每个组件 identity：resolved prefix、volume serial、file id、attributes 和 reparse tag/policy。
-- 泛化并复用现有 `pin_indexed_path_components`：执行时逐组件打开不共享 `FILE_SHARE_DELETE` 的 handle，
+- Iteration 3 先把现有 `file_index/windows_backend.rs` 的 `OwnedHandle`、组件遍历、reparse policy、identity
+  读取和 Shell dispatch 迁移/泛化到共享 `file_search/windows/path_auth.rs`；旧 Indexed adapter 与 Everything
+  action 共同委托，禁止复制 helper。执行时逐组件打开不共享 `FILE_SHARE_DELETE` 的 handle，
   拒绝未批准 reparse shape，比较全部组件 identity 和最终 resolved volume/path；所有 handles 保持到
   path-based Shell API 返回。父目录 rename、junction/reparse substitution、跨卷和 leaf 替换均失败闭合。
+- execute admission 在 backend/runtime 门禁内比较 action 捕获的 runtime epoch 与 publication generation；command
+  不得读取“当前 epoch”再作为 expected 参数传回。旧 adapter 删除后共享 path-auth 模块继续保留。
 - 不把 Everything result index、裸路径或 query id 当作长期执行凭证。
-- 普通用户新查询继续使用 `begin_query`。轮询使用 `begin_preserving_refresh`，只捕获 generation、domain
-  epoch、当前 requestId 和 fingerprint，不修改 latest query、current 或任何 ID。
-- backend 在 registry lock 外完成查询、双遍分页、逐组件 action 认证和 fingerprint 构建；失败或超时直接
-  丢弃 token，当前 ResultSet 完整保留。
+- 每个 current file ResultSet 保存 server-owned `FileRefreshContext`：原始 `QuerySpec`、runtime epoch、publication
+  generation、规范化 query key、invocation id 和 source query sequence。普通用户新查询继续使用 `begin_query`；
+  轮询 request 只允许 `{ invocationId, expectedRequestId }`，采用 deny-unknown-fields，不接收 query/category/sort。
+- `refresh_files` 首句必须是 `require_main_window`；`begin_preserving_refresh` 再验证 active invocation、file domain
+  和 exact requestId，从 current 返回 context，并捕获 generation/domain epoch/fingerprint，不修改 latest query、
+  current 或任何 ID。response 是 `Unchanged | Replaced | BootstrapRequired | Stale` discriminated union；Stale
+  区分 invocation changed、request changed、domain invalidated 和 superseded。无 current 返回
+  `BootstrapRequired`，由前端执行有界普通 `search_files` bootstrap。
+- backend 在 registry lock 外严格重放 token context 中的 `QuerySpec`，完成查询、双遍分页、逐组件 action 认证和
+  fingerprint 构建。`ConcurrentMutation`、`TieGroupTooLarge` 和单次 deadline 是 soft query error，只丢 token
+  并保留 current。
+- `StaleRuntime`、客户端 restart、`Unavailable`、manifest/owner/protocol mismatch 与 revision exhaustion 是
+  lifecycle/security error：registry 必须 bump/invalidate file domain，原子清空 current 并禁止旧 action 执行。
+  初次启动、building 首次 ready、退避恢复或任何无 current 状态走 bounded bootstrap；有 current 后才 refresh。
 - `commit_refresh_if_current` 在一个 registry lock 临界区重新验证 token。fingerprint 不变时返回
-  `Unchanged`，requestId/resultId/actions/revision 完全不变；变化时才分配新 IDs、checked increment revision
-  并一次原子替换 ResultSet。旧 IDs 在提交点之前有效，提交点之后才 stale。
+  `Unchanged`，requestId/resultId/actions/revision 完全不变；变化时才分配新 IDs、由 registry checked increment
+  revision、为 batch 盖上新 publication generation 并一次原子替换 ResultSet；action 的 runtime epoch 来自完成
+  认证的 backend admission。普通 query、hide/domain invalidation 或另一 refresh 的 commit 返回 discriminated
+  `Stale`；两个并发 refresh 最多一个可替换。旧 IDs 在提交点之前有效，提交点之后才 stale。
 
 ## 安装、升级与卸载
 
@@ -230,12 +250,12 @@ Everything 客户端是用户会话进程，不能只依赖 Service。客户端�
 | `building` | 客户端已启动，但 DB 未加载完成或正在首次建立索引 | 显示“正在准备文件索引”，允许继续输入 |
 | `ready` | IPC 可用且 DB loaded | 正常展示结果 |
 | `partial` | 非所有预期固定卷均在线，或部分 scope 不可用 | 展示当前结果和降级提示 |
-| `rebuilding` | DB 正在重建或受管客户端刚恢复 | 保留旧结果或显示等待状态，不执行旧结果 |
+| `rebuilding` | DB 正在重建或受管客户端刚恢复 | 原子失效并清空旧结果，显示等待状态，不执行旧结果；ready 后 bootstrap |
 | `unavailable` | 组件未安装、Service/客户端无法启动、协议不兼容或连续崩溃 | 空结果、重新安装提示，不回退自研索引 |
 
-`indexRevision` 改为 UiPilot 的 `content_revision`。客户端重启、DB ready、IPC 重连、状态改变以及查询
-fingerprint 改变时 checked increment。普通新增、删除或重命名由 `/find` 活跃期间的 1 秒有界轮询发现；revision
-不能只表示 runtime 生命周期，也不映射 Everything 内部数据库 revision。
+`indexRevision` 改为 UiPilot 的 `content_revision`，只由 ResultRegistry file-domain high-water 分配。初始/普通
+发布、changed refresh 和 lifecycle invalidate 各递增一次；Unchanged 不递增。普通新增、删除或重命名由
+`/find` 活跃期间的 1 秒有界轮询发现；revision 不映射 Everything 内部数据库 revision。
 
 ## 查询与结果语义
 
@@ -271,7 +291,9 @@ Rust 可以对候选结果再次执行现有 `fold_name(name).contains(folded_qu
 - 迁移旧 adapter 时暂时保留 `file-index://changed`；生产切换时改为 `/find` 内 1 秒查询轮询并删除该事件链。
 - UI debounce 后的新查询覆盖尚未发送的旧查询。
 - 已发送 Query2 不依赖协议取消；结果到达后通过 query id 和 sequence 丢弃。
-- 单次 warm query deadline 初始设为 1 秒；超时只失败当前查询，并触发一次健康检查。
+- 单次 warm query deadline 初始设为 1 秒；单次 deadline 作为 soft query error 保留可执行 current，并触发一次健康检查。
+- runtime restart、unavailable、manifest/owner/protocol mismatch 必须 invalidate file domain；恢复到 ready 且无
+  current 时由有界 `search_files` bootstrap，不得通过 `refresh_files` 恢复空 registry。
 - 客户端启动/DB loaded 使用独立的较长 deadline，不与搜索 deadline 混用。
 - 连续三次协议或进程故障后进入 `Unavailable`，仅在应用重启或退避窗口到期时重试。
 - 不允许搜索请求触发 Service 安装、UAC 或安装器操作。
@@ -361,9 +383,14 @@ Go 条件：干净 VM 和“已安装个人 Everything”的 VM 均通过安装/
 - 新建 `file_search` 抽象，现有 command 不再直接依赖 `FileIndex`。
 - 新建 backend-neutral `FileResultAction`。迁移期显式区分 Indexed 和 Everything action，禁止新 backend
   构造 `OpenIndexedPath`。
-- ResultRegistry 新增 preserve-current refresh transaction；不变 refresh 不清空、不换 ID，变化 refresh 只在
-  新 actions 全部认证后原子 swap，失败/超时保留当前 ResultSet。
-- `AuthenticatedPathAction` 泛化逐组件 pin/auth，父目录、junction/reparse 和 leaf identity 都进入 action。
+- ResultRegistry 新增 server-owned `FileRefreshContext`、preserve-current transaction 和唯一 revision high-water；
+  不变 refresh 不清空、不换 ID，变化 refresh 只在新 actions 全部认证后原子 swap。soft query error 保留 current，
+  lifecycle/security error invalidate 并清空。
+- 新建 `file_search/windows/path_auth.rs`，先从旧 `windows_backend.rs` 迁移/泛化 `OwnedHandle`、逐组件 pin/auth、
+  reparse policy、identity 读取和 Shell dispatch；旧 Indexed adapter 与 Everything action 共同委托。保留
+  `Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_UI_Shell`、`Win32_UI_Shell_Common` features。
+- `AuthenticatedPathAction` 捕获 runtime epoch/publication generation；父目录、junction/reparse 和 leaf identity
+  都进入 action，执行 admission 比较 action 自身身份。
 - `EverythingFileSearch` 接入 Query2 worker 和 runtime supervisor。
 - 保留 `FileSearchResponse`、query sequence、ResultRegistry 和 execute_result 契约。
 - 用 fake backend 迁移 command 和生命周期单元测试。
@@ -377,8 +404,14 @@ Go 条件：现有前端 `/find` 测试不需要改变产品行为即可通过�
 
 - `building/ready/partial/rebuilding/unavailable` 的新状态映射。
 - 安装缺失、Service 停止、客户端崩溃、DB rebuilding、IPC timeout 和协议不匹配提示。
-- `launcher-core.ts` 每 1 秒调用 `refresh_files`；未变化 in-flight/完成期间旧 ID 始终可执行且完全不变；变化
-  in-flight 期间旧 ID 可执行，原子提交后才 stale；失败/超时保留当前集合。
+- `refresh_files` 只接受 invocation/current request ID，首句执行 main-window gate，从 current 取得 server-owned
+  QuerySpec/context；`build.rs` permission、`capabilities/main.json`、`lib.rs` invoke 注册、Rust command 和
+  `protocol.ts`/`main.ts` client 接线必须完整。
+- `launcher-core.ts` 无 current、building 首次 ready 和退避恢复时走 bounded `search_files` bootstrap；有 current
+  后每 1 秒调用 `refresh_files`。未变化 in-flight/完成期间旧 ID 始终可执行且完全不变；变化 in-flight 期间旧
+  ID 可执行，原子提交后才 stale；soft error 保留集合，restart/unavailable/security mismatch 清空并禁用执行。
+- 测试正确 request ID 下篡改 query/category/sort、普通 query/refresh 竞态、hide/domain invalidation、两个并发
+  refresh、runtime identity stale action，以及初始/普通/unchanged/changed/invalidate/overflow revision 序列。
 - canonical fingerprint 包含完整执行身份。同路径、同 metadata 但 file ID 或父组件 identity 变化必须原子
   替换并递增 revision；checked overflow 失败闭合。
 - 首版不提供 repair command；故障 UI 只提示重新运行可信渠道的已签名安装包。
@@ -394,6 +427,8 @@ Go 条件：功能、性能、可访问性、安全和故障注入验收通过�
 - 生产构建切换到 Everything backend。
 - 删除扫描、USN watcher、SQLite index、integrity worker 和相关生命周期协调代码。
 - 删除 `rusqlite` 及只服务于自研索引的 Windows features。
+- 只删除旧 `file_index` adapter；共享 `file_search/windows/path_auth.rs`、Shell dispatch 和上述仍需 Windows
+  features 必须保留，源码门禁确认没有 helper 复制或 Everything action 绕过共享模块。
 - 将仍有价值的查询、ResultRegistry 和执行测试迁移到新模块。
 - 删除旧索引数据库时只清理 UiPilot 已知路径，并保留一次版本化迁移记录。
 
@@ -417,7 +452,10 @@ Go 条件：灰度期没有安装器冲突、Service 残留、用户 Everything 
 - 文件、文件夹、空 query、九类过滤和修改时间排序与当前产品契约一致。
 - 结果最多 200 项，total 正确，旧响应不能覆盖新响应。
 - 未变化 refresh 不重分配 requestId/resultId；变化 refresh 在提交点前保留旧执行凭证，提交点原子替换。
-- 分页漂移不会提交部分结果；持续变化、资源超限或 timeout 保留当前 ResultSet。
+- refresh 不能由 WebView 改写 QuerySpec；普通 query/hide/invalidation/并发 refresh 的 stale token 均不能提交。
+- 分页漂移不会提交部分结果；持续变化、资源超限或单次 timeout 保留当前 ResultSet；lifecycle/security error
+  原子清空并禁止旧 action，恢复时 bootstrap。
+- `content_revision` 只由 registry 分配，完整状态序列单调；overflow 永久 fail-closed。
 - 文件定位和目录打开只通过 ResultRegistry action。
 
 ### 性能
@@ -457,12 +495,16 @@ Go 条件：灰度期没有安装器冲突、Service 残留、用户 Everything 
 | Everything 查询语法改变普通文本语义 | 错误结果或语法注入 | 固定 translator、危险字符 fixture、必要时 Rust 二次过滤 |
 | 用户已有 Everything 被误操作 | 严重信任与数据风险 | 私有 instance/pipe/config/DB，所有清理基于 manifest 精确所有权 |
 | SDK/IPC 协议解析错误 | 崩溃或越界读取 | 专用线程、长度/offset 校验、fixture、真实进程和模糊测试 |
-| 普通文件变化不触发刷新 | `/find` 长期陈旧 | `launcher-core` 活跃轮询，backend 只在可见结果或状态变化时递增 revision |
+| 普通文件变化不触发刷新 | `/find` 长期陈旧 | `launcher-core` 活跃轮询，registry 只在原子发布或 lifecycle invalidate 时递增 revision |
 | 轮询提前清空 ResultSet | 可见结果 Enter 间歇 stale、ID 每秒抖动 | preserve-current token，fingerprint 不变不分配 ID，变化时单锁原子 swap |
+| refresh 重放错误查询 | 另一 query 可替换当前 request | ResultSet 保存 server-owned QuerySpec/context；refresh request 不接收查询字段并验证 invocation/request identity |
+| lifecycle 故障保留旧 action | runtime 重启后执行陈旧凭证 | soft/lifecycle 错误分类；restart/unavailable/security mismatch 原子 invalidate，ready 后 bootstrap |
+| revision 多 owner | revision 双增、回退或门禁失效 | ResultRegistry 是唯一 high-water owner；backend 只返回 fingerprint/batch |
 | fingerprint 漏掉执行身份 | 同路径替换后旧 action 永久滞留 | canonical preimage 包含逐组件 identity；identity 变化强制 revision/atomic replace |
 | Service 暴露全机文件名 | 其他本地用户越权枚举 | pipe/目录 ACL 绑定首装 credential-owner SID，覆盖 OTS 与另一管理员负向测试 |
 | Query2 offset 分页漂移 | tie group 漏项、重复或顺序错误 | overlap sentinel + stable identity + 双遍一致性 + 有界重试，失败不提交 |
 | 仅 pin 叶子对象 | 父目录替换使 path-based Shell 操作错误对象 | 泛化逐组件 pinning，全部 handles 持有至 Shell API 返回 |
+| 删除旧索引时丢失 pin helper | Everything 执行安全边界退化 | Iteration 3 先迁入共享 path-auth 并让双 adapter 委托；Iteration 5 只删旧 adapter |
 | 安装器失败留下 Service | 升级与卸载故障 | 事务式 hooks、安装清单、重新运行签名安装包、全新/中断/回滚矩阵 |
 | Everything 版本升级改变行为 | 搜索或安装回归 | 固定 1.4 Stable，升级作为独立依赖评审 |
 | 双后端长期并存 | 维护成本不降反升 | 只在开发迁移期并存，Iteration 5 删除旧引擎 |
