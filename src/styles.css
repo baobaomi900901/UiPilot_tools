@@ -33,7 +33,6 @@ input {
 .file-workspace,
 .settings-view,
 .settings-header,
-.settings-loading,
 .status-region {
   app-region: drag;
 }

@@ -1802,6 +1802,8 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(
       /button,[\s\S]*\.settings-tabs,[\s\S]*\.settings-tab-panel\s*\{[^}]*app-region:\s*no-drag;/,
     )
+    const dragRule = stylesSource.match(/\.launcher-surface,[\s\S]*?app-region:\s*drag;/)?.[0]
+    expect(dragRule).not.toContain('.settings-loading')
     expect(stylesSource).toMatch(/\.result-list:empty\s*\{[^}]*app-region:\s*drag;/)
   })
 
