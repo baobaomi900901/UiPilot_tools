@@ -19,7 +19,7 @@
 1. 快捷键继续在有效录制完成后立即生效并持久化。
 2. 勾选或取消开机启动后立即生效并持久化，无需点击保存。
 3. 删除“保存”按钮。
-4. 将“重新加载设置”替换为“恢复初始化”；确认后一次恢复快捷键 `Alt+Space` 和关闭开机启动。
+4. 将“重新加载设置”替换为“恢复初始化”；确认后一次恢复快捷键 `Shift+Space` 和关闭开机启动。
 5. 每次进入设置页都从后端加载受管的最后一次成功持久化快照，替代常驻的手动重新加载入口。
 6. 保存失败时不暴露后端错误，也不把不确定的运行时状态误判为可编辑。
 7. 保留启动加载对 `filePreviewEnabled` 的后台水合和现有 preview durable generation 防陈旧语义。
@@ -40,7 +40,7 @@
 
 - 快捷键仍只走现有 `save_hotkey` 专用事务。
 - 开机启动切换时，core 先显示新值，再调用一次 `save_settings`，payload 为当前 durable 快捷键和新的 `autostart`。
-- 恢复初始化确认后，core 一次调用 `save_settings`，payload 固定为 `{ hotkey: "Alt+Space", autostart: false }`。
+- 恢复初始化确认后，core 一次调用 `save_settings`，payload 固定为 `{ hotkey: "Shift+Space", autostart: false }`。
 - 现有 Rust 事务继续负责运行时快捷键、开机启动和磁盘持久化的顺序、补偿与串行化。
 
 当前设置页没有其他未保存草稿，因此开机启动即时提交携带当前快捷键不会误提交无关字段。文件预览、窗口位置和使用次数不在 `UserSettingsUpdate` 中，不会被覆盖。
@@ -56,7 +56,7 @@
 - 删除“保存”按钮。
 - 保留快捷键录制器和开机启动复选框。
 - 将“重新加载设置”按钮改为“恢复初始化”。
-- 点击“恢复初始化”后显示确认界面，明确将恢复 `Alt+Space` 并关闭开机启动；“取消”不产生 IPC，“恢复”只提交一次。
+- 点击“恢复初始化”后显示确认界面，明确将恢复 `Shift+Space` 并关闭开机启动；“取消”不产生 IPC，“恢复”只提交一次。
 - 任一 settings operation 进行中，快捷键、开机启动和恢复初始化均禁用，避免交错提交。
 
 不新增新的弹层组件；复用项目现有确认交互和按钮体系。
@@ -127,7 +127,9 @@ Rust 启动期 `reconcile_runtime_settings_with` 在快捷键注册、autostart 
 3. 用户确认时启动单一 `save` operation，界面显示默认值并提交固定默认 payload。
 4. 成功后释放 mutation operation，再以新 token 重新加载 authoritative snapshot 并解除锁定。
 
-默认值只来自现有产品默认：快捷键 `Alt+Space`，开机启动 `false`。不得以 `Settings::default()` 覆盖文件预览、窗口位置或使用次数。
+产品初始化与恢复初始化使用同一组默认值：快捷键 `Shift+Space`，开机启动 `false`。恢复操作不得以完整 `Settings::default()` 覆盖文件预览、窗口位置或使用次数。
+
+恢复事务进行期间设置控件短暂禁用；保存成功并完成当前 settings epoch 的 authoritative load 后，必须恢复 `ready` 且解除只读，用户可以立即再次录制快捷键。事务失败时仍沿用 `settingsUncertain` 的安全锁定语义。
 
 ## Mutation 完成与跨 epoch reconciliation
 
@@ -187,7 +189,9 @@ Tauri/Rust：
 - 设置页不渲染“保存”和“重新加载设置”，渲染“恢复初始化”。
 - 开机启动切换立即调用一次 `saveSettings`，payload 含当前 durable hotkey 和新 autostart。
 - 快捷键录制继续只调用 `saveHotkey`，不重复调用全量保存。
-- 恢复初始化取消时零调用；确认时只提交一次 `{ hotkey: "Alt+Space", autostart: false }`。
+- 全新 settings store 使用 `Shift+Space` 作为快捷键默认值。
+- 恢复初始化取消时零调用；确认时只提交一次 `{ hotkey: "Shift+Space", autostart: false }`。
+- 恢复初始化成功并完成 authoritative load 后，设置页解除只读，随后录制快捷键可立即启动 `save_hotkey`。
 - operation pending 时所有设置写操作被拒绝。
 - 即时保存成功后重新加载并应用 fake client 返回的 authoritative snapshot，而不是假设命令真实读盘。
 - 即时保存失败后自动加载 authoritative snapshot、保留固定事务错误并保持只读；恢复 load 失败显示重试且仍保持只读。
@@ -217,7 +221,7 @@ Tauri/Rust：
 2. 勾选开机启动，不点击其他按钮；重新进入设置页仍为勾选，重启后仍保留。
 3. 取消勾选开机启动，确认同样立即生效并持久化。
 4. 点击恢复初始化后取消，快捷键和开机启动均不变化。
-5. 再次点击并确认，快捷键变为 `Alt+Space`、开机启动关闭；重启后保持。
+5. 再次点击并确认，快捷键变为 `Shift+Space`、开机启动关闭，页面恢复可编辑并可继续录制；重启后保持。
 6. 恢复初始化前后的插件清单、文件预览、窗口位置和使用记录不变化。
 
 ## 完成条件
