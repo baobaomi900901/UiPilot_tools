@@ -10,11 +10,13 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{
     http::Response,
     webview::{NewWindowResponse, WebviewWindow},
     App, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
+use unicode_normalization::is_nfc;
 
 use crate::{
     model::{ResultItem, SearchResponse},
@@ -24,6 +26,13 @@ use crate::{
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
 pub(crate) const PLUGIN_RUNTIME_READY_TIMEOUT: Duration = Duration::from_millis(500);
 const PLUGIN_README_MAX_BYTES: u64 = 16 * 1024;
+const PLUGIN_PACKAGE_MAX_DIRECTORIES: usize = 64;
+const PLUGIN_PACKAGE_MAX_FILES: usize = 256;
+const PLUGIN_PACKAGE_MAX_DEPTH: usize = 8;
+const PLUGIN_PACKAGE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const PLUGIN_PACKAGE_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const PLUGIN_PACKAGE_MAX_PATH_BYTES: usize = 240;
+const PLUGIN_PACKAGE_MAX_COMPONENT_BYTES: usize = 100;
 const PLUGIN_BRIDGE: &str = r#"
 (() => {
   let handler = null;
@@ -1348,12 +1357,48 @@ pub(crate) struct PluginCatalogEntry {
     pub(crate) description: Option<String>,
     pub(crate) generation: u64,
     package_identity: DirectoryIdentity,
+    snapshot: Arc<GenerationAssetSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectoryIdentity {
     volume: u64,
     file: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PackageIdentityV1 {
+    algorithm: String,
+    digest: String,
+    volume_serial: u64,
+    file_id: String,
+}
+
+#[derive(Clone)]
+struct GenerationAssetSnapshot {
+    package_identity: PackageIdentityV1,
+    assets: HashMap<PathBuf, Vec<u8>>,
+    total_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PackageScanError;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PackageRecordV1 {
+    version: String,
+    identity: PackageIdentityV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActivePluginStateV1 {
+    schema: u32,
+    plugin_id: String,
+    active_version: Option<String>,
+    packages: Vec<PackageRecordV1>,
 }
 
 impl PluginCatalogEntry {
@@ -1413,12 +1458,53 @@ impl Version {
             parts.next()?.parse().ok()?,
             parts.next()?.parse().ok()?,
         ]);
-        parts.next().is_none().then_some(version)
+        (parts.next().is_none() && version.to_path_segment() == text).then_some(version)
     }
 
     fn to_path_segment(self) -> String {
         format!("{}.{}.{}", self.0[0], self.0[1], self.0[2])
     }
+}
+
+fn parse_active_state(bytes: &[u8], expected_plugin_id: &str) -> Result<ActivePluginStateV1, ()> {
+    let state: ActivePluginStateV1 = serde_json::from_slice(bytes).map_err(|_| ())?;
+    if state.schema != 1
+        || state.plugin_id != expected_plugin_id
+        || !valid_id(&state.plugin_id)
+        || state.packages.len() > 32
+    {
+        return Err(());
+    }
+    let mut previous = None;
+    for package in &state.packages {
+        let version = Version::parse(&package.version).ok_or(())?;
+        if previous.is_some_and(|previous| previous >= version)
+            || package.identity.algorithm != "sha256-tree-v1"
+            || !valid_lower_hex(&package.identity.digest, 64)
+            || !valid_lower_hex(&package.identity.file_id, 16)
+        {
+            return Err(());
+        }
+        previous = Some(version);
+    }
+    match (&state.active_version, state.packages.is_empty()) {
+        (None, true) => {}
+        (Some(active), false)
+            if Version::parse(active).is_some()
+                && state
+                    .packages
+                    .iter()
+                    .any(|package| &package.version == active) => {}
+        _ => return Err(()),
+    }
+    Ok(state)
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl PluginCatalog {
@@ -1561,6 +1647,11 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
     if !ordinary_file(&runtime) || has_bad_permissions(&manifest.permissions) {
         return None;
     }
+    let snapshot = scan_package_snapshot(root).ok()?;
+    if !snapshot.assets.contains_key(Path::new(&manifest.runtime)) {
+        return None;
+    }
+    let description = read_description(&snapshot);
 
     Some(PluginCatalogEntry {
         window_label: window_label(&manifest.id, 1),
@@ -1572,26 +1663,235 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
         },
         permissions: manifest.permissions,
         root: root.to_path_buf(),
-        description: read_description(root),
+        description,
         generation: 1,
         package_identity: directory_identity(root)?,
+        snapshot: Arc::new(snapshot),
     })
 }
 
-fn read_description(root: &Path) -> Option<String> {
-    let path = root.join("README.md");
-    let metadata = fs::symlink_metadata(&path).ok()?;
-    if !metadata.is_file()
-        || is_reparse_point(&metadata)
-        || metadata.len() > PLUGIN_README_MAX_BYTES
-    {
+enum PackageHashEntry {
+    Directory(String),
+    File(String, u64, [u8; 32]),
+}
+
+fn scan_package_snapshot(root: &Path) -> Result<GenerationAssetSnapshot, PackageScanError> {
+    if !ordinary_directory(root) {
+        return Err(PackageScanError);
+    }
+    let mut hash_entries = Vec::new();
+    let mut assets = HashMap::new();
+    let mut casefolded = HashSet::new();
+    let mut directories = 0usize;
+    let mut files = 0usize;
+    let mut total_bytes = 0u64;
+    scan_package_directory(
+        root,
+        root,
+        &mut hash_entries,
+        &mut assets,
+        &mut casefolded,
+        &mut directories,
+        &mut files,
+        &mut total_bytes,
+    )?;
+    hash_entries.sort_by(|left, right| package_hash_path(left).cmp(package_hash_path(right)));
+    let mut tree = Sha256::new();
+    tree.update(b"UIPILOT-PACKAGE");
+    tree.update([0]);
+    tree.update(b"SHA256-TREE-V1");
+    tree.update([0]);
+    tree.update(
+        u32::try_from(hash_entries.len())
+            .map_err(|_| PackageScanError)?
+            .to_le_bytes(),
+    );
+    for entry in hash_entries {
+        match entry {
+            PackageHashEntry::Directory(path) => {
+                tree.update([1]);
+                tree.update(
+                    u32::try_from(path.len())
+                        .map_err(|_| PackageScanError)?
+                        .to_le_bytes(),
+                );
+                tree.update(path.as_bytes());
+            }
+            PackageHashEntry::File(path, length, digest) => {
+                tree.update([2]);
+                tree.update(
+                    u32::try_from(path.len())
+                        .map_err(|_| PackageScanError)?
+                        .to_le_bytes(),
+                );
+                tree.update(path.as_bytes());
+                tree.update(length.to_le_bytes());
+                tree.update(digest);
+            }
+        }
+    }
+    let identity = directory_identity(root).ok_or(PackageScanError)?;
+    Ok(GenerationAssetSnapshot {
+        package_identity: PackageIdentityV1 {
+            algorithm: "sha256-tree-v1".into(),
+            digest: lower_hex(&tree.finalize()),
+            volume_serial: identity.volume,
+            file_id: format!("{:016x}", identity.file),
+        },
+        assets,
+        total_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_package_directory(
+    root: &Path,
+    directory: &Path,
+    hash_entries: &mut Vec<PackageHashEntry>,
+    assets: &mut HashMap<PathBuf, Vec<u8>>,
+    casefolded: &mut HashSet<String>,
+    directories: &mut usize,
+    files: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<(), PackageScanError> {
+    let entries = fs::read_dir(directory).map_err(|_| PackageScanError)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| PackageScanError)?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).map_err(|_| PackageScanError)?;
+        let canonical = canonical_package_path(relative)?;
+        if !casefolded.insert(canonical.to_lowercase()) {
+            return Err(PackageScanError);
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|_| PackageScanError)?;
+        if is_reparse_point(&metadata) {
+            if canonical == "README.md" {
+                continue;
+            }
+            return Err(PackageScanError);
+        }
+        if metadata.is_dir() {
+            *directories = directories.checked_add(1).ok_or(PackageScanError)?;
+            if *directories > PLUGIN_PACKAGE_MAX_DIRECTORIES {
+                return Err(PackageScanError);
+            }
+            hash_entries.push(PackageHashEntry::Directory(canonical));
+            scan_package_directory(
+                root,
+                &path,
+                hash_entries,
+                assets,
+                casefolded,
+                directories,
+                files,
+                total_bytes,
+            )?;
+            continue;
+        }
+        if !metadata.is_file() || !allowed_package_file(&canonical) {
+            return Err(PackageScanError);
+        }
+        *files = files.checked_add(1).ok_or(PackageScanError)?;
+        if *files > PLUGIN_PACKAGE_MAX_FILES || metadata.len() > PLUGIN_PACKAGE_MAX_FILE_BYTES {
+            return Err(PackageScanError);
+        }
+        let bytes = fs::read(&path).map_err(|_| PackageScanError)?;
+        if bytes.len() as u64 != metadata.len() || !ordinary_file(&path) {
+            return Err(PackageScanError);
+        }
+        *total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|total| *total <= PLUGIN_PACKAGE_MAX_TOTAL_BYTES)
+            .ok_or(PackageScanError)?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        hash_entries.push(PackageHashEntry::File(
+            canonical,
+            bytes.len() as u64,
+            digest,
+        ));
+        assets.insert(relative.to_path_buf(), bytes);
+    }
+    Ok(())
+}
+
+fn package_hash_path(entry: &PackageHashEntry) -> &str {
+    match entry {
+        PackageHashEntry::Directory(path) | PackageHashEntry::File(path, ..) => path,
+    }
+}
+
+fn canonical_package_path(path: &Path) -> Result<String, PackageScanError> {
+    if path.components().count() > PLUGIN_PACKAGE_MAX_DEPTH {
+        return Err(PackageScanError);
+    }
+    let mut components = Vec::new();
+    for component in path.iter() {
+        let component = component.to_str().ok_or(PackageScanError)?;
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.len() > PLUGIN_PACKAGE_MAX_COMPONENT_BYTES
+            || component.ends_with(['.', ' '])
+            || component.contains(':')
+            || !is_nfc(component)
+        {
+            return Err(PackageScanError);
+        }
+        components.push(component);
+    }
+    let canonical = components.join("/");
+    if canonical.is_empty() || canonical.len() > PLUGIN_PACKAGE_MAX_PATH_BYTES {
+        return Err(PackageScanError);
+    }
+    Ok(canonical)
+}
+
+fn allowed_package_file(path: &str) -> bool {
+    if matches!(path, "plugin.json" | "README.md") {
+        return true;
+    }
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some(
+            "html"
+                | "js"
+                | "mjs"
+                | "css"
+                | "json"
+                | "md"
+                | "txt"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "ico"
+                | "svg"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "otf"
+        )
+    )
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn read_description(snapshot: &GenerationAssetSnapshot) -> Option<String> {
+    let bytes = snapshot.assets.get(Path::new("README.md"))?;
+    if bytes.len() as u64 > PLUGIN_README_MAX_BYTES {
         return None;
     }
-    let bytes = fs::read(&path).ok()?;
-    if bytes.len() as u64 > PLUGIN_README_MAX_BYTES || !ordinary_file(&path) {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(bytes.clone()).ok()
 }
 
 fn valid_id(id: &str) -> bool {
@@ -1648,20 +1948,11 @@ fn asset_response(entry: &PluginCatalogEntry, request_path: &str) -> Response<Ve
     let Some((relative, content_type)) = asset_path(request_path) else {
         return response(415, Vec::new(), None);
     };
-    let path = entry.root.join(&relative);
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
+    debug_assert!(entry.snapshot.total_bytes <= PLUGIN_PACKAGE_MAX_TOTAL_BYTES);
+    let Some(body) = entry.snapshot.assets.get(&relative) else {
         return response(404, Vec::new(), None);
     };
-    if !metadata.is_file() || !ordinary_file_below(&entry.root, &relative) {
-        return response(403, Vec::new(), None);
-    }
-    let Ok(body) = fs::read(&path) else {
-        return response(404, Vec::new(), None);
-    };
-    if !ordinary_file_below(&entry.root, &relative) {
-        return response(403, Vec::new(), None);
-    }
-    response(200, body, Some(content_type))
+    response(200, body.clone(), Some(content_type))
 }
 
 fn route(entry: &PluginCatalogEntry, input: &str) -> PluginRoute {
@@ -1846,27 +2137,6 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
     })
 }
 
-fn ordinary_file_below(root: &Path, relative: &Path) -> bool {
-    if !ordinary_directory(root) {
-        return false;
-    }
-    let mut path = root.to_path_buf();
-    let mut components = relative.iter().peekable();
-    while let Some(component) = components.next() {
-        path.push(component);
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            return false;
-        };
-        if is_reparse_point(&metadata)
-            || (components.peek().is_some() && !metadata.is_dir())
-            || (components.peek().is_none() && !metadata.is_file())
-        {
-            return false;
-        }
-    }
-    true
-}
-
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -1940,7 +2210,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{PluginCatalog, Version};
+    use super::{parse_active_state, scan_package_snapshot, PluginCatalog, Version};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -2005,6 +2275,116 @@ mod tests {
 
     fn load(root: &TestRoot) -> PluginCatalog {
         PluginCatalog::load(&root.path, Version::new(0, 2, 0)).unwrap()
+    }
+
+    mod package_state {
+        use std::fs;
+
+        use super::{
+            load, parse_active_state, scan_package_snapshot, valid_manifest, TestRoot, Version,
+        };
+
+        #[test]
+        fn canonical_version_rejects_leading_zeroes() {
+            assert_eq!(
+                Version::parse("1.2.3").map(Version::to_path_segment),
+                Some("1.2.3".into())
+            );
+            assert!(Version::parse("01.2.3").is_none());
+            assert!(Version::parse("1.02.3").is_none());
+            assert!(Version::parse("1.2.03").is_none());
+        }
+
+        #[test]
+        fn catalog_assets_are_an_immutable_snapshot() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let package = root.path.join("plugin");
+            fs::write(package.join("runtime.js"), "original").unwrap();
+            let catalog = load(&root);
+            let label = catalog.entries[0].window_label.clone();
+
+            assert_eq!(
+                catalog.asset_response(&label, "/runtime.js").body(),
+                b"original"
+            );
+            fs::write(package.join("runtime.js"), "changed").unwrap();
+            assert_eq!(
+                catalog.asset_response(&label, "/runtime.js").body(),
+                b"original"
+            );
+        }
+
+        #[test]
+        fn active_state_enforces_empty_and_non_empty_invariants() {
+            let empty = br#"{
+                "schema":1,
+                "pluginId":"internal.math",
+                "activeVersion":null,
+                "packages":[]
+            }"#;
+            let parsed = parse_active_state(empty, "internal.math").unwrap();
+            assert!(parsed.active_version.is_none());
+            assert!(parsed.packages.is_empty());
+
+            for invalid in [
+                br#"{"schema":1,"pluginId":"other","activeVersion":null,"packages":[]}"#.as_slice(),
+                br#"{"schema":1,"pluginId":"internal.math","activeVersion":"1.0.0","packages":[]}"#.as_slice(),
+                br#"{"schema":1,"pluginId":"internal.math","activeVersion":null,"packages":[{"version":"1.0.0","identity":{"algorithm":"sha256-tree-v1","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","volumeSerial":1,"fileId":"0000000000000001"}}]}"#.as_slice(),
+                br#"{"schema":2,"pluginId":"internal.math","activeVersion":null,"packages":[]}"#.as_slice(),
+            ] {
+                assert!(parse_active_state(invalid, "internal.math").is_err());
+            }
+        }
+
+        #[test]
+        fn package_digest_changes_with_file_content() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let package = root.path.join("plugin");
+            let original = scan_package_snapshot(&package).unwrap();
+            fs::write(package.join("index.html"), "changed").unwrap();
+            let changed = scan_package_snapshot(&package).unwrap();
+
+            assert_ne!(
+                original.package_identity.digest,
+                changed.package_identity.digest
+            );
+            assert_eq!(original.package_identity.digest.len(), 64);
+            assert!(original
+                .package_identity
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+
+        #[test]
+        fn nested_assets_are_part_of_the_immutable_snapshot() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let package = root.path.join("plugin");
+            fs::create_dir(package.join("assets")).unwrap();
+            fs::write(package.join("assets").join("nested.js"), "original").unwrap();
+            let catalog = load(&root);
+            let label = catalog.entries[0].window_label.clone();
+
+            fs::write(package.join("assets").join("nested.js"), "changed").unwrap();
+            assert_eq!(
+                catalog.asset_response(&label, "/assets/nested.js").body(),
+                b"original"
+            );
+        }
+
+        #[test]
+        fn package_scan_rejects_more_than_256_files() {
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let package = root.path.join("plugin");
+            for index in 0..255 {
+                fs::write(package.join(format!("asset-{index}.js")), "").unwrap();
+            }
+            assert!(scan_package_snapshot(&package).is_err());
+        }
     }
 
     #[test]
@@ -2718,7 +3098,7 @@ mod tests {
                         catalog
                             .asset_response("plugin-6f6e65-g0000000000000001", "/linked.html",)
                             .status(),
-                        403
+                        404
                     );
                 }
 
@@ -2731,7 +3111,7 @@ mod tests {
                                 "/nested/index.html",
                             )
                             .status(),
-                        403
+                        404
                     );
                 }
 
@@ -2749,7 +3129,7 @@ mod tests {
                     catalog
                         .asset_response("plugin-6f6e65-g0000000000000001", "/junction/index.html",)
                         .status(),
-                    403
+                    404
                 );
                 fs::remove_dir(junction).unwrap();
 
@@ -2765,12 +3145,10 @@ mod tests {
                     .output()
                     .unwrap();
                 assert!(output.status.success(), "junction replacement failed");
-                assert_eq!(
-                    catalog
-                        .asset_response("plugin-6f6e65-g0000000000000001", "/index.html",)
-                        .status(),
-                    403
-                );
+                let response =
+                    catalog.asset_response("plugin-6f6e65-g0000000000000001", "/index.html");
+                assert_eq!(response.status(), 200);
+                assert!(response.body().is_empty());
                 fs::remove_dir(&plugin_root).unwrap();
                 fs::rename(parked_root, plugin_root).unwrap();
             }
