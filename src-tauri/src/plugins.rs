@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -124,6 +124,7 @@ struct PluginManagerConfig {
     plugin_root: PathBuf,
     quarantine_root: PathBuf,
     host_version: Version,
+    development_root: Option<PathBuf>,
 }
 
 struct PluginManagerState {
@@ -131,6 +132,7 @@ struct PluginManagerState {
     staged_assets: HashMap<RuntimeIdentity, PluginCatalogEntry>,
     ownership: HashMap<RuntimeIdentity, RuntimeOwnership>,
     latest_generations: HashMap<String, u64>,
+    inventory_revision: u64,
 }
 
 #[derive(Clone)]
@@ -221,6 +223,7 @@ impl PluginManagerState {
             staged_assets: HashMap::new(),
             ownership,
             latest_generations,
+            inventory_revision: 0,
         }
     }
 }
@@ -261,6 +264,7 @@ impl PluginManager {
                 plugin_root,
                 quarantine_root,
                 host_version,
+                development_root: development_plugin_root(),
             })
             .map_err(|_| PluginSetupError::AlreadyLoaded)?;
         self.state
@@ -282,6 +286,36 @@ impl PluginManager {
             .get()
             .and_then(|state| state.read().ok().map(|state| state.active.views()))
             .ok_or(PluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn list_inventory(&self) -> Result<PluginInventorySnapshot, PluginManagementError> {
+        let config = self
+            .config
+            .get()
+            .cloned()
+            .ok_or(PluginManagementError::Unavailable)?;
+        for _ in 0..2 {
+            let revision = self
+                .state
+                .get()
+                .and_then(|state| state.read().ok().map(|state| state.inventory_revision))
+                .ok_or(PluginManagementError::Unavailable)?;
+            let snapshot = scan_inventory(
+                &config.plugin_root,
+                config.development_root.as_deref(),
+                config.host_version,
+                revision,
+            )?;
+            let current_revision = self
+                .state
+                .get()
+                .and_then(|state| state.read().ok().map(|state| state.inventory_revision))
+                .ok_or(PluginManagementError::Unavailable)?;
+            if current_revision == revision {
+                return Ok(snapshot);
+            }
+        }
+        Err(PluginManagementError::Unavailable)
     }
 
     pub(crate) fn begin_routed_query(
@@ -1420,6 +1454,77 @@ pub(crate) struct PluginView {
     pub(crate) description: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginInventorySnapshot {
+    pub(crate) revision: String,
+    pub(crate) items: Vec<PluginInventoryView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginInventoryView {
+    pub(crate) key: String,
+    pub(crate) id: Option<String>,
+    pub(crate) display_name: String,
+    pub(crate) installed: InstalledPluginView,
+    pub(crate) development: DevelopmentPluginView,
+    pub(crate) description: PluginDescriptionView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub(crate) enum InstalledPluginView {
+    Absent,
+    Valid {
+        #[serde(rename = "activeVersion")]
+        active_version: String,
+        versions: Vec<String>,
+        trigger: String,
+    },
+    Invalid {
+        issue: &'static str,
+        #[serde(rename = "activeVersion")]
+        active_version: Option<String>,
+        versions: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub(crate) enum DevelopmentPluginView {
+    Absent,
+    Valid { version: String, trigger: String },
+    Invalid { reason: &'static str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub(crate) enum PluginDescriptionView {
+    Available {
+        source: PluginDescriptionSource,
+        markdown: String,
+    },
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PluginDescriptionSource {
+    Installed,
+    Development,
+}
+
+struct InventoryRowBuilder {
+    id: String,
+    installed: InstalledPluginView,
+    development: DevelopmentPluginView,
+    installed_description: Option<String>,
+    development_description: Option<String>,
+    active_version: Option<Version>,
+    development_version: Option<Version>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PluginFeature {
     pub(crate) trigger: String,
@@ -1528,7 +1633,13 @@ impl PluginCatalog {
         for child in children {
             let child = child?;
             if child.file_type()?.is_dir() && ordinary_directory(&child.path()) {
-                if let Some(entry) = load_entry(&child.path(), host_version) {
+                let path = child.path();
+                let candidate = if ordinary_file(&path.join("active.json")) {
+                    load_active_entry(&path, host_version)
+                } else {
+                    load_entry(&path, host_version)
+                };
+                if let Some(entry) = candidate {
                     candidates.push(entry);
                 }
             }
@@ -1599,6 +1710,364 @@ fn plugin_view(entry: &PluginCatalogEntry) -> PluginView {
         trigger: entry.feature.trigger.clone(),
         description: entry.description.clone(),
     }
+}
+
+fn scan_inventory(
+    installed_root: &Path,
+    development_root: Option<&Path>,
+    host_version: Version,
+    revision: u64,
+) -> Result<PluginInventorySnapshot, PluginManagementError> {
+    let mut rows = BTreeMap::<String, InventoryRowBuilder>::new();
+    let mut invalid_items = Vec::new();
+    scan_installed_rows(installed_root, host_version, &mut rows)?;
+    if let Some(development_root) = development_root {
+        scan_development_rows(
+            development_root,
+            host_version,
+            &mut rows,
+            &mut invalid_items,
+        )?;
+    }
+    let mut items = rows
+        .into_values()
+        .map(|row| {
+            let description = if row.development_description.is_some()
+                && (matches!(row.installed, InstalledPluginView::Absent)
+                    || row
+                        .active_version
+                        .zip(row.development_version)
+                        .is_some_and(|(active, development)| development > active))
+            {
+                PluginDescriptionView::Available {
+                    source: PluginDescriptionSource::Development,
+                    markdown: row.development_description.expect("description checked"),
+                }
+            } else if let Some(markdown) = row.installed_description {
+                PluginDescriptionView::Available {
+                    source: PluginDescriptionSource::Installed,
+                    markdown,
+                }
+            } else {
+                PluginDescriptionView::Unavailable
+            };
+            PluginInventoryView {
+                key: plugin_inventory_key(&row.id),
+                display_name: row.id.clone(),
+                id: Some(row.id),
+                installed: row.installed,
+                development: row.development,
+                description,
+            }
+        })
+        .collect::<Vec<_>>();
+    items.extend(invalid_items);
+    items.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(PluginInventorySnapshot {
+        revision: revision.to_string(),
+        items,
+    })
+}
+
+fn scan_installed_rows(
+    root: &Path,
+    host_version: Version,
+    rows: &mut BTreeMap<String, InventoryRowBuilder>,
+) -> Result<(), PluginManagementError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) if ordinary_directory(root) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        _ => return Err(PluginManagementError::Unavailable),
+    };
+    let mut direct_entries = 0usize;
+    let mut containers = 0usize;
+    for entry in entries {
+        direct_entries += 1;
+        if direct_entries > 128 {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let entry = entry.map_err(|_| PluginManagementError::Unavailable)?;
+        if !entry
+            .file_type()
+            .map_err(|_| PluginManagementError::Unavailable)?
+            .is_dir()
+            || !ordinary_directory(&entry.path())
+        {
+            continue;
+        }
+        containers += 1;
+        if containers > 64 {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let Some(plugin_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !valid_id(&plugin_id) {
+            continue;
+        }
+        let container = entry.path();
+        let state_path = container.join("active.json");
+        let state_bytes = match fs::read(&state_path) {
+            Ok(bytes) if bytes.len() <= 64 * 1024 && ordinary_file(&state_path) => bytes,
+            _ => {
+                rows.insert(
+                    plugin_id.clone(),
+                    invalid_installed_row(plugin_id, "stateMissing"),
+                );
+                continue;
+            }
+        };
+        let state = match parse_active_state(&state_bytes, &plugin_id) {
+            Ok(state) => state,
+            Err(()) => {
+                rows.insert(
+                    plugin_id.clone(),
+                    invalid_installed_row(plugin_id, "stateInvariantViolation"),
+                );
+                continue;
+            }
+        };
+        if state.packages.is_empty() {
+            continue;
+        }
+        let active_version = state
+            .active_version
+            .as_deref()
+            .and_then(Version::parse)
+            .ok_or(PluginManagementError::Unavailable)?;
+        let mut active_entry = None;
+        let mut valid = true;
+        for record in &state.packages {
+            let package_root = container.join(&record.version);
+            let Ok(snapshot) = scan_package_snapshot(&package_root) else {
+                valid = false;
+                break;
+            };
+            if snapshot.package_identity != record.identity {
+                valid = false;
+                break;
+            }
+            let Some(manifest) = manifest_from_snapshot(&snapshot, host_version) else {
+                valid = false;
+                break;
+            };
+            if manifest.id != plugin_id || manifest.version != record.version {
+                valid = false;
+                break;
+            }
+            if state.active_version.as_deref() == Some(record.version.as_str()) {
+                active_entry = Some((manifest, snapshot));
+            }
+        }
+        let Some((manifest, snapshot)) = active_entry.filter(|_| valid) else {
+            rows.insert(
+                plugin_id.clone(),
+                invalid_installed_row(plugin_id, "packageInvalid"),
+            );
+            continue;
+        };
+        rows.insert(
+            plugin_id.clone(),
+            InventoryRowBuilder {
+                id: plugin_id,
+                installed: InstalledPluginView::Valid {
+                    active_version: state.active_version.expect("validated active version"),
+                    versions: state
+                        .packages
+                        .iter()
+                        .map(|record| record.version.clone())
+                        .collect(),
+                    trigger: manifest.feature.trigger,
+                },
+                development: DevelopmentPluginView::Absent,
+                installed_description: read_description(&snapshot),
+                development_description: None,
+                active_version: Some(active_version),
+                development_version: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn scan_development_rows(
+    root: &Path,
+    host_version: Version,
+    rows: &mut BTreeMap<String, InventoryRowBuilder>,
+    invalid_items: &mut Vec<PluginInventoryView>,
+) -> Result<(), PluginManagementError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) if ordinary_directory(root) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        _ => return Err(PluginManagementError::Unavailable),
+    };
+    let mut direct_entries = 0usize;
+    let mut candidates = 0usize;
+    for entry in entries {
+        direct_entries += 1;
+        if direct_entries > 128 {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let entry = entry.map_err(|_| PluginManagementError::Unavailable)?;
+        if !entry
+            .file_type()
+            .map_err(|_| PluginManagementError::Unavailable)?
+            .is_dir()
+            || !ordinary_directory(&entry.path())
+        {
+            continue;
+        }
+        candidates += 1;
+        if candidates > 64 {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let Some(candidate) = load_entry(&entry.path(), host_version) else {
+            invalid_items.push(invalid_development_view(&entry, "invalidManifest"));
+            continue;
+        };
+        if entry.file_name().to_str() != Some(candidate.id.as_str()) {
+            invalid_items.push(invalid_development_view(&entry, "invalidId"));
+            continue;
+        }
+        let version = candidate.version;
+        let row = rows
+            .entry(candidate.id.clone())
+            .or_insert_with(|| InventoryRowBuilder {
+                id: candidate.id.clone(),
+                installed: InstalledPluginView::Absent,
+                development: DevelopmentPluginView::Absent,
+                installed_description: None,
+                development_description: None,
+                active_version: None,
+                development_version: None,
+            });
+        row.development = DevelopmentPluginView::Valid {
+            version: version.to_path_segment(),
+            trigger: candidate.feature.trigger,
+        };
+        row.development_description = candidate.description;
+        row.development_version = Some(version);
+    }
+    Ok(())
+}
+
+fn invalid_development_view(entry: &fs::DirEntry, reason: &'static str) -> PluginInventoryView {
+    let identity =
+        directory_identity(&entry.path()).unwrap_or(DirectoryIdentity { volume: 0, file: 0 });
+    let mut hasher = Sha256::new();
+    hasher.update(b"UIPILOT-DEVELOPMENT-INVALID");
+    hasher.update([0]);
+    hasher.update(entry.file_name().to_string_lossy().as_bytes());
+    hasher.update(identity.volume.to_le_bytes());
+    hasher.update(identity.file.to_le_bytes());
+    let digest = lower_hex(&hasher.finalize());
+    PluginInventoryView {
+        key: format!("development-invalid:{digest}"),
+        id: None,
+        display_name: format!("无效开发包 {}", &digest[..12]),
+        installed: InstalledPluginView::Absent,
+        development: DevelopmentPluginView::Invalid { reason },
+        description: PluginDescriptionView::Unavailable,
+    }
+}
+
+fn invalid_installed_row(plugin_id: String, issue: &'static str) -> InventoryRowBuilder {
+    InventoryRowBuilder {
+        id: plugin_id,
+        installed: InstalledPluginView::Invalid {
+            issue,
+            active_version: None,
+            versions: Vec::new(),
+        },
+        development: DevelopmentPluginView::Absent,
+        installed_description: None,
+        development_description: None,
+        active_version: None,
+        development_version: None,
+    }
+}
+
+fn plugin_inventory_key(plugin_id: &str) -> String {
+    format!("plugin:{}", lower_hex(plugin_id.as_bytes()))
+}
+
+fn manifest_from_snapshot(
+    snapshot: &GenerationAssetSnapshot,
+    host_version: Version,
+) -> Option<Manifest> {
+    let manifest: Manifest =
+        serde_json::from_slice(snapshot.assets.get(Path::new("plugin.json"))?).ok()?;
+    let version = Version::parse(&manifest.version)?;
+    if manifest.manifest != 1
+        || Version::parse(&manifest.min_host_version)? > host_version
+        || !valid_id(&manifest.id)
+        || !valid_id(&manifest.feature.id)
+        || !valid_trigger(&manifest.feature.trigger)
+        || manifest.runtime.contains(['/', '\\'])
+        || Path::new(&manifest.runtime)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("html")
+        || !snapshot.assets.contains_key(Path::new(&manifest.runtime))
+        || has_bad_permissions(&manifest.permissions)
+        || version.to_path_segment() != manifest.version
+    {
+        return None;
+    }
+    Some(manifest)
+}
+
+fn load_active_entry(container: &Path, host_version: Version) -> Option<PluginCatalogEntry> {
+    let plugin_id = container.file_name()?.to_str()?;
+    if !valid_id(plugin_id) {
+        return None;
+    }
+    let state_path = container.join("active.json");
+    let state_bytes = fs::read(&state_path).ok()?;
+    if state_bytes.len() > 64 * 1024 || !ordinary_file(&state_path) {
+        return None;
+    }
+    let state = parse_active_state(&state_bytes, plugin_id).ok()?;
+    let active_version = state.active_version?;
+    let record = state
+        .packages
+        .iter()
+        .find(|record| record.version == active_version)?;
+    let package_root = container.join(&active_version);
+    let snapshot = scan_package_snapshot(&package_root).ok()?;
+    if snapshot.package_identity != record.identity {
+        return None;
+    }
+    let manifest = manifest_from_snapshot(&snapshot, host_version)?;
+    if manifest.id != plugin_id || manifest.version != active_version {
+        return None;
+    }
+    catalog_entry_from_snapshot(package_root, manifest, snapshot)
+}
+
+fn catalog_entry_from_snapshot(
+    root: PathBuf,
+    manifest: Manifest,
+    snapshot: GenerationAssetSnapshot,
+) -> Option<PluginCatalogEntry> {
+    let version = Version::parse(&manifest.version)?;
+    let runtime = root.join(&manifest.runtime);
+    let description = read_description(&snapshot);
+    Some(PluginCatalogEntry {
+        window_label: window_label(&manifest.id, 1),
+        id: manifest.id,
+        version,
+        runtime,
+        feature: PluginFeature {
+            trigger: manifest.feature.trigger,
+        },
+        permissions: manifest.permissions,
+        package_identity: directory_identity(&root)?,
+        root,
+        description,
+        generation: 1,
+        snapshot: Arc::new(snapshot),
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -2000,6 +2469,18 @@ fn ordinary_directory(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_dir() && !is_reparse_point(&metadata))
 }
 
+#[cfg(debug_assertions)]
+fn development_plugin_root() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|root| root.join("examples").join("plugins"))
+}
+
+#[cfg(not(debug_assertions))]
+fn development_plugin_root() -> Option<PathBuf> {
+    None
+}
+
 fn cleanup_quarantine(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -2384,6 +2865,243 @@ mod tests {
                 fs::write(package.join(format!("asset-{index}.js")), "").unwrap();
             }
             assert!(scan_package_snapshot(&package).is_err());
+        }
+    }
+
+    mod inventory {
+        use std::{fs, path::Path};
+
+        use super::{valid_manifest, TestRoot};
+        use crate::plugins::{
+            scan_inventory, scan_package_snapshot, ActivePluginStateV1, PackageRecordV1,
+            PluginCatalog, Version,
+        };
+
+        fn write_version(
+            container: &Path,
+            plugin_id: &str,
+            version: &str,
+            description: &str,
+        ) -> PackageRecordV1 {
+            let package = container.join(version);
+            fs::create_dir(&package).unwrap();
+            fs::write(
+                package.join("plugin.json"),
+                valid_manifest(plugin_id, "/math").replace(
+                    r#""version":"1.0.0""#,
+                    format!(r#""version":"{version}""#).as_str(),
+                ),
+            )
+            .unwrap();
+            fs::write(package.join("index.html"), "").unwrap();
+            fs::write(package.join("README.md"), description).unwrap();
+            PackageRecordV1 {
+                version: version.into(),
+                identity: scan_package_snapshot(&package).unwrap().package_identity,
+            }
+        }
+
+        fn write_installed(
+            installed_root: &Path,
+            plugin_id: &str,
+            active_version: &str,
+            versions: &[(&str, &str)],
+        ) {
+            let container = installed_root.join(plugin_id);
+            fs::create_dir(&container).unwrap();
+            let packages = versions
+                .iter()
+                .map(|(version, description)| {
+                    write_version(&container, plugin_id, version, description)
+                })
+                .collect();
+            let state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: plugin_id.into(),
+                active_version: Some(active_version.into()),
+                packages,
+            };
+            fs::write(
+                container.join("active.json"),
+                serde_json::to_vec(&state).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn development_only_inventory_uses_revisioned_union_dto() {
+            let installed = TestRoot::new();
+            let development = TestRoot::new();
+            development.write_plugin("internal.math", valid_manifest("internal.math", "/math"));
+            fs::write(
+                development.path.join("internal.math").join("README.md"),
+                "# Development math",
+            )
+            .unwrap();
+
+            let snapshot = scan_inventory(
+                &installed.path,
+                Some(&development.path),
+                Version::new(0, 2, 0),
+                7,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(snapshot).unwrap(),
+                serde_json::json!({
+                    "revision":"7",
+                    "items":[{
+                        "key":"plugin:696e7465726e616c2e6d617468",
+                        "id":"internal.math",
+                        "displayName":"internal.math",
+                        "installed":{"state":"absent"},
+                        "development":{"state":"valid","version":"1.0.0","trigger":"/math"},
+                        "description":{"state":"available","source":"development","markdown":"# Development math"}
+                    }]
+                })
+            );
+        }
+
+        #[test]
+        fn installed_inventory_exposes_sorted_versions_and_active_description() {
+            let installed = TestRoot::new();
+            write_installed(
+                &installed.path,
+                "internal.math",
+                "0.2.0",
+                &[("0.1.0", "old"), ("0.2.0", "# Installed math")],
+            );
+
+            let snapshot =
+                scan_inventory(&installed.path, None, Version::new(0, 2, 0), 11).unwrap();
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(value["revision"], "11");
+            assert_eq!(value["items"][0]["installed"]["state"], "valid");
+            assert_eq!(value["items"][0]["installed"]["activeVersion"], "0.2.0");
+            assert_eq!(
+                value["items"][0]["installed"]["versions"],
+                serde_json::json!(["0.1.0", "0.2.0"])
+            );
+            assert_eq!(value["items"][0]["development"]["state"], "absent");
+            assert_eq!(value["items"][0]["description"]["source"], "installed");
+            assert_eq!(
+                value["items"][0]["description"]["markdown"],
+                "# Installed math"
+            );
+        }
+
+        #[test]
+        fn runtime_catalog_loads_only_the_active_registered_version() {
+            let installed = TestRoot::new();
+            write_installed(
+                &installed.path,
+                "internal.math",
+                "0.2.0",
+                &[("0.1.0", "old"), ("0.2.0", "active")],
+            );
+
+            let catalog = PluginCatalog::load(&installed.path, Version::new(0, 2, 0)).unwrap();
+            assert_eq!(catalog.views().len(), 1);
+            assert_eq!(catalog.views()[0].id, "internal.math");
+            assert_eq!(catalog.views()[0].version, "0.2.0");
+            assert!(catalog.route("/math 1+1").is_some());
+        }
+
+        #[test]
+        fn manager_lists_inventory_with_its_current_revision() {
+            let app_data = TestRoot::new();
+            let installed_root = app_data.path.join("plugins");
+            fs::create_dir(&installed_root).unwrap();
+            write_installed(
+                &installed_root,
+                "other.plugin",
+                "1.0.0",
+                &[("1.0.0", "installed")],
+            );
+            let manager = crate::plugins::PluginManager::new();
+            manager.load(&app_data.path, Version::new(0, 2, 0)).unwrap();
+
+            let snapshot = manager.list_inventory().unwrap();
+            assert_eq!(snapshot.revision, "0");
+            let installed = snapshot
+                .items
+                .iter()
+                .find(|item| item.id.as_deref() == Some("other.plugin"))
+                .unwrap();
+            assert!(matches!(
+                installed.installed,
+                crate::plugins::InstalledPluginView::Valid { .. }
+            ));
+        }
+
+        #[test]
+        fn newer_development_version_supplies_update_description() {
+            let installed = TestRoot::new();
+            let development = TestRoot::new();
+            write_installed(
+                &installed.path,
+                "internal.math",
+                "1.0.0",
+                &[("1.0.0", "installed")],
+            );
+            development.write_plugin(
+                "internal.math",
+                valid_manifest("internal.math", "/math")
+                    .replace(r#""version":"1.0.0""#, r#""version":"2.0.0""#),
+            );
+            fs::write(
+                development.path.join("internal.math").join("README.md"),
+                "development update",
+            )
+            .unwrap();
+
+            let snapshot = scan_inventory(
+                &installed.path,
+                Some(&development.path),
+                Version::new(0, 2, 0),
+                12,
+            )
+            .unwrap();
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(value["items"][0]["installed"]["activeVersion"], "1.0.0");
+            assert_eq!(value["items"][0]["development"]["version"], "2.0.0");
+            assert_eq!(value["items"][0]["description"]["source"], "development");
+            assert_eq!(
+                value["items"][0]["description"]["markdown"],
+                "development update"
+            );
+        }
+
+        #[test]
+        fn invalid_development_package_has_stable_path_free_identity() {
+            let installed = TestRoot::new();
+            let development = TestRoot::new();
+            let invalid = development.path.join("private-source-name");
+            fs::create_dir(&invalid).unwrap();
+            fs::write(invalid.join("plugin.json"), "{}").unwrap();
+            fs::write(invalid.join("index.html"), "").unwrap();
+
+            let snapshot = scan_inventory(
+                &installed.path,
+                Some(&development.path),
+                Version::new(0, 2, 0),
+                13,
+            )
+            .unwrap();
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(value["items"].as_array().unwrap().len(), 1);
+            let item = &value["items"][0];
+            assert!(item["id"].is_null());
+            let key = item["key"].as_str().unwrap();
+            assert!(key.starts_with("development-invalid:"));
+            assert_eq!(key.len(), "development-invalid:".len() + 64);
+            let display_name = item["displayName"].as_str().unwrap();
+            assert!(display_name.starts_with("无效开发包 "));
+            assert!(!display_name.contains("private-source-name"));
+            assert_eq!(item["installed"]["state"], "absent");
+            assert_eq!(item["development"]["state"], "invalid");
+            assert_eq!(item["development"]["reason"], "invalidManifest");
+            assert_eq!(item["description"]["state"], "unavailable");
         }
     }
 
