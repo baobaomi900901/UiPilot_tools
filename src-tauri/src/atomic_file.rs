@@ -87,6 +87,18 @@ pub(crate) fn commit_with_backup(
     commit_with(paths, previous, candidate, write_synced, replace_file)
 }
 
+pub(crate) fn replace_current(path: &Path, bytes: &[u8]) -> Result<(), AtomicFileError> {
+    let candidate_temp = sibling_temp(path, "temp");
+    if write_synced(&candidate_temp, bytes).is_err() {
+        return Err(AtomicFileError::CandidateWrite);
+    }
+    if replace_file(&candidate_temp, path, replace_flags()).is_err() {
+        remove_temp(&candidate_temp);
+        return Err(AtomicFileError::CurrentReplace);
+    }
+    Ok(())
+}
+
 fn commit_with<W, R>(
     paths: &AtomicPaths,
     previous: Option<&[u8]>,

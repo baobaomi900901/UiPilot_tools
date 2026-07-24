@@ -19,12 +19,19 @@ use tauri::{
 use unicode_normalization::is_nfc;
 
 use crate::{
+    atomic_file::replace_current,
     model::{ResultItem, SearchResponse},
     result_registry::{QueryDomain, QueryToken, ResultAction, ResultRegistry},
 };
 
 pub(crate) const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
 pub(crate) const PLUGIN_RUNTIME_READY_TIMEOUT: Duration = Duration::from_millis(500);
+const PLUGIN_DURABLE_DOCUMENT_MAX_BYTES: u64 = 64 * 1024;
+const PLUGIN_CLEANUP_MAX_RECEIPTS: usize = 128;
+const PLUGIN_CLEANUP_BATCH_RECEIPTS: usize = 8;
+const PLUGIN_CLEANUP_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const PLUGIN_CLEANUP_MAX_DIRECTORIES: usize = 512;
+const PLUGIN_CLEANUP_MAX_FILES: usize = 1024;
 const PLUGIN_README_MAX_BYTES: u64 = 16 * 1024;
 const PLUGIN_PACKAGE_MAX_DIRECTORIES: usize = 64;
 const PLUGIN_PACKAGE_MAX_FILES: usize = 256;
@@ -1435,6 +1442,248 @@ struct ActivePluginStateV1 {
     packages: Vec<PackageRecordV1>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PluginTransactionOperation {
+    Install,
+    Update,
+    DeleteWithFallback,
+    DeleteLast,
+    LegacyMigration,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PluginTransactionPhase {
+    Prepared,
+    PackagePlaced,
+    StateCommitted,
+    CleanupTransferred,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CleanupCondition {
+    IfOldState,
+    IfNewState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CleanupObjectRole {
+    CandidatePackage,
+    CandidateRuntimeData,
+    PreviousRuntimeData,
+    DeletedPackage,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CleanupOperation {
+    RollbackStaging,
+    DeleteVersion,
+    DeleteLastVersion,
+    RuntimeData,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TransactionRoot {
+    PluginRoot,
+    TransactionRoot,
+    RuntimeDataRoot,
+    QuarantineRoot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TransactionObjectLocation {
+    root: TransactionRoot,
+    relative_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StableObjectIdentityV1 {
+    volume_serial: u64,
+    file_id: String,
+    package_digest: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum MovableObjectRole {
+    CandidatePackage,
+    LegacyPackage,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MovableTransactionObjectV1 {
+    role: MovableObjectRole,
+    identity: StableObjectIdentityV1,
+    allowed_locations: Vec<TransactionObjectLocation>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum FixedObjectRole {
+    ActivationPackage,
+    CandidateRuntimeData,
+    PreviousRuntimeData,
+    DeletedPackage,
+    FallbackPackage,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedTransactionObjectV1 {
+    role: FixedObjectRole,
+    identity: StableObjectIdentityV1,
+    location: TransactionObjectLocation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum InstallMode {
+    NewVersion,
+    ActivateExisting,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum TransactionObjectsV1 {
+    Install {
+        #[serde(rename = "commandOperation")]
+        command_operation: PluginTransactionOperation,
+        mode: InstallMode,
+        #[serde(rename = "candidatePackage")]
+        candidate_package: MovableTransactionObjectV1,
+        #[serde(rename = "activationPackage")]
+        activation_package: Option<FixedTransactionObjectV1>,
+        #[serde(rename = "candidateRuntimeData")]
+        candidate_runtime_data: FixedTransactionObjectV1,
+        #[serde(rename = "previousRuntimeData")]
+        previous_runtime_data: Option<FixedTransactionObjectV1>,
+    },
+    DeleteWithFallback {
+        #[serde(rename = "deletedPackage")]
+        deleted_package: FixedTransactionObjectV1,
+        #[serde(rename = "fallbackPackage")]
+        fallback_package: FixedTransactionObjectV1,
+        #[serde(rename = "candidateRuntimeData")]
+        candidate_runtime_data: FixedTransactionObjectV1,
+        #[serde(rename = "previousRuntimeData")]
+        previous_runtime_data: Option<FixedTransactionObjectV1>,
+    },
+    DeleteLast {
+        #[serde(rename = "deletedPackage")]
+        deleted_package: FixedTransactionObjectV1,
+        #[serde(rename = "previousRuntimeData")]
+        previous_runtime_data: Option<FixedTransactionObjectV1>,
+    },
+    LegacyMigration {
+        #[serde(rename = "legacyPackage")]
+        legacy_package: MovableTransactionObjectV1,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum CleanupMeasureV1 {
+    Exact {
+        bytes: u64,
+    },
+    Bounded {
+        #[serde(rename = "maxBytes")]
+        max_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CleanupReceiptPlanV1 {
+    receipt_id: String,
+    condition: CleanupCondition,
+    object_role: CleanupObjectRole,
+    operation: CleanupOperation,
+    planned_target: TransactionObjectLocation,
+    measure: CleanupMeasureV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DurableStateKind {
+    Absent,
+    ActiveStateV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableStateReference {
+    kind: DurableStateKind,
+    sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginTransactionV1 {
+    schema: u32,
+    transaction_id: String,
+    operation: PluginTransactionOperation,
+    plugin_id: String,
+    phase: PluginTransactionPhase,
+    old_state: DurableStateReference,
+    new_state: DurableStateReference,
+    objects: TransactionObjectsV1,
+    cleanup_plans: Vec<CleanupReceiptPlanV1>,
+    cleanup_receipt_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CleanupReceiptPhase {
+    Pending,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TransactionObjectIdentityRole {
+    LegacySource,
+    StagedPackage,
+    InstalledPackage,
+    DeletedPackage,
+    RuntimeData,
+    QuarantineTarget,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TransactionObjectIdentity {
+    role: TransactionObjectIdentityRole,
+    root: TransactionRoot,
+    relative_path: String,
+    volume_serial: u64,
+    file_id: String,
+    package_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CleanupReceiptV1 {
+    schema: u32,
+    receipt_id: String,
+    origin_operation_id: String,
+    plugin_id: String,
+    operation: CleanupOperation,
+    phase: CleanupReceiptPhase,
+    source: TransactionObjectIdentity,
+    planned_target: TransactionObjectLocation,
+    target: Option<TransactionObjectIdentity>,
+    measure: CleanupMeasureV1,
+}
+
 impl PluginCatalogEntry {
     fn identity(&self) -> RuntimeIdentity {
         RuntimeIdentity {
@@ -1610,6 +1859,628 @@ fn valid_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_plugin_transaction(bytes: &[u8]) -> Result<PluginTransactionV1, ()> {
+    let transaction: PluginTransactionV1 = serde_json::from_slice(bytes).map_err(|_| ())?;
+    validate_plugin_transaction(&transaction)?;
+    Ok(transaction)
+}
+
+fn validate_plugin_transaction(transaction: &PluginTransactionV1) -> Result<(), ()> {
+    if transaction.schema != 1
+        || !valid_lower_hex(&transaction.transaction_id, 32)
+        || !valid_id(&transaction.plugin_id)
+        || transaction.cleanup_plans.len() > 8
+        || !valid_state_reference(&transaction.old_state)
+        || !valid_state_reference(&transaction.new_state)
+    {
+        return Err(());
+    }
+    let mut previous_id: Option<&str> = None;
+    for plan in &transaction.cleanup_plans {
+        if previous_id.is_some_and(|previous| previous >= plan.receipt_id.as_str())
+            || !valid_cleanup_plan(plan)
+        {
+            return Err(());
+        }
+        previous_id = Some(&plan.receipt_id);
+    }
+    let plan_ids = transaction
+        .cleanup_plans
+        .iter()
+        .map(|plan| plan.receipt_id.as_str())
+        .collect::<Vec<_>>();
+    match transaction.phase {
+        PluginTransactionPhase::Prepared
+        | PluginTransactionPhase::PackagePlaced
+        | PluginTransactionPhase::StateCommitted
+            if !transaction.cleanup_receipt_ids.is_empty() =>
+        {
+            return Err(())
+        }
+        PluginTransactionPhase::CleanupTransferred
+            if transaction
+                .cleanup_receipt_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                != plan_ids =>
+        {
+            return Err(())
+        }
+        _ => {}
+    }
+    validate_transaction_objects(transaction)?;
+    validate_cleanup_coverage(transaction)
+}
+
+fn valid_state_reference(reference: &DurableStateReference) -> bool {
+    match reference.kind {
+        DurableStateKind::Absent => reference.sha256.is_none(),
+        DurableStateKind::ActiveStateV1 => reference
+            .sha256
+            .as_deref()
+            .is_some_and(|digest| valid_lower_hex(digest, 64)),
+    }
+}
+
+fn valid_cleanup_plan(plan: &CleanupReceiptPlanV1) -> bool {
+    if !valid_lower_hex(&plan.receipt_id, 32)
+        || !valid_planned_target(&plan.planned_target, &plan.receipt_id)
+    {
+        return false;
+    }
+    matches!(
+        (plan.object_role, &plan.measure),
+        (
+            CleanupObjectRole::CandidatePackage,
+            CleanupMeasureV1::Exact { .. }
+        ) | (
+            CleanupObjectRole::DeletedPackage,
+            CleanupMeasureV1::Exact { .. }
+        ) | (
+            CleanupObjectRole::CandidateRuntimeData,
+            CleanupMeasureV1::Bounded { .. }
+        ) | (
+            CleanupObjectRole::PreviousRuntimeData,
+            CleanupMeasureV1::Bounded { .. }
+        )
+    )
+}
+
+fn validate_transaction_objects(transaction: &PluginTransactionV1) -> Result<(), ()> {
+    match (&transaction.operation, &transaction.objects) {
+        (
+            PluginTransactionOperation::Install | PluginTransactionOperation::Update,
+            TransactionObjectsV1::Install {
+                command_operation,
+                mode,
+                candidate_package,
+                activation_package,
+                candidate_runtime_data,
+                previous_runtime_data,
+            },
+        ) => {
+            if command_operation != &transaction.operation
+                || candidate_package.role != MovableObjectRole::CandidatePackage
+                || candidate_runtime_data.role != FixedObjectRole::CandidateRuntimeData
+                || previous_runtime_data
+                    .as_ref()
+                    .is_some_and(|object| object.role != FixedObjectRole::PreviousRuntimeData)
+                || !valid_stable_identity(&candidate_package.identity, true)
+                || !valid_fixed_object(candidate_runtime_data, false)
+                || previous_runtime_data
+                    .as_ref()
+                    .is_some_and(|object| !valid_fixed_object(object, false))
+            {
+                return Err(());
+            }
+            match mode {
+                InstallMode::NewVersion if activation_package.is_none() => {}
+                InstallMode::ActivateExisting
+                    if activation_package.as_ref().is_some_and(|object| {
+                        object.role == FixedObjectRole::ActivationPackage
+                            && valid_fixed_object(object, true)
+                    }) => {}
+                _ => return Err(()),
+            }
+        }
+        (
+            PluginTransactionOperation::DeleteWithFallback,
+            TransactionObjectsV1::DeleteWithFallback {
+                deleted_package,
+                fallback_package,
+                candidate_runtime_data,
+                previous_runtime_data,
+            },
+        ) => {
+            if deleted_package.role != FixedObjectRole::DeletedPackage
+                || fallback_package.role != FixedObjectRole::FallbackPackage
+                || candidate_runtime_data.role != FixedObjectRole::CandidateRuntimeData
+                || !valid_fixed_object(deleted_package, true)
+                || !valid_fixed_object(fallback_package, true)
+                || !valid_fixed_object(candidate_runtime_data, false)
+                || previous_runtime_data.as_ref().is_some_and(|object| {
+                    object.role != FixedObjectRole::PreviousRuntimeData
+                        || !valid_fixed_object(object, false)
+                })
+            {
+                return Err(());
+            }
+        }
+        (
+            PluginTransactionOperation::DeleteLast,
+            TransactionObjectsV1::DeleteLast {
+                deleted_package,
+                previous_runtime_data,
+            },
+        ) => {
+            if deleted_package.role != FixedObjectRole::DeletedPackage
+                || !valid_fixed_object(deleted_package, true)
+                || previous_runtime_data.as_ref().is_some_and(|object| {
+                    object.role != FixedObjectRole::PreviousRuntimeData
+                        || !valid_fixed_object(object, false)
+                })
+            {
+                return Err(());
+            }
+        }
+        (
+            PluginTransactionOperation::LegacyMigration,
+            TransactionObjectsV1::LegacyMigration { legacy_package },
+        ) if legacy_package.role == MovableObjectRole::LegacyPackage
+            && valid_stable_identity(&legacy_package.identity, true) => {}
+        _ => return Err(()),
+    }
+    Ok(())
+}
+
+fn valid_fixed_object(object: &FixedTransactionObjectV1, package: bool) -> bool {
+    valid_stable_identity(&object.identity, package) && valid_object_location(&object.location)
+}
+
+fn valid_stable_identity(identity: &StableObjectIdentityV1, package: bool) -> bool {
+    valid_lower_hex(&identity.file_id, 16)
+        && match (package, identity.package_digest.as_deref()) {
+            (true, Some(digest)) => valid_lower_hex(digest, 64),
+            (false, None) => true,
+            _ => false,
+        }
+}
+
+fn valid_object_location(location: &TransactionObjectLocation) -> bool {
+    !location.relative_path.is_empty()
+        && !location.relative_path.contains('\\')
+        && !location.relative_path.starts_with('/')
+        && location
+            .relative_path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(':'))
+}
+
+fn valid_planned_target(location: &TransactionObjectLocation, receipt_id: &str) -> bool {
+    location.root == TransactionRoot::QuarantineRoot && location.relative_path == receipt_id
+}
+
+fn validate_cleanup_coverage(transaction: &PluginTransactionV1) -> Result<(), ()> {
+    let actual = transaction
+        .cleanup_plans
+        .iter()
+        .map(|plan| (plan.condition, plan.object_role))
+        .collect::<Vec<_>>();
+    let mut expected = Vec::new();
+    match &transaction.objects {
+        TransactionObjectsV1::Install {
+            mode,
+            previous_runtime_data,
+            ..
+        } => {
+            expected.extend([
+                (
+                    CleanupCondition::IfOldState,
+                    CleanupObjectRole::CandidatePackage,
+                ),
+                (
+                    CleanupCondition::IfOldState,
+                    CleanupObjectRole::CandidateRuntimeData,
+                ),
+            ]);
+            if *mode == InstallMode::ActivateExisting {
+                expected.push((
+                    CleanupCondition::IfNewState,
+                    CleanupObjectRole::CandidatePackage,
+                ));
+            }
+            if previous_runtime_data.is_some() {
+                expected.push((
+                    CleanupCondition::IfNewState,
+                    CleanupObjectRole::PreviousRuntimeData,
+                ));
+            }
+        }
+        TransactionObjectsV1::DeleteWithFallback {
+            previous_runtime_data,
+            ..
+        } => {
+            expected.push((
+                CleanupCondition::IfOldState,
+                CleanupObjectRole::CandidateRuntimeData,
+            ));
+            expected.push((
+                CleanupCondition::IfNewState,
+                CleanupObjectRole::DeletedPackage,
+            ));
+            if previous_runtime_data.is_some() {
+                expected.push((
+                    CleanupCondition::IfNewState,
+                    CleanupObjectRole::PreviousRuntimeData,
+                ));
+            }
+        }
+        TransactionObjectsV1::DeleteLast {
+            previous_runtime_data,
+            ..
+        } => {
+            expected.push((
+                CleanupCondition::IfNewState,
+                CleanupObjectRole::DeletedPackage,
+            ));
+            if previous_runtime_data.is_some() {
+                expected.push((
+                    CleanupCondition::IfNewState,
+                    CleanupObjectRole::PreviousRuntimeData,
+                ));
+            }
+        }
+        TransactionObjectsV1::LegacyMigration { .. } => {}
+    }
+    let mut actual = actual;
+    actual.sort_by_key(|value| (value.0 as u8, value.1 as u8));
+    expected.sort_by_key(|value| (value.0 as u8, value.1 as u8));
+    (actual == expected).then_some(()).ok_or(())
+}
+
+fn parse_cleanup_receipt(bytes: &[u8]) -> Result<CleanupReceiptV1, ()> {
+    let receipt: CleanupReceiptV1 = serde_json::from_slice(bytes).map_err(|_| ())?;
+    if receipt.schema != 1
+        || !valid_lower_hex(&receipt.receipt_id, 32)
+        || !valid_lower_hex(&receipt.origin_operation_id, 32)
+        || !valid_id(&receipt.plugin_id)
+        || !valid_planned_target(&receipt.planned_target, &receipt.receipt_id)
+        || !valid_transaction_identity(&receipt.source)
+    {
+        return Err(());
+    }
+    match (&receipt.phase, &receipt.target) {
+        (CleanupReceiptPhase::Pending, None) => {}
+        (CleanupReceiptPhase::Quarantined, Some(target))
+            if target.root == TransactionRoot::QuarantineRoot
+                && target.relative_path == receipt.planned_target.relative_path
+                && target.role == TransactionObjectIdentityRole::QuarantineTarget
+                && valid_transaction_identity(target) => {}
+        _ => return Err(()),
+    }
+    let package = receipt.source.package_digest.is_some();
+    if !matches!(
+        (package, &receipt.measure),
+        (true, CleanupMeasureV1::Exact { .. }) | (false, CleanupMeasureV1::Bounded { .. })
+    ) {
+        return Err(());
+    }
+    Ok(receipt)
+}
+
+fn valid_transaction_identity(identity: &TransactionObjectIdentity) -> bool {
+    valid_object_location(&TransactionObjectLocation {
+        root: identity.root,
+        relative_path: identity.relative_path.clone(),
+    }) && valid_lower_hex(&identity.file_id, 16)
+        && identity
+            .package_digest
+            .as_deref()
+            .is_none_or(|digest| valid_lower_hex(digest, 64))
+}
+
+fn receipt_worker_eligible(
+    receipt: &CleanupReceiptV1,
+    active_transaction: Option<&PluginTransactionV1>,
+) -> bool {
+    !active_transaction
+        .is_some_and(|transaction| receipt.origin_operation_id == transaction.transaction_id)
+}
+
+fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> {
+    let transaction_root = app_data_dir.join("plugin-transactions");
+    let active_transaction = read_active_transaction(&transaction_root)?;
+    let receipts_root = transaction_root.join("receipts");
+    let mut receipts = read_cleanup_receipt_paths(&receipts_root)?;
+    receipts.sort();
+
+    let mut processed = 0usize;
+    let mut processed_bytes = 0u64;
+    for receipt_path in receipts {
+        if processed == PLUGIN_CLEANUP_BATCH_RECEIPTS {
+            break;
+        }
+        let receipt = read_cleanup_receipt(&receipt_path)?;
+        if !receipt_worker_eligible(&receipt, active_transaction.as_ref()) {
+            continue;
+        }
+        let source_path = cleanup_location_path(app_data_dir, &receipt.source_location())?;
+        let target_path = cleanup_location_path(app_data_dir, &receipt.planned_target)?;
+        let source_exists = ordinary_directory(&source_path);
+        let target_exists = ordinary_directory(&target_path);
+        let object_path = match (receipt.phase, source_exists, target_exists) {
+            (CleanupReceiptPhase::Pending, true, false) => &source_path,
+            (CleanupReceiptPhase::Pending, false, true)
+            | (CleanupReceiptPhase::Quarantined, false, true) => &target_path,
+            _ => return Err(PluginManagementError::Unavailable),
+        };
+        let actual_bytes = validate_cleanup_object(object_path, &receipt)?;
+        if actual_bytes > PLUGIN_CLEANUP_BATCH_BYTES {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let next_bytes = processed_bytes
+            .checked_add(actual_bytes)
+            .ok_or(PluginManagementError::Unavailable)?;
+        if next_bytes > PLUGIN_CLEANUP_BATCH_BYTES {
+            break;
+        }
+
+        let mut receipt = receipt;
+        if receipt.phase == CleanupReceiptPhase::Pending {
+            if source_exists {
+                move_cleanup_directory(&source_path, &target_path, &receipt.source)?;
+            }
+            let target_identity =
+                directory_identity(&target_path).ok_or(PluginManagementError::Unavailable)?;
+            if target_identity.volume != receipt.source.volume_serial
+                || format!("{:016x}", target_identity.file) != receipt.source.file_id
+            {
+                return Err(PluginManagementError::Unavailable);
+            }
+            receipt.phase = CleanupReceiptPhase::Quarantined;
+            receipt.target = Some(TransactionObjectIdentity {
+                role: TransactionObjectIdentityRole::QuarantineTarget,
+                root: TransactionRoot::QuarantineRoot,
+                relative_path: receipt.planned_target.relative_path.clone(),
+                volume_serial: target_identity.volume,
+                file_id: format!("{:016x}", target_identity.file),
+                package_digest: receipt.source.package_digest.clone(),
+            });
+            let bytes =
+                serde_json::to_vec(&receipt).map_err(|_| PluginManagementError::Unavailable)?;
+            if bytes.len() as u64 > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES {
+                return Err(PluginManagementError::Unavailable);
+            }
+            replace_current(&receipt_path, &bytes)
+                .map_err(|_| PluginManagementError::Unavailable)?;
+        }
+
+        validate_cleanup_object(&target_path, &receipt)?;
+        fs::remove_dir_all(&target_path).map_err(|_| PluginManagementError::Unavailable)?;
+        fs::remove_file(&receipt_path).map_err(|_| PluginManagementError::Unavailable)?;
+        processed += 1;
+        processed_bytes = next_bytes;
+    }
+    Ok(())
+}
+
+impl CleanupReceiptV1 {
+    fn source_location(&self) -> TransactionObjectLocation {
+        TransactionObjectLocation {
+            root: self.source.root,
+            relative_path: self.source.relative_path.clone(),
+        }
+    }
+}
+
+fn read_active_transaction(
+    transaction_root: &Path,
+) -> Result<Option<PluginTransactionV1>, PluginManagementError> {
+    let path = transaction_root.join("active").join("current.json");
+    let Some(bytes) = read_bounded_document(&path)? else {
+        return Ok(None);
+    };
+    parse_plugin_transaction(&bytes)
+        .map(Some)
+        .map_err(|_| PluginManagementError::Unavailable)
+}
+
+fn read_cleanup_receipt_paths(root: &Path) -> Result<Vec<PathBuf>, PluginManagementError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(PluginManagementError::Unavailable),
+    };
+    if !ordinary_directory(root) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| PluginManagementError::Unavailable)?;
+        let metadata = entry
+            .metadata()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let path = entry.path();
+        let valid_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| valid_lower_hex(name, 32));
+        if !metadata.is_file()
+            || is_reparse_point(&metadata)
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+            || !valid_name
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+        paths.push(path);
+        if paths.len() > PLUGIN_CLEANUP_MAX_RECEIPTS {
+            return Err(PluginManagementError::Unavailable);
+        }
+    }
+    Ok(paths)
+}
+
+fn read_cleanup_receipt(path: &Path) -> Result<CleanupReceiptV1, PluginManagementError> {
+    let bytes = read_bounded_document(path)?.ok_or(PluginManagementError::Unavailable)?;
+    let receipt = parse_cleanup_receipt(&bytes).map_err(|_| PluginManagementError::Unavailable)?;
+    let expected_name = format!("{}.json", receipt.receipt_id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    Ok(receipt)
+}
+
+fn read_bounded_document(path: &Path) -> Result<Option<Vec<u8>>, PluginManagementError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(PluginManagementError::Unavailable),
+    };
+    if !metadata.is_file()
+        || is_reparse_point(&metadata)
+        || metadata.len() > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let bytes = fs::read(path).map_err(|_| PluginManagementError::Unavailable)?;
+    if bytes.len() as u64 > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES {
+        return Err(PluginManagementError::Unavailable);
+    }
+    Ok(Some(bytes))
+}
+
+fn cleanup_location_path(
+    app_data_dir: &Path,
+    location: &TransactionObjectLocation,
+) -> Result<PathBuf, PluginManagementError> {
+    if !valid_object_location(location) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let root = match location.root {
+        TransactionRoot::PluginRoot => app_data_dir.join("plugins"),
+        TransactionRoot::TransactionRoot => app_data_dir.join("plugin-transactions"),
+        TransactionRoot::RuntimeDataRoot => app_data_dir.join("plugin-runtime-data"),
+        TransactionRoot::QuarantineRoot => app_data_dir.join("plugin-quarantine"),
+    };
+    Ok(location
+        .relative_path
+        .split('/')
+        .fold(root, |path, component| path.join(component)))
+}
+
+fn validate_cleanup_object(
+    path: &Path,
+    receipt: &CleanupReceiptV1,
+) -> Result<u64, PluginManagementError> {
+    let identity = directory_identity(path).ok_or(PluginManagementError::Unavailable)?;
+    if identity.volume != receipt.source.volume_serial
+        || format!("{:016x}", identity.file) != receipt.source.file_id
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    match receipt.measure {
+        CleanupMeasureV1::Exact { bytes } => {
+            let snapshot =
+                scan_package_snapshot(path).map_err(|_| PluginManagementError::Unavailable)?;
+            if snapshot.total_bytes != bytes
+                || receipt.source.package_digest.as_deref()
+                    != Some(snapshot.package_identity.digest.as_str())
+            {
+                return Err(PluginManagementError::Unavailable);
+            }
+            Ok(snapshot.total_bytes)
+        }
+        CleanupMeasureV1::Bounded { max_bytes } => {
+            let actual = measure_cleanup_directory(path)?;
+            if actual > max_bytes || actual > PLUGIN_CLEANUP_BATCH_BYTES {
+                return Err(PluginManagementError::Unavailable);
+            }
+            Ok(actual)
+        }
+    }
+}
+
+fn measure_cleanup_directory(root: &Path) -> Result<u64, PluginManagementError> {
+    fn visit(
+        directory: &Path,
+        directories: &mut usize,
+        files: &mut usize,
+        bytes: &mut u64,
+    ) -> Result<(), PluginManagementError> {
+        for entry in fs::read_dir(directory).map_err(|_| PluginManagementError::Unavailable)? {
+            let entry = entry.map_err(|_| PluginManagementError::Unavailable)?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            if is_reparse_point(&metadata) {
+                return Err(PluginManagementError::Unavailable);
+            }
+            if metadata.is_dir() {
+                *directories = directories
+                    .checked_add(1)
+                    .ok_or(PluginManagementError::Unavailable)?;
+                if *directories > PLUGIN_CLEANUP_MAX_DIRECTORIES {
+                    return Err(PluginManagementError::Unavailable);
+                }
+                visit(&entry.path(), directories, files, bytes)?;
+            } else if metadata.is_file() {
+                *files = files
+                    .checked_add(1)
+                    .ok_or(PluginManagementError::Unavailable)?;
+                *bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or(PluginManagementError::Unavailable)?;
+                if *files > PLUGIN_CLEANUP_MAX_FILES || *bytes > PLUGIN_CLEANUP_BATCH_BYTES {
+                    return Err(PluginManagementError::Unavailable);
+                }
+            } else {
+                return Err(PluginManagementError::Unavailable);
+            }
+        }
+        Ok(())
+    }
+
+    if !ordinary_directory(root) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let mut directories = 0;
+    let mut files = 0;
+    let mut bytes = 0;
+    visit(root, &mut directories, &mut files, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn move_cleanup_directory(
+    source: &Path,
+    target: &Path,
+    expected: &TransactionObjectIdentity,
+) -> Result<(), PluginManagementError> {
+    if target.exists() {
+        return Err(PluginManagementError::Unavailable);
+    }
+    #[cfg(windows)]
+    {
+        let (handle, identity) =
+            open_directory_handle(source, true).map_err(|_| PluginManagementError::Unavailable)?;
+        if identity.volume != expected.volume_serial
+            || format!("{:016x}", identity.file) != expected.file_id
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+        move_directory_handle(&handle, target).map_err(|_| PluginManagementError::Unavailable)
+    }
+    #[cfg(not(windows))]
+    {
+        let identity = directory_identity(source).ok_or(PluginManagementError::Unavailable)?;
+        if identity.volume != expected.volume_serial
+            || format!("{:016x}", identity.file) != expected.file_id
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+        fs::rename(source, target).map_err(|_| PluginManagementError::Unavailable)
+    }
 }
 
 impl PluginCatalog {
@@ -3102,6 +3973,178 @@ mod tests {
             assert_eq!(item["development"]["state"], "invalid");
             assert_eq!(item["development"]["reason"], "invalidManifest");
             assert_eq!(item["description"]["state"], "unavailable");
+        }
+    }
+
+    mod recovery {
+        use std::fs;
+
+        use super::TestRoot;
+        use crate::plugins::{
+            directory_identity, parse_cleanup_receipt, parse_plugin_transaction,
+            receipt_worker_eligible, run_cleanup_worker, scan_package_snapshot,
+        };
+
+        fn transaction(phase: &str, receipt_ids: serde_json::Value) -> serde_json::Value {
+            let receipt_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            serde_json::json!({
+                "schema":1,
+                "transactionId":"11111111111111111111111111111111",
+                "operation":"delete-last",
+                "pluginId":"internal.math",
+                "phase":phase,
+                "oldState":{"kind":"active-state-v1","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+                "newState":{"kind":"active-state-v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+                "objects":{
+                    "kind":"delete-last",
+                    "deletedPackage":{
+                        "role":"deleted-package",
+                        "identity":{"volumeSerial":1,"fileId":"0000000000000001","packageDigest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+                        "location":{"root":"plugin-root","relativePath":"internal.math/1.0.0"}
+                    },
+                    "previousRuntimeData":null
+                },
+                "cleanupPlans":[{
+                    "receiptId":receipt_id,
+                    "condition":"if-new-state",
+                    "objectRole":"deleted-package",
+                    "operation":"delete-last-version",
+                    "plannedTarget":{"root":"quarantine-root","relativePath":receipt_id},
+                    "measure":{"kind":"exact","bytes":1}
+                }],
+                "cleanupReceiptIds":receipt_ids
+            })
+        }
+
+        fn receipt(planned_root: &str, planned_path: &str) -> serde_json::Value {
+            serde_json::json!({
+                "schema":1,
+                "receiptId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "originOperationId":"11111111111111111111111111111111",
+                "pluginId":"internal.math",
+                "operation":"delete-last-version",
+                "phase":"pending",
+                "source":{
+                    "role":"deleted-package",
+                    "root":"plugin-root",
+                    "relativePath":"internal.math/1.0.0",
+                    "volumeSerial":1,
+                    "fileId":"0000000000000001",
+                    "packageDigest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                },
+                "plannedTarget":{"root":planned_root,"relativePath":planned_path},
+                "target":null,
+                "measure":{"kind":"exact","bytes":1}
+            })
+        }
+
+        #[test]
+        fn strict_transaction_phase_and_cleanup_ids_are_validated() {
+            assert!(parse_plugin_transaction(
+                &serde_json::to_vec(&transaction("prepared", serde_json::json!([]))).unwrap()
+            )
+            .is_ok());
+            assert!(parse_plugin_transaction(
+                &serde_json::to_vec(&transaction(
+                    "prepared",
+                    serde_json::json!(["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+                ))
+                .unwrap()
+            )
+            .is_err());
+            assert!(parse_plugin_transaction(
+                &serde_json::to_vec(&transaction("cleanup-transferred", serde_json::json!([])))
+                    .unwrap()
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn receipt_requires_persisted_quarantine_target_for_its_full_id() {
+            assert!(parse_cleanup_receipt(
+                &serde_json::to_vec(&receipt(
+                    "quarantine-root",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ))
+                .unwrap()
+            )
+            .is_ok());
+            assert!(parse_cleanup_receipt(
+                &serde_json::to_vec(&receipt("plugin-root", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+                    .unwrap()
+            )
+            .is_err());
+            assert!(parse_cleanup_receipt(
+                &serde_json::to_vec(&receipt("quarantine-root", "aaaaaaaaaaaa")).unwrap()
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn active_journal_lease_blocks_generic_receipt_worker() {
+            let transaction = parse_plugin_transaction(
+                &serde_json::to_vec(&transaction("prepared", serde_json::json!([]))).unwrap(),
+            )
+            .unwrap();
+            let receipt = parse_cleanup_receipt(
+                &serde_json::to_vec(&receipt(
+                    "quarantine-root",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(!receipt_worker_eligible(&receipt, Some(&transaction)));
+            assert!(receipt_worker_eligible(&receipt, None));
+        }
+
+        #[test]
+        fn durable_journal_lease_blocks_worker_until_journal_is_removed() {
+            let app_data = TestRoot::new();
+            let source = app_data
+                .path
+                .join("plugins")
+                .join("internal.math")
+                .join("1.0.0");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("plugin.json"), "{}").unwrap();
+            let snapshot = scan_package_snapshot(&source).unwrap();
+            let identity = directory_identity(&source).unwrap();
+            let active_root = app_data.path.join("plugin-transactions").join("active");
+            let receipts_root = app_data.path.join("plugin-transactions").join("receipts");
+            fs::create_dir_all(&active_root).unwrap();
+            fs::create_dir_all(&receipts_root).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let journal_path = active_root.join("current.json");
+            fs::write(
+                &journal_path,
+                serde_json::to_vec(&transaction("prepared", serde_json::json!([]))).unwrap(),
+            )
+            .unwrap();
+            let mut cleanup_receipt =
+                receipt("quarantine-root", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            cleanup_receipt["source"]["volumeSerial"] = identity.volume.into();
+            cleanup_receipt["source"]["fileId"] = format!("{:016x}", identity.file).into();
+            cleanup_receipt["source"]["packageDigest"] =
+                snapshot.package_identity.digest.clone().into();
+            cleanup_receipt["measure"]["bytes"] = snapshot.total_bytes.into();
+            let receipt_path = receipts_root.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+            fs::write(&receipt_path, serde_json::to_vec(&cleanup_receipt).unwrap()).unwrap();
+
+            run_cleanup_worker(&app_data.path).unwrap();
+            assert!(source.exists());
+            assert!(receipt_path.exists());
+
+            fs::remove_file(journal_path).unwrap();
+            run_cleanup_worker(&app_data.path).unwrap();
+            assert!(!source.exists());
+            assert!(!receipt_path.exists());
+            assert!(!app_data
+                .path
+                .join("plugin-quarantine")
+                .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .exists());
         }
     }
 
