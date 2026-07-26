@@ -3491,11 +3491,10 @@ fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> 
         validate_cleanup_object(&target_path, &receipt)?;
         if fs::remove_dir_all(&target_path).is_err() {
             let target_identity = directory_identity(&target_path);
-            if matches!(receipt.measure, CleanupMeasureV1::Bounded { .. })
-                && target_identity.is_some_and(|identity| {
-                    identity.volume == receipt.source.volume_serial
-                        && format!("{:016x}", identity.file) == receipt.source.file_id
-                })
+            if target_identity.is_some_and(|identity| {
+                identity.volume == receipt.source.volume_serial
+                    && format!("{:016x}", identity.file) == receipt.source.file_id
+            }) && validate_cleanup_object(&target_path, &receipt).is_ok()
             {
                 continue;
             }
@@ -6307,6 +6306,58 @@ mod tests {
 
             assert!(quarantine.exists());
             assert!(receipt_path.exists());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn unchanged_exact_package_lock_keeps_receipt_without_blocking_startup() {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            let app_data = TestRoot::new();
+            let source = app_data
+                .path
+                .join("plugins")
+                .join("internal\u{2e}math")
+                .join("1.0.0");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("plugin.json"), "{}").unwrap();
+            let snapshot = scan_package_snapshot(&source).unwrap();
+            let identity = directory_identity(&source).unwrap();
+            let receipts_root = app_data.path.join("plugin-transactions").join("receipts");
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("active")).unwrap();
+            fs::create_dir_all(&receipts_root).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let mut cleanup_receipt =
+                receipt("quarantine-root", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            cleanup_receipt["source"]["volumeSerial"] = identity.volume.into();
+            cleanup_receipt["source"]["fileId"] = format!("{:016x}", identity.file).into();
+            cleanup_receipt["source"]["packageDigest"] =
+                snapshot.package_identity.digest.clone().into();
+            cleanup_receipt["measure"]["bytes"] = snapshot.total_bytes.into();
+            let receipt_path = receipts_root.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+            fs::write(&receipt_path, serde_json::to_vec(&cleanup_receipt).unwrap()).unwrap();
+            handoff_cleanup_receipt(&app_data.path, &receipt_path).unwrap();
+            let quarantine = app_data
+                .path
+                .join("plugin-quarantine")
+                .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let _locked_file = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1 | 2)
+                .open(quarantine.join("plugin.json"))
+                .unwrap();
+
+            run_cleanup_worker(&app_data.path).unwrap();
+
+            assert!(quarantine.exists());
+            assert!(receipt_path.exists());
+            assert_eq!(
+                scan_package_snapshot(&quarantine)
+                    .unwrap()
+                    .package_identity
+                    .digest,
+                snapshot.package_identity.digest
+            );
         }
     }
 
