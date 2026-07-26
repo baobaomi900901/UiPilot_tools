@@ -3449,8 +3449,19 @@ fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> 
 
         let mut receipt = receipt;
         if receipt.phase == CleanupReceiptPhase::Pending {
-            if source_exists {
-                move_cleanup_directory(&source_path, &target_path, &receipt.source)?;
+            if source_exists
+                && move_cleanup_directory(&source_path, &target_path, &receipt.source).is_err()
+            {
+                let source_identity = directory_identity(&source_path);
+                let target_identity = directory_identity(&target_path);
+                if source_identity.is_some_and(|identity| {
+                    identity.volume == receipt.source.volume_serial
+                        && format!("{:016x}", identity.file) == receipt.source.file_id
+                }) && target_identity.is_none()
+                {
+                    continue;
+                }
+                return Err(PluginManagementError::Unavailable);
             }
             let target_identity =
                 directory_identity(&target_path).ok_or(PluginManagementError::Unavailable)?;
@@ -3478,7 +3489,18 @@ fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> 
         }
 
         validate_cleanup_object(&target_path, &receipt)?;
-        fs::remove_dir_all(&target_path).map_err(|_| PluginManagementError::Unavailable)?;
+        if fs::remove_dir_all(&target_path).is_err() {
+            let target_identity = directory_identity(&target_path);
+            if matches!(receipt.measure, CleanupMeasureV1::Bounded { .. })
+                && target_identity.is_some_and(|identity| {
+                    identity.volume == receipt.source.volume_serial
+                        && format!("{:016x}", identity.file) == receipt.source.file_id
+                })
+            {
+                continue;
+            }
+            return Err(PluginManagementError::Unavailable);
+        }
         fs::remove_file(&receipt_path).map_err(|_| PluginManagementError::Unavailable)?;
         processed += 1;
         processed_bytes = next_bytes;
@@ -6213,6 +6235,78 @@ mod tests {
                 .join("plugin-quarantine")
                 .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 .exists());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn transient_runtime_data_lock_keeps_receipt_without_blocking_startup() {
+            let app_data = TestRoot::new();
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("active")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let identity = super::super::RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-runtime".into(),
+                generation: 7,
+            };
+            let source = super::super::runtime_data_directory(&app_data.path, &identity);
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("WebView.lock"), "in use").unwrap();
+            let receipt_path = stage_runtime_cleanup_receipt(
+                &app_data.path,
+                "internal\u{2e}math",
+                &identity,
+                "11111111111111111111111111111111",
+                "22222222222222222222222222222222",
+            )
+            .unwrap();
+            let (_lock, _) = super::super::open_directory_handle(&source, true).unwrap();
+
+            run_cleanup_worker(&app_data.path).unwrap();
+
+            assert!(source.exists());
+            assert!(receipt_path.exists());
+            assert!(!app_data
+                .path
+                .join("plugin-quarantine")
+                .join("22222222222222222222222222222222")
+                .exists());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn transient_quarantine_lock_keeps_receipt_without_blocking_startup() {
+            let app_data = TestRoot::new();
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("active")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let identity = super::super::RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-runtime".into(),
+                generation: 8,
+            };
+            let source = super::super::runtime_data_directory(&app_data.path, &identity);
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("WebView.lock"), "in use").unwrap();
+            let receipt_path = stage_runtime_cleanup_receipt(
+                &app_data.path,
+                "internal\u{2e}math",
+                &identity,
+                "33333333333333333333333333333333",
+                "44444444444444444444444444444444",
+            )
+            .unwrap();
+            handoff_cleanup_receipt(&app_data.path, &receipt_path).unwrap();
+            let quarantine = app_data
+                .path
+                .join("plugin-quarantine")
+                .join("44444444444444444444444444444444");
+            let (_lock, _) = super::super::open_directory_handle(&quarantine, true).unwrap();
+
+            run_cleanup_worker(&app_data.path).unwrap();
+
+            assert!(quarantine.exists());
+            assert!(receipt_path.exists());
         }
     }
 
