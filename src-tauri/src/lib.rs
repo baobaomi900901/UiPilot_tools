@@ -217,6 +217,7 @@ pub fn run() {
             commands::search_files,
             commands::execute_result,
             commands::list_plugins,
+            commands::install_plugin,
             commands::reload_plugin,
             commands::delete_plugin,
             commands::load_settings,
@@ -424,13 +425,14 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 13);
+        assert_eq!(production.matches("commands::").count(), 14);
         for command in [
             "search_apps",
             "publish_plugin_results",
             "search_files",
             "execute_result",
             "list_plugins",
+            "install_plugin",
             "reload_plugin",
             "delete_plugin",
             "load_settings",

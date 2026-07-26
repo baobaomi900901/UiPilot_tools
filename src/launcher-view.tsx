@@ -130,6 +130,16 @@ function fileModified(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
+function comparePluginVersion(left: string, right: string): number {
+  const leftParts = left.split('.').map(Number)
+  const rightParts = right.split('.').map(Number)
+  for (let index = 0; index < 3; index += 1) {
+    const difference = leftParts[index]! - rightParts[index]!
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
 function scrollFileResultIntoView(container: HTMLElement | null, selected: HTMLElement | undefined): void {
   if (!container || !selected) return
   const selectedTop = selected.offsetTop
@@ -221,6 +231,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     viewEpoch: -1,
     key: 'general',
   })
+  const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const activeSettingsTab: SettingsTabKey =
     settingsTabSelection.viewEpoch === snapshot.viewEpoch ? settingsTabSelection.key : 'general'
   const optionRefs = useRef(new Map<number, HTMLElement>())
@@ -597,38 +608,92 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       )}
     </div>
   )
+  const selectSettingsTab = (key: SettingsTabKey) => {
+    setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+    if (key === 'plugins') {
+      if (activatedPluginEpoch.current === snapshot.viewEpoch) return
+      activatedPluginEpoch.current = snapshot.viewEpoch
+      void core.activatePlugins()
+    } else {
+      activatedPluginEpoch.current = undefined
+      core.deactivatePlugins()
+    }
+  }
   const pluginSettingsPanel = (
     <div className="settings-tab-panel settings-plugin-panel">
       <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
           <h2 id="plugin-inventory-title">插件</h2>
-          {plugins?.status === 'error' ? (
-            <Button size="small" onClick={() => void core.reloadPlugins()}>
-              重试
-            </Button>
-          ) : null}
+          <Button
+            size="small"
+            disabled={plugins?.status === 'loading'}
+            onClick={() => void core.reloadPlugins()}
+          >
+            {plugins?.status === 'error' ? '重试' : '刷新'}
+          </Button>
         </div>
         {plugins?.status === 'loading' || plugins?.status === 'idle' ? (
           <div className="plugin-list-state"><Spin size="small" /></div>
         ) : plugins?.status === 'error' ? (
           <div className="plugin-list-state plugin-list-error" role="alert">{plugins.error}</div>
         ) : plugins?.items.length === 0 ? (
-          <div className="plugin-list-state">未安装插件</div>
+          <div className="plugin-list-state">未发现插件</div>
         ) : (
           <div className="plugin-list">
-            {plugins?.items.map((plugin) => (
-              <article className="plugin-item" key={plugin.id}>
+            {plugins?.items.map((plugin) => {
+              const installed = plugin.installed.state === 'valid' ? plugin.installed : undefined
+              const development = plugin.development.state === 'valid' ? plugin.development : undefined
+              const canInstall =
+                plugin.id !== null &&
+                development !== undefined &&
+                (plugin.installed.state === 'absent' ||
+                  (installed !== undefined && comparePluginVersion(development.version, installed.activeVersion) > 0))
+              const installLabel = installed ? '更新' : '安装'
+              const version = installed?.activeVersion ?? development?.version
+              const trigger = installed?.trigger ?? development?.trigger
+              const fallbackVersions = installed?.versions
+                .filter((candidateVersion) => candidateVersion !== installed.activeVersion)
+                .sort(comparePluginVersion)
+              const fallbackVersion = fallbackVersions?.[fallbackVersions.length - 1]
+              const deleteDescription = installed
+                ? fallbackVersion
+                  ? `将删除 ${installed.activeVersion}，并自动启用 ${fallbackVersion}。`
+                  : `将删除最后一个版本 ${installed.activeVersion}。`
+                : ''
+              const stateLabel =
+                plugin.installed.state === 'invalid'
+                  ? '安装状态故障'
+                  : plugin.development.state === 'invalid'
+                    ? '开发包不可用'
+                    : installed
+                      ? canInstall
+                        ? '可更新'
+                        : '已安装'
+                      : '未安装'
+              return (
+              <article className="plugin-item" key={plugin.key}>
                 <div className="plugin-item-main">
                   <div className="plugin-title-line">
-                    <h3>{plugin.id}</h3>
-                    <span>{plugin.version}</span>
-                    <code>{plugin.trigger}</code>
+                    <h3>{plugin.displayName}</h3>
+                    <span>{stateLabel}</span>
+                    {version ? <span>{version}</span> : null}
+                    {trigger ? <code>{trigger}</code> : null}
                   </div>
+                  {installed ? (
+                    <div className="plugin-version-list">
+                      已安装版本：{installed.versions.join('、')}
+                    </div>
+                  ) : null}
+                  {development ? (
+                    <div className="plugin-version-list">
+                      开发版本：{development.version}
+                    </div>
+                  ) : null}
                   <div className="plugin-description">
                     <div className="plugin-description-label">说明</div>
-                    {plugin.description ? (
+                    {plugin.description.state === 'available' ? (
                       <ReactMarkdown allowedElements={pluginMarkdownElements} unwrapDisallowed>
-                        {plugin.description}
+                        {plugin.description.markdown}
                       </ReactMarkdown>
                     ) : (
                       <p>暂无说明</p>
@@ -637,29 +702,38 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                   {plugin.error ? <div className="plugin-row-error" role="alert">{plugin.error}</div> : null}
                 </div>
                 <div className="plugin-actions">
-                  <Button
+                  {canInstall ? <Button
+                    size="small"
+                    loading={plugin.operation === 'install'}
+                    disabled={plugin.operation !== undefined}
+                    onClick={() => void core.installPlugin(plugin.id!)}
+                  >
+                    {installLabel}
+                  </Button> : null}
+                  {installed && plugin.id ? <Button
                     size="small"
                     loading={plugin.operation === 'reload'}
                     disabled={plugin.operation !== undefined}
-                    onClick={() => void core.reloadPlugin(plugin.id)}
+                    onClick={() => void core.reloadPlugin(plugin.id!)}
                   >
                     重新加载
-                  </Button>
-                  <Popconfirm
+                  </Button> : null}
+                  {installed && plugin.id ? <Popconfirm
                     title="删除此插件？"
-                    description="插件包将从插件目录移除。"
+                    description={deleteDescription}
                     okText="删除"
                     cancelText="取消"
-                    onConfirm={() => void core.deletePlugin(plugin.id)}
+                    onConfirm={() => void core.deletePlugin(plugin.id!)}
                     disabled={plugin.operation !== undefined}
                   >
                     <Button size="small" danger loading={plugin.operation === 'delete'} disabled={plugin.operation !== undefined}>
                       删除
                     </Button>
-                  </Popconfirm>
+                  </Popconfirm> : null}
                 </div>
               </article>
-            ))}
+              )
+            })}
           </div>
         )}
       </section>
@@ -679,7 +753,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         onFocusCapture={(event) => {
           const key = settingsTabKey(event.target)
           if (!key || key === activeSettingsTab) return
-          setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+          selectSettingsTab(key)
         }}
       >
         <Tabs
@@ -692,7 +766,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           tabPlacement="start"
           onChange={(key) => {
             if (key !== 'general' && key !== 'plugins') return
-            setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+            selectSettingsTab(key)
           }}
         />
       </div>

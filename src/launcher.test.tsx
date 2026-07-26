@@ -21,10 +21,12 @@ import { LauncherView } from './launcher-view'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherViewSource from './launcher-view.tsx?raw'
 import {
+  compareDecimalRevision,
   parseFileIndexChanged,
   parseFileSearchResponse,
   parseLauncherShown,
-  parsePluginViews,
+  parsePluginInventorySnapshot,
+  parsePluginMutationOutcome,
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
@@ -32,7 +34,8 @@ import {
   type FileSearchResponse,
   type LauncherClient,
   type LauncherShown,
-  type PluginView,
+  type PluginInventorySnapshot,
+  type PluginInventoryView,
   type SearchResponse,
   type SettingsView,
 } from './protocol'
@@ -61,24 +64,59 @@ describe('retired validation settings contract', () => {
   })
 })
 
-describe('plugin protocol', () => {
-  const plugin: PluginView = {
-    id: 'internal.math',
-    version: '1.0.0',
-    trigger: '/math',
-    description: '# Math',
+function installedPlugin(version = '1.0.0', description = '# Math', id = 'internal.math'): PluginInventoryView {
+  return {
+    key: `plugin:${id}`,
+    id,
+    displayName: id,
+    installed: { state: 'valid', activeVersion: version, versions: [version], trigger: `/${id}` },
+    development: { state: 'absent' },
+    description: description
+      ? { state: 'available', source: 'installed', markdown: description }
+      : { state: 'unavailable' },
   }
+}
 
-  it('accepts only exact dense plain plugin arrays with unique IDs', () => {
-    expect(parsePluginViews([plugin])).toEqual([plugin])
-    expect(parsePluginViews([])).toEqual([])
-    expect(parsePluginViews([{ ...plugin, extra: true }])).toBeNull()
-    expect(parsePluginViews([{ ...plugin, description: undefined }])).toBeNull()
-    expect(parsePluginViews([plugin, { ...plugin }])).toBeNull()
-    expect(parsePluginViews(Object.assign([plugin], { extra: true }))).toBeNull()
+function developmentPlugin(version = '1.0.0'): PluginInventoryView {
+  return {
+    key: 'plugin:internal-math',
+    id: 'internal.math',
+    displayName: 'internal.math',
+    installed: { state: 'absent' },
+    development: { state: 'valid', version, trigger: '/math' },
+    description: { state: 'available', source: 'development', markdown: '# Math' },
+  }
+}
+
+function pluginInventory(
+  items: PluginInventoryView[] = [],
+  revision = '1',
+): PluginInventorySnapshot {
+  return { revision, items }
+}
+
+describe('plugin protocol', () => {
+  const plugin = installedPlugin()
+
+  it('accepts only exact revisioned dense inventory snapshots', () => {
+    expect(parsePluginInventorySnapshot(pluginInventory([plugin]))).toEqual(pluginInventory([plugin]))
+    expect(parsePluginInventorySnapshot(pluginInventory())).toEqual(pluginInventory())
+    expect(parsePluginInventorySnapshot({ ...pluginInventory(), revision: 1 })).toBeNull()
+    expect(parsePluginInventorySnapshot({ ...pluginInventory(), revision: '01' })).toBeNull()
+    expect(parsePluginInventorySnapshot(pluginInventory([plugin, { ...plugin }]))).toBeNull()
+    expect(parsePluginInventorySnapshot(pluginInventory([{ ...plugin, extra: true } as never]))).toBeNull()
     const sparse = new Array(1)
-    expect(parsePluginViews(sparse)).toBeNull()
-    expect(parsePluginViews([Object.assign(Object.create({}), plugin)])).toBeNull()
+    expect(parsePluginInventorySnapshot({ revision: '1', items: sparse })).toBeNull()
+    expect(parsePluginInventorySnapshot(Object.assign(Object.create({}), pluginInventory()))).toBeNull()
+  })
+
+  it('parses mutation revisions and compares the full u64 range without Number', () => {
+    expect(parsePluginMutationOutcome({ revision: '18446744073709551615' })).toEqual({
+      revision: '18446744073709551615',
+    })
+    expect(parsePluginMutationOutcome({ revision: '18446744073709551616' })).toBeNull()
+    expect(compareDecimalRevision('9007199254740991', '9007199254740992')).toBe(-1)
+    expect(compareDecimalRevision('18446744073709551614', '18446744073709551615')).toBe(-1)
   })
 })
 
@@ -153,14 +191,10 @@ function fakeClient() {
     setFilePreviewPreference: vi.fn(async () => undefined),
     setThemePreference: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
-    listPlugins: vi.fn(async () => []),
-    reloadPlugin: vi.fn(async ({ pluginId }) => ({
-      id: pluginId,
-      version: '1.0.0',
-      trigger: `/${pluginId}`,
-      description: null,
-    })),
-    deletePlugin: vi.fn(async () => undefined),
+    listPlugins: vi.fn(async () => pluginInventory()),
+    installPlugin: vi.fn(async () => ({ revision: '2' })),
+    reloadPlugin: vi.fn(async () => ({ revision: '2' })),
+    deletePlugin: vi.fn(async () => ({ revision: '2' })),
     loadSettings: vi.fn(async () => emptySettings),
     saveSettings: vi.fn(async () => undefined),
     saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
@@ -1523,26 +1557,24 @@ describe('settings ownership', () => {
 })
 
 describe('plugin settings ownership', () => {
-  const pluginV1: PluginView = {
-    id: 'internal.math',
-    version: '1.0.0',
-    trigger: '/math',
-    description: '# Math',
-  }
-  const pluginV2: PluginView = { ...pluginV1, version: '2.0.0', description: '# Math 2' }
+  const pluginV1 = installedPlugin()
+  const pluginV2 = installedPlugin('2.0.0', '# Math 2')
 
-  async function pluginCore(list: Promise<PluginView[]> | PluginView[] = [pluginV1]) {
+  async function pluginCore(
+    list: Promise<PluginInventorySnapshot> | PluginInventorySnapshot = pluginInventory([pluginV1]),
+  ) {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     vi.mocked(fake.client.listPlugins).mockReturnValueOnce(Promise.resolve(list))
     const core = createLauncherCore(fake.client)
     await core.start()
     fake.emit(shown('plugin-settings', 'settings'))
+    void core.activatePlugins()
     return { core, ...fake }
   }
 
   it('keeps list loading, error, empty, and retry independent from settings state', async () => {
-    const pending = deferred<PluginView[]>()
+    const pending = deferred<PluginInventorySnapshot>()
     const { core, client } = await pluginCore(pending.promise)
     expect(core.getSnapshot().plugins).toMatchObject({ status: 'loading', items: [] })
 
@@ -1551,124 +1583,142 @@ describe('plugin settings ownership', () => {
     expect(core.getSnapshot().plugins?.error).toBe('无法加载插件清单。')
     expect(core.getSnapshot().settings?.autostart).toBe(false)
 
-    vi.mocked(client.listPlugins).mockResolvedValueOnce([])
+    vi.mocked(client.listPlugins).mockResolvedValueOnce(pluginInventory())
     await core.reloadPlugins()
     expect(core.getSnapshot().plugins).toMatchObject({ status: 'ready', items: [] })
     expect(core.getSnapshot().settings?.autostart).toBe(false)
   })
 
   it('ignores an older list response after reentering settings', async () => {
-    const first = deferred<PluginView[]>()
-    const second = deferred<PluginView[]>()
+    const first = deferred<PluginInventorySnapshot>()
+    const second = deferred<PluginInventorySnapshot>()
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     vi.mocked(fake.client.listPlugins).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
     const core = createLauncherCore(fake.client)
     await core.start()
     fake.emit(shown('list-first', 'settings'))
+    void core.activatePlugins()
     fake.emit(shown('list-launcher', 'launcher'))
     fake.emit(shown('list-second', 'settings'))
+    void core.activatePlugins()
 
-    second.resolve([pluginV2])
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0'))
-    first.resolve([pluginV1])
+    second.resolve(pluginInventory([pluginV2], '2'))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '2.0.0' }))
+    first.resolve(pluginInventory([pluginV1], '1'))
     await first.promise
-    expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0')
+    expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '2.0.0' })
     expect(fake.client.listPlugins).toHaveBeenCalledTimes(2)
   })
 
-  it('updates only the active row for reload and removes it after confirmed delete', async () => {
+  it('never applies mutation rows directly and reconciles reload and delete outcomes', async () => {
     const { core, client } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    const reload = deferred<PluginView>()
-    vi.mocked(client.reloadPlugin).mockReturnValueOnce(reload.promise)
-    const reloading = core.reloadPlugin(pluginV1.id)
+    vi.mocked(client.listPlugins).mockResolvedValueOnce(pluginInventory([pluginV2], '2'))
+    const reloading = core.reloadPlugin(pluginV1.id!)
     expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'reload' })
-    reload.resolve(pluginV2)
     await reloading
-    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ version: '2.0.0' })
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '2.0.0' }))
 
-    const remove = deferred<void>()
-    vi.mocked(client.deletePlugin).mockReturnValueOnce(remove.promise)
-    const deleting = core.deletePlugin(pluginV1.id)
+    vi.mocked(client.deletePlugin).mockResolvedValueOnce({ revision: '3' })
+    vi.mocked(client.listPlugins).mockResolvedValueOnce(pluginInventory([], '3'))
+    const deleting = core.deletePlugin(pluginV1.id!)
     expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'delete' })
-    remove.resolve()
     await deleting
-    expect(core.getSnapshot().plugins?.items).toEqual([])
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items).toEqual([]))
   })
 
-  it('keeps plugin row mutation independent from an immediate settings save', async () => {
+  it('keeps a pending plugin mutation owned across refresh and rejects a duplicate command', async () => {
     const { core, client } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    const reload = deferred<PluginView>()
-    vi.mocked(client.reloadPlugin).mockReturnValueOnce(reload.promise)
-    const reloading = core.reloadPlugin(pluginV1.id)
+    const mutation = deferred<{ revision: string }>()
+    vi.mocked(client.reloadPlugin).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.listPlugins).mockResolvedValue(pluginInventory([pluginV1], '1'))
 
-    core.setAutostart(true)
-    await vi.waitFor(() => expect(client.saveSettings).toHaveBeenCalledOnce())
+    void core.reloadPlugin(pluginV1.id!)
+    await core.reloadPlugins()
+
     expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ operation: 'reload' })
-    reload.resolve(pluginV2)
-    await reloading
-    expect(core.getSnapshot().plugins?.items[0]).toMatchObject({ version: '2.0.0' })
+    void core.reloadPlugin(pluginV1.id!)
+    expect(client.reloadPlugin).toHaveBeenCalledTimes(1)
+
+    mutation.resolve({ revision: '2' })
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+  })
+
+  it('installs a development-only plugin then reconciles from backend inventory', async () => {
+    const source = developmentPlugin()
+    const installed = installedPlugin()
+    const { core, client } = await pluginCore(pluginInventory([source]))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    vi.mocked(client.listPlugins).mockResolvedValueOnce(pluginInventory([installed], '2'))
+
+    await core.installPlugin(source.id!)
+
+    expect(client.installPlugin).toHaveBeenCalledWith({ pluginId: source.id })
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.installed.state).toBe('valid'))
   })
 
   it('reconciles a stale reload after the new view first receives an old snapshot', async () => {
     const { core, client, emit } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    const mutation = deferred<PluginView>()
-    const enteredList = deferred<PluginView[]>()
-    const reconciliation = deferred<PluginView[]>()
+    const mutation = deferred<{ revision: string }>()
+    const enteredList = deferred<PluginInventorySnapshot>()
+    const reconciliation = deferred<PluginInventorySnapshot>()
     vi.mocked(client.reloadPlugin).mockReturnValueOnce(mutation.promise)
     vi.mocked(client.listPlugins)
       .mockReturnValueOnce(enteredList.promise)
       .mockReturnValueOnce(reconciliation.promise)
-    void core.reloadPlugin(pluginV1.id)
+    void core.reloadPlugin(pluginV1.id!)
 
     emit(shown('plugin-launcher', 'launcher'))
     emit(shown('plugin-settings-next', 'settings'))
-    enteredList.resolve([pluginV1])
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('1.0.0'))
-    mutation.resolve(pluginV2)
+    void core.activatePlugins()
+    enteredList.resolve(pluginInventory([pluginV1], '1'))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '1.0.0' }))
+    mutation.resolve({ revision: '2' })
     await vi.waitFor(() => expect(client.listPlugins).toHaveBeenCalledTimes(3))
     expect(core.getSnapshot().plugins?.status).toBe('loading')
-    reconciliation.resolve([pluginV2])
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0'))
+    reconciliation.resolve(pluginInventory([pluginV2], '2'))
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '2.0.0' }))
   })
 
   it('reconciles a stale delete without applying the old row response directly', async () => {
     const { core, client, emit } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    const mutation = deferred<void>()
-    const enteredList = deferred<PluginView[]>()
-    const reconciliation = deferred<PluginView[]>()
+    const mutation = deferred<{ revision: string }>()
+    const enteredList = deferred<PluginInventorySnapshot>()
+    const reconciliation = deferred<PluginInventorySnapshot>()
     vi.mocked(client.deletePlugin).mockReturnValueOnce(mutation.promise)
     vi.mocked(client.listPlugins)
       .mockReturnValueOnce(enteredList.promise)
       .mockReturnValueOnce(reconciliation.promise)
-    void core.deletePlugin(pluginV1.id)
+    void core.deletePlugin(pluginV1.id!)
 
     emit(shown('delete-launcher', 'launcher'))
     emit(shown('delete-settings-next', 'settings'))
-    enteredList.resolve([pluginV1])
+    void core.activatePlugins()
+    enteredList.resolve(pluginInventory([pluginV1], '1'))
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.items).toHaveLength(1))
-    mutation.resolve()
+    mutation.resolve({ revision: '2' })
     await vi.waitFor(() => expect(client.listPlugins).toHaveBeenCalledTimes(3))
     expect(core.getSnapshot().plugins?.status).toBe('loading')
-    reconciliation.resolve([])
+    reconciliation.resolve(pluginInventory([], '2'))
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.items).toEqual([]))
   })
 
   it('drops a stale mutation error and reconciles the current view instead', async () => {
     const { core, client, emit } = await pluginCore()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    const mutation = deferred<PluginView>()
+    const mutation = deferred<{ revision: string }>()
     vi.mocked(client.reloadPlugin).mockReturnValueOnce(mutation.promise)
     vi.mocked(client.listPlugins)
-      .mockResolvedValueOnce([pluginV1])
-      .mockResolvedValueOnce([pluginV1])
-    void core.reloadPlugin(pluginV1.id)
+      .mockResolvedValueOnce(pluginInventory([pluginV1], '1'))
+      .mockResolvedValueOnce(pluginInventory([pluginV1], '1'))
+    void core.reloadPlugin(pluginV1.id!)
     emit(shown('failure-launcher', 'launcher'))
     emit(shown('failure-settings-next', 'settings'))
+    void core.activatePlugins()
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
 
     mutation.reject({ code: 'pluginReloadFailed', message: 'private old error' })
@@ -2094,20 +2144,21 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
-    vi.mocked(fake.client.listPlugins).mockResolvedValue([])
+    vi.mocked(fake.client.listPlugins).mockResolvedValue(pluginInventory())
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('settings-tabs-first', 'settings')))
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
+    expect(core.getSnapshot().plugins?.status).toBe('idle')
 
     const settingsLoads = vi.mocked(fake.client.loadSettings).mock.calls.length
     const pluginLoads = vi.mocked(fake.client.listPlugins).mock.calls.length
     const pluginTab = await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
     expect(mounted.host.querySelector('.plugin-inventory')).toBeTruthy()
     expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeNull()
     expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
-    expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads)
+    expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 1)
 
     await act(async () => {
       pluginTab.dispatchEvent(
@@ -2123,9 +2174,10 @@ describe('React view and accessibility', () => {
     expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
     expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
     expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
-    expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads)
+    expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 1)
 
     await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 2))
     await act(async () => fake.emit(shown('settings-tabs-launcher', 'launcher')))
     await act(async () => fake.emit(shown('settings-tabs-second', 'settings')))
     await vi.waitFor(() => expect(document.activeElement).toBe(settingsTab(mounted.host, '通用')))
@@ -2143,9 +2195,7 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings)
       .mockResolvedValueOnce(settingsFixture)
       .mockRejectedValueOnce({ code: 'settingsFailed', message: 'private settings error' })
-    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce([
-      { id: 'internal.math', version: '1.0.0', trigger: '/math', description: null },
-    ])
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce(pluginInventory([installedPlugin('1.0.0', '')]))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2174,7 +2224,6 @@ describe('React view and accessibility', () => {
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('plugin-tab-error', 'settings')))
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('error'))
 
     const hotkey = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
     expect(hotkey).toBeTruthy()
@@ -2182,6 +2231,7 @@ describe('React view and accessibility', () => {
     expect(mounted.host.textContent).not.toContain('无法加载插件清单。')
 
     await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('error'))
     expect(mounted.host.querySelector('[role="alert"]')?.textContent).toBe('无法加载插件清单。')
     expect(mounted.host.textContent).not.toContain('private plugin error')
 
@@ -2195,29 +2245,34 @@ describe('React view and accessibility', () => {
   it('keeps a plugin reload running while its tab is hidden', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    const plugin = { id: 'internal.math', version: '1.0.0', trigger: '/math', description: null }
-    const reload = deferred<PluginView>()
+    const plugin = installedPlugin('1.0.0', '')
+    const reload = deferred<{ revision: string }>()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
-    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce([plugin])
+    vi.mocked(fake.client.listPlugins)
+      .mockResolvedValueOnce(pluginInventory([plugin], '1'))
+      .mockResolvedValueOnce(pluginInventory([installedPlugin('2.0.0', '')], '2'))
+      .mockResolvedValueOnce(pluginInventory([installedPlugin('2.0.0', '')], '2'))
     vi.mocked(fake.client.reloadPlugin).mockReturnValueOnce(reload.promise)
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('settings-hidden-plugin', 'settings')))
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
     await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
 
     const reloadButton = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')].find(
       (button) => button.textContent?.trim() === '重新加载',
     )!
     await act(async () => reloadButton.click())
     await activateSettingsTab(mounted.host, '通用')
-    reload.resolve({ ...plugin, version: '2.0.0' })
-    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.version).toBe('2.0.0'))
+    await act(async () => reload.resolve({ revision: '2' }))
+    expect(fake.client.listPlugins).toHaveBeenCalledTimes(1)
+    expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '1.0.0' })
     expect(mounted.host.querySelector('.plugin-inventory')).toBeNull()
 
     await activateSettingsTab(mounted.host, '插件')
-    expect(mounted.host.querySelector('.plugin-title-line span')?.textContent).toBe('2.0.0')
+    await vi.waitFor(() => expect(core.getSnapshot().plugins?.items[0]?.installed).toMatchObject({ activeVersion: '2.0.0' }))
+    expect(mounted.host.textContent).toContain('2.0.0')
 
     await mounted.unmount()
     core.destroy()
@@ -2467,15 +2522,16 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
-    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce([
-      {
-        id: 'internal.math',
-        version: '1.0.0',
-        trigger: '/math',
-        description: '# Math\n\n- item\n\n**bold** `code` [link](https://example.com) ![pixel](https://example.com/p.png)\n\n<strong>raw</strong>',
-      },
-      { id: 'plain', version: '1.0.0', trigger: '/plain', description: null },
-    ])
+    const versionedPlugin = installedPlugin(
+        '1.0.0',
+        '# Math\n\n- item\n\n**bold** `code` [link](https://example.com) ![pixel](https://example.com/p.png)\n\n<strong>raw</strong>',
+      )
+    if (versionedPlugin.installed.state !== 'valid') throw new Error('fixture must be installed')
+    versionedPlugin.installed.versions = ['0.9.0', '1.0.0']
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce(pluginInventory([
+      versionedPlugin,
+      installedPlugin('1.0.0', '', 'plain'),
+    ]))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2484,6 +2540,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('.plugin-item')).toHaveLength(2))
 
     expect(mounted.host.querySelector('.plugin-item h3')?.textContent).toBe('internal.math')
+    expect(mounted.host.textContent).toContain('已安装版本：0.9.0、1.0.0')
     expect(mounted.host.querySelector('.plugin-description h1')?.textContent).toBe('Math')
     expect(mounted.host.querySelector('.plugin-description li')?.textContent).toBe('item')
     expect(mounted.host.querySelector('.plugin-description strong')?.textContent).toBe('bold')
@@ -2550,10 +2607,11 @@ describe('real adapter and startup', () => {
     })
 
     tauriCapture.invoke.mockClear()
-    const plugin = { id: 'internal.math', version: '1.0.0', trigger: '/math', description: null }
     tauriCapture.invoke.mockImplementation((command) => {
-      if (command === 'list_plugins') return Promise.resolve([plugin])
-      if (command === 'reload_plugin') return Promise.resolve(plugin)
+      if (command === 'list_plugins') return Promise.resolve(pluginInventory([installedPlugin()]))
+      if (command === 'install_plugin' || command === 'reload_plugin' || command === 'delete_plugin') {
+        return Promise.resolve({ revision: '2' })
+      }
       return Promise.resolve(undefined)
     })
     const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const }
@@ -2563,6 +2621,7 @@ describe('real adapter and startup', () => {
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
     await main.client.listPlugins()
+    await main.client.installPlugin({ pluginId: 'internal.math' })
     await main.client.reloadPlugin({ pluginId: 'internal.math' })
     await main.client.deletePlugin({ pluginId: 'internal.math' })
     await main.client.hideLauncher()
@@ -2573,6 +2632,7 @@ describe('real adapter and startup', () => {
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
       ['list_plugins', []],
+      ['install_plugin', [{ pluginId: 'internal.math' }]],
       ['reload_plugin', [{ pluginId: 'internal.math' }]],
       ['delete_plugin', [{ pluginId: 'internal.math' }]],
       ['hide_launcher', []],

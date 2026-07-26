@@ -8,6 +8,7 @@
     "allow-search-files",
     "allow-execute-result",
     "allow-list-plugins",
+    "allow-install-plugin",
     "allow-reload-plugin",
     "allow-delete-plugin",
     "allow-load-settings",

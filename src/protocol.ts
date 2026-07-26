@@ -33,11 +33,36 @@ export interface HotkeySettingsView {
   hotkey: string
 }
 
-export interface PluginView {
-  id: string
-  version: string
-  trigger: string
-  description: string | null
+export type InstalledPluginView =
+  | { state: 'absent' }
+  | { state: 'valid'; activeVersion: string; versions: string[]; trigger: string }
+  | { state: 'invalid'; issue: string; activeVersion: string | null; versions: string[] }
+
+export type DevelopmentPluginView =
+  | { state: 'absent' }
+  | { state: 'valid'; version: string; trigger: string }
+  | { state: 'invalid'; reason: string }
+
+export type PluginDescriptionView =
+  | { state: 'unavailable' }
+  | { state: 'available'; source: 'installed' | 'development'; markdown: string }
+
+export interface PluginInventoryView {
+  key: string
+  id: string | null
+  displayName: string
+  installed: InstalledPluginView
+  development: DevelopmentPluginView
+  description: PluginDescriptionView
+}
+
+export interface PluginInventorySnapshot {
+  revision: string
+  items: PluginInventoryView[]
+}
+
+export interface PluginMutationOutcome {
+  revision: string
 }
 
 export type ExecuteOutcome =
@@ -61,6 +86,7 @@ export type CommandErrorCode =
   | 'clipboardWriteFailed'
   | 'pluginPermissionDenied'
   | 'pluginListFailed'
+  | 'pluginInstallFailed'
   | 'pluginReloadFailed'
   | 'pluginDeleteFailed'
   | 'fileNotFound'
@@ -100,9 +126,10 @@ export interface LauncherClient {
     querySequence: number
   }): Promise<FileSearchResponse | null>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
-  listPlugins(): Promise<PluginView[]>
-  reloadPlugin(input: { pluginId: string }): Promise<PluginView>
-  deletePlugin(input: { pluginId: string }): Promise<void>
+  listPlugins(): Promise<PluginInventorySnapshot>
+  installPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
+  reloadPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
+  deletePlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
   loadSettings(): Promise<SettingsView>
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
@@ -136,9 +163,9 @@ export interface SettingsSnapshot {
 }
 
 export type PluginListStatus = 'idle' | 'loading' | 'ready' | 'error'
-export type PluginMutationKind = 'reload' | 'delete'
+export type PluginMutationKind = 'install' | 'reload' | 'delete'
 
-export interface PluginItemSnapshot extends PluginView {
+export interface PluginItemSnapshot extends PluginInventoryView {
   operation?: PluginMutationKind
   error?: string
 }
@@ -257,38 +284,115 @@ function exactDenseArray(value: unknown[]): boolean {
   return keys.every((key, index) => (index < value.length ? key === String(index) : key === 'length'))
 }
 
-function parsePluginView(value: unknown): PluginView | null {
-  const plugin = plainRecord(value)
-  if (!plugin || !exactKeys(plugin, ['description', 'id', 'trigger', 'version'])) return null
-  if (
-    typeof plugin.id !== 'string' ||
-    plugin.id.length === 0 ||
-    typeof plugin.version !== 'string' ||
-    plugin.version.length === 0 ||
-    typeof plugin.trigger !== 'string' ||
-    plugin.trigger.length === 0 ||
-    (plugin.description !== null && typeof plugin.description !== 'string')
-  ) {
-    return null
-  }
-  return plugin as unknown as PluginView
+const installedIssues = new Set([
+  'stateMissing', 'stateMalformed', 'unsupportedStateSchema', 'stateInvariantViolation',
+  'packageMissing', 'packageIdentityMismatch', 'packageDigestMismatch', 'packageInvalid',
+  'transactionRecoveryRequired', 'migrationConflict', 'triggerConflict',
+])
+const developmentIssues = new Set([
+  'invalidManifest', 'invalidId', 'invalidVersion', 'incompatibleHost', 'missingRuntime',
+  'unsafePath', 'duplicateTrigger', 'resourceLimitExceeded', 'versionContentCollision',
+])
+const CANONICAL_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+
+function canonicalVersion(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const match = CANONICAL_VERSION.exec(value)
+  return match !== null && match.slice(1).every((part) => BigInt(part) <= 4_294_967_295n)
 }
 
-export function parsePluginViews(value: unknown): PluginView[] | null {
+function parseVersions(value: unknown): string[] | null {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || !exactDenseArray(value)) return null
-  const ids = new Set<string>()
-  const plugins: PluginView[] = []
-  for (const valueItem of value) {
-    const plugin = parsePluginView(valueItem)
-    if (!plugin || ids.has(plugin.id)) return null
-    ids.add(plugin.id)
-    plugins.push(plugin)
+  const versions: string[] = []
+  for (const version of value) {
+    if (!canonicalVersion(version) || versions.includes(version)) return null
+    versions.push(version)
   }
-  return plugins
+  return versions
 }
 
-export function parsePlugin(value: unknown): PluginView | null {
-  return parsePluginView(value)
+function parseInstalled(value: unknown): InstalledPluginView | null {
+  const item = plainRecord(value)
+  if (!item || typeof item.state !== 'string') return null
+  if (item.state === 'absent') return exactKeys(item, ['state']) ? { state: 'absent' } : null
+  if (item.state === 'valid') {
+    if (!exactKeys(item, ['activeVersion', 'state', 'trigger', 'versions'])) return null
+    const versions = parseVersions(item.versions)
+    if (!canonicalVersion(item.activeVersion) || !versions?.includes(item.activeVersion) || typeof item.trigger !== 'string' || item.trigger.length === 0) return null
+    return { state: 'valid', activeVersion: item.activeVersion, versions, trigger: item.trigger }
+  }
+  if (item.state === 'invalid') {
+    if (!exactKeys(item, ['activeVersion', 'issue', 'state', 'versions'])) return null
+    const versions = parseVersions(item.versions)
+    if (!versions || typeof item.issue !== 'string' || !installedIssues.has(item.issue)) return null
+    if (item.activeVersion !== null && !canonicalVersion(item.activeVersion)) return null
+    return { state: 'invalid', issue: item.issue, activeVersion: item.activeVersion, versions }
+  }
+  return null
+}
+
+function parseDevelopment(value: unknown): DevelopmentPluginView | null {
+  const item = plainRecord(value)
+  if (!item || typeof item.state !== 'string') return null
+  if (item.state === 'absent') return exactKeys(item, ['state']) ? { state: 'absent' } : null
+  if (item.state === 'valid') {
+    if (!exactKeys(item, ['state', 'trigger', 'version']) || !canonicalVersion(item.version) || typeof item.trigger !== 'string' || item.trigger.length === 0) return null
+    return { state: 'valid', version: item.version, trigger: item.trigger }
+  }
+  if (item.state === 'invalid') {
+    if (!exactKeys(item, ['reason', 'state']) || typeof item.reason !== 'string' || !developmentIssues.has(item.reason)) return null
+    return { state: 'invalid', reason: item.reason }
+  }
+  return null
+}
+
+function parseDescription(value: unknown): PluginDescriptionView | null {
+  const item = plainRecord(value)
+  if (!item || typeof item.state !== 'string') return null
+  if (item.state === 'unavailable') return exactKeys(item, ['state']) ? { state: 'unavailable' } : null
+  if (item.state !== 'available' || !exactKeys(item, ['markdown', 'source', 'state'])) return null
+  if ((item.source !== 'installed' && item.source !== 'development') || typeof item.markdown !== 'string') return null
+  return { state: 'available', source: item.source, markdown: item.markdown }
+}
+
+function parsePluginInventoryView(value: unknown): PluginInventoryView | null {
+  const item = plainRecord(value)
+  if (!item || !exactKeys(item, ['description', 'development', 'displayName', 'id', 'installed', 'key'])) return null
+  const installed = parseInstalled(item.installed)
+  const development = parseDevelopment(item.development)
+  const description = parseDescription(item.description)
+  if (typeof item.key !== 'string' || item.key.length === 0 || typeof item.displayName !== 'string' || item.displayName.length === 0) return null
+  if (item.id !== null && (typeof item.id !== 'string' || item.id.length === 0)) return null
+  if (!installed || !development || !description || (item.id === null && development.state !== 'invalid')) return null
+  return { key: item.key, id: item.id, displayName: item.displayName, installed, development, description }
+}
+
+export function parsePluginInventorySnapshot(value: unknown): PluginInventorySnapshot | null {
+  const snapshot = plainRecord(value)
+  if (!snapshot || !exactKeys(snapshot, ['items', 'revision']) || !canonicalU64(snapshot.revision)) return null
+  if (!Array.isArray(snapshot.items) || Object.getPrototypeOf(snapshot.items) !== Array.prototype || !exactDenseArray(snapshot.items)) return null
+  const keys = new Set<string>()
+  const items: PluginInventoryView[] = []
+  for (const valueItem of snapshot.items) {
+    const item = parsePluginInventoryView(valueItem)
+    if (!item || keys.has(item.key)) return null
+    keys.add(item.key)
+    items.push(item)
+  }
+  return { revision: snapshot.revision, items }
+}
+
+export function parsePluginMutationOutcome(value: unknown): PluginMutationOutcome | null {
+  const outcome = plainRecord(value)
+  return outcome && exactKeys(outcome, ['revision']) && canonicalU64(outcome.revision)
+    ? { revision: outcome.revision }
+    : null
+}
+
+export function compareDecimalRevision(left: string, right: string): -1 | 0 | 1 {
+  if (!canonicalU64(left) || !canonicalU64(right)) throw new TypeError('invalid decimal revision')
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1
+  return left === right ? 0 : left < right ? -1 : 1
 }
 
 function canonicalU64(value: unknown): value is string {

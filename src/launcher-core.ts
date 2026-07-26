@@ -1,4 +1,5 @@
 import {
+  compareDecimalRevision,
   parseFileIndexChanged,
   parseFileSearchResponse,
   parseLauncherShown,
@@ -14,9 +15,9 @@ import {
   type FileSort,
   type LauncherClient,
   type LauncherSnapshot,
+  type PluginInventoryView,
   type PluginListStatus,
   type PluginMutationKind,
-  type PluginView,
   type ResultItem,
   type SettingsLoadStatus,
   type SettingsView,
@@ -44,7 +45,10 @@ export interface LauncherCore {
   readonly setFilePreviewEnabled: (enabled: boolean) => void
   readonly resetSettings: () => Promise<void>
   readonly reloadSettings: () => Promise<void>
+  readonly activatePlugins: () => Promise<void>
+  readonly deactivatePlugins: () => void
   readonly reloadPlugins: () => Promise<void>
+  readonly installPlugin: (pluginId: string) => Promise<void>
   readonly reloadPlugin: (pluginId: string) => Promise<void>
   readonly deletePlugin: (pluginId: string) => Promise<void>
   readonly destroy: () => void
@@ -99,7 +103,7 @@ interface Model {
   plugins: PrivatePluginList
 }
 
-interface PrivatePluginItem extends PluginView {
+interface PrivatePluginItem extends PluginInventoryView {
   operation?: PluginMutationKind
   error?: string
 }
@@ -188,6 +192,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   clipboardWriteFailed: '无法复制到剪贴板。',
   pluginPermissionDenied: '插件无权写入剪贴板。',
   pluginListFailed: '无法加载插件清单。',
+  pluginInstallFailed: '无法安装插件。',
   pluginReloadFailed: '无法重新加载插件。',
   pluginDeleteFailed: '无法删除插件。',
 }
@@ -270,14 +275,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     status: model.plugins.status,
     items: Object.freeze(
       model.plugins.items.map((plugin) =>
-        Object.freeze({
-          id: plugin.id,
-          version: plugin.version,
-          trigger: plugin.trigger,
-          description: plugin.description,
-          ...(plugin.operation === undefined ? {} : { operation: plugin.operation }),
-          ...(plugin.error === undefined ? {} : { error: plugin.error }),
-        }),
+        Object.freeze({ ...plugin }),
       ),
     ),
     ...(model.plugins.error === undefined ? {} : { error: model.plugins.error }),
@@ -360,6 +358,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let pendingSettingsLoadEpoch: number | undefined
   let pluginListOwner: PluginListOwner | undefined
   const pluginMutationOwners = new Map<string, PluginMutationOwner>()
+  const pluginMutationErrors = new Map<string, string>()
+  let highestPluginRevision = '0'
+  let pluginInventoryActive = false
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -858,129 +859,143 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function projectPluginInventory(items: readonly PluginInventoryView[]): PrivatePluginItem[] {
+    return items.map((plugin) => {
+      const pluginId = plugin.id
+      const owner = pluginId === null ? undefined : pluginMutationOwners.get(pluginId)
+      const error = pluginId === null ? undefined : pluginMutationErrors.get(pluginId)
+      return {
+        ...plugin,
+        ...(owner === undefined ? {} : { operation: owner.kind }),
+        ...(error === undefined ? {} : { error }),
+      }
+    })
+  }
+
   function beginPluginList(): Promise<void> | undefined {
     if (destroyed || model.view !== 'settings') return undefined
     const owner = { token: ++token, viewEpoch: model.viewEpoch }
     pluginListOwner = owner
-    model.plugins = { status: 'loading', items: [] }
+    model.plugins = { status: 'loading', items: model.plugins.items }
     publish(true)
-    let pending: Promise<PluginView[]>
+    let pending: ReturnType<LauncherClient['listPlugins']>
     try {
       pending = client.listPlugins()
     } catch (error) {
       pending = Promise.reject(error)
     }
     return pending.then(
-      (plugins) => {
+      (snapshot) => {
         if (!ownsPluginList(owner)) return
         pluginListOwner = undefined
-        model.plugins = { status: 'ready', items: plugins.map((plugin) => ({ ...plugin })) }
+        if (compareDecimalRevision(snapshot.revision, highestPluginRevision) < 0) {
+          model.plugins = { status: 'error', items: model.plugins.items, error: ERROR_TEXT.pluginListFailed }
+          publish(true)
+          return
+        }
+        highestPluginRevision = snapshot.revision
+        const currentIds = new Set(snapshot.items.flatMap((plugin) => plugin.id === null ? [] : [plugin.id]))
+        for (const pluginId of pluginMutationErrors.keys()) {
+          if (!currentIds.has(pluginId)) pluginMutationErrors.delete(pluginId)
+        }
+        model.plugins = { status: 'ready', items: projectPluginInventory(snapshot.items) }
         publish(true)
       },
       (error: unknown) => {
         if (!ownsPluginList(owner)) return
         pluginListOwner = undefined
-        model.plugins = { status: 'error', items: [], error: errorText(error) }
+        model.plugins = { status: 'error', items: model.plugins.items, error: errorText(error) }
         publish(true)
       },
     )
   }
 
-  async function reloadPlugins(): Promise<void> {
+  async function activatePlugins(): Promise<void> {
+    if (destroyed || model.view !== 'settings') return
+    pluginInventoryActive = true
     await beginPluginList()
   }
 
-  function reconcilePluginsAfterStaleMutation(): void {
-    if (!destroyed && model.view === 'settings') void beginPluginList()
+  function deactivatePlugins(): void {
+    pluginInventoryActive = false
+  }
+
+  async function reloadPlugins(): Promise<void> {
+    pluginInventoryActive = true
+    await beginPluginList()
   }
 
   function ownsPluginMutation(owner: PluginMutationOwner): boolean {
     return pluginMutationOwners.get(owner.pluginId)?.token === owner.token
   }
 
-  function finishStalePluginMutation(owner: PluginMutationOwner): void {
-    if (!ownsPluginMutation(owner)) return
-    pluginMutationOwners.delete(owner.pluginId)
-    reconcilePluginsAfterStaleMutation()
+  function reconcilePluginsAfterMutation(): void {
+    if (!destroyed && model.view === 'settings' && pluginInventoryActive) {
+      void beginPluginList()
+    } else {
+      publish(true)
+    }
+  }
+
+  async function mutatePlugin(
+    pluginId: string,
+    kind: PluginMutationKind,
+    mutation: () => Promise<{ revision: string }>,
+  ): Promise<void> {
+    const plugin = model.plugins.items.find((item) => item.id === pluginId)
+    if (
+      destroyed ||
+      model.view !== 'settings' ||
+      model.plugins.status !== 'ready' ||
+      !plugin ||
+      plugin.operation ||
+      pluginMutationOwners.has(pluginId)
+    ) return
+    const owner: PluginMutationOwner = {
+      token: ++token,
+      viewEpoch: model.viewEpoch,
+      pluginId,
+      kind,
+    }
+    pluginMutationOwners.set(pluginId, owner)
+    pluginMutationErrors.delete(pluginId)
+    plugin.operation = kind
+    plugin.error = undefined
+    publish(true)
+    try {
+      const outcome = await mutation()
+      if (!ownsPluginMutation(owner)) return
+      pluginMutationOwners.delete(pluginId)
+      pluginMutationErrors.delete(pluginId)
+      if (compareDecimalRevision(outcome.revision, highestPluginRevision) > 0) {
+        highestPluginRevision = outcome.revision
+      }
+      reconcilePluginsAfterMutation()
+    } catch (error) {
+      if (!ownsPluginMutation(owner)) return
+      pluginMutationOwners.delete(pluginId)
+      if (model.view === 'settings' && model.viewEpoch === owner.viewEpoch) {
+        const current = model.plugins.items.find((item) => item.id === pluginId)
+        if (current) {
+          current.operation = undefined
+          current.error = errorText(error)
+          pluginMutationErrors.set(pluginId, current.error)
+        }
+      }
+      reconcilePluginsAfterMutation()
+    }
+  }
+
+  async function installPlugin(pluginId: string): Promise<void> {
+    await mutatePlugin(pluginId, 'install', () => client.installPlugin({ pluginId }))
   }
 
   async function reloadPlugin(pluginId: string): Promise<void> {
-    const plugin = model.plugins.items.find((item) => item.id === pluginId)
-    if (destroyed || model.view !== 'settings' || model.plugins.status !== 'ready' || !plugin || plugin.operation) return
-    const owner: PluginMutationOwner = {
-      token: ++token,
-      viewEpoch: model.viewEpoch,
-      pluginId,
-      kind: 'reload',
-    }
-    pluginMutationOwners.set(pluginId, owner)
-    plugin.operation = 'reload'
-    plugin.error = undefined
-    publish(true)
-    try {
-      const reloaded = await client.reloadPlugin({ pluginId })
-      if (!ownsPluginMutation(owner)) return
-      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
-        finishStalePluginMutation(owner)
-        return
-      }
-      pluginMutationOwners.delete(pluginId)
-      const index = model.plugins.items.findIndex((item) => item.id === pluginId)
-      if (index >= 0) model.plugins.items[index] = { ...reloaded }
-      publish(true)
-    } catch (error) {
-      if (!ownsPluginMutation(owner)) return
-      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
-        finishStalePluginMutation(owner)
-        return
-      }
-      pluginMutationOwners.delete(pluginId)
-      const current = model.plugins.items.find((item) => item.id === pluginId)
-      if (current) {
-        current.operation = undefined
-        current.error = errorText(error)
-      }
-      publish(true)
-    }
+    await mutatePlugin(pluginId, 'reload', () => client.reloadPlugin({ pluginId }))
   }
 
   async function deletePlugin(pluginId: string): Promise<void> {
-    const plugin = model.plugins.items.find((item) => item.id === pluginId)
-    if (destroyed || model.view !== 'settings' || model.plugins.status !== 'ready' || !plugin || plugin.operation) return
-    const owner: PluginMutationOwner = {
-      token: ++token,
-      viewEpoch: model.viewEpoch,
-      pluginId,
-      kind: 'delete',
-    }
-    pluginMutationOwners.set(pluginId, owner)
-    plugin.operation = 'delete'
-    plugin.error = undefined
-    publish(true)
-    try {
-      await client.deletePlugin({ pluginId })
-      if (!ownsPluginMutation(owner)) return
-      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
-        finishStalePluginMutation(owner)
-        return
-      }
-      pluginMutationOwners.delete(pluginId)
-      model.plugins.items = model.plugins.items.filter((item) => item.id !== pluginId)
-      publish(true)
-    } catch (error) {
-      if (!ownsPluginMutation(owner)) return
-      if (model.view !== 'settings' || model.viewEpoch !== owner.viewEpoch) {
-        finishStalePluginMutation(owner)
-        return
-      }
-      pluginMutationOwners.delete(pluginId)
-      const current = model.plugins.items.find((item) => item.id === pluginId)
-      if (current) {
-        current.operation = undefined
-        current.error = errorText(error)
-      }
-      publish(true)
-    }
+    await mutatePlugin(pluginId, 'delete', () => client.deletePlugin({ pluginId }))
   }
 
   function shown(payload: unknown): void {
@@ -994,6 +1009,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.viewEpoch += 1
     model.invocationId = event.invocationId
     model.view = event.target
+    pluginInventoryActive = false
     model.queryControlValue = model.query
     model.querySequence = 0
     searchToken = ++token
@@ -1018,7 +1034,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     if (event.target === 'settings') {
       void drainSettingsLoad()
-      void beginPluginList()
     }
   }
 
@@ -1604,7 +1619,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setFilePreviewEnabled,
     resetSettings,
     reloadSettings,
+    activatePlugins,
+    deactivatePlugins,
     reloadPlugins,
+    installPlugin,
     reloadPlugin,
     deletePlugin,
     destroy,

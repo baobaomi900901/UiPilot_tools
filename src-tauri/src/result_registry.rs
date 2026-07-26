@@ -57,6 +57,22 @@ pub(crate) struct QueryToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DomainEpochExhausted;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PluginDomainEpochReservation {
+    expected: u64,
+    next: u64,
+    nonce: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginDomainReservationError {
+    Busy,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PluginDomainReservationMismatch;
+
 struct ResultSet {
     request_id: String,
     domain: QueryDomain,
@@ -72,11 +88,13 @@ struct RegistryState {
     latest_query_domain: Option<QueryDomain>,
     domain_epochs: [u64; 3],
     domain_exhausted: [bool; 3],
+    plugin_reservation: Option<PluginDomainEpochReservation>,
     current: Option<ResultSet>,
 }
 
 struct RegistryInner {
     next_id: AtomicU64,
+    next_reservation_nonce: AtomicU64,
     state: Mutex<RegistryState>,
 }
 
@@ -90,6 +108,7 @@ impl Default for ResultRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 next_id: AtomicU64::new(0),
+                next_reservation_nonce: AtomicU64::new(0),
                 state: Mutex::new(RegistryState::default()),
             }),
         }
@@ -129,6 +148,7 @@ impl ResultRegistry {
             || state.active_invocation_id.as_deref() != Some(invocation_id)
             || query_sequence <= state.latest_query_sequence
             || state.domain_exhausted[domain.index()]
+            || (domain == QueryDomain::Plugin && state.plugin_reservation.is_some())
         {
             return None;
         }
@@ -166,6 +186,7 @@ impl ResultRegistry {
             || token.query_sequence != state.latest_query_sequence
             || Some(token.domain) != state.latest_query_domain
             || state.domain_exhausted[token.domain.index()]
+            || (token.domain == QueryDomain::Plugin && state.plugin_reservation.is_some())
             || token.domain_epoch != state.domain_epochs[token.domain.index()]
             || !authorize()
         {
@@ -228,6 +249,101 @@ impl ResultRegistry {
         state.current = None;
     }
 
+    pub(crate) fn reserve_plugin_epoch(
+        &self,
+    ) -> Result<PluginDomainEpochReservation, PluginDomainReservationError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        let index = QueryDomain::Plugin.index();
+        if state.domain_exhausted[index] {
+            return Err(PluginDomainReservationError::Exhausted);
+        }
+        if state.plugin_reservation.is_some() {
+            return Err(PluginDomainReservationError::Busy);
+        }
+        let expected = state.domain_epochs[index];
+        let Some(next) = expected.checked_add(1) else {
+            state.domain_exhausted[index] = true;
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.domain == QueryDomain::Plugin)
+            {
+                state.current = None;
+            }
+            return Err(PluginDomainReservationError::Exhausted);
+        };
+        let nonce = self
+            .inner
+            .next_reservation_nonce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                state.domain_exhausted[index] = true;
+                state.current = None;
+                PluginDomainReservationError::Exhausted
+            })?
+            + 1;
+        let reservation = PluginDomainEpochReservation {
+            expected,
+            next,
+            nonce,
+        };
+        state.plugin_reservation = Some(reservation);
+        Ok(reservation)
+    }
+
+    pub(crate) fn cancel_reserved_plugin_epoch(
+        &self,
+        reservation: PluginDomainEpochReservation,
+    ) -> Result<(), PluginDomainReservationMismatch> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        if state.plugin_reservation != Some(reservation)
+            || state.domain_epochs[QueryDomain::Plugin.index()] != reservation.expected
+        {
+            return Err(PluginDomainReservationMismatch);
+        }
+        state.plugin_reservation = None;
+        Ok(())
+    }
+
+    pub(crate) fn commit_reserved_plugin_epoch(
+        &self,
+        reservation: PluginDomainEpochReservation,
+    ) -> Result<(), PluginDomainReservationMismatch> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        let index = QueryDomain::Plugin.index();
+        if state.plugin_reservation != Some(reservation)
+            || state.domain_exhausted[index]
+            || state.domain_epochs[index] != reservation.expected
+            || reservation.next != reservation.expected + 1
+        {
+            return Err(PluginDomainReservationMismatch);
+        }
+        state.domain_epochs[index] = reservation.next;
+        state.plugin_reservation = None;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.domain == QueryDomain::Plugin)
+        {
+            state.current = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn invalidate_domain(
         &self,
         domain: QueryDomain,
@@ -237,6 +353,12 @@ impl ResultRegistry {
             .state
             .lock()
             .expect("result registry lock poisoned");
+        if domain == QueryDomain::Plugin && state.plugin_reservation.is_some() {
+            state.domain_exhausted[domain.index()] = true;
+            state.plugin_reservation = None;
+            state.current = None;
+            return Err(DomainEpochExhausted);
+        }
         let epoch = &mut state.domain_epochs[domain.index()];
         let Some(next) = epoch.checked_add(1) else {
             state.domain_exhausted[domain.index()] = true;
@@ -553,6 +675,94 @@ mod tests {
             vec![(item("", "Application"), action("application"))],
         )
         .is_some());
+    }
+
+    #[test]
+    fn plugin_epoch_reservation_blocks_tokens_and_cancel_restores_current_epoch() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let old = registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 1)
+            .unwrap();
+        let reservation = registry.reserve_plugin_epoch().unwrap();
+
+        assert!(registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 2)
+            .is_none());
+        assert!(registry
+            .publish_if_latest(
+                old,
+                vec![(item("", "Plugin"), action("old"))],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .is_none());
+        registry.cancel_reserved_plugin_epoch(reservation).unwrap();
+        assert!(registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 2)
+            .is_some());
+    }
+
+    #[test]
+    fn committed_plugin_epoch_rejects_old_token_and_clears_plugin_result() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let old = registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 1)
+            .unwrap();
+        let response = registry
+            .publish_if_latest(
+                old,
+                vec![(item("", "Plugin"), action("old"))],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+        let reservation = registry.reserve_plugin_epoch().unwrap();
+        registry.commit_reserved_plugin_epoch(reservation).unwrap();
+
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[0].0),
+            Err(RegistryError::StaleRequest)
+        );
+        assert!(registry
+            .publish_if_latest(
+                old,
+                vec![(item("", "Plugin"), action("old"))],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn plugin_epoch_allows_only_one_reservation() {
+        let registry = ResultRegistry::default();
+        let reservation = registry.reserve_plugin_epoch().unwrap();
+        assert_eq!(
+            registry.reserve_plugin_epoch(),
+            Err(super::PluginDomainReservationError::Busy)
+        );
+        registry.cancel_reserved_plugin_epoch(reservation).unwrap();
+    }
+
+    #[test]
+    fn plugin_epoch_overflow_is_terminal_without_a_reservation() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        registry.inner.state.lock().unwrap().domain_epochs[QueryDomain::Plugin.index()] = u64::MAX;
+
+        assert_eq!(
+            registry.reserve_plugin_epoch(),
+            Err(super::PluginDomainReservationError::Exhausted)
+        );
+        assert_eq!(
+            registry.reserve_plugin_epoch(),
+            Err(super::PluginDomainReservationError::Exhausted)
+        );
+        assert!(registry
+            .begin_query(QueryDomain::Plugin, "inv-1", 1)
+            .is_none());
     }
 
     #[test]

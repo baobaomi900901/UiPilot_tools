@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt, fs, io,
+    fmt, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -129,7 +130,7 @@ pub(crate) struct PluginManager {
 struct PluginManagerConfig {
     app_data_dir: PathBuf,
     plugin_root: PathBuf,
-    quarantine_root: PathBuf,
+    transaction_root: PathBuf,
     host_version: Version,
     development_root: Option<PathBuf>,
 }
@@ -230,7 +231,7 @@ impl PluginManagerState {
             staged_assets: HashMap::new(),
             ownership,
             latest_generations,
-            inventory_revision: 0,
+            inventory_revision: 1,
         }
     }
 }
@@ -250,6 +251,16 @@ impl PluginManager {
         }
     }
 
+    fn next_durable_id(&self) -> Result<String, PluginManagementError> {
+        let sequence = self
+            .next_quarantine
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        Ok(format!("{:016x}{:016x}", std::process::id(), sequence))
+    }
+
     pub(crate) fn load(
         &self,
         app_data_dir: &Path,
@@ -257,19 +268,33 @@ impl PluginManager {
     ) -> Result<(), PluginSetupError> {
         let plugin_root = app_data_dir.join("plugins");
         let quarantine_root = app_data_dir.join("plugin-quarantine");
+        let transaction_root = app_data_dir.join("plugin-transactions");
+        fs::create_dir_all(&plugin_root)?;
         fs::create_dir_all(&quarantine_root)?;
-        if !ordinary_directory(&quarantine_root) {
+        fs::create_dir_all(transaction_root.join("active"))?;
+        fs::create_dir_all(transaction_root.join("staging"))?;
+        fs::create_dir_all(transaction_root.join("receipts"))?;
+        fs::create_dir_all(app_data_dir.join("plugin-runtime-data"))?;
+        if !ordinary_directory(&plugin_root)
+            || !ordinary_directory(&quarantine_root)
+            || !ordinary_directory(&transaction_root)
+        {
             return Err(PluginSetupError::Io(io::Error::other(
-                "plugin quarantine unavailable",
+                "plugin storage unavailable",
             )));
         }
-        cleanup_quarantine(&quarantine_root);
+        recover_active_transaction(app_data_dir)
+            .map_err(|_| PluginSetupError::Io(io::Error::other("plugin recovery unavailable")))?;
+        run_cleanup_worker(app_data_dir)
+            .map_err(|_| PluginSetupError::Io(io::Error::other("plugin recovery unavailable")))?;
+        migrate_legacy_plugins(&plugin_root, &transaction_root, host_version)
+            .map_err(|_| PluginSetupError::Io(io::Error::other("plugin migration unavailable")))?;
         let catalog = PluginCatalog::load(&plugin_root, host_version)?;
         self.config
             .set(PluginManagerConfig {
                 app_data_dir: app_data_dir.to_path_buf(),
                 plugin_root,
-                quarantine_root,
+                transaction_root,
                 host_version,
                 development_root: development_plugin_root(),
             })
@@ -282,17 +307,6 @@ impl PluginManager {
     pub(crate) fn route(&self, query: &str) -> Option<PluginRoute> {
         let _admission = self.admission.read().ok()?;
         self.state.get()?.read().ok()?.active.route(query)
-    }
-
-    pub(crate) fn list_views(&self) -> Result<Vec<PluginView>, PluginManagementError> {
-        let _admission = self
-            .admission
-            .read()
-            .map_err(|_| PluginManagementError::Unavailable)?;
-        self.state
-            .get()
-            .and_then(|state| state.read().ok().map(|state| state.active.views()))
-            .ok_or(PluginManagementError::Unavailable)
     }
 
     pub(crate) fn list_inventory(&self) -> Result<PluginInventorySnapshot, PluginManagementError> {
@@ -606,12 +620,347 @@ impl PluginManager {
         Ok(window)
     }
 
+    fn stage_candidate(
+        &self,
+        plugin_id: &str,
+        mut candidate: PluginCatalogEntry,
+    ) -> Result<(PluginCatalogEntry, RuntimeIdentity, Arc<RuntimeAttempt>), PluginManagementError>
+    {
+        let attempt = Arc::new(RuntimeAttempt::default());
+        let _admission = self
+            .admission
+            .write()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let mut state = self
+            .state
+            .get()
+            .ok_or(PluginManagementError::Unavailable)?
+            .write()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        if candidate.id != plugin_id
+            || state.active.entries.iter().any(|entry| {
+                entry.id != plugin_id
+                    && (entry.id == candidate.id
+                        || entry.feature.trigger == candidate.feature.trigger)
+            })
+            || state
+                .ownership
+                .values()
+                .any(|ownership| ownership.slot == RuntimeSlot::Staged)
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let active_generation = state
+            .active
+            .entries
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .map_or(0, |entry| entry.generation);
+        let generation = state
+            .latest_generations
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(active_generation)
+            .checked_add(1)
+            .ok_or(PluginManagementError::Unavailable)?;
+        candidate.generation = generation;
+        candidate.window_label = window_label(plugin_id, generation);
+        let identity = candidate.identity();
+        state
+            .latest_generations
+            .insert(plugin_id.to_string(), generation);
+        state
+            .staged_assets
+            .insert(identity.clone(), candidate.clone());
+        state.ownership.insert(
+            identity.clone(),
+            RuntimeOwnership {
+                slot: RuntimeSlot::Staged,
+                attempt: Arc::clone(&attempt),
+            },
+        );
+        Ok((candidate, identity, attempt))
+    }
+
+    fn promote_candidate<F>(
+        &self,
+        registry: &ResultRegistry,
+        candidate: &PluginCatalogEntry,
+        identity: &RuntimeIdentity,
+        attempt: &Arc<RuntimeAttempt>,
+        expected_old: Option<&RuntimeIdentity>,
+        durable_commit: F,
+    ) -> Result<u64, PluginManagementError>
+    where
+        F: FnOnce() -> Result<(), PluginManagementError>,
+    {
+        let _admission = self
+            .admission
+            .write()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let mut state = self
+            .state
+            .get()
+            .ok_or(PluginManagementError::Unavailable)?
+            .write()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let staged_asset_matches = state
+            .staged_assets
+            .get(identity)
+            .is_some_and(|entry| entry.identity() == *identity);
+        let staged_owner_matches = state.ownership.get(identity).is_some_and(|owner| {
+            owner.slot == RuntimeSlot::Staged
+                && Arc::ptr_eq(&owner.attempt, attempt)
+                && owner
+                    .attempt
+                    .snapshot()
+                    .is_some_and(|signal| signal.ready && !signal.failed)
+        });
+        let old_index = expected_old.and_then(|old| {
+            state
+                .active
+                .entries
+                .iter()
+                .position(|entry| entry.id == candidate.id && entry.identity() == *old)
+        });
+        let old_matches = match expected_old {
+            Some(_) => old_index.is_some(),
+            None => !state
+                .active
+                .entries
+                .iter()
+                .any(|entry| entry.id == candidate.id),
+        };
+        if !staged_asset_matches || !staged_owner_matches || !old_matches {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let next_revision = state
+            .inventory_revision
+            .checked_add(1)
+            .ok_or(PluginManagementError::Unavailable)?;
+        let epoch = registry
+            .reserve_plugin_epoch()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        if durable_commit().is_err() {
+            registry
+                .cancel_reserved_plugin_epoch(epoch)
+                .expect("plugin epoch reservation changed while admission was held");
+            return Err(PluginManagementError::Unavailable);
+        }
+
+        if let Some(index) = old_index {
+            state.active.entries[index] = candidate.clone();
+        } else {
+            state.active.entries.push(candidate.clone());
+        }
+        state.staged_assets.remove(identity);
+        if let Some(old) = expected_old {
+            state.ownership.remove(old);
+        }
+        state.ownership.insert(
+            identity.clone(),
+            RuntimeOwnership {
+                slot: RuntimeSlot::Active,
+                attempt: Arc::clone(attempt),
+            },
+        );
+        state.inventory_revision = next_revision;
+        registry
+            .commit_reserved_plugin_epoch(epoch)
+            .expect("plugin epoch reservation changed after durable commit");
+        drop(state);
+
+        if let Some(old) = expected_old {
+            if let Ok(mut pending) = self.pending.write() {
+                pending.retain(|_, query| {
+                    if query.plugin_id == old.plugin_id && query.generation == old.generation {
+                        let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        if let Ok(mut disabled) = self.disabled.write() {
+            disabled.remove(&identity.window_label);
+        }
+        Ok(next_revision)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn install_plugin(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        registry: &ResultRegistry,
+        plugin_id: &str,
+    ) -> Result<PluginMutationOutcome, PluginManagementError> {
+        if !valid_id(plugin_id) {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let config = self
+            .config
+            .get()
+            .cloned()
+            .ok_or(PluginManagementError::Unavailable)?;
+        let development_root = config
+            .development_root
+            .as_ref()
+            .ok_or(PluginManagementError::Unavailable)?
+            .join(plugin_id);
+        let prepared = prepare_development_install(
+            &development_root,
+            &config.plugin_root,
+            &config.transaction_root,
+            config.host_version,
+            plugin_id,
+        )?;
+        let old_identity = self.state.get().and_then(|state| {
+            state
+                .read()
+                .ok()?
+                .active
+                .entries
+                .iter()
+                .find(|entry| entry.id == plugin_id)
+                .map(PluginCatalogEntry::identity)
+        });
+        let (candidate, identity, attempt) =
+            match self.stage_candidate(plugin_id, prepared.candidate.clone()) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    rollback_prepared_install(&prepared)?;
+                    return Err(error);
+                }
+            };
+        let staged_window = match self.create_runtime_window(app, &candidate) {
+            Ok(window) => window,
+            Err(_) => {
+                self.rollback_staged(app, &config, &identity);
+                rollback_prepared_install(&prepared)?;
+                return Err(PluginManagementError::Unavailable);
+            }
+        };
+        if !attempt
+            .wait_until_settled(PLUGIN_RUNTIME_READY_TIMEOUT)
+            .is_some_and(|state| state.ready && !state.failed)
+        {
+            self.rollback_staged(app, &config, &identity);
+            rollback_prepared_install(&prepared)?;
+            return Err(PluginManagementError::Unavailable);
+        }
+        if app.get_webview_window(&identity.window_label).is_none() {
+            self.rollback_staged(app, &config, &identity);
+            rollback_prepared_install(&prepared)?;
+            return Err(PluginManagementError::Unavailable);
+        }
+        let journal_started = if prepared.staged_version_root.is_some() {
+            let transaction_id = self.next_durable_id()?;
+            let first_receipt_id = self.next_durable_id()?;
+            let second_receipt_id = self.next_durable_id()?;
+            let third_receipt_id = old_identity
+                .as_ref()
+                .map(|_| self.next_durable_id())
+                .transpose()?;
+            let fourth_receipt_id = (prepared.mode == InstallMode::ActivateExisting
+                && old_identity.is_some())
+            .then(|| self.next_durable_id())
+            .transpose()?;
+            let mut receipt_ids = vec![first_receipt_id.as_str(), second_receipt_id.as_str()];
+            if let Some(receipt_id) = third_receipt_id.as_deref() {
+                receipt_ids.push(receipt_id);
+            }
+            if let Some(receipt_id) = fourth_receipt_id.as_deref() {
+                receipt_ids.push(receipt_id);
+            }
+            preflight_cleanup_capacity(&config.app_data_dir, &receipt_ids)?;
+            let transaction = build_new_version_install_transaction(
+                &prepared,
+                &config.app_data_dir,
+                &identity,
+                old_identity.as_ref(),
+                if old_identity.is_some() {
+                    PluginTransactionOperation::Update
+                } else {
+                    PluginTransactionOperation::Install
+                },
+                &transaction_id,
+                &receipt_ids,
+            )?;
+            write_prepared_transaction(&config.transaction_root, &transaction)?;
+            true
+        } else {
+            false
+        };
+        let revision = match self.promote_candidate(
+            registry,
+            &candidate,
+            &identity,
+            &attempt,
+            old_identity.as_ref(),
+            || {
+                if journal_started {
+                    commit_prepared_install_transaction(&prepared, &config.transaction_root)
+                } else {
+                    commit_prepared_install(&prepared)
+                }
+            },
+        ) {
+            Ok(revision) => revision,
+            Err(error) => {
+                if journal_started {
+                    self.discard_staged(app, &identity);
+                    rollback_install_transaction(&config.app_data_dir, &config.transaction_root)?;
+                } else {
+                    self.rollback_staged(app, &config, &identity);
+                    rollback_prepared_install(&prepared)?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(old) = old_identity.as_ref() {
+            if let Some(window) = app.get_webview_window(&old.window_label) {
+                let _ = window.close();
+            }
+        }
+        if journal_started {
+            if old_identity.is_some() {
+                handoff_committed_install_cleanup(&config.app_data_dir, &config.transaction_root)?;
+            } else {
+                remove_active_transaction(&config.transaction_root)?;
+            }
+        }
+        if !journal_started {
+            if let Some(old) = old_identity {
+                let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, &old));
+            }
+        }
+        drop(staged_window);
+        Ok(PluginMutationOutcome {
+            revision: revision.to_string(),
+        })
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(crate) fn install_plugin(
+        self: &Arc<Self>,
+        _app: &AppHandle,
+        _registry: &ResultRegistry,
+        _plugin_id: &str,
+    ) -> Result<PluginMutationOutcome, PluginManagementError> {
+        Err(PluginManagementError::Unavailable)
+    }
+
     pub(crate) fn reload_plugin(
         self: &Arc<Self>,
         app: &AppHandle,
         registry: &ResultRegistry,
         plugin_id: &str,
-    ) -> Result<PluginView, PluginManagementError> {
+    ) -> Result<PluginMutationOutcome, PluginManagementError> {
         if !valid_id(plugin_id) {
             return Err(PluginManagementError::Unavailable);
         }
@@ -643,60 +992,13 @@ impl PluginManager {
                 })
                 .ok_or(PluginManagementError::Unavailable)?
         };
-        let mut candidate = load_entry(&old.root, config.host_version)
+        let candidate = load_entry(&old.root, config.host_version)
             .filter(|entry| entry.id == plugin_id)
             .ok_or(PluginManagementError::Unavailable)?;
-        let attempt = Arc::new(RuntimeAttempt::default());
-        let identity = {
-            let _admission = self
-                .admission
-                .write()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            let mut state = self
-                .state
-                .get()
-                .ok_or(PluginManagementError::Unavailable)?
-                .write()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            let current = state
-                .active
-                .entries
-                .iter()
-                .find(|entry| entry.id == plugin_id)
-                .filter(|entry| entry.identity() == old.identity())
-                .ok_or(PluginManagementError::Unavailable)?;
-            if state.active.entries.iter().any(|entry| {
-                entry.id != plugin_id
-                    && (entry.id == candidate.id
-                        || entry.feature.trigger == candidate.feature.trigger)
-            }) {
-                return Err(PluginManagementError::Unavailable);
-            }
-            let generation = state
-                .latest_generations
-                .get(plugin_id)
-                .copied()
-                .unwrap_or(current.generation)
-                .checked_add(1)
-                .ok_or(PluginManagementError::Unavailable)?;
-            candidate.generation = generation;
-            candidate.window_label = window_label(plugin_id, generation);
-            let identity = candidate.identity();
-            state
-                .latest_generations
-                .insert(plugin_id.to_string(), generation);
-            state
-                .staged_assets
-                .insert(identity.clone(), candidate.clone());
-            state.ownership.insert(
-                identity.clone(),
-                RuntimeOwnership {
-                    slot: RuntimeSlot::Staged,
-                    attempt: Arc::clone(&attempt),
-                },
-            );
-            identity
-        };
+        if candidate.snapshot.package_identity != old.snapshot.package_identity {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let (candidate, identity, attempt) = self.stage_candidate(plugin_id, candidate)?;
 
         let staged_window = match self.create_runtime_window(app, &candidate) {
             Ok(window) => window,
@@ -712,84 +1014,53 @@ impl PluginManager {
         }
 
         let old_identity = old.identity();
-        let committed = {
-            let _admission = self
-                .admission
-                .write()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            if app.get_webview_window(&identity.window_label).is_none() {
-                false
-            } else {
-                let mut state = self
-                    .state
-                    .get()
-                    .ok_or(PluginManagementError::Unavailable)?
-                    .write()
-                    .map_err(|_| PluginManagementError::Unavailable)?;
-                let staged_asset_matches = state
-                    .staged_assets
-                    .get(&identity)
-                    .is_some_and(|entry| entry.identity() == identity);
-                let staged_owner_matches = state.ownership.get(&identity).is_some_and(|owner| {
-                    owner.slot == RuntimeSlot::Staged
-                        && Arc::ptr_eq(&owner.attempt, &attempt)
-                        && owner
-                            .attempt
-                            .snapshot()
-                            .is_some_and(|signal| signal.ready && !signal.failed)
-                });
-                let old_index =
-                    state.active.entries.iter().position(|entry| {
-                        entry.id == plugin_id && entry.identity() == old_identity
-                    });
-                if !staged_asset_matches || !staged_owner_matches {
-                    false
-                } else if let Some(old_index) = old_index {
-                    state.active.entries[old_index] = candidate.clone();
-                    state.staged_assets.remove(&identity);
-                    state.ownership.remove(&old_identity);
-                    state.ownership.insert(
-                        identity.clone(),
-                        RuntimeOwnership {
-                            slot: RuntimeSlot::Active,
-                            attempt: Arc::clone(&attempt),
-                        },
-                    );
-                    drop(state);
-                    if let Ok(mut pending) = self.pending.write() {
-                        pending.retain(|_, query| {
-                            if query.plugin_id == old_identity.plugin_id
-                                && query.generation == old_identity.generation
-                            {
-                                let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                    }
-                    if let Ok(mut disabled) = self.disabled.write() {
-                        disabled.remove(&identity.window_label);
-                    }
-                    let _ = registry.invalidate_domain(QueryDomain::Plugin);
-                    true
-                } else {
-                    false
-                }
-            }
-        };
-        if !committed {
+        if app.get_webview_window(&identity.window_label).is_none() {
             drop(staged_window);
             self.rollback_staged(app, &config, &identity);
             return Err(PluginManagementError::Unavailable);
         }
+        verify_catalog_entry_identity(&candidate)?;
+        let previous_operation_id = self.next_durable_id()?;
+        let previous_receipt_id = self.next_durable_id()?;
+        preflight_cleanup_capacity(&config.app_data_dir, &[previous_receipt_id.as_str()])?;
+        let previous_receipt = match stage_runtime_cleanup_receipt(
+            &config.app_data_dir,
+            plugin_id,
+            &old_identity,
+            &previous_operation_id,
+            &previous_receipt_id,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                self.rollback_staged(app, &config, &identity);
+                return Err(error);
+            }
+        };
+        let revision = match self.promote_candidate(
+            registry,
+            &candidate,
+            &identity,
+            &attempt,
+            Some(&old_identity),
+            || Ok(()),
+        ) {
+            Ok(revision) => revision,
+            Err(error) => {
+                fs::remove_file(&previous_receipt)
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                self.rollback_staged(app, &config, &identity);
+                return Err(error);
+            }
+        };
 
         if let Some(window) = app.get_webview_window(&old_identity.window_label) {
             let _ = window.close();
         }
-        let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, &old_identity));
+        handoff_cleanup_receipt(&config.app_data_dir, &previous_receipt)?;
         drop(staged_window);
-        Ok(plugin_view(&candidate))
+        Ok(PluginMutationOutcome {
+            revision: revision.to_string(),
+        })
     }
 
     pub(crate) fn delete_plugin(
@@ -797,128 +1068,249 @@ impl PluginManager {
         app: &AppHandle,
         registry: &ResultRegistry,
         plugin_id: &str,
-    ) -> Result<(), PluginManagementError> {
+    ) -> Result<PluginMutationOutcome, PluginManagementError> {
         if !valid_id(plugin_id) {
             return Err(PluginManagementError::Unavailable);
         }
-        #[cfg(not(windows))]
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let config = self
+            .config
+            .get()
+            .cloned()
+            .ok_or(PluginManagementError::Unavailable)?;
+        let active = {
+            let _admission = self
+                .admission
+                .read()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            self.state
+                .get()
+                .and_then(|state| {
+                    state
+                        .read()
+                        .ok()?
+                        .active
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == plugin_id)
+                        .cloned()
+                })
+                .ok_or(PluginManagementError::Unavailable)?
+        };
+        let container = active
+            .root
+            .parent()
+            .filter(|container| container.parent() == Some(config.plugin_root.as_path()))
+            .ok_or(PluginManagementError::Unavailable)?;
+        let state_path = container.join("active.json");
+        let state_bytes =
+            read_bounded_document(&state_path)?.ok_or(PluginManagementError::Unavailable)?;
+        let state = parse_active_state(&state_bytes, plugin_id)
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        let active_version = state
+            .active_version
+            .as_deref()
+            .ok_or(PluginManagementError::Unavailable)?;
+        let active_record = state
+            .packages
+            .iter()
+            .find(|record| record.version == active_version)
+            .ok_or(PluginManagementError::Unavailable)?;
+        if active.snapshot.package_identity != active_record.identity
+            || directory_identity(&active.root) != Some(active.package_identity)
         {
-            let _ = (app, registry);
             return Err(PluginManagementError::Unavailable);
         }
-        #[cfg(windows)]
-        {
-            let _mutation = self
-                .mutation
-                .lock()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            let config = self
-                .config
-                .get()
-                .cloned()
-                .ok_or(PluginManagementError::Unavailable)?;
-            let active = {
-                let _admission = self
-                    .admission
-                    .read()
-                    .map_err(|_| PluginManagementError::Unavailable)?;
-                self.state
-                    .get()
-                    .and_then(|state| {
-                        state
-                            .read()
-                            .ok()?
-                            .active
-                            .entries
-                            .iter()
-                            .find(|entry| entry.id == plugin_id)
-                            .cloned()
-                    })
-                    .ok_or(PluginManagementError::Unavailable)?
-            };
-            if active.root.parent() != Some(config.plugin_root.as_path()) {
-                return Err(PluginManagementError::Unavailable);
-            }
-            let (package_handle, current_identity) = open_directory_handle(&active.root, true)
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            if current_identity != active.package_identity {
-                return Err(PluginManagementError::Unavailable);
-            }
-            let (_, quarantine_identity) = open_directory_handle(&config.quarantine_root, false)
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            if quarantine_identity.volume != current_identity.volume {
-                return Err(PluginManagementError::Unavailable);
-            }
-            let sequence = self.next_quarantine.fetch_add(1, Ordering::Relaxed);
-            let quarantine_path = config.quarantine_root.join(format!(
-                "removed-{}-{:016x}-{:016x}-{:08x}",
-                plugin_id,
-                active.generation,
-                sequence,
-                std::process::id()
-            ));
-            let identity = active.identity();
-            {
-                let _admission = self
-                    .admission
-                    .write()
-                    .map_err(|_| PluginManagementError::Unavailable)?;
-                let state = self
-                    .state
-                    .get()
-                    .ok_or(PluginManagementError::Unavailable)?
-                    .read()
-                    .map_err(|_| PluginManagementError::Unavailable)?;
-                let current_entry = state.active.entries.iter().any(|entry| {
+        let old_identity = active.identity();
+        let mut remaining = state
+            .packages
+            .into_iter()
+            .filter(|record| record.version != active_version)
+            .collect::<Vec<_>>();
+        remaining.sort_by_key(|record| Version::parse(&record.version));
+
+        let revision = if let Some(fallback_record) = remaining.last().cloned() {
+            let fallback_root = container.join(&fallback_record.version);
+            let fallback = load_entry(&fallback_root, config.host_version)
+                .filter(|entry| {
                     entry.id == plugin_id
-                        && entry.identity() == identity
-                        && entry.package_identity == current_identity
-                });
-                if !current_entry {
+                        && entry.snapshot.package_identity == fallback_record.identity
+                })
+                .ok_or(PluginManagementError::Unavailable)?;
+            let (candidate, identity, attempt) = self.stage_candidate(plugin_id, fallback)?;
+            let staged_window = match self.create_runtime_window(app, &candidate) {
+                Ok(window) => window,
+                Err(_) => {
+                    self.rollback_staged(app, &config, &identity);
                     return Err(PluginManagementError::Unavailable);
                 }
-                drop(state);
-                move_directory_handle(&package_handle, &quarantine_path)
-                    .map_err(|_| PluginManagementError::Unavailable)?;
-                let mut state = self
-                    .state
-                    .get()
-                    .expect("plugin state disappeared during delete")
-                    .write()
-                    .expect("plugin state poisoned during delete");
-                let active_index = state
-                    .active
-                    .entries
-                    .iter()
-                    .position(|entry| entry.id == plugin_id && entry.identity() == identity)
-                    .expect("active plugin changed while delete held admission");
-                state.active.entries.remove(active_index);
-                state.ownership.remove(&identity);
-                state.latest_generations.remove(plugin_id);
-                drop(state);
-                if let Ok(mut pending) = self.pending.write() {
-                    pending.retain(|_, query| {
-                        if query.plugin_id == plugin_id {
-                            let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                }
-                if let Ok(mut disabled) = self.disabled.write() {
-                    disabled.remove(&identity.window_label);
-                }
-                let _ = registry.invalidate_domain(QueryDomain::Plugin);
+            };
+            if !attempt
+                .wait_until_settled(PLUGIN_RUNTIME_READY_TIMEOUT)
+                .is_some_and(|signal| signal.ready && !signal.failed)
+                || app.get_webview_window(&identity.window_label).is_none()
+            {
+                self.rollback_staged(app, &config, &identity);
+                return Err(PluginManagementError::Unavailable);
             }
-            drop(package_handle);
-            if let Some(window) = app.get_webview_window(&identity.window_label) {
-                let _ = window.close();
+            verify_catalog_entry_identity(&candidate)?;
+            let new_state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: plugin_id.to_string(),
+                active_version: Some(fallback_record.version),
+                packages: remaining,
+            };
+            let transaction_id = self.next_durable_id()?;
+            let candidate_receipt_id = self.next_durable_id()?;
+            let package_receipt_id = self.next_durable_id()?;
+            let runtime_receipt_id = self.next_durable_id()?;
+            preflight_cleanup_capacity(
+                &config.app_data_dir,
+                &[
+                    candidate_receipt_id.as_str(),
+                    package_receipt_id.as_str(),
+                    runtime_receipt_id.as_str(),
+                ],
+            )?;
+            let transaction = build_delete_fallback_transaction(DeleteFallbackTransactionInput {
+                app_data_dir: &config.app_data_dir,
+                active: &active,
+                fallback: &candidate,
+                candidate_runtime: &identity,
+                previous_runtime: Some(&old_identity),
+                old_state: durable_state_reference(Some(&state_bytes)),
+                new_state: &new_state,
+                transaction_id: &transaction_id,
+                receipt_ids: &[
+                    &candidate_receipt_id,
+                    &package_receipt_id,
+                    &runtime_receipt_id,
+                ],
+            })?;
+            write_prepared_transaction(&config.transaction_root, &transaction)?;
+            let revision = match self.promote_candidate(
+                registry,
+                &candidate,
+                &identity,
+                &attempt,
+                Some(&old_identity),
+                || {
+                    commit_active_state(&state_path, &new_state)?;
+                    update_transaction_phase(
+                        &config.transaction_root,
+                        PluginTransactionPhase::StateCommitted,
+                        Vec::new(),
+                    )
+                    .expect(
+                        "plugin fallback-delete journal phase failed after durable state commit",
+                    );
+                    Ok(())
+                },
+            ) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    self.discard_staged(app, &identity);
+                    rollback_delete_fallback_transaction(
+                        &config.app_data_dir,
+                        &config.transaction_root,
+                    )?;
+                    return Err(error);
+                }
+            };
+            drop(staged_window);
+            revision
+        } else {
+            let empty_state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: plugin_id.to_string(),
+                active_version: None,
+                packages: Vec::new(),
+            };
+            let transaction_id = self.next_durable_id()?;
+            let package_receipt_id = self.next_durable_id()?;
+            let runtime_receipt_id = self.next_durable_id()?;
+            preflight_cleanup_capacity(
+                &config.app_data_dir,
+                &[package_receipt_id.as_str(), runtime_receipt_id.as_str()],
+            )?;
+            let transaction = build_delete_last_transaction(
+                &config.app_data_dir,
+                &active,
+                durable_state_reference(Some(&state_bytes)),
+                &empty_state,
+                Some(&old_identity),
+                &transaction_id,
+                &[&package_receipt_id, &runtime_receipt_id],
+            )?;
+            write_prepared_transaction(&config.transaction_root, &transaction)?;
+            let _admission = self
+                .admission
+                .write()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            let mut manager_state = self
+                .state
+                .get()
+                .ok_or(PluginManagementError::Unavailable)?
+                .write()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            let active_index = manager_state
+                .active
+                .entries
+                .iter()
+                .position(|entry| entry.id == plugin_id && entry.identity() == old_identity)
+                .ok_or(PluginManagementError::Unavailable)?;
+            let next_revision = manager_state
+                .inventory_revision
+                .checked_add(1)
+                .ok_or(PluginManagementError::Unavailable)?;
+            let epoch = registry
+                .reserve_plugin_epoch()
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            if commit_active_state(&state_path, &empty_state).is_err() {
+                registry
+                    .cancel_reserved_plugin_epoch(epoch)
+                    .expect("plugin epoch reservation changed while admission was held");
+                return Err(PluginManagementError::Unavailable);
             }
-            let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, &identity));
-            let _ = fs::remove_dir_all(quarantine_path);
-            Ok(())
+            update_transaction_phase(
+                &config.transaction_root,
+                PluginTransactionPhase::StateCommitted,
+                Vec::new(),
+            )
+            .expect("plugin delete-last journal phase failed after durable state commit");
+            manager_state.active.entries.remove(active_index);
+            manager_state.ownership.remove(&old_identity);
+            manager_state.inventory_revision = next_revision;
+            registry
+                .commit_reserved_plugin_epoch(epoch)
+                .expect("plugin epoch reservation changed after durable delete commit");
+            drop(manager_state);
+            if let Ok(mut pending) = self.pending.write() {
+                pending.retain(|_, query| {
+                    if query.plugin_id == plugin_id {
+                        let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            if let Ok(mut disabled) = self.disabled.write() {
+                disabled.remove(&old_identity.window_label);
+            }
+            next_revision
+        };
+
+        if let Some(window) = app.get_webview_window(&old_identity.window_label) {
+            let _ = window.close();
         }
+        handoff_committed_delete_cleanup(&config.app_data_dir, &config.transaction_root)?;
+        Ok(PluginMutationOutcome {
+            revision: revision.to_string(),
+        })
     }
 
     fn rollback_staged(
@@ -927,6 +1319,11 @@ impl PluginManager {
         config: &PluginManagerConfig,
         identity: &RuntimeIdentity,
     ) {
+        self.discard_staged(app, identity);
+        let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, identity));
+    }
+
+    fn discard_staged(&self, app: &AppHandle, identity: &RuntimeIdentity) {
         if let Ok(_admission) = self.admission.write() {
             if let Some(state) = self.state.get() {
                 if let Ok(mut state) = state.write() {
@@ -944,7 +1341,6 @@ impl PluginManager {
         if let Some(window) = app.get_webview_window(&identity.window_label) {
             let _ = window.close();
         }
-        let _ = fs::remove_dir_all(runtime_data_directory(&config.app_data_dir, identity));
     }
 
     fn runtime_ready(&self, identity: &RuntimeIdentity) {
@@ -968,18 +1364,38 @@ impl PluginManager {
         let Ok(_admission) = self.admission.write() else {
             return;
         };
-        let ownership = self
-            .state
-            .get()
-            .and_then(|state| state.read().ok()?.ownership.get(identity).cloned());
-        let Some(ownership) = ownership else {
+        let Some(state) = self.state.get() else {
+            return;
+        };
+        let Ok(mut state) = state.write() else {
+            return;
+        };
+        let Some(ownership) = state.ownership.get(identity).cloned() else {
             return;
         };
         if !ownership.attempt.mark_failed() || ownership.slot == RuntimeSlot::Staged {
             return;
         }
+        let Some(next_revision) = state.inventory_revision.checked_add(1) else {
+            drop(state);
+            self.disable_runtime(identity);
+            let _ = registry.invalidate_domain(QueryDomain::Plugin);
+            return;
+        };
+        let epoch = match registry.reserve_plugin_epoch() {
+            Ok(epoch) => epoch,
+            Err(_) => {
+                drop(state);
+                self.disable_runtime(identity);
+                return;
+            }
+        };
+        state.inventory_revision = next_revision;
+        drop(state);
         self.disable_runtime(identity);
-        let _ = registry.invalidate_domain(QueryDomain::Plugin);
+        registry
+            .commit_reserved_plugin_epoch(epoch)
+            .expect("plugin epoch reservation changed during runtime failure");
     }
 
     fn disable_runtime(&self, identity: &RuntimeIdentity) {
@@ -1395,7 +1811,6 @@ pub(crate) struct PluginCatalogEntry {
     pub(crate) permissions: Vec<String>,
     pub(crate) root: PathBuf,
     pub(crate) window_label: String,
-    pub(crate) description: Option<String>,
     pub(crate) generation: u64,
     package_identity: DirectoryIdentity,
     snapshot: Arc<GenerationAssetSnapshot>,
@@ -1487,12 +1902,15 @@ enum CleanupOperation {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
 enum TransactionRoot {
-    PluginRoot,
-    TransactionRoot,
-    RuntimeDataRoot,
-    QuarantineRoot,
+    #[serde(rename = "plugin-root")]
+    Plugin,
+    #[serde(rename = "transaction-root")]
+    Transaction,
+    #[serde(rename = "runtime-data-root")]
+    RuntimeData,
+    #[serde(rename = "quarantine-root")]
+    Quarantine,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1694,6 +2112,7 @@ impl PluginCatalogEntry {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginView {
@@ -1708,6 +2127,12 @@ pub(crate) struct PluginView {
 pub(crate) struct PluginInventorySnapshot {
     pub(crate) revision: String,
     pub(crate) items: Vec<PluginInventoryView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginMutationOutcome {
+    pub(crate) revision: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1854,6 +2279,790 @@ fn parse_active_state(bytes: &[u8], expected_plugin_id: &str) -> Result<ActivePl
     Ok(state)
 }
 
+#[cfg(debug_assertions)]
+struct PreparedInstall {
+    candidate: PluginCatalogEntry,
+    mode: InstallMode,
+    verification_snapshot: GenerationAssetSnapshot,
+    state_path: PathBuf,
+    old_state: DurableStateReference,
+    new_state: ActivePluginStateV1,
+    staged_version_root: Option<PathBuf>,
+    installed_version_root: Option<PathBuf>,
+    remove_container_on_rollback: bool,
+}
+
+#[cfg(debug_assertions)]
+fn prepare_development_install(
+    development_root: &Path,
+    plugin_root: &Path,
+    transaction_root: &Path,
+    host_version: Version,
+    plugin_id: &str,
+) -> Result<PreparedInstall, PluginManagementError> {
+    if !valid_id(plugin_id)
+        || development_root.file_name().and_then(|name| name.to_str()) != Some(plugin_id)
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let development = load_entry(development_root, host_version)
+        .filter(|entry| entry.id == plugin_id)
+        .ok_or(PluginManagementError::Unavailable)?;
+    let version = development.version.to_path_segment();
+    fs::create_dir_all(plugin_root).map_err(|_| PluginManagementError::Unavailable)?;
+    if !ordinary_directory(plugin_root) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let container = plugin_root.join(plugin_id);
+    let remove_container_on_rollback = match fs::create_dir(&container) {
+        Ok(()) => true,
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists && ordinary_directory(&container) =>
+        {
+            false
+        }
+        Err(_) => return Err(PluginManagementError::Unavailable),
+    };
+    let state_path = container.join("active.json");
+    let (old_state, old_state_reference) = match read_bounded_document(&state_path)? {
+        Some(bytes) => (
+            parse_active_state(&bytes, plugin_id)
+                .map_err(|_| PluginManagementError::Unavailable)?,
+            durable_state_reference(Some(&bytes)),
+        ),
+        None => (
+            ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: plugin_id.to_string(),
+                active_version: None,
+                packages: Vec::new(),
+            },
+            durable_state_reference(None),
+        ),
+    };
+    if old_state
+        .active_version
+        .as_deref()
+        .and_then(Version::parse)
+        .is_some_and(|active| development.version <= active)
+    {
+        if remove_container_on_rollback {
+            let _ = fs::remove_dir(&container);
+        }
+        return Err(PluginManagementError::Unavailable);
+    }
+
+    if let Some(record) = old_state
+        .packages
+        .iter()
+        .find(|package| package.version == version)
+        .cloned()
+    {
+        let staging_root = transaction_root.join("staging");
+        fs::create_dir_all(&staging_root).map_err(|_| PluginManagementError::Unavailable)?;
+        if !ordinary_directory(&staging_root) {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let staged_version_root = staging_root.join(format!("{plugin_id}-{version}-activate"));
+        if fs::create_dir(&staged_version_root).is_err() {
+            return Err(PluginManagementError::Unavailable);
+        }
+        if copy_snapshot_files(&development.snapshot, &staged_version_root).is_err() {
+            let _ = fs::remove_dir_all(&staged_version_root);
+            return Err(PluginManagementError::Unavailable);
+        }
+        let verification_snapshot = match scan_package_snapshot(&staged_version_root) {
+            Ok(snapshot)
+                if snapshot.package_identity.digest
+                    == development.snapshot.package_identity.digest =>
+            {
+                snapshot
+            }
+            _ => {
+                let _ = fs::remove_dir_all(&staged_version_root);
+                return Err(PluginManagementError::Unavailable);
+            }
+        };
+        let registered_root = container.join(&version);
+        let candidate = (|| {
+            let snapshot = scan_package_snapshot(&registered_root)
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            if development.snapshot.package_identity.digest != record.identity.digest
+                || snapshot.package_identity != record.identity
+            {
+                return Err(PluginManagementError::Unavailable);
+            }
+            let manifest = manifest_from_snapshot(&snapshot, host_version)
+                .filter(|manifest| manifest.id == plugin_id && manifest.version == version)
+                .ok_or(PluginManagementError::Unavailable)?;
+            catalog_entry_from_snapshot(registered_root, manifest, snapshot)
+                .ok_or(PluginManagementError::Unavailable)
+        })();
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staged_version_root);
+                return Err(error);
+            }
+        };
+        let new_state = ActivePluginStateV1 {
+            schema: 1,
+            plugin_id: plugin_id.to_string(),
+            active_version: Some(version),
+            packages: old_state.packages,
+        };
+        return Ok(PreparedInstall {
+            candidate,
+            mode: InstallMode::ActivateExisting,
+            verification_snapshot,
+            state_path,
+            old_state: old_state_reference,
+            new_state,
+            staged_version_root: Some(staged_version_root),
+            installed_version_root: None,
+            remove_container_on_rollback: false,
+        });
+    }
+
+    let installed_version_root = container.join(&version);
+    if installed_version_root.exists() {
+        if remove_container_on_rollback {
+            let _ = fs::remove_dir(&container);
+        }
+        return Err(PluginManagementError::Unavailable);
+    }
+    let staging_root = transaction_root.join("staging");
+    fs::create_dir_all(&staging_root).map_err(|_| PluginManagementError::Unavailable)?;
+    if !ordinary_directory(&staging_root) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let staged_version_root = staging_root.join(format!("{plugin_id}-{version}-install"));
+    if fs::create_dir(&staged_version_root).is_err() {
+        if remove_container_on_rollback {
+            let _ = fs::remove_dir(&container);
+        }
+        return Err(PluginManagementError::Unavailable);
+    }
+    let copied = copy_snapshot_files(&development.snapshot, &staged_version_root).and_then(|()| {
+        let snapshot = scan_package_snapshot(&staged_version_root)
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        if snapshot.package_identity.digest != development.snapshot.package_identity.digest {
+            return Err(PluginManagementError::Unavailable);
+        }
+        let manifest = manifest_from_snapshot(&snapshot, host_version)
+            .filter(|manifest| manifest.id == plugin_id && manifest.version == version)
+            .ok_or(PluginManagementError::Unavailable)?;
+        let runtime = manifest.runtime.clone();
+        let mut candidate =
+            catalog_entry_from_snapshot(staged_version_root.clone(), manifest, snapshot)
+                .ok_or(PluginManagementError::Unavailable)?;
+        candidate.root = installed_version_root.clone();
+        candidate.runtime = installed_version_root.join(runtime);
+        Ok(candidate)
+    });
+    let candidate = match copied {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staged_version_root);
+            if remove_container_on_rollback {
+                let _ = fs::remove_dir(&container);
+            }
+            return Err(error);
+        }
+    };
+    let mut packages = old_state.packages;
+    packages.push(PackageRecordV1 {
+        version: version.clone(),
+        identity: candidate.snapshot.package_identity.clone(),
+    });
+    packages.sort_by_key(|package| Version::parse(&package.version));
+    let new_state = ActivePluginStateV1 {
+        schema: 1,
+        plugin_id: plugin_id.to_string(),
+        active_version: Some(version),
+        packages,
+    };
+    if parse_active_state(
+        &serde_json::to_vec(&new_state).map_err(|_| PluginManagementError::Unavailable)?,
+        plugin_id,
+    )
+    .is_err()
+    {
+        let _ = fs::remove_dir_all(&staged_version_root);
+        if remove_container_on_rollback {
+            let _ = fs::remove_dir(&container);
+        }
+        return Err(PluginManagementError::Unavailable);
+    }
+    Ok(PreparedInstall {
+        verification_snapshot: prepared_snapshot(&candidate),
+        candidate,
+        mode: InstallMode::NewVersion,
+        state_path,
+        old_state: old_state_reference,
+        new_state,
+        staged_version_root: Some(staged_version_root),
+        installed_version_root: Some(installed_version_root),
+        remove_container_on_rollback,
+    })
+}
+
+#[cfg(debug_assertions)]
+fn prepared_snapshot(candidate: &PluginCatalogEntry) -> GenerationAssetSnapshot {
+    candidate.snapshot.as_ref().clone()
+}
+
+#[cfg(debug_assertions)]
+fn copy_snapshot_files(
+    snapshot: &GenerationAssetSnapshot,
+    destination: &Path,
+) -> Result<(), PluginManagementError> {
+    let mut assets = snapshot.assets.iter().collect::<Vec<_>>();
+    assets.sort_by(|left, right| left.0.cmp(right.0));
+    for (relative, bytes) in assets {
+        let path = destination.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| PluginManagementError::Unavailable)?;
+        }
+        fs::write(path, bytes).map_err(|_| PluginManagementError::Unavailable)?;
+    }
+    Ok(())
+}
+
+fn commit_active_state(
+    path: &Path,
+    state: &ActivePluginStateV1,
+) -> Result<(), PluginManagementError> {
+    let bytes = serde_json::to_vec(state).map_err(|_| PluginManagementError::Unavailable)?;
+    if bytes.len() as u64 > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES {
+        return Err(PluginManagementError::Unavailable);
+    }
+    replace_current(path, &bytes).map_err(|_| PluginManagementError::Unavailable)
+}
+
+#[cfg(debug_assertions)]
+fn commit_prepared_install(prepared: &PreparedInstall) -> Result<(), PluginManagementError> {
+    if let (Some(staged), Some(installed)) = (
+        prepared.staged_version_root.as_ref(),
+        prepared.installed_version_root.as_ref(),
+    ) {
+        fs::rename(staged, installed).map_err(|_| PluginManagementError::Unavailable)?;
+    }
+    commit_active_state(&prepared.state_path, &prepared.new_state)
+}
+
+#[cfg(debug_assertions)]
+fn commit_prepared_install_transaction(
+    prepared: &PreparedInstall,
+    transaction_root: &Path,
+) -> Result<(), PluginManagementError> {
+    let verification = scan_package_snapshot(
+        prepared
+            .staged_version_root
+            .as_ref()
+            .ok_or(PluginManagementError::Unavailable)?,
+    )
+    .map_err(|_| PluginManagementError::Unavailable)?;
+    if verification.package_identity != prepared.verification_snapshot.package_identity {
+        return Err(PluginManagementError::Unavailable);
+    }
+    if let (Some(staged), Some(installed)) = (
+        prepared.staged_version_root.as_ref(),
+        prepared.installed_version_root.as_ref(),
+    ) {
+        fs::rename(staged, installed).map_err(|_| PluginManagementError::Unavailable)?;
+        update_transaction_phase(
+            transaction_root,
+            PluginTransactionPhase::PackagePlaced,
+            Vec::new(),
+        )?;
+    }
+    let final_snapshot = scan_package_snapshot(&prepared.candidate.root)
+        .map_err(|_| PluginManagementError::Unavailable)?;
+    if final_snapshot.package_identity != prepared.candidate.snapshot.package_identity {
+        return Err(PluginManagementError::Unavailable);
+    }
+    commit_active_state(&prepared.state_path, &prepared.new_state)?;
+    update_transaction_phase(
+        transaction_root,
+        PluginTransactionPhase::StateCommitted,
+        Vec::new(),
+    )
+    .expect("plugin install journal phase failed after durable state commit");
+    Ok(())
+}
+
+fn verify_catalog_entry_identity(entry: &PluginCatalogEntry) -> Result<(), PluginManagementError> {
+    let snapshot =
+        scan_package_snapshot(&entry.root).map_err(|_| PluginManagementError::Unavailable)?;
+    if snapshot.package_identity != entry.snapshot.package_identity
+        || directory_identity(&entry.root) != Some(entry.package_identity)
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    Ok(())
+}
+
+fn durable_state_reference(bytes: Option<&[u8]>) -> DurableStateReference {
+    match bytes {
+        Some(bytes) => DurableStateReference {
+            kind: DurableStateKind::ActiveStateV1,
+            sha256: Some(lower_hex(&Sha256::digest(bytes))),
+        },
+        None => DurableStateReference {
+            kind: DurableStateKind::Absent,
+            sha256: None,
+        },
+    }
+}
+
+fn stable_runtime_object(
+    app_data_dir: &Path,
+    identity: &RuntimeIdentity,
+    role: FixedObjectRole,
+) -> Result<FixedTransactionObjectV1, PluginManagementError> {
+    let path = runtime_data_directory(app_data_dir, identity);
+    let directory = directory_identity(&path).ok_or(PluginManagementError::Unavailable)?;
+    Ok(FixedTransactionObjectV1 {
+        role,
+        identity: StableObjectIdentityV1 {
+            volume_serial: directory.volume,
+            file_id: format!("{:016x}", directory.file),
+            package_digest: None,
+        },
+        location: TransactionObjectLocation {
+            root: TransactionRoot::RuntimeData,
+            relative_path: identity.window_label.clone(),
+        },
+    })
+}
+
+fn cleanup_plan(
+    receipt_id: &str,
+    condition: CleanupCondition,
+    object_role: CleanupObjectRole,
+    operation: CleanupOperation,
+    measure: CleanupMeasureV1,
+) -> CleanupReceiptPlanV1 {
+    CleanupReceiptPlanV1 {
+        receipt_id: receipt_id.to_string(),
+        condition,
+        object_role,
+        operation,
+        planned_target: TransactionObjectLocation {
+            root: TransactionRoot::Quarantine,
+            relative_path: receipt_id.to_string(),
+        },
+        measure,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn build_new_version_install_transaction(
+    prepared: &PreparedInstall,
+    app_data_dir: &Path,
+    candidate_runtime: &RuntimeIdentity,
+    previous_runtime: Option<&RuntimeIdentity>,
+    operation: PluginTransactionOperation,
+    transaction_id: &str,
+    receipt_ids: &[&str],
+) -> Result<PluginTransactionV1, PluginManagementError> {
+    let expected_receipts = match (prepared.mode, previous_runtime.is_some()) {
+        (InstallMode::NewVersion, false) => 2,
+        (InstallMode::NewVersion, true) | (InstallMode::ActivateExisting, false) => 3,
+        (InstallMode::ActivateExisting, true) => 4,
+    };
+    if !matches!(
+        operation,
+        PluginTransactionOperation::Install | PluginTransactionOperation::Update
+    ) || !valid_lower_hex(transaction_id, 32)
+        || receipt_ids.len() != expected_receipts
+        || receipt_ids
+            .iter()
+            .any(|receipt_id| !valid_lower_hex(receipt_id, 32))
+        || receipt_ids.windows(2).any(|ids| ids[0] >= ids[1])
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let staged = prepared
+        .staged_version_root
+        .as_ref()
+        .ok_or(PluginManagementError::Unavailable)?;
+    let staged_name = staged
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PluginManagementError::Unavailable)?;
+    let final_root = prepared
+        .installed_version_root
+        .as_ref()
+        .unwrap_or(&prepared.candidate.root);
+    let container = final_root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or(PluginManagementError::Unavailable)?;
+    let version = final_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PluginManagementError::Unavailable)?;
+    let package = &prepared.verification_snapshot.package_identity;
+    let mut allowed_locations = vec![TransactionObjectLocation {
+        root: TransactionRoot::Transaction,
+        relative_path: format!("staging/{staged_name}"),
+    }];
+    if prepared.mode == InstallMode::NewVersion {
+        allowed_locations.push(TransactionObjectLocation {
+            root: TransactionRoot::Plugin,
+            relative_path: format!("{container}/{version}"),
+        });
+    }
+    let candidate_package = MovableTransactionObjectV1 {
+        role: MovableObjectRole::CandidatePackage,
+        identity: StableObjectIdentityV1 {
+            volume_serial: package.volume_serial,
+            file_id: package.file_id.clone(),
+            package_digest: Some(package.digest.clone()),
+        },
+        allowed_locations,
+    };
+    let activation_package = if prepared.mode == InstallMode::ActivateExisting {
+        let activation = &prepared.candidate.snapshot.package_identity;
+        Some(FixedTransactionObjectV1 {
+            role: FixedObjectRole::ActivationPackage,
+            identity: StableObjectIdentityV1 {
+                volume_serial: activation.volume_serial,
+                file_id: activation.file_id.clone(),
+                package_digest: Some(activation.digest.clone()),
+            },
+            location: TransactionObjectLocation {
+                root: TransactionRoot::Plugin,
+                relative_path: format!("{container}/{version}"),
+            },
+        })
+    } else {
+        None
+    };
+    let candidate_runtime_data = stable_runtime_object(
+        app_data_dir,
+        candidate_runtime,
+        FixedObjectRole::CandidateRuntimeData,
+    )?;
+    let previous_runtime_data = previous_runtime
+        .map(|identity| {
+            stable_runtime_object(app_data_dir, identity, FixedObjectRole::PreviousRuntimeData)
+        })
+        .transpose()?;
+    let mut plans = vec![
+        cleanup_plan(
+            receipt_ids[0],
+            CleanupCondition::IfOldState,
+            CleanupObjectRole::CandidatePackage,
+            CleanupOperation::RollbackStaging,
+            CleanupMeasureV1::Exact {
+                bytes: prepared.verification_snapshot.total_bytes,
+            },
+        ),
+        cleanup_plan(
+            receipt_ids[1],
+            CleanupCondition::IfOldState,
+            CleanupObjectRole::CandidateRuntimeData,
+            CleanupOperation::RuntimeData,
+            CleanupMeasureV1::Bounded {
+                max_bytes: PLUGIN_CLEANUP_BATCH_BYTES,
+            },
+        ),
+    ];
+    let previous_receipt_index = if prepared.mode == InstallMode::ActivateExisting {
+        plans.push(cleanup_plan(
+            receipt_ids[2],
+            CleanupCondition::IfNewState,
+            CleanupObjectRole::CandidatePackage,
+            CleanupOperation::RollbackStaging,
+            CleanupMeasureV1::Exact {
+                bytes: prepared.verification_snapshot.total_bytes,
+            },
+        ));
+        3
+    } else {
+        2
+    };
+    if previous_runtime_data.is_some() {
+        plans.push(cleanup_plan(
+            receipt_ids[previous_receipt_index],
+            CleanupCondition::IfNewState,
+            CleanupObjectRole::PreviousRuntimeData,
+            CleanupOperation::RuntimeData,
+            CleanupMeasureV1::Bounded {
+                max_bytes: PLUGIN_CLEANUP_BATCH_BYTES,
+            },
+        ));
+    }
+    plans.sort_by(|left, right| left.receipt_id.cmp(&right.receipt_id));
+    let new_state_bytes =
+        serde_json::to_vec(&prepared.new_state).map_err(|_| PluginManagementError::Unavailable)?;
+    let transaction = PluginTransactionV1 {
+        schema: 1,
+        transaction_id: transaction_id.to_string(),
+        operation,
+        plugin_id: prepared.new_state.plugin_id.clone(),
+        phase: PluginTransactionPhase::Prepared,
+        old_state: prepared.old_state.clone(),
+        new_state: durable_state_reference(Some(&new_state_bytes)),
+        objects: TransactionObjectsV1::Install {
+            command_operation: operation,
+            mode: prepared.mode,
+            candidate_package,
+            activation_package,
+            candidate_runtime_data,
+            previous_runtime_data,
+        },
+        cleanup_plans: plans,
+        cleanup_receipt_ids: Vec::new(),
+    };
+    validate_plugin_transaction(&transaction).map_err(|_| PluginManagementError::Unavailable)?;
+    Ok(transaction)
+}
+
+fn build_delete_last_transaction(
+    app_data_dir: &Path,
+    active: &PluginCatalogEntry,
+    old_state: DurableStateReference,
+    new_state: &ActivePluginStateV1,
+    previous_runtime: Option<&RuntimeIdentity>,
+    transaction_id: &str,
+    receipt_ids: &[&str],
+) -> Result<PluginTransactionV1, PluginManagementError> {
+    let expected_receipts = if previous_runtime.is_some() { 2 } else { 1 };
+    if receipt_ids.len() != expected_receipts
+        || !valid_lower_hex(transaction_id, 32)
+        || receipt_ids
+            .iter()
+            .any(|receipt_id| !valid_lower_hex(receipt_id, 32))
+        || receipt_ids.windows(2).any(|ids| ids[0] >= ids[1])
+        || new_state.plugin_id != active.id
+        || new_state.active_version.is_some()
+        || !new_state.packages.is_empty()
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let relative = active
+        .root
+        .strip_prefix(app_data_dir.join("plugins"))
+        .ok()
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .filter(|path| !path.is_empty())
+        .ok_or(PluginManagementError::Unavailable)?;
+    let deleted_package = FixedTransactionObjectV1 {
+        role: FixedObjectRole::DeletedPackage,
+        identity: StableObjectIdentityV1 {
+            volume_serial: active.package_identity.volume,
+            file_id: format!("{:016x}", active.package_identity.file),
+            package_digest: Some(active.snapshot.package_identity.digest.clone()),
+        },
+        location: TransactionObjectLocation {
+            root: TransactionRoot::Plugin,
+            relative_path: relative,
+        },
+    };
+    let previous_runtime_data = previous_runtime
+        .map(|identity| {
+            stable_runtime_object(app_data_dir, identity, FixedObjectRole::PreviousRuntimeData)
+        })
+        .transpose()?;
+    let mut plans = vec![cleanup_plan(
+        receipt_ids[0],
+        CleanupCondition::IfNewState,
+        CleanupObjectRole::DeletedPackage,
+        CleanupOperation::DeleteLastVersion,
+        CleanupMeasureV1::Exact {
+            bytes: active.snapshot.total_bytes,
+        },
+    )];
+    if previous_runtime_data.is_some() {
+        plans.push(cleanup_plan(
+            receipt_ids[1],
+            CleanupCondition::IfNewState,
+            CleanupObjectRole::PreviousRuntimeData,
+            CleanupOperation::RuntimeData,
+            CleanupMeasureV1::Bounded {
+                max_bytes: PLUGIN_CLEANUP_BATCH_BYTES,
+            },
+        ));
+    }
+    let new_state_bytes =
+        serde_json::to_vec(new_state).map_err(|_| PluginManagementError::Unavailable)?;
+    let transaction = PluginTransactionV1 {
+        schema: 1,
+        transaction_id: transaction_id.to_string(),
+        operation: PluginTransactionOperation::DeleteLast,
+        plugin_id: active.id.clone(),
+        phase: PluginTransactionPhase::Prepared,
+        old_state,
+        new_state: durable_state_reference(Some(&new_state_bytes)),
+        objects: TransactionObjectsV1::DeleteLast {
+            deleted_package,
+            previous_runtime_data,
+        },
+        cleanup_plans: plans,
+        cleanup_receipt_ids: Vec::new(),
+    };
+    validate_plugin_transaction(&transaction).map_err(|_| PluginManagementError::Unavailable)?;
+    Ok(transaction)
+}
+
+struct DeleteFallbackTransactionInput<'a> {
+    app_data_dir: &'a Path,
+    active: &'a PluginCatalogEntry,
+    fallback: &'a PluginCatalogEntry,
+    candidate_runtime: &'a RuntimeIdentity,
+    previous_runtime: Option<&'a RuntimeIdentity>,
+    old_state: DurableStateReference,
+    new_state: &'a ActivePluginStateV1,
+    transaction_id: &'a str,
+    receipt_ids: &'a [&'a str],
+}
+
+fn build_delete_fallback_transaction(
+    input: DeleteFallbackTransactionInput<'_>,
+) -> Result<PluginTransactionV1, PluginManagementError> {
+    let DeleteFallbackTransactionInput {
+        app_data_dir,
+        active,
+        fallback,
+        candidate_runtime,
+        previous_runtime,
+        old_state,
+        new_state,
+        transaction_id,
+        receipt_ids,
+    } = input;
+    let expected_receipts = if previous_runtime.is_some() { 3 } else { 2 };
+    if receipt_ids.len() != expected_receipts
+        || !valid_lower_hex(transaction_id, 32)
+        || receipt_ids
+            .iter()
+            .any(|receipt_id| !valid_lower_hex(receipt_id, 32))
+        || receipt_ids.windows(2).any(|ids| ids[0] >= ids[1])
+        || active.id != fallback.id
+        || new_state.plugin_id != active.id
+        || new_state.active_version.as_deref() != Some(fallback.version.to_path_segment().as_str())
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let package_object = |entry: &PluginCatalogEntry, role| {
+        let relative = entry
+            .root
+            .strip_prefix(app_data_dir.join("plugins"))
+            .ok()
+            .and_then(|path| path.to_str())
+            .map(|path| path.replace('\\', "/"))
+            .filter(|path| !path.is_empty())
+            .ok_or(PluginManagementError::Unavailable)?;
+        Ok(FixedTransactionObjectV1 {
+            role,
+            identity: StableObjectIdentityV1 {
+                volume_serial: entry.package_identity.volume,
+                file_id: format!("{:016x}", entry.package_identity.file),
+                package_digest: Some(entry.snapshot.package_identity.digest.clone()),
+            },
+            location: TransactionObjectLocation {
+                root: TransactionRoot::Plugin,
+                relative_path: relative,
+            },
+        })
+    };
+    let deleted_package = package_object(active, FixedObjectRole::DeletedPackage)?;
+    let fallback_package = package_object(fallback, FixedObjectRole::FallbackPackage)?;
+    let candidate_runtime_data = stable_runtime_object(
+        app_data_dir,
+        candidate_runtime,
+        FixedObjectRole::CandidateRuntimeData,
+    )?;
+    let previous_runtime_data = previous_runtime
+        .map(|identity| {
+            stable_runtime_object(app_data_dir, identity, FixedObjectRole::PreviousRuntimeData)
+        })
+        .transpose()?;
+    let mut plans = vec![
+        cleanup_plan(
+            receipt_ids[0],
+            CleanupCondition::IfOldState,
+            CleanupObjectRole::CandidateRuntimeData,
+            CleanupOperation::RuntimeData,
+            CleanupMeasureV1::Bounded {
+                max_bytes: PLUGIN_CLEANUP_BATCH_BYTES,
+            },
+        ),
+        cleanup_plan(
+            receipt_ids[1],
+            CleanupCondition::IfNewState,
+            CleanupObjectRole::DeletedPackage,
+            CleanupOperation::DeleteVersion,
+            CleanupMeasureV1::Exact {
+                bytes: active.snapshot.total_bytes,
+            },
+        ),
+    ];
+    if previous_runtime_data.is_some() {
+        plans.push(cleanup_plan(
+            receipt_ids[2],
+            CleanupCondition::IfNewState,
+            CleanupObjectRole::PreviousRuntimeData,
+            CleanupOperation::RuntimeData,
+            CleanupMeasureV1::Bounded {
+                max_bytes: PLUGIN_CLEANUP_BATCH_BYTES,
+            },
+        ));
+    }
+    plans.sort_by(|left, right| left.receipt_id.cmp(&right.receipt_id));
+    let new_state_bytes =
+        serde_json::to_vec(new_state).map_err(|_| PluginManagementError::Unavailable)?;
+    let transaction = PluginTransactionV1 {
+        schema: 1,
+        transaction_id: transaction_id.to_string(),
+        operation: PluginTransactionOperation::DeleteWithFallback,
+        plugin_id: active.id.clone(),
+        phase: PluginTransactionPhase::Prepared,
+        old_state,
+        new_state: durable_state_reference(Some(&new_state_bytes)),
+        objects: TransactionObjectsV1::DeleteWithFallback {
+            deleted_package,
+            fallback_package,
+            candidate_runtime_data,
+            previous_runtime_data,
+        },
+        cleanup_plans: plans,
+        cleanup_receipt_ids: Vec::new(),
+    };
+    validate_plugin_transaction(&transaction).map_err(|_| PluginManagementError::Unavailable)?;
+    Ok(transaction)
+}
+
+#[cfg(debug_assertions)]
+fn rollback_prepared_install(prepared: &PreparedInstall) -> Result<(), PluginManagementError> {
+    if let Some(root) = &prepared.staged_version_root {
+        if root.exists() {
+            fs::remove_dir_all(root).map_err(|_| PluginManagementError::Unavailable)?;
+        }
+    }
+    if let Some(root) = &prepared.installed_version_root {
+        if root.exists() {
+            fs::remove_dir_all(root).map_err(|_| PluginManagementError::Unavailable)?;
+        }
+    }
+    if prepared.remove_container_on_rollback {
+        let container = prepared
+            .state_path
+            .parent()
+            .ok_or(PluginManagementError::Unavailable)?;
+        if container.exists() {
+            fs::remove_dir(container).map_err(|_| PluginManagementError::Unavailable)?;
+        }
+    }
+    Ok(())
+}
+
 fn valid_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -1886,9 +3095,16 @@ fn validate_plugin_transaction(transaction: &PluginTransactionV1) -> Result<(), 
         }
         previous_id = Some(&plan.receipt_id);
     }
-    let plan_ids = transaction
+    let old_state_plan_ids = transaction
         .cleanup_plans
         .iter()
+        .filter(|plan| plan.condition == CleanupCondition::IfOldState)
+        .map(|plan| plan.receipt_id.as_str())
+        .collect::<Vec<_>>();
+    let new_state_plan_ids = transaction
+        .cleanup_plans
+        .iter()
+        .filter(|plan| plan.condition == CleanupCondition::IfNewState)
         .map(|plan| plan.receipt_id.as_str())
         .collect::<Vec<_>>();
     match transaction.phase {
@@ -1900,12 +3116,15 @@ fn validate_plugin_transaction(transaction: &PluginTransactionV1) -> Result<(), 
             return Err(())
         }
         PluginTransactionPhase::CleanupTransferred
-            if transaction
-                .cleanup_receipt_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                != plan_ids =>
+            if {
+                let receipt_ids = transaction
+                    .cleanup_receipt_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                receipt_ids.is_empty()
+                    || (receipt_ids != old_state_plan_ids && receipt_ids != new_state_plan_ids)
+            } =>
         {
             return Err(())
         }
@@ -2060,7 +3279,7 @@ fn valid_object_location(location: &TransactionObjectLocation) -> bool {
 }
 
 fn valid_planned_target(location: &TransactionObjectLocation, receipt_id: &str) -> bool {
-    location.root == TransactionRoot::QuarantineRoot && location.relative_path == receipt_id
+    location.root == TransactionRoot::Quarantine && location.relative_path == receipt_id
 }
 
 fn validate_cleanup_coverage(transaction: &PluginTransactionV1) -> Result<(), ()> {
@@ -2155,7 +3374,7 @@ fn parse_cleanup_receipt(bytes: &[u8]) -> Result<CleanupReceiptV1, ()> {
     match (&receipt.phase, &receipt.target) {
         (CleanupReceiptPhase::Pending, None) => {}
         (CleanupReceiptPhase::Quarantined, Some(target))
-            if target.root == TransactionRoot::QuarantineRoot
+            if target.root == TransactionRoot::Quarantine
                 && target.relative_path == receipt.planned_target.relative_path
                 && target.role == TransactionObjectIdentityRole::QuarantineTarget
                 && valid_transaction_identity(target) => {}
@@ -2186,8 +3405,8 @@ fn receipt_worker_eligible(
     receipt: &CleanupReceiptV1,
     active_transaction: Option<&PluginTransactionV1>,
 ) -> bool {
-    !active_transaction
-        .is_some_and(|transaction| receipt.origin_operation_id == transaction.transaction_id)
+    active_transaction
+        .is_none_or(|transaction| receipt.origin_operation_id != transaction.transaction_id)
 }
 
 fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> {
@@ -2243,7 +3462,7 @@ fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> 
             receipt.phase = CleanupReceiptPhase::Quarantined;
             receipt.target = Some(TransactionObjectIdentity {
                 role: TransactionObjectIdentityRole::QuarantineTarget,
-                root: TransactionRoot::QuarantineRoot,
+                root: TransactionRoot::Quarantine,
                 relative_path: receipt.planned_target.relative_path.clone(),
                 volume_serial: target_identity.volume,
                 file_id: format!("{:016x}", target_identity.file),
@@ -2286,6 +3505,670 @@ fn read_active_transaction(
     parse_plugin_transaction(&bytes)
         .map(Some)
         .map_err(|_| PluginManagementError::Unavailable)
+}
+
+fn write_prepared_transaction(
+    transaction_root: &Path,
+    transaction: &PluginTransactionV1,
+) -> Result<(), PluginManagementError> {
+    if transaction.phase != PluginTransactionPhase::Prepared
+        || !transaction.cleanup_receipt_ids.is_empty()
+        || validate_plugin_transaction(transaction).is_err()
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let bytes = serde_json::to_vec(transaction).map_err(|_| PluginManagementError::Unavailable)?;
+    if bytes.len() as u64 > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let active_root = transaction_root.join("active");
+    if !ordinary_directory(&active_root) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let path = active_root.join("current.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|_| PluginManagementError::Unavailable)?;
+    if file
+        .write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(PluginManagementError::Unavailable);
+    }
+    Ok(())
+}
+
+fn update_transaction_phase(
+    transaction_root: &Path,
+    phase: PluginTransactionPhase,
+    cleanup_receipt_ids: Vec<String>,
+) -> Result<(), PluginManagementError> {
+    let mut transaction =
+        read_active_transaction(transaction_root)?.ok_or(PluginManagementError::Unavailable)?;
+    let allowed = matches!(
+        (transaction.phase, phase),
+        (
+            PluginTransactionPhase::Prepared,
+            PluginTransactionPhase::PackagePlaced | PluginTransactionPhase::StateCommitted
+        ) | (
+            PluginTransactionPhase::PackagePlaced,
+            PluginTransactionPhase::StateCommitted
+        ) | (
+            PluginTransactionPhase::StateCommitted,
+            PluginTransactionPhase::CleanupTransferred
+        ) | (
+            PluginTransactionPhase::Prepared | PluginTransactionPhase::PackagePlaced,
+            PluginTransactionPhase::CleanupTransferred
+        )
+    );
+    if !allowed {
+        return Err(PluginManagementError::Unavailable);
+    }
+    transaction.phase = phase;
+    transaction.cleanup_receipt_ids = cleanup_receipt_ids;
+    validate_plugin_transaction(&transaction).map_err(|_| PluginManagementError::Unavailable)?;
+    let bytes = serde_json::to_vec(&transaction).map_err(|_| PluginManagementError::Unavailable)?;
+    if bytes.len() as u64 > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES {
+        return Err(PluginManagementError::Unavailable);
+    }
+    replace_current(
+        &transaction_root.join("active").join("current.json"),
+        &bytes,
+    )
+    .map_err(|_| PluginManagementError::Unavailable)
+}
+
+fn remove_active_transaction(transaction_root: &Path) -> Result<(), PluginManagementError> {
+    fs::remove_file(transaction_root.join("active").join("current.json"))
+        .map_err(|_| PluginManagementError::Unavailable)
+}
+
+fn recover_active_transaction(app_data_dir: &Path) -> Result<(), PluginManagementError> {
+    let transaction_root = app_data_dir.join("plugin-transactions");
+    let Some(transaction) = read_active_transaction(&transaction_root)? else {
+        return Ok(());
+    };
+    let state_path = app_data_dir
+        .join("plugins")
+        .join(&transaction.plugin_id)
+        .join("active.json");
+    let current_bytes = read_bounded_document(&state_path)?;
+    let current = durable_state_reference(current_bytes.as_deref());
+    if current == transaction.new_state {
+        if transaction.phase != PluginTransactionPhase::StateCommitted {
+            update_transaction_phase(
+                &transaction_root,
+                PluginTransactionPhase::StateCommitted,
+                Vec::new(),
+            )?;
+        }
+        return match transaction.operation {
+            PluginTransactionOperation::Install | PluginTransactionOperation::Update => {
+                handoff_committed_install_cleanup(app_data_dir, &transaction_root)
+            }
+            PluginTransactionOperation::DeleteWithFallback
+            | PluginTransactionOperation::DeleteLast => {
+                handoff_committed_delete_cleanup(app_data_dir, &transaction_root)
+            }
+            PluginTransactionOperation::LegacyMigration => Err(PluginManagementError::Unavailable),
+        };
+    }
+    if current != transaction.old_state {
+        return Err(PluginManagementError::Unavailable);
+    }
+    match transaction.operation {
+        PluginTransactionOperation::DeleteLast => remove_active_transaction(&transaction_root),
+        PluginTransactionOperation::DeleteWithFallback => {
+            rollback_delete_fallback_transaction(app_data_dir, &transaction_root)
+        }
+        PluginTransactionOperation::Install | PluginTransactionOperation::Update => {
+            rollback_install_transaction(app_data_dir, &transaction_root)
+        }
+        PluginTransactionOperation::LegacyMigration => Err(PluginManagementError::Unavailable),
+    }
+}
+
+fn rollback_install_transaction(
+    app_data_dir: &Path,
+    transaction_root: &Path,
+) -> Result<(), PluginManagementError> {
+    let transaction =
+        read_active_transaction(transaction_root)?.ok_or(PluginManagementError::Unavailable)?;
+    let TransactionObjectsV1::Install {
+        candidate_package,
+        candidate_runtime_data,
+        ..
+    } = &transaction.objects
+    else {
+        return Err(PluginManagementError::Unavailable);
+    };
+    let selected = transaction
+        .cleanup_plans
+        .iter()
+        .filter(|plan| plan.condition == CleanupCondition::IfOldState)
+        .collect::<Vec<_>>();
+    let mut receipt_ids = Vec::with_capacity(selected.len());
+    for plan in selected {
+        let source = match plan.object_role {
+            CleanupObjectRole::CandidatePackage => resolve_or_adopt_movable_source(
+                app_data_dir,
+                transaction_root,
+                &transaction,
+                plan,
+                candidate_package,
+            )?,
+            CleanupObjectRole::CandidateRuntimeData => TransactionObjectIdentity {
+                role: TransactionObjectIdentityRole::RuntimeData,
+                root: candidate_runtime_data.location.root,
+                relative_path: candidate_runtime_data.location.relative_path.clone(),
+                volume_serial: candidate_runtime_data.identity.volume_serial,
+                file_id: candidate_runtime_data.identity.file_id.clone(),
+                package_digest: None,
+            },
+            _ => return Err(PluginManagementError::Unavailable),
+        };
+        let receipt = CleanupReceiptV1 {
+            schema: 1,
+            receipt_id: plan.receipt_id.clone(),
+            origin_operation_id: transaction.transaction_id.clone(),
+            plugin_id: transaction.plugin_id.clone(),
+            operation: plan.operation,
+            phase: CleanupReceiptPhase::Pending,
+            source,
+            planned_target: plan.planned_target.clone(),
+            target: None,
+            measure: plan.measure.clone(),
+        };
+        let receipt_path = write_cleanup_receipt(transaction_root, &receipt)?;
+        handoff_cleanup_receipt(app_data_dir, &receipt_path)?;
+        receipt_ids.push(plan.receipt_id.clone());
+    }
+    update_transaction_phase(
+        transaction_root,
+        PluginTransactionPhase::CleanupTransferred,
+        receipt_ids,
+    )?;
+    remove_active_transaction(transaction_root)
+}
+
+fn write_cleanup_receipt(
+    transaction_root: &Path,
+    receipt: &CleanupReceiptV1,
+) -> Result<PathBuf, PluginManagementError> {
+    let bytes = serde_json::to_vec(receipt).map_err(|_| PluginManagementError::Unavailable)?;
+    parse_cleanup_receipt(&bytes).map_err(|_| PluginManagementError::Unavailable)?;
+    if bytes.len() as u64 > PLUGIN_DURABLE_DOCUMENT_MAX_BYTES {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let path = transaction_root
+        .join("receipts")
+        .join(format!("{}.json", receipt.receipt_id));
+    if path.exists() {
+        let existing = read_cleanup_receipt(&path)?;
+        if cleanup_receipt_matches_expected(&existing, receipt) {
+            return Ok(path);
+        }
+        return Err(PluginManagementError::Unavailable);
+    }
+    let opened = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing =
+                read_cleanup_receipt(&path).map_err(|_| PluginManagementError::Unavailable)?;
+            if cleanup_receipt_matches_expected(&existing, receipt) {
+                return Ok(path);
+            } else {
+                return Err(PluginManagementError::Unavailable);
+            }
+        }
+        Err(_) => return Err(PluginManagementError::Unavailable),
+    };
+    if file
+        .write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(PluginManagementError::Unavailable);
+    }
+    Ok(path)
+}
+
+fn preflight_cleanup_capacity(
+    app_data_dir: &Path,
+    receipt_ids: &[&str],
+) -> Result<(), PluginManagementError> {
+    if receipt_ids.is_empty()
+        || receipt_ids
+            .iter()
+            .any(|receipt_id| !valid_lower_hex(receipt_id, 32))
+        || receipt_ids.iter().copied().collect::<HashSet<_>>().len() != receipt_ids.len()
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let transaction_root = app_data_dir.join("plugin-transactions");
+    let receipt_root = transaction_root.join("receipts");
+    let existing_receipts = read_cleanup_receipt_paths(&receipt_root)?;
+    let quarantine_root = app_data_dir.join("plugin-quarantine");
+    if !ordinary_directory(&quarantine_root) {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let mut quarantine_count = 0usize;
+    for entry in fs::read_dir(&quarantine_root).map_err(|_| PluginManagementError::Unavailable)? {
+        let entry = entry.map_err(|_| PluginManagementError::Unavailable)?;
+        let metadata = entry
+            .metadata()
+            .map_err(|_| PluginManagementError::Unavailable)?;
+        if !metadata.is_dir() || is_reparse_point(&metadata) {
+            return Err(PluginManagementError::Unavailable);
+        }
+        quarantine_count += 1;
+        if quarantine_count > PLUGIN_CLEANUP_MAX_RECEIPTS {
+            return Err(PluginManagementError::Unavailable);
+        }
+    }
+    if existing_receipts.len() + receipt_ids.len() > PLUGIN_CLEANUP_MAX_RECEIPTS
+        || quarantine_count + receipt_ids.len() > PLUGIN_CLEANUP_MAX_RECEIPTS
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    for receipt_id in receipt_ids {
+        if receipt_root.join(format!("{receipt_id}.json")).exists()
+            || quarantine_root.join(receipt_id).exists()
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_receipt_matches_expected(
+    existing: &CleanupReceiptV1,
+    expected: &CleanupReceiptV1,
+) -> bool {
+    existing.schema == expected.schema
+        && existing.receipt_id == expected.receipt_id
+        && existing.origin_operation_id == expected.origin_operation_id
+        && existing.plugin_id == expected.plugin_id
+        && existing.operation == expected.operation
+        && existing.source == expected.source
+        && existing.planned_target == expected.planned_target
+        && existing.measure == expected.measure
+        && matches!(
+            existing.phase,
+            CleanupReceiptPhase::Pending | CleanupReceiptPhase::Quarantined
+        )
+}
+
+fn stage_runtime_cleanup_receipt(
+    app_data_dir: &Path,
+    plugin_id: &str,
+    identity: &RuntimeIdentity,
+    operation_id: &str,
+    receipt_id: &str,
+) -> Result<PathBuf, PluginManagementError> {
+    if !valid_id(plugin_id)
+        || !valid_lower_hex(operation_id, 32)
+        || !valid_lower_hex(receipt_id, 32)
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let object = stable_runtime_object(
+        app_data_dir,
+        identity,
+        FixedObjectRole::CandidateRuntimeData,
+    )?;
+    let receipt = CleanupReceiptV1 {
+        schema: 1,
+        receipt_id: receipt_id.to_string(),
+        origin_operation_id: operation_id.to_string(),
+        plugin_id: plugin_id.to_string(),
+        operation: CleanupOperation::RuntimeData,
+        phase: CleanupReceiptPhase::Pending,
+        source: TransactionObjectIdentity {
+            role: TransactionObjectIdentityRole::RuntimeData,
+            root: object.location.root,
+            relative_path: object.location.relative_path,
+            volume_serial: object.identity.volume_serial,
+            file_id: object.identity.file_id,
+            package_digest: None,
+        },
+        planned_target: TransactionObjectLocation {
+            root: TransactionRoot::Quarantine,
+            relative_path: receipt_id.to_string(),
+        },
+        target: None,
+        measure: CleanupMeasureV1::Bounded {
+            max_bytes: PLUGIN_CLEANUP_BATCH_BYTES,
+        },
+    };
+    write_cleanup_receipt(&app_data_dir.join("plugin-transactions"), &receipt)
+}
+
+fn handoff_cleanup_receipt(
+    app_data_dir: &Path,
+    receipt_path: &Path,
+) -> Result<(), PluginManagementError> {
+    let mut receipt = read_cleanup_receipt(receipt_path)?;
+    if receipt.phase == CleanupReceiptPhase::Quarantined {
+        return Ok(());
+    }
+    let source_path = cleanup_location_path(app_data_dir, &receipt.source_location())?;
+    let target_path = cleanup_location_path(app_data_dir, &receipt.planned_target)?;
+    let source_exists = directory_identity(&source_path).is_some();
+    let target_exists = directory_identity(&target_path).is_some();
+    if source_exists && !target_exists {
+        if move_cleanup_directory(&source_path, &target_path, &receipt.source).is_err() {
+            if directory_identity(&source_path).is_some()
+                && directory_identity(&target_path).is_none()
+            {
+                return Ok(());
+            }
+            return Err(PluginManagementError::Unavailable);
+        }
+    } else if source_exists || !target_exists {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let target_identity =
+        directory_identity(&target_path).ok_or(PluginManagementError::Unavailable)?;
+    if target_identity.volume != receipt.source.volume_serial
+        || format!("{:016x}", target_identity.file) != receipt.source.file_id
+    {
+        return Err(PluginManagementError::Unavailable);
+    }
+    receipt.phase = CleanupReceiptPhase::Quarantined;
+    receipt.target = Some(TransactionObjectIdentity {
+        role: TransactionObjectIdentityRole::QuarantineTarget,
+        root: TransactionRoot::Quarantine,
+        relative_path: receipt.planned_target.relative_path.clone(),
+        volume_serial: target_identity.volume,
+        file_id: format!("{:016x}", target_identity.file),
+        package_digest: receipt.source.package_digest.clone(),
+    });
+    let bytes = serde_json::to_vec(&receipt).map_err(|_| PluginManagementError::Unavailable)?;
+    parse_cleanup_receipt(&bytes).map_err(|_| PluginManagementError::Unavailable)?;
+    replace_current(receipt_path, &bytes).map_err(|_| PluginManagementError::Unavailable)
+}
+
+fn handoff_committed_install_cleanup(
+    app_data_dir: &Path,
+    transaction_root: &Path,
+) -> Result<(), PluginManagementError> {
+    let transaction =
+        read_active_transaction(transaction_root)?.ok_or(PluginManagementError::Unavailable)?;
+    if transaction.phase != PluginTransactionPhase::StateCommitted {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let TransactionObjectsV1::Install {
+        candidate_package,
+        previous_runtime_data,
+        ..
+    } = &transaction.objects
+    else {
+        return Err(PluginManagementError::Unavailable);
+    };
+    let selected = transaction
+        .cleanup_plans
+        .iter()
+        .filter(|plan| plan.condition == CleanupCondition::IfNewState)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return remove_active_transaction(transaction_root);
+    }
+    let mut receipt_ids = Vec::with_capacity(selected.len());
+    for plan in selected {
+        let source = match plan.object_role {
+            CleanupObjectRole::CandidatePackage => resolve_or_adopt_movable_source(
+                app_data_dir,
+                transaction_root,
+                &transaction,
+                plan,
+                candidate_package,
+            )?,
+            CleanupObjectRole::PreviousRuntimeData => {
+                let previous = previous_runtime_data
+                    .as_ref()
+                    .ok_or(PluginManagementError::Unavailable)?;
+                TransactionObjectIdentity {
+                    role: TransactionObjectIdentityRole::RuntimeData,
+                    root: previous.location.root,
+                    relative_path: previous.location.relative_path.clone(),
+                    volume_serial: previous.identity.volume_serial,
+                    file_id: previous.identity.file_id.clone(),
+                    package_digest: None,
+                }
+            }
+            _ => return Err(PluginManagementError::Unavailable),
+        };
+        let receipt = CleanupReceiptV1 {
+            schema: 1,
+            receipt_id: plan.receipt_id.clone(),
+            origin_operation_id: transaction.transaction_id.clone(),
+            plugin_id: transaction.plugin_id.clone(),
+            operation: plan.operation,
+            phase: CleanupReceiptPhase::Pending,
+            source,
+            planned_target: plan.planned_target.clone(),
+            target: None,
+            measure: plan.measure.clone(),
+        };
+        let receipt_path = write_cleanup_receipt(transaction_root, &receipt)?;
+        handoff_cleanup_receipt(app_data_dir, &receipt_path)?;
+        receipt_ids.push(plan.receipt_id.clone());
+    }
+    update_transaction_phase(
+        transaction_root,
+        PluginTransactionPhase::CleanupTransferred,
+        receipt_ids,
+    )?;
+    remove_active_transaction(transaction_root)
+}
+
+fn resolve_movable_cleanup_source(
+    app_data_dir: &Path,
+    object: &MovableTransactionObjectV1,
+) -> Result<TransactionObjectIdentity, PluginManagementError> {
+    let mut resolved = None;
+    for location in &object.allowed_locations {
+        let path = cleanup_location_path(app_data_dir, location)?;
+        let Some(identity) = directory_identity(&path) else {
+            continue;
+        };
+        let snapshot =
+            scan_package_snapshot(&path).map_err(|_| PluginManagementError::Unavailable)?;
+        if identity.volume != object.identity.volume_serial
+            || format!("{:016x}", identity.file) != object.identity.file_id
+            || object.identity.package_digest.as_deref()
+                != Some(snapshot.package_identity.digest.as_str())
+            || resolved.is_some()
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+        resolved = Some(TransactionObjectIdentity {
+            role: if location.root == TransactionRoot::Transaction {
+                TransactionObjectIdentityRole::StagedPackage
+            } else {
+                TransactionObjectIdentityRole::InstalledPackage
+            },
+            root: location.root,
+            relative_path: location.relative_path.clone(),
+            volume_serial: identity.volume,
+            file_id: format!("{:016x}", identity.file),
+            package_digest: object.identity.package_digest.clone(),
+        });
+    }
+    resolved.ok_or(PluginManagementError::Unavailable)
+}
+
+fn resolve_or_adopt_movable_source(
+    app_data_dir: &Path,
+    transaction_root: &Path,
+    transaction: &PluginTransactionV1,
+    plan: &CleanupReceiptPlanV1,
+    object: &MovableTransactionObjectV1,
+) -> Result<TransactionObjectIdentity, PluginManagementError> {
+    let receipt_path = transaction_root
+        .join("receipts")
+        .join(format!("{}.json", plan.receipt_id));
+    if receipt_path.exists() {
+        let receipt = read_cleanup_receipt(&receipt_path)?;
+        let source_location = receipt.source_location();
+        let source_allowed = object
+            .allowed_locations
+            .iter()
+            .any(|location| location == &source_location);
+        if receipt.origin_operation_id != transaction.transaction_id
+            || receipt.plugin_id != transaction.plugin_id
+            || receipt.operation != plan.operation
+            || receipt.planned_target != plan.planned_target
+            || receipt.measure != plan.measure
+            || !source_allowed
+            || receipt.source.volume_serial != object.identity.volume_serial
+            || receipt.source.file_id != object.identity.file_id
+            || receipt.source.package_digest != object.identity.package_digest
+        {
+            return Err(PluginManagementError::Unavailable);
+        }
+        return Ok(receipt.source);
+    }
+    resolve_movable_cleanup_source(app_data_dir, object)
+}
+
+fn handoff_committed_delete_cleanup(
+    app_data_dir: &Path,
+    transaction_root: &Path,
+) -> Result<(), PluginManagementError> {
+    let transaction =
+        read_active_transaction(transaction_root)?.ok_or(PluginManagementError::Unavailable)?;
+    if transaction.phase != PluginTransactionPhase::StateCommitted {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let (deleted, previous) = match &transaction.objects {
+        TransactionObjectsV1::DeleteLast {
+            deleted_package,
+            previous_runtime_data,
+        }
+        | TransactionObjectsV1::DeleteWithFallback {
+            deleted_package,
+            previous_runtime_data,
+            ..
+        } => (deleted_package, previous_runtime_data.as_ref()),
+        _ => return Err(PluginManagementError::Unavailable),
+    };
+    let selected = transaction
+        .cleanup_plans
+        .iter()
+        .filter(|plan| plan.condition == CleanupCondition::IfNewState)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let mut receipt_ids = Vec::with_capacity(selected.len());
+    for plan in selected {
+        let object = match plan.object_role {
+            CleanupObjectRole::DeletedPackage => deleted,
+            CleanupObjectRole::PreviousRuntimeData => {
+                previous.ok_or(PluginManagementError::Unavailable)?
+            }
+            _ => return Err(PluginManagementError::Unavailable),
+        };
+        let source = TransactionObjectIdentity {
+            role: if plan.object_role == CleanupObjectRole::DeletedPackage {
+                TransactionObjectIdentityRole::DeletedPackage
+            } else {
+                TransactionObjectIdentityRole::RuntimeData
+            },
+            root: object.location.root,
+            relative_path: object.location.relative_path.clone(),
+            volume_serial: object.identity.volume_serial,
+            file_id: object.identity.file_id.clone(),
+            package_digest: object.identity.package_digest.clone(),
+        };
+        let receipt = CleanupReceiptV1 {
+            schema: 1,
+            receipt_id: plan.receipt_id.clone(),
+            origin_operation_id: transaction.transaction_id.clone(),
+            plugin_id: transaction.plugin_id.clone(),
+            operation: plan.operation,
+            phase: CleanupReceiptPhase::Pending,
+            source,
+            planned_target: plan.planned_target.clone(),
+            target: None,
+            measure: plan.measure.clone(),
+        };
+        let receipt_path = write_cleanup_receipt(transaction_root, &receipt)?;
+        handoff_cleanup_receipt(app_data_dir, &receipt_path)?;
+        receipt_ids.push(plan.receipt_id.clone());
+    }
+    update_transaction_phase(
+        transaction_root,
+        PluginTransactionPhase::CleanupTransferred,
+        receipt_ids,
+    )?;
+    remove_active_transaction(transaction_root)
+}
+
+fn rollback_delete_fallback_transaction(
+    app_data_dir: &Path,
+    transaction_root: &Path,
+) -> Result<(), PluginManagementError> {
+    let transaction =
+        read_active_transaction(transaction_root)?.ok_or(PluginManagementError::Unavailable)?;
+    if transaction.phase != PluginTransactionPhase::Prepared {
+        return Err(PluginManagementError::Unavailable);
+    }
+    let TransactionObjectsV1::DeleteWithFallback {
+        candidate_runtime_data,
+        ..
+    } = &transaction.objects
+    else {
+        return Err(PluginManagementError::Unavailable);
+    };
+    let plan = transaction
+        .cleanup_plans
+        .iter()
+        .find(|plan| {
+            plan.condition == CleanupCondition::IfOldState
+                && plan.object_role == CleanupObjectRole::CandidateRuntimeData
+        })
+        .ok_or(PluginManagementError::Unavailable)?;
+    let receipt = CleanupReceiptV1 {
+        schema: 1,
+        receipt_id: plan.receipt_id.clone(),
+        origin_operation_id: transaction.transaction_id.clone(),
+        plugin_id: transaction.plugin_id.clone(),
+        operation: plan.operation,
+        phase: CleanupReceiptPhase::Pending,
+        source: TransactionObjectIdentity {
+            role: TransactionObjectIdentityRole::RuntimeData,
+            root: candidate_runtime_data.location.root,
+            relative_path: candidate_runtime_data.location.relative_path.clone(),
+            volume_serial: candidate_runtime_data.identity.volume_serial,
+            file_id: candidate_runtime_data.identity.file_id.clone(),
+            package_digest: None,
+        },
+        planned_target: plan.planned_target.clone(),
+        target: None,
+        measure: plan.measure.clone(),
+    };
+    let receipt_path = write_cleanup_receipt(transaction_root, &receipt)?;
+    handoff_cleanup_receipt(app_data_dir, &receipt_path)?;
+    update_transaction_phase(
+        transaction_root,
+        PluginTransactionPhase::CleanupTransferred,
+        vec![plan.receipt_id.clone()],
+    )?;
+    remove_active_transaction(transaction_root)
 }
 
 fn read_cleanup_receipt_paths(root: &Path) -> Result<Vec<PathBuf>, PluginManagementError> {
@@ -2360,10 +4243,10 @@ fn cleanup_location_path(
         return Err(PluginManagementError::Unavailable);
     }
     let root = match location.root {
-        TransactionRoot::PluginRoot => app_data_dir.join("plugins"),
-        TransactionRoot::TransactionRoot => app_data_dir.join("plugin-transactions"),
-        TransactionRoot::RuntimeDataRoot => app_data_dir.join("plugin-runtime-data"),
-        TransactionRoot::QuarantineRoot => app_data_dir.join("plugin-quarantine"),
+        TransactionRoot::Plugin => app_data_dir.join("plugins"),
+        TransactionRoot::Transaction => app_data_dir.join("plugin-transactions"),
+        TransactionRoot::RuntimeData => app_data_dir.join("plugin-runtime-data"),
+        TransactionRoot::Quarantine => app_data_dir.join("plugin-quarantine"),
     };
     Ok(location
         .relative_path
@@ -2544,6 +4427,7 @@ impl PluginCatalog {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn views(&self) -> Vec<PluginView> {
         let mut views = self.entries.iter().map(plugin_view).collect::<Vec<_>>();
         views.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2574,12 +4458,13 @@ impl PluginCatalog {
     }
 }
 
+#[cfg(test)]
 fn plugin_view(entry: &PluginCatalogEntry) -> PluginView {
     PluginView {
         id: entry.id.clone(),
         version: entry.version.to_path_segment(),
         trigger: entry.feature.trigger.clone(),
-        description: entry.description.clone(),
+        description: read_description(&entry.snapshot),
     }
 }
 
@@ -2603,25 +4488,25 @@ fn scan_inventory(
     let mut items = rows
         .into_values()
         .map(|row| {
-            let description = if row.development_description.is_some()
-                && (matches!(row.installed, InstalledPluginView::Absent)
-                    || row
-                        .active_version
-                        .zip(row.development_version)
-                        .is_some_and(|(active, development)| development > active))
-            {
-                PluginDescriptionView::Available {
-                    source: PluginDescriptionSource::Development,
-                    markdown: row.development_description.expect("description checked"),
-                }
-            } else if let Some(markdown) = row.installed_description {
-                PluginDescriptionView::Available {
-                    source: PluginDescriptionSource::Installed,
-                    markdown,
-                }
-            } else {
-                PluginDescriptionView::Unavailable
-            };
+            let prefer_development = matches!(&row.installed, InstalledPluginView::Absent)
+                || row
+                    .active_version
+                    .zip(row.development_version)
+                    .is_some_and(|(active, development)| development > active);
+            let description =
+                if let (true, Some(markdown)) = (prefer_development, row.development_description) {
+                    PluginDescriptionView::Available {
+                        source: PluginDescriptionSource::Development,
+                        markdown,
+                    }
+                } else if let Some(markdown) = row.installed_description {
+                    PluginDescriptionView::Available {
+                        source: PluginDescriptionSource::Installed,
+                        markdown,
+                    }
+                } else {
+                    PluginDescriptionView::Unavailable
+                };
             PluginInventoryView {
                 key: plugin_inventory_key(&row.id),
                 display_name: row.id.clone(),
@@ -2761,6 +4646,7 @@ fn scan_installed_rows(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 fn scan_development_rows(
     root: &Path,
     host_version: Version,
@@ -2816,12 +4702,29 @@ fn scan_development_rows(
             version: version.to_path_segment(),
             trigger: candidate.feature.trigger,
         };
-        row.development_description = candidate.description;
+        row.development_description = read_description(&candidate.snapshot);
         row.development_version = Some(version);
     }
     Ok(())
 }
 
+#[cfg(not(debug_assertions))]
+fn scan_development_rows(
+    _root: &Path,
+    _host_version: Version,
+    _rows: &mut BTreeMap<String, InventoryRowBuilder>,
+    _invalid_items: &mut Vec<PluginInventoryView>,
+) -> Result<(), PluginManagementError> {
+    let _ = InstalledPluginView::Absent;
+    let _ = DevelopmentPluginView::Valid {
+        version: String::new(),
+        trigger: String::new(),
+    };
+    let _ = DevelopmentPluginView::Invalid { reason: "disabled" };
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 fn invalid_development_view(entry: &fs::DirEntry, reason: &'static str) -> PluginInventoryView {
     let identity =
         directory_identity(&entry.path()).unwrap_or(DirectoryIdentity { volume: 0, file: 0 });
@@ -2923,7 +4826,6 @@ fn catalog_entry_from_snapshot(
 ) -> Option<PluginCatalogEntry> {
     let version = Version::parse(&manifest.version)?;
     let runtime = root.join(&manifest.runtime);
-    let description = read_description(&snapshot);
     Some(PluginCatalogEntry {
         window_label: window_label(&manifest.id, 1),
         id: manifest.id,
@@ -2935,7 +4837,6 @@ fn catalog_entry_from_snapshot(
         permissions: manifest.permissions,
         package_identity: directory_identity(&root)?,
         root,
-        description,
         generation: 1,
         snapshot: Arc::new(snapshot),
     })
@@ -2991,8 +4892,6 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
     if !snapshot.assets.contains_key(Path::new(&manifest.runtime)) {
         return None;
     }
-    let description = read_description(&snapshot);
-
     Some(PluginCatalogEntry {
         window_label: window_label(&manifest.id, 1),
         id: manifest.id,
@@ -3003,7 +4902,6 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
         },
         permissions: manifest.permissions,
         root: root.to_path_buf(),
-        description,
         generation: 1,
         package_identity: directory_identity(root)?,
         snapshot: Arc::new(snapshot),
@@ -3019,22 +4917,22 @@ fn scan_package_snapshot(root: &Path) -> Result<GenerationAssetSnapshot, Package
     if !ordinary_directory(root) {
         return Err(PackageScanError);
     }
-    let mut hash_entries = Vec::new();
-    let mut assets = HashMap::new();
-    let mut casefolded = HashSet::new();
-    let mut directories = 0usize;
-    let mut files = 0usize;
-    let mut total_bytes = 0u64;
-    scan_package_directory(
+    let mut context = PackageScanContext {
         root,
-        root,
-        &mut hash_entries,
-        &mut assets,
-        &mut casefolded,
-        &mut directories,
-        &mut files,
-        &mut total_bytes,
-    )?;
+        hash_entries: Vec::new(),
+        assets: HashMap::new(),
+        casefolded: HashSet::new(),
+        directories: 0,
+        files: 0,
+        total_bytes: 0,
+    };
+    scan_package_directory(root, &mut context)?;
+    let PackageScanContext {
+        mut hash_entries,
+        assets,
+        total_bytes,
+        ..
+    } = context;
     hash_entries.sort_by(|left, right| package_hash_path(left).cmp(package_hash_path(right)));
     let mut tree = Sha256::new();
     tree.update(b"UIPILOT-PACKAGE");
@@ -3083,24 +4981,29 @@ fn scan_package_snapshot(root: &Path) -> Result<GenerationAssetSnapshot, Package
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+struct PackageScanContext<'a> {
+    root: &'a Path,
+    hash_entries: Vec<PackageHashEntry>,
+    assets: HashMap<PathBuf, Vec<u8>>,
+    casefolded: HashSet<String>,
+    directories: usize,
+    files: usize,
+    total_bytes: u64,
+}
+
 fn scan_package_directory(
-    root: &Path,
     directory: &Path,
-    hash_entries: &mut Vec<PackageHashEntry>,
-    assets: &mut HashMap<PathBuf, Vec<u8>>,
-    casefolded: &mut HashSet<String>,
-    directories: &mut usize,
-    files: &mut usize,
-    total_bytes: &mut u64,
+    context: &mut PackageScanContext<'_>,
 ) -> Result<(), PackageScanError> {
     let entries = fs::read_dir(directory).map_err(|_| PackageScanError)?;
     for entry in entries {
         let entry = entry.map_err(|_| PackageScanError)?;
         let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|_| PackageScanError)?;
+        let relative = path
+            .strip_prefix(context.root)
+            .map_err(|_| PackageScanError)?;
         let canonical = canonical_package_path(relative)?;
-        if !casefolded.insert(canonical.to_lowercase()) {
+        if !context.casefolded.insert(canonical.to_lowercase()) {
             return Err(PackageScanError);
         }
         let metadata = fs::symlink_metadata(&path).map_err(|_| PackageScanError)?;
@@ -3111,45 +5014,41 @@ fn scan_package_directory(
             return Err(PackageScanError);
         }
         if metadata.is_dir() {
-            *directories = directories.checked_add(1).ok_or(PackageScanError)?;
-            if *directories > PLUGIN_PACKAGE_MAX_DIRECTORIES {
+            context.directories = context.directories.checked_add(1).ok_or(PackageScanError)?;
+            if context.directories > PLUGIN_PACKAGE_MAX_DIRECTORIES {
                 return Err(PackageScanError);
             }
-            hash_entries.push(PackageHashEntry::Directory(canonical));
-            scan_package_directory(
-                root,
-                &path,
-                hash_entries,
-                assets,
-                casefolded,
-                directories,
-                files,
-                total_bytes,
-            )?;
+            context
+                .hash_entries
+                .push(PackageHashEntry::Directory(canonical));
+            scan_package_directory(&path, context)?;
             continue;
         }
         if !metadata.is_file() || !allowed_package_file(&canonical) {
             return Err(PackageScanError);
         }
-        *files = files.checked_add(1).ok_or(PackageScanError)?;
-        if *files > PLUGIN_PACKAGE_MAX_FILES || metadata.len() > PLUGIN_PACKAGE_MAX_FILE_BYTES {
+        context.files = context.files.checked_add(1).ok_or(PackageScanError)?;
+        if context.files > PLUGIN_PACKAGE_MAX_FILES
+            || metadata.len() > PLUGIN_PACKAGE_MAX_FILE_BYTES
+        {
             return Err(PackageScanError);
         }
         let bytes = fs::read(&path).map_err(|_| PackageScanError)?;
         if bytes.len() as u64 != metadata.len() || !ordinary_file(&path) {
             return Err(PackageScanError);
         }
-        *total_bytes = total_bytes
+        context.total_bytes = context
+            .total_bytes
             .checked_add(bytes.len() as u64)
             .filter(|total| *total <= PLUGIN_PACKAGE_MAX_TOTAL_BYTES)
             .ok_or(PackageScanError)?;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        hash_entries.push(PackageHashEntry::File(
+        context.hash_entries.push(PackageHashEntry::File(
             canonical,
             bytes.len() as u64,
             digest,
         ));
-        assets.insert(relative.to_path_buf(), bytes);
+        context.assets.insert(relative.to_path_buf(), bytes);
     }
     Ok(())
 }
@@ -3352,16 +5251,82 @@ fn development_plugin_root() -> Option<PathBuf> {
     None
 }
 
-fn cleanup_quarantine(root: &Path) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn migrate_legacy_plugins(
+    plugin_root: &Path,
+    transaction_root: &Path,
+    host_version: Version,
+) -> Result<(), PluginManagementError> {
+    let entries = fs::read_dir(plugin_root).map_err(|_| PluginManagementError::Unavailable)?;
+    let mut legacy = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| PluginManagementError::Unavailable)?;
+        if legacy.len() >= 128 {
+            return Err(PluginManagementError::Unavailable);
+        }
         let path = entry.path();
-        if ordinary_directory(&path) {
-            let _ = fs::remove_dir_all(path);
+        if entry
+            .file_type()
+            .map_err(|_| PluginManagementError::Unavailable)?
+            .is_dir()
+            && ordinary_directory(&path)
+            && !path.join("active.json").exists()
+            && path.join("plugin.json").exists()
+        {
+            let package =
+                load_entry(&path, host_version).ok_or(PluginManagementError::Unavailable)?;
+            if path.file_name().and_then(|name| name.to_str()) != Some(package.id.as_str()) {
+                return Err(PluginManagementError::Unavailable);
+            }
+            legacy.push((path, package.id, package.version));
         }
     }
+
+    let staging_root = transaction_root.join("staging");
+    for (container, plugin_id, version) in legacy {
+        let staging = staging_root.join(format!("legacy-{}", lower_hex(plugin_id.as_bytes())));
+        if staging.exists() {
+            return Err(PluginManagementError::Unavailable);
+        }
+        fs::rename(&container, &staging).map_err(|_| PluginManagementError::Unavailable)?;
+        if fs::create_dir(&container).is_err() {
+            let _ = fs::rename(&staging, &container);
+            return Err(PluginManagementError::Unavailable);
+        }
+        let version_text = version.to_path_segment();
+        let destination = container.join(&version_text);
+        if fs::rename(&staging, &destination).is_err() {
+            let _ = fs::remove_dir(&container);
+            let _ = fs::rename(&staging, &container);
+            return Err(PluginManagementError::Unavailable);
+        }
+        let committed = (|| {
+            let snapshot = scan_package_snapshot(&destination)
+                .map_err(|_| PluginManagementError::Unavailable)?;
+            manifest_from_snapshot(&snapshot, host_version)
+                .filter(|manifest| manifest.id == plugin_id && manifest.version == version_text)
+                .ok_or(PluginManagementError::Unavailable)?;
+            let state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: plugin_id.clone(),
+                active_version: Some(version_text.clone()),
+                packages: vec![PackageRecordV1 {
+                    version: version_text.clone(),
+                    identity: snapshot.package_identity,
+                }],
+            };
+            commit_active_state(&container.join("active.json"), &state)
+        })();
+        if let Err(error) = committed {
+            let rollback = fs::rename(&destination, &staging)
+                .and_then(|()| fs::remove_dir(&container))
+                .and_then(|()| fs::rename(&staging, &container));
+            if rollback.is_err() {
+                return Err(PluginManagementError::Unavailable);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -3671,21 +5636,21 @@ mod tests {
         fn active_state_enforces_empty_and_non_empty_invariants() {
             let empty = br#"{
                 "schema":1,
-                "pluginId":"internal.math",
+                "pluginId":"internal\u002emath",
                 "activeVersion":null,
                 "packages":[]
             }"#;
-            let parsed = parse_active_state(empty, "internal.math").unwrap();
+            let parsed = parse_active_state(empty, "internal\u{2e}math").unwrap();
             assert!(parsed.active_version.is_none());
             assert!(parsed.packages.is_empty());
 
             for invalid in [
                 br#"{"schema":1,"pluginId":"other","activeVersion":null,"packages":[]}"#.as_slice(),
-                br#"{"schema":1,"pluginId":"internal.math","activeVersion":"1.0.0","packages":[]}"#.as_slice(),
-                br#"{"schema":1,"pluginId":"internal.math","activeVersion":null,"packages":[{"version":"1.0.0","identity":{"algorithm":"sha256-tree-v1","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","volumeSerial":1,"fileId":"0000000000000001"}}]}"#.as_slice(),
-                br#"{"schema":2,"pluginId":"internal.math","activeVersion":null,"packages":[]}"#.as_slice(),
+                br#"{"schema":1,"pluginId":"internal\u002emath","activeVersion":"1.0.0","packages":[]}"#.as_slice(),
+                br#"{"schema":1,"pluginId":"internal\u002emath","activeVersion":null,"packages":[{"version":"1.0.0","identity":{"algorithm":"sha256-tree-v1","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","volumeSerial":1,"fileId":"0000000000000001"}}]}"#.as_slice(),
+                br#"{"schema":2,"pluginId":"internal\u002emath","activeVersion":null,"packages":[]}"#.as_slice(),
             ] {
-                assert!(parse_active_state(invalid, "internal.math").is_err());
+                assert!(parse_active_state(invalid, "internal\u{2e}math").is_err());
             }
         }
 
@@ -3758,7 +5723,7 @@ mod tests {
             fs::create_dir(&package).unwrap();
             fs::write(
                 package.join("plugin.json"),
-                valid_manifest(plugin_id, "/math").replace(
+                valid_manifest(plugin_id, "/\u{6d}ath").replace(
                     r#""version":"1.0.0""#,
                     format!(r#""version":"{version}""#).as_str(),
                 ),
@@ -3803,9 +5768,15 @@ mod tests {
         fn development_only_inventory_uses_revisioned_union_dto() {
             let installed = TestRoot::new();
             let development = TestRoot::new();
-            development.write_plugin("internal.math", valid_manifest("internal.math", "/math"));
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
             fs::write(
-                development.path.join("internal.math").join("README.md"),
+                development
+                    .path
+                    .join("internal\u{2e}math")
+                    .join("README.md"),
                 "# Development math",
             )
             .unwrap();
@@ -3823,10 +5794,10 @@ mod tests {
                     "revision":"7",
                     "items":[{
                         "key":"plugin:696e7465726e616c2e6d617468",
-                        "id":"internal.math",
-                        "displayName":"internal.math",
+                        "id":"internal\u{2e}math",
+                        "displayName":"internal\u{2e}math",
                         "installed":{"state":"absent"},
-                        "development":{"state":"valid","version":"1.0.0","trigger":"/math"},
+                        "development":{"state":"valid","version":"1.0.0","trigger":"/\u{6d}ath"},
                         "description":{"state":"available","source":"development","markdown":"# Development math"}
                     }]
                 })
@@ -3838,7 +5809,7 @@ mod tests {
             let installed = TestRoot::new();
             write_installed(
                 &installed.path,
-                "internal.math",
+                "internal\u{2e}math",
                 "0.2.0",
                 &[("0.1.0", "old"), ("0.2.0", "# Installed math")],
             );
@@ -3866,16 +5837,16 @@ mod tests {
             let installed = TestRoot::new();
             write_installed(
                 &installed.path,
-                "internal.math",
+                "internal\u{2e}math",
                 "0.2.0",
                 &[("0.1.0", "old"), ("0.2.0", "active")],
             );
 
             let catalog = PluginCatalog::load(&installed.path, Version::new(0, 2, 0)).unwrap();
             assert_eq!(catalog.views().len(), 1);
-            assert_eq!(catalog.views()[0].id, "internal.math");
+            assert_eq!(catalog.views()[0].id, "internal\u{2e}math");
             assert_eq!(catalog.views()[0].version, "0.2.0");
-            assert!(catalog.route("/math 1+1").is_some());
+            assert!(catalog.route("/\u{6d}ath 1+1").is_some());
         }
 
         #[test]
@@ -3893,7 +5864,7 @@ mod tests {
             manager.load(&app_data.path, Version::new(0, 2, 0)).unwrap();
 
             let snapshot = manager.list_inventory().unwrap();
-            assert_eq!(snapshot.revision, "0");
+            assert_eq!(snapshot.revision, "1");
             let installed = snapshot
                 .items
                 .iter()
@@ -3911,17 +5882,20 @@ mod tests {
             let development = TestRoot::new();
             write_installed(
                 &installed.path,
-                "internal.math",
+                "internal\u{2e}math",
                 "1.0.0",
                 &[("1.0.0", "installed")],
             );
             development.write_plugin(
-                "internal.math",
-                valid_manifest("internal.math", "/math")
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath")
                     .replace(r#""version":"1.0.0""#, r#""version":"2.0.0""#),
             );
             fs::write(
-                development.path.join("internal.math").join("README.md"),
+                development
+                    .path
+                    .join("internal\u{2e}math")
+                    .join("README.md"),
                 "development update",
             )
             .unwrap();
@@ -3981,8 +5955,10 @@ mod tests {
 
         use super::TestRoot;
         use crate::plugins::{
-            directory_identity, parse_cleanup_receipt, parse_plugin_transaction,
-            receipt_worker_eligible, run_cleanup_worker, scan_package_snapshot,
+            directory_identity, handoff_cleanup_receipt, parse_cleanup_receipt,
+            parse_plugin_transaction, read_active_transaction, receipt_worker_eligible,
+            run_cleanup_worker, scan_package_snapshot, stage_runtime_cleanup_receipt,
+            update_transaction_phase, write_prepared_transaction,
         };
 
         fn transaction(phase: &str, receipt_ids: serde_json::Value) -> serde_json::Value {
@@ -3991,7 +5967,7 @@ mod tests {
                 "schema":1,
                 "transactionId":"11111111111111111111111111111111",
                 "operation":"delete-last",
-                "pluginId":"internal.math",
+                "pluginId":"internal\u{2e}math",
                 "phase":phase,
                 "oldState":{"kind":"active-state-v1","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
                 "newState":{"kind":"active-state-v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
@@ -4000,7 +5976,7 @@ mod tests {
                     "deletedPackage":{
                         "role":"deleted-package",
                         "identity":{"volumeSerial":1,"fileId":"0000000000000001","packageDigest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-                        "location":{"root":"plugin-root","relativePath":"internal.math/1.0.0"}
+                        "location":{"root":"plugin-root","relativePath":"internal\u{2e}math/1.0.0"}
                     },
                     "previousRuntimeData":null
                 },
@@ -4021,13 +5997,13 @@ mod tests {
                 "schema":1,
                 "receiptId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "originOperationId":"11111111111111111111111111111111",
-                "pluginId":"internal.math",
+                "pluginId":"internal\u{2e}math",
                 "operation":"delete-last-version",
                 "phase":"pending",
                 "source":{
                     "role":"deleted-package",
                     "root":"plugin-root",
-                    "relativePath":"internal.math/1.0.0",
+                    "relativePath":"internal\u{2e}math/1.0.0",
                     "volumeSerial":1,
                     "fileId":"0000000000000001",
                     "packageDigest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
@@ -4057,6 +6033,98 @@ mod tests {
                     .unwrap()
             )
             .is_err());
+        }
+
+        #[test]
+        fn prepared_journal_is_create_new_durable_and_never_overwrites_an_active_owner() {
+            let root = TestRoot::new();
+            let transaction_root = root.path.join("plugin-transactions");
+            fs::create_dir_all(transaction_root.join("active")).unwrap();
+            let first = parse_plugin_transaction(
+                &serde_json::to_vec(&transaction("prepared", serde_json::json!([]))).unwrap(),
+            )
+            .unwrap();
+
+            write_prepared_transaction(&transaction_root, &first).unwrap();
+            assert_eq!(
+                read_active_transaction(&transaction_root).unwrap(),
+                Some(first.clone())
+            );
+            let before = fs::read(transaction_root.join("active").join("current.json")).unwrap();
+
+            assert!(write_prepared_transaction(&transaction_root, &first).is_err());
+            assert_eq!(
+                fs::read(transaction_root.join("active").join("current.json")).unwrap(),
+                before
+            );
+        }
+
+        #[test]
+        fn journal_phase_update_preserves_the_durable_plan() {
+            let root = TestRoot::new();
+            let transaction_root = root.path.join("plugin-transactions");
+            fs::create_dir_all(transaction_root.join("active")).unwrap();
+            let prepared = parse_plugin_transaction(
+                &serde_json::to_vec(&transaction("prepared", serde_json::json!([]))).unwrap(),
+            )
+            .unwrap();
+            write_prepared_transaction(&transaction_root, &prepared).unwrap();
+
+            update_transaction_phase(
+                &transaction_root,
+                super::super::PluginTransactionPhase::StateCommitted,
+                Vec::new(),
+            )
+            .unwrap();
+
+            let committed = read_active_transaction(&transaction_root).unwrap().unwrap();
+            assert_eq!(
+                committed.phase,
+                super::super::PluginTransactionPhase::StateCommitted
+            );
+            assert_eq!(committed.objects, prepared.objects);
+            assert_eq!(committed.cleanup_plans, prepared.cleanup_plans);
+            assert_eq!(committed.old_state, prepared.old_state);
+            assert_eq!(committed.new_state, prepared.new_state);
+        }
+
+        #[test]
+        fn standalone_runtime_receipt_is_durable_before_cleanup_can_be_deferred() {
+            let app_data = TestRoot::new();
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let identity = super::super::RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-runtime".into(),
+                generation: 7,
+            };
+            fs::create_dir_all(super::super::runtime_data_directory(
+                &app_data.path,
+                &identity,
+            ))
+            .unwrap();
+
+            let receipt_path = stage_runtime_cleanup_receipt(
+                &app_data.path,
+                "internal\u{2e}math",
+                &identity,
+                "11111111111111111111111111111111",
+                "22222222222222222222222222222222",
+            )
+            .unwrap();
+
+            let receipt = super::super::read_cleanup_receipt(&receipt_path).unwrap();
+            assert_eq!(receipt.phase, super::super::CleanupReceiptPhase::Pending);
+            assert!(super::super::runtime_data_directory(&app_data.path, &identity).is_dir());
+
+            handoff_cleanup_receipt(&app_data.path, &receipt_path).unwrap();
+            assert!(!super::super::runtime_data_directory(&app_data.path, &identity).exists());
+            assert_eq!(
+                super::super::read_cleanup_receipt(&receipt_path)
+                    .unwrap()
+                    .phase,
+                super::super::CleanupReceiptPhase::Quarantined
+            );
         }
 
         #[test]
@@ -4105,7 +6173,7 @@ mod tests {
             let source = app_data
                 .path
                 .join("plugins")
-                .join("internal.math")
+                .join("internal\u{2e}math")
                 .join("1.0.0");
             fs::create_dir_all(&source).unwrap();
             fs::write(source.join("plugin.json"), "{}").unwrap();
@@ -4372,6 +6440,788 @@ mod tests {
                     {"id":"zeta","version":"1.0.0","trigger":"/zeta","description":"Zeta docs"}
                 ])
             );
+        }
+    }
+
+    mod lifecycle {
+        use std::fs;
+
+        use crate::plugins::{
+            build_delete_fallback_transaction, build_delete_last_transaction,
+            build_new_version_install_transaction, commit_active_state, commit_prepared_install,
+            commit_prepared_install_transaction, copy_snapshot_files,
+            handoff_committed_install_cleanup, parse_active_state, prepare_development_install,
+            read_active_transaction, read_cleanup_receipt, recover_active_transaction,
+            runtime_data_directory, scan_package_snapshot, write_prepared_transaction,
+            ActivePluginStateV1, CleanupCondition, CleanupObjectRole, CleanupReceiptPhase,
+            PackageRecordV1, PluginTransactionOperation, PluginTransactionPhase, RuntimeIdentity,
+            TransactionObjectsV1,
+        };
+
+        use super::{valid_manifest, TestRoot, Version};
+
+        #[test]
+        fn development_install_uses_version_directory_and_commits_registered_identity() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let installed = TestRoot::new();
+
+            let prepared = prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &installed.path,
+                &installed.path.join("plugin-transactions"),
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.candidate.root,
+                installed.path.join("internal\u{2e}math").join("1.0.0")
+            );
+            assert!(!installed
+                .path
+                .join("internal\u{2e}math")
+                .join("active.json")
+                .exists());
+
+            commit_prepared_install(&prepared).unwrap();
+            let state_bytes = fs::read(
+                installed
+                    .path
+                    .join("internal\u{2e}math")
+                    .join("active.json"),
+            )
+            .unwrap();
+            let state = parse_active_state(&state_bytes, "internal\u{2e}math").unwrap();
+            assert_eq!(state.active_version.as_deref(), Some("1.0.0"));
+            assert_eq!(state.packages.len(), 1);
+            assert_eq!(
+                state.packages[0].identity,
+                prepared.candidate.snapshot.package_identity
+            );
+        }
+
+        #[test]
+        fn development_install_is_staged_before_the_durable_journal_commit() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let installed = TestRoot::new();
+            let transaction_root = installed.path.join("plugin-transactions");
+
+            let prepared = prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &installed.path,
+                &transaction_root,
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .unwrap();
+
+            assert!(prepared
+                .staged_version_root
+                .as_ref()
+                .is_some_and(|root| root.starts_with(transaction_root.join("staging"))));
+            assert!(!installed
+                .path
+                .join("internal\u{2e}math")
+                .join("1.0.0")
+                .exists());
+        }
+
+        #[test]
+        fn new_version_install_transaction_owns_staging_and_candidate_runtime_before_commit() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let app_data = TestRoot::new();
+            let transaction_root = app_data.path.join("plugin-transactions");
+            let prepared = prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &app_data.path.join("plugins"),
+                &transaction_root,
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .unwrap();
+            let runtime = RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-test".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &runtime)).unwrap();
+
+            let transaction = build_new_version_install_transaction(
+                &prepared,
+                &app_data.path,
+                &runtime,
+                None,
+                PluginTransactionOperation::Install,
+                "11111111111111111111111111111111",
+                &[
+                    "22222222222222222222222222222222",
+                    "33333333333333333333333333333333",
+                ],
+            )
+            .unwrap();
+
+            assert_eq!(transaction.cleanup_plans.len(), 2);
+            assert!(transaction.cleanup_plans.iter().any(|plan| {
+                plan.condition == CleanupCondition::IfOldState
+                    && plan.object_role == CleanupObjectRole::CandidatePackage
+            }));
+            assert!(transaction.cleanup_plans.iter().any(|plan| {
+                plan.condition == CleanupCondition::IfOldState
+                    && plan.object_role == CleanupObjectRole::CandidateRuntimeData
+            }));
+            let TransactionObjectsV1::Install {
+                candidate_package,
+                candidate_runtime_data,
+                ..
+            } = &transaction.objects
+            else {
+                panic!("install transaction must use install objects");
+            };
+            assert_eq!(candidate_package.allowed_locations.len(), 2);
+            assert_eq!(
+                candidate_runtime_data.location.root,
+                super::super::TransactionRoot::RuntimeData
+            );
+
+            fs::create_dir_all(transaction_root.join("active")).unwrap();
+            fs::create_dir_all(transaction_root.join("receipts")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            write_prepared_transaction(&transaction_root, &transaction).unwrap();
+            recover_active_transaction(&app_data.path).unwrap();
+            assert!(read_active_transaction(&transaction_root)
+                .unwrap()
+                .is_none());
+            assert!(!prepared.staged_version_root.as_ref().unwrap().exists());
+            assert!(!runtime_data_directory(&app_data.path, &runtime).exists());
+        }
+
+        #[test]
+        fn update_transaction_owns_previous_runtime_cleanup_after_commit() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let app_data = TestRoot::new();
+            let transaction_root = app_data.path.join("plugin-transactions");
+            let prepared = prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &app_data.path.join("plugins"),
+                &transaction_root,
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .unwrap();
+            let candidate = RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-candidate".into(),
+                generation: 2,
+            };
+            let previous = RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-previous".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &candidate)).unwrap();
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &previous)).unwrap();
+
+            let transaction = build_new_version_install_transaction(
+                &prepared,
+                &app_data.path,
+                &candidate,
+                Some(&previous),
+                PluginTransactionOperation::Update,
+                "11111111111111111111111111111111",
+                &[
+                    "22222222222222222222222222222222",
+                    "33333333333333333333333333333333",
+                    "44444444444444444444444444444444",
+                ],
+            )
+            .unwrap();
+
+            assert!(transaction.cleanup_plans.iter().any(|plan| {
+                plan.condition == CleanupCondition::IfNewState
+                    && plan.object_role == CleanupObjectRole::PreviousRuntimeData
+                    && plan.receipt_id == "44444444444444444444444444444444"
+            }));
+            let TransactionObjectsV1::Install {
+                previous_runtime_data,
+                ..
+            } = transaction.objects
+            else {
+                panic!("update transaction must use install objects");
+            };
+            assert!(previous_runtime_data.is_some());
+        }
+
+        #[test]
+        fn committed_update_hands_previous_runtime_to_a_durable_receipt() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let app_data = TestRoot::new();
+            let transaction_root = app_data.path.join("plugin-transactions");
+            fs::create_dir_all(transaction_root.join("active")).unwrap();
+            fs::create_dir_all(transaction_root.join("receipts")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let prepared = prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &app_data.path.join("plugins"),
+                &transaction_root,
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .unwrap();
+            let candidate = RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-candidate".into(),
+                generation: 2,
+            };
+            let previous = RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-previous".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &candidate)).unwrap();
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &previous)).unwrap();
+            fs::write(
+                runtime_data_directory(&app_data.path, &previous).join("state.bin"),
+                "old",
+            )
+            .unwrap();
+            let transaction = build_new_version_install_transaction(
+                &prepared,
+                &app_data.path,
+                &candidate,
+                Some(&previous),
+                PluginTransactionOperation::Update,
+                "11111111111111111111111111111111",
+                &[
+                    "22222222222222222222222222222222",
+                    "33333333333333333333333333333333",
+                    "44444444444444444444444444444444",
+                ],
+            )
+            .unwrap();
+            write_prepared_transaction(&transaction_root, &transaction).unwrap();
+            commit_prepared_install_transaction(&prepared, &transaction_root).unwrap();
+
+            handoff_committed_install_cleanup(&app_data.path, &transaction_root).unwrap();
+
+            assert!(!runtime_data_directory(&app_data.path, &previous).exists());
+            assert!(app_data
+                .path
+                .join("plugin-quarantine")
+                .join("44444444444444444444444444444444")
+                .is_dir());
+            assert!(read_active_transaction(&transaction_root)
+                .unwrap()
+                .is_none());
+            let receipt = read_cleanup_receipt(
+                &transaction_root
+                    .join("receipts")
+                    .join("44444444444444444444444444444444.json"),
+            )
+            .unwrap();
+            assert_eq!(receipt.phase, CleanupReceiptPhase::Quarantined);
+        }
+
+        #[test]
+        fn activate_existing_transaction_uses_registered_snapshot_and_cleans_verification_staging()
+        {
+            let app_data = TestRoot::new();
+            let id = super::package_id();
+            let trigger = super::trigger();
+            let development = app_data.path.join("development").join(&id);
+            fs::create_dir_all(&development).unwrap();
+            fs::write(
+                development.join("plugin.json"),
+                valid_manifest(&id, &trigger)
+                    .replace(r#""version":"1.0.0""#, r#""version":"2.0.0""#),
+            )
+            .unwrap();
+            fs::write(development.join("index.html"), "").unwrap();
+            fs::write(development.join("runtime.js"), "").unwrap();
+            let development_snapshot = scan_package_snapshot(&development).unwrap();
+            let plugin_root = app_data.path.join("plugins");
+            let container = plugin_root.join(&id);
+            let active_root = container.join("1.0.0");
+            let activation_root = container.join("2.0.0");
+            fs::create_dir_all(&active_root).unwrap();
+            fs::write(
+                active_root.join("plugin.json"),
+                valid_manifest(&id, &trigger),
+            )
+            .unwrap();
+            fs::write(active_root.join("index.html"), "").unwrap();
+            fs::write(active_root.join("runtime.js"), "").unwrap();
+            fs::create_dir(&activation_root).unwrap();
+            copy_snapshot_files(&development_snapshot, &activation_root).unwrap();
+            let state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: id.clone(),
+                active_version: Some("1.0.0".into()),
+                packages: vec![
+                    PackageRecordV1 {
+                        version: "1.0.0".into(),
+                        identity: scan_package_snapshot(&active_root)
+                            .unwrap()
+                            .package_identity,
+                    },
+                    PackageRecordV1 {
+                        version: "2.0.0".into(),
+                        identity: scan_package_snapshot(&activation_root)
+                            .unwrap()
+                            .package_identity,
+                    },
+                ],
+            };
+            fs::write(
+                container.join("active.json"),
+                serde_json::to_vec(&state).unwrap(),
+            )
+            .unwrap();
+            let prepared = prepare_development_install(
+                &development,
+                &plugin_root,
+                &app_data.path.join("plugin-transactions"),
+                Version::new(0, 2, 0),
+                &id,
+            )
+            .unwrap();
+            let candidate = RuntimeIdentity {
+                plugin_id: id.clone(),
+                window_label: "plugin-candidate".into(),
+                generation: 2,
+            };
+            let previous = RuntimeIdentity {
+                plugin_id: id,
+                window_label: "plugin-previous".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &candidate)).unwrap();
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &previous)).unwrap();
+
+            let transaction = build_new_version_install_transaction(
+                &prepared,
+                &app_data.path,
+                &candidate,
+                Some(&previous),
+                PluginTransactionOperation::Update,
+                "11111111111111111111111111111111",
+                &[
+                    "22222222222222222222222222222222",
+                    "33333333333333333333333333333333",
+                    "44444444444444444444444444444444",
+                    "55555555555555555555555555555555",
+                ],
+            )
+            .unwrap();
+            let TransactionObjectsV1::Install {
+                mode,
+                candidate_package,
+                activation_package,
+                ..
+            } = transaction.objects
+            else {
+                panic!("activation must use install objects");
+            };
+            assert_eq!(mode, super::super::InstallMode::ActivateExisting);
+            assert_eq!(candidate_package.allowed_locations.len(), 1);
+            assert!(activation_package.is_some());
+            assert_eq!(
+                transaction
+                    .cleanup_plans
+                    .iter()
+                    .filter(|plan| plan.object_role == CleanupObjectRole::CandidatePackage)
+                    .count(),
+                2
+            );
+        }
+
+        #[test]
+        fn install_transaction_records_package_placement_before_state_commit() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let app_data = TestRoot::new();
+            let transaction_root = app_data.path.join("plugin-transactions");
+            fs::create_dir_all(transaction_root.join("active")).unwrap();
+            let prepared = prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &app_data.path.join("plugins"),
+                &transaction_root,
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .unwrap();
+            let runtime = RuntimeIdentity {
+                plugin_id: "internal\u{2e}math".into(),
+                window_label: "plugin-test".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &runtime)).unwrap();
+            let transaction = build_new_version_install_transaction(
+                &prepared,
+                &app_data.path,
+                &runtime,
+                None,
+                PluginTransactionOperation::Install,
+                "11111111111111111111111111111111",
+                &[
+                    "22222222222222222222222222222222",
+                    "33333333333333333333333333333333",
+                ],
+            )
+            .unwrap();
+            write_prepared_transaction(&transaction_root, &transaction).unwrap();
+
+            commit_prepared_install_transaction(&prepared, &transaction_root).unwrap();
+
+            assert!(prepared
+                .installed_version_root
+                .as_ref()
+                .is_some_and(|root| root.is_dir()));
+            assert_eq!(
+                read_active_transaction(&transaction_root)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                PluginTransactionPhase::StateCommitted
+            );
+            assert_eq!(
+                parse_active_state(
+                    &fs::read(&prepared.state_path).unwrap(),
+                    "internal\u{2e}math"
+                )
+                .unwrap()
+                .active_version
+                .as_deref(),
+                Some("1.0.0")
+            );
+        }
+
+        #[test]
+        fn delete_last_transaction_owns_deleted_package_and_previous_runtime() {
+            let app_data = TestRoot::new();
+            let id = super::package_id();
+            let plugin_root = app_data.path.join("plugins");
+            let package_root = plugin_root.join(&id).join("1.0.0");
+            fs::create_dir_all(&package_root).unwrap();
+            fs::write(
+                package_root.join("plugin.json"),
+                valid_manifest(&id, &super::trigger()),
+            )
+            .unwrap();
+            fs::write(package_root.join("index.html"), "").unwrap();
+            fs::write(package_root.join("runtime.js"), "").unwrap();
+            let active = super::super::load_entry(&package_root, Version::new(0, 2, 0)).unwrap();
+            let old_state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: id.clone(),
+                active_version: Some("1.0.0".into()),
+                packages: vec![PackageRecordV1 {
+                    version: "1.0.0".into(),
+                    identity: active.snapshot.package_identity.clone(),
+                }],
+            };
+            let old_bytes = serde_json::to_vec(&old_state).unwrap();
+            let empty_state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: id.clone(),
+                active_version: None,
+                packages: Vec::new(),
+            };
+            let previous = RuntimeIdentity {
+                plugin_id: id,
+                window_label: "plugin-previous".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &previous)).unwrap();
+
+            let transaction = build_delete_last_transaction(
+                &app_data.path,
+                &active,
+                super::super::durable_state_reference(Some(&old_bytes)),
+                &empty_state,
+                Some(&previous),
+                "11111111111111111111111111111111",
+                &[
+                    "22222222222222222222222222222222",
+                    "33333333333333333333333333333333",
+                ],
+            )
+            .unwrap();
+
+            assert_eq!(
+                transaction.operation,
+                PluginTransactionOperation::DeleteLast
+            );
+            assert_eq!(transaction.cleanup_plans.len(), 2);
+            assert!(transaction
+                .cleanup_plans
+                .iter()
+                .all(|plan| { plan.condition == CleanupCondition::IfNewState }));
+
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("active")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let transaction_root = app_data.path.join("plugin-transactions");
+            write_prepared_transaction(&transaction_root, &transaction).unwrap();
+            commit_active_state(
+                &package_root.parent().unwrap().join("active.json"),
+                &empty_state,
+            )
+            .unwrap();
+            super::super::update_transaction_phase(
+                &transaction_root,
+                PluginTransactionPhase::StateCommitted,
+                Vec::new(),
+            )
+            .unwrap();
+
+            recover_active_transaction(&app_data.path).unwrap();
+
+            assert!(!package_root.exists());
+            assert!(!runtime_data_directory(&app_data.path, &previous).exists());
+            assert!(read_active_transaction(&transaction_root)
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn fallback_delete_transaction_keeps_fallback_and_owns_deleted_resources() {
+            let app_data = TestRoot::new();
+            let id = super::package_id();
+            let plugin_root = app_data.path.join("plugins");
+            let active_root = plugin_root.join(&id).join("2.0.0");
+            let fallback_root = plugin_root.join(&id).join("1.0.0");
+            for (root, version) in [(&active_root, "2.0.0"), (&fallback_root, "1.0.0")] {
+                fs::create_dir_all(root).unwrap();
+                fs::write(
+                    root.join("plugin.json"),
+                    valid_manifest(&id, &super::trigger())
+                        .replace(r#""version":"1.0.0""#, &format!(r#""version":"{version}""#)),
+                )
+                .unwrap();
+                fs::write(root.join("index.html"), "").unwrap();
+                fs::write(root.join("runtime.js"), "").unwrap();
+            }
+            let active = super::super::load_entry(&active_root, Version::new(0, 2, 0)).unwrap();
+            let fallback = super::super::load_entry(&fallback_root, Version::new(0, 2, 0)).unwrap();
+            let old_state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: id.clone(),
+                active_version: Some("2.0.0".into()),
+                packages: vec![
+                    PackageRecordV1 {
+                        version: "1.0.0".into(),
+                        identity: fallback.snapshot.package_identity.clone(),
+                    },
+                    PackageRecordV1 {
+                        version: "2.0.0".into(),
+                        identity: active.snapshot.package_identity.clone(),
+                    },
+                ],
+            };
+            let new_state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: id.clone(),
+                active_version: Some("1.0.0".into()),
+                packages: vec![old_state.packages[0].clone()],
+            };
+            let candidate_runtime = RuntimeIdentity {
+                plugin_id: id.clone(),
+                window_label: "plugin-candidate".into(),
+                generation: 2,
+            };
+            let previous_runtime = RuntimeIdentity {
+                plugin_id: id,
+                window_label: "plugin-previous".into(),
+                generation: 1,
+            };
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &candidate_runtime)).unwrap();
+            fs::create_dir_all(runtime_data_directory(&app_data.path, &previous_runtime)).unwrap();
+
+            let transaction =
+                build_delete_fallback_transaction(super::super::DeleteFallbackTransactionInput {
+                    app_data_dir: &app_data.path,
+                    active: &active,
+                    fallback: &fallback,
+                    candidate_runtime: &candidate_runtime,
+                    previous_runtime: Some(&previous_runtime),
+                    old_state: super::super::durable_state_reference(Some(
+                        &serde_json::to_vec(&old_state).unwrap(),
+                    )),
+                    new_state: &new_state,
+                    transaction_id: "11111111111111111111111111111111",
+                    receipt_ids: &[
+                        "22222222222222222222222222222222",
+                        "33333333333333333333333333333333",
+                        "44444444444444444444444444444444",
+                    ],
+                })
+                .unwrap();
+
+            assert_eq!(
+                transaction.operation,
+                PluginTransactionOperation::DeleteWithFallback
+            );
+            assert_eq!(transaction.cleanup_plans.len(), 3);
+        }
+
+        #[test]
+        fn existing_version_content_is_never_overwritten() {
+            let development = TestRoot::new();
+            development.write_plugin(
+                "internal\u{2e}math",
+                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+            );
+            let installed = TestRoot::new();
+            let version_root = installed.path.join("internal\u{2e}math").join("1.0.0");
+            fs::create_dir_all(&version_root).unwrap();
+            fs::write(version_root.join("marker.txt"), "keep").unwrap();
+
+            assert!(prepare_development_install(
+                &development.path.join("internal\u{2e}math"),
+                &installed.path,
+                &installed.path.join("plugin-transactions"),
+                Version::new(0, 2, 0),
+                "internal\u{2e}math",
+            )
+            .is_err());
+            assert_eq!(
+                fs::read_to_string(version_root.join("marker.txt")).unwrap(),
+                "keep"
+            );
+        }
+
+        #[test]
+        fn a_higher_inactive_registered_version_is_activated_without_overwrite() {
+            let app_data = TestRoot::new();
+            let id = super::package_id();
+            let trigger = super::trigger();
+            let development = app_data.path.join("development").join(&id);
+            fs::create_dir_all(&development).unwrap();
+            fs::write(
+                development.join("plugin.json"),
+                valid_manifest(&id, &trigger)
+                    .replace(r#""version":"1.0.0""#, r#""version":"2.0.0""#),
+            )
+            .unwrap();
+            fs::write(development.join("index.html"), "").unwrap();
+            fs::write(development.join("runtime.js"), "").unwrap();
+            let development_snapshot = scan_package_snapshot(&development).unwrap();
+
+            let plugin_root = app_data.path.join("plugins");
+            let container = plugin_root.join(&id);
+            let version_one = container.join("1.0.0");
+            let version_two = container.join("2.0.0");
+            fs::create_dir_all(&version_one).unwrap();
+            fs::write(
+                version_one.join("plugin.json"),
+                valid_manifest(&id, &trigger),
+            )
+            .unwrap();
+            fs::write(version_one.join("index.html"), "").unwrap();
+            fs::write(version_one.join("runtime.js"), "").unwrap();
+            fs::create_dir(&version_two).unwrap();
+            copy_snapshot_files(&development_snapshot, &version_two).unwrap();
+            let one_identity = scan_package_snapshot(&version_one)
+                .unwrap()
+                .package_identity;
+            let two_identity = scan_package_snapshot(&version_two)
+                .unwrap()
+                .package_identity;
+            let state = ActivePluginStateV1 {
+                schema: 1,
+                plugin_id: id.clone(),
+                active_version: Some("1.0.0".into()),
+                packages: vec![
+                    PackageRecordV1 {
+                        version: "1.0.0".into(),
+                        identity: one_identity,
+                    },
+                    PackageRecordV1 {
+                        version: "2.0.0".into(),
+                        identity: two_identity.clone(),
+                    },
+                ],
+            };
+            fs::write(
+                container.join("active.json"),
+                serde_json::to_vec(&state).unwrap(),
+            )
+            .unwrap();
+
+            let prepared = prepare_development_install(
+                &development,
+                &plugin_root,
+                &app_data.path.join("plugin-transactions"),
+                Version::new(0, 2, 0),
+                &id,
+            )
+            .unwrap();
+            assert_eq!(prepared.candidate.root, version_two);
+            assert!(prepared.installed_version_root.is_none());
+            assert_eq!(prepared.mode, super::super::InstallMode::ActivateExisting);
+            assert!(prepared
+                .staged_version_root
+                .as_ref()
+                .is_some_and(|root| root
+                    .starts_with(app_data.path.join("plugin-transactions").join("staging"))));
+            assert_eq!(prepared.candidate.snapshot.package_identity, two_identity);
+            commit_prepared_install(&prepared).unwrap();
+            let active =
+                parse_active_state(&fs::read(container.join("active.json")).unwrap(), &id).unwrap();
+            assert_eq!(active.active_version.as_deref(), Some("2.0.0"));
+        }
+
+        #[test]
+        fn manager_startup_migrates_a_valid_flat_package_to_registered_version_layout() {
+            let app_data = TestRoot::new();
+            let id = super::package_id();
+            let plugin_root = app_data.path.join("plugins");
+            let flat_package = plugin_root.join(&id);
+            fs::create_dir_all(&flat_package).unwrap();
+            fs::write(
+                flat_package.join("plugin.json"),
+                valid_manifest(&id, &super::trigger()),
+            )
+            .unwrap();
+            fs::write(flat_package.join("index.html"), "").unwrap();
+            fs::write(flat_package.join("runtime.js"), "").unwrap();
+
+            let manager = crate::plugins::PluginManager::new();
+            manager.load(&app_data.path, Version::new(0, 2, 0)).unwrap();
+
+            let container = plugin_root.join(&id);
+            assert!(!container.join("plugin.json").exists());
+            assert!(container.join("1.0.0").join("plugin.json").exists());
+            let state =
+                parse_active_state(&fs::read(container.join("active.json")).unwrap(), &id).unwrap();
+            assert_eq!(state.active_version.as_deref(), Some("1.0.0"));
+            assert_eq!(manager.list_inventory().unwrap().items.len(), 1);
+            assert!(manager
+                .route(&format!("{} 1+1", super::trigger()))
+                .is_some());
         }
     }
 

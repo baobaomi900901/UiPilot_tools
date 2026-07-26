@@ -14,8 +14,8 @@ use crate::{
     lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
     plugins::{
-        PluginCopyError, PluginManagementError, PluginManager, PluginQueryError, PluginQueryStart,
-        PluginView,
+        PluginCopyError, PluginInventorySnapshot, PluginManagementError, PluginManager,
+        PluginMutationOutcome, PluginQueryError, PluginQueryStart,
     },
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
     settings::{SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WindowPosition},
@@ -161,6 +161,13 @@ impl CommandError {
         }
     }
 
+    fn plugin_install_failed() -> Self {
+        Self {
+            code: "pluginInstallFailed",
+            message: "plugin install failed",
+        }
+    }
+
     fn plugin_reload_failed() -> Self {
         Self {
             code: "pluginReloadFailed",
@@ -226,9 +233,9 @@ fn require_main_window(window: &WebviewWindow) -> Result<(), CommandError> {
     require_main_label(window.label())
 }
 
-fn list_plugins_with_label<L>(label: &str, list: L) -> Result<Vec<PluginView>, CommandError>
+fn list_plugins_with_label<L>(label: &str, list: L) -> Result<PluginInventorySnapshot, CommandError>
 where
-    L: FnOnce() -> Result<Vec<PluginView>, PluginManagementError>,
+    L: FnOnce() -> Result<PluginInventorySnapshot, PluginManagementError>,
 {
     require_main_label(label)?;
     list().map_err(|_| CommandError::plugin_list_failed())
@@ -238,13 +245,40 @@ where
 pub(crate) fn list_plugins(
     window: WebviewWindow,
     plugins: State<'_, Arc<PluginManager>>,
-) -> Result<Vec<PluginView>, CommandError> {
-    list_plugins_with_label(window.label(), || plugins.list_views())
+) -> Result<PluginInventorySnapshot, CommandError> {
+    list_plugins_with_label(window.label(), || plugins.list_inventory())
 }
 
-fn reload_plugin_with_label<R>(label: &str, reload: R) -> Result<PluginView, CommandError>
+fn install_plugin_with_label<I>(
+    label: &str,
+    install: I,
+) -> Result<PluginMutationOutcome, CommandError>
 where
-    R: FnOnce() -> Result<PluginView, PluginManagementError>,
+    I: FnOnce() -> Result<PluginMutationOutcome, PluginManagementError>,
+{
+    require_main_label(label)?;
+    install().map_err(|_| CommandError::plugin_install_failed())
+}
+
+#[tauri::command]
+pub(crate) async fn install_plugin(
+    window: WebviewWindow,
+    app: AppHandle,
+    plugins: State<'_, Arc<PluginManager>>,
+    registry: State<'_, ResultRegistry>,
+    plugin_id: String,
+) -> Result<PluginMutationOutcome, CommandError> {
+    install_plugin_with_label(window.label(), || {
+        plugins.install_plugin(&app, &registry, &plugin_id)
+    })
+}
+
+fn reload_plugin_with_label<R>(
+    label: &str,
+    reload: R,
+) -> Result<PluginMutationOutcome, CommandError>
+where
+    R: FnOnce() -> Result<PluginMutationOutcome, PluginManagementError>,
 {
     require_main_label(label)?;
     reload().map_err(|_| CommandError::plugin_reload_failed())
@@ -257,15 +291,18 @@ pub(crate) async fn reload_plugin(
     plugins: State<'_, Arc<PluginManager>>,
     registry: State<'_, ResultRegistry>,
     plugin_id: String,
-) -> Result<PluginView, CommandError> {
+) -> Result<PluginMutationOutcome, CommandError> {
     reload_plugin_with_label(window.label(), || {
         plugins.reload_plugin(&app, &registry, &plugin_id)
     })
 }
 
-fn delete_plugin_with_label<D>(label: &str, delete: D) -> Result<(), CommandError>
+fn delete_plugin_with_label<D>(
+    label: &str,
+    delete: D,
+) -> Result<PluginMutationOutcome, CommandError>
 where
-    D: FnOnce() -> Result<(), PluginManagementError>,
+    D: FnOnce() -> Result<PluginMutationOutcome, PluginManagementError>,
 {
     require_main_label(label)?;
     delete().map_err(|_| CommandError::plugin_delete_failed())
@@ -278,7 +315,7 @@ pub(crate) async fn delete_plugin(
     plugins: State<'_, Arc<PluginManager>>,
     registry: State<'_, ResultRegistry>,
     plugin_id: String,
-) -> Result<(), CommandError> {
+) -> Result<PluginMutationOutcome, CommandError> {
     delete_plugin_with_label(window.label(), || {
         plugins.delete_plugin(&app, &registry, &plugin_id)
     })
@@ -2411,10 +2448,12 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use super::super::{
-            delete_plugin_with_label, list_plugins_with_label, publish_plugin_results_with_label,
-            reload_plugin_with_label, CommandError,
+            delete_plugin_with_label, install_plugin_with_label, list_plugins_with_label,
+            publish_plugin_results_with_label, reload_plugin_with_label, CommandError,
         };
-        use crate::plugins::{PluginManagementError, PluginQueryError, PluginView};
+        use crate::plugins::{
+            PluginInventorySnapshot, PluginManagementError, PluginMutationOutcome, PluginQueryError,
+        };
 
         #[test]
         fn list_guard_and_fixed_error_mapping_precede_manager_access() {
@@ -2422,18 +2461,19 @@ mod tests {
             assert_eq!(
                 list_plugins_with_label("secondary", || {
                     calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(Vec::new())
+                    Ok(PluginInventorySnapshot {
+                        revision: "1".into(),
+                        items: Vec::new(),
+                    })
                 }),
                 Err(CommandError::invalid_caller())
             );
             assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-            let expected = vec![PluginView {
-                id: "plugin".into(),
-                version: "1.0.0".into(),
-                trigger: "/plugin".into(),
-                description: None,
-            }];
+            let expected = PluginInventorySnapshot {
+                revision: "1".into(),
+                items: Vec::new(),
+            };
             assert_eq!(
                 list_plugins_with_label("main", || Ok(expected.clone())),
                 Ok(expected)
@@ -2441,6 +2481,30 @@ mod tests {
             assert_eq!(
                 list_plugins_with_label("main", || Err(PluginManagementError::Unavailable)),
                 Err(CommandError::plugin_list_failed())
+            );
+        }
+
+        #[test]
+        fn install_guard_and_fixed_error_mapping_precede_manager_access() {
+            let calls = AtomicUsize::new(0);
+            assert_eq!(
+                install_plugin_with_label("secondary", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err(PluginManagementError::Unavailable)
+                }),
+                Err(CommandError::invalid_caller())
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                install_plugin_with_label("main", || Err(PluginManagementError::Unavailable)),
+                Err(CommandError::plugin_install_failed())
+            );
+            let expected = PluginMutationOutcome {
+                revision: "2".into(),
+            };
+            assert_eq!(
+                install_plugin_with_label("main", || Ok(expected.clone())),
+                Ok(expected)
             );
         }
 
