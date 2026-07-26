@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -406,6 +406,7 @@ pub(crate) struct LifecycleCoordinator {
     lifecycle_phase: AtomicU8,
     lifecycle_attempt_epoch: AtomicU64,
     window_move_active: AtomicBool,
+    transient_focus_suppressions: AtomicUsize,
     readiness: Mutex<Readiness>,
     exit_gate: Mutex<ExitGate>,
     critical_changed: Condvar,
@@ -421,6 +422,7 @@ impl Default for LifecycleCoordinator {
             lifecycle_phase: AtomicU8::new(FileIndexPhase::Running as u8),
             lifecycle_attempt_epoch: AtomicU64::new(0),
             window_move_active: AtomicBool::new(false),
+            transient_focus_suppressions: AtomicUsize::new(0),
             readiness: Mutex::new(Readiness::default()),
             exit_gate: Mutex::new(ExitGate::default()),
             critical_changed: Condvar::new(),
@@ -536,6 +538,21 @@ pub(crate) struct CriticalReservation {
     released: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct TransientFocusSuppression {
+    coordinator: Arc<LifecycleCoordinator>,
+}
+
+impl Drop for TransientFocusSuppression {
+    fn drop(&mut self) {
+        let previous = self
+            .coordinator
+            .transient_focus_suppressions
+            .fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "transient focus suppression count underflow");
+    }
+}
+
 impl Drop for CriticalReservation {
     fn drop(&mut self) {
         if self.released {
@@ -559,6 +576,19 @@ impl Drop for CriticalReservation {
 }
 
 impl LifecycleCoordinator {
+    pub(crate) fn suppress_transient_focus_loss(
+        self: &Arc<Self>,
+    ) -> Result<TransientFocusSuppression, ReservationError> {
+        self.transient_focus_suppressions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| ReservationError::Overflow)?;
+        Ok(TransientFocusSuppression {
+            coordinator: Arc::clone(self),
+        })
+    }
+
     pub(crate) fn file_index_phase(&self) -> FileIndexPhase {
         match self.lifecycle_phase.load(Ordering::Acquire) {
             0 => FileIndexPhase::Running,
@@ -903,7 +933,10 @@ impl LifecycleCoordinator {
     where
         H: FnMut() -> Result<(), ()>,
     {
-        if !focused && self.window_move_active.load(Ordering::Acquire) {
+        if !focused
+            && (self.window_move_active.load(Ordering::Acquire)
+                || self.transient_focus_suppressions.load(Ordering::Acquire) > 0)
+        {
             return Ok(());
         }
         if focused {
@@ -3041,6 +3074,33 @@ mod tests {
 
         coordinator.observe_window_move_message(WM_EXITSIZEMOVE);
         let hides = Cell::new(0);
+        coordinator
+            .handle_focus_event_with(false, || {
+                hides.set(hides.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(hides.get(), 1);
+    }
+
+    #[test]
+    fn scoped_plugin_management_suppresses_only_focus_loss_until_drop() {
+        let coordinator = coordinator_for_test();
+        let hides = Cell::new(0);
+        let guard = coordinator.suppress_transient_focus_loss().unwrap();
+
+        coordinator
+            .handle_focus_event_with(false, || {
+                hides.set(hides.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        coordinator
+            .handle_focus_event_with(true, || panic!("focus gain must never hide"))
+            .unwrap();
+        assert_eq!(hides.get(), 0);
+
+        drop(guard);
         coordinator
             .handle_focus_event_with(false, || {
                 hides.set(hides.get() + 1);

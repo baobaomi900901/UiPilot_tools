@@ -251,12 +251,16 @@ pub(crate) fn list_plugins(
 
 fn install_plugin_with_label<I>(
     label: &str,
+    coordinator: &Arc<LifecycleCoordinator>,
     install: I,
 ) -> Result<PluginMutationOutcome, CommandError>
 where
     I: FnOnce() -> Result<PluginMutationOutcome, PluginManagementError>,
 {
     require_main_label(label)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| CommandError::plugin_install_failed())?;
     install().map_err(|_| CommandError::plugin_install_failed())
 }
 
@@ -266,21 +270,26 @@ pub(crate) async fn install_plugin(
     app: AppHandle,
     plugins: State<'_, Arc<PluginManager>>,
     registry: State<'_, ResultRegistry>,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
     plugin_id: String,
 ) -> Result<PluginMutationOutcome, CommandError> {
-    install_plugin_with_label(window.label(), || {
+    install_plugin_with_label(window.label(), &coordinator, || {
         plugins.install_plugin(&app, &registry, &plugin_id)
     })
 }
 
 fn reload_plugin_with_label<R>(
     label: &str,
+    coordinator: &Arc<LifecycleCoordinator>,
     reload: R,
 ) -> Result<PluginMutationOutcome, CommandError>
 where
     R: FnOnce() -> Result<PluginMutationOutcome, PluginManagementError>,
 {
     require_main_label(label)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| CommandError::plugin_reload_failed())?;
     reload().map_err(|_| CommandError::plugin_reload_failed())
 }
 
@@ -290,21 +299,26 @@ pub(crate) async fn reload_plugin(
     app: AppHandle,
     plugins: State<'_, Arc<PluginManager>>,
     registry: State<'_, ResultRegistry>,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
     plugin_id: String,
 ) -> Result<PluginMutationOutcome, CommandError> {
-    reload_plugin_with_label(window.label(), || {
+    reload_plugin_with_label(window.label(), &coordinator, || {
         plugins.reload_plugin(&app, &registry, &plugin_id)
     })
 }
 
 fn delete_plugin_with_label<D>(
     label: &str,
+    coordinator: &Arc<LifecycleCoordinator>,
     delete: D,
 ) -> Result<PluginMutationOutcome, CommandError>
 where
     D: FnOnce() -> Result<PluginMutationOutcome, PluginManagementError>,
 {
     require_main_label(label)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| CommandError::plugin_delete_failed())?;
     delete().map_err(|_| CommandError::plugin_delete_failed())
 }
 
@@ -314,9 +328,10 @@ pub(crate) async fn delete_plugin(
     app: AppHandle,
     plugins: State<'_, Arc<PluginManager>>,
     registry: State<'_, ResultRegistry>,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
     plugin_id: String,
 ) -> Result<PluginMutationOutcome, CommandError> {
-    delete_plugin_with_label(window.label(), || {
+    delete_plugin_with_label(window.label(), &coordinator, || {
         plugins.delete_plugin(&app, &registry, &plugin_id)
     })
 }
@@ -2445,12 +2460,16 @@ mod tests {
     }
 
     mod plugin {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
         use super::super::{
             delete_plugin_with_label, install_plugin_with_label, list_plugins_with_label,
             publish_plugin_results_with_label, reload_plugin_with_label, CommandError,
         };
+        use crate::lifecycle::LifecycleCoordinator;
         use crate::plugins::{
             PluginInventorySnapshot, PluginManagementError, PluginMutationOutcome, PluginQueryError,
         };
@@ -2487,8 +2506,9 @@ mod tests {
         #[test]
         fn install_guard_and_fixed_error_mapping_precede_manager_access() {
             let calls = AtomicUsize::new(0);
+            let coordinator = Arc::new(LifecycleCoordinator::default());
             assert_eq!(
-                install_plugin_with_label("secondary", || {
+                install_plugin_with_label("secondary", &coordinator, || {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Err(PluginManagementError::Unavailable)
                 }),
@@ -2496,14 +2516,16 @@ mod tests {
             );
             assert_eq!(calls.load(Ordering::Relaxed), 0);
             assert_eq!(
-                install_plugin_with_label("main", || Err(PluginManagementError::Unavailable)),
+                install_plugin_with_label("main", &coordinator, || {
+                    Err(PluginManagementError::Unavailable)
+                }),
                 Err(CommandError::plugin_install_failed())
             );
             let expected = PluginMutationOutcome {
                 revision: "2".into(),
             };
             assert_eq!(
-                install_plugin_with_label("main", || Ok(expected.clone())),
+                install_plugin_with_label("main", &coordinator, || Ok(expected.clone())),
                 Ok(expected)
             );
         }
@@ -2511,8 +2533,9 @@ mod tests {
         #[test]
         fn reload_guard_and_fixed_error_mapping_precede_manager_access() {
             let calls = AtomicUsize::new(0);
+            let coordinator = Arc::new(LifecycleCoordinator::default());
             assert_eq!(
-                reload_plugin_with_label("secondary", || {
+                reload_plugin_with_label("secondary", &coordinator, || {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Err(PluginManagementError::Unavailable)
                 }),
@@ -2521,7 +2544,9 @@ mod tests {
             assert_eq!(calls.load(Ordering::Relaxed), 0);
 
             assert_eq!(
-                reload_plugin_with_label("main", || Err(PluginManagementError::Unavailable)),
+                reload_plugin_with_label("main", &coordinator, || {
+                    Err(PluginManagementError::Unavailable)
+                }),
                 Err(CommandError::plugin_reload_failed())
             );
         }
@@ -2529,8 +2554,9 @@ mod tests {
         #[test]
         fn delete_guard_and_fixed_error_mapping_precede_manager_access() {
             let calls = AtomicUsize::new(0);
+            let coordinator = Arc::new(LifecycleCoordinator::default());
             assert_eq!(
-                delete_plugin_with_label("secondary", || {
+                delete_plugin_with_label("secondary", &coordinator, || {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Err(PluginManagementError::Unavailable)
                 }),
@@ -2539,7 +2565,9 @@ mod tests {
             assert_eq!(calls.load(Ordering::Relaxed), 0);
 
             assert_eq!(
-                delete_plugin_with_label("main", || Err(PluginManagementError::Unavailable)),
+                delete_plugin_with_label("main", &coordinator, || {
+                    Err(PluginManagementError::Unavailable)
+                }),
                 Err(CommandError::plugin_delete_failed())
             );
         }
