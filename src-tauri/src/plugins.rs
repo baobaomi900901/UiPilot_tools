@@ -3432,8 +3432,8 @@ fn run_cleanup_worker(app_data_dir: &Path) -> Result<(), PluginManagementError> 
         let target_exists = ordinary_directory(&target_path);
         let object_path = match (receipt.phase, source_exists, target_exists) {
             (CleanupReceiptPhase::Pending, true, false) => &source_path,
-            (CleanupReceiptPhase::Pending, false, true)
-            | (CleanupReceiptPhase::Quarantined, false, true) => &target_path,
+            (CleanupReceiptPhase::Pending, false, true) => &target_path,
+            (CleanupReceiptPhase::Quarantined, _, true) => &target_path,
             _ => return Err(PluginManagementError::Unavailable),
         };
         let actual_bytes = validate_cleanup_object(object_path, &receipt)?;
@@ -6358,6 +6358,50 @@ mod tests {
                     .digest,
                 snapshot.package_identity.digest
             );
+        }
+
+        #[test]
+        fn quarantined_receipt_ignores_a_new_identity_reusing_the_source_path() {
+            let app_data = TestRoot::new();
+            let source = app_data
+                .path
+                .join("plugins")
+                .join("internal\u{2e}math")
+                .join("1.0.0");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("plugin.json"), "{}").unwrap();
+            let old_snapshot = scan_package_snapshot(&source).unwrap();
+            let old_identity = directory_identity(&source).unwrap();
+            let receipts_root = app_data.path.join("plugin-transactions").join("receipts");
+            fs::create_dir_all(app_data.path.join("plugin-transactions").join("active")).unwrap();
+            fs::create_dir_all(&receipts_root).unwrap();
+            fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
+            let mut cleanup_receipt =
+                receipt("quarantine-root", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            cleanup_receipt["source"]["volumeSerial"] = old_identity.volume.into();
+            cleanup_receipt["source"]["fileId"] = format!("{:016x}", old_identity.file).into();
+            cleanup_receipt["source"]["packageDigest"] =
+                old_snapshot.package_identity.digest.into();
+            cleanup_receipt["measure"]["bytes"] = old_snapshot.total_bytes.into();
+            let receipt_path = receipts_root.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+            fs::write(&receipt_path, serde_json::to_vec(&cleanup_receipt).unwrap()).unwrap();
+            handoff_cleanup_receipt(&app_data.path, &receipt_path).unwrap();
+
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("plugin.json"), r#"{"replacement":true}"#).unwrap();
+            let replacement_identity = directory_identity(&source).unwrap();
+            assert_ne!(replacement_identity, old_identity);
+
+            run_cleanup_worker(&app_data.path).unwrap();
+
+            assert!(source.exists());
+            assert_eq!(directory_identity(&source), Some(replacement_identity));
+            assert!(!receipt_path.exists());
+            assert!(!app_data
+                .path
+                .join("plugin-quarantine")
+                .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .exists());
         }
     }
 
