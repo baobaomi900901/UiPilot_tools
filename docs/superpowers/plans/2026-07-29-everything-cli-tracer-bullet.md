@@ -90,6 +90,10 @@ Exit code `2` is a CLI contract error, `3` is unavailable/timeout, and `4` is pr
 - Consumes: `EverythingQueryResult` and `EverythingResultItem` from `protocol.rs`.
 - Produces: `CliArgs`, `CliError`, `OutputFormat`, `parse_args`, and `render_result` from `Cross-Task Interfaces`.
 
+- [ ] **Step 0: Add compile-time serialization dependencies**
+
+Before writing the RED renderer test, add the exact `serde` and `serde_json` dependencies shown in Step 3. This is compile scaffolding: it lets the renderer test fail on the deliberate `RenderFailed` stub instead of failing because a test crate is missing. Do not add any other dependency.
+
 - [ ] **Step 1: Add failing parser and renderer tests**
 
 Create `src/cli.rs` with the public types and function signatures above. Add unit tests covering the exact defaults and invalid boundaries:
@@ -157,7 +161,7 @@ cargo test --manifest-path spikes/everything-ipc/Cargo.toml cli::tests -- --noca
 
 Expected: FAIL because `parses_defaults` unwraps `Err(CliError::InvalidArguments)` and the renderer fixture receives `Err(CliError::RenderFailed)`.
 
-- [ ] **Step 3: Add only the serialization dependencies**
+- [ ] **Step 3: Confirm only the serialization dependencies were added**
 
 Add target-independent dependencies without Clap or an async runtime:
 
@@ -168,6 +172,8 @@ serde_json = "1"
 ```
 
 Keep the existing `windows` dependency under `target.'cfg(windows)'.dependencies`.
+
+These entries were added in Step 0; this step verifies their exact versions/features and confirms no additional direct dependency was introduced.
 
 - [ ] **Step 4: Implement strict parsing**
 
