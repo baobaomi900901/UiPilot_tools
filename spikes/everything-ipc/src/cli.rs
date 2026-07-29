@@ -247,6 +247,10 @@ mod tests {
             Err(CliError::InvalidTimeout)
         );
         assert_eq!(
+            parse_args(["--timeout-ms", "60001", "--query", "x"].map(OsString::from)),
+            Err(CliError::InvalidTimeout)
+        );
+        assert_eq!(
             parse_args(["--format", "xml", "--query", "x"].map(OsString::from)),
             Err(CliError::InvalidFormat)
         );
@@ -307,6 +311,29 @@ mod tests {
         );
         assert_eq!(output["items"][1]["kind"], "directory");
         assert_eq!(output["items"][1]["sizeBytes"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn renders_text_items_on_one_line_after_sanitizing_delimiters() {
+        let raw_path = "C:\\bad\rpath\nwith\ttabs";
+        let result = EverythingQueryResult {
+            total: 1,
+            request_flags: 0x145,
+            sort_type: 14,
+            items: vec![EverythingResultItem {
+                full_path: raw_path.to_owned(),
+                file_name: "report\r\n\t.rs".to_owned(),
+                attributes: 0,
+                size_bytes: Some(123),
+                modified_filetime: Some(456),
+            }],
+        };
+
+        let text = render_result(OutputFormat::Text, &result).unwrap();
+
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("file\t456\t123\tC:\\bad path with tabs"));
+        assert!(!text.contains(raw_path));
     }
 
     fn fixture() -> EverythingQueryResult {
