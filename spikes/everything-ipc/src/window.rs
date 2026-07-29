@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
 };
 
-use crate::client::EverythingClientError;
+use crate::client::{EverythingClientError, QueryPermit, MAX_OUTSTANDING_QUERIES};
 use crate::protocol::{
     decode_list2_payload, encode_query2, EverythingQueryResult, EverythingQuerySpec,
     List2ReplyContract, QueryReplyRoute,
@@ -32,19 +32,21 @@ const WORKER_TIMER_ID: usize = 1;
 const WORKER_TIMER_INTERVAL_MS: u32 = 5;
 const MAX_REPLY_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const COMMAND_CHANNEL_CAPACITY: usize = MAX_OUTSTANDING_QUERIES;
+const WORKER_QUEUE_CAPACITY: usize = MAX_OUTSTANDING_QUERIES - 1;
+const COMMAND_BATCH_SIZE: usize = 8;
 
 static REPLY_CLASS_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) enum WorkerCommand {
-    Query {
-        spec: EverythingQuerySpec,
-        response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
-    },
-    Shutdown,
+pub(crate) struct WorkerCommand {
+    pub(crate) spec: EverythingQuerySpec,
+    pub(crate) response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
+    pub(crate) permit: QueryPermit,
 }
 
 pub(crate) struct WorkerParts {
-    pub(crate) command_tx: mpsc::Sender<WorkerCommand>,
+    pub(crate) command_tx: mpsc::SyncSender<WorkerCommand>,
+    pub(crate) shutdown_tx: mpsc::SyncSender<()>,
     pub(crate) reply_hwnd_bits: usize,
     pub(crate) join: JoinHandle<()>,
 }
@@ -57,6 +59,7 @@ enum StartupDecision {
 trait StartupHooks: Send + Sync + 'static {
     fn before_ready_publication(&self) {}
     fn startup_timed_out(&self) {}
+    fn before_message_loop(&self) {}
 }
 
 impl StartupHooks for () {}
@@ -104,11 +107,13 @@ struct PendingQuery {
     deadline: Instant,
     reply_contract: List2ReplyContract,
     response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
+    _permit: QueryPermit,
 }
 
 struct QueuedQuery {
     spec: EverythingQuerySpec,
     response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
+    permit: QueryPermit,
 }
 
 struct WorkerState {
@@ -116,6 +121,7 @@ struct WorkerState {
     reply_hwnd: HWND,
     reply_hwnd_u32: u32,
     command_rx: mpsc::Receiver<WorkerCommand>,
+    shutdown_rx: mpsc::Receiver<()>,
     envelope_rx: mpsc::Receiver<ReplyEnvelope>,
     active_request_ids: Arc<Mutex<HashSet<u32>>>,
     queued: VecDeque<QueuedQuery>,
@@ -140,7 +146,8 @@ fn spawn_worker_with_hooks<H: StartupHooks>(
     if everything_hwnd_bits == 0 {
         return Err(EverythingClientError::IpcUnavailable);
     }
-    let (command_tx, command_rx) = mpsc::channel();
+    let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (startup_decision_tx, startup_decision_rx) = mpsc::channel();
     let hooks = Arc::new(hooks);
@@ -150,6 +157,7 @@ fn spawn_worker_with_hooks<H: StartupHooks>(
         run_worker(
             everything_hwnd_bits,
             command_rx,
+            shutdown_rx,
             ready_tx,
             startup_decision_rx,
             worker_hooks,
@@ -166,6 +174,7 @@ fn spawn_worker_with_hooks<H: StartupHooks>(
             } else {
                 Ok(WorkerParts {
                     command_tx,
+                    shutdown_tx,
                     reply_hwnd_bits,
                     join,
                 })
@@ -204,6 +213,7 @@ pub(crate) fn wake_worker(reply_hwnd_bits: usize) -> Result<(), EverythingClient
 fn run_worker(
     everything_hwnd_bits: usize,
     command_rx: mpsc::Receiver<WorkerCommand>,
+    shutdown_rx: mpsc::Receiver<()>,
     ready_tx: mpsc::Sender<Result<usize, EverythingClientError>>,
     startup_decision_rx: mpsc::Receiver<StartupDecision>,
     startup_hooks: Arc<impl StartupHooks>,
@@ -276,12 +286,14 @@ fn run_worker(
         reply_hwnd,
         reply_hwnd_u32,
         command_rx,
+        shutdown_rx,
         envelope_rx,
         active_request_ids,
         queued: VecDeque::new(),
         active: None,
         next_request_id: Some(1),
     };
+    startup_hooks.before_message_loop();
     let mut message = MSG::default();
     loop {
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
@@ -322,24 +334,50 @@ fn run_worker(
 
 impl WorkerState {
     fn drain_commands(&mut self) -> bool {
-        loop {
+        if self.shutdown_requested() {
+            return true;
+        }
+        let available = WORKER_QUEUE_CAPACITY.saturating_sub(self.queued.len());
+        let batch_size = available.min(COMMAND_BATCH_SIZE);
+        for _ in 0..batch_size {
             match self.command_rx.try_recv() {
-                Ok(WorkerCommand::Query { spec, response_tx }) => {
-                    self.queued.push_back(QueuedQuery { spec, response_tx });
+                Ok(WorkerCommand {
+                    spec,
+                    response_tx,
+                    permit,
+                }) => {
+                    self.queued.push_back(QueuedQuery {
+                        spec,
+                        response_tx,
+                        permit,
+                    });
                 }
-                Ok(WorkerCommand::Shutdown) => return true,
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.start_next_query();
-                    return false;
-                }
+                Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return true,
             }
+            if self.shutdown_requested() {
+                return true;
+            }
+        }
+        self.start_next_query();
+        self.shutdown_requested()
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        match self.shutdown_rx.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => true,
+            Err(mpsc::TryRecvError::Empty) => false,
         }
     }
 
     fn start_next_query(&mut self) {
         while self.active.is_none() {
-            let Some(QueuedQuery { spec, response_tx }) = self.queued.pop_front() else {
+            let Some(QueuedQuery {
+                spec,
+                response_tx,
+                permit,
+            }) = self.queued.pop_front()
+            else {
                 return;
             };
             if spec.deadline <= Instant::now() {
@@ -382,6 +420,7 @@ impl WorkerState {
                 deadline: spec.deadline,
                 reply_contract,
                 response_tx,
+                _permit: permit,
             });
             if send_query2(
                 self.everything_hwnd,
@@ -482,9 +521,9 @@ impl WorkerState {
 
 fn drain_commands_closed(command_rx: &mpsc::Receiver<WorkerCommand>) {
     while let Ok(command) = command_rx.try_recv() {
-        if let WorkerCommand::Query { response_tx, .. } = command {
-            let _ = response_tx.send(Err(EverythingClientError::ClientClosed));
-        }
+        let _ = command
+            .response_tx
+            .send(Err(EverythingClientError::ClientClosed));
     }
 }
 
@@ -672,6 +711,24 @@ fn hwnd_from_bits(bits: usize) -> HWND {
 mod tests {
     use super::*;
 
+    struct LoopBarrierHooks {
+        reached_tx: mpsc::Sender<()>,
+        release_rx: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl StartupHooks for LoopBarrierHooks {
+        fn before_message_loop(&self) {
+            self.reached_tx
+                .send(())
+                .expect("shutdown test dropped loop barrier receiver");
+            self.release_rx
+                .lock()
+                .expect("loop release mutex poisoned")
+                .recv()
+                .expect("shutdown test dropped loop release sender");
+        }
+    }
+
     #[test]
     fn startup_timeout_after_prepublication_check_has_bounded_shutdown() {
         let closed = Arc::new(AtomicBool::new(false));
@@ -701,5 +758,70 @@ mod tests {
             caller.join().expect("startup caller panicked"),
             Err(EverythingClientError::IpcUnavailable)
         ));
+    }
+
+    #[test]
+    fn saturated_command_admission_does_not_block_worker_shutdown() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let hooks = LoopBarrierHooks {
+            reached_tx,
+            release_rx: Mutex::new(release_rx),
+        };
+        let parts = spawn_worker_with_hooks(1, Duration::from_secs(1), closed, hooks)
+            .expect("worker should start for shutdown saturation test");
+        reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker did not reach message-loop barrier");
+
+        let mut responses = Vec::new();
+        let outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..COMMAND_CHANNEL_CAPACITY {
+            let (response_tx, response_rx) = mpsc::channel();
+            let command = WorkerCommand {
+                spec: EverythingQuerySpec {
+                    search: Vec::new(),
+                    offset: 0,
+                    max_results: 1,
+                    request_flags: 0,
+                    sort: crate::protocol::EverythingSort::DateModifiedDescending,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+                response_tx,
+                permit: crate::client::try_acquire_query_permit(&outstanding)
+                    .expect("permit bound exhausted before command capacity"),
+            };
+            if parts.command_tx.try_send(command).is_err() {
+                panic!("command channel saturated before documented capacity");
+            }
+            responses.push(response_rx);
+        }
+        assert!(crate::client::try_acquire_query_permit(&outstanding).is_none());
+        parts
+            .shutdown_tx
+            .try_send(())
+            .expect("independent shutdown admission should remain available");
+        wake_worker(parts.reply_hwnd_bits).expect("failed to wake saturated worker");
+        release_tx
+            .send(())
+            .expect("worker dropped loop barrier release receiver");
+
+        let (joined_tx, joined_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = parts.join.join();
+            let _ = joined_tx.send(());
+        });
+        joined_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("saturated worker shutdown did not complete");
+        for response in responses {
+            assert_eq!(
+                response
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("saturated command did not close"),
+                Err(EverythingClientError::ClientClosed)
+            );
+        }
     }
 }

@@ -2,12 +2,12 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use everything_ipc::client::{EverythingClient, EverythingClientError};
+use everything_ipc::client::{EverythingClient, EverythingClientError, MAX_OUTSTANDING_QUERIES};
 use everything_ipc::protocol::{
     EverythingQueryResult, EverythingQuerySpec, EverythingSort, ProtocolError,
 };
@@ -35,6 +35,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(80);
 const ASSERT_STILL_PENDING: Duration = Duration::from_millis(20);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const OVERLOAD_MARGIN: usize = 8;
+const PRESSURE_OVERLOAD_EVENTS: usize = 32;
 
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 static FAKE_STATE: OnceLock<Mutex<Option<Arc<FakeState>>>> = OnceLock::new();
@@ -455,6 +457,44 @@ fn spawn_query(
     result_rx
 }
 
+struct QueryAttempts {
+    gate: Arc<Barrier>,
+    results: mpsc::Receiver<Result<EverythingQueryResult, EverythingClientError>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+fn spawn_query_attempts(
+    client: Arc<EverythingClient>,
+    count: usize,
+    timeout: Duration,
+) -> QueryAttempts {
+    let gate = Arc::new(Barrier::new(count + 1));
+    let (result_tx, result_rx) = mpsc::channel();
+    let threads = (0..count)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            let gate = Arc::clone(&gate);
+            let result_tx = result_tx.clone();
+            thread::spawn(move || {
+                gate.wait();
+                let _ = result_tx.send(client.query(query_spec(timeout)));
+            })
+        })
+        .collect();
+    drop(result_tx);
+    QueryAttempts {
+        gate,
+        results: result_rx,
+        threads,
+    }
+}
+
+fn join_query_attempts(threads: Vec<JoinHandle<()>>) {
+    for thread in threads {
+        thread.join().expect("query attempt panicked");
+    }
+}
+
 fn assert_query_route(query: &CapturedQuery) {
     assert_eq!(query.copydata_kind, EVERYTHING_COPYDATA_QUERY2W);
     assert_ne!(query.encoded_reply_hwnd, 0);
@@ -496,6 +536,126 @@ fn hwnd_from_bits(bits: usize) -> HWND {
 
 fn hwnd_from_u32(bits: u32) -> HWND {
     hwnd_from_bits(bits as usize)
+}
+
+#[test]
+fn saturation_rejects_at_total_bound_and_active_reply_survives_pressure() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let client = fake.connect_client();
+    let active_result = spawn_query(Arc::clone(&client), Duration::from_secs(5));
+    let active_query = fake.capture();
+    let additional_attempts = MAX_OUTSTANDING_QUERIES + OVERLOAD_MARGIN - 1;
+    let QueryAttempts {
+        gate,
+        results,
+        threads,
+    } = spawn_query_attempts(
+        Arc::clone(&client),
+        additional_attempts,
+        Duration::from_secs(5),
+    );
+
+    gate.wait();
+    for _ in 0..OVERLOAD_MARGIN {
+        assert_eq!(
+            results
+                .recv_timeout(CLEANUP_TIMEOUT)
+                .expect("overload result did not arrive at the fixed bound"),
+            Err(EverythingClientError::Overloaded)
+        );
+    }
+    assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+    let pressure_running = Arc::new(AtomicBool::new(true));
+    let pressure_client = Arc::clone(&client);
+    let pressure_flag = Arc::clone(&pressure_running);
+    let (pressure_tx, pressure_rx) = mpsc::channel();
+    let (pressure_done_tx, pressure_done_rx) = mpsc::channel();
+    let pressure_thread = thread::spawn(move || {
+        while pressure_flag.load(Ordering::Acquire) {
+            match pressure_client.query(query_spec(Duration::from_millis(200))) {
+                Err(EverythingClientError::Overloaded) => {
+                    let _ = pressure_tx.send(());
+                }
+                Err(EverythingClientError::QueryTimedOut) | Ok(_) => {}
+                Err(error) => panic!("unexpected pressure result: {error:?}"),
+            }
+        }
+        let _ = pressure_done_tx.send(());
+    });
+    for _ in 0..PRESSURE_OVERLOAD_EVENTS {
+        pressure_rx
+            .recv_timeout(CLEANUP_TIMEOUT)
+            .expect("sustained producer stopped observing overload");
+    }
+
+    fake.send_valid_empty_reply(&active_query);
+    expect_empty_result(&active_result);
+    pressure_running.store(false, Ordering::Release);
+    pressure_done_rx
+        .recv_timeout(CLEANUP_TIMEOUT)
+        .expect("pressure producer did not stop after active reply");
+    pressure_thread.join().expect("pressure producer panicked");
+
+    for _ in 0..MAX_OUTSTANDING_QUERIES - 1 {
+        let query = fake.capture();
+        fake.send_valid_empty_reply(&query);
+    }
+    for _ in 0..MAX_OUTSTANDING_QUERIES - 1 {
+        let result = results
+            .recv_timeout(CLEANUP_TIMEOUT)
+            .expect("accepted saturated query did not complete")
+            .expect("accepted saturated query failed");
+        assert!(result.items.is_empty());
+    }
+    assert!(matches!(
+        results.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    join_query_attempts(threads);
+}
+
+#[test]
+fn saturated_accepted_queries_keep_original_absolute_deadlines() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let client = fake.connect_client();
+    let active_result = spawn_query(Arc::clone(&client), Duration::from_secs(1));
+    let active_query = fake.capture();
+    let additional_attempts = MAX_OUTSTANDING_QUERIES + OVERLOAD_MARGIN - 1;
+    let QueryAttempts {
+        gate,
+        results,
+        threads,
+    } = spawn_query_attempts(
+        Arc::clone(&client),
+        additional_attempts,
+        Duration::from_millis(35),
+    );
+
+    gate.wait();
+    let completion_deadline = Instant::now() + Duration::from_millis(500);
+    let mut overloads = 0;
+    let mut timeouts = 0;
+    for _ in 0..additional_attempts {
+        let result = results
+            .recv_timeout(CLEANUP_TIMEOUT)
+            .expect("saturated query did not resolve");
+        match result {
+            Err(EverythingClientError::Overloaded) => overloads += 1,
+            Err(EverythingClientError::QueryTimedOut) => timeouts += 1,
+            other => panic!("unexpected saturated deadline result: {other:?}"),
+        }
+    }
+    assert!(Instant::now() <= completion_deadline);
+    assert_eq!(overloads, OVERLOAD_MARGIN);
+    assert_eq!(timeouts + 1, MAX_OUTSTANDING_QUERIES);
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
+
+    fake.send_valid_empty_reply(&active_query);
+    expect_empty_result(&active_result);
+    join_query_attempts(threads);
 }
 
 #[test]
@@ -719,18 +879,23 @@ fn thousand_queries_have_no_crosstalk_timeout_leak_or_id_reuse() {
 
     let remaining = gate_deadline.saturating_duration_since(Instant::now());
     assert!(!remaining.is_zero(), "concurrent gate deadline elapsed");
-    let receivers: Vec<_> = (0..500)
-        .map(|_| spawn_query(Arc::clone(&client), remaining.min(Duration::from_secs(10))))
-        .collect();
-    for _ in 0..500 {
-        let query = fake.capture();
-        assert!(query.reply_copydata_message > last_id);
-        assert!(seen_ids.insert(query.reply_copydata_message));
-        last_id = query.reply_copydata_message;
-        fake.send_valid_empty_reply(&query);
-    }
-    for receiver in &receivers {
-        expect_empty_result(receiver);
+    let mut remaining_concurrent = 500;
+    while remaining_concurrent != 0 {
+        let wave_size = remaining_concurrent.min(MAX_OUTSTANDING_QUERIES);
+        let receivers: Vec<_> = (0..wave_size)
+            .map(|_| spawn_query(Arc::clone(&client), remaining.min(Duration::from_secs(10))))
+            .collect();
+        for _ in 0..wave_size {
+            let query = fake.capture();
+            assert!(query.reply_copydata_message > last_id);
+            assert!(seen_ids.insert(query.reply_copydata_message));
+            last_id = query.reply_copydata_message;
+            fake.send_valid_empty_reply(&query);
+        }
+        for receiver in &receivers {
+            expect_empty_result(receiver);
+        }
+        remaining_concurrent -= wave_size;
     }
     assert_eq!(seen_ids.len(), 1_000);
     assert_eq!(fake.cancellation_count(), 0);

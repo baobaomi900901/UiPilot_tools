@@ -1,8 +1,44 @@
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 #[cfg(not(windows))]
 use std::time::Duration;
 
 use crate::protocol::{EverythingQueryResult, EverythingQuerySpec, ProtocolError};
+
+pub const MAX_OUTSTANDING_QUERIES: usize = 32;
+
+pub(crate) struct QueryPermit {
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl Drop for QueryPermit {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_query_permit(outstanding: &Arc<AtomicUsize>) -> Option<QueryPermit> {
+    let mut current = outstanding.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_OUTSTANDING_QUERIES {
+            return None;
+        }
+        match outstanding.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(QueryPermit {
+                    outstanding: Arc::clone(outstanding),
+                });
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EverythingClientError {
@@ -10,6 +46,7 @@ pub enum EverythingClientError {
     ConnectionTimedOut,
     IpcUnavailable,
     IpcSendFailed,
+    Overloaded,
     RequestIdExhausted,
     Protocol(ProtocolError),
     QueryTimedOut,
@@ -23,6 +60,7 @@ impl fmt::Display for EverythingClientError {
             Self::ConnectionTimedOut => "Everything IPC connection timed out",
             Self::IpcUnavailable => "Everything IPC is unavailable",
             Self::IpcSendFailed => "Everything IPC send failed",
+            Self::Overloaded => "Everything IPC query capacity is exhausted",
             Self::RequestIdExhausted => "Everything IPC request id exhausted",
             Self::Protocol(_) => "Everything IPC protocol error",
             Self::QueryTimedOut => "Everything query timed out",
@@ -42,7 +80,7 @@ impl std::error::Error for EverythingClientError {
 
 #[cfg(windows)]
 mod imp {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -50,16 +88,20 @@ mod imp {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 
-    use super::{EverythingClientError, EverythingQueryResult, EverythingQuerySpec};
+    use super::{
+        try_acquire_query_permit, EverythingClientError, EverythingQueryResult, EverythingQuerySpec,
+    };
     use crate::window::{self, WorkerCommand};
 
     const EVERYTHING_IPC_DEFAULT_WINDOW_CLASS: &str = "EVERYTHING_TASKBAR_NOTIFICATION";
     const FIND_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
     pub struct EverythingClient {
-        command_tx: mpsc::Sender<WorkerCommand>,
+        command_tx: mpsc::SyncSender<WorkerCommand>,
+        shutdown_tx: mpsc::SyncSender<()>,
         reply_hwnd_bits: usize,
         closed: Arc<AtomicBool>,
+        outstanding_queries: Arc<AtomicUsize>,
         worker: Mutex<Option<JoinHandle<()>>>,
     }
 
@@ -72,12 +114,15 @@ mod imp {
             let everything_hwnd_bits = find_everything_window(&class_name, timeout)?;
             let worker_timeout = timeout.saturating_sub(started.elapsed());
             let closed = Arc::new(AtomicBool::new(false));
+            let outstanding_queries = Arc::new(AtomicUsize::new(0));
             let worker =
                 window::spawn_worker(everything_hwnd_bits, worker_timeout, Arc::clone(&closed))?;
             Ok(Self {
                 command_tx: worker.command_tx,
+                shutdown_tx: worker.shutdown_tx,
                 reply_hwnd_bits: worker.reply_hwnd_bits,
                 closed,
+                outstanding_queries,
                 worker: Mutex::new(Some(worker.join)),
             })
         }
@@ -89,13 +134,22 @@ mod imp {
             if self.closed.load(Ordering::Acquire) {
                 return Err(EverythingClientError::ClientClosed);
             }
+            let permit = try_acquire_query_permit(&self.outstanding_queries)
+                .ok_or(EverythingClientError::Overloaded)?;
             let (response_tx, response_rx) = mpsc::channel();
-            self.command_tx
-                .send(WorkerCommand::Query {
-                    spec: query,
-                    response_tx,
-                })
-                .map_err(|_| EverythingClientError::ClientClosed)?;
+            match self.command_tx.try_send(WorkerCommand {
+                spec: query,
+                response_tx,
+                permit,
+            }) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    return Err(EverythingClientError::Overloaded);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(EverythingClientError::ClientClosed);
+                }
+            }
             let _ = window::wake_worker(self.reply_hwnd_bits);
             response_rx
                 .recv()
@@ -106,7 +160,7 @@ mod imp {
     impl Drop for EverythingClient {
         fn drop(&mut self) {
             self.closed.store(true, Ordering::Release);
-            let _ = self.command_tx.send(WorkerCommand::Shutdown);
+            let _ = self.shutdown_tx.try_send(());
             let _ = window::wake_worker(self.reply_hwnd_bits);
             if let Some(join) = self.worker.lock().expect("worker mutex poisoned").take() {
                 let _ = join.join();
