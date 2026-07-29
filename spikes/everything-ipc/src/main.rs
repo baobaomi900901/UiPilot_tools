@@ -3,7 +3,7 @@ use std::fmt;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use everything_ipc::cli::{parse_args as parse_cli_args, render_result, CliError};
+use everything_ipc::cli::{parse_args as parse_cli_args, write_result, CliError};
 use everything_ipc::client::{EverythingClient, EverythingClientError};
 use everything_ipc::protocol::{EverythingQuerySpec, EverythingSort};
 
@@ -30,7 +30,7 @@ impl ProbeError {
         match self {
             Self::Cli(CliError::InvalidArguments) => "E_ARGUMENTS",
             Self::Cli(CliError::InvalidLimit) => "E_LIMIT",
-            Self::Cli(CliError::InvalidTimeout) => "E_TIMEOUT",
+            Self::Cli(CliError::InvalidTimeout) => "E_TIMEOUT_ARGUMENT",
             Self::Cli(CliError::InvalidFormat) => "E_FORMAT",
             Self::Cli(CliError::RenderFailed) => "E_RENDER",
             Self::Client(EverythingClientError::ConnectionTimedOut)
@@ -103,7 +103,9 @@ fn run() -> Result<(), ProbeError> {
         sort: EverythingSort::DateModifiedDescending,
         deadline,
     })?;
-    println!("{}", render_result(args.format, &result)?);
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    write_result(&mut stdout, args.format, &result)?;
     Ok(())
 }
 
@@ -114,8 +116,17 @@ mod tests {
 
     #[test]
     fn maps_expected_failures_to_stable_codes() {
-        assert_eq!(ProbeError::Cli(CliError::InvalidLimit).code(), "E_LIMIT");
-        assert_eq!(ProbeError::Cli(CliError::InvalidLimit).exit_code(), 2);
+        for (error, expected_code, expected_exit) in [
+            (CliError::InvalidArguments, "E_ARGUMENTS", 2),
+            (CliError::InvalidLimit, "E_LIMIT", 2),
+            (CliError::InvalidTimeout, "E_TIMEOUT_ARGUMENT", 2),
+            (CliError::InvalidFormat, "E_FORMAT", 2),
+            (CliError::RenderFailed, "E_RENDER", 4),
+        ] {
+            let error = ProbeError::Cli(error);
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(error.exit_code(), expected_exit);
+        }
         assert_eq!(
             ProbeError::Client(EverythingClientError::ConnectionTimedOut).code(),
             "E_EVERYTHING_UNAVAILABLE"
@@ -128,8 +139,6 @@ mod tests {
             ProbeError::Client(EverythingClientError::QueryTimedOut).exit_code(),
             3
         );
-        assert_eq!(ProbeError::Cli(CliError::RenderFailed).code(), "E_RENDER");
-        assert_eq!(ProbeError::Cli(CliError::RenderFailed).exit_code(), 4);
         assert_eq!(
             ProbeError::Client(EverythingClientError::Protocol(
                 ProtocolError::PayloadTooShort

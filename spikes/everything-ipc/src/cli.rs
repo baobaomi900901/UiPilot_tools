@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Write;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -99,6 +100,19 @@ pub fn render_result(
     }
 }
 
+pub fn write_result(
+    writer: &mut impl Write,
+    format: OutputFormat,
+    result: &EverythingQueryResult,
+) -> Result<(), CliError> {
+    let rendered = render_result(format, result)?;
+    writer
+        .write_all(rendered.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|_| CliError::RenderFailed)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonOutput<'a> {
@@ -197,6 +211,25 @@ fn sanitize_text_field(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::protocol::{EverythingQueryResult, EverythingResultItem};
+    use std::io::{self, Write};
+
+    struct FailingWriter {
+        fail_write: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "write failed"))
+            } else {
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+        }
+    }
 
     #[test]
     fn parses_defaults() {
@@ -334,6 +367,26 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains("file\t456\t123\tC:\\bad path with tabs"));
         assert!(!text.contains(raw_path));
+    }
+
+    #[test]
+    fn result_write_failure_maps_to_render_error() {
+        let mut writer = FailingWriter { fail_write: true };
+
+        assert_eq!(
+            write_result(&mut writer, OutputFormat::Json, &fixture()),
+            Err(CliError::RenderFailed)
+        );
+    }
+
+    #[test]
+    fn result_flush_failure_maps_to_render_error() {
+        let mut writer = FailingWriter { fail_write: false };
+
+        assert_eq!(
+            write_result(&mut writer, OutputFormat::Json, &fixture()),
+            Err(CliError::RenderFailed)
+        );
     }
 
     fn fixture() -> EverythingQueryResult {
