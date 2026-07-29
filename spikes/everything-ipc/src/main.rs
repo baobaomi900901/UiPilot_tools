@@ -43,9 +43,11 @@ impl ProbeError {
 
     fn exit_code(&self) -> u8 {
         match self {
-            Self::Cli(_) => 2,
+            Self::Cli(CliError::RenderFailed) => 4,
             Self::Client(EverythingClientError::ConnectionTimedOut)
-            | Self::Client(EverythingClientError::IpcUnavailable) => 3,
+            | Self::Client(EverythingClientError::IpcUnavailable)
+            | Self::Client(EverythingClientError::QueryTimedOut) => 3,
+            Self::Cli(_) => 2,
             Self::DeadlineOverflow | Self::Client(_) => 4,
         }
     }
@@ -122,6 +124,12 @@ mod tests {
             ProbeError::Client(EverythingClientError::QueryTimedOut).code(),
             "E_QUERY_TIMEOUT"
         );
+        assert_eq!(
+            ProbeError::Client(EverythingClientError::QueryTimedOut).exit_code(),
+            3
+        );
+        assert_eq!(ProbeError::Cli(CliError::RenderFailed).code(), "E_RENDER");
+        assert_eq!(ProbeError::Cli(CliError::RenderFailed).exit_code(), 4);
         assert_eq!(
             ProbeError::Client(EverythingClientError::Protocol(
                 ProtocolError::PayloadTooShort
