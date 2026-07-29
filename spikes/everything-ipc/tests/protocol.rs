@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use everything_ipc::protocol::{
     decode_list2_payload, encode_query2, EverythingQueryResult, EverythingQuerySpec,
-    EverythingSort, QueryReplyRoute,
+    EverythingSort, List2ReplyContract, ProtocolError, QueryReplyRoute,
 };
 
 const QUERY2_REPLY_HWND_OFFSET: usize = 0;
@@ -105,6 +105,34 @@ fn valid_route() -> QueryReplyRoute {
         reply_hwnd: 0x1122_3344,
         reply_copydata_message: 0xa1b2_c3d4,
     }
+}
+
+fn reply_contract(
+    offset: u32,
+    max_results: u32,
+    request_flags: u32,
+    sort_type: u32,
+) -> List2ReplyContract {
+    List2ReplyContract {
+        offset,
+        max_results,
+        request_flags,
+        sort_type,
+    }
+}
+
+fn decode_matching_list2_payload(payload: &[u8]) -> Result<EverythingQueryResult, ProtocolError> {
+    let contract = if payload.len() >= LIST2_HEADER_LEN {
+        reply_contract(
+            u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+            u32::MAX,
+            u32::from_le_bytes(payload[12..16].try_into().unwrap()),
+            u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+        )
+    } else {
+        reply_contract(0, u32::MAX, 0, 0)
+    };
+    decode_list2_payload(payload, contract)
 }
 
 #[test]
@@ -223,7 +251,7 @@ fn list2_empty_result_preserves_actual_flags_and_sort_without_query_id() {
         &SORT_DATE_MODIFIED_DESCENDING.to_le_bytes()
     );
 
-    let result = decode_list2_payload(&payload).expect("empty LIST2 fixture must decode");
+    let result = decode_matching_list2_payload(&payload).expect("empty LIST2 fixture must decode");
     let EverythingQueryResult {
         total,
         request_flags,
@@ -238,7 +266,7 @@ fn list2_empty_result_preserves_actual_flags_and_sort_without_query_id() {
 
 #[test]
 fn list2_single_item_decodes_requested_fields_in_wire_order() {
-    let result = decode_list2_payload(&single_item_payload())
+    let result = decode_matching_list2_payload(&single_item_payload())
         .expect("single-item LIST2 fixture must decode");
     assert_eq!(result.total, 9);
     assert_eq!(
@@ -261,7 +289,7 @@ fn list2_single_item_decodes_requested_fields_in_wire_order() {
 
 #[test]
 fn list2_rejects_header_shorter_than_twenty_bytes() {
-    assert!(decode_list2_payload(&[0u8; LIST2_HEADER_LEN - 1]).is_err());
+    assert!(decode_matching_list2_payload(&[0u8; LIST2_HEADER_LEN - 1]).is_err());
 }
 
 #[test]
@@ -271,7 +299,7 @@ fn list2_rejects_odd_byte_utf16_field() {
     push_u32(&mut payload, (LIST2_HEADER_LEN + LIST2_ITEM_LEN) as u32);
     push_u32(&mut payload, 1);
     payload.push(b'A');
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
 }
 
 #[test]
@@ -279,7 +307,7 @@ fn list2_rejects_item_data_offset_beyond_payload() {
     let mut payload = list2_header(1, 1, 0, REQUEST_NAME, 1);
     push_u32(&mut payload, 0);
     push_u32(&mut payload, 0x1000);
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
 }
 
 #[test]
@@ -290,13 +318,13 @@ fn list2_rejects_truncated_later_field_offset() {
     push_utf16_field(&mut payload, "name");
     push_u32(&mut payload, 2);
     push_u16(&mut payload, b'C' as u16);
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
 }
 
 #[test]
 fn list2_rejects_huge_item_count_with_checked_multiply() {
     let payload = list2_header(0, u32::MAX, 0, 0, 1);
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
 }
 
 #[test]
@@ -304,7 +332,7 @@ fn list2_rejects_max_data_offset_with_checked_add() {
     let mut payload = list2_header(1, 1, 0, REQUEST_NAME, 1);
     push_u32(&mut payload, 0);
     push_u32(&mut payload, u32::MAX);
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
 }
 
 #[test]
@@ -313,7 +341,7 @@ fn list2_rejects_max_utf16_length_with_checked_multiply() {
     push_u32(&mut payload, 0);
     push_u32(&mut payload, (LIST2_HEADER_LEN + LIST2_ITEM_LEN) as u32);
     push_u32(&mut payload, u32::MAX);
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
 }
 
 #[test]
@@ -323,5 +351,53 @@ fn list2_rejects_missing_utf16_terminator() {
     push_u32(&mut payload, (LIST2_HEADER_LEN + LIST2_ITEM_LEN) as u32);
     push_u32(&mut payload, 1);
     push_u16(&mut payload, b'A' as u16);
-    assert!(decode_list2_payload(&payload).is_err());
+    assert!(decode_matching_list2_payload(&payload).is_err());
+}
+
+#[test]
+fn list2_rejects_empty_reply_with_mismatched_offset() {
+    let payload = list2_header(0, 0, 7, REQUEST_PATH, SORT_DATE_MODIFIED_DESCENDING);
+    assert_eq!(
+        decode_list2_payload(
+            &payload,
+            reply_contract(0, 200, REQUEST_PATH, SORT_DATE_MODIFIED_DESCENDING),
+        ),
+        Err(ProtocolError::ReplyContractMismatch)
+    );
+}
+
+#[test]
+fn list2_rejects_item_count_above_requested_limit_before_item_table_allocation() {
+    let payload = list2_header(2, 2, 0, REQUEST_PATH, SORT_DATE_MODIFIED_DESCENDING);
+    assert_eq!(
+        decode_list2_payload(
+            &payload,
+            reply_contract(0, 1, REQUEST_PATH, SORT_DATE_MODIFIED_DESCENDING),
+        ),
+        Err(ProtocolError::ReplyContractMismatch)
+    );
+}
+
+#[test]
+fn list2_rejects_empty_reply_with_mismatched_request_flags() {
+    let payload = list2_header(0, 0, 0, REQUEST_NAME, SORT_DATE_MODIFIED_DESCENDING);
+    assert_eq!(
+        decode_list2_payload(
+            &payload,
+            reply_contract(0, 200, REQUEST_PATH, SORT_DATE_MODIFIED_DESCENDING),
+        ),
+        Err(ProtocolError::ReplyContractMismatch)
+    );
+}
+
+#[test]
+fn list2_rejects_empty_reply_with_mismatched_sort_type() {
+    let payload = list2_header(0, 0, 0, REQUEST_PATH, 13);
+    assert_eq!(
+        decode_list2_payload(
+            &payload,
+            reply_contract(0, 200, REQUEST_PATH, SORT_DATE_MODIFIED_DESCENDING),
+        ),
+        Err(ProtocolError::ReplyContractMismatch)
+    );
 }

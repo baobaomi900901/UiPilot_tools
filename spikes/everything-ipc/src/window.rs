@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::client::EverythingClientError;
 use crate::protocol::{
     decode_list2_payload, encode_query2, EverythingQueryResult, EverythingQuerySpec,
-    QueryReplyRoute,
+    List2ReplyContract, QueryReplyRoute,
 };
 
 const EVERYTHING_COPYDATA_QUERY2W: usize = 18;
@@ -49,6 +49,45 @@ pub(crate) struct WorkerParts {
     pub(crate) join: JoinHandle<()>,
 }
 
+enum StartupDecision {
+    Proceed,
+    Cancel,
+}
+
+trait StartupHooks: Send + Sync + 'static {
+    fn before_ready_publication(&self) {}
+    fn startup_timed_out(&self) {}
+}
+
+impl StartupHooks for () {}
+
+#[cfg(test)]
+struct StartupTestHooks {
+    before_ready_tx: mpsc::Sender<()>,
+    release_ready_rx: Mutex<mpsc::Receiver<()>>,
+    timeout_tx: mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl StartupHooks for StartupTestHooks {
+    fn before_ready_publication(&self) {
+        self.before_ready_tx
+            .send(())
+            .expect("startup test dropped prepublication receiver");
+        self.release_ready_rx
+            .lock()
+            .expect("startup release mutex poisoned")
+            .recv()
+            .expect("startup test dropped release sender");
+    }
+
+    fn startup_timed_out(&self) {
+        self.timeout_tx
+            .send(())
+            .expect("startup test dropped timeout receiver");
+    }
+}
+
 struct ReplyEnvelope {
     request_id: u32,
     payload: Vec<u8>,
@@ -61,7 +100,14 @@ struct WindowBinding {
 }
 
 struct PendingQuery {
+    request_id: u32,
     deadline: Instant,
+    reply_contract: List2ReplyContract,
+    response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
+}
+
+struct QueuedQuery {
+    spec: EverythingQuerySpec,
     response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
 }
 
@@ -72,7 +118,8 @@ struct WorkerState {
     command_rx: mpsc::Receiver<WorkerCommand>,
     envelope_rx: mpsc::Receiver<ReplyEnvelope>,
     active_request_ids: Arc<Mutex<HashSet<u32>>>,
-    pending: HashMap<u32, PendingQuery>,
+    queued: VecDeque<QueuedQuery>,
+    active: Option<PendingQuery>,
     next_request_id: Option<u32>,
 }
 
@@ -81,37 +128,57 @@ pub(crate) fn spawn_worker(
     startup_timeout: Duration,
     closed: Arc<AtomicBool>,
 ) -> Result<WorkerParts, EverythingClientError> {
+    spawn_worker_with_hooks(everything_hwnd_bits, startup_timeout, closed, ())
+}
+
+fn spawn_worker_with_hooks<H: StartupHooks>(
+    everything_hwnd_bits: usize,
+    startup_timeout: Duration,
+    closed: Arc<AtomicBool>,
+    hooks: H,
+) -> Result<WorkerParts, EverythingClientError> {
     if everything_hwnd_bits == 0 {
         return Err(EverythingClientError::IpcUnavailable);
     }
     let (command_tx, command_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let startup_cancelled = Arc::new(AtomicBool::new(false));
-    let worker_cancelled = Arc::clone(&startup_cancelled);
+    let (startup_decision_tx, startup_decision_rx) = mpsc::channel();
+    let hooks = Arc::new(hooks);
+    let worker_hooks = Arc::clone(&hooks);
     let worker_closed = Arc::clone(&closed);
     let join = thread::spawn(move || {
         run_worker(
             everything_hwnd_bits,
             command_rx,
             ready_tx,
-            worker_cancelled,
+            startup_decision_rx,
+            worker_hooks,
             worker_closed,
         );
     });
 
     match ready_rx.recv_timeout(startup_timeout) {
-        Ok(Ok(reply_hwnd_bits)) => Ok(WorkerParts {
-            command_tx,
-            reply_hwnd_bits,
-            join,
-        }),
+        Ok(Ok(reply_hwnd_bits)) => {
+            if startup_decision_tx.send(StartupDecision::Proceed).is_err() {
+                closed.store(true, Ordering::Release);
+                let _ = join.join();
+                Err(EverythingClientError::IpcUnavailable)
+            } else {
+                Ok(WorkerParts {
+                    command_tx,
+                    reply_hwnd_bits,
+                    join,
+                })
+            }
+        }
         Ok(Err(error)) => {
             closed.store(true, Ordering::Release);
             let _ = join.join();
             Err(error)
         }
         Err(_) => {
-            startup_cancelled.store(true, Ordering::Release);
+            let _ = startup_decision_tx.send(StartupDecision::Cancel);
+            hooks.startup_timed_out();
             closed.store(true, Ordering::Release);
             let _ = join.join();
             Err(EverythingClientError::IpcUnavailable)
@@ -138,7 +205,8 @@ fn run_worker(
     everything_hwnd_bits: usize,
     command_rx: mpsc::Receiver<WorkerCommand>,
     ready_tx: mpsc::Sender<Result<usize, EverythingClientError>>,
-    startup_cancelled: Arc<AtomicBool>,
+    startup_decision_rx: mpsc::Receiver<StartupDecision>,
+    startup_hooks: Arc<impl StartupHooks>,
     closed: Arc<AtomicBool>,
 ) {
     let everything_hwnd = hwnd_from_bits(everything_hwnd_bits);
@@ -190,7 +258,10 @@ fn run_worker(
         drain_commands_closed(&command_rx);
         return;
     }
-    if startup_cancelled.load(Ordering::Acquire) || ready_tx.send(Ok(reply_hwnd_bits)).is_err() {
+    startup_hooks.before_ready_publication();
+    let startup_proceeds = ready_tx.send(Ok(reply_hwnd_bits)).is_ok()
+        && matches!(startup_decision_rx.recv(), Ok(StartupDecision::Proceed));
+    if !startup_proceeds {
         unsafe {
             let _ = KillTimer(Some(reply_hwnd), WORKER_TIMER_ID);
         }
@@ -207,7 +278,8 @@ fn run_worker(
         command_rx,
         envelope_rx,
         active_request_ids,
-        pending: HashMap::new(),
+        queued: VecDeque::new(),
+        active: None,
         next_request_id: Some(1),
     };
     let mut message = MSG::default();
@@ -253,115 +325,147 @@ impl WorkerState {
         loop {
             match self.command_rx.try_recv() {
                 Ok(WorkerCommand::Query { spec, response_tx }) => {
-                    self.start_query(spec, response_tx);
+                    self.queued.push_back(QueuedQuery { spec, response_tx });
                 }
                 Ok(WorkerCommand::Shutdown) => return true,
-                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.start_next_query();
+                    return false;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => return true,
             }
         }
     }
 
-    fn start_query(
-        &mut self,
-        spec: EverythingQuerySpec,
-        response_tx: mpsc::Sender<Result<EverythingQueryResult, EverythingClientError>>,
-    ) {
-        if spec.deadline <= Instant::now() {
-            let _ = response_tx.send(Err(EverythingClientError::QueryTimedOut));
-            return;
-        }
-        let request_id = match self.next_request_id {
-            Some(request_id) => request_id,
-            None => {
-                let _ = response_tx.send(Err(EverythingClientError::RequestIdExhausted));
+    fn start_next_query(&mut self) {
+        while self.active.is_none() {
+            let Some(QueuedQuery { spec, response_tx }) = self.queued.pop_front() else {
                 return;
+            };
+            if spec.deadline <= Instant::now() {
+                let _ = response_tx.send(Err(EverythingClientError::QueryTimedOut));
+                continue;
             }
-        };
-        self.next_request_id = request_id.checked_add(1);
-        let encoded = match encode_query2(
-            &spec,
-            QueryReplyRoute {
-                reply_hwnd: self.reply_hwnd_u32,
-                reply_copydata_message: request_id,
-            },
-        ) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                let _ = response_tx.send(Err(EverythingClientError::Protocol(error)));
-                return;
+            let request_id = match self.next_request_id {
+                Some(request_id) => request_id,
+                None => {
+                    let _ = response_tx.send(Err(EverythingClientError::RequestIdExhausted));
+                    continue;
+                }
+            };
+            self.next_request_id = request_id.checked_add(1);
+            let reply_contract = List2ReplyContract::from(&spec);
+            let encoded = match encode_query2(
+                &spec,
+                QueryReplyRoute {
+                    reply_hwnd: self.reply_hwnd_u32,
+                    reply_copydata_message: request_id,
+                },
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let _ = response_tx.send(Err(EverythingClientError::Protocol(error)));
+                    continue;
+                }
+            };
+            let registered = self
+                .active_request_ids
+                .lock()
+                .map(|mut active_request_ids| active_request_ids.insert(request_id))
+                .unwrap_or(false);
+            if !registered {
+                let _ = response_tx.send(Err(EverythingClientError::IpcUnavailable));
+                continue;
             }
-        };
-        let registered = self
-            .active_request_ids
-            .lock()
-            .map(|mut active_request_ids| active_request_ids.insert(request_id))
-            .unwrap_or(false);
-        if !registered {
-            let _ = response_tx.send(Err(EverythingClientError::IpcUnavailable));
-            return;
-        }
-        self.pending.insert(
-            request_id,
-            PendingQuery {
+            self.active = Some(PendingQuery {
+                request_id,
                 deadline: spec.deadline,
+                reply_contract,
                 response_tx,
-            },
-        );
-        if !send_query2(
-            self.everything_hwnd,
-            self.reply_hwnd,
-            &encoded,
-            spec.deadline,
-        ) {
-            self.remove_active_request(request_id);
-            if let Some(pending) = self.pending.remove(&request_id) {
-                let _ = pending
-                    .response_tx
-                    .send(Err(EverythingClientError::IpcSendFailed));
+            });
+            if send_query2(
+                self.everything_hwnd,
+                self.reply_hwnd,
+                &encoded,
+                spec.deadline,
+            ) {
+                return;
             }
+
+            self.remove_active_request(request_id);
+            let pending = self.active.take().expect("active query disappeared");
+            let error = if pending.deadline <= Instant::now() {
+                EverythingClientError::QueryTimedOut
+            } else {
+                EverythingClientError::IpcSendFailed
+            };
+            let _ = pending.response_tx.send(Err(error));
         }
     }
 
     fn drain_envelopes(&mut self) {
         while let Ok(envelope) = self.envelope_rx.try_recv() {
-            let Some(pending) = self.pending.remove(&envelope.request_id) else {
+            let Some(pending) = self.active.take() else {
                 continue;
             };
+            if pending.request_id != envelope.request_id {
+                self.active = Some(pending);
+                continue;
+            }
             if pending.deadline <= Instant::now() {
                 let _ = pending
                     .response_tx
                     .send(Err(EverythingClientError::QueryTimedOut));
-                continue;
+            } else {
+                let result = decode_list2_payload(&envelope.payload, pending.reply_contract)
+                    .map_err(EverythingClientError::Protocol);
+                let _ = pending.response_tx.send(result);
             }
-            let result =
-                decode_list2_payload(&envelope.payload).map_err(EverythingClientError::Protocol);
-            let _ = pending.response_tx.send(result);
+            self.start_next_query();
         }
     }
 
     fn expire_queries(&mut self) {
         let now = Instant::now();
-        let expired: Vec<u32> = self
-            .pending
-            .iter()
-            .filter_map(|(request_id, pending)| (pending.deadline <= now).then_some(*request_id))
-            .collect();
-        for request_id in expired {
-            self.remove_active_request(request_id);
-            if let Some(pending) = self.pending.remove(&request_id) {
+        let mut queued = VecDeque::with_capacity(self.queued.len());
+        while let Some(pending) = self.queued.pop_front() {
+            if pending.spec.deadline <= now {
                 let _ = pending
                     .response_tx
                     .send(Err(EverythingClientError::QueryTimedOut));
+            } else {
+                queued.push_back(pending);
             }
         }
+        self.queued = queued;
+
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|pending| pending.deadline <= now)
+        {
+            let pending = self
+                .active
+                .take()
+                .expect("expired active query disappeared");
+            self.remove_active_request(pending.request_id);
+            let _ = pending
+                .response_tx
+                .send(Err(EverythingClientError::QueryTimedOut));
+        }
+        self.start_next_query();
     }
 
     fn close_all(&mut self) {
         if let Ok(mut active_request_ids) = self.active_request_ids.lock() {
             active_request_ids.clear();
         }
-        for (_, pending) in self.pending.drain() {
+        if let Some(pending) = self.active.take() {
+            let _ = pending
+                .response_tx
+                .send(Err(EverythingClientError::ClientClosed));
+        }
+        for pending in self.queued.drain(..) {
             let _ = pending
                 .response_tx
                 .send(Err(EverythingClientError::ClientClosed));
@@ -543,7 +647,11 @@ unsafe fn handle_copydata(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
         });
         return LRESULT(1);
     }
-    let payload = std::slice::from_raw_parts(copydata.lpData.cast::<u8>(), payload_len).to_vec();
+    let payload = if payload_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(copydata.lpData.cast::<u8>(), payload_len).to_vec()
+    };
     active_request_ids.remove(&request_id);
     let _ = binding.envelope_tx.send(ReplyEnvelope {
         request_id,
@@ -558,4 +666,40 @@ fn hwnd_bits(hwnd: HWND) -> usize {
 
 fn hwnd_from_bits(bits: usize) -> HWND {
     HWND(bits as *mut c_void)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_timeout_after_prepublication_check_has_bounded_shutdown() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let (before_ready_tx, before_ready_rx) = mpsc::channel();
+        let (release_ready_tx, release_ready_rx) = mpsc::channel();
+        let (timeout_tx, timeout_rx) = mpsc::channel();
+        let hooks = StartupTestHooks {
+            before_ready_tx,
+            release_ready_rx: Mutex::new(release_ready_rx),
+            timeout_tx,
+        };
+        let caller = thread::spawn(move || {
+            spawn_worker_with_hooks(1, Duration::from_millis(1), closed, hooks)
+        });
+
+        before_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker did not reach readiness publication barrier");
+        timeout_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("caller did not cancel timed-out startup");
+        release_ready_tx
+            .send(())
+            .expect("worker dropped readiness release channel");
+
+        assert!(matches!(
+            caller.join().expect("startup caller panicked"),
+            Err(EverythingClientError::IpcUnavailable)
+        ));
+    }
 }

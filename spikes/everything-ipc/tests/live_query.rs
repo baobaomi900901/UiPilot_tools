@@ -8,7 +8,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use everything_ipc::client::{EverythingClient, EverythingClientError};
-use everything_ipc::protocol::{EverythingQueryResult, EverythingQuerySpec, EverythingSort};
+use everything_ipc::protocol::{
+    EverythingQueryResult, EverythingQuerySpec, EverythingSort, ProtocolError,
+};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -52,6 +54,9 @@ struct CapturedQuery {
 struct FakeState {
     captured_tx: mpsc::Sender<CapturedQuery>,
     recipient_hwnd: AtomicUsize,
+    active_request_id: Mutex<Option<u32>>,
+    cancelled_request_ids: Mutex<HashSet<u32>>,
+    cancellation_count: AtomicUsize,
 }
 
 struct FakeEverything {
@@ -60,6 +65,7 @@ struct FakeEverything {
     hwnd: HWND,
     captured_rx: mpsc::Receiver<CapturedQuery>,
     stopped_rx: mpsc::Receiver<()>,
+    state: Arc<FakeState>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -74,9 +80,13 @@ impl FakeEverything {
         let state = Arc::new(FakeState {
             captured_tx,
             recipient_hwnd: AtomicUsize::new(0),
+            active_request_id: Mutex::new(None),
+            cancelled_request_ids: Mutex::new(HashSet::new()),
+            cancellation_count: AtomicUsize::new(0),
         });
         *fake_state_slot().lock().expect("fake state mutex poisoned") = Some(Arc::clone(&state));
         let thread_window_class = HSTRING::from(&window_class);
+        let thread_state = Arc::clone(&state);
 
         let thread = thread::spawn(move || {
             let result = create_fake_window(&thread_window_class);
@@ -88,7 +98,7 @@ impl FakeEverything {
                     return;
                 }
             };
-            state
+            thread_state
                 .recipient_hwnd
                 .store(hwnd_bits(hwnd), Ordering::Release);
             ready_tx
@@ -121,6 +131,7 @@ impl FakeEverything {
             hwnd: hwnd_from_bits(hwnd_bits),
             captured_rx,
             stopped_rx,
+            state,
             thread: Some(thread),
         }
     }
@@ -148,7 +159,28 @@ impl FakeEverything {
     }
 
     fn send_valid_empty_reply(&self, query: &CapturedQuery) {
-        self.send_empty_reply_from(self.hwnd, query.reply_copydata_message, query);
+        if self.state.finish_reply(query.reply_copydata_message) {
+            self.send_empty_reply_from(self.hwnd, query.reply_copydata_message, query);
+        }
+    }
+
+    fn send_null_empty_reply(&self, query: &CapturedQuery) {
+        if !self.state.finish_reply(query.reply_copydata_message) {
+            return;
+        }
+        let copydata = COPYDATASTRUCT {
+            dwData: query.reply_copydata_message as usize,
+            cbData: 0,
+            lpData: std::ptr::null_mut(),
+        };
+        unsafe {
+            SendMessageW(
+                hwnd_from_u32(query.encoded_reply_hwnd),
+                WM_COPYDATA,
+                Some(WPARAM(hwnd_bits(self.hwnd))),
+                Some(LPARAM((&copydata as *const COPYDATASTRUCT) as isize)),
+            );
+        }
     }
 
     fn send_empty_reply_from(&self, source_hwnd: HWND, request_id: u32, query: &CapturedQuery) {
@@ -173,7 +205,7 @@ impl FakeEverything {
         let copydata = COPYDATASTRUCT {
             dwData: request_id as usize,
             cbData: 1,
-            lpData: 1usize as *mut c_void,
+            lpData: std::ptr::dangling_mut::<c_void>(),
         };
         unsafe {
             SendMessageW(
@@ -186,7 +218,6 @@ impl FakeEverything {
     }
 
     fn assert_no_query_after_return(&self, timeout: Duration) {
-        while self.captured_rx.try_recv().is_ok() {}
         assert!(matches!(
             self.captured_rx.recv_timeout(timeout),
             Err(mpsc::RecvTimeoutError::Timeout)
@@ -207,6 +238,46 @@ impl FakeEverything {
 
     fn mismatched_source(&self) -> HWND {
         hwnd_from_bits(hwnd_bits(self.hwnd).wrapping_add(1))
+    }
+
+    fn cancellation_count(&self) -> usize {
+        self.state.cancellation_count.load(Ordering::Acquire)
+    }
+}
+
+impl FakeState {
+    fn record_query(&self, request_id: u32) {
+        let previous = self
+            .active_request_id
+            .lock()
+            .expect("fake active request mutex poisoned")
+            .replace(request_id);
+        if let Some(previous) = previous {
+            self.cancelled_request_ids
+                .lock()
+                .expect("fake cancelled request mutex poisoned")
+                .insert(previous);
+            self.cancellation_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn finish_reply(&self, request_id: u32) -> bool {
+        if self
+            .cancelled_request_ids
+            .lock()
+            .expect("fake cancelled request mutex poisoned")
+            .remove(&request_id)
+        {
+            return false;
+        }
+        let mut active_request_id = self
+            .active_request_id
+            .lock()
+            .expect("fake active request mutex poisoned");
+        if *active_request_id == Some(request_id) {
+            *active_request_id = None;
+        }
+        true
     }
 }
 
@@ -315,6 +386,7 @@ unsafe extern "system" fn fake_window_proc(
             {
                 if state.recipient_hwnd.load(Ordering::Acquire) == hwnd_bits(hwnd) {
                     if let Some(query) = capture_query(hwnd, wparam, lparam) {
+                        state.record_query(query.reply_copydata_message);
                         let _ = state.captured_tx.send(query);
                     }
                 }
@@ -427,7 +499,69 @@ fn hwnd_from_u32(bits: u32) -> HWND {
 }
 
 #[test]
-#[ignore = "Task 3 Step 2 implements the hidden reply-window client"]
+fn null_empty_copydata_payload_is_admitted_then_rejected_by_protocol() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let client = fake.connect_client();
+    let result = spawn_query(Arc::clone(&client), QUERY_TIMEOUT);
+    let query = fake.capture();
+
+    fake.send_null_empty_reply(&query);
+
+    assert_eq!(
+        result
+            .recv_timeout(CLEANUP_TIMEOUT)
+            .expect("null-empty reply did not complete"),
+        Err(EverythingClientError::Protocol(
+            ProtocolError::PayloadTooShort
+        ))
+    );
+}
+
+#[test]
+fn concurrent_calls_wait_for_active_reply_without_peer_cancellation() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let client = fake.connect_client();
+    let first_result = spawn_query(Arc::clone(&client), Duration::from_millis(500));
+    let first = fake.capture();
+
+    let second_result = spawn_query(Arc::clone(&client), Duration::from_millis(500));
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
+    assert_eq!(fake.cancellation_count(), 0);
+
+    fake.send_valid_empty_reply(&first);
+    expect_empty_result(&first_result);
+    let second = fake.capture();
+    fake.send_valid_empty_reply(&second);
+    expect_empty_result(&second_result);
+    assert_eq!(fake.cancellation_count(), 0);
+}
+
+#[test]
+fn queued_call_expires_at_its_original_deadline_before_dispatch() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let client = fake.connect_client();
+    let first_result = spawn_query(Arc::clone(&client), Duration::from_millis(500));
+    let first = fake.capture();
+    let queued_result = spawn_query(Arc::clone(&client), Duration::from_millis(35));
+
+    assert_eq!(
+        queued_result
+            .recv_timeout(Duration::from_millis(250))
+            .expect("queued query did not honor its original deadline"),
+        Err(EverythingClientError::QueryTimedOut)
+    );
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
+    assert_eq!(fake.cancellation_count(), 0);
+
+    fake.send_valid_empty_reply(&first);
+    expect_empty_result(&first_result);
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
+}
+
+#[test]
 fn reply_window_lifecycle_and_message_ids_are_stable() {
     let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
     let fake = FakeEverything::start();
@@ -440,31 +574,25 @@ fn reply_window_lifecycle_and_message_ids_are_stable() {
     expect_empty_result(&first_result);
 
     let second_result = spawn_query(Arc::clone(&client), QUERY_TIMEOUT);
-    let third_result = spawn_query(Arc::clone(&client), QUERY_TIMEOUT);
     let second = fake.capture();
-    let third = fake.capture();
     assert_query_route(&second);
-    assert_query_route(&third);
-
-    let concurrent_ids =
-        HashSet::from([second.reply_copydata_message, third.reply_copydata_message]);
-    assert_eq!(concurrent_ids.len(), 2);
-    assert!(third.reply_copydata_message > second.reply_copydata_message);
-    let concurrent_max = *concurrent_ids.iter().max().unwrap();
-    assert!(concurrent_ids
-        .iter()
-        .all(|id| *id > first.reply_copydata_message));
-
-    fake.send_valid_empty_reply(&third);
+    assert!(second.reply_copydata_message > first.reply_copydata_message);
+    let third_result = spawn_query(Arc::clone(&client), QUERY_TIMEOUT);
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
     fake.send_valid_empty_reply(&second);
     expect_empty_result(&second_result);
+    let third = fake.capture();
+    assert_query_route(&third);
+    assert!(third.reply_copydata_message > second.reply_copydata_message);
+    fake.send_valid_empty_reply(&third);
     expect_empty_result(&third_result);
 
     let fourth_result = spawn_query(Arc::clone(&client), QUERY_TIMEOUT);
     let fourth = fake.capture();
-    assert!(fourth.reply_copydata_message > concurrent_max);
+    assert!(fourth.reply_copydata_message > third.reply_copydata_message);
     fake.send_valid_empty_reply(&fourth);
     expect_empty_result(&fourth_result);
+    assert_eq!(fake.cancellation_count(), 0);
 
     let reply_hwnd = fourth.encoded_reply_hwnd;
     drop(client);
@@ -472,15 +600,14 @@ fn reply_window_lifecycle_and_message_ids_are_stable() {
 }
 
 #[test]
-#[ignore = "Task 3 Step 2 implements WM_COPYDATA envelope admission"]
 fn source_hwnd_and_dwdata_must_match_the_pending_request() {
     let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
     let fake = FakeEverything::start();
     let client = fake.connect_client();
     let first_result = spawn_query(Arc::clone(&client), Duration::from_millis(500));
-    let second_result = spawn_query(Arc::clone(&client), Duration::from_millis(500));
     let first = fake.capture();
-    let second = fake.capture();
+    let second_result = spawn_query(Arc::clone(&client), Duration::from_millis(500));
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
 
     let unknown_id = first.reply_copydata_message.wrapping_add(10_000);
     fake.send_unknown_reply_with_invalid_payload(unknown_id, &first);
@@ -499,18 +626,15 @@ fn source_hwnd_and_dwdata_must_match_the_pending_request() {
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
 
-    fake.send_valid_empty_reply(&second);
-    expect_empty_result(&second_result);
-    assert!(matches!(
-        first_result.recv_timeout(ASSERT_STILL_PENDING),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
     fake.send_valid_empty_reply(&first);
     expect_empty_result(&first_result);
+    let second = fake.capture();
+    fake.send_valid_empty_reply(&second);
+    expect_empty_result(&second_result);
+    assert_eq!(fake.cancellation_count(), 0);
 }
 
 #[test]
-#[ignore = "Task 3 Step 2 implements bounded query deadlines and late-reply rejection"]
 fn timeout_and_late_reply_do_not_pollute_the_next_request() {
     let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
     let fake = FakeEverything::start();
@@ -542,7 +666,6 @@ fn timeout_and_late_reply_do_not_pollute_the_next_request() {
 }
 
 #[test]
-#[ignore = "Task 3 Step 2 implements pending-query failure on client worker exit"]
 fn worker_exit_fails_all_pending_requests_with_a_fixed_error() {
     let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
     let fake = FakeEverything::start();
@@ -551,11 +674,9 @@ fn worker_exit_fails_all_pending_requests_with_a_fixed_error() {
     let receivers: Vec<_> = (0..3)
         .map(|_| spawn_query(Arc::clone(&client), Duration::from_secs(1)))
         .collect();
-    let queries: Vec<_> = (0..3).map(|_| fake.capture()).collect();
-    let reply_hwnd = queries[0].encoded_reply_hwnd;
-    assert!(queries
-        .iter()
-        .all(|query| query.encoded_reply_hwnd == reply_hwnd));
+    let active_query = fake.capture();
+    let reply_hwnd = active_query.encoded_reply_hwnd;
+    fake.assert_no_query_after_return(ASSERT_STILL_PENDING);
 
     fake.stop_client_window(reply_hwnd);
     assert_eq!(
@@ -576,7 +697,6 @@ fn worker_exit_fails_all_pending_requests_with_a_fixed_error() {
 }
 
 #[test]
-#[ignore = "Task 3 live gate: runs 1,000 sequential and concurrent fake IPC queries"]
 fn thousand_queries_have_no_crosstalk_timeout_leak_or_id_reuse() {
     let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
     let gate_deadline = Instant::now() + Duration::from_secs(30);
@@ -602,21 +722,18 @@ fn thousand_queries_have_no_crosstalk_timeout_leak_or_id_reuse() {
     let receivers: Vec<_> = (0..500)
         .map(|_| spawn_query(Arc::clone(&client), remaining.min(Duration::from_secs(10))))
         .collect();
-    let mut queries = Vec::with_capacity(500);
     for _ in 0..500 {
         let query = fake.capture();
         assert!(query.reply_copydata_message > last_id);
         assert!(seen_ids.insert(query.reply_copydata_message));
         last_id = query.reply_copydata_message;
-        queries.push(query);
-    }
-    for query in queries.iter().rev() {
-        fake.send_valid_empty_reply(query);
+        fake.send_valid_empty_reply(&query);
     }
     for receiver in &receivers {
         expect_empty_result(receiver);
     }
     assert_eq!(seen_ids.len(), 1_000);
+    assert_eq!(fake.cancellation_count(), 0);
 
     let final_result = spawn_query(Arc::clone(&client), QUERY_TIMEOUT);
     let final_query = fake.capture();

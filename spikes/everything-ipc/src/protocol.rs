@@ -35,6 +35,14 @@ pub struct QueryReplyRoute {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct List2ReplyContract {
+    pub offset: u32,
+    pub max_results: u32,
+    pub request_flags: u32,
+    pub sort_type: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EverythingSort {
     DateModifiedAscending,
     DateModifiedDescending,
@@ -45,6 +53,17 @@ impl EverythingSort {
         match self {
             Self::DateModifiedAscending => 13,
             Self::DateModifiedDescending => 14,
+        }
+    }
+}
+
+impl From<&EverythingQuerySpec> for List2ReplyContract {
+    fn from(spec: &EverythingQuerySpec) -> Self {
+        Self {
+            offset: spec.offset,
+            max_results: spec.max_results,
+            request_flags: spec.request_flags,
+            sort_type: spec.sort.wire_value(),
         }
     }
 }
@@ -72,6 +91,7 @@ pub enum ProtocolError {
     EmbeddedQueryNul,
     LengthOverflow,
     PayloadTooShort,
+    ReplyContractMismatch,
     UnsupportedRequestFlags,
     ItemTableOutOfBounds,
     ItemDataOffsetOutOfBounds,
@@ -93,6 +113,7 @@ impl fmt::Display for ProtocolError {
             Self::EmbeddedQueryNul => "query contains an embedded nul",
             Self::LengthOverflow => "protocol length overflow",
             Self::PayloadTooShort => "protocol payload is too short",
+            Self::ReplyContractMismatch => "reply does not match the query contract",
             Self::UnsupportedRequestFlags => "unsupported request flags",
             Self::ItemTableOutOfBounds => "item table is out of bounds",
             Self::ItemDataOffsetOutOfBounds => "item data offset is out of bounds",
@@ -157,15 +178,26 @@ pub fn encode_query2(
     Ok(encoded)
 }
 
-pub fn decode_list2_payload(payload: &[u8]) -> Result<EverythingQueryResult, ProtocolError> {
+pub fn decode_list2_payload(
+    payload: &[u8],
+    contract: List2ReplyContract,
+) -> Result<EverythingQueryResult, ProtocolError> {
     if payload.len() < LIST2_HEADER_LEN {
         return Err(ProtocolError::PayloadTooShort);
     }
 
     let total = read_u32_at(payload, 0, payload.len())?;
     let num_items = read_u32_at(payload, 4, payload.len())?;
+    let result_offset = read_u32_at(payload, 8, payload.len())?;
     let request_flags = read_u32_at(payload, 12, payload.len())?;
     let sort_type = read_u32_at(payload, 16, payload.len())?;
+    if result_offset != contract.offset
+        || num_items > contract.max_results
+        || request_flags != contract.request_flags
+        || sort_type != contract.sort_type
+    {
+        return Err(ProtocolError::ReplyContractMismatch);
+    }
     if request_flags & !SUPPORTED_REQUEST_FLAGS != 0 {
         return Err(ProtocolError::UnsupportedRequestFlags);
     }
