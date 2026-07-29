@@ -1460,7 +1460,9 @@ impl PageSource for InjectedPageSource {
             .cloned()
             .ok_or(PaginationError::ConcurrentMutation)?;
         if offset == 0 {
-            if matches!(self.mode, InjectedDriftMode::ContinuousChange) && self.calls % 2 == 0 {
+            if matches!(self.mode, InjectedDriftMode::ContinuousChange)
+                && self.calls.is_multiple_of(2)
+            {
                 page.items.swap(0, 1);
             }
             return Ok(page);
@@ -1701,7 +1703,7 @@ fn run_real_mutation_case(case: RealMutationCase) -> Result<(), Box<dyn Error>> 
         .map_err(|error| format!("case={case:?} stage=read_stable_cutoff error={error:?}"))?;
     eprintln!("MUTATION_PASS_TRACE case={case:?} trace={trace:?}");
 
-    assert_eq!(source.evidence.first_page_captured, true);
+    assert!(source.evidence.first_page_captured);
     assert_eq!(
         source.evidence.verified_first_page_targets,
         expected_first_page_targets
