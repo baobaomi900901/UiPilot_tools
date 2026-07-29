@@ -1,43 +1,73 @@
 use std::env;
 use std::fmt;
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use everything_ipc::cli::{parse_args as parse_cli_args, render_result, CliError};
 use everything_ipc::client::{EverythingClient, EverythingClientError};
 use everything_ipc::protocol::{EverythingQuerySpec, EverythingSort};
 
-const DEFAULT_TIMEOUT_MS: u64 = 1_000;
-const MAX_TIMEOUT_MS: u64 = 60_000;
-const MAX_RESULTS: u32 = 200;
 const REQUEST_NAME: u32 = 0x0000_0001;
 const REQUEST_FULL_PATH_AND_NAME: u32 = 0x0000_0004;
+const REQUEST_SIZE: u32 = 0x0000_0010;
 const REQUEST_DATE_MODIFIED: u32 = 0x0000_0040;
 const REQUEST_ATTRIBUTES: u32 = 0x0000_0100;
-const REQUEST_FLAGS: u32 =
-    REQUEST_NAME | REQUEST_FULL_PATH_AND_NAME | REQUEST_DATE_MODIFIED | REQUEST_ATTRIBUTES;
-
-struct ProbeArgs {
-    instance: String,
-    query: String,
-    timeout: Duration,
-}
+const REQUEST_FLAGS: u32 = REQUEST_NAME
+    | REQUEST_FULL_PATH_AND_NAME
+    | REQUEST_SIZE
+    | REQUEST_DATE_MODIFIED
+    | REQUEST_ATTRIBUTES;
 
 #[derive(Debug)]
 enum ProbeError {
-    InvalidArguments,
-    InvalidTimeout,
+    Cli(CliError),
     DeadlineOverflow,
     Client(EverythingClientError),
+}
+
+impl ProbeError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Cli(CliError::InvalidArguments) => "E_ARGUMENTS",
+            Self::Cli(CliError::InvalidLimit) => "E_LIMIT",
+            Self::Cli(CliError::InvalidTimeout) => "E_TIMEOUT",
+            Self::Cli(CliError::InvalidFormat) => "E_FORMAT",
+            Self::Cli(CliError::RenderFailed) => "E_RENDER",
+            Self::Client(EverythingClientError::ConnectionTimedOut)
+            | Self::Client(EverythingClientError::IpcUnavailable) => "E_EVERYTHING_UNAVAILABLE",
+            Self::Client(EverythingClientError::QueryTimedOut) => "E_QUERY_TIMEOUT",
+            Self::Client(EverythingClientError::Protocol(_)) => "E_PROTOCOL",
+            Self::DeadlineOverflow | Self::Client(_) => "E_IPC",
+        }
+    }
+
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Cli(_) => 2,
+            Self::Client(EverythingClientError::ConnectionTimedOut)
+            | Self::Client(EverythingClientError::IpcUnavailable) => 3,
+            Self::DeadlineOverflow | Self::Client(_) => 4,
+        }
+    }
 }
 
 impl fmt::Display for ProbeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidArguments => "invalid probe arguments",
-            Self::InvalidTimeout => "invalid probe timeout",
-            Self::DeadlineOverflow => "probe deadline overflow",
+            Self::Cli(CliError::InvalidArguments) => "invalid arguments",
+            Self::Cli(CliError::InvalidLimit) => "invalid result limit",
+            Self::Cli(CliError::InvalidTimeout) => "invalid timeout",
+            Self::Cli(CliError::InvalidFormat) => "invalid output format",
+            Self::Cli(CliError::RenderFailed) => "failed to render query result",
+            Self::DeadlineOverflow => "query deadline overflow",
             Self::Client(error) => return error.fmt(formatter),
         })
+    }
+}
+
+impl From<CliError> for ProbeError {
+    fn from(error: CliError) -> Self {
+        Self::Cli(error)
     }
 }
 
@@ -51,14 +81,14 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
+            eprintln!("{}: {error}", error.code());
+            ExitCode::from(error.exit_code())
         }
     }
 }
 
 fn run() -> Result<(), ProbeError> {
-    let args = parse_args(env::args_os().skip(1))?;
+    let args = parse_cli_args(env::args_os().skip(1))?;
     let client = EverythingClient::connect(&args.instance, args.timeout)?;
     let deadline = Instant::now()
         .checked_add(args.timeout)
@@ -66,58 +96,38 @@ fn run() -> Result<(), ProbeError> {
     let result = client.query(EverythingQuerySpec {
         search: args.query.encode_utf16().collect(),
         offset: 0,
-        max_results: MAX_RESULTS,
+        max_results: args.limit,
         request_flags: REQUEST_FLAGS,
         sort: EverythingSort::DateModifiedDescending,
         deadline,
     })?;
-    println!(
-        "total={} returned={} request_flags=0x{:08x} sort_type={}",
-        result.total,
-        result.items.len(),
-        result.request_flags,
-        result.sort_type
-    );
+    println!("{}", render_result(args.format, &result)?);
     Ok(())
 }
 
-fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<ProbeArgs, ProbeError> {
-    let mut instance = None;
-    let mut query = None;
-    let mut timeout_ms = None;
-    let mut args = args.into_iter();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use everything_ipc::protocol::ProtocolError;
 
-    while let Some(argument) = args.next() {
-        let argument = argument
-            .into_string()
-            .map_err(|_| ProbeError::InvalidArguments)?;
-        let value = args.next().ok_or(ProbeError::InvalidArguments)?;
-        let value = value
-            .into_string()
-            .map_err(|_| ProbeError::InvalidArguments)?;
-        match argument.as_str() {
-            "--instance" if instance.is_none() => instance = Some(value),
-            "--query" if query.is_none() => query = Some(value),
-            "--timeout-ms" if timeout_ms.is_none() => {
-                timeout_ms = Some(parse_timeout(&value)?);
-            }
-            _ => return Err(ProbeError::InvalidArguments),
-        }
+    #[test]
+    fn maps_expected_failures_to_stable_codes() {
+        assert_eq!(ProbeError::Cli(CliError::InvalidLimit).code(), "E_LIMIT");
+        assert_eq!(ProbeError::Cli(CliError::InvalidLimit).exit_code(), 2);
+        assert_eq!(
+            ProbeError::Client(EverythingClientError::ConnectionTimedOut).code(),
+            "E_EVERYTHING_UNAVAILABLE"
+        );
+        assert_eq!(
+            ProbeError::Client(EverythingClientError::QueryTimedOut).code(),
+            "E_QUERY_TIMEOUT"
+        );
+        assert_eq!(
+            ProbeError::Client(EverythingClientError::Protocol(
+                ProtocolError::PayloadTooShort
+            ))
+            .code(),
+            "E_PROTOCOL"
+        );
     }
-
-    Ok(ProbeArgs {
-        instance: instance.ok_or(ProbeError::InvalidArguments)?,
-        query: query.ok_or(ProbeError::InvalidArguments)?,
-        timeout: Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
-    })
-}
-
-fn parse_timeout(value: &str) -> Result<u64, ProbeError> {
-    let timeout_ms = value
-        .parse::<u64>()
-        .map_err(|_| ProbeError::InvalidTimeout)?;
-    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
-        return Err(ProbeError::InvalidTimeout);
-    }
-    Ok(timeout_ms)
 }
