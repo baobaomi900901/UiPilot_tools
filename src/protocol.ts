@@ -86,7 +86,6 @@ export type ClassifiedTextRecord =
 
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
-  listenFileIndexChanged(handler: (payload: unknown) => void): Promise<() => void>
   searchApps(input: { query: string; invocationId: string; querySequence: number }): Promise<SearchResponse | null>
   searchFiles(input: {
     query: string
@@ -165,10 +164,6 @@ export interface FileSearchResponse {
   items: FileResultItem[]
 }
 
-export interface FileIndexChanged {
-  revision: string
-  status: FileIndexStatus
-}
 
 export interface FileResultView {
   key: string
@@ -344,11 +339,4 @@ export function parseFileSearchResponse(value: unknown): FileSearchResponse | nu
     if (parseFileResultItem(response.items[index]) === null) return null
   }
   return response as unknown as FileSearchResponse
-}
-
-export function parseFileIndexChanged(value: unknown): FileIndexChanged | null {
-  const event = plainRecord(value)
-  if (!event || !exactKeys(event, ['revision', 'status'])) return null
-  if (!canonicalU64(event.revision) || !fileStatus(event.status)) return null
-  return event as unknown as FileIndexChanged
 }

@@ -19,7 +19,6 @@ import {
 
 export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
-  listenFileIndexChanged: (handler) => listen<unknown>('file-index://changed', (event) => handler(event.payload)),
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', input),
   searchFiles: async (input) => {
     const payload = Object.freeze({

@@ -41,7 +41,6 @@ button,
 input,
 label,
 .result-list,
-.file-category-strip,
 .file-preview,
 .file-toolbar,
 .settings-form {
@@ -74,10 +73,10 @@ label,
 .file-workspace {
   display: grid;
   grid-template-areas:
-    "query query query"
-    "categories results preview"
-    "toolbar toolbar toolbar";
-  grid-template-columns: minmax(112px, 150px) minmax(0, 1fr) minmax(160px, 200px);
+    "query query"
+    "results preview"
+    "toolbar toolbar";
+  grid-template-columns: minmax(0, 1fr) minmax(160px, 200px);
   grid-template-rows: 44px minmax(0, 1fr) auto;
   gap: 8px;
   min-width: 0;
@@ -89,14 +88,6 @@ label,
   grid-area: query;
 }
 
-.file-category-strip {
-  grid-area: categories;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-  overflow-y: auto;
-}
 
 .file-result-list {
   grid-area: results;
@@ -524,18 +515,11 @@ label,
   .file-workspace {
     grid-template-areas:
       "query"
-      "categories"
       "results"
       "preview"
       "toolbar";
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: 44px auto minmax(96px, 1fr) minmax(96px, auto) auto;
-  }
-
-  .file-category-strip {
-    flex-direction: row;
-    overflow-x: auto;
-    overflow-y: hidden;
+    grid-template-rows: 44px minmax(96px, 1fr) minmax(96px, auto) auto;
   }
 
   .file-toolbar {

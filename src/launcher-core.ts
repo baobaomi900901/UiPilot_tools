@@ -1,5 +1,4 @@
 import {
-  parseFileIndexChanged,
   parseFileSearchResponse,
   parseLauncherShown,
   type ClassifiedTextRecord,
@@ -134,7 +133,6 @@ interface FileSearchOwner {
   query: string
   category: FileCategory
   sort: FileSort
-  requiredRevision: bigint
 }
 
 interface PreviewPreferenceOwner {
@@ -321,13 +319,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let destroyed = false
   let started = false
   let unlisten: (() => void) | undefined
-  let fileUnlisten: (() => void) | undefined
-  let fileListenerRegistration: Promise<boolean> | undefined
-  let fileListenerToken = 0
-  let fileRefreshTimer: ReturnType<typeof setTimeout> | undefined
-  let fileRefreshMaxTimer: ReturnType<typeof setTimeout> | undefined
-  let fileStreamingPollTimer: ReturnType<typeof setTimeout> | undefined
-  let fileRefreshRequired = 0n
   let previewPreferenceToken = 0
   let previewPreferencePending: PreviewPreferenceOwner | undefined
   let previewPreferenceDurableGeneration = 0
@@ -451,29 +442,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.selectedIndex = -1
   }
 
-  function clearFileRefreshTimers(): void {
-    if (fileRefreshTimer !== undefined) clearTimeout(fileRefreshTimer)
-    if (fileRefreshMaxTimer !== undefined) clearTimeout(fileRefreshMaxTimer)
-    if (fileStreamingPollTimer !== undefined) clearTimeout(fileStreamingPollTimer)
-    fileRefreshTimer = undefined
-    fileRefreshMaxTimer = undefined
-    fileStreamingPollTimer = undefined
-    fileRefreshRequired = 0n
-  }
 
   function leaveFileMode(): void {
     if (model.launcherMode !== 'files') return
-    clearFileRefreshTimers()
     searchToken = ++token
     model.searchPending = false
     model.launcherMode = 'applications'
     model.file = undefined
     model.query = ''
     model.queryControlValue = ''
-    if (!fileUnlisten && fileListenerRegistration) {
-      fileListenerToken += 1
-      fileListenerRegistration = undefined
-    }
   }
 
   function fileCommand(value: string): string | null {
@@ -501,31 +478,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return true
   }
 
-  async function ensureFileListener(): Promise<boolean> {
-    if (fileUnlisten) return true
-    if (fileListenerRegistration) return fileListenerRegistration
-    const owner = ++fileListenerToken
-    let registration: Promise<boolean>
-    try {
-      registration = client.listenFileIndexChanged(fileIndexChanged).then(
-        (release) => {
-          if (destroyed || owner !== fileListenerToken) {
-            release()
-            return false
-          }
-          fileUnlisten = release
-          return true
-        },
-        () => false,
-      )
-    } catch {
-      return false
-    }
-    fileListenerRegistration = registration
-    const result = await registration
-    if (fileListenerRegistration === registration) fileListenerRegistration = undefined
-    return result
-  }
 
   function ownsFileSearch(owner: FileSearchOwner): boolean {
     const file = model.file
@@ -545,7 +497,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
-  function beginFileSearch(requiredRevision: bigint): void {
+  function beginFileSearch(): void {
     const invocationId = model.invocationId
     const file = model.file
     if (!invocationId || !file) return
@@ -557,7 +509,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       query: model.query,
       category: file.category,
       sort: file.sort,
-      requiredRevision,
     }
     searchToken = owner.token
     model.searchPending = true
@@ -590,12 +541,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     const revision = BigInt(response.indexRevision)
-    if (revision < owner.requiredRevision || revision < file.latestSeenRevision) {
-      model.searchPending = false
-      publish(true)
-      return
-    }
-    if (revision >= fileRefreshRequired) clearFileRefreshTimers()
     const selectedPath = file.results[file.selectedIndex]?.view.fullPath
     const results = response.items.map((item: FileResultItem) => ({
       resultId: item.resultId,
@@ -618,7 +563,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     model.status = fileStatusText(response.status, results.length > 0)
     publish(true)
-    scheduleFileStreamingPoll()
   }
 
   function failFileSearch(owner: FileSearchOwner, error: unknown): void {
@@ -629,15 +573,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function enterFileMode(query: string): Promise<void> {
-    const epoch = model.viewEpoch
-    const invocationId = model.invocationId
-    if (!invocationId) return
+    if (!model.invocationId) return
     searchToken = ++token
     clearResults()
     model.launcherMode = 'files'
     model.query = query
     model.queryControlValue = query
-    model.status = fileStatusText('building')
+    model.status = ''
     model.file = {
       category: 'all',
       sort: 'modifiedDesc',
@@ -651,28 +593,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       selectedIndex: -1,
     }
     publish(true)
-    const listening = await ensureFileListener()
-    if (
-      !listening ||
-      destroyed ||
-      epoch !== model.viewEpoch ||
-      invocationId !== model.invocationId ||
-      model.launcherMode !== 'files'
-    ) {
-      if (!listening && model.launcherMode === 'files' && epoch === model.viewEpoch) {
-        model.status = '搜索暂不可用。'
-        publish(true)
-      }
-      return
-    }
-    if (!nextFileSequence()) return
-    beginFileSearch(0n)
+    if (query.length === 0 || !nextFileSequence()) return
+    beginFileSearch()
   }
 
   function applyFileEdit(value: string): void {
     const file = model.file
     if (!file) return
-    clearFileRefreshTimers()
     model.shownNotice = undefined
     model.query = value
     model.queryControlValue = value
@@ -683,57 +610,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.status = ''
     searchToken = ++token
     model.searchPending = false
-    if (!fileUnlisten) {
+    if (value.length === 0 || !nextFileSequence()) {
       publish(true)
       return
     }
-    if (!nextFileSequence()) return
-    beginFileSearch(file.latestSeenRevision)
-  }
-
-  function runFileRefresh(): void {
-    const file = model.file
-    const required = fileRefreshRequired
-    clearFileRefreshTimers()
-    if (!file || required === 0n || !nextFileSequence()) return
-    beginFileSearch(required)
-  }
-
-  function runFileStreamingPoll(): void {
-    fileStreamingPollTimer = undefined
-    const file = model.file
-    if (!file || file.indexStatus !== 'building' || model.searchPending || !nextFileSequence()) return
-    beginFileSearch(file.latestSeenRevision)
-  }
-
-  function scheduleFileStreamingPoll(): void {
-    if (!model.file || model.file.indexStatus !== 'building' || model.searchPending || fileStreamingPollTimer !== undefined) return
-    fileStreamingPollTimer = setTimeout(runFileStreamingPoll, 1_000)
-  }
-
-  function scheduleFileRefresh(required: bigint): void {
-    fileRefreshRequired = required > fileRefreshRequired ? required : fileRefreshRequired
-    if (fileRefreshTimer !== undefined) clearTimeout(fileRefreshTimer)
-    if (fileStreamingPollTimer !== undefined) clearTimeout(fileStreamingPollTimer)
-    fileStreamingPollTimer = undefined
-    fileRefreshTimer = setTimeout(runFileRefresh, 250)
-    fileRefreshMaxTimer ??= setTimeout(runFileRefresh, 1_000)
-  }
-
-  function fileIndexChanged(payload: unknown): void {
-    const event = parseFileIndexChanged(payload)
-    const file = model.file
-    if (!event || !file || model.launcherMode !== 'files') return
-    const revision = BigInt(event.revision)
-    if (revision <= file.latestSeenRevision) return
-    const statusChanged = file.indexStatus !== event.status
-    file.latestSeenRevision = revision
-    file.indexStatus = event.status
-    if (statusChanged) {
-      model.status = fileStatusText(event.status)
-      publish(true)
-    }
-    scheduleFileRefresh(revision)
+    beginFileSearch()
   }
 
   function beginSearch(): void {
@@ -1391,54 +1272,21 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
-    clearFileRefreshTimers()
     settingsOperation = undefined
     pendingSettingsLoadEpoch = undefined
     pluginListOwner = undefined
     pluginMutationOwners.clear()
     unlisten?.()
     unlisten = undefined
-    fileListenerToken += 1
-    fileUnlisten?.()
-    fileUnlisten = undefined
-    fileListenerRegistration = undefined
     listeners.clear()
   }
 
-  function setFileCategory(category: FileCategory): void {
-    const file = model.file
-    if (model.launcherMode !== 'files' || !file || file.category === category) return
-    clearFileRefreshTimers()
-    file.category = category
-    file.results = []
-    file.selectedIndex = -1
-    file.total = '0'
-    searchToken = ++token
-    model.searchPending = false
-    if (!fileUnlisten) {
-      publish(true)
-      return
-    }
-    if (!nextFileSequence()) return
-    beginFileSearch(file.latestSeenRevision)
+  function setFileCategory(_category: FileCategory): void {
+    if (model.file) model.file.category = 'all'
   }
 
-  function setFileSort(sort: FileSort): void {
-    const file = model.file
-    if (model.launcherMode !== 'files' || !file || file.sort === sort) return
-    clearFileRefreshTimers()
-    file.sort = sort
-    file.results = []
-    file.selectedIndex = -1
-    file.total = '0'
-    searchToken = ++token
-    model.searchPending = false
-    if (!fileUnlisten) {
-      publish(true)
-      return
-    }
-    if (!nextFileSequence()) return
-    beginFileSearch(file.latestSeenRevision)
+  function setFileSort(_sort: FileSort): void {
+    if (model.file) model.file.sort = 'modifiedDesc'
   }
 
   function setFilePreviewEnabled(enabled: boolean): void {
