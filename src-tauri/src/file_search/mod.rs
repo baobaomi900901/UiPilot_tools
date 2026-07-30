@@ -75,6 +75,22 @@ pub(crate) struct FileSearchResponse {
     pub(crate) items: Vec<FileResultItem>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublishedFileDraft {
+    pub(crate) action: FileExecutionAction,
+    pub(crate) name: String,
+    pub(crate) kind: FileResultKind,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) modified_utc: String,
+    pub(crate) full_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublishedFileBatch {
+    pub(crate) index_revision: u64,
+    pub(crate) items: Vec<PublishedFileDraft>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FilePathKind {
     File,
@@ -96,3 +112,46 @@ pub(crate) enum FileExecutionError {
 }
 
 pub(crate) mod windows;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        windows::path_auth::AuthenticatedPathIdentity, EverythingPathAction, FileExecutionAction,
+        FilePathKind, FileResultKind, PublishedFileBatch, PublishedFileDraft,
+    };
+
+    #[test]
+    fn published_file_batch_preserves_everything_action_fields() {
+        let action = FileExecutionAction::Everything(EverythingPathAction::for_test(
+            AuthenticatedPathIdentity {
+                display_path: r"C:\Visible\report.pdf".into(),
+                volume_guid_path: r"\\?\Volume{PUBLISHED}\".into(),
+                relative_path: r"docs\report.pdf".into(),
+                volume_serial: 42,
+                file_id: [7; 16],
+                kind: FilePathKind::File,
+            },
+        ));
+        let batch = PublishedFileBatch {
+            index_revision: 17,
+            items: vec![PublishedFileDraft {
+                action: action.clone(),
+                name: "report.pdf".into(),
+                kind: FileResultKind::File,
+                size_bytes: Some(123),
+                modified_utc: "2026-07-30T00:00:00.000Z".into(),
+                full_path: r"C:\Visible\report.pdf".into(),
+            }],
+        };
+
+        assert_eq!(batch.index_revision, 17);
+        assert_eq!(batch.items.len(), 1);
+        let draft = &batch.items[0];
+        assert_eq!(draft.action, action);
+        assert_eq!(draft.name, "report.pdf");
+        assert_eq!(draft.kind, FileResultKind::File);
+        assert_eq!(draft.size_bytes, Some(123));
+        assert_eq!(draft.modified_utc, "2026-07-30T00:00:00.000Z");
+        assert_eq!(draft.full_path, r"C:\Visible\report.pdf");
+    }
+}
