@@ -589,6 +589,13 @@ fn reveal_file(path: &str) -> Result<(), FileExecutionError> {
 }
 
 fn open_directory(path: &str) -> Result<(), FileExecutionError> {
+    open_directory_with(path, |info| unsafe { ShellExecuteExW(info) })
+}
+
+fn open_directory_with(
+    path: &str,
+    shell_execute: impl FnOnce(&mut SHELLEXECUTEINFOW) -> windows::core::Result<()>,
+) -> Result<(), FileExecutionError> {
     let wide = to_wide(path)?;
     let mut info = SHELLEXECUTEINFOW {
         cbSize: u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>())
@@ -598,7 +605,7 @@ fn open_directory(path: &str) -> Result<(), FileExecutionError> {
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
-    unsafe { ShellExecuteExW(&mut info) }.map_err(|_| FileExecutionError::OpenFailed)
+    shell_execute(&mut info).map_err(|_| FileExecutionError::OpenFailed)
 }
 
 #[cfg(test)]
@@ -860,6 +867,31 @@ mod tests {
                 FilePathKind::Directory,
             ))
         );
+    }
+
+    #[test]
+    fn directory_shell_configuration_uses_authenticated_target_and_maps_failure() {
+        let mut identity = test_identity(r"Documents\Report", FilePathKind::Directory);
+        identity.display_path = r"C:\decoy\Report".into();
+        let target = joined_path(&identity.volume_guid_path, &identity.relative_path);
+
+        let result = open_directory_with(&target, |info: &mut SHELLEXECUTEINFOW| {
+            assert_eq!(
+                info.cbSize,
+                u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap()
+            );
+            assert!(info.lpVerb.is_null());
+            assert!(info.lpParameters.is_null());
+            assert!(info.lpDirectory.is_null());
+            assert_eq!(info.fMask, SEE_MASK_FLAG_NO_UI);
+            assert_eq!(info.nShow, SW_SHOWNORMAL.0);
+            assert_eq!(unsafe { info.lpFile.to_string() }.unwrap(), target);
+            Err(windows::core::Error::from_hresult(
+                windows::core::HRESULT::from_win32(5),
+            ))
+        });
+
+        assert_eq!(result, Err(FileExecutionError::OpenFailed));
     }
 
     #[test]
