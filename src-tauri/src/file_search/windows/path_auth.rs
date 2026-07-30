@@ -12,9 +12,10 @@ use windows::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
             FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_STANDARD_INFO, OPEN_EXISTING, VOLUME_NAME_GUID,
+            FILE_STANDARD_INFO, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS,
+            VOLUME_NAME_GUID,
         },
-        System::Com::CoTaskMemFree,
+        System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED},
         UI::{
             Shell::{
                 Common::ITEMIDLIST, ILClone, ILCreateFromPathW, ILFindLastID, ILRemoveLastID,
@@ -143,14 +144,14 @@ where
     I: FnMut(&str, FilePathKind, &H) -> Result<ComponentObservation, FileExecutionError>,
     S: FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
 {
-    let (handles, _) = walk_expected_components_and_observe_with(
+    let (handles, observation) = walk_expected_components_and_observe_with(
         identity,
         expected_filesystem_name,
         true,
         open,
         inspect,
     )?;
-    let path = joined_path(&identity.volume_guid_path, &identity.relative_path);
+    let path = observation.shell_path;
     execute_with_components(handles, || shell(&path, identity.kind))
 }
 
@@ -183,6 +184,7 @@ enum ExecutionShare {
 struct ComponentObservation {
     reparse: bool,
     kind: FilePathKind,
+    shell_path: String,
     volume_guid_path: String,
     volume_serial: u32,
     filesystem_name: String,
@@ -505,6 +507,7 @@ fn inspect_execution_component(
         } else {
             FilePathKind::File
         },
+        shell_path: final_shell_path(handle.0)?,
         volume_guid_path,
         volume_serial: serial,
         filesystem_name: from_nul_terminated(&filesystem)?.to_uppercase(),
@@ -519,8 +522,22 @@ fn inspect_execution_component(
 }
 
 fn final_path(handle: HANDLE) -> Result<String, FileExecutionError> {
+    final_path_with_flags(handle, VOLUME_NAME_GUID)
+}
+
+fn final_shell_path(handle: HANDLE) -> Result<String, FileExecutionError> {
+    let path = final_path_with_flags(handle, VOLUME_NAME_DOS)?;
+    path.strip_prefix(r"\\?\")
+        .map(str::to_owned)
+        .ok_or(FileExecutionError::OpenFailed)
+}
+
+fn final_path_with_flags(
+    handle: HANDLE,
+    flags: GETFINALPATHNAMEBYHANDLE_FLAGS,
+) -> Result<String, FileExecutionError> {
     let mut path = vec![0u16; 32_768];
-    let written = unsafe { GetFinalPathNameByHandleW(handle, &mut path, VOLUME_NAME_GUID) };
+    let written = unsafe { GetFinalPathNameByHandleW(handle, &mut path, flags) };
     let written = usize::try_from(written).map_err(|_| FileExecutionError::OpenFailed)?;
     if written == 0 || written >= path.len() {
         return Err(FileExecutionError::OpenFailed);
@@ -551,11 +568,29 @@ impl Drop for OwnedPidl {
     }
 }
 
+struct ComApartment;
+
+impl ComApartment {
+    fn initialize() -> Result<Self, FileExecutionError> {
+        if unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_err() {
+            Err(FileExecutionError::OpenFailed)
+        } else {
+            Ok(Self)
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
 fn execute_shell(
     path: &str,
     kind: FilePathKind,
 ) -> Result<FileExecutionOutcome, FileExecutionError> {
-    match kind {
+    execute_shell_with(path, kind, |path, kind| match kind {
         FilePathKind::File => {
             reveal_file(path)?;
             Ok(FileExecutionOutcome::FileRevealRequested)
@@ -564,7 +599,19 @@ fn execute_shell(
             open_directory(path)?;
             Ok(FileExecutionOutcome::FolderOpenRequested)
         }
-    }
+    })
+}
+
+fn execute_shell_with<S>(
+    path: &str,
+    kind: FilePathKind,
+    shell: S,
+) -> Result<FileExecutionOutcome, FileExecutionError>
+where
+    S: FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
+{
+    let _apartment = ComApartment::initialize()?;
+    shell(path, kind)
 }
 
 fn reveal_file(path: &str) -> Result<(), FileExecutionError> {
@@ -685,6 +732,7 @@ mod tests {
         ComponentObservation {
             reparse: false,
             kind,
+            shell_path: format!(r"C:\authenticated\{relative_path}"),
             volume_guid_path: r"\\?\VOLUME{PATH-AUTH}\".into(),
             volume_serial: 42,
             filesystem_name: "NTFS".into(),
@@ -815,16 +863,18 @@ mod tests {
     }
 
     #[test]
-    fn real_file_authentication_revalidates_before_injected_shell_dispatch() {
+    fn real_file_execution_uses_shell_compatible_path_from_revalidated_handle() {
         let tree = TempTree::new();
         let parent = tree.child("Documents");
         fs::create_dir(&parent).unwrap();
         let file = parent.join("Report.txt");
         fs::write(&file, b"report").unwrap();
         let snapshot = authenticate_test_path(&file, FilePathKind::File);
+        let mut identity = snapshot.identity.clone();
+        identity.display_path = tree.child("decoy.txt").to_string_lossy().into_owned();
         let shell_target = RefCell::new(None);
 
-        let outcome = execute_real_path_with_shell(&snapshot.identity, |path, kind| {
+        let outcome = execute_real_path_with_shell(&identity, |path, kind| {
             shell_target.replace(Some((path.to_owned(), kind)));
             Ok(FileExecutionOutcome::FileRevealRequested)
         })
@@ -834,25 +884,21 @@ mod tests {
         assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
         assert_eq!(
             shell_target.into_inner(),
-            Some((
-                joined_path(
-                    &snapshot.identity.volume_guid_path,
-                    &snapshot.identity.relative_path,
-                ),
-                FilePathKind::File,
-            ))
+            Some((file.to_string_lossy().into_owned(), FilePathKind::File))
         );
     }
 
     #[test]
-    fn real_directory_authentication_preserves_open_configuration() {
+    fn real_directory_execution_uses_shell_compatible_path_from_revalidated_handle() {
         let tree = TempTree::new();
         let directory = tree.child("Documents");
         fs::create_dir(&directory).unwrap();
         let snapshot = authenticate_test_path(&directory, FilePathKind::Directory);
+        let mut identity = snapshot.identity.clone();
+        identity.display_path = tree.child("decoy").to_string_lossy().into_owned();
         let shell_target = RefCell::new(None);
 
-        let outcome = execute_real_path_with_shell(&snapshot.identity, |path, kind| {
+        let outcome = execute_real_path_with_shell(&identity, |path, kind| {
             shell_target.replace(Some((path.to_owned(), kind)));
             Ok(FileExecutionOutcome::FolderOpenRequested)
         })
@@ -863,20 +909,38 @@ mod tests {
         assert_eq!(
             shell_target.into_inner(),
             Some((
-                joined_path(
-                    &snapshot.identity.volume_guid_path,
-                    &snapshot.identity.relative_path,
-                ),
+                directory.to_string_lossy().into_owned(),
                 FilePathKind::Directory,
             ))
         );
     }
 
     #[test]
-    fn directory_shell_configuration_uses_authenticated_target_and_maps_failure() {
-        let mut identity = test_identity(r"Documents\Report", FilePathKind::Directory);
-        identity.display_path = r"C:\decoy\Report".into();
-        let target = joined_path(&identity.volume_guid_path, &identity.relative_path);
+    fn shell_dispatch_initializes_sta_com_on_worker_thread() {
+        let outcome = std::thread::spawn(|| {
+            execute_shell_with("unused", FilePathKind::File, |_, kind| {
+                let nested = unsafe {
+                    windows::Win32::System::Com::CoInitializeEx(
+                        None,
+                        windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                    )
+                };
+                assert_eq!(nested.0, 1);
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+                assert_eq!(kind, FilePathKind::File);
+                Ok(FileExecutionOutcome::FileRevealRequested)
+            })
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
+    }
+
+    #[test]
+    fn directory_shell_configuration_uses_shell_target_and_maps_failure() {
+        let target = r"C:\authenticated\Documents\Report".to_owned();
 
         let result = open_directory_with(&target, |info: &mut SHELLEXECUTEINFOW| {
             assert_eq!(
@@ -1048,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_uses_authenticated_path_instead_of_display_path() {
+    fn execution_uses_final_observation_shell_path_instead_of_display_path() {
         let mut expected = test_identity(r"docs\report.pdf", FilePathKind::File);
         expected.display_path = r"C:\decoy\report.pdf".into();
         let shell_target = RefCell::new(None);
@@ -1068,7 +1132,7 @@ mod tests {
         assert_eq!(
             shell_target.into_inner(),
             Some((
-                r"\\?\Volume{PATH-AUTH}\docs\report.pdf".into(),
+                r"C:\authenticated\docs\report.pdf".into(),
                 FilePathKind::File,
             ))
         );

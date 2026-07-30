@@ -2927,14 +2927,7 @@ mod tests {
         assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
         assert_eq!(
             shell_target.into_inner(),
-            Some((
-                format!(
-                    "{}\\{}",
-                    volume.identity.volume_guid_path.trim_end_matches('\\'),
-                    action.relative_path
-                ),
-                FilePathKind::File,
-            ))
+            Some((file.to_string_lossy().into_owned(), FilePathKind::File))
         );
     }
 
@@ -2957,11 +2950,7 @@ mod tests {
         assert_eq!(
             shell_target.into_inner(),
             Some((
-                format!(
-                    "{}\\{}",
-                    volume.identity.volume_guid_path.trim_end_matches('\\'),
-                    action.relative_path
-                ),
+                directory.to_string_lossy().into_owned(),
                 FilePathKind::Directory,
             ))
         );
