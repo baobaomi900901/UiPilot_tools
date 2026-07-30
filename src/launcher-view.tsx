@@ -239,7 +239,8 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       event.preventDefault()
       core.setFilePreviewEnabled(!file.previewEnabled)
       return
-    }    if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
+    }
+    if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
     const isComposing = composing(event)
     if (event.key === 'Escape' && !isComposing) event.preventDefault()
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)

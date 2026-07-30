@@ -2504,6 +2504,20 @@ describe('file mode ownership', () => {
     await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(1))
   })
 
+  it('reports a building index without promising automatic result updates', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1', [], 'building'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('file-building'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find report', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file?.indexStatus).toBe('building'))
+    expect(core.getSnapshot().status).toBe('正在索引。')
+    expect(core.getSnapshot().status).not.toContain('持续更新')
+    core.destroy()
+  })
   it('starts no streaming or revision refresh timer', async () => {
     vi.useFakeTimers()
     try {

@@ -459,7 +459,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function fileStatusText(status: FileIndexStatus, hasResults = true): string {
-    if (status === 'building') return '正在索引，结果持续更新…'
+    if (status === 'building') return '正在索引。'
     if (status === 'partial') return '部分位置无法访问。'
     if (status === 'rebuilding') return '索引正在重建。'
     if (status === 'unavailable') return '搜索暂不可用。'
