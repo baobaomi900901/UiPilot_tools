@@ -1015,6 +1015,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "everything-ipc-spike"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4342,6 +4351,7 @@ dependencies = [
 name = "uipilot"
 version = "0.2.0"
 dependencies = [
+ "everything-ipc-spike",
  "icu_casemap",
  "rusqlite",
  "serde",

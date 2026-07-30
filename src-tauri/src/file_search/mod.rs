@@ -111,6 +111,7 @@ pub(crate) enum FileExecutionError {
     OpenFailed,
 }
 
+pub(crate) mod everything;
 pub(crate) mod windows;
 
 #[cfg(test)]

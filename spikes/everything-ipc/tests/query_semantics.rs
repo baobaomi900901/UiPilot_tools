@@ -1519,6 +1519,70 @@ fn create_semantic_tree(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     Ok(entries)
 }
 
+struct LiteralSyntaxCase {
+    literal: String,
+    expected_path: Option<PathBuf>,
+}
+
+fn create_literal_syntax_tree(root: &Path) -> io::Result<Vec<LiteralSyntaxCase>> {
+    let cases = [
+        ("uipilotlitgate-ascii", "uipilotlitgate-ascii.txt", true),
+        (
+            "uipilotlitgate-space name",
+            "uipilotlitgate-space name.txt",
+            true,
+        ),
+        (
+            "uipilotlitgate-中文资料",
+            "uipilotlitgate-中文资料.txt",
+            true,
+        ),
+        (
+            "uipilotlitgate-bang!name",
+            "uipilotlitgate-bang!name.txt",
+            true,
+        ),
+        (
+            "uipilotlitgate-pipe|decoy",
+            "uipilotlitgate-pipe.txt",
+            false,
+        ),
+        ("<uipilotlitgate-angle>", "uipilotlitgate-angle.txt", false),
+        (
+            "\"uipilotlitgate-quote phrase\"",
+            "uipilotlitgate-quote phrase.txt",
+            false,
+        ),
+        (
+            "uipilotlitgate-question?tail.txt",
+            "uipilotlitgate-questionXtail.txt",
+            false,
+        ),
+        (
+            "uipilotlitgate-star*tail*",
+            "uipilotlitgate-star-middle-tail.txt",
+            false,
+        ),
+        (
+            "uipilotlitgate-mixed 文档!2026",
+            "uipilotlitgate-mixed 文档!2026.txt",
+            true,
+        ),
+    ];
+
+    cases
+        .into_iter()
+        .map(|(literal, name, matches)| {
+            let path = root.join(name);
+            fs::write(&path, literal.as_bytes())?;
+            Ok(LiteralSyntaxCase {
+                literal: literal.to_owned(),
+                expected_path: matches.then_some(path),
+            })
+        })
+        .collect()
+}
+
 fn is_illegal_windows_component_character(character: char) -> bool {
     matches!(
         character,
@@ -1773,6 +1837,42 @@ fn vanished_query_entry_is_concurrent_mutation_but_relative_path_is_invalid_page
         canonical_ordinal(Path::new("relative-entry.dat")),
         Err(PaginationError::InvalidPage)
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "live gate: launches an isolated frozen Everything folder-index instance"]
+fn real_literal_entity_queries_match_plain_filenames() -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut harness = IsolatedEverything::prepare()?;
+    let entries = create_literal_syntax_tree(&harness.indexed_root)?;
+    harness.start(deadline)?;
+    harness.wait_for_exact_total("uipilotlitgate-", entries.len() as u32, deadline)?;
+
+    for entry in entries {
+        let encoded_entities = entry
+            .literal
+            .chars()
+            .map(|scalar| format!("#x{:X}:", u32::from(scalar)))
+            .collect::<String>();
+        let encoded = format!("nowildcards:{encoded_entities}");
+        let result = harness.query(&encoded, 0, 200, deadline)?;
+        let expected_total = if entry.expected_path.is_some() { 1 } else { 0 };
+        assert_eq!(result.total, expected_total, "literal {:?}", entry.literal);
+        assert_eq!(
+            canonical_path_set(
+                result
+                    .items
+                    .iter()
+                    .map(|item| PathBuf::from(&item.full_path))
+            )?,
+            canonical_path_set(entry.expected_path.into_iter())?,
+            "literal {:?}",
+            entry.literal
+        );
+    }
+
+    harness.shutdown()?;
     Ok(())
 }
 
