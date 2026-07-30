@@ -125,7 +125,10 @@ fn published_draft(
         FilePathKind::Directory => FileResultKind::Folder,
     };
     let full_path = snapshot.identity.display_path.clone();
-    let size_bytes = item.size_bytes.or(snapshot.size_bytes);
+    let size_bytes = match kind {
+        FileResultKind::File => item.size_bytes.or(snapshot.size_bytes),
+        FileResultKind::Folder => None,
+    };
     let modified_filetime = item.modified_filetime.unwrap_or(snapshot.modified_filetime);
     let modified_utc = filetime_to_rfc3339(modified_filetime)?;
 
@@ -461,6 +464,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.items[0].kind, FileResultKind::Folder);
+        assert_eq!(result.items[0].size_bytes, None);
         match &result.items[0].action {
             FileExecutionAction::Everything(action) => {
                 assert_eq!(action.identity().kind, FilePathKind::Directory);
