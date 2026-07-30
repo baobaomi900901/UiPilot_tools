@@ -13,7 +13,6 @@ use std::{
 use std::{sync::mpsc, thread};
 
 use icu_casemap::CaseMapper;
-use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
@@ -25,6 +24,8 @@ use crate::{
     lifecycle::{FileIndexPhase, LifecycleCoordinator},
     result_registry::{QueryDomain, ResultRegistry},
 };
+
+pub(crate) use crate::file_search::{FileIndexStatus, FileResultKind};
 
 mod store;
 mod windows_backend;
@@ -698,12 +699,8 @@ mod tests {
     }
 
     fn file_action() -> ResultAction {
-        ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
-            0,
-            1,
-            volume(),
-            "file.txt",
-            IndexedKind::File,
+        ResultAction::OpenFile(crate::file_search::FileExecutionAction::Indexed(
+            OpenIndexedPath::for_test(0, 1, volume(), "file.txt", IndexedKind::File),
         ))
     }
 
@@ -4101,6 +4098,14 @@ impl OpenIndexedPath {
     pub(crate) fn runtime_epoch(&self) -> u64 {
         self.runtime_epoch
     }
+
+    #[cfg(test)]
+    pub(crate) fn kind_for_test(&self) -> crate::file_search::FilePathKind {
+        match self.kind {
+            IndexedKind::File => crate::file_search::FilePathKind::File,
+            IndexedKind::Directory => crate::file_search::FilePathKind::Directory,
+        }
+    }
 }
 
 pub(crate) use crate::file_search::{FileExecutionError, FileExecutionOutcome};
@@ -4202,23 +4207,6 @@ struct IndexEntry {
     modified_utc_ms: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum FileIndexStatus {
-    Building,
-    Ready,
-    Partial,
-    Rebuilding,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum FileResultKind {
-    File,
-    Folder,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileResultDraft {
     pub(crate) action: OpenIndexedPath,
@@ -4227,27 +4215,6 @@ pub(crate) struct FileResultDraft {
     pub(crate) size_bytes: Option<u64>,
     pub(crate) modified_utc: String,
     pub(crate) full_path: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileResultItem {
-    pub(crate) result_id: String,
-    pub(crate) name: String,
-    pub(crate) kind: FileResultKind,
-    pub(crate) size_bytes: Option<String>,
-    pub(crate) modified_utc: String,
-    pub(crate) full_path: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileSearchResponse {
-    pub(crate) request_id: String,
-    pub(crate) index_revision: String,
-    pub(crate) total: String,
-    pub(crate) status: FileIndexStatus,
-    pub(crate) items: Vec<FileResultItem>,
 }
 
 pub(crate) struct FileSearchBatch {

@@ -7,14 +7,14 @@ use std::{
     },
 };
 
-use crate::{apps::ApplicationLaunchTarget, file_index::OpenIndexedPath};
+use crate::{apps::ApplicationLaunchTarget, file_search::FileExecutionAction};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
     LaunchApplication {
         app_id: String,
         target: ApplicationLaunchTarget,
     },
-    OpenIndexedPath(OpenIndexedPath),
+    OpenFile(FileExecutionAction),
     CopyText {
         plugin_id: String,
         generation: u64,
@@ -292,6 +292,10 @@ mod tests {
     use crate::{
         apps::ApplicationLaunchTarget,
         file_index::{IndexedKind, OpenIndexedPath, VolumeIdentity},
+        file_search::{
+            windows::path_auth::AuthenticatedPathIdentity, EverythingPathAction,
+            FileExecutionAction, FilePathKind, FileResultItem, FileResultKind, FileSearchResponse,
+        },
         model::{ResultItem, SearchResponse},
     };
 
@@ -320,13 +324,37 @@ mod tests {
     }
 
     fn file_action() -> ResultAction {
-        ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+        ResultAction::OpenFile(FileExecutionAction::Indexed(OpenIndexedPath::for_test(
             0,
             1,
             VolumeIdentity::for_test(r"\\?\Volume{REGISTRY}\", 1, "ntfs"),
             "file.txt",
             IndexedKind::File,
-        ))
+        )))
+    }
+
+    fn indexed_action_for_test() -> OpenIndexedPath {
+        OpenIndexedPath::for_test(
+            0,
+            1,
+            VolumeIdentity::for_test(r"\\?\Volume{REGISTRY}\", 1, "ntfs"),
+            "file.txt",
+            IndexedKind::File,
+        )
+    }
+
+    fn authenticated_identity_for_test(
+        relative_path: &str,
+        file_id: [u8; 16],
+    ) -> AuthenticatedPathIdentity {
+        AuthenticatedPathIdentity {
+            display_path: r"C:\Visible\report.pdf".into(),
+            volume_guid_path: r"\\?\Volume{EVERYTHING-SECRET}\".into(),
+            relative_path: relative_path.into(),
+            volume_serial: 42,
+            file_id,
+            kind: FilePathKind::File,
+        }
     }
 
     fn publish_app(
@@ -703,6 +731,87 @@ mod tests {
         assert!(!json.contains("executable"));
         assert!(!json.contains("family!private-calculator"));
         assert!(!json.contains("target"));
+    }
+
+    #[test]
+    fn registry_resolves_indexed_and_everything_actions_as_opaque_file_actions() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let token = registry.begin_query(QueryDomain::File, "inv-1", 1).unwrap();
+        let indexed = FileExecutionAction::Indexed(indexed_action_for_test());
+        let everything = FileExecutionAction::Everything(EverythingPathAction::for_test(
+            authenticated_identity_for_test(r"docs\report.pdf", [7; 16]),
+        ));
+
+        let response = registry
+            .publish_if_latest(
+                token,
+                vec![
+                    ("indexed", ResultAction::OpenFile(indexed.clone())),
+                    ("everything", ResultAction::OpenFile(everything.clone())),
+                ],
+                || true,
+                |request_id, items| (request_id, items),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[0].0),
+            Ok(ResultAction::OpenFile(indexed))
+        );
+        assert_eq!(
+            registry.resolve(&response.0, &response.1[1].0),
+            Ok(ResultAction::OpenFile(everything))
+        );
+    }
+
+    #[test]
+    fn file_search_response_serialization_omits_everything_identity() {
+        let registry = ResultRegistry::default();
+        registry.on_show("inv-1".into());
+        let token = registry.begin_query(QueryDomain::File, "inv-1", 1).unwrap();
+        let action = FileExecutionAction::Everything(EverythingPathAction::for_test(
+            authenticated_identity_for_test(r"docs\report.pdf", [7; 16]),
+        ));
+
+        let response = registry
+            .publish_if_latest(
+                token,
+                vec![("report", ResultAction::OpenFile(action))],
+                || true,
+                |request_id, items| FileSearchResponse {
+                    request_id,
+                    index_revision: "1".into(),
+                    total: "1".into(),
+                    status: crate::file_search::FileIndexStatus::Ready,
+                    items: items
+                        .into_iter()
+                        .map(|(result_id, _)| FileResultItem {
+                            result_id,
+                            name: "report.pdf".into(),
+                            kind: FileResultKind::File,
+                            size_bytes: None,
+                            modified_utc: "2026-07-30T00:00:00.000Z".into(),
+                            full_path: r"C:\Visible\report.pdf".into(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+
+        let json = serde_json::to_value(response).unwrap().to_string();
+        for private in [
+            "identity",
+            "volumeGuidPath",
+            "fileId",
+            r"\\?\Volume{EVERYTHING-SECRET}\",
+            r"docs\report.pdf",
+        ] {
+            assert!(
+                !json.contains(private),
+                "serialized response exposes {private}"
+            );
+        }
     }
 
     #[test]

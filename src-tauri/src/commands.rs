@@ -7,8 +7,11 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use crate::{
     apps::{self, AppCache, Application},
     file_index::{
-        fold_name, FileCategory, FileExecutionError, FileExecutionOutcome, FileIndex,
-        FileResultItem, FileSearchBatch, FileSearchResponse, FileSort, OpenIndexedPath, QuerySpec,
+        fold_name, FileCategory, FileIndex, FileSearchBatch, FileSort, OpenIndexedPath, QuerySpec,
+    },
+    file_search::{
+        windows::path_auth, FileExecutionAction, FileExecutionError, FileExecutionOutcome,
+        FileResultItem, FileSearchResponse,
     },
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
@@ -469,7 +472,7 @@ fn publish_file_search(
         .items
         .into_iter()
         .map(|item| {
-            let action = ResultAction::OpenIndexedPath(item.action.clone());
+            let action = ResultAction::OpenFile(FileExecutionAction::Indexed(item.action.clone()));
             (item, action)
         })
         .collect();
@@ -750,14 +753,20 @@ pub(crate) async fn execute_result(
         ClipboardExecution {
             resolve: |request_id: &str, result_id: &str| registry.resolve(request_id, result_id),
             execute: |action: &ResultAction| apps::execute_application(action).map_err(|_| ()),
-            execute_file: move |action| async move {
-                tauri::async_runtime::spawn_blocking(move || {
-                    worker_index
-                        .execute_indexed_path(action)
+            execute_file: move |action| {
+                let worker_index = Arc::clone(&worker_index);
+                async move {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        execute_file_action_with(
+                            action,
+                            |action| worker_index.execute_indexed_path(action),
+                            |action| path_auth::execute_authenticated_path(action.identity()),
+                        )
                         .map_err(map_file_execution_error)
-                })
-                .await
-                .map_err(|_| CommandError::file_open_failed())?
+                    })
+                    .await
+                    .map_err(|_| CommandError::file_open_failed())?
+                }
             },
             copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                 plugins.copy_text(plugin_id, generation, || {
@@ -787,7 +796,7 @@ async fn execute_result_with_clipboard<R, A, F, Fut, P, H, S>(
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
-    F: FnOnce(OpenIndexedPath) -> Fut,
+    F: FnOnce(FileExecutionAction) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     P: FnOnce(&str, u64, &str) -> Result<(), PluginCopyError>,
     H: FnOnce() -> Result<(), CommandError>,
@@ -839,6 +848,23 @@ fn map_file_execution_error(error: FileExecutionError) -> CommandError {
     }
 }
 
+fn execute_file_action_with<I, E>(
+    action: FileExecutionAction,
+    execute_indexed: I,
+    execute_everything: E,
+) -> Result<FileExecutionOutcome, FileExecutionError>
+where
+    I: FnOnce(OpenIndexedPath) -> Result<FileExecutionOutcome, FileExecutionError>,
+    E: FnOnce(
+        crate::file_search::EverythingPathAction,
+    ) -> Result<FileExecutionOutcome, FileExecutionError>,
+{
+    match action {
+        FileExecutionAction::Indexed(action) => execute_indexed(action),
+        FileExecutionAction::Everything(action) => execute_everything(action),
+    }
+}
+
 async fn execute_resolved_result_with<R, A, F, Fut, H, S>(
     ids: (&str, &str),
     resolve: R,
@@ -850,7 +876,7 @@ async fn execute_resolved_result_with<R, A, F, Fut, H, S>(
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
-    F: FnOnce(OpenIndexedPath) -> Fut,
+    F: FnOnce(FileExecutionAction) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     H: FnOnce() -> Result<(), CommandError>,
     S: FnOnce(&str) -> Result<(), ()>,
@@ -863,7 +889,7 @@ where
         ResultAction::LaunchApplication { .. } => {
             execute_application_result_with(&action, execute_application, clear_and_hide, increment)
         }
-        ResultAction::OpenIndexedPath(action) => {
+        ResultAction::OpenFile(action) => {
             let outcome = execute_file(action).await?;
             let response = match outcome {
                 FileExecutionOutcome::FileRevealRequested => ExecuteOutcome::FileRevealRequested,
@@ -895,7 +921,7 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
-    if matches!(action, ResultAction::OpenIndexedPath(_)) {
+    if matches!(action, ResultAction::OpenFile(_)) {
         return Err(CommandError::application_entry_unavailable());
     }
     if matches!(action, ResultAction::CopyText { .. }) {
@@ -1010,18 +1036,23 @@ mod tests {
     };
 
     use super::{
-        clear_and_hide_with, execute_resolved_result_with, execute_result_with, load_settings_core,
-        load_settings_ready_with, map_file_preview_worker_result, map_save_worker_result,
-        prepare_file_query, prepare_hotkey_save, prepare_settings_save, publish_file_search,
-        require_main_label, save_settings_core, save_settings_with, save_settings_worker_with,
-        search_apps_with, search_files_with, set_file_preview_preference_with, CommandError,
-        ExecuteOutcome, FilePreviewPreferenceUpdate, HotkeySettingsUpdate, UserSettingsUpdate,
+        clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
+        execute_result_with, load_settings_core, load_settings_ready_with,
+        map_file_preview_worker_result, map_save_worker_result, prepare_file_query,
+        prepare_hotkey_save, prepare_settings_save, publish_file_search, require_main_label,
+        save_settings_core, save_settings_with, save_settings_worker_with, search_apps_with,
+        search_files_with, set_file_preview_preference_with, CommandError, ExecuteOutcome,
+        FilePreviewPreferenceUpdate, HotkeySettingsUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
         file_index::{
             FileExecutionOutcome, FileIndex, FileIndexStatus, FileResultDraft, FileResultKind,
             FileSearchBatch, IndexedKind, OpenIndexedPath, VolumeIdentity,
+        },
+        file_search::{
+            windows::path_auth::AuthenticatedPathIdentity, EverythingPathAction,
+            FileExecutionAction, FilePathKind,
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
@@ -1094,6 +1125,17 @@ mod tests {
             relative_path,
             kind,
         )
+    }
+
+    fn everything_action_for_test() -> EverythingPathAction {
+        EverythingPathAction::for_test(AuthenticatedPathIdentity {
+            display_path: r"C:\Visible\report.pdf".into(),
+            volume_guid_path: r"\\?\Volume{COMMANDS}\".into(),
+            relative_path: r"docs\report.pdf".into(),
+            volume_serial: 42,
+            file_id: [7; 16],
+            kind: FilePathKind::File,
+        })
     }
 
     fn settings_store(dir: &TestDir) -> SettingsStore {
@@ -1333,18 +1375,14 @@ mod tests {
         assert_eq!(response.items.len(), 2);
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
-            Ok(ResultAction::OpenIndexedPath(file_action(
-                1,
-                "First.txt",
-                IndexedKind::File
+            Ok(ResultAction::OpenFile(FileExecutionAction::Indexed(
+                file_action(1, "First.txt", IndexedKind::File),
             )))
         );
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[1].result_id),
-            Ok(ResultAction::OpenIndexedPath(file_action(
-                2,
-                "Folder",
-                IndexedKind::Directory
+            Ok(ResultAction::OpenFile(FileExecutionAction::Indexed(
+                file_action(2, "Folder", IndexedKind::Directory),
             )))
         );
     }
@@ -1359,7 +1397,11 @@ mod tests {
                 old_token,
                 vec![(
                     (),
-                    ResultAction::OpenIndexedPath(file_action(3, "old.txt", IndexedKind::File)),
+                    ResultAction::OpenFile(FileExecutionAction::Indexed(file_action(
+                        3,
+                        "old.txt",
+                        IndexedKind::File,
+                    ))),
                 )],
                 || true,
                 |request_id, items| (request_id, items),
@@ -1601,10 +1643,8 @@ mod tests {
         let result = execute_result_with(
             ("request", "result"),
             |_, _| {
-                Ok(ResultAction::OpenIndexedPath(file_action(
-                    4,
-                    "blocked.txt",
-                    IndexedKind::File,
+                Ok(ResultAction::OpenFile(FileExecutionAction::Indexed(
+                    file_action(4, "blocked.txt", IndexedKind::File),
                 )))
             },
             |_| {
@@ -2130,7 +2170,7 @@ mod tests {
         }
 
         async fn no_file_execution(
-            _: OpenIndexedPath,
+            _: FileExecutionAction,
         ) -> Result<FileExecutionOutcome, CommandError> {
             unreachable!()
         }
@@ -2485,13 +2525,13 @@ mod tests {
     #[test]
     fn execute_result_preserves_application_branch_and_isolates_file_branch() {
         let volume = VolumeIdentity::for_test(r"\\?\Volume{EXECUTION}\", 41, "ntfs");
-        let file = ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+        let file = ResultAction::OpenFile(FileExecutionAction::Indexed(OpenIndexedPath::for_test(
             7,
             19,
             volume,
             r"docs\report.pdf",
             IndexedKind::File,
-        ));
+        )));
         let application_calls = Cell::new(0);
         let file_calls = Cell::new(0);
         let hide_calls = Cell::new(0);
@@ -2523,5 +2563,41 @@ mod tests {
         assert_eq!(file_calls.get(), 1);
         assert_eq!(hide_calls.get(), 1);
         assert_eq!(later_application_calls.get(), 0);
+    }
+
+    #[test]
+    fn execute_file_action_dispatches_each_backend_once() {
+        for (action, expected_backend) in [
+            (
+                FileExecutionAction::Indexed(file_action(1, "report.pdf", IndexedKind::File)),
+                "indexed",
+            ),
+            (
+                FileExecutionAction::Everything(everything_action_for_test()),
+                "everything",
+            ),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let outcome = execute_file_action_with(
+                action,
+                |action| {
+                    calls.borrow_mut().push(("indexed", action.kind_for_test()));
+                    Ok(FileExecutionOutcome::FileRevealRequested)
+                },
+                |action| {
+                    calls
+                        .borrow_mut()
+                        .push(("everything", action.kind_for_test()));
+                    Ok(FileExecutionOutcome::FileRevealRequested)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
+            assert_eq!(
+                calls.borrow().as_slice(),
+                [(expected_backend, FilePathKind::File)]
+            );
+        }
     }
 }
