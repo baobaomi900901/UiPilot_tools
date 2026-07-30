@@ -11,8 +11,8 @@ use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use super::windows::path_auth::{authenticate_path, AuthenticatedPathSnapshot};
 use super::{
-    EverythingPathAction, FileExecutionAction, FileExecutionError, FilePathKind, FileResultKind,
-    PublishedFileBatch, PublishedFileDraft,
+    EverythingPathAction, FileExecutionError, FilePathKind, FileResultKind, PublishedFileBatch,
+    PublishedFileDraft,
 };
 
 pub(crate) struct EverythingSearchState {
@@ -130,7 +130,7 @@ fn published_draft(
     let modified_utc = filetime_to_rfc3339(modified_filetime)?;
 
     Ok(PublishedFileDraft {
-        action: FileExecutionAction::Everything(EverythingPathAction::new(snapshot.identity)),
+        action: EverythingPathAction::new(snapshot.identity).into(),
         name: item.file_name,
         kind,
         size_bytes,

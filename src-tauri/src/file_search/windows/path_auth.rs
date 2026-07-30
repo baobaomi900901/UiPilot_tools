@@ -196,6 +196,7 @@ struct ComponentObservation {
     modified_filetime: u64,
 }
 
+#[cfg(test)]
 fn walk_expected_components_with<H, O, I>(
     expected: &AuthenticatedPathIdentity,
     open: O,
@@ -619,6 +620,12 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn component_walk_wrapper_is_test_only() {
+        let source = include_str!("path_auth.rs").replace("\r\n", "\n");
+        assert!(source.contains("#[cfg(test)]\nfn walk_expected_components_with<"));
+    }
 
     static NEXT_TEMP_TREE_ID: AtomicU64 = AtomicU64::new(0);
 

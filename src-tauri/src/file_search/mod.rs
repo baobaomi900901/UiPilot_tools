@@ -10,7 +10,6 @@ pub(crate) struct EverythingPathAction {
 }
 
 impl EverythingPathAction {
-    #[allow(dead_code)]
     pub(crate) fn new(identity: AuthenticatedPathIdentity) -> Self {
         Self { identity }
     }
@@ -33,8 +32,19 @@ impl EverythingPathAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FileExecutionAction {
     Indexed(OpenIndexedPath),
-    #[allow(dead_code)]
     Everything(EverythingPathAction),
+}
+
+impl From<OpenIndexedPath> for FileExecutionAction {
+    fn from(action: OpenIndexedPath) -> Self {
+        Self::Indexed(action)
+    }
+}
+
+impl From<EverythingPathAction> for FileExecutionAction {
+    fn from(action: EverythingPathAction) -> Self {
+        Self::Everything(action)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -43,7 +53,9 @@ pub(crate) enum FileIndexStatus {
     Building,
     Ready,
     Partial,
+    #[cfg(test)]
     Rebuilding,
+    #[cfg(test)]
     Unavailable,
 }
 

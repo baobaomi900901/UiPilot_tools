@@ -21,9 +21,11 @@ use windows::Win32::{
 };
 
 use super::{
-    FileIndexStatus, FileSort, IndexChangeBatch, IndexEntry, IndexedKind, OpenIndexedPath,
-    QuerySpec, VolumeIdentity, FOLD_ALGORITHM_ID,
+    FileIndexStatus, IndexChangeBatch, IndexEntry, IndexedKind, OpenIndexedPath, VolumeIdentity,
+    FOLD_ALGORITHM_ID,
 };
+#[cfg(test)]
+use super::{FileSort, QuerySpec};
 
 const APPLICATION_ID: i64 = 1_430_868_038;
 const USER_VERSION: i64 = 1;
@@ -226,6 +228,7 @@ fn register_collation(
     Ok(invalid)
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QueryStrategy {
     Empty,
@@ -233,6 +236,7 @@ pub(super) enum QueryStrategy {
     Trigram,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StoredEntry {
     pub(super) row_id: i64,
@@ -245,6 +249,7 @@ pub(super) struct StoredEntry {
     pub(super) modified_utc: String,
 }
 
+#[cfg(test)]
 pub(super) struct StoreQueryResult {
     pub(super) index_revision: u64,
     pub(super) total: u64,
@@ -263,6 +268,7 @@ pub(super) struct PriorIntegrityMetadata {
 
 pub(super) struct Store {
     connection: Connection,
+    #[cfg(test)]
     invalid_collations: [Arc<AtomicBool>; 2],
     prior_integrity: PriorIntegrityMetadata,
     #[cfg(test)]
@@ -270,6 +276,7 @@ pub(super) struct Store {
 }
 
 impl Store {
+    #[cfg(test)]
     pub(super) fn open(path: &Path, ordinal_identity: &str) -> Result<Self, StoreError> {
         Self::open_authorized(path, ordinal_identity, || true)
     }
@@ -311,10 +318,16 @@ impl Store {
         if !authorize() {
             return Err(StoreError::InvalidData);
         }
+        #[cfg(test)]
         let invalid_collations = [
             register_collation(&connection, "uipilot_name_ordinal_ci", true)?,
             register_collation(&connection, "uipilot_path_ordinal_cs", false)?,
         ];
+        #[cfg(not(test))]
+        {
+            register_collation(&connection, "uipilot_name_ordinal_ci", true)?;
+            register_collation(&connection, "uipilot_path_ordinal_cs", false)?;
+        }
         let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let created_schema = page_count == 0;
         if created_schema {
@@ -353,6 +366,7 @@ impl Store {
         transaction.commit()?;
         Ok(Self {
             connection,
+            #[cfg(test)]
             invalid_collations,
             prior_integrity: PriorIntegrityMetadata {
                 clean_close,
@@ -364,6 +378,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn ensure_sort_identity(
         &mut self,
         ordinal_identity: &str,
@@ -395,6 +410,7 @@ impl Store {
         Ok(Some((previous, revision)))
     }
 
+    #[cfg(test)]
     pub(super) fn index_revision(&self) -> Result<u64, StoreError> {
         let value: String = self.connection.query_row(
             "SELECT index_revision FROM metadata WHERE singleton=1",
@@ -404,6 +420,7 @@ impl Store {
         parse_canonical_u64(&value)
     }
 
+    #[cfg(test)]
     pub(super) fn persist_index_revision(&mut self, revision: u64) -> Result<(), StoreError> {
         self.persist_index_revision_authorized(revision, || true)
     }
@@ -441,6 +458,7 @@ impl Store {
         self.prior_integrity.clone()
     }
 
+    #[cfg(test)]
     pub(super) fn integrity_check_due(&self, now_utc: &str) -> Result<bool, StoreError> {
         let old_or_missing = match self.prior_integrity.last_integrity_check_utc.as_deref() {
             None => true,
@@ -455,6 +473,7 @@ impl Store {
             || old_or_missing)
     }
 
+    #[cfg(test)]
     pub(super) fn integrity_check_due_now(&self) -> Result<bool, StoreError> {
         let now = self.connection.query_row(
             "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')",
@@ -545,6 +564,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn recover_candidates(&mut self) -> Result<Option<u64>, StoreError> {
         let transaction = self.connection.transaction()?;
         let pending: i64 = transaction.query_row(
@@ -1125,6 +1145,7 @@ impl Store {
         Ok(revision)
     }
 
+    #[cfg(test)]
     pub(super) fn query(
         &mut self,
         spec: &QuerySpec,
@@ -1185,6 +1206,7 @@ impl Store {
         Ok(matches == 1)
     }
 
+    #[cfg(test)]
     fn query_with_hook<F>(
         &mut self,
         spec: &QuerySpec,
@@ -1356,6 +1378,7 @@ fn parse_canonical_u64(value: &str) -> Result<u64, StoreError> {
     value.parse().map_err(|_| StoreError::InvalidData)
 }
 
+#[cfg(test)]
 fn parse_canonical_u64_sql(value: &str) -> Result<u64, rusqlite::Error> {
     parse_canonical_u64(value).map_err(|_| rusqlite::Error::InvalidQuery)
 }
@@ -1854,6 +1877,7 @@ fn read_status(
     )
 }
 
+#[cfg(test)]
 fn query_parts(
     spec: &QuerySpec,
     identities: &[VolumeIdentity],

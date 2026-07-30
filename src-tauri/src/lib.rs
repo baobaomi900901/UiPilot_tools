@@ -64,25 +64,6 @@ fn lifecycle_setup_error() -> std::io::Error {
 }
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
-fn retain_legacy_file_search_linkage() {
-    let _search = file_index::FileIndex::search;
-    let _authorizes_publication = file_index::FileIndex::authorizes_publication;
-    let _parse_category = file_index::FileCategory::parse;
-    let _parse_sort = file_index::FileSort::parse;
-    let _indexed_action = file_search::FileExecutionAction::Indexed;
-    let _batch_fields = |batch: &file_index::FileSearchBatch| {
-        (
-            batch.runtime_epoch,
-            batch.publication_generation,
-            batch.index_revision,
-            batch.total,
-            batch.status,
-            batch.items.len(),
-        )
-    };
-}
-
-#[cfg(any(test, not(feature = "test-instrumentation")))]
 fn setup_production_lifecycle(
     app: &mut tauri::App,
     app_cache: &Arc<apps::AppCache>,
@@ -177,9 +158,6 @@ fn setup_production_lifecycle(
 }
 
 pub fn run() {
-    #[cfg(any(test, not(feature = "test-instrumentation")))]
-    retain_legacy_file_search_linkage();
-
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let app_cache = Arc::new(apps::AppCache::new());
 
@@ -748,6 +726,8 @@ mod tests {
         let file_index = include_str!("file_index/mod.rs").replace("\r\n", "\n");
         let file_store = include_str!("file_index/store.rs").replace("\r\n", "\n");
         let file_windows = include_str!("file_index/windows_backend.rs").replace("\r\n", "\n");
+        let file_search = include_str!("file_search/mod.rs").replace("\r\n", "\n");
+        let path_auth = include_str!("file_search/windows/path_auth.rs").replace("\r\n", "\n");
         let file_windows_production = file_windows
             .split("\n#[cfg(test)]\nmod tests")
             .next()
@@ -786,6 +766,8 @@ mod tests {
             ("file_index/mod.rs", file_index.as_str()),
             ("file_index/store.rs", file_store.as_str()),
             ("file_index/windows_backend.rs", file_windows_production),
+            ("file_search/mod.rs", file_search.as_str()),
+            ("file_search/windows/path_auth.rs", path_auth.as_str()),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
             ("settings.rs", include_str!("settings.rs")),
@@ -924,6 +906,12 @@ mod lib {
                 .next()
                 .expect("test module marker is missing");
 
+            assert!(!production.contains("retain_legacy_file_search_linkage"));
+            assert!(!production.contains("FileIndex::search"));
+            for forbidden in ["#[allow(dead_code)]", "#[expect(dead_code)]"] {
+                assert!(!production.contains(forbidden));
+                assert!(!include_str!("file_search/windows/path_auth.rs").contains(forbidden));
+            }
             assert_eq!(
                 production
                     .matches("let file_index = Arc::new(file_index::FileIndex::new(")
