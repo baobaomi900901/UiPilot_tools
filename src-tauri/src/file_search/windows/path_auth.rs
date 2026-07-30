@@ -50,6 +50,7 @@ pub(crate) struct AuthenticatedPathSnapshot {
     pub(crate) modified_filetime: u64,
 }
 
+#[cfg(test)]
 pub(crate) struct LegacyPathExpectation<'a> {
     pub(crate) volume_guid_path: &'a str,
     pub(crate) volume_serial: u32,
@@ -153,12 +154,7 @@ where
     execute_with_components(handles, || shell(&path, identity.kind))
 }
 
-pub(crate) fn execute_legacy_indexed_path(
-    expectation: LegacyPathExpectation<'_>,
-) -> Result<FileExecutionOutcome, FileExecutionError> {
-    execute_legacy_indexed_path_with_shell(expectation, execute_shell)
-}
-
+#[cfg(test)]
 pub(crate) fn execute_legacy_indexed_path_with_shell<S>(
     expectation: LegacyPathExpectation<'_>,
     shell: S,

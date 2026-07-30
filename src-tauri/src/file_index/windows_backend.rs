@@ -46,10 +46,10 @@ use windows::Win32::{
     },
 };
 
-use super::{
-    fold_name, FileExecutionOutcome, IndexChangeBatch, IndexEntry, IndexedKind, OpenIndexedPath,
-    VolumeIdentity,
-};
+use super::{fold_name, IndexChangeBatch, IndexEntry, IndexedKind, VolumeIdentity};
+#[cfg(test)]
+use super::{FileExecutionOutcome, OpenIndexedPath};
+#[cfg(test)]
 use crate::file_search::{
     windows::path_auth::{self, LegacyPathExpectation},
     FileExecutionError, FilePathKind,
@@ -235,14 +235,7 @@ fn open_pinned_with_policy(
     Ok((handle, tag))
 }
 
-pub(super) fn execute_indexed_path(
-    volume: &FixedVolume,
-    action: &OpenIndexedPath,
-) -> Result<FileExecutionOutcome, BackendError> {
-    path_auth::execute_legacy_indexed_path(legacy_path_expectation(volume, action))
-        .map_err(map_shared_execution_error)
-}
-
+#[cfg(test)]
 fn legacy_path_expectation<'a>(
     volume: &'a FixedVolume,
     action: &'a OpenIndexedPath,
@@ -275,6 +268,7 @@ where
     .map_err(map_shared_execution_error)
 }
 
+#[cfg(test)]
 fn map_shared_execution_error(error: FileExecutionError) -> BackendError {
     match error {
         FileExecutionError::NotFound => BackendError::Missing,
@@ -1098,6 +1092,7 @@ pub(super) fn reauthenticate_volume_with(
     Ok(())
 }
 
+#[cfg(not(test))]
 pub(super) fn reauthenticate_volume(volume: &FixedVolume) -> Result<(), BackendError> {
     let mount = volume
         .mount_point

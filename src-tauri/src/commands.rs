@@ -6,7 +6,6 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::{
     apps::{self, AppCache, Application},
-    file_index::{FileIndex, OpenIndexedPath},
     file_search::{
         everything::{EverythingSearchError, EverythingSearchState},
         windows::path_auth,
@@ -728,30 +727,22 @@ pub(crate) async fn execute_result(
     require_main_window(&window)?;
     let app = window.app_handle().clone();
     let registry = app.state::<ResultRegistry>();
-    let file_index = app.state::<Arc<FileIndex>>();
     let plugins = app.state::<Arc<PluginManager>>();
     let settings = app.state::<SettingsStore>();
     let cache = app.state::<Arc<AppCache>>();
-    let worker_index = Arc::clone(file_index.inner());
     execute_result_with_clipboard(
         (&request_id, &result_id),
         ClipboardExecution {
             resolve: |request_id: &str, result_id: &str| registry.resolve(request_id, result_id),
             execute: |action: &ResultAction| apps::execute_application(action).map_err(|_| ()),
-            execute_file: move |action| {
-                let worker_index = Arc::clone(&worker_index);
-                async move {
-                    tauri::async_runtime::spawn_blocking(move || {
-                        execute_file_action_with(
-                            action,
-                            |action| worker_index.execute_indexed_path(action),
-                            |action| path_auth::execute_authenticated_path(action.identity()),
-                        )
+            execute_file: |action: FileExecutionAction| async move {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let action = action.into_everything();
+                    path_auth::execute_authenticated_path(action.identity())
                         .map_err(map_file_execution_error)
-                    })
-                    .await
-                    .map_err(|_| CommandError::file_open_failed())?
-                }
+                })
+                .await
+                .map_err(|_| CommandError::file_open_failed())?
             },
             copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                 plugins.copy_text(plugin_id, generation, || {
@@ -826,6 +817,7 @@ where
 
 fn map_file_execution_error(error: FileExecutionError) -> CommandError {
     match error {
+        #[cfg(test)]
         FileExecutionError::SearchUnavailable => CommandError::search_unavailable(),
         FileExecutionError::Stale => CommandError::stale_request(),
         FileExecutionError::NotFound => CommandError::file_not_found(),
@@ -833,13 +825,16 @@ fn map_file_execution_error(error: FileExecutionError) -> CommandError {
     }
 }
 
+#[cfg(test)]
 fn execute_file_action_with<I, E>(
     action: FileExecutionAction,
     execute_indexed: I,
     execute_everything: E,
 ) -> Result<FileExecutionOutcome, FileExecutionError>
 where
-    I: FnOnce(OpenIndexedPath) -> Result<FileExecutionOutcome, FileExecutionError>,
+    I: FnOnce(
+        crate::file_index::OpenIndexedPath,
+    ) -> Result<FileExecutionOutcome, FileExecutionError>,
     E: FnOnce(
         crate::file_search::EverythingPathAction,
     ) -> Result<FileExecutionOutcome, FileExecutionError>,
@@ -2575,6 +2570,32 @@ mod tests {
             assert_eq!(
                 calls.borrow().as_slice(),
                 [(expected_backend, FilePathKind::File)]
+            );
+        }
+    }
+    #[test]
+    fn production_execute_result_dispatches_only_authenticated_everything_actions() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let start = production
+            .find("pub(crate) async fn execute_result(")
+            .expect("execute_result command is missing");
+        let command = &production[start..production.find("struct ClipboardExecution").unwrap()];
+
+        assert!(command.contains("let action = action.into_everything();"));
+        assert!(command.contains("path_auth::execute_authenticated_path(action.identity())"));
+        for forbidden in [
+            "state::<Arc<FileIndex>>",
+            "execute_file_action_with",
+            "execute_indexed_path",
+            "FileExecutionAction::Indexed",
+        ] {
+            assert!(
+                !command.contains(forbidden),
+                "unexpected production dispatch: {forbidden}"
             );
         }
     }

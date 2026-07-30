@@ -21,8 +21,7 @@ use windows::Win32::{
 };
 
 use super::{
-    FileIndexStatus, IndexChangeBatch, IndexEntry, IndexedKind, OpenIndexedPath, VolumeIdentity,
-    FOLD_ALGORITHM_ID,
+    FileIndexStatus, IndexChangeBatch, IndexEntry, IndexedKind, VolumeIdentity, FOLD_ALGORITHM_ID,
 };
 #[cfg(test)]
 use super::{FileSort, QuerySpec};
@@ -1152,58 +1151,6 @@ impl Store {
         identities: &[VolumeIdentity],
     ) -> Result<StoreQueryResult, StoreError> {
         self.query_with_hook(spec, identities, || {})
-    }
-
-    pub(super) fn execution_row_matches(
-        &mut self,
-        action: &OpenIndexedPath,
-    ) -> Result<bool, StoreError> {
-        let transaction = self.connection.transaction()?;
-        let kind = match action.kind {
-            IndexedKind::File => "file",
-            IndexedKind::Directory => "directory",
-        };
-        let matches: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM (
-                SELECT e.row_id,e.volume_guid_path,e.volume_serial,e.filesystem_name,e.relative_path,e.kind
-                FROM entries e JOIN volumes v
-                  ON v.volume_guid_path=e.volume_guid_path
-                 AND v.volume_serial=e.volume_serial
-                 AND v.filesystem_name=e.filesystem_name
-                WHERE v.committed_generation IS NOT NULL
-                  AND NOT EXISTS (
-                    SELECT 1 FROM candidate_entries c
-                    WHERE c.volume_guid_path=e.volume_guid_path
-                      AND c.volume_serial=e.volume_serial
-                      AND c.filesystem_name=e.filesystem_name
-                      AND c.relative_path=e.relative_path COLLATE BINARY
-                  )
-                UNION ALL
-                SELECT c.row_id,c.volume_guid_path,c.volume_serial,c.filesystem_name,c.relative_path,c.kind
-                FROM candidate_entries c JOIN volumes v
-                  ON v.volume_guid_path=c.volume_guid_path
-                 AND v.volume_serial=c.volume_serial
-                 AND v.filesystem_name=c.filesystem_name
-                WHERE v.candidate_generation IS NOT NULL
-             ) visible
-             WHERE row_id=?1
-               AND volume_guid_path=?2 COLLATE BINARY
-               AND volume_serial=?3
-               AND filesystem_name=?4 COLLATE BINARY
-               AND relative_path=?5 COLLATE BINARY
-               AND kind=?6 COLLATE BINARY",
-            params![
-                action.row_id,
-                action.volume_identity.volume_guid_path,
-                action.volume_identity.volume_serial,
-                action.volume_identity.filesystem_name,
-                action.relative_path,
-                kind,
-            ],
-            |row| row.get(0),
-        )?;
-        transaction.commit()?;
-        Ok(matches == 1)
     }
 
     #[cfg(test)]

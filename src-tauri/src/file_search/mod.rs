@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+#[cfg(test)]
 use crate::file_index::OpenIndexedPath;
 
 use self::windows::path_auth::AuthenticatedPathIdentity;
@@ -31,16 +32,20 @@ impl EverythingPathAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FileExecutionAction {
+    #[cfg(test)]
     Indexed(OpenIndexedPath),
     Everything(EverythingPathAction),
 }
 
-impl From<OpenIndexedPath> for FileExecutionAction {
-    fn from(action: OpenIndexedPath) -> Self {
-        Self::Indexed(action)
+impl FileExecutionAction {
+    pub(crate) fn into_everything(self) -> EverythingPathAction {
+        match self {
+            Self::Everything(action) => action,
+            #[cfg(test)]
+            Self::Indexed(_) => panic!("indexed actions are test-only"),
+        }
     }
 }
-
 impl From<EverythingPathAction> for FileExecutionAction {
     fn from(action: EverythingPathAction) -> Self {
         Self::Everything(action)
@@ -117,6 +122,7 @@ pub(crate) enum FileExecutionOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileExecutionError {
+    #[cfg(test)]
     SearchUnavailable,
     Stale,
     NotFound,
@@ -166,5 +172,13 @@ mod tests {
         assert_eq!(draft.size_bytes, Some(123));
         assert_eq!(draft.modified_utc, "2026-07-30T00:00:00.000Z");
         assert_eq!(draft.full_path, r"C:\Visible\report.pdf");
+    }
+    #[test]
+    fn indexed_action_is_test_only_without_a_synthetic_conversion() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+
+        assert!(source.contains("#[cfg(test)]\n    Indexed(OpenIndexedPath),"));
+        let conversion = ["impl From<", "OpenIndexedPath> for FileExecutionAction"].concat();
+        assert!(!source.contains(&conversion));
     }
 }

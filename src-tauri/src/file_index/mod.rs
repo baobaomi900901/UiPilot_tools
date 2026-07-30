@@ -36,11 +36,13 @@ mod windows_backend;
 use store::StoreQueryResult;
 use store::{ordinal_sort_identity, Store, StoreError};
 #[cfg(not(test))]
+use windows_backend::BackendError;
+#[cfg(not(test))]
 use windows_backend::{
     filter_replay_events, fixed_volumes, materialize_events, scan_volume, system_exclusions,
     ScanSummary, Watcher,
 };
-use windows_backend::{BackendError, EventBuffer, ExcludedPrefix, FixedVolume};
+use windows_backend::{EventBuffer, ExcludedPrefix, FixedVolume};
 
 pub(crate) const FOLD_ALGORITHM_ID: &str = "uipilot-unicode-15.1-full-fold-nfc-v1";
 
@@ -711,9 +713,9 @@ mod tests {
     }
 
     fn file_action() -> ResultAction {
-        ResultAction::OpenFile(
-            OpenIndexedPath::for_test(0, 1, volume(), "file.txt", IndexedKind::File).into(),
-        )
+        ResultAction::OpenFile(crate::file_search::FileExecutionAction::Indexed(
+            OpenIndexedPath::for_test(0, 1, volume(), "file.txt", IndexedKind::File),
+        ))
     }
 
     #[test]
@@ -4080,6 +4082,7 @@ pub(crate) enum IndexedKind {
     Directory,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpenIndexedPath {
     runtime_epoch: u64,
@@ -4089,6 +4092,7 @@ pub(crate) struct OpenIndexedPath {
     kind: IndexedKind,
 }
 
+#[cfg(test)]
 impl OpenIndexedPath {
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -4120,7 +4124,8 @@ impl OpenIndexedPath {
     }
 }
 
-pub(crate) use crate::file_search::{FileExecutionError, FileExecutionOutcome};
+#[cfg(test)]
+pub(crate) use crate::file_search::FileExecutionOutcome;
 
 impl VolumeIdentity {
     #[cfg(test)]
@@ -4290,6 +4295,7 @@ enum AdmissionKind {
     #[cfg(test)]
     LazyInit,
     DbWork,
+    #[cfg(test)]
     Execution,
 }
 
@@ -4557,6 +4563,7 @@ struct DbWorkReservation {
     released: bool,
 }
 
+#[cfg(test)]
 pub(crate) struct FileExecutionReservation {
     state: Arc<Mutex<IndexState>>,
     coordinator: Arc<CoordinatorControl>,
@@ -4564,6 +4571,7 @@ pub(crate) struct FileExecutionReservation {
     released: bool,
 }
 
+#[cfg(test)]
 impl FileExecutionReservation {
     #[cfg(test)]
     fn runtime_epoch(&self) -> u64 {
@@ -4636,6 +4644,7 @@ impl Drop for DbWorkReservation {
     }
 }
 
+#[cfg(test)]
 impl Drop for FileExecutionReservation {
     fn drop(&mut self) {
         if self.released {
@@ -5015,68 +5024,6 @@ impl FileIndex {
         self.publication_runtime_epoch.load(Ordering::Acquire)
     }
 
-    pub(crate) fn execute_indexed_path(
-        self: &Arc<Self>,
-        action: OpenIndexedPath,
-    ) -> Result<FileExecutionOutcome, FileExecutionError> {
-        let reservation = self
-            .reserve_execution(action.runtime_epoch())
-            .map_err(|_| FileExecutionError::SearchUnavailable)?;
-        let (volume, row_match) = {
-            let mut state = self.state.lock().expect("file index lock poisoned");
-            let mount = state
-                .authenticated_mounts
-                .iter()
-                .find(|(identity, _)| identity == &action.volume_identity)
-                .map(|(_, mount)| mount.clone())
-                .ok_or(FileExecutionError::Stale)?;
-            let result = state
-                .store
-                .as_mut()
-                .ok_or(FileExecutionError::SearchUnavailable)?
-                .execution_row_matches(&action);
-            (
-                FixedVolume {
-                    identity: action.volume_identity.clone(),
-                    mount_point: PathBuf::from(mount),
-                },
-                result,
-            )
-        };
-        let row_match = match row_match {
-            Ok(row_match) => row_match,
-            Err(StoreError::Corrupt) => {
-                let _ = self.request_recovery_from_execution(&reservation);
-                return Err(FileExecutionError::SearchUnavailable);
-            }
-            Err(
-                StoreError::Sqlite
-                | StoreError::InvalidData
-                | StoreError::Platform
-                | StoreError::RevisionExhausted,
-            ) => return Err(FileExecutionError::SearchUnavailable),
-        };
-        if !row_match {
-            return Err(FileExecutionError::Stale);
-        }
-        windows_backend::reauthenticate_volume(&volume).map_err(|error| match error {
-            BackendError::Missing => FileExecutionError::NotFound,
-            BackendError::InvalidData => FileExecutionError::Stale,
-            BackendError::Platform
-            | BackendError::Denied
-            | BackendError::Overflow
-            | BackendError::Stopped => FileExecutionError::OpenFailed,
-        })?;
-        windows_backend::execute_indexed_path(&volume, &action).map_err(|error| match error {
-            BackendError::Missing => FileExecutionError::NotFound,
-            BackendError::InvalidData => FileExecutionError::Stale,
-            BackendError::Platform
-            | BackendError::Denied
-            | BackendError::Overflow
-            | BackendError::Stopped => FileExecutionError::OpenFailed,
-        })
-    }
-
     fn admit_locked(
         &self,
         state: &IndexState,
@@ -5107,6 +5054,7 @@ impl FileIndex {
             {
                 Ok(())
             }
+            #[cfg(test)]
             AdmissionKind::Execution
                 if state.mode == LifecycleMode::Active && state.admission_open =>
             {
@@ -5114,10 +5062,13 @@ impl FileIndex {
             }
             #[cfg(test)]
             AdmissionKind::LazyInit => Err(AdmissionError::WrongMode),
-            AdmissionKind::DbWork | AdmissionKind::Execution => Err(AdmissionError::WrongMode),
+            AdmissionKind::DbWork => Err(AdmissionError::WrongMode),
+            #[cfg(test)]
+            AdmissionKind::Execution => Err(AdmissionError::WrongMode),
         }
     }
 
+    #[cfg(test)]
     fn reserve_execution(
         &self,
         expected_runtime_epoch: u64,
@@ -5440,23 +5391,6 @@ impl FileIndex {
         let won = self.transition_recovery(reporter, || {
             self.registry.invalidate_domain(QueryDomain::File)
         });
-        if won {
-            self.ensure_coordinator_thread();
-            self.coordinator.signal.notify_all();
-        }
-        won
-    }
-
-    fn request_recovery_from_execution(
-        self: &Arc<Self>,
-        reporter: &FileExecutionReservation,
-    ) -> bool {
-        let won = self.transition_recovery_with(
-            &reporter.state,
-            reporter.runtime_epoch,
-            AdmissionKind::Execution,
-            || self.registry.invalidate_domain(QueryDomain::File),
-        );
         if won {
             self.ensure_coordinator_thread();
             self.coordinator.signal.notify_all();
