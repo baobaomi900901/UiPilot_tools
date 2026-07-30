@@ -164,6 +164,9 @@ fn filetime_to_rfc3339(filetime: u64) -> Result<String, EverythingSearchError> {
     let mut system_time = SYSTEMTIME::default();
     unsafe { FileTimeToSystemTime(&filetime, &mut system_time) }
         .map_err(|_| EverythingSearchError::Unavailable)?;
+    if system_time.wYear > 9_999 {
+        return Err(EverythingSearchError::Unavailable);
+    }
 
     Ok(format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
@@ -243,18 +246,26 @@ mod tests {
         EverythingQueryResult, EverythingQuerySpec, EverythingResultItem, EverythingSort,
         ProtocolError,
     };
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::SystemTimeToFileTime;
 
     use super::super::windows::path_auth::{AuthenticatedPathIdentity, AuthenticatedPathSnapshot};
     use super::super::{FileExecutionAction, FileExecutionError, FilePathKind, FileResultKind};
     use super::{
-        encode_literal_query, file_path_kind_for_attributes, query_cached_with, run_search_with,
-        EverythingSearchError, EverythingSearchState,
+        encode_literal_query, file_path_kind_for_attributes, filetime_to_rfc3339,
+        query_cached_with, run_search_with, EverythingSearchError, EverythingSearchState,
     };
 
     const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
 
     fn literal_text(query: &str) -> String {
         String::from_utf16(&encode_literal_query(query)).unwrap()
+    }
+
+    fn filetime_for_test(system_time: SYSTEMTIME) -> u64 {
+        let mut filetime = FILETIME::default();
+        unsafe { SystemTimeToFileTime(&system_time, &mut filetime) }.unwrap();
+        (u64::from(filetime.dwHighDateTime) << 32) | u64::from(filetime.dwLowDateTime)
     }
 
     fn query_item_for_test(index: usize) -> EverythingResultItem {
@@ -505,6 +516,65 @@ mod tests {
         assert_eq!(result.items[1].size_bytes, Some(123));
         assert_eq!(result.items[1].modified_utc, "1970-01-01T00:00:00.789Z");
         assert_eq!(result.items[1].full_path, r"C:\authenticated\modified.txt");
+    }
+
+    #[test]
+    fn rfc3339_accepts_latest_four_digit_year() {
+        let filetime = filetime_for_test(SYSTEMTIME {
+            wYear: 9_999,
+            wMonth: 12,
+            wDay: 31,
+            wHour: 23,
+            wMinute: 59,
+            wSecond: 59,
+            wMilliseconds: 999,
+            ..SYSTEMTIME::default()
+        });
+
+        assert_eq!(
+            filetime_to_rfc3339(filetime),
+            Ok("9999-12-31T23:59:59.999Z".into())
+        );
+    }
+
+    #[test]
+    fn rfc3339_rejects_year_beyond_four_digits() {
+        let filetime = filetime_for_test(SYSTEMTIME {
+            wYear: 10_000,
+            wMonth: 1,
+            wDay: 1,
+            ..SYSTEMTIME::default()
+        });
+
+        assert_eq!(
+            filetime_to_rfc3339(filetime),
+            Err(EverythingSearchError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn out_of_range_modified_year_fails_batch_without_allocating_revision() {
+        let revision = AtomicU64::new(23);
+        let filetime = filetime_for_test(SYSTEMTIME {
+            wYear: 10_000,
+            wMonth: 1,
+            wDay: 1,
+            ..SYSTEMTIME::default()
+        });
+
+        let result = run_search_with(
+            "x",
+            &revision,
+            |_| {
+                let mut query_result = query_result_for_test(1);
+                query_result.items[0].modified_filetime = Some(filetime);
+                Ok(query_result)
+            },
+            authenticate_item_for_test,
+        );
+
+        assert_eq!(result, Err(EverythingSearchError::Unavailable));
+        assert_eq!(revision.load(Ordering::Acquire), 23);
     }
 
     #[test]

@@ -1563,6 +1563,9 @@ fn create_literal_syntax_tree(root: &Path) -> io::Result<Vec<LiteralSyntaxCase>>
             "uipilotlitgate-star-middle-tail.txt",
             false,
         ),
+        ("ext:txt", "uipilotlitgate-macro-extension.txt", false),
+        ("regex:.*", "uipilotlitgate-macro-regex.dat", false),
+        ("#x2A:", "uipilotlitgate-recursive-entity.dat", false),
         (
             "uipilotlitgate-mixed 文档!2026",
             "uipilotlitgate-mixed 文档!2026.txt",
@@ -1846,6 +1849,14 @@ fn real_literal_entity_queries_match_plain_filenames() -> Result<(), Box<dyn Err
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut harness = IsolatedEverything::prepare()?;
     let entries = create_literal_syntax_tree(&harness.indexed_root)?;
+    for required_literal in ["ext:txt", "regex:.*", "#x2A:"] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.literal == required_literal),
+            "missing literal syntax fixture {required_literal:?}"
+        );
+    }
     harness.start(deadline)?;
     harness.wait_for_exact_total("uipilotlitgate-", entries.len() as u32, deadline)?;
 
