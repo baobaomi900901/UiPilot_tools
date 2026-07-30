@@ -239,15 +239,15 @@ pub(super) fn execute_indexed_path(
     volume: &FixedVolume,
     action: &OpenIndexedPath,
 ) -> Result<FileExecutionOutcome, BackendError> {
-    execute_indexed_path_with(volume, action, path_auth::execute_legacy_indexed_path)
+    path_auth::execute_legacy_indexed_path(legacy_path_expectation(volume, action))
+        .map_err(map_shared_execution_error)
 }
 
-fn execute_indexed_path_with<'a>(
+fn legacy_path_expectation<'a>(
     volume: &'a FixedVolume,
     action: &'a OpenIndexedPath,
-    execute: impl FnOnce(LegacyPathExpectation<'a>) -> Result<FileExecutionOutcome, FileExecutionError>,
-) -> Result<FileExecutionOutcome, BackendError> {
-    execute(LegacyPathExpectation {
+) -> LegacyPathExpectation<'a> {
+    LegacyPathExpectation {
         volume_guid_path: &volume.identity.volume_guid_path,
         volume_serial: volume.identity.volume_serial,
         filesystem_name: &volume.identity.filesystem_name,
@@ -256,7 +256,22 @@ fn execute_indexed_path_with<'a>(
             IndexedKind::File => FilePathKind::File,
             IndexedKind::Directory => FilePathKind::Directory,
         },
-    })
+    }
+}
+
+#[cfg(test)]
+fn execute_indexed_path_with_shell<S>(
+    volume: &FixedVolume,
+    action: &OpenIndexedPath,
+    shell: S,
+) -> Result<FileExecutionOutcome, BackendError>
+where
+    S: FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
+{
+    path_auth::execute_legacy_indexed_path_with_shell(
+        legacy_path_expectation(volume, action),
+        shell,
+    )
     .map_err(map_shared_execution_error)
 }
 
@@ -1938,7 +1953,9 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         collections::VecDeque,
+        fs,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use windows::Win32::Storage::FileSystem::{
@@ -1950,17 +1967,16 @@ mod tests {
     use super::{
         classify_category, classify_enumeration_error_for_test, classify_open_failure_for_test,
         collect_fixed_volumes_with, drive_relative_path, excluded_prefix_for_resolved_path_with,
-        execute_indexed_path_with, filter_replay_events, is_excluded,
-        materialize_event_batches_with, parse_directory_records, parse_event_batch,
-        parse_notifications, path_is_same_or_descendant, push_denied_prefix,
-        reauthenticate_volume_with, run_scanner_batches_with, run_scanner_with,
+        execute_indexed_path_with_shell, filter_replay_events, is_excluded,
+        map_shared_execution_error, materialize_event_batches_with, parse_directory_records,
+        parse_event_batch, parse_notifications, path_is_same_or_descendant, push_denied_prefix,
+        read_raw_volume, reauthenticate_volume_with, run_scanner_batches_with, run_scanner_with,
         scan_directories_with, shutdown_pending_io_with, validate_pinned_shape, watcher_cycle_with,
         windows_time_to_unix_ms, BackendError, CancelOutcome, CompletionOutcome, DirectoryRecord,
         DirectoryStack, EnumerationStep, EventBuffer, ExcludedPrefix, FileExecutionError,
         FileExecutionOutcome, FilePathKind, FixedVolume, IndexEntry, IndexedKind, NativeEntry,
         OpenFailure, OpenIndexedPath, PathUpdate, PinnedPathPolicy, RawVolume, ScanBatcher,
-        StructuredEvent, VolumeIdentity, WatchCompletion, DRIVE_FIXED_VALUE, EVENT_CAPACITY,
-        SCAN_BATCH_SIZE,
+        StructuredEvent, WatchCompletion, DRIVE_FIXED_VALUE, EVENT_CAPACITY, SCAN_BATCH_SIZE,
     };
 
     fn raw_volume(mount: &str, guid: &str, serial: u32, drive_type: u32) -> RawVolume {
@@ -1973,12 +1989,50 @@ mod tests {
         }
     }
 
-    fn execution_identity() -> VolumeIdentity {
-        VolumeIdentity {
-            volume_guid_path: r"\\?\Volume{PIN}\".into(),
-            volume_serial: 1,
-            filesystem_name: "NTFS".into(),
+    static NEXT_TEMP_TREE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new() -> Self {
+            let id = NEXT_TEMP_TREE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "uipilot-legacy-path-auth-test-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
         }
+
+        fn child(&self, relative_path: impl AsRef<Path>) -> PathBuf {
+            self.0.join(relative_path)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn fixed_volume_for(path: &Path) -> FixedVolume {
+        let mount_point = path.ancestors().last().unwrap().to_str().unwrap();
+        collect_fixed_volumes_with([read_raw_volume(mount_point).unwrap()])
+            .unwrap()
+            .remove(0)
+    }
+
+    fn indexed_action_for_path(
+        volume: &FixedVolume,
+        path: &Path,
+        kind: IndexedKind,
+    ) -> OpenIndexedPath {
+        let relative_path = path
+            .strip_prefix(&volume.mount_point)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        OpenIndexedPath::for_test(1, 2, volume.identity.clone(), relative_path, kind)
     }
 
     #[test]
@@ -2859,74 +2913,100 @@ mod tests {
     }
 
     #[test]
-    fn pinned_path_file_delegates_to_shared_reveal() {
-        let identity = execution_identity();
-        let volume = FixedVolume {
-            identity: identity.clone(),
-            mount_point: PathBuf::from(r"C:\"),
-        };
-        let action =
-            OpenIndexedPath::for_test(1, 2, identity, r"docs\report.pdf", IndexedKind::File);
+    fn pinned_path_file_delegates_through_real_shared_revalidation() {
+        let tree = TempTree::new();
+        let parent = tree.child("docs");
+        fs::create_dir(&parent).unwrap();
+        let file = parent.join("report.pdf");
+        fs::write(&file, b"report").unwrap();
+        let volume = fixed_volume_for(&file);
+        let action = indexed_action_for_path(&volume, &file, IndexedKind::File);
+        let shell_target = RefCell::new(None);
 
-        let outcome = execute_indexed_path_with(&volume, &action, |expectation| {
-            assert_eq!(expectation.volume_guid_path, r"\\?\Volume{PIN}\");
-            assert_eq!(expectation.volume_serial, 1);
-            assert_eq!(expectation.filesystem_name, "NTFS");
-            assert_eq!(expectation.relative_path, r"docs\report.pdf");
-            assert_eq!(expectation.kind, FilePathKind::File);
+        let outcome = execute_indexed_path_with_shell(&volume, &action, |path, kind| {
+            shell_target.replace(Some((path.to_owned(), kind)));
             Ok(FileExecutionOutcome::FileRevealRequested)
         })
         .unwrap();
 
         assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
+        assert_eq!(
+            shell_target.into_inner(),
+            Some((
+                format!(
+                    "{}\\{}",
+                    volume.identity.volume_guid_path.trim_end_matches('\\'),
+                    action.relative_path
+                ),
+                FilePathKind::File,
+            ))
+        );
     }
 
     #[test]
-    fn pinned_path_directory_delegates_to_shared_open() {
-        let identity = execution_identity();
-        let volume = FixedVolume {
-            identity: identity.clone(),
-            mount_point: PathBuf::from(r"C:\"),
-        };
-        let action = OpenIndexedPath::for_test(1, 2, identity, "docs", IndexedKind::Directory);
+    fn pinned_path_directory_delegates_through_real_shared_revalidation() {
+        let tree = TempTree::new();
+        let directory = tree.child("docs");
+        fs::create_dir(&directory).unwrap();
+        let volume = fixed_volume_for(&directory);
+        let action = indexed_action_for_path(&volume, &directory, IndexedKind::Directory);
+        let shell_target = RefCell::new(None);
 
-        let outcome = execute_indexed_path_with(&volume, &action, |expectation| {
-            assert_eq!(expectation.relative_path, "docs");
-            assert_eq!(expectation.kind, FilePathKind::Directory);
+        let outcome = execute_indexed_path_with_shell(&volume, &action, |path, kind| {
+            shell_target.replace(Some((path.to_owned(), kind)));
             Ok(FileExecutionOutcome::FolderOpenRequested)
         })
         .unwrap();
 
         assert_eq!(outcome, FileExecutionOutcome::FolderOpenRequested);
+        assert_eq!(
+            shell_target.into_inner(),
+            Some((
+                format!(
+                    "{}\\{}",
+                    volume.identity.volume_guid_path.trim_end_matches('\\'),
+                    action.relative_path
+                ),
+                FilePathKind::Directory,
+            ))
+        );
+    }
+
+    #[test]
+    fn pinned_path_case_only_rename_is_stale_before_injected_shell_dispatch() {
+        let tree = TempTree::new();
+        let file = tree.child("Report.pdf");
+        fs::write(&file, b"report").unwrap();
+        let volume = fixed_volume_for(&file);
+        let action = indexed_action_for_path(&volume, &file, IndexedKind::File);
+        fs::rename(&file, tree.child("report.pdf")).unwrap();
+        let shell_calls = Cell::new(0);
+
+        let result = execute_indexed_path_with_shell(&volume, &action, |_, _| {
+            shell_calls.set(shell_calls.get() + 1);
+            Ok(FileExecutionOutcome::FileRevealRequested)
+        });
+
+        assert!(matches!(result, Err(BackendError::InvalidData)));
+        assert_eq!(shell_calls.get(), 0);
     }
 
     #[test]
     fn pinned_path_preserves_legacy_error_mapping() {
-        let identity = execution_identity();
-        let volume = FixedVolume {
-            identity: identity.clone(),
-            mount_point: PathBuf::from(r"C:\"),
-        };
-        let action =
-            OpenIndexedPath::for_test(1, 2, identity, r"docs\report.pdf", IndexedKind::File);
-        let mapped_error = |shared_error| {
-            execute_indexed_path_with(&volume, &action, |_| Err(shared_error)).unwrap_err()
-        };
-
         assert!(matches!(
-            mapped_error(FileExecutionError::NotFound),
+            map_shared_execution_error(FileExecutionError::NotFound),
             BackendError::Missing
         ));
         assert!(matches!(
-            mapped_error(FileExecutionError::Stale),
+            map_shared_execution_error(FileExecutionError::Stale),
             BackendError::InvalidData
         ));
         assert!(matches!(
-            mapped_error(FileExecutionError::SearchUnavailable),
+            map_shared_execution_error(FileExecutionError::SearchUnavailable),
             BackendError::Platform
         ));
         assert!(matches!(
-            mapped_error(FileExecutionError::OpenFailed),
+            map_shared_execution_error(FileExecutionError::OpenFailed),
             BackendError::Platform
         ));
     }

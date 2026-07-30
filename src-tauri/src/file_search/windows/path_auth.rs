@@ -88,6 +88,7 @@ where
     let (handles, observation) = walk_expected_components_and_observe_with(
         expected,
         expected_filesystem_name,
+        false,
         open,
         inspect,
     )?;
@@ -109,12 +110,23 @@ where
 pub(crate) fn execute_authenticated_path(
     identity: &AuthenticatedPathIdentity,
 ) -> Result<FileExecutionOutcome, FileExecutionError> {
+    execute_authenticated_path_with_shell(identity, None, execute_shell)
+}
+
+fn execute_authenticated_path_with_shell<S>(
+    identity: &AuthenticatedPathIdentity,
+    expected_filesystem_name: Option<&str>,
+    shell: S,
+) -> Result<FileExecutionOutcome, FileExecutionError>
+where
+    S: FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
+{
     execute_authenticated_path_with(
         identity,
-        None,
+        expected_filesystem_name,
         |relative, kind, _| open_execution_component(&identity.volume_guid_path, relative, kind),
         |_, _, handle| inspect_execution_component(handle, identity),
-        execute_shell,
+        shell,
     )
 }
 
@@ -133,6 +145,7 @@ where
     let (handles, _) = walk_expected_components_and_observe_with(
         identity,
         expected_filesystem_name,
+        true,
         open,
         inspect,
     )?;
@@ -143,6 +156,16 @@ where
 pub(crate) fn execute_legacy_indexed_path(
     expectation: LegacyPathExpectation<'_>,
 ) -> Result<FileExecutionOutcome, FileExecutionError> {
+    execute_legacy_indexed_path_with_shell(expectation, execute_shell)
+}
+
+pub(crate) fn execute_legacy_indexed_path_with_shell<S>(
+    expectation: LegacyPathExpectation<'_>,
+    shell: S,
+) -> Result<FileExecutionOutcome, FileExecutionError>
+where
+    S: FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
+{
     validate_relative_path(expectation.relative_path)?;
     let identity = AuthenticatedPathIdentity {
         display_path: joined_path(expectation.volume_guid_path, expectation.relative_path),
@@ -152,13 +175,7 @@ pub(crate) fn execute_legacy_indexed_path(
         file_id: [0; 16],
         kind: expectation.kind,
     };
-    execute_authenticated_path_with(
-        &identity,
-        Some(expectation.filesystem_name),
-        |relative, kind, _| open_execution_component(&identity.volume_guid_path, relative, kind),
-        |_, _, handle| inspect_execution_component(handle, &identity),
-        execute_shell,
-    )
+    execute_authenticated_path_with_shell(&identity, Some(expectation.filesystem_name), shell)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,13 +205,14 @@ where
     O: FnMut(&str, FilePathKind, ExecutionShare) -> Result<H, FileExecutionError>,
     I: FnMut(&str, FilePathKind, &H) -> Result<ComponentObservation, FileExecutionError>,
 {
-    walk_expected_components_and_observe_with(expected, None, open, inspect)
+    walk_expected_components_and_observe_with(expected, None, true, open, inspect)
         .map(|(handles, _)| handles)
 }
 
 fn walk_expected_components_and_observe_with<H, O, I>(
     expected: &AuthenticatedPathIdentity,
     expected_filesystem_name: Option<&str>,
+    require_exact_relative_path: bool,
     mut open: O,
     mut inspect: I,
 ) -> Result<(Vec<H>, ComponentObservation), FileExecutionError>
@@ -230,9 +248,13 @@ where
             || !observation
                 .volume_guid_path
                 .eq_ignore_ascii_case(&expected_volume_guid_path)
-            || !observation
-                .relative_path
-                .eq_ignore_ascii_case(&relative_path)
+            || if require_exact_relative_path {
+                observation.relative_path != relative_path
+            } else {
+                !observation
+                    .relative_path
+                    .eq_ignore_ascii_case(&relative_path)
+            }
             || expected_filesystem_name.is_some_and(|filesystem_name| {
                 !observation
                     .filesystem_name
@@ -583,10 +605,50 @@ fn open_directory(path: &str) -> Result<(), FileExecutionError> {
 mod tests {
     use std::{
         cell::{Cell, RefCell},
+        fs,
+        path::{Path, PathBuf},
         rc::Rc,
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
+
+    static NEXT_TEMP_TREE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new() -> Self {
+            let id = NEXT_TEMP_TREE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "uipilot-path-auth-test-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn child(&self, relative_path: impl AsRef<Path>) -> PathBuf {
+            self.0.join(relative_path)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn authenticate_test_path(path: &Path, kind: FilePathKind) -> AuthenticatedPathSnapshot {
+        authenticate_path(path.to_str().unwrap(), kind).unwrap()
+    }
+
+    fn execute_real_path_with_shell(
+        identity: &AuthenticatedPathIdentity,
+        shell: impl FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
+    ) -> Result<FileExecutionOutcome, FileExecutionError> {
+        execute_authenticated_path_with_shell(identity, None, shell)
+    }
 
     fn test_identity(relative_path: &str, kind: FilePathKind) -> AuthenticatedPathIdentity {
         AuthenticatedPathIdentity {
@@ -742,6 +804,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn real_file_authentication_revalidates_before_injected_shell_dispatch() {
+        let tree = TempTree::new();
+        let parent = tree.child("Documents");
+        fs::create_dir(&parent).unwrap();
+        let file = parent.join("Report.txt");
+        fs::write(&file, b"report").unwrap();
+        let snapshot = authenticate_test_path(&file, FilePathKind::File);
+        let shell_target = RefCell::new(None);
+
+        let outcome = execute_real_path_with_shell(&snapshot.identity, |path, kind| {
+            shell_target.replace(Some((path.to_owned(), kind)));
+            Ok(FileExecutionOutcome::FileRevealRequested)
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.size_bytes, Some(6));
+        assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
+        assert_eq!(
+            shell_target.into_inner(),
+            Some((
+                joined_path(
+                    &snapshot.identity.volume_guid_path,
+                    &snapshot.identity.relative_path,
+                ),
+                FilePathKind::File,
+            ))
+        );
+    }
+
+    #[test]
+    fn real_directory_authentication_preserves_open_configuration() {
+        let tree = TempTree::new();
+        let directory = tree.child("Documents");
+        fs::create_dir(&directory).unwrap();
+        let snapshot = authenticate_test_path(&directory, FilePathKind::Directory);
+        let shell_target = RefCell::new(None);
+
+        let outcome = execute_real_path_with_shell(&snapshot.identity, |path, kind| {
+            shell_target.replace(Some((path.to_owned(), kind)));
+            Ok(FileExecutionOutcome::FolderOpenRequested)
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.size_bytes, None);
+        assert_eq!(outcome, FileExecutionOutcome::FolderOpenRequested);
+        assert_eq!(
+            shell_target.into_inner(),
+            Some((
+                joined_path(
+                    &snapshot.identity.volume_guid_path,
+                    &snapshot.identity.relative_path,
+                ),
+                FilePathKind::Directory,
+            ))
+        );
+    }
+
+    #[test]
+    fn real_leaf_replacement_is_stale_before_injected_shell_dispatch() {
+        let tree = TempTree::new();
+        let file = tree.child("Report.txt");
+        let replacement = tree.child("replacement.tmp");
+        fs::write(&file, b"original").unwrap();
+        fs::write(&replacement, b"replacement").unwrap();
+        let snapshot = authenticate_test_path(&file, FilePathKind::File);
+        fs::remove_file(&file).unwrap();
+        fs::rename(&replacement, &file).unwrap();
+        let shell_calls = Cell::new(0);
+
+        let result = execute_real_path_with_shell(&snapshot.identity, |_, _| {
+            shell_calls.set(shell_calls.get() + 1);
+            Ok(FileExecutionOutcome::FileRevealRequested)
+        });
+
+        assert_eq!(result, Err(FileExecutionError::Stale));
+        assert_eq!(shell_calls.get(), 0);
+    }
+
     #[derive(Clone, Copy)]
     enum ExecutionMutation {
         LeafReplacement,
@@ -811,6 +952,44 @@ mod tests {
     #[test]
     fn parent_rename_is_stale_before_shell() {
         assert_stale_before_shell(FilePathKind::File, ExecutionMutation::ParentRename);
+    }
+
+    #[test]
+    fn case_only_parent_rename_is_stale_before_shell() {
+        let tree = TempTree::new();
+        let original_parent = tree.child("CaseParent");
+        fs::create_dir(&original_parent).unwrap();
+        let file = original_parent.join("report.txt");
+        fs::write(&file, b"report").unwrap();
+        let snapshot = authenticate_test_path(&file, FilePathKind::File);
+        fs::rename(&original_parent, tree.child("caseparent")).unwrap();
+        let shell_calls = Cell::new(0);
+
+        let result = execute_real_path_with_shell(&snapshot.identity, |_, _| {
+            shell_calls.set(shell_calls.get() + 1);
+            Ok(FileExecutionOutcome::FileRevealRequested)
+        });
+
+        assert_eq!(result, Err(FileExecutionError::Stale));
+        assert_eq!(shell_calls.get(), 0);
+    }
+
+    #[test]
+    fn case_only_leaf_rename_is_stale_before_shell() {
+        let tree = TempTree::new();
+        let original_file = tree.child("Report.txt");
+        fs::write(&original_file, b"report").unwrap();
+        let snapshot = authenticate_test_path(&original_file, FilePathKind::File);
+        fs::rename(&original_file, tree.child("report.txt")).unwrap();
+        let shell_calls = Cell::new(0);
+
+        let result = execute_real_path_with_shell(&snapshot.identity, |_, _| {
+            shell_calls.set(shell_calls.get() + 1);
+            Ok(FileExecutionOutcome::FileRevealRequested)
+        });
+
+        assert_eq!(result, Err(FileExecutionError::Stale));
+        assert_eq!(shell_calls.get(), 0);
     }
 
     #[test]
