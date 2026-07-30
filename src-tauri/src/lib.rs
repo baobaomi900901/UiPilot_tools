@@ -42,6 +42,8 @@ mod lifecycle;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod file_index;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugins;

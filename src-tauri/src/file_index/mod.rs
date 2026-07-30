@@ -4103,19 +4103,7 @@ impl OpenIndexedPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileExecutionOutcome {
-    FileRevealRequested,
-    FolderOpenRequested,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileExecutionError {
-    SearchUnavailable,
-    Stale,
-    NotFound,
-    OpenFailed,
-}
+pub(crate) use crate::file_search::{FileExecutionError, FileExecutionOutcome};
 
 impl VolumeIdentity {
     #[cfg(test)]
