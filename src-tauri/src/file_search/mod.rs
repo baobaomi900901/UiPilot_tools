@@ -1,6 +1,5 @@
 use serde::Serialize;
 
-#[cfg(test)]
 use crate::file_index::OpenIndexedPath;
 
 use self::windows::path_auth::AuthenticatedPathIdentity;
@@ -32,20 +31,16 @@ impl EverythingPathAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FileExecutionAction {
-    #[cfg(test)]
     Indexed(OpenIndexedPath),
     Everything(EverythingPathAction),
 }
 
-impl FileExecutionAction {
-    pub(crate) fn into_everything(self) -> EverythingPathAction {
-        match self {
-            Self::Everything(action) => action,
-            #[cfg(test)]
-            Self::Indexed(_) => panic!("indexed actions are test-only"),
-        }
+impl From<OpenIndexedPath> for FileExecutionAction {
+    fn from(action: OpenIndexedPath) -> Self {
+        Self::Indexed(action)
     }
 }
+
 impl From<EverythingPathAction> for FileExecutionAction {
     fn from(action: EverythingPathAction) -> Self {
         Self::Everything(action)
@@ -122,7 +117,6 @@ pub(crate) enum FileExecutionOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileExecutionError {
-    #[cfg(test)]
     SearchUnavailable,
     Stale,
     NotFound,
@@ -174,11 +168,19 @@ mod tests {
         assert_eq!(draft.full_path, r"C:\Visible\report.pdf");
     }
     #[test]
-    fn indexed_action_is_test_only_without_a_synthetic_conversion() {
-        let source = include_str!("mod.rs").replace("\r\n", "\n");
+    fn production_indexed_action_and_open_path_remain_available() {
+        let action_source = include_str!("mod.rs").replace("\r\n", "\n");
+        let index_source = include_str!("../file_index/mod.rs").replace("\r\n", "\n");
 
-        assert!(source.contains("#[cfg(test)]\n    Indexed(OpenIndexedPath),"));
-        let conversion = ["impl From<", "OpenIndexedPath> for FileExecutionAction"].concat();
-        assert!(!source.contains(&conversion));
+        assert!(action_source.contains("use crate::file_index::OpenIndexedPath;"));
+        assert!(!action_source.contains("#[cfg(test)]\nuse crate::file_index::OpenIndexedPath;"));
+        assert!(action_source.contains("    Indexed(OpenIndexedPath),"));
+        assert!(!action_source.contains("#[cfg(test)]\n    Indexed(OpenIndexedPath),"));
+        assert!(action_source.contains("impl From<OpenIndexedPath> for FileExecutionAction"));
+        assert!(index_source.contains("pub(crate) struct OpenIndexedPath"));
+        assert!(!index_source.contains(
+            "#[cfg(test)]\n#[derive(Clone, Debug, Eq, PartialEq)]\npub(crate) struct OpenIndexedPath"
+        ));
+        assert!(index_source.contains("pub(crate) fn execute_indexed_path("));
     }
 }
