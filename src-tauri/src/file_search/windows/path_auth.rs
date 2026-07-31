@@ -529,11 +529,73 @@ fn final_path(handle: HANDLE) -> Result<String, FileExecutionError> {
     final_path_with_flags(handle, VOLUME_NAME_GUID)
 }
 
+const SHELL_MAX_PATH_UTF16_UNITS: usize = 260;
+
 fn final_shell_path(handle: HANDLE) -> Result<String, FileExecutionError> {
     let path = final_path_with_flags(handle, VOLUME_NAME_DOS)?;
-    path.strip_prefix(r"\\?\")
-        .map(str::to_owned)
-        .ok_or(FileExecutionError::OpenFailed)
+    let path = path
+        .strip_prefix(r"\\?\")
+        .ok_or(FileExecutionError::OpenFailed)?;
+    validate_shell_path(path)?;
+    Ok(path.to_owned())
+}
+
+fn validate_shell_path(path: &str) -> Result<(), FileExecutionError> {
+    let bytes = path.as_bytes();
+    if path.encode_utf16().count() >= SHELL_MAX_PATH_UTF16_UNITS
+        || bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+    {
+        return Err(FileExecutionError::OpenFailed);
+    }
+
+    let relative_path = &path[3..];
+    if relative_path.is_empty() {
+        return Ok(());
+    }
+    if relative_path.split('\\').any(invalid_shell_path_component) {
+        Err(FileExecutionError::OpenFailed)
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_shell_path_component(component: &str) -> bool {
+    component.is_empty()
+        || component.ends_with(' ')
+        || component.ends_with('.')
+        || component.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+        })
+        || is_reserved_device_basename(component)
+}
+
+fn is_reserved_device_basename(component: &str) -> bool {
+    let basename = component
+        .split_once('.')
+        .map_or(component, |(basename, _)| basename);
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|reserved| basename.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+
+    let Some(prefix) = basename.get(..3) else {
+        return false;
+    };
+    let suffix = &basename[3..];
+    (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+        && matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"
+        )
 }
 
 fn final_path_with_flags(
@@ -966,6 +1028,120 @@ mod tests {
     }
 
     #[test]
+    fn shell_path_validation_accepts_stable_drive_absolute_paths() {
+        for path in [
+            r"C:\",
+            r"z:\Program Files\Quarterly Report.txt",
+            "D:\\Users\\Jos\u{e9}\\\u{6587}\u{6863}.txt",
+            r"C:\CONSOLE\COM0\COM10\LPT0\LPT10\report.con",
+        ] {
+            assert_eq!(validate_shell_path(path), Ok(()), "{path:?}");
+        }
+
+        let first = "\u{1f600}".repeat(64);
+        let second = "\u{1f600}".repeat(63);
+        let at_max_path = format!(r"C:\{first}\{second}a");
+        assert_eq!(at_max_path.encode_utf16().count() + 1, 260);
+        assert_eq!(validate_shell_path(&at_max_path), Ok(()));
+    }
+
+    #[test]
+    fn shell_path_validation_rejects_noncanonical_or_overlong_paths() {
+        for path in [
+            "",
+            r"C:",
+            r"C:relative\file.txt",
+            r"\rooted\file.txt",
+            r"\\server\share\file.txt",
+            r"\\?\C:\file.txt",
+            r"1:\file.txt",
+            r"C:/file.txt",
+            r"C:\\file.txt",
+            r"C:\folder\",
+        ] {
+            assert_eq!(
+                validate_shell_path(path),
+                Err(FileExecutionError::OpenFailed),
+                "{path:?}"
+            );
+        }
+
+        let first = "\u{1f600}".repeat(64);
+        let second = "\u{1f600}".repeat(63);
+        let over_max_path = format!(r"C:\{first}\{second}ab");
+        assert_eq!(over_max_path.encode_utf16().count() + 1, 261);
+        assert_eq!(
+            validate_shell_path(&over_max_path),
+            Err(FileExecutionError::OpenFailed)
+        );
+    }
+
+    #[test]
+    fn shell_path_validation_rejects_unstable_components() {
+        for path in [
+            r"C:\trailing ",
+            r"C:\trailing.",
+            r"C:\parent \file.txt",
+            r"C:\parent.\file.txt",
+        ] {
+            assert_eq!(
+                validate_shell_path(path),
+                Err(FileExecutionError::OpenFailed),
+                "{path:?}"
+            );
+        }
+
+        for character in ['<', '>', ':', '"', '/', '|', '?', '*'] {
+            let path = format!(r"C:\bad{character}name");
+            assert_eq!(
+                validate_shell_path(&path),
+                Err(FileExecutionError::OpenFailed),
+                "{path:?}"
+            );
+        }
+
+        for character in ['\0', '\u{1f}', '\u{7f}', '\u{85}'] {
+            let path = format!("C:\\bad{character}name");
+            assert_eq!(
+                validate_shell_path(&path),
+                Err(FileExecutionError::OpenFailed),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_path_validation_rejects_reserved_device_basenames() {
+        for component in [
+            "CON",
+            "con.txt",
+            "PRN.log",
+            "prn",
+            "AUX.tar.gz",
+            "aux",
+            "NUL.bin",
+            "nul",
+            "COM1",
+            "com9.txt",
+            "LPT1",
+            "lpt9.txt",
+            "COM\u{b9}",
+            "com\u{b2}.txt",
+            "CoM\u{b3}.log",
+            "LPT\u{b9}",
+            "lpt\u{b2}.txt",
+            "LpT\u{b3}.log",
+        ] {
+            let path = format!(r"C:\safe\{component}");
+            assert_eq!(
+                validate_shell_path(&path),
+                Err(FileExecutionError::OpenFailed),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn real_leaf_replacement_is_stale_before_injected_shell_dispatch() {
         let tree = TempTree::new();
         let file = tree.child("Report.txt");
@@ -1152,6 +1328,26 @@ mod tests {
         };
         assert_eq!(first.file_id, second.file_id);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn real_hard_links_authenticate_distinct_paths_with_same_file_identity() {
+        let tree = TempTree::new();
+        let first_path = tree.child("first.txt");
+        let second_path = tree.child("second.txt");
+        fs::write(&first_path, b"shared").unwrap();
+        fs::hard_link(&first_path, &second_path).unwrap();
+
+        let first = authenticate_test_path(&first_path, FilePathKind::File).identity;
+        let second = authenticate_test_path(&second_path, FilePathKind::File).identity;
+        let first_canonical = joined_path(&first.volume_guid_path, &first.relative_path);
+        let second_canonical = joined_path(&second.volume_guid_path, &second.relative_path);
+
+        assert_ne!(first.display_path, second.display_path);
+        assert_ne!(first.relative_path, second.relative_path);
+        assert_ne!(first_canonical, second_canonical);
+        assert_eq!(first.volume_serial, second.volume_serial);
+        assert_eq!(first.file_id, second.file_id);
     }
 
     struct TestHandle(Rc<Cell<usize>>);
