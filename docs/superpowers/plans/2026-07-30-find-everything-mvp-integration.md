@@ -313,7 +313,7 @@ AuthenticatedPathSnapshot {
 }
 ```
 
-For execution, walk again, compare all identity fields, reconstruct the Shell target from the authenticated `volume_guid_path + relative_path` rather than trusting `display_path`, retain the `Vec<OwnedHandle>` in scope, invoke `SHOpenFolderAndSelectItems` for files or `ShellExecuteExW` for directories, and drop handles only after that call returns. Reparse points present at inspection fail closed; because DELETE is not shared, parent or leaf rename, deletion, and replacement that require delete sharing fail while the handles are held through the Shell return.
+For execution, walk again and compare all identity fields. After component authentication completes, obtain the handle-derived DOS final path from the final pinned handle, validate that it is a Shell-safe drive-absolute path within `MAX_PATH` and contains no ambiguous components, retain the `Vec<OwnedHandle>` in scope, invoke `SHOpenFolderAndSelectItems` for files or `ShellExecuteExW` for directories while those handles remain held, and drop the handles only after that call returns. Reparse points present at inspection fail closed; because DELETE is not shared, parent or leaf rename, deletion, and replacement that require delete sharing fail while the handles are held through the Shell return.
 
 **Accepted post-MVP hardening boundary (2026-07-31):**
 
