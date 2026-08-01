@@ -13,7 +13,6 @@ use std::{
 use std::{sync::mpsc, thread};
 
 use icu_casemap::CaseMapper;
-use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
@@ -26,10 +25,16 @@ use crate::{
     result_registry::{QueryDomain, ResultRegistry},
 };
 
+pub(crate) use crate::file_search::FileIndexStatus;
+#[cfg(test)]
+pub(crate) use crate::file_search::FileResultKind;
+
 mod store;
 mod windows_backend;
 
-use store::{ordinal_sort_identity, Store, StoreError, StoreQueryResult};
+#[cfg(test)]
+use store::StoreQueryResult;
+use store::{ordinal_sort_identity, Store, StoreError};
 #[cfg(not(test))]
 use windows_backend::{
     filter_replay_events, fixed_volumes, materialize_events, scan_volume, system_exclusions,
@@ -242,6 +247,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_query_parsers_preserve_the_supported_contract() {
+        for (value, expected) in [
+            ("all", FileCategory::All),
+            ("folder", FileCategory::Folder),
+            ("excel", FileCategory::Excel),
+            ("word", FileCategory::Word),
+            ("ppt", FileCategory::Ppt),
+            ("pdf", FileCategory::Pdf),
+            ("image", FileCategory::Image),
+            ("video", FileCategory::Video),
+            ("audio", FileCategory::Audio),
+            ("archive", FileCategory::Archive),
+        ] {
+            assert_eq!(FileCategory::parse(value), Some(expected));
+        }
+        assert_eq!(FileCategory::parse("unknown"), None);
+        assert_eq!(
+            FileSort::parse("modifiedDesc"),
+            Some(FileSort::ModifiedDesc)
+        );
+        assert_eq!(FileSort::parse("modifiedAsc"), Some(FileSort::ModifiedAsc));
+        assert_eq!(FileSort::parse("unknown"), None);
+    }
+
+    #[test]
     fn revision_persistence_failure_does_not_advance_memory_and_latches_unavailable() {
         let store = Store::open_in_memory_for_test("identity-a").unwrap();
         store.remove_metadata_for_test();
@@ -425,26 +455,9 @@ mod tests {
         );
         assert!(first.is_err());
 
-        let second = index
-            .search_with(
-                dir.path(),
-                query(),
-                0,
-                |root| {
-                    auth_calls.set(auth_calls.get() + 1);
-                    Ok(root.join("file-index.sqlite3"))
-                },
-                |path| {
-                    open_calls.set(open_calls.get() + 1);
-                    open_store(path)
-                },
-                |_, _| {
-                    query_calls.set(query_calls.get() + 1);
-                    unreachable!()
-                },
-            )
-            .unwrap();
+        let second = index.search(dir.path(), query(), 0).unwrap();
         assert_eq!(second.status, FileIndexStatus::Unavailable);
+        assert_eq!(second.index_revision, 0);
         assert_eq!(auth_calls.get(), 1);
         assert_eq!(open_calls.get(), 1);
         assert_eq!(query_calls.get(), 0);
@@ -698,13 +711,9 @@ mod tests {
     }
 
     fn file_action() -> ResultAction {
-        ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
-            0,
-            1,
-            volume(),
-            "file.txt",
-            IndexedKind::File,
-        ))
+        ResultAction::OpenFile(
+            OpenIndexedPath::for_test(0, 1, volume(), "file.txt", IndexedKind::File).into(),
+        )
     }
 
     #[test]
@@ -4101,21 +4110,17 @@ impl OpenIndexedPath {
     pub(crate) fn runtime_epoch(&self) -> u64 {
         self.runtime_epoch
     }
+
+    #[cfg(test)]
+    pub(crate) fn kind_for_test(&self) -> crate::file_search::FilePathKind {
+        match self.kind {
+            IndexedKind::File => crate::file_search::FilePathKind::File,
+            IndexedKind::Directory => crate::file_search::FilePathKind::Directory,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileExecutionOutcome {
-    FileRevealRequested,
-    FolderOpenRequested,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileExecutionError {
-    SearchUnavailable,
-    Stale,
-    NotFound,
-    OpenFailed,
-}
+pub(crate) use crate::file_search::{FileExecutionError, FileExecutionOutcome};
 
 impl VolumeIdentity {
     #[cfg(test)]
@@ -4132,6 +4137,7 @@ impl VolumeIdentity {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileCategory {
     All,
@@ -4146,6 +4152,7 @@ pub(crate) enum FileCategory {
     Archive,
 }
 
+#[cfg(test)]
 impl FileCategory {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -4179,12 +4186,14 @@ impl FileCategory {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileSort {
     ModifiedDesc,
     ModifiedAsc,
 }
 
+#[cfg(test)]
 impl FileSort {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
@@ -4195,6 +4204,7 @@ impl FileSort {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QuerySpec {
     pub(crate) folded_query: String,
@@ -4214,23 +4224,7 @@ struct IndexEntry {
     modified_utc_ms: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum FileIndexStatus {
-    Building,
-    Ready,
-    Partial,
-    Rebuilding,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum FileResultKind {
-    File,
-    Folder,
-}
-
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileResultDraft {
     pub(crate) action: OpenIndexedPath,
@@ -4241,27 +4235,7 @@ pub(crate) struct FileResultDraft {
     pub(crate) full_path: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileResultItem {
-    pub(crate) result_id: String,
-    pub(crate) name: String,
-    pub(crate) kind: FileResultKind,
-    pub(crate) size_bytes: Option<String>,
-    pub(crate) modified_utc: String,
-    pub(crate) full_path: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileSearchResponse {
-    pub(crate) request_id: String,
-    pub(crate) index_revision: String,
-    pub(crate) total: String,
-    pub(crate) status: FileIndexStatus,
-    pub(crate) items: Vec<FileResultItem>,
-}
-
+#[cfg(test)]
 pub(crate) struct FileSearchBatch {
     pub(crate) runtime_epoch: u64,
     pub(crate) publication_generation: u64,
@@ -4281,6 +4255,7 @@ enum Availability {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleMode {
     Uninitialized,
+    #[cfg(test)]
     Opening {
         owner: u64,
     },
@@ -4293,6 +4268,7 @@ enum LifecycleMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum LazyInitDecision {
     Start { owner: u64 },
     ObserveBuilding,
@@ -4302,6 +4278,7 @@ enum LazyInitDecision {
 enum AdmissionError {
     Unavailable,
     EpochMismatch,
+    #[cfg(test)]
     OwnerExhausted,
     WrongMode,
     Lifecycle,
@@ -4310,6 +4287,7 @@ enum AdmissionError {
 
 #[derive(Clone, Copy)]
 enum AdmissionKind {
+    #[cfg(test)]
     LazyInit,
     DbWork,
     Execution,
@@ -4317,6 +4295,7 @@ enum AdmissionKind {
 
 struct IndexState {
     mode: LifecycleMode,
+    #[cfg(test)]
     lazy_owner_high_water: u64,
     availability: Availability,
     admission_open: bool,
@@ -4351,6 +4330,7 @@ impl Default for IndexState {
     fn default() -> Self {
         Self {
             mode: LifecycleMode::Uninitialized,
+            #[cfg(test)]
             lazy_owner_high_water: 0,
             availability: Availability::Normal,
             admission_open: false,
@@ -4384,6 +4364,7 @@ impl Default for IndexState {
 }
 
 impl IndexState {
+    #[cfg(test)]
     fn advance_revision_locked(
         &mut self,
         publication_generation: &AtomicU64,
@@ -4432,6 +4413,7 @@ impl IndexState {
     }
 }
 
+#[cfg(test)]
 fn begin_lazy_init_locked(
     state: &mut IndexState,
     expected_runtime_epoch: u64,
@@ -4521,6 +4503,7 @@ fn authenticate_app_data_root(app_data_dir: &Path) -> Result<PathBuf, FileIndexE
     }
 }
 
+#[cfg(test)]
 fn open_store(database: &Path) -> Result<(Store, u64, Option<u64>), FileIndexError> {
     let identity = ordinal_sort_identity().map_err(|_| FileIndexError::Unavailable)?;
     let mut store = Store::open(database, &identity).map_err(map_store_error)?;
@@ -4588,6 +4571,7 @@ impl FileExecutionReservation {
     }
 }
 
+#[cfg(test)]
 enum SearchAdmission {
     Work {
         owner: Option<u64>,
@@ -5109,6 +5093,7 @@ impl FileIndex {
             return Err(AdmissionError::EpochMismatch);
         }
         match kind {
+            #[cfg(test)]
             AdmissionKind::LazyInit
                 if matches!(
                     state.mode,
@@ -5127,9 +5112,9 @@ impl FileIndex {
             {
                 Ok(())
             }
-            AdmissionKind::LazyInit | AdmissionKind::DbWork | AdmissionKind::Execution => {
-                Err(AdmissionError::WrongMode)
-            }
+            #[cfg(test)]
+            AdmissionKind::LazyInit => Err(AdmissionError::WrongMode),
+            AdmissionKind::DbWork | AdmissionKind::Execution => Err(AdmissionError::WrongMode),
         }
     }
 
@@ -5189,6 +5174,7 @@ impl FileIndex {
         })
     }
 
+    #[cfg(test)]
     fn begin_search(&self, expected_runtime_epoch: u64) -> Result<SearchAdmission, FileIndexError> {
         let mut state = self.state.lock().expect("file index lock poisoned");
         if self.lifecycle.file_index_phase() != FileIndexPhase::Running {
@@ -5837,7 +5823,7 @@ impl FileIndex {
             {
                 return false;
             }
-            match state.mode {
+            let should_transition = match state.mode {
                 LifecycleMode::Terminal => return false,
                 LifecycleMode::Pausing {
                     attempt_epoch: current,
@@ -5851,32 +5837,35 @@ impl FileIndex {
                     state.pause_deadline = Some(deadline);
                     false
                 }
-                LifecycleMode::Uninitialized
-                | LifecycleMode::Opening { .. }
-                | LifecycleMode::Active => {
-                    let Some(runtime_epoch) = state.runtime_epoch.checked_add(1) else {
-                        let newly_fatal = self.latch_exhaustion_locked(&mut state);
-                        drop(state);
-                        if newly_fatal {
-                            self.consume_fatal_effects();
-                        }
-                        return false;
-                    };
-                    state.runtime_epoch = runtime_epoch;
-                    state.mode = LifecycleMode::Pausing {
-                        attempt_epoch,
-                        resume_requested: false,
-                    };
-                    state.admission_open = false;
-                    state.recovery_owner = None;
-                    state.recovery_deadline = None;
-                    state.pause_deadline = Some(deadline);
-                    state.retained_store = state.store.take();
-                    state.clean_close_permit_issued = false;
-                    self.publication_runtime_epoch
-                        .store(runtime_epoch, Ordering::Release);
-                    true
-                }
+                LifecycleMode::Uninitialized | LifecycleMode::Active => true,
+                #[cfg(test)]
+                LifecycleMode::Opening { .. } => true,
+            };
+            if !should_transition {
+                false
+            } else {
+                let Some(runtime_epoch) = state.runtime_epoch.checked_add(1) else {
+                    let newly_fatal = self.latch_exhaustion_locked(&mut state);
+                    drop(state);
+                    if newly_fatal {
+                        self.consume_fatal_effects();
+                    }
+                    return false;
+                };
+                state.runtime_epoch = runtime_epoch;
+                state.mode = LifecycleMode::Pausing {
+                    attempt_epoch,
+                    resume_requested: false,
+                };
+                state.admission_open = false;
+                state.recovery_owner = None;
+                state.recovery_deadline = None;
+                state.pause_deadline = Some(deadline);
+                state.retained_store = state.store.take();
+                state.clean_close_permit_issued = false;
+                self.publication_runtime_epoch
+                    .store(runtime_epoch, Ordering::Release);
+                true
             }
         };
         if increment_runtime {
@@ -6264,6 +6253,7 @@ impl FileIndex {
         self.state.lock().expect("file index lock poisoned").mode
     }
 
+    #[cfg(test)]
     pub(crate) fn authorizes_publication(
         &self,
         expected_runtime_epoch: u64,
@@ -6806,6 +6796,7 @@ impl FileIndex {
         Ok(revision)
     }
 
+    #[cfg(test)]
     pub(crate) fn search(
         self: &Arc<Self>,
         app_data_dir: &Path,
@@ -6834,6 +6825,7 @@ impl FileIndex {
         Ok(batch)
     }
 
+    #[cfg(test)]
     fn refresh_query_volumes_with<F>(&self, inventory: F) -> Result<(), FileIndexError>
     where
         F: FnOnce() -> Result<Vec<FixedVolume>, FileIndexError>,
@@ -7010,6 +7002,7 @@ impl FileIndex {
         )
     }
 
+    #[cfg(test)]
     fn search_admitted_with<A, O, Q>(
         self: &Arc<Self>,
         app_data_dir: &Path,
@@ -7228,6 +7221,7 @@ impl FileIndex {
         Ok(batch)
     }
 
+    #[cfg(test)]
     fn schedule_integrity(self: &Arc<Self>) -> bool {
         let state = self.state.lock().expect("file index lock poisoned");
         if !state.integrity_pending
@@ -7411,6 +7405,7 @@ impl FileIndex {
         }
     }
 
+    #[cfg(test)]
     fn schedule_calibration(self: &Arc<Self>) -> bool {
         let app_data_root = {
             let state = self.state.lock().expect("file index lock poisoned");
@@ -7490,6 +7485,7 @@ impl FileIndex {
         }));
     }
 
+    #[cfg(test)]
     fn ensure_running_coordinator_thread_locked(self: &Arc<Self>, state: &IndexState) -> bool {
         if self
             .admit_locked(state, AdmissionKind::DbWork, state.runtime_epoch)
@@ -8473,6 +8469,7 @@ struct CoordinatorSnapshot {
     thread_starts: usize,
 }
 
+#[cfg(test)]
 fn empty_batch(
     runtime_epoch: u64,
     publication_generation: u64,

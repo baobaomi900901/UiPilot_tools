@@ -6,9 +6,12 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::{
     apps::{self, AppCache, Application},
-    file_index::{
-        fold_name, FileCategory, FileExecutionError, FileExecutionOutcome, FileIndex,
-        FileResultItem, FileSearchBatch, FileSearchResponse, FileSort, OpenIndexedPath, QuerySpec,
+    file_index::{FileIndex, OpenIndexedPath},
+    file_search::{
+        everything::{EverythingSearchError, EverythingSearchState},
+        windows::path_auth,
+        FileExecutionAction, FileExecutionError, FileExecutionOutcome, FileIndexStatus,
+        FileResultItem, FileSearchResponse, PublishedFileBatch, PublishedFileDraft,
     },
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
@@ -429,7 +432,7 @@ where
 }
 
 struct PreparedFileQuery {
-    spec: QuerySpec,
+    query: String,
     invocation_id: String,
     query_sequence: u64,
 }
@@ -441,26 +444,19 @@ fn prepare_file_query(
     invocation_id: String,
     query_sequence: u64,
 ) -> Result<PreparedFileQuery, CommandError> {
-    if query.len() > 1_024
+    if query.is_empty()
+        || query.len() > 1_024
         || query.chars().count() > 255
         || query.contains('\0')
+        || category != "all"
+        || sort != "modifiedDesc"
         || invocation_id.is_empty()
         || query_sequence == 0
     {
         return Err(CommandError::invalid_file_query());
     }
-    let category = FileCategory::parse(&category).ok_or_else(CommandError::invalid_file_query)?;
-    let sort = FileSort::parse(&sort).ok_or_else(CommandError::invalid_file_query)?;
-    let folded_query = fold_name(&query);
-    if folded_query.len() > 4_096 || folded_query.chars().count() > 1_024 {
-        return Err(CommandError::invalid_file_query());
-    }
     Ok(PreparedFileQuery {
-        spec: QuerySpec {
-            folded_query,
-            category,
-            sort,
-        },
+        query,
         invocation_id,
         query_sequence,
     })
@@ -470,9 +466,8 @@ fn prepare_file_query(
 #[tauri::command]
 pub(crate) async fn search_files(
     window: WebviewWindow,
-    app: AppHandle,
     registry: State<'_, ResultRegistry>,
-    file_index: State<'_, Arc<FileIndex>>,
+    everything_search: State<'_, Arc<EverythingSearchState>>,
     query: String,
     category: String,
     sort: String,
@@ -481,25 +476,18 @@ pub(crate) async fn search_files(
 ) -> Result<Option<FileSearchResponse>, CommandError> {
     require_main_window(&window)?;
     let prepared = prepare_file_query(query, category, sort, invocation_id, query_sequence)?;
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| CommandError::search_unavailable())?;
-    search_files_with(
-        &registry,
-        Arc::clone(file_index.inner()),
-        app_data_dir,
-        prepared,
-    )
-    .await
+    let state = Arc::clone(everything_search.inner());
+    search_files_with(&registry, prepared, move |query| state.search(&query)).await
 }
 
-async fn search_files_with(
+async fn search_files_with<S>(
     registry: &ResultRegistry,
-    file_index: Arc<FileIndex>,
-    app_data_dir: std::path::PathBuf,
     prepared: PreparedFileQuery,
-) -> Result<Option<FileSearchResponse>, CommandError> {
+    search: S,
+) -> Result<Option<FileSearchResponse>, CommandError>
+where
+    S: FnOnce(String) -> Result<PublishedFileBatch, EverythingSearchError> + Send + 'static,
+{
     let token = match registry.begin_query(
         QueryDomain::File,
         &prepared.invocation_id,
@@ -508,53 +496,53 @@ async fn search_files_with(
         Some(token) => token,
         None => return Ok(None),
     };
-    let runtime_epoch = file_index.runtime_epoch();
-    let worker_index = Arc::clone(&file_index);
-    let batch = tauri::async_runtime::spawn_blocking(move || {
-        worker_index.search(&app_data_dir, prepared.spec, runtime_epoch)
-    })
-    .await
-    .map_err(|_| CommandError::file_search_worker_failed())?
-    .map_err(|_| CommandError::search_unavailable())?;
-    Ok(publish_file_search(registry, &file_index, token, batch))
+    let batch = tauri::async_runtime::spawn_blocking(move || search(prepared.query))
+        .await
+        .map_err(|_| CommandError::file_search_worker_failed())?
+        .map_err(map_everything_search_error)?;
+    Ok(publish_everything_search(registry, token, batch))
 }
 
-fn publish_file_search(
+fn map_everything_search_error(_: EverythingSearchError) -> CommandError {
+    CommandError::search_unavailable()
+}
+
+fn publish_everything_search(
     registry: &ResultRegistry,
-    file_index: &FileIndex,
     token: QueryToken,
-    batch: FileSearchBatch,
+    batch: PublishedFileBatch,
 ) -> Option<FileSearchResponse> {
-    let entries = batch
-        .items
-        .into_iter()
-        .map(|item| {
-            let action = ResultAction::OpenIndexedPath(item.action.clone());
-            (item, action)
-        })
-        .collect();
+    let total = batch.items.len();
     registry.publish_if_latest(
         token,
-        entries,
-        || file_index.authorizes_publication(batch.runtime_epoch, batch.publication_generation),
+        batch
+            .items
+            .into_iter()
+            .map(|item| {
+                let action = ResultAction::OpenFile(item.action.clone());
+                (item, action)
+            })
+            .collect(),
+        || true,
         |request_id, items| FileSearchResponse {
             request_id,
             index_revision: batch.index_revision.to_string(),
-            total: batch.total.to_string(),
-            status: batch.status,
-            items: items
-                .into_iter()
-                .map(|(result_id, item)| FileResultItem {
-                    result_id,
-                    name: item.name,
-                    kind: item.kind,
-                    size_bytes: item.size_bytes.map(|value| value.to_string()),
-                    modified_utc: item.modified_utc,
-                    full_path: item.full_path,
-                })
-                .collect(),
+            total: total.to_string(),
+            status: FileIndexStatus::Ready,
+            items: items.into_iter().map(map_published_file_item).collect(),
         },
     )
+}
+
+fn map_published_file_item((result_id, item): (String, PublishedFileDraft)) -> FileResultItem {
+    FileResultItem {
+        result_id,
+        name: item.name,
+        kind: item.kind,
+        size_bytes: item.size_bytes.map(|value| value.to_string()),
+        modified_utc: item.modified_utc,
+        full_path: item.full_path,
+    }
 }
 
 #[tauri::command]
@@ -861,14 +849,20 @@ pub(crate) async fn execute_result(
         ClipboardExecution {
             resolve: |request_id: &str, result_id: &str| registry.resolve(request_id, result_id),
             execute: |action: &ResultAction| apps::execute_application(action).map_err(|_| ()),
-            execute_file: move |action| async move {
-                tauri::async_runtime::spawn_blocking(move || {
-                    worker_index
-                        .execute_indexed_path(action)
+            execute_file: move |action| {
+                let worker_index = Arc::clone(&worker_index);
+                async move {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        execute_file_action_with(
+                            action,
+                            |action| worker_index.execute_indexed_path(action),
+                            |action| path_auth::execute_authenticated_path(action.identity()),
+                        )
                         .map_err(map_file_execution_error)
-                })
-                .await
-                .map_err(|_| CommandError::file_open_failed())?
+                    })
+                    .await
+                    .map_err(|_| CommandError::file_open_failed())?
+                }
             },
             copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                 plugins.copy_text(plugin_id, generation, || {
@@ -898,7 +892,7 @@ async fn execute_result_with_clipboard<R, A, F, Fut, P, H, S>(
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
-    F: FnOnce(OpenIndexedPath) -> Fut,
+    F: FnOnce(FileExecutionAction) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     P: FnOnce(&str, u64, &str) -> Result<(), PluginCopyError>,
     H: FnOnce() -> Result<(), CommandError>,
@@ -950,6 +944,23 @@ fn map_file_execution_error(error: FileExecutionError) -> CommandError {
     }
 }
 
+fn execute_file_action_with<I, E>(
+    action: FileExecutionAction,
+    execute_indexed: I,
+    execute_everything: E,
+) -> Result<FileExecutionOutcome, FileExecutionError>
+where
+    I: FnOnce(OpenIndexedPath) -> Result<FileExecutionOutcome, FileExecutionError>,
+    E: FnOnce(
+        crate::file_search::EverythingPathAction,
+    ) -> Result<FileExecutionOutcome, FileExecutionError>,
+{
+    match action {
+        FileExecutionAction::Indexed(action) => execute_indexed(action),
+        FileExecutionAction::Everything(action) => execute_everything(action),
+    }
+}
+
 async fn execute_resolved_result_with<R, A, F, Fut, H, S>(
     ids: (&str, &str),
     resolve: R,
@@ -961,7 +972,7 @@ async fn execute_resolved_result_with<R, A, F, Fut, H, S>(
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
-    F: FnOnce(OpenIndexedPath) -> Fut,
+    F: FnOnce(FileExecutionAction) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     H: FnOnce() -> Result<(), CommandError>,
     S: FnOnce(&str) -> Result<(), ()>,
@@ -974,7 +985,7 @@ where
         ResultAction::LaunchApplication { .. } => {
             execute_application_result_with(&action, execute_application, clear_and_hide, increment)
         }
-        ResultAction::OpenIndexedPath(action) => {
+        ResultAction::OpenFile(action) => {
             let outcome = execute_file(action).await?;
             let response = match outcome {
                 FileExecutionOutcome::FileRevealRequested => ExecuteOutcome::FileRevealRequested,
@@ -1006,7 +1017,7 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
-    if matches!(action, ResultAction::OpenIndexedPath(_)) {
+    if matches!(action, ResultAction::OpenFile(_)) {
         return Err(CommandError::application_entry_unavailable());
     }
     if matches!(action, ResultAction::CopyText { .. }) {
@@ -1121,20 +1132,25 @@ mod tests {
     };
 
     use super::{
-        clear_and_hide_with, execute_resolved_result_with, execute_result_with, load_settings_core,
-        load_settings_ready_with, map_file_preview_worker_result, map_save_worker_result,
+        clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
+        execute_result_with, load_settings_core, load_settings_ready_with,
+        map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
         map_theme_preference_worker_result, prepare_file_query, prepare_hotkey_save,
-        prepare_settings_save, publish_file_search, require_main_label, save_settings_core,
+        prepare_settings_save, publish_everything_search, require_main_label, save_settings_core,
         save_settings_with, save_settings_worker_with, search_apps_with, search_files_with,
         set_file_preview_preference_with, CommandError, ExecuteOutcome,
-        FilePreviewPreferenceUpdate, HotkeySettingsUpdate, ThemePreferenceUpdate,
-        UserSettingsUpdate,
+        FilePreviewPreferenceUpdate, HotkeySettingsUpdate, PreparedFileQuery,
+        ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
         file_index::{
-            FileExecutionOutcome, FileIndex, FileIndexStatus, FileResultDraft, FileResultKind,
-            FileSearchBatch, IndexedKind, OpenIndexedPath, VolumeIdentity,
+            FileExecutionOutcome, FileResultKind, IndexedKind, OpenIndexedPath, VolumeIdentity,
+        },
+        file_search::{
+            everything::EverythingSearchError, windows::path_auth::AuthenticatedPathIdentity,
+            EverythingPathAction, FileExecutionAction, FileIndexStatus, FilePathKind,
+            PublishedFileBatch, PublishedFileDraft,
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
@@ -1207,6 +1223,50 @@ mod tests {
             relative_path,
             kind,
         )
+    }
+
+    fn everything_action_for_test() -> EverythingPathAction {
+        EverythingPathAction::for_test(AuthenticatedPathIdentity {
+            display_path: r"C:\Visible\report.pdf".into(),
+            volume_guid_path: r"\\?\Volume{COMMANDS}\".into(),
+            relative_path: r"docs\report.pdf".into(),
+            volume_serial: 42,
+            file_id: [7; 16],
+            kind: FilePathKind::File,
+        })
+    }
+
+    fn ready_registry(invocation_id: &str) -> ResultRegistry {
+        let registry = ResultRegistry::default();
+        registry.on_show(invocation_id.into());
+        registry
+    }
+
+    fn prepared_query(query: &str, invocation_id: &str, query_sequence: u64) -> PreparedFileQuery {
+        prepare_file_query(
+            query.into(),
+            "all".into(),
+            "modifiedDesc".into(),
+            invocation_id.into(),
+            query_sequence,
+        )
+        .unwrap()
+    }
+
+    fn everything_batch_for_test(index_revision: u64, item_count: usize) -> PublishedFileBatch {
+        PublishedFileBatch {
+            index_revision,
+            items: (0..item_count)
+                .map(|index| PublishedFileDraft {
+                    action: FileExecutionAction::Everything(everything_action_for_test()),
+                    name: format!("Result {index}"),
+                    kind: FileResultKind::File,
+                    size_bytes: Some(index as u64),
+                    modified_utc: "2026-07-30T00:00:00.000Z".into(),
+                    full_path: format!("Result {index}"),
+                })
+                .collect(),
+        }
     }
 
     fn settings_store(dir: &TestDir) -> SettingsStore {
@@ -1348,163 +1408,108 @@ mod tests {
     }
 
     #[test]
-    fn file_query_rejects_wire_input_before_registry_or_index() {
-        let invalid = [
-            (
-                "x".repeat(1_025),
-                "all".into(),
-                "modifiedDesc".into(),
-                "inv".into(),
-                1,
-            ),
-            (
-                "x".repeat(256),
-                "all".into(),
-                "modifiedDesc".into(),
-                "inv".into(),
-                1,
-            ),
-            (
-                "bad\0query".into(),
-                "all".into(),
-                "modifiedDesc".into(),
-                "inv".into(),
-                1,
-            ),
-            (
-                "ok".into(),
-                "other".into(),
-                "modifiedDesc".into(),
-                "inv".into(),
-                1,
-            ),
-            ("ok".into(), "all".into(), "nameAsc".into(), "inv".into(), 1),
-            (
-                "ok".into(),
-                "all".into(),
-                "modifiedDesc".into(),
-                "".into(),
-                1,
-            ),
-            (
-                "ok".into(),
-                "all".into(),
-                "modifiedDesc".into(),
-                "inv".into(),
-                0,
-            ),
-        ];
-        for (query, category, sort, invocation, sequence) in invalid {
+    fn file_query_accepts_only_nonempty_all_modified_desc() {
+        assert!(prepare_file_query(
+            "report".into(),
+            "all".into(),
+            "modifiedDesc".into(),
+            "inv".into(),
+            1,
+        )
+        .is_ok());
+        for invalid in [
+            ("", "all", "modifiedDesc"),
+            ("report", "pdf", "modifiedDesc"),
+            ("report", "all", "modifiedAsc"),
+        ] {
             assert!(matches!(
-                prepare_file_query(query, category, sort, invocation, sequence),
+                prepare_file_query(
+                    invalid.0.into(),
+                    invalid.1.into(),
+                    invalid.2.into(),
+                    "inv".into(),
+                    1,
+                ),
                 Err(error) if error == CommandError::invalid_file_query()
             ));
         }
 
-        let registry = ResultRegistry::default();
-        registry.on_show("inv".into());
-        assert!(registry
-            .begin_query(QueryDomain::Application, "inv", 1)
-            .is_some());
+        let prepared = prepared_query("RePort", "inv", 1);
+        assert_eq!(prepared.query, "RePort");
     }
 
     #[test]
-    fn file_query_publishes_only_through_shared_registry() {
-        let registry = ResultRegistry::default();
-        let index = FileIndex::default();
-        registry.on_show("inv".into());
-        let token = registry.begin_query(QueryDomain::File, "inv", 1).unwrap();
-        let batch = FileSearchBatch {
-            runtime_epoch: 0,
-            publication_generation: 0,
-            index_revision: 7,
-            total: 2,
-            status: FileIndexStatus::Ready,
-            items: vec![
-                FileResultDraft {
-                    action: file_action(1, "First.txt", IndexedKind::File),
-                    name: "First.txt".into(),
-                    kind: FileResultKind::File,
-                    size_bytes: Some(1),
-                    modified_utc: "2026-07-21T00:00:00.000Z".into(),
-                    full_path: r"C:\Results\First.txt".into(),
-                },
-                FileResultDraft {
-                    action: file_action(2, "Folder", IndexedKind::Directory),
-                    name: "Folder".into(),
-                    kind: FileResultKind::Folder,
-                    size_bytes: None,
-                    modified_utc: "2026-07-21T00:00:01.000Z".into(),
-                    full_path: r"C:\Results\Folder".into(),
-                },
-            ],
-        };
-
-        let response = publish_file_search(&registry, &index, token, batch).unwrap();
-        assert_eq!(response.request_id, "req-0000000000000001");
-        assert_eq!(response.index_revision, "7");
-        assert_eq!(response.total, "2");
-        assert_eq!(response.items.len(), 2);
-        assert_eq!(
-            registry.resolve(&response.request_id, &response.items[0].result_id),
-            Ok(ResultAction::OpenIndexedPath(file_action(
-                1,
-                "First.txt",
-                IndexedKind::File
-            )))
-        );
-        assert_eq!(
-            registry.resolve(&response.request_id, &response.items[1].result_id),
-            Ok(ResultAction::OpenIndexedPath(file_action(
-                2,
-                "Folder",
-                IndexedKind::Directory
-            )))
-        );
-    }
-
-    #[test]
-    fn empty_file_query_initializes_and_clears_the_file_mapping() {
-        let registry = ResultRegistry::default();
-        registry.on_show("inv".into());
-        let old_token = registry.begin_query(QueryDomain::File, "inv", 1).unwrap();
-        let old = registry
-            .publish_if_latest(
-                old_token,
-                vec![(
-                    (),
-                    ResultAction::OpenIndexedPath(file_action(3, "old.txt", IndexedKind::File)),
-                )],
-                || true,
-                |request_id, items| (request_id, items),
-            )
-            .unwrap();
-
-        let dir = TestDir::new();
-        let prepared = prepare_file_query(
-            "".into(),
+    fn file_query_preserves_existing_wire_limits() {
+        assert!(prepare_file_query(
+            "x".repeat(255),
             "all".into(),
             "modifiedDesc".into(),
             "inv".into(),
-            2,
+            1,
         )
-        .unwrap();
+        .is_ok());
+        for (query, invocation_id, query_sequence) in [
+            ("x".repeat(1_025), "inv".into(), 1),
+            ("x".repeat(256), "inv".into(), 1),
+            ("bad\0query".into(), "inv".into(), 1),
+            ("ok".into(), String::new(), 1),
+            ("ok".into(), "inv".into(), 0),
+        ] {
+            assert!(matches!(
+                prepare_file_query(
+                    query,
+                    "all".into(),
+                    "modifiedDesc".into(),
+                    invocation_id,
+                    query_sequence,
+                ),
+                Err(error) if error == CommandError::invalid_file_query()
+            ));
+        }
+    }
+
+    #[test]
+    fn production_file_search_uses_everything_once_and_never_legacy_index() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
         let response = tauri::async_runtime::block_on(search_files_with(
-            &registry,
-            Arc::new(FileIndex::default()),
-            dir.path().to_path_buf(),
-            prepared,
+            &ready_registry("inv"),
+            prepared_query("report", "inv", 1),
+            move |query| {
+                assert_eq!(query, "report");
+                worker_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(everything_batch_for_test(7, 2))
+            },
         ))
         .unwrap()
         .unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(response.index_revision, "7");
+        assert_eq!(response.total, "2");
+        assert_eq!(response.status, FileIndexStatus::Ready);
+    }
 
-        assert_eq!(response.total, "0");
-        assert!(response.items.is_empty());
-        assert_eq!(response.status, FileIndexStatus::Building);
-        assert_eq!(
-            registry.resolve(&old.0, &old.1[0].0),
-            Err(RegistryError::StaleRequest)
+    #[test]
+    fn stale_everything_query_consumes_no_publication_slot() {
+        let registry = ready_registry("inv");
+        let old = registry.begin_query(QueryDomain::File, "inv", 1).unwrap();
+        let _new = registry.begin_query(QueryDomain::File, "inv", 2).unwrap();
+        assert!(
+            publish_everything_search(&registry, old, everything_batch_for_test(8, 1)).is_none()
         );
+    }
+
+    #[test]
+    fn everything_search_failures_map_to_path_free_unavailable_errors() {
+        for error in [
+            EverythingSearchError::Unavailable,
+            EverythingSearchError::RevisionExhausted,
+        ] {
+            let command = map_everything_search_error(error);
+            assert_eq!(command, CommandError::search_unavailable());
+            assert!(!command.message.contains('\\'));
+            assert!(!command.message.contains(':'));
+        }
     }
 
     #[test]
@@ -1518,10 +1523,12 @@ mod tests {
         let guard = body
             .find("require_main_window(&window)?;")
             .expect("main guard missing");
+        let opening_brace = body.find('{').expect("search_files opening brace missing");
+        assert!(body[opening_brace + 1..]
+            .trim_start()
+            .starts_with("require_main_window(&window)?;"));
         for forbidden in [
-            "app.path()",
             "registry.inner()",
-            "file_index.inner()",
             "prepare_file_query(",
             "begin_query(",
             "spawn_blocking",
@@ -1529,6 +1536,19 @@ mod tests {
             assert!(
                 body[..guard].find(forbidden).is_none(),
                 "{forbidden} occurs before caller guard"
+            );
+        }
+        assert!(body.contains("everything_search.inner()"));
+        for forbidden in [
+            "file_index.inner()",
+            "state::<Arc<FileIndex>>()",
+            "app.path()",
+            "app_data_dir",
+            "FileIndex::search",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "search_files contains {forbidden}"
             );
         }
     }
@@ -1796,10 +1816,8 @@ mod tests {
         let result = execute_result_with(
             ("request", "result"),
             |_, _| {
-                Ok(ResultAction::OpenIndexedPath(file_action(
-                    4,
-                    "blocked.txt",
-                    IndexedKind::File,
+                Ok(ResultAction::OpenFile(FileExecutionAction::Indexed(
+                    file_action(4, "blocked.txt", IndexedKind::File),
                 )))
             },
             |_| {
@@ -2327,7 +2345,7 @@ mod tests {
         }
 
         async fn no_file_execution(
-            _: OpenIndexedPath,
+            _: FileExecutionAction,
         ) -> Result<FileExecutionOutcome, CommandError> {
             unreachable!()
         }
@@ -2722,13 +2740,13 @@ mod tests {
     #[test]
     fn execute_result_preserves_application_branch_and_isolates_file_branch() {
         let volume = VolumeIdentity::for_test(r"\\?\Volume{EXECUTION}\", 41, "ntfs");
-        let file = ResultAction::OpenIndexedPath(OpenIndexedPath::for_test(
+        let file = ResultAction::OpenFile(FileExecutionAction::Indexed(OpenIndexedPath::for_test(
             7,
             19,
             volume,
             r"docs\report.pdf",
             IndexedKind::File,
-        ));
+        )));
         let application_calls = Cell::new(0);
         let file_calls = Cell::new(0);
         let hide_calls = Cell::new(0);
@@ -2760,5 +2778,75 @@ mod tests {
         assert_eq!(file_calls.get(), 1);
         assert_eq!(hide_calls.get(), 1);
         assert_eq!(later_application_calls.get(), 0);
+    }
+
+    #[test]
+    fn execute_file_action_dispatches_each_backend_once() {
+        for (action, expected_backend) in [
+            (
+                FileExecutionAction::Indexed(file_action(1, "report.pdf", IndexedKind::File)),
+                "indexed",
+            ),
+            (
+                FileExecutionAction::Everything(everything_action_for_test()),
+                "everything",
+            ),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let outcome = execute_file_action_with(
+                action,
+                |action| {
+                    calls.borrow_mut().push(("indexed", action.kind_for_test()));
+                    Ok(FileExecutionOutcome::FileRevealRequested)
+                },
+                |action| {
+                    calls
+                        .borrow_mut()
+                        .push(("everything", action.kind_for_test()));
+                    Ok(FileExecutionOutcome::FileRevealRequested)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(outcome, FileExecutionOutcome::FileRevealRequested);
+            assert_eq!(
+                calls.borrow().as_slice(),
+                [(expected_backend, FilePathKind::File)]
+            );
+        }
+    }
+    #[test]
+    fn production_execute_result_dispatches_both_file_backends() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let start = production
+            .find("pub(crate) async fn execute_result(")
+            .expect("execute_result command is missing");
+        let command = &production[start..production.find("struct ClipboardExecution").unwrap()];
+
+        for required in [
+            "let file_index = app.state::<Arc<FileIndex>>();",
+            "let worker_index = Arc::clone(file_index.inner());",
+            "execute_file_action_with(",
+            "|action| worker_index.execute_indexed_path(action),",
+            "|action| path_auth::execute_authenticated_path(action.identity()),",
+        ] {
+            assert!(
+                command.contains(required),
+                "missing production dispatch: {required}"
+            );
+        }
+        assert!(!command.contains("action.into_everything()"));
+
+        assert_eq!(
+            production
+                .matches("fn execute_file_action_with<I, E>(")
+                .count(),
+            1
+        );
+        assert!(!production.contains("#[cfg(test)]\nfn execute_file_action_with<I, E>("));
     }
 }

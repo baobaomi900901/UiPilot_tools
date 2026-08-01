@@ -28,7 +28,7 @@ import ReactMarkdown from 'react-markdown'
 
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
-import type { ControlKey, FileCategory, FileResultKind, ThemePreference } from './protocol'
+import type { ControlKey, FileResultKind, ThemePreference } from './protocol'
 import {
   formatHotkeyDisplay,
   reduceHotkeyRecorder,
@@ -75,18 +75,6 @@ function composing(event: ReactKeyboardEvent): boolean {
   return event.nativeEvent.isComposing
 }
 
-const fileCategories: readonly { value: FileCategory; label: string }[] = [
-  { value: 'all', label: '全部' },
-  { value: 'folder', label: '文件夹' },
-  { value: 'excel', label: 'Excel' },
-  { value: 'word', label: 'Word' },
-  { value: 'ppt', label: 'PPT' },
-  { value: 'pdf', label: 'PDF' },
-  { value: 'image', label: '图片' },
-  { value: 'video', label: '视频' },
-  { value: 'audio', label: '音频' },
-  { value: 'archive', label: '压缩包' },
-]
 
 const pluginMarkdownElements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'li', 'em', 'strong', 'code', 'pre']
 
@@ -305,22 +293,10 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       : '')
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (event.altKey && (event.key.toLowerCase() === 's' || event.key.toLowerCase() === 'p')) {
+    if (event.altKey && event.key.toLowerCase() === 'p') {
       if (composing(event) || !file) return
       event.preventDefault()
-      if (event.key.toLowerCase() === 's') {
-        core.setFileSort(file.sort === 'modifiedDesc' ? 'modifiedAsc' : 'modifiedDesc')
-      } else {
-        core.setFilePreviewEnabled(!file.previewEnabled)
-      }
-      return
-    }
-    if (event.key === 'Tab' && file && !composing(event)) {
-      event.preventDefault()
-      const current = fileCategories.findIndex((category) => category.value === file.category)
-      const offset = event.shiftKey ? -1 : 1
-      const nextIndex = (current + offset + fileCategories.length) % fileCategories.length
-      core.setFileCategory(fileCategories[nextIndex]!.value)
+      core.setFilePreviewEnabled(!file.previewEnabled)
       return
     }
     if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
@@ -434,32 +410,6 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         onBound={reportQueryBound}
         onBindingFailed={reportFailed}
       />
-      <div className="file-category-strip" role="tablist" aria-label="文件类型">
-        {fileCategories.map((category, index) => (
-          <Button
-            key={category.value}
-            role="tab"
-            tabIndex={file.category === category.value ? 0 : -1}
-            aria-selected={file.category === category.value}
-            type={file.category === category.value ? 'primary' : 'default'}
-            onClick={() => core.setFileCategory(category.value)}
-            onKeyDown={(event) => {
-              if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return
-              event.preventDefault()
-              const offset = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1
-              const nextIndex =
-                event.key === 'Home'
-                  ? 0
-                  : event.key === 'End'
-                    ? fileCategories.length - 1
-                    : (index + offset + fileCategories.length) % fileCategories.length
-              core.setFileCategory(fileCategories[nextIndex]!.value)
-            }}
-          >
-            {category.label}
-          </Button>
-        ))}
-      </div>
       <Spin spinning={snapshot.searchPending} size="small">
         <div id="file-results" className="result-list file-result-list" role="listbox" aria-label="文件结果">
           {file.results.map((item, index) => (
@@ -521,9 +471,6 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       </aside>
       <footer className="file-toolbar">
         <span>{file.indexStatus === 'building' ? `正在索引，已有 ${file.total} 条结果` : `共 ${file.total} 条结果`}</span>
-        <Button onClick={() => core.setFileSort(file.sort === 'modifiedDesc' ? 'modifiedAsc' : 'modifiedDesc')}>
-          {file.sort === 'modifiedDesc' ? '修改时间 ↓' : '修改时间 ↑'}
-        </Button>
         <Switch
           aria-label="文件预览"
           checked={file.previewEnabled}
