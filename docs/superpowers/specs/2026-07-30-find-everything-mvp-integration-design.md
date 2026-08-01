@@ -208,9 +208,9 @@ Authentication failure removes only that item. The rest of the result set may st
 Enter execution performs these steps:
 
 1. Resolve requestId/resultId from ResultRegistry.
-2. Reopen every path component from the authenticated volume root.
-3. Do not share FILE_SHARE_DELETE.
-4. Open reparse points themselves and reject any reparse component.
+2. Reopen every path component from the authenticated volume root with FILE_FLAG_OPEN_REPARSE_POINT.
+3. Inspect each opened component and reject it if FILE_ATTRIBUTE_REPARSE_POINT is present at inspection.
+4. Share only FILE_SHARE_READ | FILE_SHARE_WRITE, intentionally omitting FILE_SHARE_DELETE.
 5. Validate each resolved component remains on the expected volume and canonical relative path.
 6. Validate the final component volume serial, 128-bit file ID, and kind match EverythingPathAction.
 7. Hold all component handles while the Shell API runs.
@@ -218,7 +218,13 @@ Enter execution performs these steps:
 9. Open a directory with ShellExecuteExW.
 10. Release handles only after the Shell call returns.
 
-Parent rename, path substitution, junction insertion, reparse insertion, leaf replacement, and file/folder type change therefore fail closed.
+Every component is therefore checked with OPEN_REPARSE_POINT, and any reparse present at inspection is rejected. Because the handles do not share DELETE, parent or leaf rename, deletion, and replacement operations that require delete sharing fail while those handles remain held, through the return of the Shell call.
+
+### Accepted Post-MVP Reparse Hardening
+
+Windows share modes do not constrain FILE_WRITE_ATTRIBUTES. A malicious same-SID process that has or obtains suitable access may change reparse metadata in place between the final component inspection and path-based Shell resolution. This MVP does not claim to defend against that race.
+
+This residual risk is inherited from the legacy Indexed path-based Shell execution boundary. The user accepted it on 2026-07-31 for the shortest MVP path, and it is tracked as post-MVP hardening. This MVP does not add an ineffective FILE_SHARE_WRITE change or expand into a Shell/oplock refactor.
 
 Successful Shell dispatch clears and hides UiPilot. Stale, missing, denied, or failed dispatch leaves UiPilot visible and reports the existing mapped command error.
 
@@ -290,7 +296,7 @@ No error response contains a local path.
 - Preview still renders selected result metadata.
 - No streaming or revision refresh timer starts.
 - A late result cannot replace a newer query.
-- Unavailable search shows the existing unavailable status.
+- A rejected current search sets file.indexStatus to unavailable and preserves the mapped error status; without published result/request IDs, Enter remains inert.
 - Enter sends the current opaque requestId/resultId.
 
 ### Verification Gates

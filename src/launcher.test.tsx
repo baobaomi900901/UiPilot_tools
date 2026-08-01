@@ -2518,6 +2518,27 @@ describe('file mode ownership', () => {
     expect(core.getSnapshot().status).not.toContain('持续更新')
     core.destroy()
   })
+
+  it('marks a rejected current file search unavailable and keeps Enter inert', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockRejectedValueOnce({ code: 'searchUnavailable', message: 'private backend text' })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('file-search-rejected'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find report', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(core.getSnapshot().file?.indexStatus).toBe('unavailable'))
+    expect(core.getSnapshot().status).toBe('搜索暂不可用。')
+    expect(core.getSnapshot().file?.results).toEqual([])
+
+    core.keyDown('Enter', false)
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(core.getSnapshot().status).toBe('搜索暂不可用。')
+    core.destroy()
+  })
+
   it('starts no streaming or revision refresh timer', async () => {
     vi.useFakeTimers()
     try {

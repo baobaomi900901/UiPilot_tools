@@ -580,7 +580,7 @@ fn is_reserved_device_basename(component: &str) -> bool {
     let basename = component
         .split_once('.')
         .map_or(component, |(basename, _)| basename);
-    if ["CON", "PRN", "AUX", "NUL"]
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
         .iter()
         .any(|reserved| basename.eq_ignore_ascii_case(reserved))
     {
@@ -1121,6 +1121,10 @@ mod tests {
             "aux",
             "NUL.bin",
             "nul",
+            "CONIN$",
+            "conin$.txt",
+            "CONOUT$",
+            "conout$.log",
             "COM1",
             "com9.txt",
             "LPT1",

@@ -567,6 +567,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function failFileSearch(owner: FileSearchOwner, error: unknown): void {
     if (!ownsFileSearch(owner)) return
+    model.file!.indexStatus = 'unavailable'
     model.searchPending = false
     model.status = errorText(error)
     publish(true)

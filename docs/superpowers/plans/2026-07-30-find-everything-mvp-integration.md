@@ -294,7 +294,7 @@ fn read_file_id(handle: HANDLE) -> Result<[u8; 16], FileExecutionError> {
 }
 ```
 
-Open every component with `FILE_FLAG_OPEN_REPARSE_POINT`, add `FILE_FLAG_BACKUP_SEMANTICS` for directories, request `FILE_LIST_DIRECTORY` for directories and `FILE_READ_ATTRIBUTES` for file leaves, and pass only `FILE_SHARE_READ | FILE_SHARE_WRITE`. Reject `FILE_ATTRIBUTE_REPARSE_POINT` on every component.
+Open every component with `FILE_FLAG_OPEN_REPARSE_POINT`, add `FILE_FLAG_BACKUP_SEMANTICS` for directories, request `FILE_LIST_DIRECTORY` for directories and `FILE_READ_ATTRIBUTES` for file leaves, and pass only `FILE_SHARE_READ | FILE_SHARE_WRITE`, intentionally omitting `FILE_SHARE_DELETE`. Inspect every opened component and reject it when `FILE_ATTRIBUTE_REPARSE_POINT` is present.
 
 For publication, resolve the input path to its fixed-volume root, walk from that root, compare every observed canonical prefix, and return:
 
@@ -313,7 +313,15 @@ AuthenticatedPathSnapshot {
 }
 ```
 
-For execution, walk again, compare all identity fields, reconstruct the Shell target from the authenticated `volume_guid_path + relative_path` rather than trusting `display_path`, retain the `Vec<OwnedHandle>` in scope, invoke `SHOpenFolderAndSelectItems` for files or `ShellExecuteExW` for directories, and drop handles only after that call returns.
+For execution, walk again, compare all identity fields, reconstruct the Shell target from the authenticated `volume_guid_path + relative_path` rather than trusting `display_path`, retain the `Vec<OwnedHandle>` in scope, invoke `SHOpenFolderAndSelectItems` for files or `ShellExecuteExW` for directories, and drop handles only after that call returns. Reparse points present at inspection fail closed; because DELETE is not shared, parent or leaf rename, deletion, and replacement that require delete sharing fail while the handles are held through the Shell return.
+
+**Accepted post-MVP hardening boundary (2026-07-31):**
+
+Windows share modes do not constrain `FILE_WRITE_ATTRIBUTES`. A malicious same-SID process that has or obtains suitable access may change reparse metadata in place between the final component inspection and path-based Shell resolution. The MVP does not claim to defend against this race.
+
+This residual risk is inherited from legacy Indexed path-based Shell execution and was accepted by the user for the shortest MVP path. Track stronger protection as post-MVP hardening.
+
+Do not change `FILE_SHARE_READ | FILE_SHARE_WRITE` as a mitigation, and do not expand this MVP into a Shell/oplock refactor.
 
 - [ ] **Step 4: Make the legacy index delegate to the shared helper**
 
@@ -1000,6 +1008,8 @@ expect(fake.client.executeResult).toHaveBeenCalledWith({
   resultId: 'res-0000000000000001',
 })
 ```
+
+Add a rejection regression: when the current owner `searchFiles` call rejects, set `file.indexStatus` to `unavailable`, preserve the mapped error text, keep results empty when none were published, and ensure Enter does not call `executeResult`. A stale rejection remains ignored by the existing ownership guard.
 
 - [ ] **Step 2: Run focused frontend tests and confirm the red state**
 
