@@ -11,7 +11,7 @@ use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use super::windows::path_auth::{authenticate_path, AuthenticatedPathSnapshot};
 use super::{
-    EverythingPathAction, FileExecutionError, FilePathKind, FileResultKind, PublishedFileBatch,
+    EverythingPathAction, FileCategory, FileExecutionError, FilePathKind, FileResultKind, PublishedFileBatch,
     PublishedFileDraft,
 };
 
@@ -34,9 +34,14 @@ impl EverythingSearchState {
         }
     }
 
-    pub(crate) fn search(&self, query: &str) -> Result<PublishedFileBatch, EverythingSearchError> {
-        run_search_with(
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        category: FileCategory,
+    ) -> Result<PublishedFileBatch, EverythingSearchError> {
+        run_search_with_category(
             query,
+            category,
             &self.revision,
             |spec| {
                 query_cached_with(
@@ -67,8 +72,23 @@ fn literal_search_query(query: &str) -> Vec<u16> {
     search
 }
 
+#[cfg(test)]
 fn run_search_with<Q, A>(
     query: &str,
+    revision: &AtomicU64,
+    query_client: Q,
+    authenticate: A,
+) -> Result<PublishedFileBatch, EverythingSearchError>
+where
+    Q: FnOnce(EverythingQuerySpec) -> Result<EverythingQueryResult, EverythingClientError>,
+    A: FnMut(&EverythingResultItem) -> Result<AuthenticatedPathSnapshot, FileExecutionError>,
+{
+    run_search_with_category(query, FileCategory::All, revision, query_client, authenticate)
+}
+
+fn run_search_with_category<Q, A>(
+    query: &str,
+    category: FileCategory,
     revision: &AtomicU64,
     query_client: Q,
     mut authenticate: A,
@@ -82,7 +102,7 @@ where
     }
 
     let result = query_client(EverythingQuerySpec {
-        search: literal_search_query(query),
+        search: category_search_query(query, category),
         offset: 0,
         max_results: 200,
         request_flags: 0x155,
@@ -115,7 +135,6 @@ where
         items,
     })
 }
-
 fn published_draft(
     item: EverythingResultItem,
     snapshot: AuthenticatedPathSnapshot,
@@ -814,19 +833,6 @@ mod category_tests {
         );
         assert!(!query.contains("a b|!*?<>\""));
     }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileCategory {
-    All,
-    Folder,
-    Excel,
-    Word,
-    Ppt,
-    Pdf,
-    Image,
-    Video,
-    Audio,
-    Archive,
 }
 
 pub(crate) fn category_predicate(category: FileCategory) -> &'static str {

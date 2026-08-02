@@ -4,6 +4,38 @@ use crate::file_index::OpenIndexedPath;
 
 use self::windows::path_auth::AuthenticatedPathIdentity;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileCategory {
+    All,
+    Folder,
+    Excel,
+    Word,
+    Ppt,
+    Pdf,
+    Image,
+    Video,
+    Audio,
+    Archive,
+}
+impl FileCategory {
+    pub(crate) fn parse_wire(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "folder" => Some(Self::Folder),
+            "excel" => Some(Self::Excel),
+            "word" => Some(Self::Word),
+            "ppt" => Some(Self::Ppt),
+            "pdf" => Some(Self::Pdf),
+            "image" => Some(Self::Image),
+            "video" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
+            "archive" => Some(Self::Archive),
+            _ => None,
+        }
+    }
+}
+
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EverythingPathAction {
     identity: AuthenticatedPathIdentity,
