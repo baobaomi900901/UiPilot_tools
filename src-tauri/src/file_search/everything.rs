@@ -773,3 +773,84 @@ mod tests {
         assert!(Arc::ptr_eq(cached.as_ref().unwrap(), &replacement));
     }
 }
+#[cfg(test)]
+mod category_tests {
+    use super::{category_predicate, category_search_query, FileCategory};
+    #[test]
+    fn category_predicates_use_the_fixed_everything_filters() {
+        for (category, expected) in [
+            (FileCategory::All, ""),
+            (FileCategory::Folder, "folder:"),
+            (FileCategory::Excel, "file: ext:xls;xlsx;xlsm;xlsb;csv"),
+            (FileCategory::Word, "file: ext:doc;docx;docm;rtf"),
+            (FileCategory::Ppt, "file: ext:ppt;pptx;pptm"),
+            (FileCategory::Pdf, "file: ext:pdf"),
+            (
+                FileCategory::Image,
+                "file: ext:bmp;gif;heic;jpeg;jpg;png;svg;tif;tiff;webp",
+            ),
+            (
+                FileCategory::Video,
+                "file: ext:avi;m4v;mkv;mov;mp4;webm;wmv",
+            ),
+            (
+                FileCategory::Audio,
+                "file: ext:aac;flac;m4a;mp3;ogg;wav;wma",
+            ),
+            (FileCategory::Archive, "file: ext:7z;bz2;gz;rar;tar;tgz;zip"),
+        ] {
+            assert_eq!(category_predicate(category), expected);
+        }
+    }
+
+    #[test]
+    fn category_query_keeps_special_user_text_literal() {
+        let query =
+            String::from_utf16(&category_search_query("a b|!*?<>\"", FileCategory::Pdf)).unwrap();
+
+        assert_eq!(
+            query,
+            "nowildcards:#x61:#x20:#x62:#x7C:#x21:#x2A:#x3F:#x3C:#x3E:#x22: file: ext:pdf"
+        );
+        assert!(!query.contains("a b|!*?<>\""));
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileCategory {
+    All,
+    Folder,
+    Excel,
+    Word,
+    Ppt,
+    Pdf,
+    Image,
+    Video,
+    Audio,
+    Archive,
+}
+
+pub(crate) fn category_predicate(category: FileCategory) -> &'static str {
+    match category {
+        FileCategory::All => "",
+        FileCategory::Folder => "folder:",
+        FileCategory::Excel => "file: ext:xls;xlsx;xlsm;xlsb;csv",
+        FileCategory::Word => "file: ext:doc;docx;docm;rtf",
+        FileCategory::Ppt => "file: ext:ppt;pptx;pptm",
+        FileCategory::Pdf => "file: ext:pdf",
+        FileCategory::Image => "file: ext:bmp;gif;heic;jpeg;jpg;png;svg;tif;tiff;webp",
+        FileCategory::Video => "file: ext:avi;m4v;mkv;mov;mp4;webm;wmv",
+        FileCategory::Audio => "file: ext:aac;flac;m4a;mp3;ogg;wav;wma",
+        FileCategory::Archive => "file: ext:7z;bz2;gz;rar;tar;tgz;zip",
+    }
+}
+
+pub(crate) fn category_search_query(query: &str, category: FileCategory) -> Vec<u16> {
+    let mut search = literal_search_query(query);
+    let predicate = category_predicate(category);
+    if !predicate.is_empty() {
+        search.push(b' ' as u16);
+        search.extend(predicate.encode_utf16());
+    }
+
+    search
+}
