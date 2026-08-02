@@ -40,6 +40,7 @@ export interface LauncherCore {
   readonly setHotkeyCanonical: (value: string) => void
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
+  readonly cycleFileCategory: (direction: 'next' | 'previous') => void
   readonly setFileSort: (sort: FileSort) => void
   readonly setFilePreviewEnabled: (enabled: boolean) => void
   readonly resetSettings: () => Promise<void>
@@ -206,6 +207,18 @@ const THEME_PREFERENCE_ERROR = '无法保存风格设置。'
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
 const ICON_PREFIX = 'data:image/png;base64,'
 const MAX_ICON_LENGTH = 65_536
+export const FILE_CATEGORY_ORDER: readonly FileCategory[] = [
+  'all',
+  'folder',
+  'excel',
+  'word',
+  'ppt',
+  'pdf',
+  'image',
+  'video',
+  'audio',
+  'archive',
+]
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 
 function safeApplicationIcon(value: unknown): string | undefined {
@@ -1389,8 +1402,31 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     listeners.clear()
   }
 
-  function setFileCategory(_category: FileCategory): void {
-    if (model.file) model.file.category = 'all'
+  function setFileCategory(category: FileCategory): void {
+    const file = model.file
+    if (model.launcherMode !== 'files' || !file || file.category === category) return
+    file.category = category
+    file.results = []
+    file.selectedIndex = -1
+    file.total = '0'
+    model.requestId = undefined
+    model.status = ''
+    searchToken = ++token
+    model.searchPending = false
+    if (model.query.length === 0 || !nextFileSequence()) {
+      publish(true)
+      return
+    }
+    beginFileSearch()
+  }
+
+  function cycleFileCategory(direction: 'next' | 'previous'): void {
+    const file = model.file
+    if (model.launcherMode !== 'files' || !file) return
+    const index = FILE_CATEGORY_ORDER.indexOf(file.category)
+    const offset = direction === 'next' ? 1 : -1
+    const nextIndex = (index + offset + FILE_CATEGORY_ORDER.length) % FILE_CATEGORY_ORDER.length
+    setFileCategory(FILE_CATEGORY_ORDER[nextIndex]!)
   }
 
   function setFileSort(_sort: FileSort): void {
@@ -1464,6 +1500,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setHotkeyCanonical,
     saveHotkeyCanonical,
     setFileCategory,
+    cycleFileCategory,
     setFileSort,
     setFilePreviewEnabled,
     resetSettings,

@@ -2982,20 +2982,41 @@ describe('file mode ownership', () => {
     expect(fake.client.executeResult).toHaveBeenCalledWith({ requestId: 'req-0000000000000001', resultId: 'res-0000000000000001' })
   })
 
-  it('keeps compatibility setters fixed without a new search', async () => {
+  it('requeries a nonempty keyword when the file category changes', async () => {
     const fake = fakeClient()
-    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1'))
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
     const core = createLauncherCore(fake.client)
     await core.start()
-    fake.emit(shown('fixed-options'))
+    fake.emit(shown('category-search'))
     const control = core.getSnapshot().queryControl
     core.text({ kind: 'ordinaryInput', control, value: '/find report', inputType: 'insertText' })
     core.keyDown('Enter', false)
     await vi.waitFor(() => expect(core.getSnapshot().file).toBeDefined())
+
     core.setFileCategory('pdf')
-    core.setFileSort('modifiedAsc')
-    expect(fake.client.searchFiles).toHaveBeenCalledTimes(1)
-    expect(core.getSnapshot().file).toMatchObject({ category: 'all', sort: 'modifiedDesc' })
+    expect(fake.client.searchFiles).toHaveBeenCalledTimes(2)
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith(
+      expect.objectContaining({ query: 'report', category: 'pdf', sort: 'modifiedDesc' }),
+    )
+    expect(core.getSnapshot().file).toMatchObject({ category: 'pdf', total: '0', results: [] })
+  })
+
+  it('cycles categories in both directions and wraps', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('1'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('category-cycle'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find report', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().file).toBeDefined())
+
+    core.cycleFileCategory('previous')
+    expect(core.getSnapshot().file?.category).toBe('archive')
+    core.cycleFileCategory('next')
+    expect(core.getSnapshot().file?.category).toBe('all')
+    expect(fake.client.searchFiles).toHaveBeenCalledTimes(3)
   })
 })
 describe('file panel accessibility', () => {
@@ -3029,6 +3050,34 @@ describe('file panel accessibility', () => {
     await mounted.unmount()
   })
 })
+describe('file category navigation', () => {
+  it('renders categories and cycles them from the file query input', async () => {
+    installMatchMedia(false)
+    const { core, mounted } = await startedFileView()
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    expect([...mounted.host.querySelectorAll('.file-category')].map((button) => button.textContent)).toEqual([
+      '全部',
+      '文件夹',
+      'Excel',
+      'Word',
+      'PPT',
+      'PDF',
+      '图片',
+      '视频',
+      '音频',
+      '压缩包',
+    ])
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true })))
+    expect(core.getSnapshot().file?.category).toBe('folder')
+    expect(document.activeElement).toBe(input)
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true })))
+    expect(core.getSnapshot().file?.category).toBe('all')
+    expect(document.activeElement).toBe(input)
+    await mounted.unmount()
+  })
+})
 describe('file panel responsive layout', () => {
   it('keeps the file UI in one scoped responsive surface without extra component families', () => {
     expect(launcherViewSource).toContain('className="file-workspace"')
@@ -3045,7 +3094,8 @@ describe('file panel responsive layout', () => {
     expect(filePanelSource).not.toContain('<Select')
     expect(stylesSource).toContain('.file-workspace')
     expect(stylesSource).toContain('grid-template-areas')
-    expect(stylesSource).not.toContain('categories results preview')
+    expect(stylesSource).toContain('categories results preview')
+    expect(stylesSource).toContain('.file-categories')
     expect(stylesSource).toContain('.file-preview')
     expect(stylesSource).toContain('@media (max-width: 600px)')
     expect(stylesSource).toContain('@media (forced-colors: active)')

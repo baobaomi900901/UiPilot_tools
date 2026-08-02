@@ -28,7 +28,7 @@ import ReactMarkdown from 'react-markdown'
 
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
-import type { ControlKey, FileResultKind, ThemePreference } from './protocol'
+import type { ControlKey, FileCategory, FileResultKind, ThemePreference } from './protocol'
 import {
   formatHotkeyDisplay,
   reduceHotkeyRecorder,
@@ -84,6 +84,18 @@ const themeOptions = [
   { value: 'light', label: 'Light' },
 ] satisfies { value: ThemePreference; label: string }[]
 
+const fileCategoryOptions = [
+  { value: 'all', label: '全部' },
+  { value: 'folder', label: '文件夹' },
+  { value: 'excel', label: 'Excel' },
+  { value: 'word', label: 'Word' },
+  { value: 'ppt', label: 'PPT' },
+  { value: 'pdf', label: 'PDF' },
+  { value: 'image', label: '图片' },
+  { value: 'video', label: '视频' },
+  { value: 'audio', label: '音频' },
+  { value: 'archive', label: '压缩包' },
+] satisfies readonly { value: FileCategory; label: string }[]
 type SettingsTabKey = 'general' | 'plugins'
 
 interface SettingsTabSelection {
@@ -293,6 +305,18 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       : '')
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (
+      event.key === 'Tab' &&
+      snapshot.file &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey
+    ) {
+      if (composing(event)) return
+      event.preventDefault()
+      core.cycleFileCategory(event.shiftKey ? 'previous' : 'next')
+      return
+    }
     if (event.altKey && event.key.toLowerCase() === 'p') {
       if (composing(event) || !file) return
       event.preventDefault()
@@ -337,6 +361,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         onBound={reportQueryBound}
         onBindingFailed={reportFailed}
       />
+
       <Spin spinning={snapshot.searchPending} size="small">
         <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
           {snapshot.results.map((item, index) => (
@@ -410,6 +435,23 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         onBound={reportQueryBound}
         onBindingFailed={reportFailed}
       />
+      <nav className="file-categories" aria-label="文件分类">
+        {fileCategoryOptions.map(({ value, label }) => (
+          <button
+            key={value}
+            type="button"
+            className={file.category === value ? 'file-category is-selected' : 'file-category'}
+            aria-current={file.category === value ? 'page' : undefined}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              core.setFileCategory(value)
+              queryRef.current?.focus()
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
       <Spin spinning={snapshot.searchPending} size="small">
         <div id="file-results" className="result-list file-result-list" role="listbox" aria-label="文件结果">
           {file.results.map((item, index) => (
