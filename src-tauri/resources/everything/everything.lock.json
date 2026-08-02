@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "version": "1.4.1.1032",
+  "architecture": "x64",
+  "artifactFileName": "Everything-1.4.1.1032.x64.zip",
+  "sourceUrl": "https://www.voidtools.com/Everything-1.4.1.1032.x64.zip",
+  "artifactSha256": "698df475ec44e638f66f1b6a32d28fea613cec78d3b6310e6abe53431eeb940c",
+  "everythingExeSha256": "f191f756996a14a11e5445fa7103d302efd510cf2fbf920e6c0c8ed51d512e36",
+  "authenticodePublisher": "CN=voidtools PTY LTD, O=voidtools PTY LTD, L=Wilmington, S=South Australia, C=AU, SERIALNUMBER=624 373 397, OID.2.5.4.15=Private Organization, OID.1.3.6.1.4.1.311.60.2.1.3=AU",
+  "license": "MIT",
+  "licenseUrl": "https://www.voidtools.com/License.txt",
+  "licenseSha256": "c13d19adcbfd5d07e9512de9df99956a3423399ed1fadc5fd33186697ad8df2f"
+}

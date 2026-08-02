@@ -107,6 +107,12 @@ launcher-view.tsx renders the category navigation only in file mode. Each catego
 
 The view does not add a sort control or expose Everything syntax. Preview, Enter, double-click, unavailable state, and status text remain unchanged.
 
+## Development Runtime
+
+npm run dev invokes scripts/dev-with-everything.ps1 before Vite. The wrapper uses the reviewed src-tauri/resources/everything/Everything.exe resource, or the equivalent local third-party copy, and starts it with -startup when no Everything process is already running. It waits for the process startup window, then starts Vite on port 1420. On exit it stops only the process started by the wrapper.
+
+The executable and its license/lock are bundle resources. A fresh checkout must run powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-everything.ps1 once when the ignored local resource is absent. This development bootstrap does not implement the production installer, Windows Service, owner policy, or runtime supervisor.
+
 ## Error Behavior
 
 - Invalid category: invalidFileQuery; no search or registry mutation occurs.
@@ -137,7 +143,7 @@ The view does not add a sort control or expose Everything syntax. Preview, Enter
 
 ### Manual acceptance
 
-With Everything running and a non-empty keyword matching multiple types:
+After npm run dev has started Everything, use a non-empty keyword matching multiple types:
 
 1. /find shows the left category panel.
 2. Each category returns only its declared file/folder class.
@@ -152,7 +158,7 @@ With Everything running and a non-empty keyword matching multiple types:
 - Sort selection or a new sort protocol.
 - Local filtering of the current result list.
 - Per-extension multi-query merging.
-- Pagination, background refresh, installer/runtime management, permissions, or multi-user policy.
+- Pagination, background refresh, production installer/Service management, permissions, or multi-user policy.
 
 ## Official Reference
 

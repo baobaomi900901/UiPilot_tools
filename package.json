@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "test": "vitest run",
-    "dev": "vite --port 1420",
+    "dev": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-with-everything.ps1",
+    "dev:vite": "vite --port 1420",
     "build": "tsc --noEmit && vite build",
     "tauri": "tauri"
   },
