@@ -10,7 +10,7 @@ use crate::{
     file_search::{
         everything::{EverythingSearchError, EverythingSearchState},
         windows::path_auth,
-        FileExecutionAction, FileExecutionError, FileExecutionOutcome, FileIndexStatus,
+        FileCategory, FileExecutionAction, FileExecutionError, FileExecutionOutcome, FileIndexStatus,
         FileResultItem, FileSearchResponse, PublishedFileBatch, PublishedFileDraft,
     },
     hotkey::HotkeyKind,
@@ -433,6 +433,7 @@ where
 
 struct PreparedFileQuery {
     query: String,
+    category: FileCategory,
     invocation_id: String,
     query_sequence: u64,
 }
@@ -444,11 +445,12 @@ fn prepare_file_query(
     invocation_id: String,
     query_sequence: u64,
 ) -> Result<PreparedFileQuery, CommandError> {
+    let category = FileCategory::parse_wire(&category);
     if query.is_empty()
         || query.len() > 1_024
         || query.chars().count() > 255
         || query.contains('\0')
-        || category != "all"
+        || category.is_none()
         || sort != "modifiedDesc"
         || invocation_id.is_empty()
         || query_sequence == 0
@@ -457,10 +459,10 @@ fn prepare_file_query(
     }
     Ok(PreparedFileQuery {
         query,
+        category: category.expect("validated file category"),
         invocation_id,
         query_sequence,
-    })
-}
+    })}
 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -477,7 +479,7 @@ pub(crate) async fn search_files(
     require_main_window(&window)?;
     let prepared = prepare_file_query(query, category, sort, invocation_id, query_sequence)?;
     let state = Arc::clone(everything_search.inner());
-    search_files_with(&registry, prepared, move |query| state.search(&query)).await
+    search_files_with(&registry, prepared, move |query, category| state.search(&query, category)).await
 }
 
 async fn search_files_with<S>(
@@ -486,7 +488,7 @@ async fn search_files_with<S>(
     search: S,
 ) -> Result<Option<FileSearchResponse>, CommandError>
 where
-    S: FnOnce(String) -> Result<PublishedFileBatch, EverythingSearchError> + Send + 'static,
+    S: FnOnce(String, FileCategory) -> Result<PublishedFileBatch, EverythingSearchError> + Send + 'static,
 {
     let token = match registry.begin_query(
         QueryDomain::File,
@@ -496,7 +498,7 @@ where
         Some(token) => token,
         None => return Ok(None),
     };
-    let batch = tauri::async_runtime::spawn_blocking(move || search(prepared.query))
+    let batch = tauri::async_runtime::spawn_blocking(move || search(prepared.query, prepared.category))
         .await
         .map_err(|_| CommandError::file_search_worker_failed())?
         .map_err(map_everything_search_error)?;
@@ -1148,7 +1150,7 @@ mod tests {
             FileExecutionOutcome, FileResultKind, IndexedKind, OpenIndexedPath, VolumeIdentity,
         },
         file_search::{
-            everything::EverythingSearchError, windows::path_auth::AuthenticatedPathIdentity,
+            everything::EverythingSearchError, windows::path_auth::AuthenticatedPathIdentity, FileCategory,
             EverythingPathAction, FileExecutionAction, FileIndexStatus, FilePathKind,
             PublishedFileBatch, PublishedFileDraft,
         },
@@ -1419,7 +1421,6 @@ mod tests {
         .is_ok());
         for invalid in [
             ("", "all", "modifiedDesc"),
-            ("report", "pdf", "modifiedDesc"),
             ("report", "all", "modifiedAsc"),
         ] {
             assert!(matches!(
@@ -1475,8 +1476,9 @@ mod tests {
         let response = tauri::async_runtime::block_on(search_files_with(
             &ready_registry("inv"),
             prepared_query("report", "inv", 1),
-            move |query| {
+            move |query, category| {
                 assert_eq!(query, "report");
+                assert_eq!(category, FileCategory::All);
                 worker_calls.fetch_add(1, Ordering::AcqRel);
                 Ok(everything_batch_for_test(7, 2))
             },
