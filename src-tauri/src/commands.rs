@@ -10,8 +10,9 @@ use crate::{
     file_search::{
         everything::{EverythingSearchError, EverythingSearchState},
         windows::path_auth,
-        FileCategory, FileExecutionAction, FileExecutionError, FileExecutionOutcome, FileIndexStatus,
-        FileResultItem, FileSearchResponse, PublishedFileBatch, PublishedFileDraft,
+        FileCategory, FileExecutionAction, FileExecutionError, FileExecutionOutcome,
+        FileIndexStatus, FileResultItem, FileSearchResponse, PublishedFileBatch,
+        PublishedFileDraft,
     },
     hotkey::HotkeyKind,
     lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
@@ -462,7 +463,8 @@ fn prepare_file_query(
         category: category.expect("validated file category"),
         invocation_id,
         query_sequence,
-    })}
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -479,7 +481,10 @@ pub(crate) async fn search_files(
     require_main_window(&window)?;
     let prepared = prepare_file_query(query, category, sort, invocation_id, query_sequence)?;
     let state = Arc::clone(everything_search.inner());
-    search_files_with(&registry, prepared, move |query, category| state.search(&query, category)).await
+    search_files_with(&registry, prepared, move |query, category| {
+        state.search(&query, category)
+    })
+    .await
 }
 
 async fn search_files_with<S>(
@@ -488,7 +493,9 @@ async fn search_files_with<S>(
     search: S,
 ) -> Result<Option<FileSearchResponse>, CommandError>
 where
-    S: FnOnce(String, FileCategory) -> Result<PublishedFileBatch, EverythingSearchError> + Send + 'static,
+    S: FnOnce(String, FileCategory) -> Result<PublishedFileBatch, EverythingSearchError>
+        + Send
+        + 'static,
 {
     let token = match registry.begin_query(
         QueryDomain::File,
@@ -498,10 +505,11 @@ where
         Some(token) => token,
         None => return Ok(None),
     };
-    let batch = tauri::async_runtime::spawn_blocking(move || search(prepared.query, prepared.category))
-        .await
-        .map_err(|_| CommandError::file_search_worker_failed())?
-        .map_err(map_everything_search_error)?;
+    let batch =
+        tauri::async_runtime::spawn_blocking(move || search(prepared.query, prepared.category))
+            .await
+            .map_err(|_| CommandError::file_search_worker_failed())?
+            .map_err(map_everything_search_error)?;
     Ok(publish_everything_search(registry, token, batch))
 }
 
@@ -1150,8 +1158,8 @@ mod tests {
             FileExecutionOutcome, FileResultKind, IndexedKind, OpenIndexedPath, VolumeIdentity,
         },
         file_search::{
-            everything::EverythingSearchError, windows::path_auth::AuthenticatedPathIdentity, FileCategory,
-            EverythingPathAction, FileExecutionAction, FileIndexStatus, FilePathKind,
+            everything::EverythingSearchError, windows::path_auth::AuthenticatedPathIdentity,
+            EverythingPathAction, FileCategory, FileExecutionAction, FileIndexStatus, FilePathKind,
             PublishedFileBatch, PublishedFileDraft,
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
@@ -1411,14 +1419,21 @@ mod tests {
 
     #[test]
     fn file_query_accepts_only_nonempty_all_modified_desc() {
-        assert!(prepare_file_query(
-            "report".into(),
-            "all".into(),
-            "modifiedDesc".into(),
-            "inv".into(),
-            1,
-        )
-        .is_ok());
+        for category in [
+            "all", "folder", "excel", "word", "ppt", "pdf", "image", "video", "audio", "archive",
+        ] {
+            assert!(
+                prepare_file_query(
+                    "report".into(),
+                    category.into(),
+                    "modifiedDesc".into(),
+                    "inv".into(),
+                    1,
+                )
+                .is_ok(),
+                "category {category} should be accepted",
+            );
+        }
         for invalid in [
             ("", "all", "modifiedDesc"),
             ("report", "all", "modifiedAsc"),

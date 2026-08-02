@@ -74,22 +74,54 @@ label,
 .file-workspace {
   display: grid;
   grid-template-areas:
-    "query query"
-    "results preview"
-    "toolbar toolbar";
-  grid-template-columns: minmax(0, 1fr) minmax(160px, 200px);
+    "query query query"
+    "categories results preview"
+    "toolbar toolbar toolbar";
+  grid-template-columns: 112px minmax(0, 1fr) minmax(160px, 200px);
   grid-template-rows: 44px minmax(0, 1fr) auto;
   gap: 8px;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
-
 .file-workspace > .ant-input {
   grid-area: query;
 }
 
 
+.file-categories {
+  grid-area: categories;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.file-category {
+  min-height: 32px;
+  padding: 4px 8px;
+  overflow: hidden;
+  color: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.file-category:hover {
+  background: #f0f0f0;
+}
+
+.file-category.is-selected {
+  color: #0067c0;
+  font-weight: 600;
+  background: #e8f2fb;
+}
 .file-result-list {
   grid-area: results;
 }
@@ -552,6 +584,15 @@ label,
   --result-scrollbar-thumb: rgba(217, 217, 217, 0.55);
 }
 
+.launcher-surface[data-color-scheme="dark"] .file-category:hover {
+  background: #303030;
+}
+
+.launcher-surface[data-color-scheme="dark"] .file-category.is-selected {
+  color: #69b1ff;
+  background: #263b4d;
+}
+
 .launcher-surface[data-color-scheme="dark"] .result-row.is-selected {
   background: #263b4d;
   box-shadow: inset 3px 0 #69b1ff;
@@ -572,13 +613,23 @@ label,
   .file-workspace {
     grid-template-areas:
       "query"
+      "categories"
       "results"
       "preview"
       "toolbar";
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: 44px minmax(96px, 1fr) minmax(96px, auto) auto;
+    grid-template-rows: 44px auto minmax(96px, 1fr) minmax(96px, auto) auto;
   }
 
+  .file-categories {
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .file-category {
+    flex: 0 0 auto;
+  }
   .file-toolbar {
     flex-wrap: wrap;
   }

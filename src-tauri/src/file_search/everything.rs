@@ -11,8 +11,8 @@ use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use super::windows::path_auth::{authenticate_path, AuthenticatedPathSnapshot};
 use super::{
-    EverythingPathAction, FileCategory, FileExecutionError, FilePathKind, FileResultKind, PublishedFileBatch,
-    PublishedFileDraft,
+    EverythingPathAction, FileCategory, FileExecutionError, FilePathKind, FileResultKind,
+    PublishedFileBatch, PublishedFileDraft,
 };
 
 pub(crate) struct EverythingSearchState {
@@ -83,7 +83,13 @@ where
     Q: FnOnce(EverythingQuerySpec) -> Result<EverythingQueryResult, EverythingClientError>,
     A: FnMut(&EverythingResultItem) -> Result<AuthenticatedPathSnapshot, FileExecutionError>,
 {
-    run_search_with_category(query, FileCategory::All, revision, query_client, authenticate)
+    run_search_with_category(
+        query,
+        FileCategory::All,
+        revision,
+        query_client,
+        authenticate,
+    )
 }
 
 fn run_search_with_category<Q, A>(
