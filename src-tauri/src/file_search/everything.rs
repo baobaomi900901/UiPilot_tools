@@ -47,13 +47,48 @@ impl EverythingSearchState {
                 query_cached_with(
                     &self.client,
                     spec,
-                    || EverythingClient::connect("", Duration::from_millis(250)),
+                    || {
+                        connect_ready_with(
+                            || EverythingClient::connect("", Duration::from_millis(250)),
+                            EverythingClient::query,
+                        )
+                    },
                     EverythingClient::query,
                 )
                 .map_err(|_| EverythingClientError::IpcUnavailable)
             },
             authenticate_everything_item,
         )
+    }
+}
+
+fn everything_index_probe_spec() -> Result<EverythingQuerySpec, EverythingClientError> {
+    Ok(EverythingQuerySpec {
+        search: Vec::new(),
+        offset: 0,
+        max_results: 1,
+        request_flags: 0x155,
+        sort: EverythingSort::DateModifiedDescending,
+        deadline: Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or(EverythingClientError::IpcUnavailable)?,
+    })
+}
+
+fn connect_ready_with<C, Connect, Probe>(
+    connect: Connect,
+    probe: Probe,
+) -> Result<C, EverythingClientError>
+where
+    Connect: FnOnce() -> Result<C, EverythingClientError>,
+    Probe: FnOnce(&C, EverythingQuerySpec) -> Result<EverythingQueryResult, EverythingClientError>,
+{
+    let client = connect()?;
+    let result = probe(&client, everything_index_probe_spec()?)?;
+    if result.total == 0 {
+        Err(EverythingClientError::IpcUnavailable)
+    } else {
+        Ok(client)
     }
 }
 
@@ -280,8 +315,9 @@ mod tests {
     use super::super::windows::path_auth::{AuthenticatedPathIdentity, AuthenticatedPathSnapshot};
     use super::super::{FileExecutionAction, FileExecutionError, FilePathKind, FileResultKind};
     use super::{
-        encode_literal_query, file_path_kind_for_attributes, filetime_to_rfc3339,
-        query_cached_with, run_search_with, EverythingSearchError, EverythingSearchState,
+        connect_ready_with, encode_literal_query, file_path_kind_for_attributes,
+        filetime_to_rfc3339, query_cached_with, run_search_with, EverythingSearchError,
+        EverythingSearchState,
     };
 
     const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
@@ -655,6 +691,69 @@ mod tests {
     #[derive(Debug)]
     struct TestClient {
         id: usize,
+    }
+
+    #[test]
+    fn connection_requires_a_nonempty_loaded_index() {
+        let captured = RefCell::new(None);
+        let empty = connect_ready_with(
+            || Ok(TestClient { id: 1 }),
+            |_, spec| {
+                *captured.borrow_mut() = Some(spec);
+                Ok(EverythingQueryResult {
+                    total: 0,
+                    request_flags: 0x155,
+                    sort_type: 14,
+                    items: Vec::new(),
+                })
+            },
+        );
+        assert!(matches!(empty, Err(EverythingClientError::IpcUnavailable)));
+        let spec = captured.borrow();
+        let spec = spec.as_ref().unwrap();
+        assert!(spec.search.is_empty());
+        assert_eq!(spec.max_results, 1);
+
+        assert_eq!(
+            connect_ready_with(
+                || Ok(TestClient { id: 2 }),
+                |_, _| Ok(EverythingQueryResult {
+                    total: 1,
+                    request_flags: 0x155,
+                    sort_type: 14,
+                    items: Vec::new(),
+                }),
+            )
+            .unwrap()
+            .id,
+            2
+        );
+    }
+
+    #[test]
+    fn failed_readiness_probe_is_not_cached() {
+        let slot = Mutex::new(None);
+        let result = query_cached_with(
+            &slot,
+            query_spec_for_test(),
+            || {
+                connect_ready_with(
+                    || Ok(TestClient { id: 1 }),
+                    |_, _| {
+                        Ok(EverythingQueryResult {
+                            total: 0,
+                            request_flags: 0x155,
+                            sort_type: 14,
+                            items: Vec::new(),
+                        })
+                    },
+                )
+            },
+            |_, _| unreachable!(),
+        );
+
+        assert_eq!(result, Err(EverythingSearchError::Unavailable));
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[test]

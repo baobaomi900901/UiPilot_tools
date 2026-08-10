@@ -5,7 +5,7 @@
   "scripts": {
     "test": "vitest run",
     "dev": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-with-everything.ps1",
-    "dev:vite": "vite --port 1420",
+    "dev:vite": "vite",
     "build": "tsc --noEmit && vite build",
     "tauri": "tauri"
   },

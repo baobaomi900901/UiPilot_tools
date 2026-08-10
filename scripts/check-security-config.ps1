@@ -55,7 +55,7 @@ if (
   $config.version -ne '0.2.0' -or
   $config.identifier -ne 'com.uipilot.launcher' -or
   $config.build.frontendDist -ne '../dist' -or
-  $config.build.devUrl -ne 'http://localhost:1420' -or
+  $config.build.devUrl -ne 'http://127.0.0.1:14321' -or
   $config.build.beforeDevCommand -ne 'npm run dev' -or
   $config.build.beforeBuildCommand -ne 'npm run build' -or
   $config.app.withGlobalTauri -ne $false -or
