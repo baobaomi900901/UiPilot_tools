@@ -17,7 +17,8 @@ use windows::Win32::{
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_QUERYENDSESSION,
+            GetForegroundWindow, WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
+            WM_QUERYENDSESSION,
         },
     },
 };
@@ -25,9 +26,13 @@ use windows::Win32::{
 use crate::{
     commands::clear_and_hide,
     file_index::FileIndex,
+    find_window::{
+        FindWindowController, FocusEffect, ForegroundWindow, ForwardFinish, NativeFocusSnapshot,
+        TransferFocusResult,
+    },
     hotkey::{DoubleTapModifier, HotkeyKind},
     hotkey_hook::HotkeyHook,
-    result_registry::ResultRegistry,
+    result_registry::{ResultRegistries, ResultRegistry},
     settings::{Settings, SettingsStore, SettingsUpdate, WindowPosition},
 };
 
@@ -1494,6 +1499,161 @@ fn save_window_position(app: &AppHandle) -> Result<(), ()> {
             y: position.y,
         })
         .map_err(|_| ())
+}
+
+fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, LifecycleError> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or(LifecycleError::WindowFailed)?;
+    let find = app
+        .get_webview_window("find")
+        .ok_or(LifecycleError::WindowFailed)?;
+    let main_focused = main
+        .is_focused()
+        .map_err(|_| LifecycleError::WindowFailed)?;
+    let find_focused = find
+        .is_focused()
+        .map_err(|_| LifecycleError::WindowFailed)?;
+    let main_hwnd = main.hwnd().map_err(|_| LifecycleError::WindowFailed)?;
+    let find_hwnd = find.hwnd().map_err(|_| LifecycleError::WindowFailed)?;
+    let foreground_hwnd = unsafe { GetForegroundWindow() };
+    let foreground = if foreground_hwnd == main_hwnd {
+        ForegroundWindow::Main
+    } else if foreground_hwnd == find_hwnd {
+        ForegroundWindow::Find
+    } else {
+        ForegroundWindow::Other
+    };
+    Ok(NativeFocusSnapshot {
+        main_focused,
+        find_focused,
+        foreground,
+    })
+}
+
+pub(crate) fn start_find_transfer(
+    app: &AppHandle,
+    controller: &FindWindowController,
+    registries: &ResultRegistries,
+) -> Result<(), LifecycleError> {
+    let initial = find_native_snapshot(app)?;
+    let Some(plan) = controller.admit_queued_transfer(initial, Instant::now()) else {
+        return Ok(());
+    };
+    let main = app
+        .get_webview_window("main")
+        .ok_or(LifecycleError::WindowFailed)?;
+    let find = app
+        .get_webview_window("find")
+        .ok_or(LifecycleError::WindowFailed)?;
+    let main_visible = main
+        .is_visible()
+        .map_err(|_| LifecycleError::WindowFailed)?;
+    let find_visible = find
+        .is_visible()
+        .map_err(|_| LifecycleError::WindowFailed)?;
+    let main_topmost = main
+        .is_always_on_top()
+        .map_err(|_| LifecycleError::WindowFailed)?;
+
+    let native_result = main
+        .set_always_on_top(false)
+        .and_then(|()| find.show())
+        .and_then(|()| find.set_focus());
+    if native_result.is_err() {
+        let _ = main.set_always_on_top(main_topmost);
+        if main_visible {
+            let _ = main.show();
+        } else {
+            let _ = main.hide();
+        }
+        if find_visible {
+            let _ = find.show();
+        } else {
+            let _ = find.hide();
+        }
+        if initial.main_focused {
+            let _ = main.set_focus();
+        } else if initial.find_focused {
+            let _ = find.set_focus();
+        }
+        controller.fail_transfer_before_ownership(plan.transfer_id);
+        return Err(LifecycleError::WindowFailed);
+    }
+
+    advance_find_transfer(app, controller, registries, plan.transfer_id)
+}
+
+pub(crate) fn advance_find_transfer(
+    app: &AppHandle,
+    controller: &FindWindowController,
+    registries: &ResultRegistries,
+    transfer_id: u64,
+) -> Result<(), LifecycleError> {
+    let snapshot = find_native_snapshot(app)?;
+    if controller.confirm_transfer_focus(transfer_id, snapshot)
+        != TransferFocusResult::CommitFindScope
+    {
+        return Ok(());
+    }
+    let payload = controller
+        .commit_find_scope(transfer_id, registries)
+        .map_err(|_| LifecycleError::InvocationExhausted)?;
+    let find = app
+        .get_webview_window("find")
+        .ok_or(LifecycleError::WindowFailed)?;
+    let emitted = find.emit("find://forward", &payload).is_ok();
+    let finish = controller.finish_forward_emit(transfer_id, emitted, registries);
+    if !emitted {
+        let _ = find.hide();
+        return Err(LifecycleError::WindowFailed);
+    }
+    if matches!(
+        finish,
+        ForwardFinish::Visible {
+            snapshot_required: true
+        }
+    ) {
+        start_find_transfer(app, controller, registries)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_find_focus_effect(
+    app: &AppHandle,
+    controller: &FindWindowController,
+    registries: &ResultRegistries,
+    effect: FocusEffect,
+) -> Result<(), LifecycleError> {
+    match effect {
+        FocusEffect::RecheckNativeSnapshot(transfer_id) => {
+            advance_find_transfer(app, controller, registries, transfer_id)
+        }
+        FocusEffect::RefocusFind => app
+            .get_webview_window("find")
+            .ok_or(LifecycleError::WindowFailed)?
+            .set_focus()
+            .map_err(|_| LifecycleError::WindowFailed),
+        FocusEffect::RestoreMainTopmost => app
+            .get_webview_window("main")
+            .ok_or(LifecycleError::WindowFailed)?
+            .set_always_on_top(true)
+            .map_err(|_| LifecycleError::WindowFailed),
+        FocusEffect::HideFind => {
+            let Some(invocation_id) = controller.current_invocation() else {
+                return Ok(());
+            };
+            let find = app
+                .get_webview_window("find")
+                .ok_or(LifecycleError::WindowFailed)?;
+            let hidden = find.hide().is_ok();
+            controller.finish_explicit_hide(&invocation_id, hidden, registries);
+            hidden.then_some(()).ok_or(LifecycleError::WindowFailed)
+        }
+        FocusEffect::None | FocusEffect::ExpectedHideConsumed | FocusEffect::ClearAndHideMain => {
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn install_session_end_hook(

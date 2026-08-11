@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "find-capability",
+  "description": "Exact permissions for the local find WebView",
+  "windows": ["find"],
+  "permissions": [
+    "allow-search-files",
+    "allow-execute-result",
+    "allow-prepare-find-initialization",
+    "allow-commit-find-ready",
+    "allow-get-find-ready-status",
+    "allow-set-find-pinned",
+    "allow-set-find-preview-preference",
+    "allow-hide-find-window",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

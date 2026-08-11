@@ -4,8 +4,8 @@
   "description": "Exact permissions for the local launcher WebView",
   "windows": ["main"],
   "permissions": [
+    "allow-open-find-window",
     "allow-search-apps",
-    "allow-search-files",
     "allow-execute-result",
     "allow-list-plugins",
     "allow-install-plugin",
@@ -14,7 +14,6 @@
     "allow-load-settings",
     "allow-save-settings",
     "allow-save-hotkey",
-    "allow-set-file-preview-preference",
     "allow-set-theme-preference",
     "allow-hide-launcher",
     "core:event:allow-listen",

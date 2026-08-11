@@ -1,7 +1,11 @@
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::{
@@ -14,14 +18,20 @@ use crate::{
         FileIndexStatus, FileResultItem, FileSearchResponse, PublishedFileBatch,
         PublishedFileDraft,
     },
+    find_window::{
+        ExecutionHideAdmission, FindReadyStatus, FindWindowController, HideFinish,
+        OpenFindCompletion,
+    },
     hotkey::HotkeyKind,
-    lifecycle::{CriticalReservation, LifecycleCoordinator, ReservationError},
+    lifecycle::{self, CriticalReservation, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
     plugins::{
         PluginCopyError, PluginInventorySnapshot, PluginManagementError, PluginManager,
         PluginMutationOutcome, PluginQueryError, PluginQueryStart,
     },
-    result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
+    result_registry::{
+        QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
+    },
     settings::{SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WindowPosition},
 };
 
@@ -66,6 +76,84 @@ pub(crate) struct FilePreviewPreferenceUpdate {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ThemePreferenceUpdate {
     theme: ThemePreference,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OpenFindInput {
+    query: String,
+    invocation_id: String,
+    query_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub(crate) enum OpenFindOutcome {
+    Forwarded,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FindInitializationPrepared {
+    initialization_token: String,
+    theme_revision: String,
+    theme: ThemePreference,
+    file_preview_revision: String,
+    file_preview_enabled: bool,
+    pinned: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub(crate) enum FindReadyOutcome {
+    Prepared {
+        initialization: FindInitializationPrepared,
+    },
+    Ready {
+        initialization_token: String,
+    },
+    Superseded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct FindInitializationInput {
+    initialization_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct FindPinUpdate {
+    invocation_id: String,
+    pinned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FindPinResult {
+    pinned: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FindPreviewPreferenceResult {
+    file_preview_revision: String,
+    file_preview_enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FindThemeChanged {
+    theme_revision: String,
+    theme: ThemePreference,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct FindHideInput {
+    invocation_id: String,
+    force: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -237,6 +325,188 @@ fn require_main_window(window: &WebviewWindow) -> Result<(), CommandError> {
     require_main_label(window.label())
 }
 
+fn require_find_label(label: &str) -> Result<(), CommandError> {
+    (label == "find")
+        .then_some(())
+        .ok_or_else(CommandError::invalid_caller)
+}
+
+fn require_find_window(window: &WebviewWindow) -> Result<(), CommandError> {
+    require_find_label(window.label())
+}
+
+#[tauri::command]
+pub(crate) async fn open_find_window(
+    window: WebviewWindow,
+    input: OpenFindInput,
+    app: AppHandle,
+    registries: State<'_, ResultRegistries>,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<OpenFindOutcome, CommandError> {
+    require_main_window(&window)?;
+    if input.invocation_id.is_empty()
+        || input.query_sequence == 0
+        || input.query.len() > 1_024
+        || input.query.contains('\0')
+    {
+        return Err(CommandError::invalid_file_query());
+    }
+    let retirement = registries
+        .main()
+        .prepare_application_query_retirement(&input.invocation_id, input.query_sequence)
+        .map_err(|_| CommandError::stale_request())?
+        .ok_or_else(CommandError::stale_request)?;
+    let submission = controller
+        .submit_open(input.query, retirement, Instant::now())
+        .map_err(|_| CommandError::window_failed())?;
+    if submission.snapshot_required {
+        lifecycle::start_find_transfer(&app, controller.inner().as_ref(), &registries)
+            .map_err(|_| CommandError::window_failed())?;
+    }
+    let wait_controller = Arc::clone(controller.inner());
+    let completion = tauri::async_runtime::spawn_blocking(move || loop {
+        match submission
+            .completion
+            .recv_timeout(Duration::from_millis(50))
+        {
+            Ok(outcome) => break Some(outcome),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                wait_controller.expire(Instant::now());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+        }
+    })
+    .await
+    .map_err(|_| CommandError::window_failed())?;
+    match completion {
+        Some(OpenFindCompletion::Forwarded) => Ok(OpenFindOutcome::Forwarded),
+        Some(OpenFindCompletion::Superseded) => Ok(OpenFindOutcome::Superseded),
+        Some(OpenFindCompletion::Unavailable) | None => {
+            controller.expire(Instant::now());
+            Err(CommandError::window_failed())
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn prepare_find_initialization(
+    window: WebviewWindow,
+    settings: State<'_, SettingsStore>,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<FindReadyOutcome, CommandError> {
+    require_find_window(&window)?;
+    let preferences = settings.find_preference_snapshot();
+    let prepared = controller
+        .prepare_initialization(Instant::now())
+        .map_err(|_| CommandError::window_failed())?;
+    Ok(FindReadyOutcome::Prepared {
+        initialization: FindInitializationPrepared {
+            initialization_token: prepared.token,
+            theme_revision: preferences.theme_revision.to_string(),
+            theme: preferences.theme,
+            file_preview_revision: preferences.file_preview_revision.to_string(),
+            file_preview_enabled: preferences.file_preview_enabled,
+            pinned: controller.pinned(),
+        },
+    })
+}
+
+#[tauri::command]
+pub(crate) fn commit_find_ready(
+    window: WebviewWindow,
+    input: FindInitializationInput,
+    app: AppHandle,
+    registries: State<'_, ResultRegistries>,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<FindReadyOutcome, CommandError> {
+    require_find_window(&window)?;
+    let commit = controller.commit_ready(&input.initialization_token, Instant::now());
+    if commit.snapshot_required {
+        lifecycle::start_find_transfer(&app, controller.inner().as_ref(), &registries)
+            .map_err(|_| CommandError::window_failed())?;
+    }
+    Ok(match commit.outcome {
+        FindReadyStatus::Ready => FindReadyOutcome::Ready {
+            initialization_token: input.initialization_token,
+        },
+        FindReadyStatus::Prepared => FindReadyOutcome::Superseded,
+        FindReadyStatus::Superseded => FindReadyOutcome::Superseded,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn get_find_ready_status(
+    window: WebviewWindow,
+    input: FindInitializationInput,
+    settings: State<'_, SettingsStore>,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<FindReadyOutcome, CommandError> {
+    require_find_window(&window)?;
+    Ok(
+        match controller.ready_status(&input.initialization_token, Instant::now()) {
+            FindReadyStatus::Ready => FindReadyOutcome::Ready {
+                initialization_token: input.initialization_token,
+            },
+            FindReadyStatus::Prepared => {
+                let preferences = settings.find_preference_snapshot();
+                FindReadyOutcome::Prepared {
+                    initialization: FindInitializationPrepared {
+                        initialization_token: input.initialization_token,
+                        theme_revision: preferences.theme_revision.to_string(),
+                        theme: preferences.theme,
+                        file_preview_revision: preferences.file_preview_revision.to_string(),
+                        file_preview_enabled: preferences.file_preview_enabled,
+                        pinned: controller.pinned(),
+                    },
+                }
+            }
+            FindReadyStatus::Superseded => FindReadyOutcome::Superseded,
+        },
+    )
+}
+
+#[tauri::command]
+pub(crate) fn set_find_pinned(
+    window: WebviewWindow,
+    input: FindPinUpdate,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<FindPinResult, CommandError> {
+    require_find_window(&window)?;
+    controller
+        .set_pin(&input.invocation_id, input.pinned)
+        .then_some(FindPinResult {
+            pinned: input.pinned,
+        })
+        .ok_or_else(CommandError::stale_request)
+}
+
+#[tauri::command]
+pub(crate) fn hide_find_window(
+    window: WebviewWindow,
+    input: FindHideInput,
+    app: AppHandle,
+    registries: State<'_, ResultRegistries>,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<(), CommandError> {
+    require_find_window(&window)?;
+    if !controller.request_explicit_hide(&input.invocation_id, input.force) {
+        if controller.pinned() && !input.force {
+            return Ok(());
+        }
+        return Err(CommandError::stale_request());
+    }
+    let hidden = window.hide().is_ok();
+    controller.finish_explicit_hide(&input.invocation_id, hidden, &registries);
+    if !hidden {
+        return Err(CommandError::window_failed());
+    }
+    if controller.queued_query().is_some() {
+        lifecycle::start_find_transfer(&app, controller.inner().as_ref(), &registries)
+            .map_err(|_| CommandError::window_failed())?;
+    }
+    Ok(())
+}
+
 fn list_plugins_with_label<L>(label: &str, list: L) -> Result<PluginInventorySnapshot, CommandError>
 where
     L: FnOnce() -> Result<PluginInventorySnapshot, PluginManagementError>,
@@ -273,12 +543,12 @@ pub(crate) async fn install_plugin(
     window: WebviewWindow,
     app: AppHandle,
     plugins: State<'_, Arc<PluginManager>>,
-    registry: State<'_, ResultRegistry>,
+    registries: State<'_, ResultRegistries>,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     plugin_id: String,
 ) -> Result<PluginMutationOutcome, CommandError> {
     install_plugin_with_label(window.label(), &coordinator, || {
-        plugins.install_plugin(&app, &registry, &plugin_id)
+        plugins.install_plugin(&app, registries.main(), &plugin_id)
     })
 }
 
@@ -302,12 +572,12 @@ pub(crate) async fn reload_plugin(
     window: WebviewWindow,
     app: AppHandle,
     plugins: State<'_, Arc<PluginManager>>,
-    registry: State<'_, ResultRegistry>,
+    registries: State<'_, ResultRegistries>,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     plugin_id: String,
 ) -> Result<PluginMutationOutcome, CommandError> {
     reload_plugin_with_label(window.label(), &coordinator, || {
-        plugins.reload_plugin(&app, &registry, &plugin_id)
+        plugins.reload_plugin(&app, registries.main(), &plugin_id)
     })
 }
 
@@ -331,12 +601,12 @@ pub(crate) async fn delete_plugin(
     window: WebviewWindow,
     app: AppHandle,
     plugins: State<'_, Arc<PluginManager>>,
-    registry: State<'_, ResultRegistry>,
+    registries: State<'_, ResultRegistries>,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     plugin_id: String,
 ) -> Result<PluginMutationOutcome, CommandError> {
     delete_plugin_with_label(window.label(), &coordinator, || {
-        plugins.delete_plugin(&app, &registry, &plugin_id)
+        plugins.delete_plugin(&app, registries.main(), &plugin_id)
     })
 }
 
@@ -349,7 +619,8 @@ pub(crate) async fn search_apps(
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
     let app = window.app_handle();
-    let registry = app.state::<ResultRegistry>();
+    let registries = app.state::<ResultRegistries>();
+    let registry = registries.main();
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let plugins = app.state::<Arc<PluginManager>>();
@@ -470,7 +741,8 @@ fn prepare_file_query(
 #[tauri::command]
 pub(crate) async fn search_files(
     window: WebviewWindow,
-    registry: State<'_, ResultRegistry>,
+    registries: State<'_, ResultRegistries>,
+    controller: State<'_, Arc<FindWindowController>>,
     everything_search: State<'_, Arc<EverythingSearchState>>,
     query: String,
     category: String,
@@ -478,17 +750,21 @@ pub(crate) async fn search_files(
     invocation_id: String,
     query_sequence: u64,
 ) -> Result<Option<FileSearchResponse>, CommandError> {
-    require_main_window(&window)?;
+    require_find_window(&window)?;
     let prepared = prepare_file_query(query, category, sort, invocation_id, query_sequence)?;
     let state = Arc::clone(everything_search.inner());
-    search_files_with(&registry, prepared, move |query, category| {
-        state.search(&query, category)
-    })
+    search_files_with(
+        registries.find(),
+        controller.inner().as_ref(),
+        prepared,
+        move |query, category| state.search(&query, category),
+    )
     .await
 }
 
 async fn search_files_with<S>(
     registry: &ResultRegistry,
+    controller: &FindWindowController,
     prepared: PreparedFileQuery,
     search: S,
 ) -> Result<Option<FileSearchResponse>, CommandError>
@@ -497,20 +773,23 @@ where
         + Send
         + 'static,
 {
-    let token = match registry.begin_query(
-        QueryDomain::File,
-        &prepared.invocation_id,
-        prepared.query_sequence,
-    ) {
-        Some(token) => token,
-        None => return Ok(None),
+    let invocation_id = prepared.invocation_id.clone();
+    let token = match controller.with_visible_admission(&invocation_id, || {
+        registry.begin_query(QueryDomain::File, &invocation_id, prepared.query_sequence)
+    }) {
+        Some(Some(token)) => token,
+        None | Some(None) => return Ok(None),
     };
     let batch =
         tauri::async_runtime::spawn_blocking(move || search(prepared.query, prepared.category))
             .await
             .map_err(|_| CommandError::file_search_worker_failed())?
             .map_err(map_everything_search_error)?;
-    Ok(publish_everything_search(registry, token, batch))
+    Ok(controller
+        .with_visible_admission(&invocation_id, || {
+            publish_everything_search(registry, token, batch)
+        })
+        .flatten())
 }
 
 fn map_everything_search_error(_: EverythingSearchError) -> CommandError {
@@ -771,10 +1050,21 @@ pub(crate) async fn set_theme_preference(
         || coordinator.reserve_critical(),
         move |reservation, preference| {
             let _reservation = reservation;
-            app_for_worker
+            let revision = app_for_worker
                 .state::<SettingsStore>()
-                .set_theme_preference(preference.theme)
-                .map_err(|_| ())
+                .set_theme_preference_with_revision(preference.theme)
+                .map_err(|_| ())?;
+            if let Some(find) = app_for_worker.get_webview_window("find") {
+                find.emit(
+                    "find://theme-changed",
+                    FindThemeChanged {
+                        theme_revision: revision.to_string(),
+                        theme: preference.theme,
+                    },
+                )
+                .map_err(|_| ())?;
+            }
+            Ok(())
         },
     )
     .await
@@ -826,6 +1116,40 @@ pub(crate) async fn set_file_preview_preference(
     .await
 }
 
+#[tauri::command]
+pub(crate) async fn set_find_preview_preference(
+    window: tauri::WebviewWindow,
+    preference: FilePreviewPreferenceUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+) -> Result<FindPreviewPreferenceResult, CommandError> {
+    require_find_window(&window)?;
+    let controller = app.state::<Arc<FindWindowController>>();
+    let Some(invocation_id) = controller.current_invocation() else {
+        return Err(CommandError::stale_request());
+    };
+    if !controller.admit_search(&invocation_id) {
+        return Err(CommandError::stale_request());
+    }
+    let app_for_worker = app.clone();
+    let reservation = coordinator.reserve_critical()?;
+    let enabled = preference.enabled;
+    let revision = tauri::async_runtime::spawn_blocking(move || {
+        let _reservation = reservation;
+        app_for_worker
+            .state::<SettingsStore>()
+            .set_file_preview_enabled_with_revision(enabled)
+            .map_err(|_| ())
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+    .map_err(|_| CommandError::settings_failed())?;
+    Ok(FindPreviewPreferenceResult {
+        file_preview_revision: revision.to_string(),
+        file_preview_enabled: enabled,
+    })
+}
+
 #[cfg(test)]
 fn save_settings_core(
     settings: UserSettingsUpdate,
@@ -846,10 +1170,63 @@ pub(crate) async fn execute_result(
     request_id: String,
     result_id: String,
 ) -> Result<ExecuteOutcome, CommandError> {
-    require_main_window(&window)?;
+    if window.label() != "main" && window.label() != "find" {
+        return Err(CommandError::invalid_caller());
+    }
     let app = window.app_handle().clone();
-    let registry = app.state::<ResultRegistry>();
+    let registries = app.state::<ResultRegistries>();
     let file_index = app.state::<Arc<FileIndex>>();
+    if window.label() == "find" {
+        let controller = app.state::<Arc<FindWindowController>>();
+        let (action, ticket) = registries
+            .find()
+            .resolve_with_ticket(&request_id, &result_id)
+            .map_err(|error| match error {
+                RegistryError::StaleRequest => CommandError::stale_request(),
+                RegistryError::UnknownResult => CommandError::unknown_result(),
+            })?;
+        let ResultAction::OpenFile(action) = action else {
+            return Err(CommandError::unknown_result());
+        };
+        let worker_index = Arc::clone(file_index.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            execute_file_action_with(
+                action,
+                |action| worker_index.execute_indexed_path(action),
+                |action| path_auth::execute_authenticated_path(action.identity()),
+            )
+            .map_err(map_file_execution_error)
+        })
+        .await
+        .map_err(|_| CommandError::file_open_failed())??;
+        let outcome = match result {
+            FileExecutionOutcome::FileRevealRequested => ExecuteOutcome::FileRevealRequested,
+            FileExecutionOutcome::FolderOpenRequested => ExecuteOutcome::FolderOpenRequested,
+        };
+        if controller.begin_execution_hide(&ticket, registries.find())
+            == ExecutionHideAdmission::Started
+        {
+            let hidden = window.hide().is_ok();
+            let finish = controller.finish_execution_hide(hidden, &registries);
+            if matches!(
+                finish,
+                HideFinish::Hidden {
+                    snapshot_required: true
+                } | HideFinish::Visible {
+                    snapshot_required: true
+                }
+            ) {
+                lifecycle::start_find_transfer(&app, controller.inner().as_ref(), &registries)
+                    .map_err(|_| CommandError::window_failed())?;
+            }
+            if !hidden {
+                return Err(CommandError::window_failed());
+            }
+        }
+        return Ok(outcome);
+    }
+
+    let registry = registries.main();
     let plugins = app.state::<Arc<PluginManager>>();
     let settings = app.state::<SettingsStore>();
     let cache = app.state::<Arc<AppCache>>();
@@ -1076,10 +1453,10 @@ fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> ExecuteOutcome {
 #[tauri::command]
 pub(crate) fn hide_launcher(
     window: WebviewWindow,
-    registry: State<'_, ResultRegistry>,
+    registries: State<'_, ResultRegistries>,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    clear_and_hide(&registry, &window)
+    clear_and_hide(registries.main(), &window)
 }
 
 pub(crate) fn clear_and_hide(
@@ -1146,9 +1523,9 @@ mod tests {
         execute_result_with, load_settings_core, load_settings_ready_with,
         map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
         map_theme_preference_worker_result, prepare_file_query, prepare_hotkey_save,
-        prepare_settings_save, publish_everything_search, require_main_label, save_settings_core,
-        save_settings_with, save_settings_worker_with, search_apps_with, search_files_with,
-        set_file_preview_preference_with, CommandError, ExecuteOutcome,
+        prepare_settings_save, publish_everything_search, require_find_label, require_main_label,
+        save_settings_core, save_settings_with, save_settings_worker_with, search_apps_with,
+        search_files_with, set_file_preview_preference_with, CommandError, ExecuteOutcome,
         FilePreviewPreferenceUpdate, HotkeySettingsUpdate, PreparedFileQuery,
         ThemePreferenceUpdate, UserSettingsUpdate,
     };
@@ -1299,6 +1676,11 @@ mod tests {
     #[test]
     fn caller_guard_rejects_non_main_commands_without_side_effects() {
         assert_eq!(require_main_label("main"), Ok(()));
+        assert_eq!(require_find_label("find"), Ok(()));
+        assert_eq!(
+            require_find_label("main"),
+            Err(CommandError::invalid_caller())
+        );
         for command in [
             "search_apps",
             "search_files",
@@ -1488,8 +1870,11 @@ mod tests {
     fn production_file_search_uses_everything_once_and_never_legacy_index() {
         let calls = Arc::new(AtomicUsize::new(0));
         let worker_calls = Arc::clone(&calls);
+        let controller = crate::find_window::FindWindowController::default();
+        controller.set_visible_for_test("inv");
         let response = tauri::async_runtime::block_on(search_files_with(
             &ready_registry("inv"),
+            &controller,
             prepared_query("report", "inv", 1),
             move |query, category| {
                 assert_eq!(query, "report");
@@ -1538,12 +1923,12 @@ mod tests {
         let body = &source[start..];
         let body = &body[..body.find("\n}").expect("search_files body missing")];
         let guard = body
-            .find("require_main_window(&window)?;")
-            .expect("main guard missing");
+            .find("require_find_window(&window)?;")
+            .expect("find guard missing");
         let opening_brace = body.find('{').expect("search_files opening brace missing");
         assert!(body[opening_brace + 1..]
             .trim_start()
-            .starts_with("require_main_window(&window)?;"));
+            .starts_with("require_find_window(&window)?;"));
         for forbidden in [
             "registry.inner()",
             "prepare_file_query(",
@@ -2069,7 +2454,7 @@ mod tests {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         let start = source.find("fn hide_launcher(").unwrap();
         let body = &source[start..source[start..].find("\n}\n").unwrap() + start + 3];
-        assert!(body.contains("clear_and_hide(&registry, &window)"));
+        assert!(body.contains("clear_and_hide(registries.main(), &window)"));
         assert!(!body.contains("registry.hide_and_clear"));
         assert!(!body.contains("window.hide()"));
     }
@@ -2090,7 +2475,6 @@ mod tests {
         let source = include_str!("commands.rs");
         for command in [
             "search_apps",
-            "execute_result",
             "load_settings",
             "save_settings",
             "hide_launcher",
@@ -2105,6 +2489,14 @@ mod tests {
                 "{command} must guard before state access or side effects"
             );
         }
+        let start = source.find("fn execute_result(").unwrap();
+        let body = &source[start..];
+        let first_statement = body[body.find('{').unwrap() + 1..].trim_start();
+        assert!(
+            first_statement
+                .starts_with("if window.label() != \"main\" && window.label() != \"find\""),
+            "execute_result must validate its exact caller before state access"
+        );
     }
 
     fn user_settings(hotkey: &str) -> UserSettingsUpdate {
@@ -2693,7 +3085,7 @@ mod tests {
             .find("pub(crate) async fn set_file_preview_preference(")
             .unwrap();
         let end = production[start..]
-            .find("#[cfg(test)]\nfn save_settings_core")
+            .find("#[tauri::command]\npub(crate) async fn set_find_preview_preference(")
             .map(|offset| start + offset)
             .unwrap();
         let command = &production[start..end];

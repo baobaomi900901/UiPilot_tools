@@ -54,6 +54,16 @@ pub(crate) struct SettingsUpdate {
 struct SettingsState {
     value: Settings,
     current_is_valid: bool,
+    theme_revision: u64,
+    file_preview_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FindPreferenceSnapshot {
+    pub(crate) theme_revision: u64,
+    pub(crate) theme: ThemePreference,
+    pub(crate) file_preview_revision: u64,
+    pub(crate) file_preview_enabled: bool,
 }
 
 pub(crate) struct SettingsStore {
@@ -116,6 +126,8 @@ impl SettingsStore {
                 state: Mutex::new(SettingsState {
                     value,
                     current_is_valid: true,
+                    theme_revision: 0,
+                    file_preview_revision: 0,
                 }),
             });
         }
@@ -125,6 +137,8 @@ impl SettingsStore {
                 state: Mutex::new(SettingsState {
                     value,
                     current_is_valid: false,
+                    theme_revision: 0,
+                    file_preview_revision: 0,
                 }),
             });
         }
@@ -134,6 +148,8 @@ impl SettingsStore {
             state: Mutex::new(SettingsState {
                 value: Settings::default(),
                 current_is_valid: false,
+                theme_revision: 0,
+                file_preview_revision: 0,
             }),
         })
     }
@@ -184,17 +200,54 @@ impl SettingsStore {
     }
 
     pub(crate) fn set_file_preview_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.set_file_preview_enabled_with_revision(enabled)
+            .map(|_| ())
+    }
+
+    pub(crate) fn set_file_preview_enabled_with_revision(
+        &self,
+        enabled: bool,
+    ) -> Result<u64, SettingsError> {
         let mut state = self.state.lock().expect("settings lock poisoned");
+        let revision = state
+            .file_preview_revision
+            .checked_add(1)
+            .ok_or(SettingsError::CountOverflow)?;
         let mut candidate = state.value.clone();
         candidate.file_preview_enabled = enabled;
-        self.persist(&mut state, candidate)
+        self.persist(&mut state, candidate)?;
+        state.file_preview_revision = revision;
+        Ok(revision)
     }
 
     pub(crate) fn set_theme_preference(&self, theme: ThemePreference) -> Result<(), SettingsError> {
+        self.set_theme_preference_with_revision(theme).map(|_| ())
+    }
+
+    pub(crate) fn set_theme_preference_with_revision(
+        &self,
+        theme: ThemePreference,
+    ) -> Result<u64, SettingsError> {
         let mut state = self.state.lock().expect("settings lock poisoned");
+        let revision = state
+            .theme_revision
+            .checked_add(1)
+            .ok_or(SettingsError::CountOverflow)?;
         let mut candidate = state.value.clone();
         candidate.theme = theme;
-        self.persist(&mut state, candidate)
+        self.persist(&mut state, candidate)?;
+        state.theme_revision = revision;
+        Ok(revision)
+    }
+
+    pub(crate) fn find_preference_snapshot(&self) -> FindPreferenceSnapshot {
+        let state = self.state.lock().expect("settings lock poisoned");
+        FindPreferenceSnapshot {
+            theme_revision: state.theme_revision,
+            theme: state.value.theme,
+            file_preview_revision: state.file_preview_revision,
+            file_preview_enabled: state.value.file_preview_enabled,
+        }
     }
 
     pub(crate) fn set_window_position(
@@ -234,9 +287,13 @@ impl SettingsStore {
             serde_json::to_vec(&candidate).map_err(|_| SettingsError::Serialize)?;
         let previous = state.current_is_valid.then_some(previous_bytes.as_slice());
         commit_with_backup(&self.paths, previous, &candidate_bytes)?;
+        let theme_revision = state.theme_revision;
+        let file_preview_revision = state.file_preview_revision;
         **state = SettingsState {
             value: candidate,
             current_is_valid: true,
+            theme_revision,
+            file_preview_revision,
         };
         Ok(())
     }
@@ -627,6 +684,36 @@ mod tests {
             }
         );
         assert_eq!(read_current(&dir), store.snapshot());
+    }
+
+    #[test]
+    fn find_preference_revisions_advance_independently_after_durable_writes() {
+        let dir = TestDir::new("find-preference-revisions");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            store.find_preference_snapshot(),
+            FindPreferenceSnapshot {
+                theme_revision: 0,
+                theme: ThemePreference::System,
+                file_preview_revision: 0,
+                file_preview_enabled: true,
+            }
+        );
+
+        assert_eq!(
+            store.set_theme_preference_with_revision(ThemePreference::Dark),
+            Ok(1)
+        );
+        assert_eq!(store.set_file_preview_enabled_with_revision(false), Ok(1));
+        assert_eq!(
+            store.set_theme_preference_with_revision(ThemePreference::Light),
+            Ok(2)
+        );
+        let snapshot = store.find_preference_snapshot();
+        assert_eq!(snapshot.theme_revision, 2);
+        assert_eq!(snapshot.file_preview_revision, 1);
+        assert_eq!(snapshot.theme, ThemePreference::Light);
+        assert!(!snapshot.file_preview_enabled);
     }
 
     #[test]

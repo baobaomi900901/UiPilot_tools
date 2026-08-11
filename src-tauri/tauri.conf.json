@@ -21,6 +21,19 @@
         "decorations": false,
         "resizable": false,
         "fullscreen": false
+      },
+      {
+        "label": "find",
+        "title": "UiPilot Find",
+        "width": 900,
+        "height": 600,
+        "minWidth": 720,
+        "minHeight": 420,
+        "visible": false,
+        "decorations": false,
+        "resizable": true,
+        "fullscreen": false,
+        "alwaysOnTop": false
       }
     ],
     "security": {

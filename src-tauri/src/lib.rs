@@ -5,6 +5,8 @@ use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+use find_window::{FocusEffect, WindowLabel};
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 use lifecycle::ShowTarget;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -24,6 +26,9 @@ mod model;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod result_registry;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod find_window;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod settings;
@@ -87,17 +92,59 @@ fn setup_production_lifecycle(
     let event_coordinator = Arc::clone(coordinator);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
-            let registry = event_app.state::<result_registry::ResultRegistry>();
-            let _ = event_coordinator.handle_focus_event_with(*focused, || {
-                commands::clear_and_hide(&registry, &event_window).map_err(|_| ())
-            });
+            let registries = event_app.state::<result_registry::ResultRegistries>();
+            let controller = event_app.state::<Arc<find_window::FindWindowController>>();
+            let effect = controller.observe_focus(WindowLabel::Main, *focused);
+            if effect == FocusEffect::ClearAndHideMain {
+                let _ = event_coordinator.handle_focus_event_with(*focused, || {
+                    commands::clear_and_hide(registries.main(), &event_window).map_err(|_| ())
+                });
+            } else {
+                let _ = lifecycle::handle_find_focus_effect(
+                    &event_app,
+                    controller.inner().as_ref(),
+                    &registries,
+                    effect,
+                );
+            }
         }
         tauri::WindowEvent::CloseRequested { api, .. }
             if event_coordinator.should_prevent_close() =>
         {
             api.prevent_close();
-            let registry = event_app.state::<result_registry::ResultRegistry>();
-            let _ = commands::clear_and_hide(&registry, &event_window);
+            let registries = event_app.state::<result_registry::ResultRegistries>();
+            let _ = commands::clear_and_hide(registries.main(), &event_window);
+        }
+        _ => {}
+    });
+
+    let find = app
+        .get_webview_window("find")
+        .ok_or_else(lifecycle_setup_error)?;
+    let find_app = app.handle().clone();
+    let find_window = find.clone();
+    find.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(focused) => {
+            let registries = find_app.state::<result_registry::ResultRegistries>();
+            let controller = find_app.state::<Arc<find_window::FindWindowController>>();
+            let effect = controller.observe_focus(WindowLabel::Find, *focused);
+            let _ = lifecycle::handle_find_focus_effect(
+                &find_app,
+                controller.inner().as_ref(),
+                &registries,
+                effect,
+            );
+        }
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let registries = find_app.state::<result_registry::ResultRegistries>();
+            let controller = find_app.state::<Arc<find_window::FindWindowController>>();
+            if let Some(invocation_id) = controller.current_invocation() {
+                let hidden = find_window.hide().is_ok();
+                controller.finish_explicit_hide(&invocation_id, hidden, &registries);
+            } else {
+                let _ = find_window.hide();
+            }
         }
         _ => {}
     });
@@ -165,12 +212,15 @@ pub fn run() {
     let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
-    let result_registry = result_registry::ResultRegistry::default();
+    let result_registries = result_registry::ResultRegistries::default();
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let find_controller = Arc::new(find_window::FindWindowController::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let file_index = Arc::new(file_index::FileIndex::new(
         Arc::clone(&coordinator),
-        result_registry.clone(),
+        result_registries.find().clone(),
     ));
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -216,8 +266,16 @@ pub fn run() {
                 plugin_manager.asset_response(ctx.webview_label(), request.uri().path())
             }
         })
-        .manage(result_registry)
+        .manage(result_registries)
+        .manage(Arc::clone(&find_controller))
         .invoke_handler(tauri::generate_handler![
+            commands::open_find_window,
+            commands::prepare_find_initialization,
+            commands::commit_find_ready,
+            commands::get_find_ready_status,
+            commands::set_find_pinned,
+            commands::set_find_preview_preference,
+            commands::hide_find_window,
             commands::search_apps,
             commands::publish_plugin_results,
             commands::search_files,
@@ -243,6 +301,9 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let run_file_index = Arc::clone(&file_index);
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let run_find_controller = Arc::clone(&find_controller);
+
     let app = builder
         .setup(move |_app| {
             #[cfg(all(not(test), feature = "test-instrumentation"))]
@@ -262,6 +323,7 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                run_find_controller.shutdown();
                 run_file_index.enter_terminal();
                 run_coordinator.uninstall_hook_for_exit();
                 run_coordinator.observe_run_exit();
@@ -431,8 +493,15 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 14);
+        assert_eq!(production.matches("commands::").count(), 21);
         for command in [
+            "open_find_window",
+            "prepare_find_initialization",
+            "commit_find_ready",
+            "get_find_ready_status",
+            "set_find_pinned",
+            "set_find_preview_preference",
+            "hide_find_window",
             "search_apps",
             "publish_plugin_results",
             "search_files",
@@ -456,23 +525,19 @@ mod tests {
             .expect("test module marker is missing");
         assert_eq!(
             production_root
-                .matches("result_registry::ResultRegistry::default()")
+                .matches("result_registry::ResultRegistries::default()")
                 .count(),
             1
         );
-        assert_eq!(
-            production_root
-                .matches("manage(result_registry::ResultRegistry::default())")
-                .count(),
-            0
-        );
         assert!(production_root
-            .contains("let result_registry = result_registry::ResultRegistry::default();"));
+            .contains("let result_registries = result_registry::ResultRegistries::default();"));
         assert!(production_root.contains(
-            "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registry.clone(),\n    ));"
+            "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registries.find().clone(),\n    ));"
         ));
         assert_eq!(
-            production_root.matches(".manage(result_registry)").count(),
+            production_root
+                .matches(".manage(result_registries)")
+                .count(),
             1
         );
 
@@ -714,6 +779,7 @@ mod tests {
             "commands",
             "model",
             "result_registry",
+            "find_window",
             "settings",
             "hotkey",
             "double_tap",
@@ -785,6 +851,7 @@ mod tests {
             ("file_search/windows/path_auth.rs", path_auth.as_str()),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
+            ("find_window.rs", include_str!("find_window.rs")),
             ("settings.rs", include_str!("settings.rs")),
             ("plugins.rs", include_str!("plugins.rs")),
         ];
@@ -934,7 +1001,7 @@ mod lib {
                 1
             );
             assert!(production.contains(
-                "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registry.clone(),\n    ));"
+                "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registries.find().clone(),\n    ));"
             ));
             assert_eq!(
                 production
@@ -977,24 +1044,27 @@ mod lib {
                         .unwrap()
             );
 
-            let capability = include_str!("../capabilities/main.json");
+            let main_capability = include_str!("../capabilities/main.json");
+            let find_capability = include_str!("../capabilities/find.json");
             let build = include_str!("../build.rs");
-            assert!(capability.contains("\"allow-search-files\""));
-            assert!(capability.contains("\"allow-execute-result\""));
+            assert!(!main_capability.contains("\"allow-search-files\""));
+            assert!(find_capability.contains("\"allow-search-files\""));
+            assert!(main_capability.contains("\"allow-execute-result\""));
+            assert!(find_capability.contains("\"allow-execute-result\""));
             assert_eq!(production.matches("commands::search_files,").count(), 1);
             assert_eq!(production.matches("commands::execute_result,").count(), 1);
             for forbidden in ["refresh_files", "refresh-files"] {
                 assert!(!production.contains(forbidden));
                 assert!(!build.contains(forbidden));
-                assert!(!capability.contains(forbidden));
+                assert!(!main_capability.contains(forbidden));
             }
             let autogenerated = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("permissions")
                 .join("autogenerated")
                 .join("refresh_files.toml");
             assert!(!autogenerated.exists());
-            assert!(!capability.contains("\"core:window:allow-start-dragging\""));
-            assert!(!capability.contains("\"core:window:default\""));
+            assert!(!main_capability.contains("\"core:window:allow-start-dragging\""));
+            assert!(!find_capability.contains("\"core:window:default\""));
             let probe_load_settings = ["security_probe", "::", "load_settings"].concat();
             assert_eq!(source.matches(&probe_load_settings).count(), 3);
             let probe_search_files = ["security_probe", "::", "search_files"].concat();
