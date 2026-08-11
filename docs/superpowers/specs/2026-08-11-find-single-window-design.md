@@ -43,6 +43,9 @@ reuse the same file-search window and replace only its query text.
 - A later genuine `main` blur retains the launcher's existing automatic-hide
   behavior. When `main` regains focus, it restores its always-on-top state.
 - `find` never becomes always-on-top as part of the handoff or pin behavior.
+- An old execution completion never hides a newer admitted query. If execution
+  has already entered its native-hide phase, the latest new main forward waits
+  and is displayed only after that phase terminates.
 
 ### Pin And Hide Behavior
 
@@ -95,42 +98,52 @@ cannot bypass the native decision by changing JavaScript state.
 
 ### Native Main-To-Find Focus Transfer
 
-`open_find_window` uses one serialized native transfer transaction. Before any
-operation that can move focus, it captures prior visibility, focus, and
-always-on-top observations and enters a transfer-ID-bound `TransferringToFind`
-state. That state reserves exactly the matching native `main Focused(false)`
-event; it does not suppress unrelated later focus loss.
+`open_find_window` uses one serialized native transfer transaction. A transfer
+ID identifies controller state and waiters; native `Focused(bool)` events do not
+and cannot carry that ID.
 
-The transaction:
+Before native work, the controller records the last confirmed focus state for
+both labels and takes fresh `is_focused` plus Windows foreground-window
+snapshots. A transfer may start only from a snapshot consistent with its actual
+precondition. It enters `TransferringToFind { transfer_id, phase }`, lowers
+`main`, shows `find`, and requests focus without holding the controller lock.
 
-1. lowers `main` from always-on-top;
-2. shows `find` if necessary;
-3. requests focus for `find`;
-4. waits for the matching `main Focused(false)` and `find Focused(true)`
-   observations within a two-second production deadline; tests inject a shorter
-   deterministic deadline;
-5. establishes find ownership and emits the forward only after both
-   observations prove the handoff.
+Each window listener reports only `{ label, focused }`. Under the controller
+lock, the handler:
 
-The suppression reservation spans from before lowering `main` until the
-matching focus events are observed or the transaction rolls back. The transfer
-ID and expected window labels bind both events, so a delayed event from an old
-transfer cannot suppress a later genuine blur.
+1. rejects duplicate values that are not a focus edge;
+2. records the new confirmed edge for that label;
+3. checks the active transaction phase;
+4. takes or schedules a fresh native focus/foreground snapshot;
+5. advances the transaction only when the observed edges and snapshot together
+   prove `main` is unfocused, `find` is focused, and the foreground window is
+   `find`.
+
+A delayed event from an older operation cannot complete the current transfer
+when the native snapshot contradicts it. If the snapshot already proves the
+required final state, accepting the edge is safe regardless of which queued
+notification caused the handler to recheck it. Repeated identical events are
+idempotent.
+
+Focus handlers notify an async waiter through a one-shot signal. The command
+waits up to two seconds in production; tests inject a shorter deterministic
+deadline. No native call or async wait occurs while holding the controller lock,
+and the event handler never waits for a lock held by the command.
 
 After success, `main` remains visible and non-topmost while `find` has focus. A
-`main Focused(true)` event restores `main` to always-on-top. Any subsequent
-unsuppressed `main Focused(false)` follows the existing clear-and-hide path.
-Hiding `find` while `main` is not focused leaves `main` visible and non-topmost;
-focusing `main` restores its normal topmost state.
+confirmed `main Focused(true)` edge restores `main` to always-on-top. Any later
+confirmed and unsuppressed `main Focused(false)` follows the existing
+clear-and-hide path. Hiding `find` while `main` is not focused leaves `main`
+visible and non-topmost; focusing `main` restores its normal topmost state.
 
-If lowering, showing, focusing, focus observation, ownership establishment, or
-emission fails, the transaction invalidates its transfer ID and
-performs a best-effort rollback to the captured native state: `find` returns to
-its prior visibility, `main` regains its prior topmost state and focus when it
-previously owned focus, and no main authorization or launcher input is retired.
-If rollback itself fails, both result scopes fail closed and the command returns
-the fixed window failure.
-
+Rollback is phase-specific. Before find ownership commits, any lowering, show,
+focus, observation, or timeout failure invalidates the transfer waiter and
+best-effort restores the captured native visibility, focus, and topmost state.
+After find ownership commits, old find authorization no longer exists; a later
+emit failure must clear the new find scope and keep `find` hidden. It may restore
+`main` focus/topmost state, but it never restores a previously visible stale
+find UI. Rollback failure fails both scopes closed and returns the fixed window
+failure.
 ### Window-Scoped Result Authorization
 
 The current `ResultRegistry` is a single active result slot. Sharing it between
@@ -148,6 +161,12 @@ and checked.
 Commands select the scope from an already validated caller window label. A
 caller cannot supply or spoof a scope parameter.
 
+Any operation needing both lifecycle admission and find authorization acquires
+the controller before the find registry and releases them before native or
+async work. No path acquires them in the reverse order. Main retirement
+preparation releases the main registry before entering the controller, and
+readiness releases its settings snapshot before entering the controller.
+
 Every published result mapping receives a checked result-set generation inside
 its scope. Resolving a file action returns the Rust-owned action together with
 an `ExecutionTicket` that binds the `find` scope, scope generation, invocation,
@@ -163,41 +182,53 @@ ownership or the `find` scope.
 
 ### Narrow Find Preferences
 
-`find` does not receive the full settings DTO or general settings commands. A
-narrow initialization command returns only:
+`find` does not receive the full settings DTO or general settings commands. The
+initialization handshake returns only:
 
 ```ts
-interface FindPreferencesView {
-  preferencesRevision: string
+interface FindInitialization {
+  themeRevision: string
   theme: 'system' | 'dark' | 'light'
+  filePreviewRevision: string
   filePreviewEnabled: boolean
   pinned: boolean
+  pendingForward?: FindForwardPayload
 }
 ```
 
-The command validates the `find` caller before reading `SettingsStore` or the
-controller. A separate find-only command accepts exactly
-`{ enabled: boolean }` and persists only `filePreviewEnabled`. It uses the
-existing critical-operation reservation and fixed settings error mapping.
+Theme revision and file-preview revision are independent checked Rust `u64`
+counters serialized as canonical decimal text. Each field is reconciled only
+against its own revision, so a theme update cannot suppress or overwrite a
+preview completion and vice versa.
 
-The preview toggle retains its last durable value, disables while a write is
-pending, commits only on owned success, and rolls back on owned failure. A late
-completion cannot overwrite a newer preferences revision.
+A separate find-only preview command accepts exactly `{ enabled: boolean }`,
+persists only `filePreviewEnabled`, and returns:
 
-When `main` durably changes theme, Rust emits a narrow theme-change event to
-`find`:
+```ts
+interface FindPreviewPreferenceResult {
+  filePreviewRevision: string
+  filePreviewEnabled: boolean
+}
+```
+
+It uses the existing critical-operation reservation and fixed settings error
+mapping. The toggle retains its last durable value, disables while its write is
+pending, commits only an owned result with a newer file-preview revision, and
+rolls back an owned failure. A late completion cannot overwrite a newer field
+revision.
+
+When `main` durably changes theme, Rust emits:
 
 ```ts
 interface FindThemeChanged {
-  preferencesRevision: string
+  themeRevision: string
   theme: 'system' | 'dark' | 'light'
 }
 ```
 
-A preferences revision is a checked Rust `u64` serialized with the same
-canonical decimal rules as a forward sequence. `find` accepts only a newer
-revision and one of the three theme values. Thus explicit themes and `system`
-behavior remain correct without granting `find` full settings access.
+`find` accepts only one of the three theme values and a newer theme revision.
+This keeps explicit and system themes correct without granting full settings
+access.
 
 ## Frozen Terminology And Wire Contract
 
@@ -206,11 +237,12 @@ behavior remain correct without granting `find` full settings access.
 - **Scope generation**: a checked Rust counter that invalidates every invocation
   and result mapping in exactly one window scope when that scope is hidden or
   failed closed.
-- **Transfer ID**: a checked Rust identifier for one native focus transaction;
-  only native focus events carrying the current transfer ID may complete or
-  suppress events for that transaction.
-- **Preferences revision**: a checked Rust `u64` ordering the narrow find
-  preference snapshot and theme events, serialized as canonical decimal text.
+- **Transfer ID**: a checked Rust identifier for controller transaction state
+  and async waiters. Native focus events do not carry it; confirmed focus edges
+  plus a fresh native focus/foreground snapshot prove transaction progress.
+- **Theme revision**: a checked Rust `u64` ordering only durable theme state.
+- **File-preview revision**: a separate checked Rust `u64` ordering only durable
+  file-preview state. Both revisions use canonical decimal serialization.
 - **Invocation**: one Rust-created ownership lifetime inside one window scope. A
   committed forward creates a fresh `find` invocation.
 - **Forward sequence**: a process-local checked Rust `u64` ordering main-to-find
@@ -245,34 +277,63 @@ is never reused across invocations.
 
 ## Data Flow
 
+### Find Readiness And Preference Reconciliation
+
+Readiness is a listener-first handshake:
+
+1. `FindView` creates its core while controls remain non-interactive.
+2. It registers both forward and theme listeners and retains their unlisten
+   handles. Listener registration failure destroys the core and never marks the
+   controller ready.
+3. It calls the find-only initialization command.
+4. Rust snapshots both preference fields and revisions, then releases settings
+   state before acquiring the controller. Under the controller lock it removes
+   at most one latest pending forward into the response and marks the frontend
+   ready at one linearization point. The returned pending forward is not also
+   emitted. Because listeners were registered first, a theme update committed
+   between the snapshot and ready point is delivered as a newer event.
+5. Any forward or theme change committed after that point uses the already
+   registered listener. Such an event may arrive before the initialization
+   promise resolves; frontend reconciliation therefore compares forward
+   sequence, theme revision, and file-preview revision independently and keeps
+   the newest value for each dimension.
+6. The initialization response applies only fields or a pending forward newer
++   than values already accepted from events.
+
+Initialization failure unregisters both listeners, destroys the provisional
+core, leaves the controller not ready, and preserves only the latest pending
+forward for a later clean initialization attempt.
 ### Launcher Submission
 
 1. `main` recognizes `/find` or `/find ` followed by text.
 2. It captures a submission owner containing a fresh token, current view epoch,
-   query control key, and exact control value. It also captures the current main
-   invocation and application query sequence for conditional retirement.
-3. It calls `open_find_window` with the query and captured main ownership.
-4. Rust validates that the caller label is exactly `main` before state access.
-5. The controller allocates the next checked forward sequence and a fresh opaque
-   find invocation ID. Exhaustion fails before native or registry mutation.
-6. The controller completes the native focus transfer.
-7. Before emitting, Rust executes `find_scope.on_show(invocationId)` or an
-   equivalent atomic ownership establishment. It then emits
+   query control key, exact value, main invocation, and application query
+   sequence.
+3. Rust validates the exact `main` caller before state access.
+4. Before any native side effect, the main scope prepares a conditional
+   retirement lease. On a current match it records the expected ownership and a
+   checked next application domain epoch without applying it. A mismatch yields
+   an explicit no-op lease. Epoch exhaustion aborts before native work or emit,
+   returns the fixed search-unavailable error, and leaves the launcher input and
+   current mapping unchanged.
+5. The controller allocates a checked forward sequence and fresh opaque find
+   invocation, then completes the native focus transfer.
+6. Rust commits `find_scope.on_show(invocationId)` before emit, then emits
    `{ invocationId, forwardSequence, query }`.
-8. If emission fails after ownership establishment, Rust hides `find`, clears
-   the new find ownership, rolls back the native transfer, and returns failure.
-9. After successful emission, Rust conditionally retires the captured main
-   application query. This comparison-and-retire occurs before command success
-   is returned. A mismatch is a successful no-op because a newer main query
-   already owns the scope.
-10. Only the still-current submission owner may clear the launcher input on
-    success or publish a failure message. A stale completion has no frontend
-    effect.
+7. If emit fails after `on_show`, Rust clears the new find scope and keeps
+   `find` hidden. It performs only the post-commit rollback defined above and
+   never restores the old find UI.
+8. After successful emit, Rust commits the prepared main retirement lease under
+   the main registry lock. The commit cannot exhaust: it either applies the
+   precomputed epoch when ownership still matches or does nothing after a newer
+   main query. It never changes plugin or find ownership.
+9. The command returns success only after retirement commit.
+10. Only the still-current submission owner may clear launcher input on success
+    or publish a failure. A stale completion has no frontend effect.
 
-The ordering is fixed: successful find ownership and emission, conditional main
-retirement, command success, then owner-checked launcher clearing. A failed
-transfer never retires main authorization.
-
+The ordering is fixed: prepare retirement, native handoff, find ownership,
+emit, non-failing retirement commit, command success, then owner-checked
+frontend completion.
 ### Find Query
 
 1. `FindView` accepts only a payload with a valid invocation ID, canonical
@@ -293,29 +354,39 @@ transfer never retires main authorization.
 
 ### Result Execution
 
-1. `find` sends its opaque request ID and result ID to `execute_result`.
+1. `find` sends opaque request and result IDs to `execute_result`.
 2. Rust validates the caller and atomically resolves the action plus its
    `ExecutionTicket` from the `find` scope.
 3. Existing path identity revalidation and Shell execution run without holding
-   the registry or controller lock. A stale lease may safely complete its
-   already-authorized Shell operation.
-4. After successful Shell completion, Rust enters one controller/registry
-   completion linearization point. It checks that the ticket still matches the
-   current find scope generation, invocation, result-set generation, request
-   ID, and result ID, then reads the current pin state.
-5. A stale ticket returns the successful execution outcome but cannot clear,
-   hide, or otherwise mutate the newer find UI.
-6. A current ticket with pin set clears and hides nothing.
-7. A current ticket with pin unset conditionally retires exactly that result set
-   and then requests native hide.
-8. If native hide fails after conditional retirement, the window remains
-   visible with inert old result IDs, the command returns the fixed window
-   failure, and the frontend requires a new query. No newer result set can be
-   cleared by this path.
+   the registry or controller lock. A stale lease may safely finish its already
+   authorized Shell operation.
+4. After Shell success, Rust takes controller then registry locks in one fixed
+   order. It verifies the ticket still matches the current scope generation,
+   invocation, result-set generation, request ID, and result ID, then samples
+   current pin state.
+5. A stale ticket returns the successful execution outcome without lifecycle or
+   authorization mutation. A current pinned ticket also returns without hide.
+6. For a current unpinned ticket, the controller atomically enters
+   `HidingForExecution(ticket)` before either lock is released and conditionally
+   retires exactly that result set.
+7. While this phase is active, `search_files`, local search submission, pin
+   mutation, explicit hide, and result execution cannot enter. `FindView`
+   disables its editable controls while execution is pending. A new main
+   forward is accepted only into the controller's single latest-forward queue.
+8. Native hide runs without locks while the admission phase remains visible to
+   every command. Its resulting `find Focused(false)` edge is marked as the
+   expected programmatic hide; the listener records the edge but performs no
+   second clear or hide.
+9. On hide success, the controller leaves the phase with `find` hidden and its
+   ticket result retired, then processes the latest queued forward, if any.
+10. On hide failure, `find` remains visible with inert old IDs. The controller
+    leaves the phase and processes a queued forward before ordinary admission
+    resumes; without a queued forward, the frontend reports the fixed window
+    error and requires a new query.
 
-Pin state is sampled only at step 4. Therefore a pin change while Shell work is
-pending deterministically controls the completion behavior at that point.
-
+No new query can begin between ticket validation and native hide completion.
+Therefore execution A can neither hide nor clear a query B; B is queued and
+shown only after A's hide transaction terminates.
 ## Frontend Structure
 
 The current file-mode responsibilities move out of the launcher state machine
@@ -337,9 +408,10 @@ The pin uses the repository's enabled icon library and has an explicit selected
 state. It does not change native always-on-top state. Escape requests explicit
 hide when unpinned and is inert when pinned. Close always requests forced hide.
 
-`FindView` obtains `FindPreferencesView` during its readiness handshake before
-rendering interactive controls. It listens for narrow theme updates and uses
-the dedicated preview command for persistence.
+`FindView` follows the listener-first initialization handshake before rendering
+interactive controls. It reconciles initialization, forward events, theme
+events, and preview command results by their independent sequence or field
+revision, and uses the dedicated preview command for persistence.
 
 ## Commands And Capabilities
 
@@ -362,100 +434,125 @@ settings, hotkey, autostart, plugin management, or launcher-hide permissions.
 
 ## Failure Behavior
 
-- Forward sequence exhaustion fails closed before native or registry mutation.
-- Malformed, noncanonical, stale, or duplicate forward payloads are ignored by
-  `FindView`; they never reset invocation or query state.
-- Invalid or exhausted local query sequences start no search and expose no
-  result IDs.
-- Native lookup, topmost change, show, focus, event observation, or emission
-  failure follows the focus-transfer rollback contract and returns one fixed
-  path-free window error.
-- A failed transfer never retires main authorization or clears launcher input.
-- Conditional main retirement cannot clear a newer main query and never touches
-  `find` or plugin ownership.
-- A stale launcher submission completion cannot clear or report into newer
-  frontend state.
+- Forward sequence or retirement preparation exhaustion fails before native
+  side effects, emit, or launcher clearing.
+- Malformed, noncanonical, stale, or duplicate forward payloads are ignored and
+  never reset invocation or query state.
+- Listener registration or initialization failure unregisters partial listeners,
+  destroys provisional frontend state, and leaves Rust not ready with only the
+  latest pending forward retained.
+- Snapshot/event reordering is reconciled independently by forward sequence,
+  theme revision, and file-preview revision.
+- Invalid or exhausted local query sequences start no search and expose no IDs.
+- Native lookup, topmost, show, focus, observation, or pre-commit failure restores
+  captured native state and returns one fixed path-free window error.
+- Emit failure after find ownership commit clears that scope and keeps `find`
+  hidden; it never restores a visible stale UI.
+- A failed transfer never commits the prepared main retirement or clears owned
+  launcher input.
+- Main retirement commit is non-failing after emit: it applies its precomputed
+  epoch only on the captured CAS match or is a no-op for newer ownership.
+- A stale launcher completion cannot clear or report into newer frontend state.
 - Invalid caller labels fail before controller, registry, settings, filesystem,
   or Shell access.
 - Invalid, stale, or cross-scope result IDs retain fixed path-free errors.
 - A stale execution ticket may finish its authorized side effect but cannot
-  mutate current window lifecycle or authorization.
-- Hide failure after current execution fails closed by retaining a visible
-  window with retired, inert result IDs and a fixed error.
-- A preview preference failure restores the last durable value; late preference
-  completions cannot overwrite newer state.
+  enter `HidingForExecution` or mutate current lifecycle or authorization.
+- While `HidingForExecution` is active, search and lifecycle admission remains
+  closed until native hide succeeds or fails; only the latest main forward may
+  queue.
+- Programmatic hide focus loss is consumed once by the expected-hide phase and
+  cannot trigger a second clear.
+- Hide failure retains a visible window with retired inert IDs, processes any
+  queued forward before reopening admission, and otherwise returns a fixed
+  error requiring a new query.
+- Preview failure restores the last durable preview field; late preview or theme
+  completions cannot overwrite a newer revision of the same field.
 - Hiding `find` invalidates only file results. Hiding `main` invalidates only
   main results.
 - Process shutdown owns final destruction; ordinary close never destroys
   `find`.
-
 ## Testing
 
 ### Frontend
 
 - `/find str` forwards `str`, clears only on owned success, and never enters
   embedded file mode.
-- Failed forwarding preserves the owned launcher command and shows the mapped
-  error.
-- Submission A success after edit/submission B cannot clear B.
-- Submission A failure after edit/submission B cannot report into B.
+- Submission A success or failure after edit/submission B cannot clear or report
+  into B.
 - `/find` forwards empty text and performs no file search.
-- Valid newer forwards replace the query and reset only local query sequence.
-- Malformed decimal, overflow, duplicate, and stale forwards are ignored.
-- Forwarded queries preserve category, sort, preview preference, and pin state.
+- Forward and theme listeners are registered before initialization; partial
+  registration or initialization failure cleans up and does not mark ready.
+- Event-before-response and response-before-event orders converge independently
+  for forward sequence, theme revision, and file-preview revision.
+- A pending forward returned by initialization is not applied twice.
+- Valid newer forwards reset only local query sequence; malformed, overflow,
+  duplicate, and stale forwards are ignored.
+- Forwarded queries preserve category, sort, preview, and pin state.
 - Query sequence never exceeds `Number.MAX_SAFE_INTEGER`.
+- Controls remain non-interactive during initialization and execution pending,
+  including the `HidingForExecution` phase.
 - Unpinned Escape requests hide; pinned Escape is inert; close always forces
-  hide.
-- Pinned execution retains current query and results.
-- Find preference initialization exposes only theme, preview, and pin.
-- Preview persistence success commits; failure rolls back; stale completions are
-  inert.
-- Theme events accept only valid values and a newer preferences revision.
+  hide outside a conflicting admission phase.
+- Preview persistence returns a field revision; owned success commits, failure
+  rolls back, and stale field completions are inert.
+- Theme events accept only valid values and a newer theme revision.
 - Existing category, list, preview, keyboard, stale-response, and error tests
   move to the dedicated file-search core without losing coverage.
-
 ### Rust
 
 - The controller resolves exactly one precreated `find` window and never creates
   another instance.
-- Before readiness, only the latest forward is delivered.
-- Focus transfer lowers `main`, suppresses exactly the matching blur, observes
-  both native events, and leaves both windows visible.
-- A later real `main` blur hides normally; `main` refocus restores topmost.
-- Every native failure point rolls back prior visibility, focus, and topmost
-  observations; rollback failure fails both scopes closed.
-- Find ownership is established before emit; emit failure hides and clears that
-  ownership.
-- Forward and result-set counter exhaustion fail before partial mutation.
+- Before readiness, only the latest forward is retained and initialization
+  returns it exactly once.
+- Focus listeners update confirmed edges; duplicate events are inert, stale
+  events with contradictory native snapshots cannot advance a transaction, and
+  a snapshot already proving the target state completes safely.
+- The async focus waiter never blocks the UI thread or holds a lock required by
+  event handlers.
+- Main lowering, refocus topmost restoration, genuine later blur hiding, timeout,
+  and every pre-commit rollback point are deterministic.
+- Find ownership is established before emit; emit failure clears new ownership,
+  keeps find hidden, and never restores an old visible UI.
+- Retirement preparation occurs before native work; exhaustion emits nothing;
+  post-emit CAS commit cannot fail and preserves newer main ownership.
 - Main and find scopes publish and resolve concurrently without invalidation.
-- Pending app search A, successful `/find`, then late A publication and
-  execution are rejected.
-- Conditional main retirement mismatch preserves a newer main query and never
-  changes plugin or find ownership.
-- `execute A pending -> forward B -> A success` leaves B visible and authorized.
-- Pin off-to-on before A completion keeps current A visible; pin on-to-off hides
-  only when A's ticket remains current.
-- Hide failure retires only the ticket's current result set and cannot clear a
-  newer result set.
+- Pending app search A, successful `/find`, then late A publication and execution
+  are rejected.
+- `execute A pending -> local query B -> A success` makes A stale before hide.
+- `execute A completion check -> main forward B -> native hide` queues B during
+  `HidingForExecution` and shows it only after A hide terminates.
+- Search, pin, explicit hide, and second execution admission are rejected during
+  `HidingForExecution`; programmatic focus loss is consumed once.
+- Pin off-to-on before completion keeps current A visible; pin on-to-off hides
+  only if A remains current when the completion phase begins.
+- Hide success/failure retires only A, cannot hide an admitted B, and processes
+  the latest queued forward before reopening admission.
+- Initialization snapshots racing theme events reconcile by field revision;
+  preview updates return a durable file-preview revision and cannot overwrite
+  theme state.
 - Find preference commands guard the caller first and expose or mutate only the
   narrow fields.
 - Capability and Tauri configuration tests enforce exact labels and minimum
   permissions.
-
 ### Real Window Event Tests
 
 A Windows-only native harness uses real Tauri window events, not closure-only
 simulation, to verify:
 
-- `main Focused(false)` and `find Focused(true)` complete one transfer;
+- confirmed main blur plus find focus and a matching foreground snapshot complete
+  one transfer even though events carry no transfer ID;
+- duplicate and delayed events cannot complete a contradictory transaction;
 - the handoff blur does not hide `main`;
-- `main` is non-topmost during `find` focus and restores topmost on refocus;
+- `main` is non-topmost during find focus and restores topmost on refocus;
 - a later genuine blur hides `main`;
-- timeout and focus failure release suppression and perform rollback;
-- a delayed old focus event cannot consume a newer transfer reservation.
+- timeout and focus failure release the async waiter and perform phase-correct
+  rollback;
+- an expected programmatic find blur during execution hide is recorded without a
+  second clear or hide.
 
-These tests do not synthesize user mouse or keyboard input.
-
+These tests do not synthesize user mouse or keyboard input. Any harness capable
+of changing foreground focus is announced to the user before it runs.
 ### Verification Gates
 
 - Focused frontend and Rust red-green tests.
@@ -487,20 +584,26 @@ The feature is complete only when:
 
 1. `/find str` leaves `main` visible and non-occluding, clears only its owned
    input after success, and shows the one `find` window with `str`.
-2. Failed or out-of-order forwards preserve newer launcher input and errors.
-3. Repeated submissions update the same window with the frozen payload and
-   preserve filters, preview preference, and pin state.
-4. Focus transfer suppresses exactly its own main blur, downgrades and restores
-   main topmost state correctly, and rolls back every failure point.
-5. Both window scopes remain concurrently usable; successful forwarding
-   conditionally retires only the captured main application query.
-6. Unpinned focus loss and current execution hide `find`; pinned focus loss and
-   current execution preserve it.
-7. A stale execution ticket can complete its authorized Shell operation but
-   cannot hide, clear, or mutate a newer query.
-8. Pinned Escape is inert, while close always hides.
-9. `/find` opens an empty search box without issuing a search.
-10. `find` receives only narrow initial preferences and preview persistence
-    authority, while theme updates remain correct.
-11. Automated verification passes and the user completes manual acceptance
+2. Listener-first initialization cannot lose the first forward or a concurrent
+   theme update; field revisions reconcile every event/response order.
+3. Repeated submissions update the same window and preserve filters, preview,
+   and pin state.
+4. Focus transfer is proven by confirmed edges plus native snapshots, never by
+   an event-carried transfer ID; it does not block the UI thread or deadlock the
+   event handler.
+5. Pre-commit native failures restore captured state; post-ownership emit failure
+   keeps find hidden and never restores a stale old UI.
+6. Successful forwarding commits a prevalidated, non-failing conditional main
+   retirement without affecting newer main, plugin, or find ownership.
+7. Both window scopes remain concurrently usable.
+8. Unpinned current execution hides `find`; pinned or stale execution preserves
+   it.
+9. `HidingForExecution` prevents any query from being admitted between ticket
+   validation and hide completion, queues only the latest main forward, and
+   consumes programmatic focus loss once.
+10. Pinned Escape is inert, while close always hides when admission permits.
+11. `/find` opens empty without issuing a search.
+12. `find` receives only narrow independently revisioned theme/preview state and
+    preview persistence authority.
+13. Automated verification passes and the user completes manual acceptance
     without Codex controlling input devices.
