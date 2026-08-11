@@ -23,6 +23,12 @@ pub(crate) enum ResultAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowScope {
+    Main,
+    Find,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryDomain {
     Application,
     File,
@@ -45,6 +51,9 @@ impl fmt::Display for RegistryError {
 }
 
 impl std::error::Error for RegistryError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CounterExhausted;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryToken {
@@ -73,15 +82,42 @@ pub(crate) enum PluginDomainReservationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PluginDomainReservationMismatch;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionTicket {
+    scope: WindowScope,
+    scope_generation: u64,
+    invocation_id: String,
+    result_set_generation: u64,
+    request_id: String,
+    result_id: String,
+}
+
+impl ExecutionTicket {
+    pub(crate) const fn scope(&self) -> WindowScope {
+        self.scope
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedApplicationQueryRetirement {
+    scope_generation: u64,
+    invocation_id: String,
+    query_sequence: u64,
+    expected_domain_epoch: u64,
+    next_domain_epoch: u64,
+}
+
 struct ResultSet {
     request_id: String,
     domain: QueryDomain,
+    generation: u64,
     actions: HashMap<String, ResultAction>,
 }
 
 #[derive(Default)]
 struct RegistryState {
     generation: u64,
+    result_set_generation: u64,
     active: bool,
     active_invocation_id: Option<String>,
     latest_query_sequence: u64,
@@ -92,10 +128,27 @@ struct RegistryState {
     current: Option<ResultSet>,
 }
 
-struct RegistryInner {
+#[derive(Default)]
+struct OpaqueIdAllocator {
     next_id: AtomicU64,
+}
+
+impl OpaqueIdAllocator {
+    fn allocate(&self, count: u64) -> Option<u64> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(count)
+            })
+            .ok()
+    }
+}
+
+struct RegistryInner {
+    allocator: Arc<OpaqueIdAllocator>,
     next_reservation_nonce: AtomicU64,
     state: Mutex<RegistryState>,
+    scope: WindowScope,
+    restrict_domains: bool,
 }
 
 #[derive(Clone)]
@@ -103,34 +156,81 @@ pub(crate) struct ResultRegistry {
     inner: Arc<RegistryInner>,
 }
 
-impl Default for ResultRegistry {
+#[derive(Clone)]
+pub(crate) struct ResultRegistries {
+    main: ResultRegistry,
+    find: ResultRegistry,
+}
+
+impl Default for ResultRegistries {
     fn default() -> Self {
+        let allocator = Arc::new(OpaqueIdAllocator::default());
         Self {
-            inner: Arc::new(RegistryInner {
-                next_id: AtomicU64::new(0),
-                next_reservation_nonce: AtomicU64::new(0),
-                state: Mutex::new(RegistryState::default()),
-            }),
+            main: ResultRegistry::scoped(WindowScope::Main, Arc::clone(&allocator)),
+            find: ResultRegistry::scoped(WindowScope::Find, Arc::clone(&allocator)),
         }
     }
 }
 
+impl ResultRegistries {
+    pub(crate) fn main(&self) -> &ResultRegistry {
+        &self.main
+    }
+
+    pub(crate) fn find(&self) -> &ResultRegistry {
+        &self.find
+    }
+}
+
+impl Default for ResultRegistry {
+    fn default() -> Self {
+        // Kept unrestricted until production managed state migrates to ResultRegistries.
+        Self::new(
+            WindowScope::Main,
+            Arc::new(OpaqueIdAllocator::default()),
+            false,
+        )
+    }
+}
+
 impl ResultRegistry {
+    fn scoped(scope: WindowScope, allocator: Arc<OpaqueIdAllocator>) -> Self {
+        Self::new(scope, allocator, true)
+    }
+
+    fn new(scope: WindowScope, allocator: Arc<OpaqueIdAllocator>, restrict_domains: bool) -> Self {
+        Self {
+            inner: Arc::new(RegistryInner {
+                allocator,
+                next_reservation_nonce: AtomicU64::new(0),
+                state: Mutex::new(RegistryState::default()),
+                scope,
+                restrict_domains,
+            }),
+        }
+    }
+
     pub(crate) fn on_show(&self, invocation_id: String) {
+        let _ = self.try_on_show(invocation_id);
+    }
+
+    pub(crate) fn try_on_show(&self, invocation_id: String) -> Result<(), CounterExhausted> {
         let mut state = self
             .inner
             .state
             .lock()
             .expect("result registry lock poisoned");
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("result registry generation exhausted");
+        let Some(next_generation) = state.generation.checked_add(1) else {
+            Self::clear_state(&mut state);
+            return Err(CounterExhausted);
+        };
+        state.generation = next_generation;
         state.active = true;
         state.active_invocation_id = Some(invocation_id);
         state.latest_query_sequence = 0;
         state.latest_query_domain = None;
         state.current = None;
+        Ok(())
     }
 
     pub(crate) fn begin_query(
@@ -139,6 +239,9 @@ impl ResultRegistry {
         invocation_id: &str,
         query_sequence: u64,
     ) -> Option<QueryToken> {
+        if !self.allows_domain(domain) {
+            return None;
+        }
         let mut state = self
             .inner
             .state
@@ -193,18 +296,51 @@ impl ResultRegistry {
             return None;
         }
 
-        let request_id = self.allocate_id("req");
+        let next_result_set_generation = match state.result_set_generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                state.current = None;
+                return None;
+            }
+        };
+        let Some(id_count) = u64::try_from(entries.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+        else {
+            state.current = None;
+            return None;
+        };
+        let first_id = match self.inner.allocator.allocate(id_count) {
+            Some(previous) => match previous.checked_add(1) {
+                Some(first) => first,
+                None => {
+                    state.current = None;
+                    return None;
+                }
+            },
+            None => {
+                state.current = None;
+                return None;
+            }
+        };
+        let request_id = Self::format_id("req", first_id);
         let mut items = Vec::with_capacity(entries.len());
         let mut actions = HashMap::with_capacity(entries.len());
+        let mut allocated_id = first_id;
         for (item, action) in entries {
-            let result_id = self.allocate_id("item");
+            allocated_id = allocated_id
+                .checked_add(1)
+                .expect("reserved opaque identifier range must be contiguous");
+            let result_id = Self::format_id("item", allocated_id);
             actions.insert(result_id.clone(), action);
             items.push((result_id, item));
         }
 
+        state.result_set_generation = next_result_set_generation;
         state.current = Some(ResultSet {
             request_id: request_id.clone(),
             domain: token.domain,
+            generation: next_result_set_generation,
             actions,
         });
         Some(response(request_id, items))
@@ -215,6 +351,15 @@ impl ResultRegistry {
         request_id: &str,
         result_id: &str,
     ) -> Result<ResultAction, RegistryError> {
+        self.resolve_with_ticket(request_id, result_id)
+            .map(|(action, _)| action)
+    }
+
+    pub(crate) fn resolve_with_ticket(
+        &self,
+        request_id: &str,
+        result_id: &str,
+    ) -> Result<(ResultAction, ExecutionTicket), RegistryError> {
         let state = self
             .inner
             .state
@@ -225,28 +370,133 @@ impl ResultRegistry {
             return Err(RegistryError::StaleRequest);
         }
 
-        current
+        let action = current
             .actions
             .get(result_id)
             .cloned()
-            .ok_or(RegistryError::UnknownResult)
+            .ok_or(RegistryError::UnknownResult)?;
+        let invocation_id = state
+            .active_invocation_id
+            .as_ref()
+            .ok_or(RegistryError::StaleRequest)?
+            .clone();
+        let ticket = ExecutionTicket {
+            scope: self.inner.scope,
+            scope_generation: state.generation,
+            invocation_id,
+            result_set_generation: current.generation,
+            request_id: request_id.to_owned(),
+            result_id: result_id.to_owned(),
+        };
+        Ok((action, ticket))
     }
 
-    pub(crate) fn hide_and_clear(&self) {
+    pub(crate) fn is_execution_ticket_current(&self, ticket: &ExecutionTicket) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        self.ticket_matches(&state, ticket)
+    }
+
+    pub(crate) fn retire_result_set_if_current(&self, ticket: &ExecutionTicket) -> bool {
         let mut state = self
             .inner
             .state
             .lock()
             .expect("result registry lock poisoned");
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("result registry generation exhausted");
-        state.active = false;
-        state.active_invocation_id = None;
-        state.latest_query_sequence = 0;
-        state.latest_query_domain = None;
+        if !self.ticket_matches(&state, ticket) {
+            return false;
+        }
         state.current = None;
+        true
+    }
+
+    pub(crate) fn hide_and_clear(&self) {
+        let _ = self.try_hide_and_clear();
+    }
+
+    pub(crate) fn try_hide_and_clear(&self) -> Result<(), CounterExhausted> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        let next_generation = state.generation.checked_add(1);
+        Self::clear_state(&mut state);
+        let Some(next_generation) = next_generation else {
+            return Err(CounterExhausted);
+        };
+        state.generation = next_generation;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_application_query_retirement(
+        &self,
+        invocation_id: &str,
+        query_sequence: u64,
+    ) -> Result<Option<PreparedApplicationQueryRetirement>, CounterExhausted> {
+        if !self.allows_domain(QueryDomain::Application) {
+            return Ok(None);
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        if !state.active
+            || state.active_invocation_id.as_deref() != Some(invocation_id)
+            || state.latest_query_sequence != query_sequence
+            || state.latest_query_domain != Some(QueryDomain::Application)
+            || state.domain_exhausted[QueryDomain::Application.index()]
+        {
+            return Ok(None);
+        }
+        let expected_domain_epoch = state.domain_epochs[QueryDomain::Application.index()];
+        let next_domain_epoch = expected_domain_epoch
+            .checked_add(1)
+            .ok_or(CounterExhausted)?;
+        Ok(Some(PreparedApplicationQueryRetirement {
+            scope_generation: state.generation,
+            invocation_id: invocation_id.to_owned(),
+            query_sequence,
+            expected_domain_epoch,
+            next_domain_epoch,
+        }))
+    }
+
+    pub(crate) fn retire_application_query_if_current(
+        &self,
+        prepared: PreparedApplicationQueryRetirement,
+    ) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("result registry lock poisoned");
+        let index = QueryDomain::Application.index();
+        if !self.allows_domain(QueryDomain::Application)
+            || !state.active
+            || state.generation != prepared.scope_generation
+            || state.active_invocation_id.as_deref() != Some(&prepared.invocation_id)
+            || state.latest_query_sequence != prepared.query_sequence
+            || state.latest_query_domain != Some(QueryDomain::Application)
+            || state.domain_exhausted[index]
+            || state.domain_epochs[index] != prepared.expected_domain_epoch
+            || prepared.expected_domain_epoch.checked_add(1) != Some(prepared.next_domain_epoch)
+        {
+            return false;
+        }
+        state.domain_epochs[index] = prepared.next_domain_epoch;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.domain == QueryDomain::Application)
+        {
+            state.current = None;
+        }
+        true
     }
 
     pub(crate) fn reserve_plugin_epoch(
@@ -328,7 +578,7 @@ impl ResultRegistry {
         if state.plugin_reservation != Some(reservation)
             || state.domain_exhausted[index]
             || state.domain_epochs[index] != reservation.expected
-            || reservation.next != reservation.expected + 1
+            || reservation.expected.checked_add(1) != Some(reservation.next)
         {
             return Err(PluginDomainReservationMismatch);
         }
@@ -382,15 +632,41 @@ impl ResultRegistry {
         Ok(())
     }
 
-    fn allocate_id(&self, prefix: &str) -> String {
-        let previous = self
-            .inner
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
+    fn allows_domain(&self, domain: QueryDomain) -> bool {
+        if !self.inner.restrict_domains {
+            return true;
+        }
+        matches!(
+            (self.inner.scope, domain),
+            (
+                WindowScope::Main,
+                QueryDomain::Application | QueryDomain::Plugin
+            ) | (WindowScope::Find, QueryDomain::File)
+        )
+    }
+
+    fn ticket_matches(&self, state: &RegistryState, ticket: &ExecutionTicket) -> bool {
+        state.active
+            && ticket.scope == self.inner.scope
+            && ticket.scope_generation == state.generation
+            && state.active_invocation_id.as_deref() == Some(&ticket.invocation_id)
+            && state.current.as_ref().is_some_and(|current| {
+                current.generation == ticket.result_set_generation
+                    && current.request_id == ticket.request_id
+                    && current.actions.contains_key(&ticket.result_id)
             })
-            .expect("result registry identifier space exhausted");
-        format!("{prefix}-{:016x}", previous + 1)
+    }
+
+    fn clear_state(state: &mut RegistryState) {
+        state.active = false;
+        state.active_invocation_id = None;
+        state.latest_query_sequence = 0;
+        state.latest_query_domain = None;
+        state.current = None;
+    }
+
+    fn format_id(prefix: &str, id: u64) -> String {
+        format!("{prefix}-{id:016x}")
     }
 }
 
@@ -410,7 +686,10 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry};
+    use super::{
+        QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
+        WindowScope,
+    };
     use crate::{
         apps::ApplicationLaunchTarget,
         file_index::{IndexedKind, OpenIndexedPath, VolumeIdentity},
@@ -499,6 +778,231 @@ mod tests {
                     .collect(),
             },
         )
+    }
+
+    fn publish_one(
+        registry: &ResultRegistry,
+        domain: QueryDomain,
+        invocation_id: &str,
+        query_sequence: u64,
+        expected: ResultAction,
+    ) -> (String, String) {
+        let token = registry
+            .begin_query(domain, invocation_id, query_sequence)
+            .unwrap();
+        registry
+            .publish_if_latest(
+                token,
+                vec![((), expected)],
+                || true,
+                |request_id, items| (request_id, items[0].0.clone()),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn window_scopes_publish_concurrently_and_hide_independently() {
+        let registries = ResultRegistries::default();
+        let main = registries.main();
+        let find = registries.find();
+        main.on_show("main-invocation".into());
+        find.on_show("find-invocation".into());
+
+        let main_ids = publish_one(
+            main,
+            QueryDomain::Application,
+            "main-invocation",
+            1,
+            action("main"),
+        );
+        let find_ids = publish_one(find, QueryDomain::File, "find-invocation", 1, file_action());
+
+        assert_eq!(
+            main_ids,
+            (
+                "req-0000000000000001".into(),
+                "item-0000000000000002".into()
+            )
+        );
+        assert_eq!(
+            find_ids,
+            (
+                "req-0000000000000003".into(),
+                "item-0000000000000004".into()
+            )
+        );
+        assert_eq!(main.resolve(&main_ids.0, &main_ids.1), Ok(action("main")));
+        assert_eq!(find.resolve(&find_ids.0, &find_ids.1), Ok(file_action()));
+        assert_eq!(
+            main.resolve(&find_ids.0, &find_ids.1),
+            Err(RegistryError::StaleRequest)
+        );
+        assert!(main
+            .begin_query(QueryDomain::File, "main-invocation", 2)
+            .is_none());
+        assert!(find
+            .begin_query(QueryDomain::Application, "find-invocation", 2)
+            .is_none());
+
+        find.hide_and_clear();
+        assert_eq!(
+            find.resolve(&find_ids.0, &find_ids.1),
+            Err(RegistryError::StaleRequest)
+        );
+        assert_eq!(main.resolve(&main_ids.0, &main_ids.1), Ok(action("main")));
+    }
+
+    #[test]
+    fn prepared_application_retirement_is_a_non_failing_current_query_cas() {
+        let registries = ResultRegistries::default();
+        let main = registries.main();
+        let find = registries.find();
+        main.on_show("main-invocation".into());
+        find.on_show("find-invocation".into());
+        let application_ids = publish_one(
+            main,
+            QueryDomain::Application,
+            "main-invocation",
+            1,
+            action("application"),
+        );
+        let prepared = main
+            .prepare_application_query_retirement("main-invocation", 1)
+            .unwrap()
+            .unwrap();
+
+        let newer_application_ids = publish_one(
+            main,
+            QueryDomain::Application,
+            "main-invocation",
+            2,
+            action("newer-application"),
+        );
+        let plugin_reservation = main.reserve_plugin_epoch().unwrap();
+        let find_ids = publish_one(find, QueryDomain::File, "find-invocation", 1, file_action());
+
+        assert!(!main.retire_application_query_if_current(prepared));
+        assert_eq!(
+            main.resolve(&newer_application_ids.0, &newer_application_ids.1),
+            Ok(action("newer-application"))
+        );
+        assert_eq!(
+            main.reserve_plugin_epoch(),
+            Err(super::PluginDomainReservationError::Busy)
+        );
+        main.cancel_reserved_plugin_epoch(plugin_reservation)
+            .unwrap();
+        assert_eq!(find.resolve(&find_ids.0, &find_ids.1), Ok(file_action()));
+        assert!(main
+            .begin_query(QueryDomain::Application, "main-invocation", 3)
+            .is_some());
+        assert_eq!(
+            main.resolve(&application_ids.0, &application_ids.1),
+            Err(RegistryError::StaleRequest)
+        );
+    }
+
+    #[test]
+    fn committed_application_retirement_keeps_invocation_active_and_plugin_epoch_unchanged() {
+        let registries = ResultRegistries::default();
+        let main = registries.main();
+        main.on_show("main-invocation".into());
+        let application_ids = publish_one(
+            main,
+            QueryDomain::Application,
+            "main-invocation",
+            1,
+            action("application"),
+        );
+        let prepared = main
+            .prepare_application_query_retirement("main-invocation", 1)
+            .unwrap()
+            .unwrap();
+
+        assert!(main.retire_application_query_if_current(prepared));
+        assert_eq!(
+            main.resolve(&application_ids.0, &application_ids.1),
+            Err(RegistryError::StaleRequest)
+        );
+        assert!(main
+            .begin_query(QueryDomain::Plugin, "main-invocation", 2)
+            .is_some());
+    }
+
+    #[test]
+    fn execution_ticket_is_stale_after_newer_result_set_generation() {
+        let registries = ResultRegistries::default();
+        let find = registries.find();
+        find.on_show("find-invocation".into());
+        let first_ids = publish_one(find, QueryDomain::File, "find-invocation", 1, file_action());
+        let (_, ticket) = find
+            .resolve_with_ticket(&first_ids.0, &first_ids.1)
+            .unwrap();
+
+        let second_ids = publish_one(find, QueryDomain::File, "find-invocation", 2, file_action());
+
+        assert_eq!(ticket.scope(), WindowScope::Find);
+        assert!(!find.is_execution_ticket_current(&ticket));
+        assert!(!find.retire_result_set_if_current(&ticket));
+        assert_eq!(
+            find.resolve(&second_ids.0, &second_ids.1),
+            Ok(file_action())
+        );
+    }
+
+    #[test]
+    fn checked_scope_result_set_and_global_id_exhaustion_fail_closed() {
+        for case in ["scope", "result-set", "opaque-id"] {
+            let registries = ResultRegistries::default();
+            let find = registries.find();
+            find.on_show("find-invocation".into());
+            match case {
+                "scope" => {
+                    find.inner.state.lock().unwrap().generation = u64::MAX;
+                    assert_eq!(
+                        find.try_on_show("next".into()),
+                        Err(super::CounterExhausted)
+                    );
+                    assert!(find.begin_query(QueryDomain::File, "next", 1).is_none());
+                }
+                "result-set" => {
+                    find.inner.state.lock().unwrap().result_set_generation = u64::MAX;
+                    let token = find
+                        .begin_query(QueryDomain::File, "find-invocation", 1)
+                        .unwrap();
+                    assert!(find
+                        .publish_if_latest(
+                            token,
+                            vec![((), file_action())],
+                            || true,
+                            |request_id, items| (request_id, items),
+                        )
+                        .is_none());
+                }
+                "opaque-id" => {
+                    find.inner
+                        .allocator
+                        .next_id
+                        .store(u64::MAX - 1, Ordering::Release);
+                    let token = find
+                        .begin_query(QueryDomain::File, "find-invocation", 1)
+                        .unwrap();
+                    assert!(find
+                        .publish_if_latest(
+                            token,
+                            vec![((), file_action())],
+                            || true,
+                            |request_id, items| (request_id, items),
+                        )
+                        .is_none());
+                    assert_eq!(
+                        find.inner.allocator.next_id.load(Ordering::Acquire),
+                        u64::MAX - 1
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -692,7 +1196,7 @@ mod tests {
         assert!(registry
             .begin_query(QueryDomain::File, "inv-1", 2)
             .is_none());
-        assert_eq!(registry.inner.next_id.load(Ordering::Acquire), 0);
+        assert_eq!(registry.inner.allocator.next_id.load(Ordering::Acquire), 0);
 
         let application = registry
             .begin_query(QueryDomain::Application, "inv-1", 2)
