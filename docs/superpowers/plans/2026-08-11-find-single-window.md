@@ -52,9 +52,9 @@
 - [ ] Implement listener-first two-phase readiness: five-second preparation expiry, token supersession, idempotent ready commit/status, and no queue drain before commit.
 - [ ] Implement a complete latest-only queued open transaction containing payload, prepared retirement lease, five-second deadline, and waiter. Replaced/expired/shutdown waiters terminate exactly once.
 - [ ] Implement checked invocation/forward/transfer counters, confirmed focus edges plus native snapshot admission, process-local pin, and execution-hide admission closure.
-- [ ] Keep the locked core synchronous and free of native I/O or waiting.
+- [ ] Keep the locked core synchronous and free of native I/O or waiting. `find_window.rs` may depend on `result_registry`, but must not import `commands` or `lifecycle`; those modules adapt outward into the controller.
 
-**Test coverage:** frozen state transitions; B replaced by C; prepare does not emit/wake; lost commit retry; expiry/shutdown; duplicate and contradictory focus events; two-second transfer timeout; stale/pinned execution ticket; hide success/failure with queued forward.
+**Test coverage:** use table-driven cases for ordinary state transitions; keep B replaced by C, prepare without emit/wake, lost commit retry, expiry/shutdown, duplicate/contradictory focus events, two-second transfer timeout, stale/pinned execution ticket, and hide success/failure with queued forward as named ordering tests.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml find_window::tests -- --nocapture`
 
@@ -135,6 +135,7 @@
 **Files:** create `src-tauri/tests/find_window_events.rs`; modify `src-tauri/Cargo.toml` only if an explicit test target is required and preserve all existing user edits.
 
 - [ ] Add a Windows-only harness gated by `UIPILOT_RUN_REAL_WINDOW_TESTS=1`. It may use Tauri/Win32 focus APIs but must never synthesize mouse or keyboard input.
+- [ ] Preflight interactive-session and foreground-focus capability. If Windows policy, lock screen, or remote-session state prevents establishing the precondition, report `SKIPPED/INCONCLUSIVE` and do not claim a pass; once the precondition is established, a focus mismatch remains a test failure rather than a warning.
 - [ ] Verify real handoff, duplicate/delayed events, timeout rollback, later genuine main blur, main topmost restoration, and one-time execution-hide blur handling.
 - [ ] Run all non-foreground verification gates first.
 - [ ] Before enabling the harness, tell the user: `下一步将运行 Windows 实际窗口事件测试。它不会控制鼠标或键盘，但会通过窗口 API 短暂改变前台焦点。请确认后我再运行。`
