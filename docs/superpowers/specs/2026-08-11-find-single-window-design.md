@@ -2,8 +2,8 @@
 
 ## Status
 
-Draft revised on 2026-08-11 after independent review. It requires another
-independent approval before implementation planning.
+Independently approved on 2026-08-11 after five review rounds. Awaiting
+final user review before implementation planning.
 
 ## Goal
 
