@@ -92,13 +92,16 @@ drops its lease. Timeout and shutdown complete waiters with a fixed unavailable
 outcome. No waiter is left without exactly one terminal result.
 
 Only `VisibleReady` with a matching active invocation admits file search, pin,
-explicit hide, or result execution. Only a committed ready token moves
-`PreparedNotReady` to `Hidden`; only a fresh successful `on_show` moves
-`Hidden` to `VisibleReady`; successful hide always returns to `Hidden` after
-closing the find scope.
+explicit hide, or result execution. The readiness path is exactly
+`NotReady -> PreparedNotReady(token) -> Hidden`; a new prepare replaces the
+token while remaining `PreparedNotReady`. An uncommitted token expires after
+five seconds and returns admission to `NotReady`. Only fresh successful
+`on_show` moves `Hidden -> Transferring -> VisibleReady`; successful hide always
+returns to `Hidden` after closing the find scope.
 
 Native focus-loss handling consults Rust-owned pin and admission state. The
 WebView cannot bypass native decisions by changing JavaScript state.
+
 ### Native Main-To-Find Focus Transfer
 
 `open_find_window` uses one serialized native transfer transaction. A transfer
@@ -108,7 +111,7 @@ and cannot carry that ID.
 Before native work, the controller records the last confirmed focus state for
 both labels and takes fresh `is_focused` plus Windows foreground-window
 snapshots. A transfer may start only from a snapshot consistent with its actual
-precondition. It enters `TransferringToFind { transfer_id, phase }`, lowers
+precondition. It enters `Transferring { transfer_id, phase }`, lowers
 `main`, shows `find`, and requests focus without holding the controller lock.
 
 Each window listener reports only `{ label, focused }`. Under the controller
@@ -147,6 +150,7 @@ emit failure must clear the new find scope and keep `find` hidden. It may restor
 `main` focus/topmost state, but it never restores a previously visible stale
 find UI. Rollback failure fails both scopes closed and returns the fixed window
 failure.
+
 ### Window-Scoped Result Authorization
 
 The current `ResultRegistry` is a single active result slot. Sharing it between
@@ -233,6 +237,7 @@ interface FindThemeChanged {
 `find` accepts only one of the three theme values and a newer theme revision.
 This keeps explicit and system themes correct without granting full settings
 access.
+
 ## Frozen Terminology And Wire Contract
 
 - **Window scope**: the Rust-selected `main` or `find` authorization context,
@@ -299,68 +304,61 @@ is never reused across invocations.
 
 Readiness is a listener-first, two-phase, retryable handshake:
 
-1. `FindView` creates its core with controls non-interactive and registers both
+1. `FindView` creates its core with controls non-interactive and registers
    forward and theme listeners. Partial listener failure unregisters everything
-   and never contacts readiness commands.
-2. It calls `prepare_find_initialization`. Rust snapshots both preference fields
-   and revisions, releases settings state, then records one active preparation
-   token while remaining `NotReady`. Pending open transactions stay queued and
-   no forward is removed, returned, or emitted.
-3. `FindView` parses and reconciles the prepared snapshot by independent field
-   revisions. Parse or response failure keeps listeners installed and retries
-   prepare; a newer prepare token supersedes the old uncommitted token.
-4. After successful parse, the frontend calls `commit_find_ready(token)`. The
-   first valid commit atomically changes `NotReady` to `Ready` and wakes the
-   controller's latest queued `open_find_window` transaction. That transaction,
-   not the readiness response, performs the unique native handoff, find
-   `on_show`, emit, and main retirement flow.
-5. Commit and ready-status return `FindReadyOutcome`. Commit is idempotent: Rust
-   retains the committed token and returns `ready` to every retry with that
-   token. A token replaced before commit returns `superseded` and changes no
-   readiness or queue state. If the commit response is lost, the frontend keeps
-   listeners installed and retries the same token or calls ready-status until
-   it confirms `ready`; it does not tear down the core during this uncertainty.
-6. Only after confirmed ready does the frontend enable controls. Forwards and
-   theme events committed after ready use already registered listeners. Events
-   may arrive before a retry response, so sequence/revision reconciliation still
-   applies independently.
+   and never calls readiness commands.
+2. It calls `prepare_find_initialization()`. Rust snapshots narrow preferences,
+   releases settings state, creates a five-second initialization token, and
+   changes `NotReady -> PreparedNotReady(token)`. A newer prepare replaces the
+   old token while staying `PreparedNotReady`; the old token becomes
+   `superseded`. No queued forward is removed, returned, emitted, or woken.
+3. The frontend parses and reconciles the prepared snapshot. Lost/malformed
+   response keeps listeners installed and retries prepare; expiry returns the
+   controller to `NotReady` unless a newer preparation owns the state.
+4. After successful parse, it calls
+   `commit_find_ready({ initializationToken })`. A valid current token changes
+   `PreparedNotReady(token) -> Hidden` and wakes the latest queued open
+   transaction. That transaction performs the only handoff/on_show/emit/
+   retirement flow.
+5. Commit is idempotent for the retained committed token. If its response is
+   lost, the frontend keeps listeners and retries commit or calls
+   `get_find_ready_status({ initializationToken })`. Both return `ready` for the
+   committed token and `superseded` for replaced, expired, or unknown tokens.
+6. Only confirmed `ready` enables controls. Events may arrive before a retry
+   response, so forward sequence and field revisions still reconcile
+   independently.
 
-A preparation abandoned before commit has no readiness or queue side effect.
-Frontend destruction explicitly cancels its uncommitted token. Process shutdown
-completes every queued open waiter with the fixed unavailable outcome and drops
-all uncommitted tokens and retirement leases.
+Frontend destruction performs only best-effort local listener/core cleanup; it
+does not claim to cancel server state. The next prepare supersedes an old token,
+token expiry returns to `NotReady`, and process shutdown drops every token,
+lease, and queued waiter.
+
 ### Launcher Submission
 
-1. `main` recognizes `/find` or `/find ` followed by text and captures a
-   submission owner, main invocation, and application query sequence.
-2. Rust validates the exact `main` caller, prepares a conditional main retirement
-   lease, and allocates a checked forward sequence plus opaque find invocation
-   before any native side effect. Exhaustion fails before queueing or emit.
-3. If the controller is `NotReady`, transferring, or hiding, the complete open
-   transaction `{ payload, retirement_lease, waiter }` enters the single
-   latest-only queue. It performs no native work while queued.
-4. Queueing C replaces B immediately. B's waiter completes with
-   `{ status: 'superseded' }`; its retirement lease is discarded without commit,
-   and B is never emitted. B's frontend completion is already stale because C
-   owns the launcher submission token, so it changes no UI state.
-5. The latest queued transaction has a five-second readiness/admission deadline.
-   Timeout removes it, drops its lease, and completes its waiter with the fixed
-   unavailable error. Shutdown does the same for every waiter.
-6. Once admission is `Ready`, the selected transaction performs the native
-   focus transfer.
-7. Rust commits `find_scope.on_show(invocationId)` before emitting the frozen
-   payload. Emit failure clears the new find scope, keeps `find` hidden, performs
-   post-commit native rollback, drops the retirement lease, and returns failure.
-8. After successful emit, Rust commits the prepared main retirement lease. The
-   commit cannot exhaust: it applies the precomputed epoch on a CAS match or is
-   a no-op for newer main ownership.
-9. The waiter completes `{ status: 'forwarded' }` only after retirement commit.
-   Only the still-current frontend submission owner clears launcher input.
-   `superseded`, stale success, and stale failure completions have no frontend
-   effect.
+1. `main` captures the `/find` submission owner and main query ownership.
+2. Rust validates `main`, prepares conditional retirement, and allocates checked
+   forward/invocation IDs before side effects.
+3. In `NotReady`, `PreparedNotReady`, `Transferring`, or
+   `HidingForExecution`, the complete open transaction enters the single latest
+   queue. In `Hidden`, it may start transfer immediately. `VisibleReady` starts
+   a serialized replacement transfer for the same window.
+4. Queueing C replaces B: B completes `superseded`, its lease is dropped, and it
+   is never emitted or retired. Its stale frontend completion is inert.
+5. A queued transaction has a five-second deadline. Timeout or shutdown removes
+   it, drops its lease, and completes its waiter with fixed unavailable.
+6. From `Hidden` admission, the selected transaction enters `Transferring` and
+   performs the native focus handoff.
+7. Rust commits find `on_show(invocationId)` before emit. Emit failure clears the
+   new scope, leaves admission `Hidden`, keeps find hidden, drops retirement,
+   and returns failure.
+8. Successful emit is followed by non-failing prepared main-retirement commit.
+9. The waiter completes `forwarded` only after retirement. Only the current
+   submission owner clears launcher input; superseded or stale completions are
+   inert.
 
-Every forward, including one queued before readiness, follows this one flow.
-Initialization responses never contain or commit a forward.
+Every forward, including one queued before readiness, follows this flow.
+Initialization commands never carry or commit a forward.
+
 ### Find Query
 
 1. `FindView` accepts only a payload with a valid invocation ID, canonical
@@ -402,15 +400,16 @@ Initialization responses never contain or commit a forward.
    invalidating the invocation and every mapping), and changes admission to
    `Hidden` before releasing either lock. Hidden WebView commands cannot search.
 10. If a queued forward exists, only its fresh `on_show` reactivates the scope
-    and changes admission from `Hidden` to visible-ready. Otherwise the window
+    and changes admission from `Hidden` to `VisibleReady`. Otherwise the window
     remains hidden and inactive.
 11. On hide failure, the invocation remains active but the ticket result set is
     already retired. Rust processes the latest queued forward before returning
-    to visible-ready admission; without one, the visible frontend reports the
+    to `VisibleReady` admission; without one, the visible frontend reports the
     fixed error and must issue a new query under the still-active invocation.
 
 No query can be admitted between ticket validation and hide completion, and no
 hidden invocation remains active after successful hide.
+
 ## Frontend Structure
 
 The current file-mode responsibilities move out of the launcher state machine
@@ -441,21 +440,25 @@ revision, and uses the dedicated preview command for persistence.
 
 The command boundary is split by caller:
 
-- `open_find_window`: main-only; accepts query plus captured main invocation and
-  application query sequence, and returns `forwarded` or `superseded`.
+- `open_find_window(input) -> OpenFindOutcome`: main-only; input contains query,
+  captured main invocation, and application query sequence.
+- `prepare_find_initialization() -> FindReadyOutcome`: find-only; returns
+  `prepared` with `FindInitializationPrepared`.
+- `commit_find_ready({ initializationToken }) -> FindReadyOutcome`: find-only,
+  idempotent for the current committed token.
+- `get_find_ready_status({ initializationToken }) -> FindReadyOutcome`:
+  find-only and read-only; returns `ready` only for the retained committed token,
+  otherwise `prepared` for the current uncommitted token or `superseded`.
 - application, general settings, and plugin commands: main-only.
-- file search and file result execution: find-only and resolve only against the
-  active find scope.
-- `prepare_find_initialization`, `commit_find_ready`, and
-  `get_find_ready_status`: find-only two-phase readiness commands.
-- pin update, narrow preview update, and explicit find hide: find-only and
+- file search/execution, pin, preview update, and explicit hide: find-only and
   admitted only by the applicable controller state.
 
-Every command performs its exact label guard before state access or side
-effects. The `find` capability includes only file search, result execution,
-three readiness commands, pin, preview update, explicit hide, and minimum event
-listen permissions. It does not receive application search, full load/save
-settings, hotkey, autostart, plugin management, or launcher-hide permissions.
+Every command guards the exact label before state access. The `find` capability
+includes only file search/execution, these three readiness commands, pin,
+preview update, explicit hide, and minimum event-listen permissions. It does not
+receive application search, full settings, hotkey, autostart, plugin management,
+or launcher-hide permissions.
+
 ## Failure Behavior
 
 - Counter or retirement preparation exhaustion fails before queueing, native
@@ -463,11 +466,11 @@ settings, hotkey, autostart, plugin management, or launcher-hide permissions.
 - Malformed, noncanonical, stale, or duplicate forward payloads are ignored.
 - Partial listener registration fails before readiness preparation and cleans up
   all listeners.
-- Lost or malformed prepare responses leave Rust not ready and listeners intact;
+- Lost or malformed prepare responses leave Rust in `PreparedNotReady` and listeners intact;
   the frontend retries prepare. Lost ready-commit responses retry idempotently
   or query ready status without unregistering listeners.
-- Cancelling an uncommitted preparation has no queue effect. Shutdown cancels
-  tokens, drops leases, and completes every queued waiter.
+- Superseding or expiring an uncommitted preparation has no queue effect. Shutdown
+  drops tokens and leases and completes every queued waiter.
 - Replacing queued B with C immediately completes B as `superseded`, drops B's
   lease, and never emits or retires for B.
 - Native pre-ownership failure restores captured state. Emit failure after
@@ -491,6 +494,7 @@ settings, hotkey, autostart, plugin management, or launcher-hide permissions.
   cannot overwrite a newer revision of that field.
 - Process shutdown owns final destruction; ordinary close never destroys
   `find`.
+
 ## Testing
 
 ### Frontend
@@ -502,7 +506,7 @@ settings, hotkey, autostart, plugin management, or launcher-hide permissions.
   failure cleans up before readiness contact.
 - Prepare response loss/parse failure retries while retaining listeners and
   controls remain disabled.
-- Ready commit response loss retries the same token or checks status; no listener
+- Readiness commit response loss retries the same token or checks status; no listener
   teardown or duplicate ready transition occurs.
 - Initialization responses contain no pending forward. First forward arrives
   only through the registered event after ready commit.
@@ -518,13 +522,14 @@ settings, hotkey, autostart, plugin management, or launcher-hide permissions.
   completions are inert.
 - Existing category, list, preview, keyboard, stale-response, and error tests
   move to the dedicated file-search core without losing coverage.
+
 ### Rust
 
 - The controller has the frozen admission states and resolves exactly one
   precreated find window.
-- Prepare remains not-ready and never drains or emits a queued forward; commit
+- Prepare enters `PreparedNotReady` and never drains or emits a queued forward; commit
   is idempotent and only commit wakes the latest original open transaction.
-- Lost prepare/commit responses, token supersession/cancellation, readiness
+- Lost prepare/commit responses, token supersession/expiry, readiness
   timeout, and shutdown give every token and waiter a terminal state.
 - Queue B replaced by C completes B `superseded`, drops B's retirement lease,
   emits only C, and commits retirement only for C when current.
@@ -544,10 +549,11 @@ settings, hotkey, autostart, plugin management, or launcher-hide permissions.
   `Hidden`, and rejects commands from the hidden old invocation.
 - Only queued forward fresh `on_show` reactivates after hide success.
 - Hide failure keeps the invocation active with inert old IDs and processes a
-  queued forward before visible-ready admission.
+  queued forward before `VisibleReady` admission.
 - Preference snapshots/events reconcile by independent field revision; narrow
   commands guard caller first.
 - Capability and configuration tests enforce exact labels and permissions.
+
 ### Real Window Event Tests
 
 A Windows-only native harness uses real Tauri window events, not closure-only
@@ -566,6 +572,7 @@ simulation, to verify:
 
 These tests do not synthesize user mouse or keyboard input. Any harness capable
 of changing foreground focus is announced to the user before it runs.
+
 ### Verification Gates
 
 - Focused frontend and Rust red-green tests.
