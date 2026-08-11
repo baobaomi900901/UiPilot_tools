@@ -2,8 +2,8 @@
 
 ## Status
 
-Independently approved on 2026-08-11 after five review rounds. Awaiting
-final user review before implementation planning.
+Approved for implementation planning on 2026-08-11 after five independent
+review rounds and final user confirmation.
 
 ## Goal
 
