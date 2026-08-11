@@ -12,6 +12,7 @@ import {
   type FileResultView,
   type FileSearchResponse,
   type FileSort,
+  type FindClient,
   type LauncherClient,
   type LauncherSnapshot,
   type PluginInventoryView,
@@ -365,6 +366,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   const pluginMutationErrors = new Map<string, string>()
   let highestPluginRevision = '0'
   let pluginInventoryActive = false
+  const legacyFindClient = client as unknown as Pick<FindClient, 'searchFiles' | 'setPreviewPreference'>
+  let findSubmissionToken = 0
+
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -498,6 +502,50 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return value.startsWith('/find ') ? value.slice(6) : null
   }
 
+  function submitFind(query: string): void {
+    const invocationId = model.invocationId
+    if (!invocationId || model.view !== 'launcher' || model.executePending) return
+    const owner = {
+      token: ++findSubmissionToken,
+      epoch: model.viewEpoch,
+      control: model.queryControl,
+      value: model.queryControlValue,
+      invocationId,
+      querySequence: model.querySequence,
+    }
+    model.status = ''
+    model.shownNotice = undefined
+    publish(true)
+    let pending
+    try {
+      pending = client.openFind({ query, invocationId, querySequence: owner.querySequence })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      (outcome) => {
+        if (destroyed || outcome.status !== 'forwarded' || owner.token !== findSubmissionToken ||
+            owner.epoch !== model.viewEpoch || owner.control !== model.queryControl ||
+            owner.value !== model.queryControlValue || owner.invocationId !== model.invocationId ||
+            owner.querySequence !== model.querySequence) return
+        searchToken = ++token
+        model.searchPending = false
+        model.query = ''
+        model.queryControlValue = ''
+        model.status = ''
+        clearResults()
+        publish(true)
+      },
+      () => {
+        if (destroyed || owner.token !== findSubmissionToken || owner.epoch !== model.viewEpoch ||
+            owner.control !== model.queryControl || owner.value !== model.queryControlValue ||
+            owner.invocationId !== model.invocationId || owner.querySequence !== model.querySequence) return
+        model.status = '文件搜索窗口暂不可用。'
+        publish(true)
+      },
+    )
+  }
+
   function fileStatusText(status: FileIndexStatus, hasResults = true): string {
     if (status === 'building') return '正在索引。'
     if (status === 'partial') return '部分位置无法访问。'
@@ -555,7 +603,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<FileSearchResponse | null>
     try {
-      pending = client.searchFiles({
+      pending = legacyFindClient.searchFiles({
         query: owner.query,
         category: owner.category,
         sort: owner.sort,
@@ -1301,7 +1349,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (key === 'Enter') {
       const fileQuery = model.launcherMode === 'applications' ? fileCommand(model.query) : null
       if (model.view === 'launcher' && fileQuery !== null && model.queryControlValue === model.query) {
-        void enterFileMode(fileQuery)
+        submitFind(fileQuery)
         return
       }
       if (
@@ -1451,7 +1499,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<void>
     try {
-      pending = client.setFilePreviewPreference({ preference: { enabled } })
+      pending = legacyFindClient.setPreviewPreference({ preference: { enabled } }).then(() => undefined)
     } catch (error) {
       pending = Promise.reject(error)
     }

@@ -766,7 +766,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     <ConfigProvider theme={{ algorithm: colorScheme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
       <App>
         <main className="launcher-surface" data-color-scheme={colorScheme}>
-          {snapshot.view === 'launcher' ? filePanel ?? launcher : settingsView}
+          {snapshot.view === 'launcher' ? launcher : settingsView}
           <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
             {status}
           </div>

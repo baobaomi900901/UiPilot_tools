@@ -117,13 +117,7 @@ export type ClassifiedTextRecord =
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
   searchApps(input: { query: string; invocationId: string; querySequence: number }): Promise<SearchResponse | null>
-  searchFiles(input: {
-    query: string
-    category: FileCategory
-    sort: FileSort
-    invocationId: string
-    querySequence: number
-  }): Promise<FileSearchResponse | null>
+  openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   listPlugins(): Promise<PluginInventorySnapshot>
   installPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
@@ -132,9 +126,45 @@ export interface LauncherClient {
   loadSettings(): Promise<SettingsView>
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
-  setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
   setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
   hideLauncher(): Promise<void>
+}
+
+export type U64Decimal = string & { readonly __u64Decimal: unique symbol }
+export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string }
+export type OpenFindOutcome = { status: 'forwarded' } | { status: 'superseded' }
+export interface OpenFindInput { query: string; invocationId: string; querySequence: number }
+export interface FindInitializationPrepared {
+  initializationToken: string
+  themeRevision: U64Decimal
+  theme: ThemePreference
+  filePreviewRevision: U64Decimal
+  filePreviewEnabled: boolean
+  pinned: boolean
+}
+export type FindReadyOutcome =
+  | { status: 'prepared'; initialization: FindInitializationPrepared }
+  | { status: 'ready'; initializationToken: string }
+  | { status: 'superseded' }
+export interface FindPreviewPreferenceResult { filePreviewRevision: U64Decimal; filePreviewEnabled: boolean }
+export interface FindThemeChanged { themeRevision: U64Decimal; theme: ThemePreference }
+export interface FindClient {
+  listenForward(handler: (payload: unknown) => void): Promise<() => void>
+  listenThemeChanged(handler: (payload: unknown) => void): Promise<() => void>
+  prepareInitialization(): Promise<unknown>
+  commitReady(input: { initializationToken: string }): Promise<unknown>
+  getReadyStatus(input: { initializationToken: string }): Promise<unknown>
+  searchFiles(input: {
+    query: string
+    category: FileCategory
+    sort: FileSort
+    invocationId: string
+    querySequence: number
+  }): Promise<FileSearchResponse | null>
+  executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  setPinned(input: { invocationId: string; pinned: boolean }): Promise<{ pinned: boolean }>
+  setPreviewPreference(input: { preference: { enabled: boolean } }): Promise<unknown>
+  hide(input: { invocationId: string; force: boolean }): Promise<void>
 }
 
 export interface ViewResult {
@@ -390,9 +420,62 @@ export function compareDecimalRevision(left: string, right: string): -1 | 0 | 1 
   return left === right ? 0 : left < right ? -1 : 1
 }
 
+export function parseU64Decimal(value: unknown): U64Decimal | null {
+  if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return null
+  return BigInt(value) <= U64_MAX ? value as U64Decimal : null
+}
+
 function canonicalU64(value: unknown): value is string {
-  if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return false
-  return BigInt(value) <= U64_MAX
+  return parseU64Decimal(value) !== null
+}
+
+export function parseFindForwardPayload(value: unknown): FindForwardPayload | null {
+  const payload = plainRecord(value)
+  const forwardSequence = payload ? parseU64Decimal(payload.forwardSequence) : null
+  if (!payload || !exactKeys(payload, ['forwardSequence', 'invocationId', 'query']) ||
+      typeof payload.invocationId !== 'string' || payload.invocationId.length === 0 ||
+      typeof payload.query !== 'string' || !forwardSequence) return null
+  return { invocationId: payload.invocationId, forwardSequence, query: payload.query }
+}
+
+export function parseFindReadyOutcome(value: unknown): FindReadyOutcome | null {
+  const outcome = plainRecord(value)
+  if (!outcome || typeof outcome.status !== 'string') return null
+  if (outcome.status === 'superseded') return exactKeys(outcome, ['status']) ? { status: 'superseded' } : null
+  if (outcome.status === 'ready') {
+    return exactKeys(outcome, ['initializationToken', 'status']) &&
+      typeof outcome.initializationToken === 'string' && outcome.initializationToken.length > 0
+      ? { status: 'ready', initializationToken: outcome.initializationToken } : null
+  }
+  if (outcome.status !== 'prepared' || !exactKeys(outcome, ['initialization', 'status'])) return null
+  const initialization = plainRecord(outcome.initialization)
+  if (!initialization || !exactKeys(initialization, ['filePreviewEnabled', 'filePreviewRevision', 'initializationToken', 'pinned', 'theme', 'themeRevision'])) return null
+  const themeRevision = parseU64Decimal(initialization.themeRevision)
+  const filePreviewRevision = parseU64Decimal(initialization.filePreviewRevision)
+  if (typeof initialization.initializationToken !== 'string' || initialization.initializationToken.length === 0 ||
+      (initialization.theme !== 'system' && initialization.theme !== 'dark' && initialization.theme !== 'light') ||
+      typeof initialization.filePreviewEnabled !== 'boolean' || typeof initialization.pinned !== 'boolean' ||
+      !themeRevision || !filePreviewRevision) return null
+  return { status: 'prepared', initialization: {
+    initializationToken: initialization.initializationToken, themeRevision, theme: initialization.theme,
+    filePreviewRevision, filePreviewEnabled: initialization.filePreviewEnabled, pinned: initialization.pinned,
+  } }
+}
+
+export function parseFindThemeChanged(value: unknown): FindThemeChanged | null {
+  const event = plainRecord(value)
+  const themeRevision = event ? parseU64Decimal(event.themeRevision) : null
+  if (!event || !exactKeys(event, ['theme', 'themeRevision']) || !themeRevision ||
+      (event.theme !== 'system' && event.theme !== 'dark' && event.theme !== 'light')) return null
+  return { themeRevision, theme: event.theme }
+}
+
+export function parseFindPreviewPreferenceResult(value: unknown): FindPreviewPreferenceResult | null {
+  const result = plainRecord(value)
+  const filePreviewRevision = result ? parseU64Decimal(result.filePreviewRevision) : null
+  if (!result || !exactKeys(result, ['filePreviewEnabled', 'filePreviewRevision']) ||
+      !filePreviewRevision || typeof result.filePreviewEnabled !== 'boolean') return null
+  return { filePreviewRevision, filePreviewEnabled: result.filePreviewEnabled }
 }
 
 function fileStatus(value: unknown): value is FileIndexStatus {
