@@ -527,7 +527,8 @@ describe('shown and search ownership', () => {
       query: 'calc',
       queryControlValue: 'calc',
       querySequence: 1,
-      selectedIndex: -1,
+      results: [{ title: '/find', subtitle: '搜索文件：calc' }],
+      selectedIndex: 0,
       shownNotice: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
     })
     expect(client.searchApps).toHaveBeenCalledOnce()
@@ -548,12 +549,19 @@ describe('shown and search ownership', () => {
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'a', inputType: 'insertText' })
     const beforeSecond = core.getSnapshot()
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'ab', inputType: 'insertText' })
-    expect(core.getSnapshot()).toMatchObject({ query: 'ab', querySequence: 2, results: [], searchPending: true, status: '' })
+    expect(core.getSnapshot()).toMatchObject({
+      query: 'ab',
+      querySequence: 2,
+      results: [{ title: '/find', subtitle: '搜索文件：ab' }],
+      selectedIndex: 0,
+      searchPending: true,
+      status: '',
+    })
     first.resolve({ requestId: 'old-request', items: [{ resultId: 'old', title: 'old' }] })
     await first.promise
     await Promise.resolve()
     expect(core.getSnapshot()).not.toBe(beforeSecond)
-    expect(core.getSnapshot().results).toEqual([])
+    expect(core.getSnapshot().results).toMatchObject([{ title: '/find', subtitle: '搜索文件：ab' }])
 
     second.resolve({
       requestId: 'request',
@@ -564,10 +572,10 @@ describe('shown and search ownership', () => {
     })
     await second.promise
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
-    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['One', 'Two'])
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find', 'One', 'Two'])
     expect(core.getSnapshot().selectedIndex).toBe(0)
     core.keyDown('ArrowUp', false)
-    expect(core.getSnapshot().selectedIndex).toBe(1)
+    expect(core.getSnapshot().selectedIndex).toBe(2)
     core.keyDown('ArrowDown', false)
     expect(core.getSnapshot().selectedIndex).toBe(0)
 
@@ -621,8 +629,9 @@ describe('shown and search ownership', () => {
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' })
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
 
-    expect(core.getSnapshot().results[0]?.icon).toBe(valid)
-    expect(core.getSnapshot().results.slice(1).every((item) => item.icon === undefined)).toBe(true)
+    expect(core.getSnapshot().results[0]?.icon).toBeUndefined()
+    expect(core.getSnapshot().results[1]?.icon).toBe(valid)
+    expect(core.getSnapshot().results.slice(2).every((item) => item.icon === undefined)).toBe(true)
   })
 })
 
@@ -635,9 +644,10 @@ describe('execute and hide ownership', () => {
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
     emit(shown('execute'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private-request')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private-result')
+    core.keyDown('ArrowDown', false)
     core.keyDown('Enter', false)
     core.keyDown('Enter', false)
     expect(client.executeResult).toHaveBeenCalledOnce()
@@ -657,8 +667,9 @@ describe('execute and hide ownership', () => {
     vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
     emit(shown('copy'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'copy', inputType: 'insertText' })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
 
+    core.keyDown('ArrowDown', false)
     core.keyDown('Enter', false)
     await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
 
@@ -693,7 +704,7 @@ describe('execute and hide ownership', () => {
     hide.reject({ code: 'windowFailed' })
     await hiding
     search.resolve({ requestId: 'application-after-hide', items: [{ resultId: 'result', title: 'Calculator' }] })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
   })
 })
 
@@ -736,7 +747,7 @@ describe('IME ownership', () => {
     current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New' }] })
     await Promise.all([old.promise, current.promise])
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
-    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['New'])
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find', 'New'])
   })
 
   it('keeps an exact empty commit state-idempotent', async () => {
@@ -932,23 +943,23 @@ describe('R3 correlated composition boundary', () => {
     expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5' })
   })
 
-  it('restores an unfinished draft once and keeps exact-value edits idempotent', async () => {
+  it('restores an unfinished command draft once and keeps exact-value edits idempotent', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('idempotent'))
     const control = core.getSnapshot().queryControl
-    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '/unknown', inputType: 'insertText' }))
     vi.mocked(client.searchApps).mockClear()
     core.text(r3({ kind: 'compositionStart', control }))
     core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
     const listener = vi.fn()
     core.subscribe(listener)
 
-    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '/unknown', inputType: 'insertText' }))
     expect(listener).toHaveBeenCalledOnce()
     expect(client.searchApps).not.toHaveBeenCalled()
     const restored = core.getSnapshot()
     listener.mockClear()
-    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertFromPaste' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '/unknown', inputType: 'insertFromPaste' }))
     expect(core.getSnapshot()).toBe(restored)
     expect(listener).not.toHaveBeenCalled()
 
@@ -956,7 +967,7 @@ describe('R3 correlated composition boundary', () => {
     emit(shown('idempotent-rerun', 'launcher', 'settingsFailed'))
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({
-      query: 'calc',
+      query: '/unknown',
       querySequence: 1,
       results: [],
       selectedIndex: -1,
@@ -968,7 +979,7 @@ describe('R3 correlated composition boundary', () => {
     const searchCalls = vi.mocked(client.searchApps).mock.calls.length
     core.keyDown('Enter', false)
     expect(core.getSnapshot()).toMatchObject({
-      query: 'calc',
+      query: '/unknown',
       querySequence: 2,
       results: [],
       selectedIndex: -1,
@@ -977,7 +988,7 @@ describe('R3 correlated composition boundary', () => {
     })
     expect(core.getSnapshot().shownNotice).toBeUndefined()
     expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
-    expect(client.searchApps).toHaveBeenLastCalledWith({ query: 'calc', invocationId: 'idempotent-rerun', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenLastCalledWith({ query: '/unknown', invocationId: 'idempotent-rerun', querySequence: 2 })
     expect(client.executeResult).not.toHaveBeenCalled()
 
     core.keyDown('Enter', false)
@@ -1733,7 +1744,8 @@ describe('execute and hide continuation', () => {
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
     emit(shown('execute-old'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'app', inputType: 'insertText' })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    core.keyDown('ArrowDown', false)
     core.keyDown('Enter', false)
     emit(shown('settings-new', 'settings'))
     execute.resolve({ status: 'activationRefusedLaunchRequested', message: 'raw backend text' })
@@ -1871,15 +1883,15 @@ describe('React view and accessibility', () => {
       await act(async () =>
         core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'layout', inputType: 'insertText' }),
       )
-      await vi.waitFor(() => expect(mounted.host.querySelector('.result-icon')).toBeInstanceOf(HTMLElement))
+      await vi.waitFor(() => expect(mounted.host.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement))
       const app = mounted.host.querySelector<HTMLElement>(':scope > .ant-app')!
       const surface = app.querySelector<HTMLElement>('.launcher-surface')!
       const launcher = surface.querySelector<HTMLElement>('.launcher-view')!
       const spinRoot = launcher.querySelector<HTMLElement>(':scope > .ant-spin')!
       const spinContainer = spinRoot.querySelector<HTMLElement>('.ant-spin-container')!
       const results = spinContainer.querySelector<HTMLElement>('.result-list')!
-      const icon = results.querySelector<HTMLElement>('.result-icon')!
-      const image = icon.querySelector<HTMLImageElement>('.result-icon-image')!
+      const image = results.querySelector<HTMLImageElement>('.result-icon-image')!
+      const icon = image.closest<HTMLElement>('.result-icon')!
       const status = surface.querySelector<HTMLElement>('.status-region')!
       const normalized = (value: string) => value.replace(/\s+/g, ' ').trim()
       const isZero = (value: string) => /^0(?:px)?$/.test(value)
@@ -1974,15 +1986,15 @@ describe('React view and accessibility', () => {
       await act(async () =>
         core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' }),
       )
-      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
 
       const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
-      const image = rows[0]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const fallback = rows[0]!.querySelector<HTMLElement>('.result-icon .app-mark')
-      const siblingImage = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const siblingFallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
-      const missingImage = rows[2]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const missingFallback = rows[2]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const image = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const fallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const siblingImage = rows[2]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const siblingFallback = rows[2]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const missingImage = rows[3]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const missingFallback = rows[3]!.querySelector<HTMLElement>('.result-icon .app-mark')
       expect(image).toBeInstanceOf(HTMLImageElement)
       expect(fallback).toBeInstanceOf(HTMLElement)
       expect(siblingImage).toBeInstanceOf(HTMLImageElement)
@@ -2010,8 +2022,9 @@ describe('React view and accessibility', () => {
       await vi.waitFor(() =>
         expect(mounted.host.querySelector<HTMLImageElement>('.result-icon-image')?.src).toContain(secondIcon),
       )
-      const nextImage = mounted.host.querySelector<HTMLImageElement>('.result-icon-image')!
-      const nextFallback = mounted.host.querySelector<HTMLElement>('.result-icon .app-mark')!
+      const nextRow = mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!
+      const nextImage = nextRow.querySelector<HTMLImageElement>('.result-icon-image')!
+      const nextFallback = nextRow.querySelector<HTMLElement>('.result-icon .app-mark')!
       expect(nextImage).not.toBe(image)
       expect(nextImage.hidden).toBe(false)
       expect(nextFallback.hidden).toBe(true)
@@ -2044,16 +2057,18 @@ describe('React view and accessibility', () => {
     expect(document.activeElement).toBe(input)
 
     await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'app', inputType: 'insertText' }))
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
     const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     expect(mounted.host.querySelector('[role="listbox"]')?.id).toBe('launcher-results')
     expect(input.getAttribute('aria-expanded')).toBe('true')
     expect(options[0]!.getAttribute('aria-selected')).toBe('true')
-    expect(options[0]!.textContent).toContain('<b>literal</b>')
-    expect(options[0]!.querySelector('b')).toBeNull()
+    expect(options[0]!.textContent).toContain('/find')
+    expect(options[0]!.textContent).toContain('搜索文件：app')
+    expect(options[1]!.textContent).toContain('<b>literal</b>')
+    expect(options[1]!.querySelector('b')).toBeNull()
     expect(mounted.host.innerHTML).not.toContain('private-request')
     expect(mounted.host.innerHTML).not.toContain('private-one')
-    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('2 个结果')
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('3 个结果')
 
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
     expect(document.activeElement).toBe(input)
@@ -2075,7 +2090,9 @@ describe('React view and accessibility', () => {
     await act(async () => fake.emit(shown('empty-results')))
     expect(input.disabled).toBe(false)
     await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'missing', inputType: 'insertText' }))
-    await vi.waitFor(() => expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('未找到应用'))
+    await vi.waitFor(() =>
+      expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('1 个结果。/find，搜索文件：missing'),
+    )
     await act(async () =>
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, isComposing: true })),
     )
@@ -2808,6 +2825,63 @@ describe('real adapter and startup', () => {
 })
 
 describe('launcher find forwarding ownership', () => {
+  it('keeps an ordinary-query find action first and forwards it on Enter', async () => {
+    const fake = fakeClient()
+    const applications = deferred<SearchResponse | null>()
+    vi.mocked(fake.client.searchApps).mockReturnValueOnce(applications.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('find-suggestion'))
+    const control = core.getSnapshot().queryControl
+
+    core.text({ kind: 'ordinaryInput', control, value: 'windows', inputType: 'insertText' })
+    expect(core.getSnapshot()).toMatchObject({
+      query: 'windows',
+      selectedIndex: 0,
+      searchPending: true,
+      results: [{ title: '/find', subtitle: '搜索文件：windows' }],
+    })
+
+    applications.resolve({
+      requestId: 'application-request',
+      items: [{ resultId: 'windows-terminal', title: 'Windows Terminal' }],
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().results.map(({ title }) => title)).toEqual(['/find', 'Windows Terminal'])
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+
+    const querySequence = core.getSnapshot().querySequence
+    core.keyDown('Enter', false)
+    expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'find-suggestion',
+      querySequence,
+    })
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('keeps explicit find commands free of suggestions and application searches', async () => {
+    for (const [value, query] of [['/find windows', 'windows'], ['/find', '']] as const) {
+      const fake = fakeClient()
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown(`explicit-${query || 'empty'}`))
+      const control = core.getSnapshot().queryControl
+
+      core.text({ kind: 'ordinaryInput', control, value, inputType: 'insertText' })
+      expect(core.getSnapshot()).toMatchObject({ results: [], selectedIndex: -1, searchPending: false })
+      expect(fake.client.searchApps).not.toHaveBeenCalled()
+
+      core.keyDown('Enter', false)
+      expect(fake.client.openFind).toHaveBeenCalledWith({
+        query,
+        invocationId: `explicit-${query || 'empty'}`,
+        querySequence: core.getSnapshot().querySequence,
+      })
+      core.destroy()
+    }
+  })
+
   it('clears only an owned forwarded submission and forwards an empty query exactly', async () => {
     for (const [value, query] of [['/find reports', 'reports'], ['/find', '']] as const) {
       const fake = fakeClient()

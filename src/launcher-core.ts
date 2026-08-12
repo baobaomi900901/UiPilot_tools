@@ -55,9 +55,17 @@ export interface LauncherCore {
   readonly destroy: () => void
 }
 
-interface PrivateResult extends ViewResult {
+interface PrivateApplicationResult extends ViewResult {
+  kind: 'application'
   resultId: string
 }
+
+interface PrivateFindResult extends ViewResult {
+  kind: 'find'
+  query: string
+}
+
+type PrivateResult = PrivateApplicationResult | PrivateFindResult
 
 interface PrivateFileResult {
   resultId: string
@@ -502,6 +510,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return value.startsWith('/find ') ? value.slice(6) : null
   }
 
+  function localFindResult(query: string): PrivateFindResult {
+    return {
+      kind: 'find',
+      key: resultKey++,
+      query,
+      title: '/find',
+      subtitle: `搜索文件：${query}`,
+    }
+  }
+
   function submitFind(query: string): void {
     const invocationId = model.invocationId
     if (!invocationId || model.view !== 'launcher' || model.executePending) return
@@ -708,7 +726,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function beginSearch(): void {
     const invocationId = model.invocationId
-    if (!invocationId || model.query === '') return
+    if (!invocationId || model.query === '' || fileCommand(model.query) !== null) return
+    if (!model.query.startsWith('/')) {
+      model.results = [localFindResult(model.query)]
+      model.selectedIndex = 0
+    }
     const captured = {
       token: ++token,
       epoch: model.viewEpoch,
@@ -750,9 +772,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     if (response !== null) {
       model.requestId = response.requestId
-      model.results = response.items.map((item: ResultItem) => {
+      const findResult = model.results.find((item): item is PrivateFindResult => item.kind === 'find')
+      const applications: PrivateApplicationResult[] = response.items.map((item: ResultItem) => {
         const icon = safeApplicationIcon(item.icon)
         return {
+          kind: 'application',
           key: resultKey++,
           resultId: item.resultId,
           title: item.title,
@@ -760,8 +784,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           ...(icon === undefined ? {} : { icon }),
         }
       })
+      model.results = findResult ? [findResult, ...applications] : applications
       model.selectedIndex = model.results.length ? 0 : -1
-      model.status = model.results.length || fileCommand(captured.query) !== null ? '' : '未找到应用'
+      model.status = model.results.length ? '' : '未找到应用'
     }
     publish(true)
   }
@@ -1285,10 +1310,20 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function executeSelection(): void {
-    if (model.view !== 'launcher' || model.executePending || !model.requestId) return
-    const selected =
-      model.launcherMode === 'files' ? model.file?.results[model.file.selectedIndex] : model.results[model.selectedIndex]
-    if (!selected) return
+    if (model.view !== 'launcher' || model.executePending) return
+    let resultId: string | undefined
+    if (model.launcherMode === 'applications') {
+      const selected = model.results[model.selectedIndex]
+      if (!selected) return
+      if (selected.kind === 'find') {
+        submitFind(selected.query)
+        return
+      }
+      resultId = selected.resultId
+    } else {
+      resultId = model.file?.results[model.file.selectedIndex]?.resultId
+    }
+    if (!model.requestId || resultId === undefined) return
     model.shownNotice = undefined
     model.status = ''
     model.executePending = true
@@ -1298,7 +1333,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<ExecuteOutcome>
     try {
-      pending = client.executeResult({ requestId, resultId: selected.resultId })
+      pending = client.executeResult({ requestId, resultId })
     } catch (error) {
       pending = Promise.reject(error)
     }
