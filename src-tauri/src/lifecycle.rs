@@ -1602,7 +1602,7 @@ pub(crate) fn advance_find_transfer(
     let find = app
         .get_webview_window("find")
         .ok_or(LifecycleError::WindowFailed)?;
-    let emitted = find.emit("find://forward", &payload).is_ok();
+    let emitted = find.emit("find://forwarded", &payload).is_ok();
     let finish = controller.finish_forward_emit(transfer_id, emitted, registries);
     if !emitted {
         let _ = find.hide();
@@ -1926,6 +1926,15 @@ mod tests {
             .expect("show_main source markers are missing");
         assert!(show_main.contains("app.state::<ResultRegistries>().main().clone()"));
         assert!(!show_main.contains("app.state::<ResultRegistry>()"));
+    }
+
+    #[test]
+    fn find_forward_event_name_matches_the_frontend_listener() {
+        let lifecycle = include_str!("lifecycle.rs");
+        let frontend = include_str!("../../src/main.ts");
+        assert!(lifecycle.contains("find.emit(\"find://forwarded\", &payload)"));
+        assert!(frontend.contains("listen('find://forwarded'"));
+        assert!(!lifecycle.contains("find.emit(\"find://forward\", &payload)"));
     }
 
     #[test]
