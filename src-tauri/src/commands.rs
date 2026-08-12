@@ -624,20 +624,20 @@ pub(crate) async fn search_apps(
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let plugins = app.state::<Arc<PluginManager>>();
-    match plugins.begin_routed_query(&query, &registry, &invocation_id, query_sequence) {
+    match plugins.begin_routed_query(&query, registry, &invocation_id, query_sequence) {
         PluginQueryStart::Started { route, token } => {
             let entries = match plugins.query(window.app_handle(), route.clone()).await {
                 Ok(entries) => entries,
                 Err(PluginQueryError::Timeout) => Vec::new(),
                 Err(_) => return Err(CommandError::plugin_query_failed()),
             };
-            return Ok(plugins.publish_results(&registry, token, &route, entries));
+            return Ok(plugins.publish_results(registry, token, &route, entries));
         }
         PluginQueryStart::Rejected => return Ok(None),
         PluginQueryStart::NoRoute => {}
     }
     Ok(search_apps_with(
-        &registry,
+        registry,
         &query,
         &invocation_id,
         query_sequence,
@@ -1256,7 +1256,7 @@ pub(crate) async fn execute_result(
                     app.clipboard().write_text(text.to_owned()).map_err(|_| ())
                 })
             },
-            clear_and_hide: || clear_and_hide(&registry, &window),
+            clear_and_hide: || clear_and_hide(registry, &window),
             increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
         },
     )
@@ -2016,7 +2016,7 @@ mod tests {
         fs::remove_file(&current).unwrap();
         fs::create_dir(&current).unwrap();
         assert_eq!(
-            store.set_theme_preference(ThemePreference::Dark),
+            store.set_theme_preference_with_revision(ThemePreference::Dark),
             Err(crate::settings::SettingsError::Storage)
         );
         assert_eq!(store.snapshot(), before);

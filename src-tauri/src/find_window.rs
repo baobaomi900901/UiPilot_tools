@@ -25,16 +25,6 @@ pub(crate) enum ControllerError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdmissionView {
-    NotReady,
-    PreparedNotReady,
-    Hidden,
-    Transferring,
-    VisibleReady,
-    HidingForExecution,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FindReadyStatus {
     Prepared,
     Ready,
@@ -578,10 +568,6 @@ impl FindWindowController {
         true
     }
 
-    pub(crate) fn admit_explicit_hide(&self, invocation_id: &str) -> bool {
-        self.admit_search(invocation_id)
-    }
-
     pub(crate) fn request_explicit_hide(&self, invocation_id: &str, force: bool) -> bool {
         let core = self.lock();
         matches!(
@@ -720,17 +706,6 @@ impl FindWindowController {
         let state = mem::replace(&mut core.state, AdmissionState::NotReady);
         if let AdmissionState::Transferring(transfer) = state {
             Self::complete(transfer.transaction, OpenFindCompletion::Unavailable);
-        }
-    }
-
-    pub(crate) fn admission(&self) -> AdmissionView {
-        match self.lock().state {
-            AdmissionState::NotReady => AdmissionView::NotReady,
-            AdmissionState::PreparedNotReady { .. } => AdmissionView::PreparedNotReady,
-            AdmissionState::Hidden => AdmissionView::Hidden,
-            AdmissionState::Transferring(_) => AdmissionView::Transferring,
-            AdmissionState::VisibleReady { .. } => AdmissionView::VisibleReady,
-            AdmissionState::HidingForExecution { .. } => AdmissionView::HidingForExecution,
         }
     }
 
@@ -961,7 +936,7 @@ mod tests {
             controller.commit_ready(&second.token, now).outcome,
             FindReadyStatus::Ready
         );
-        assert_eq!(controller.admission(), AdmissionView::Hidden);
+        assert_eq!(controller.current_invocation(), None);
     }
 
     #[test]
@@ -1042,7 +1017,10 @@ mod tests {
             controller.ready_status(&prepared.token, now),
             FindReadyStatus::Superseded
         );
-        assert_eq!(controller.admission(), AdmissionView::NotReady);
+        assert_eq!(
+            controller.prepare_initialization(now),
+            Err(ControllerError::Unavailable)
+        );
     }
 
     #[test]
@@ -1100,7 +1078,7 @@ mod tests {
             open.completion.recv().unwrap(),
             OpenFindCompletion::Unavailable
         );
-        assert_eq!(controller.admission(), AdmissionView::Hidden);
+        assert_eq!(controller.current_invocation(), None);
     }
 
     #[test]
@@ -1164,7 +1142,7 @@ mod tests {
             controller.begin_execution_hide(&current, registries.find()),
             ExecutionHideAdmission::Pinned
         );
-        assert_eq!(controller.admission(), AdmissionView::VisibleReady);
+        assert_eq!(controller.current_invocation(), Some(invocation.clone()));
     }
 
     #[test]
@@ -1181,7 +1159,6 @@ mod tests {
 
         assert!(!controller.admit_search(&invocation));
         assert!(!controller.set_pin(&invocation, true));
-        assert!(!controller.admit_explicit_hide(&invocation));
         assert_eq!(
             controller.begin_execution_hide(&ticket, registries.find()),
             ExecutionHideAdmission::Stale
@@ -1216,7 +1193,7 @@ mod tests {
             }
         );
         assert!(!registries.find().is_execution_ticket_current(&ticket));
-        assert_eq!(controller.admission(), AdmissionView::Hidden);
+        assert_eq!(controller.current_invocation(), None);
         assert!(queued.completion.try_recv().is_err());
     }
 
@@ -1239,7 +1216,7 @@ mod tests {
                 snapshot_required: true,
             }
         );
-        assert_eq!(controller.admission(), AdmissionView::VisibleReady);
+        assert_eq!(controller.current_invocation(), Some(invocation.clone()));
         assert!(!controller.admit_search(&invocation));
         assert!(queued.completion.try_recv().is_err());
     }

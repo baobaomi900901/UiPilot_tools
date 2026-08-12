@@ -220,10 +220,6 @@ impl SettingsStore {
         Ok(revision)
     }
 
-    pub(crate) fn set_theme_preference(&self, theme: ThemePreference) -> Result<(), SettingsError> {
-        self.set_theme_preference_with_revision(theme).map(|_| ())
-    }
-
     pub(crate) fn set_theme_preference_with_revision(
         &self,
         theme: ThemePreference,
@@ -447,7 +443,7 @@ mod tests {
             ThemePreference::Dark,
             ThemePreference::Light,
         ] {
-            store.set_theme_preference(theme).unwrap();
+            store.set_theme_preference_with_revision(theme).unwrap();
             assert_eq!(store.snapshot().theme, theme);
             assert_eq!(
                 SettingsStore::load(dir.path()).unwrap().snapshot().theme,
@@ -469,7 +465,9 @@ mod tests {
         write_settings(&dir.current(), &initial);
         let store = SettingsStore::load(dir.path()).unwrap();
         let before = store.snapshot();
-        store.set_theme_preference(ThemePreference::Dark).unwrap();
+        store
+            .set_theme_preference_with_revision(ThemePreference::Dark)
+            .unwrap();
 
         assert_eq!(
             store.snapshot(),
