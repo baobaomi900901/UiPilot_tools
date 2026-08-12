@@ -32,7 +32,7 @@ use crate::{
     },
     hotkey::{DoubleTapModifier, HotkeyKind},
     hotkey_hook::HotkeyHook,
-    result_registry::{ResultRegistries, ResultRegistry},
+    result_registry::ResultRegistries,
     settings::{Settings, SettingsStore, SettingsUpdate, WindowPosition},
 };
 
@@ -969,7 +969,7 @@ impl LifecycleCoordinator {
                 let window = app
                     .get_webview_window("main")
                     .ok_or(LifecycleError::WindowFailed)?;
-                let registry = app.state::<ResultRegistry>();
+                let registry = app.state::<ResultRegistries>().main().clone();
                 Ok((window, registry))
             },
         )?
@@ -1913,6 +1913,19 @@ mod tests {
         assert!(system_end.contains("run_system_end_nonblocking_with"));
         assert!(system_end.contains("terminal_index.enter_terminal()"));
         assert!(!system_end.contains("wait_for_clean_change"));
+    }
+
+    #[test]
+    fn production_show_main_resolves_the_managed_main_scope() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let show_main = production
+            .split("    fn show_main(\n")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn show_main_with_resolver").next())
+            .expect("show_main source markers are missing");
+        assert!(show_main.contains("app.state::<ResultRegistries>().main().clone()"));
+        assert!(!show_main.contains("app.state::<ResultRegistry>()"));
     }
 
     #[test]
