@@ -28,6 +28,9 @@ mod model;
 mod result_registry;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod public_plugins;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod find_window;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]

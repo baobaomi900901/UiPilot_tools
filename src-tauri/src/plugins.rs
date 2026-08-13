@@ -4388,6 +4388,11 @@ fn move_cleanup_directory(
 }
 
 impl PluginCatalog {
+    #[cfg(test)]
+    pub(crate) fn entry_count_for_test(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(crate) fn load(root: &Path, host_version: Version) -> Result<Self, PluginSetupError> {
         let mut candidates = Vec::new();
         let children = match fs::read_dir(root) {
