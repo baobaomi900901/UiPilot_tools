@@ -602,7 +602,9 @@ plugin ID、generation、当前 request 和具体权限。
 
 ### 12.2 已保留但未开放的权限
 
-以下名称在公开枚举中保留，但第一阶段宿主把声明它们的插件标记为“不支持此权限”，不能启用：
+以下名称只为后续协议预留枚举值。第一阶段候选一旦声明任一权限，安装或升级必须在 staging 校验阶段
+返回 `UnsupportedPermission`，不得提交插件记录、路由、名称或新 generation；升级失败只清理候选
+staging，当前已安装 generation 继续运行：
 
 - `clipboard.read`：未来只允许用户主动调用时读取，禁止后台监听；
 - `network.https`：未来必须同时声明 HTTPS 域名并使用 UiPilot 网络代理；
