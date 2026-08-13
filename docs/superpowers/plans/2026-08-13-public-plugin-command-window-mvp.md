@@ -6,7 +6,7 @@
 
 **Architecture:** Keep `PluginManager` as the integration facade, but move new public contracts into focused `public_plugins` modules instead of further expanding the existing `src-tauri/src/plugins.rs`. Rust owns package staging, compatibility, durable state, request identity, scheduling, result authorization, native windows, permissions, and rollback. TypeScript owns launcher presentation and the host window shell; plugin JavaScript receives only the frozen per-request API and isolated window update bridge defined by the approved specification.
 
-**Tech Stack:** Rust 1.96, Tauri 2.11, Windows APIs through `windows` 0.61, WebView2 through `webview2-com` 0.38.2, TypeScript 7, React 19, Ant Design 6, Vitest 4, jsdom 29. Add a Rust ZIP reader with only required archive features and Tauri dialog 2 for user-selected `.uipilot-plugin` files; use Windows DPAPI through the existing `windows` crate for MVP secret storage.
+**Tech Stack:** Rust 1.96, Tauri 2.11, Windows APIs through `windows` 0.61, WebView2 through `webview2-com` 0.38.2, TypeScript 7, React 19, Ant Design 6, Vitest 4, and jsdom 29. Add a Rust ZIP reader with only required archive features, Tauri dialog 2 for user-selected `.uipilot-plugin` files, and `schemars` for manifest/data DTO JSON Schema generation; use Windows DPAPI through the existing `windows` crate for MVP secret storage. The function-bearing TypeScript API declaration remains a compact checked-in contract because `schemars` does not generate TypeScript function interfaces.
 
 ## Binding Specification
 
@@ -35,29 +35,28 @@
 
 ## Estimation Model
 
-`AI coding` is active test/code/document editing in an already prepared workspace with dependencies cached. `Checkpoint` includes that work plus focused compilation and tests. It excludes user response time, network/package-registry outages, Windows focus-policy failures, and unrelated dirty-worktree conflicts.
+`AI coding` is active code, test, and document editing in an already prepared workspace with dependencies cached. `Checkpoint` includes that work plus the task's focused compilation and core-risk tests. It excludes user response time, network/package-registry outages, Windows focus-policy failures, and unrelated dirty-worktree conflicts.
 
 | Task | AI coding | Through focused checkpoint |
 |---|---:|---:|
-| 1. Public package intake and staging | 2.5-4 h | 4-6.25 h |
-| 2. Durable names, settings, storage, and secrets | 3.5-5.5 h | 5.75-9 h |
-| 3. Runtime API, scheduler, and atomic activation | 4.5-7.25 h | 7.25-11.5 h |
-| 4. Main results and plugin management UI | 3.5-5.5 h | 5.5-8.75 h |
-| 5. Singleton plugin window and global handoff | 5.25-8.5 h | 8.5-13.75 h |
-| 6. `/demo`, SDK artifacts, and acceptance | 2.25-3.75 h | 4.75-8.5 h including user acceptance |
-| **Total** | **21.5-34.5 h** | **36-58 h including user acceptance** |
+| 1. Public package intake and staging | 1.5-2.5 h | 2.5-4 h |
+| 2. Durable names, settings, storage, and secrets | 2-3.5 h | 3.5-5.5 h |
+| 3. Runtime API, scheduler, and atomic activation | 3.5-5.5 h | 5.5-8.5 h |
+| 4. Main results and plugin management UI | 2.5-4 h | 4-6.5 h |
+| 5. Singleton plugin window and global handoff | 4-6 h | 6-9.5 h |
+| 6. `/demo`, SDK artifacts, and acceptance | 1.5-2.5 h | 2.5-4.5 h including user acceptance |
+| **Total** | **15-24 h** | **24-39 h including user acceptance** |
 
-The largest uncertainty is Task 5 because it combines WebView2 isolation with real native focus behavior. The first reliable implementation checkpoint is Task 1, not the total estimate.
+Task 5 remains the largest uncertainty because WebView2 isolation and Windows focus policy are environment-sensitive. The first reliable estimate checkpoint is the completed Task 1, after package and build dependencies are known.
 
 ## Global Execution Rules
 
-- Dependency order is `Task 1 -> Task 2 -> Task 3 -> Task 4 -> Task 5 -> Task 6`. The shared files and security contracts make serial execution safer than parallel edits.
-- Every task uses TDD: add focused failing tests, confirm the intended failure, implement the smallest contract, rerun focused tests, then create one atomic commit. Review fixes may be separate commits.
-- Use table-driven tests for shared validation matrices. Keep async ordering, caller authorization, rollback, stale ownership, and native focus sequences as separately named tests.
-- Each task performs a specification-compliance self-check and its listed automated verification before the dependent task begins. Do not add independent review rounds unless the user asks.
+- Dependency order is `Task 1 -> Task 2 -> Task 3 -> Task 4 -> Task 5 -> Task 6`. Shared files and security contracts require serial task boundaries.
+- Implement each task as one vertical slice, then add and run its listed core-risk tests before the checkpoint. The plan does not require a separate red-green-refactor ceremony for every subitem.
+- Combine variants that share ordering and terminal behavior into table-driven tests. Keep atomic activation, latest-only scheduling, caller authorization, asynchronous ownership, and focus rollback explicit; do not create one test per equivalent error code or API method.
+- Create one atomic commit after each task checkpoint. Run focused verification at task boundaries and the full regression suite once in Task 6. Do not add independent review rounds unless the user asks.
 - Generated Tauri permissions are committed with the command that requires them. Capabilities must use non-overlapping exact label families.
 - Existing internal plugin packages continue through their compatibility loader and resource rules; public `schemaVersion: 1` rules do not apply retroactively.
-
 ---
 
 ### Task 1: Public Package Intake and Staging
@@ -66,14 +65,13 @@ The largest uncertainty is Task 5 because it combines WebView2 isolation with re
 
 **Dependencies:** approved design sections `7.1 包结构`, `7.3 清单校验`, `7.4 API 兼容`, `12.1 第一阶段可用能力`, `12.2 已保留但未开放的权限`, and `13.3 安装、升级、禁用和卸载`.
 
-**Produces:** `PublicManifestV1`, `PublicPackageSource::{Archive, DevelopmentDirectory}`, `PreparedPublicPlugin`, `PublicPackageError`, and `stage_public_package(source, staging_root, host) -> Result<PreparedPublicPlugin, PublicPackageError>`. A prepared candidate is not routable and owns cleanup of its staging directory until Task 3 atomically promotes it.
+**Produces:** `PublicManifestV1`, `PublicPackageSource::{Archive, DevelopmentDirectory}`, `PreparedPublicPlugin`, `PublicPackageError`, and `stage_public_package(source, staging_root, host) -> Result<PreparedPublicPlugin, PublicPackageError>`. A prepared candidate is not routable and owns cleanup until Task 3 atomically promotes it.
 
-- [ ] **Step 1: Add the strict public manifest model and compatibility matrix.** Parse exact `schemaVersion: 1` keys, one command, `live | submit`, `mainResult | window`, settings definitions, platform/API versions, permissions, and all field limits. Keep legacy `manifest: 1` dispatch unchanged. **Estimate:** AI coding 35-55 min; checkpoint 55-85 min.
-- [ ] **Step 2: Add bounded ZIP extraction and development-directory snapshots.** Copy either source into a fresh transaction staging directory, then apply the identical validator. Reject duplicate canonical paths, traversal, absolute paths, ADS, encrypted entries, reparse points, symlinks, double extensions, count/depth/size overflow, and every resource outside `plugin.json/.html/.js/.css`. Never execute directly from the chosen archive or development directory. **Estimate:** AI coding 45-75 min; checkpoint 75-120 min.
-- [ ] **Step 3: Freeze the staged snapshot and fixed MIME resolver.** Hash and revalidate ordinary files, map only the approved MIME types, forbid sniffing and `data:`/remote CSS resources, and preserve the old internal asset resolver unchanged. **Estimate:** AI coding 35-55 min; checkpoint 55-90 min.
-- [ ] **Step 4: Add cleanup and hostile-package regression matrices.** Prove every static failure removes staging, creates no plugin record/route/name reservation, and returns a stable `InvalidPackage`, `IncompatiblePlatform`, `IncompatibleApi`, or `UnsupportedPermission` category. **Estimate:** AI coding 30-45 min; checkpoint 50-75 min.
+- [ ] **Step 1: Implement strict intake and a frozen staging snapshot.** Parse exact `schemaVersion: 1` data, check platform/API/permission compatibility, and copy ZIP or development-directory input into a fresh transaction directory before validation. Reject traversal, absolute/ADS/link/reparse paths, canonical collisions, archive limits, double extensions, and resources outside root `plugin.json` plus lowercase `.html/.js/.css`. Resolve MIME only through the fixed extension table; do not add or call a MIME-sniffing library. **Estimate:** AI coding 55-90 min.
+- [ ] **Step 2: Integrate preparation and atomic cleanup boundaries.** Hash and revalidate ordinary staged files, preserve the legacy internal-package loader, and ensure every rejection removes staging without creating a route, plugin record, or name reservation. **Estimate:** AI coding 20-35 min.
+- [ ] **Step 3: Add three table-driven package test groups.** Cover accepted archive/directory packages, rejected resource/path variants, and incompatible or malformed candidates with cleanup and unchanged legacy behavior. **Estimate:** AI coding 15-25 min.
 
-**Distinct test coverage:** valid public window/main-result packages; public-vs-legacy discriminator; incompatible platform/API; unsupported reserved permission; malformed setting definitions; ZIP path collision and case folding; double extension; fixed MIME; failed staging cleanup; unchanged legacy asset behavior.
+**Core test coverage:** (1) valid `window` and `mainResult` candidates; (2) illegal extension, double extension, traversal, case-folded collision, and fixed-MIME enforcement; (3) incompatible platform/API, unsupported permission, malformed settings, staging cleanup, and legacy-package isolation.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::tests plugins::tests::package_state -- --nocapture`
 
@@ -83,15 +81,13 @@ The largest uncertainty is Task 5 because it combines WebView2 isolation with re
 
 **Dependencies:** Task 1; design sections `8 插件设置 Schema`, `12.1 第一阶段可用能力`, `12.3 禁止能力`, `13.1 设置页`, `13.2 启动名称`, and `13.3 安装、升级、禁用和卸载`.
 
-**Produces:** `PluginStateStore`, `EffectivePluginConfig`, `PluginStorageStore`, and `PluginSecretStore`. Reads return immutable snapshots; writes are plugin-scoped, atomic, quota-checked, and generation-independent where the specification requires data to survive upgrades.
+**Produces:** `PluginStateStore`, `EffectivePluginConfig`, `PluginStorageStore`, and `PluginSecretStore`. State and private JSON writes use the existing atomic-file pattern; secret values use Windows DPAPI and are never returned to Runtime.
 
-- [ ] **Step 1: Persist effective names and lifecycle state.** Store one effective name, user-disabled/automatic-fault state, permission grants, and inventory revision; enforce global case-folded command uniqueness against installed plugins and system-reserved names. **Estimate:** AI coding 40-65 min; checkpoint 65-100 min.
-- [ ] **Step 2: Persist and validate host-rendered settings.** Apply manifest defaults, retain values by stable key across compatible upgrades, reject type/range/option violations atomically, and never persist secret defaults. **Estimate:** AI coding 45-75 min; checkpoint 75-120 min.
-- [ ] **Step 3: Implement the 5 MiB private JSON store.** Reject non-finite numbers, prototype-special keys, quota overflow, and cross-plugin access; `set/remove` must leave the old document intact on any failure. **Estimate:** AI coding 40-65 min; checkpoint 65-105 min.
-- [ ] **Step 4: Implement Windows DPAPI secret writes and presence checks.** Bind encrypted records to plugin ID and setting key, never return plaintext to Runtime, preserve secrets across upgrades, and honor uninstall delete/retain choice. Non-Windows builds expose an unsupported backend without weakening the public contract. **Estimate:** AI coding 45-80 min; checkpoint 80-130 min.
-- [ ] **Step 5: Add migration, corruption quarantine, and uninstall/retain tests.** A corrupt plugin-state document must not expose another plugin's data or block healthy siblings. **Estimate:** AI coding 30-45 min; checkpoint 50-80 min.
+- [ ] **Step 1: Implement durable lifecycle, effective-name, and settings state.** Persist one globally unique case-folded command name, enabled/fault state, permission grants, inventory revision, and validated bool/text/number/select settings. Preserve compatible values across upgrades and never persist a secret default. **Estimate:** AI coding 35-60 min.
+- [ ] **Step 2: Implement private storage and DPAPI secrets.** Enforce plugin scope and the 5 MiB JSON limit with atomic rollback; bind encrypted secret records to plugin ID and setting key, expose presence only, and support uninstall delete/retain behavior. Preserve position/settings/storage/secrets across compatible plugin upgrades. **Estimate:** AI coding 55-95 min.
+- [ ] **Step 3: Add boundary and rollback tests.** Parameterize shared setting and lifecycle variants while retaining explicit assertions for atomic rename, quota rollback, cross-plugin denial, DPAPI round trip without logged/plaintext exposure, and uninstall retention. **Estimate:** AI coding 30-55 min.
 
-**Distinct test coverage:** effective-name collisions and atomic rename; disabled name remains reserved; settings schema evolution; independent plugin data; quota rollback; DPAPI round trip without logged plaintext; secret unreadability; uninstall delete/retain; corrupt-document quarantine.
+**Core test coverage:** effective-name collision and atomic rename; min/max/enum setting validation; independent plugin stores and quota rollback; one shared caller-scope guard; DPAPI write/presence/unreadability; uninstall delete/retain; corrupt state quarantines only its owner.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::state::tests public_plugins::storage::tests public_plugins::secrets::tests -- --nocapture`
 
@@ -101,15 +97,14 @@ The largest uncertainty is Task 5 because it combines WebView2 isolation with re
 
 **Dependencies:** Tasks 1-2; design sections `9.1 Runtime 装载`, `9.2 调用 DTO`, `9.3 Runtime 宿主 API`, `10.1 路由和请求所有权`, `14.1 请求时效`, and `14.2 故障隔离`.
 
-**Produces:** `PluginRequestScheduler`, `PluginRequestContext`, `PluginApiOperation`, and atomic manager operations for package install/update/reload/enable/disable/uninstall. Hidden Runtime labels become `plugin-runtime-*`; visible-window labels reserved by Task 5 use a non-overlapping family.
+**Produces:** `PluginRequestScheduler`, `PluginRequestContext`, `PluginApiOperation`, and atomic install/update/reload/enable/disable/uninstall operations. Runtime labels use only `plugin-runtime-*`; Task 5 visible-window labels remain disjoint.
 
-- [ ] **Step 1: Replace the public Runtime bootstrap with `onCommand(invocation, api)`.** Create a fresh deeply frozen invocation/API facade per dispatch, derive plugin/generation from the exact caller label, attach only request ID in the bridge, remove `api.resolve`, and keep the legacy bridge only for internal packages. **Estimate:** AI coding 60-95 min; checkpoint 95-150 min.
-- [ ] **Step 2: Implement guarded API operations.** Route `storage.get/set/remove`, `settings.get`, and `settings.isSecretConfigured` through one narrow tagged command; reject malformed/forged context as `InvalidContext` and stale context as `ExpiredRequestError`, rechecking before state commit. **Estimate:** AI coding 45-75 min; checkpoint 75-120 min.
-- [ ] **Step 3: Implement one-running/one-latest scheduling.** Allocate `requestId` only at dispatch, expire A when B arrives, replace waiting B with C, start timeout at dispatch, and isolate schedulers by plugin generation. **Estimate:** AI coding 55-90 min; checkpoint 90-145 min.
-- [ ] **Step 4: Implement timeout, Runtime replacement, and fault accounting.** Destroy a timed-out Runtime, increment generation, dispatch only the still-valid latest candidate to the same installed package, discard candidates on upgrade/disable/uninstall, and exclude normal supersession from fault counts. Persist automatic disable only after three current-owner faults within five minutes; redact inputs, returned text, secrets, authorization data, and real paths from logs. **Estimate:** AI coding 45-75 min; checkpoint 75-120 min.
-- [ ] **Step 5: Complete two-phase atomic activation and management commands.** `prepare_public_plugin_install(path)` stages and validates the user-selected archive and returns only a one-use token plus safe manifest, unsigned-source, permission, version, and conflict summary. After explicit UI confirmation, `commit_public_plugin_install(token)` starts the isolated Runtime, waits for `ready`, then atomically commits package, state, route, name, and generation; `cancel_public_plugin_install(token)` removes staging. Tokens expire and are main-caller-bound. Failure cleans staging; update/reload failure keeps the old generation. Existing development install/reload enters the same preparation path without a file picker. **Estimate:** AI coding 55-90 min; checkpoint 90-150 min.
+- [ ] **Step 1: Implement the public Runtime bootstrap and shared API guard.** Dispatch only `onCommand(invocation, api)`, create fresh deeply frozen per-request objects, bind the facade to `(pluginId, pluginGeneration, requestId)`, derive identity from the exact caller label, and revalidate through one Rust guard before reads or commits. Preserve the legacy internal bridge separately. **Estimate:** AI coding 70-105 min.
+- [ ] **Step 2: Implement latest-only scheduling, timeout, and Runtime replacement.** Maintain one running plus one latest waiting candidate per plugin generation; allocate request IDs and start 5/30-second timeouts only at dispatch; expire A when B arrives, replace B with C, and rebuild/increment generation after timeout without counting normal supersession as a fault. **Estimate:** AI coding 65-100 min.
+- [ ] **Step 3: Implement two-phase activation and management commands.** Prepare returns one caller-bound token and safe confirmation summary; commit waits for isolated Runtime `ready` before atomically changing package/state/route/name/generation; cancel and expired tokens remove staging. Update/reload failure leaves the current generation usable. **Estimate:** AI coding 50-80 min.
+- [ ] **Step 4: Add the three core contract tests.** Use one guard table for valid/forged/expired context, one A/B/C scheduler test including timeout generation replacement, and one prepare/commit/cancel table including ready failure and update rollback. **Estimate:** AI coding 25-45 min.
 
-**Distinct test coverage:** frozen per-request API; wrong label before state access; forged vs expired context; state invalidated between entry and commit; A-running/B-waiting/C-replaces-B ordering; dispatch-based 5/30-second timeout; normal cancellation not counted; Runtime restart; install cancellation; ready timeout cleanup; update rollback; no overlapping runtime/window capabilities.
+**Core test coverage:** `InvalidContext` versus `ExpiredRequestError` at the shared guard; state invalidated between command entry and commit; A running/B waiting/C replaces B; dispatch-based timeout and generation rebuild; prepare/cancel/commit cleanup; failed update keeps the old Runtime and route; runtime/window capabilities do not overlap.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::runtime::tests public_plugins::scheduler::tests plugins::tests::query commands::tests -- --nocapture`
 
@@ -119,17 +114,16 @@ The largest uncertainty is Task 5 because it combines WebView2 isolation with re
 
 **Dependencies:** Tasks 1-3; design sections `5.1 命令发现与解析`, `5.2 激活模式`, `9.4 主窗口结果 DTO`, `10.2 mainResult`, `13.1 设置页`, and `18 完成标准` items 3-4.
 
-**Produces:** exact public inventory/settings DTO parsers, `live/submit` routing through effective names, host-rendered pure-text results, and one current `copyText` default action bound to plugin/generation/request/result.
+**Produces:** exact public inventory/settings DTO parsers, `live/submit` routing through effective names, host-rendered pure-text results, and one current `copyText` action bound to plugin/generation/request/result.
 
-- [ ] **Step 1: Route effective public commands without changing ordinary app search.** Implement `/`, prefix discovery, full-command hint, input-required behavior, ASCII-space body parsing, 150 ms `live` debounce, and first-Enter `submit`. **Estimate:** AI coding 35-60 min; checkpoint 60-95 min.
-- [ ] **Step 2: Validate and register `MainResultResponse`.** Enforce exact keys, 0-20 items, text and 64 KiB limits, zero/one `copyText`, reject `actions[]`, and retain real action payload only in Rust under `pluginId + generation + requestId + resultId`. **Estimate:** AI coding 40-65 min; checkpoint 65-100 min.
-- [ ] **Step 3: Add launcher ownership and result interaction.** Only the current view epoch/control/value/submission token may publish, clear, or show errors; first Enter submits, second Enter or row click executes the current default action, and no-action rows remain display-only. **Estimate:** AI coding 45-75 min; checkpoint 75-120 min.
-- [ ] **Step 4: Complete the plugin settings UI.** Register `tauri-plugin-dialog` in Rust and grant only main `dialog:allow-open`. A user click opens a single-file `.uipilot-plugin` picker; the UI calls prepare, displays unsigned-source status, exact permissions, version/change summary, and conflicts, then explicitly commits or cancels. Add development install/reload, enable/disable, rename/reset, uninstall with delete/retain choice, and host-rendered bool/text/number/select/secret controls whose secret value is never read back. Do not expose `outputMode` as a setting. **Estimate:** AI coding 50-80 min; checkpoint 80-130 min.
-- [ ] **Step 5: Preserve action safety and regressions.** Copy rechecks the full binding and permission immediately before clipboard write; success follows existing clear/hide behavior, failure preserves current results. `/math`, `/find`, settings, and application results remain unchanged. **Estimate:** AI coding 30-45 min; checkpoint 50-80 min.
+- [ ] **Step 1: Implement command routing and bounded main results.** Preserve ordinary app search while adding prefix discovery, ASCII-space body parsing, 150 ms `live` debounce, first-Enter `submit`, exact response validation, and Rust-only storage of real action payloads. **Estimate:** AI coding 55-85 min.
+- [ ] **Step 2: Implement launcher ownership and result interaction.** Bind publish/clear/error/copy behavior to the current view epoch, control value, submission token, plugin generation, request, and result; execute the single default action on second Enter or row click and preserve results on clipboard failure. **Estimate:** AI coding 40-65 min.
+- [ ] **Step 3: Complete host-rendered plugin management and settings UI.** Add the main-only package picker and prepare/confirm/commit flow, development install/reload, enable/disable, rename/reset, uninstall delete/retain, and bool/text/number/select/secret controls. Never read secret values or expose `outputMode` as a setting. **Estimate:** AI coding 40-65 min.
+- [ ] **Step 4: Add focused frontend/backend tests using existing Vitest/jsdom event patterns.** Do not add `@testing-library/user-event`; cover routing/result rendering, one settings submit interaction, stale result ownership, and `/math`/`/find` regression. **Estimate:** AI coding 15-25 min.
 
-**Distinct test coverage:** command discovery and preserved internal spaces; live debounce; submit first/second Enter; late A success/failure after edited B; response and action validation; click/Enter equivalence; stale result cannot copy; management operation errors stay row-local; dynamic settings validation; `/math` and `/find` regression.
+**Core test coverage:** preserved internal spaces and activation modes; result bounds and no `actions[]`; late A success/failure after user-edited B is inert; current copy action works by click/Enter; stale action is rejected; management errors stay local; all setting widget types submit valid values.
 
-**Verify:** `npm.cmd test -- src/launcher.test.tsx` then `cargo test --manifest-path src-tauri/Cargo.toml result_registry::tests commands::tests::execute_plugin plugins::tests::query -- --nocapture` and `npm.cmd run build`
+**Verify:** `npm.cmd test -- src/launcher.test.tsx`, then `cargo test --manifest-path src-tauri/Cargo.toml result_registry::tests commands::tests::execute_plugin plugins::tests::query -- --nocapture`, then `npm.cmd run build`
 
 ### Task 5: Singleton Plugin Window and Global Native Handoff
 
@@ -137,33 +131,32 @@ The largest uncertainty is Task 5 because it combines WebView2 isolation with re
 
 **Dependencies:** Tasks 1-4; design sections `10.3 window`, `11 插件窗口合同`, `12 权限与安全边界`, `16.3 插件窗口`, and `18 完成标准` items 5-6.
 
-**Produces:** one host-wide `MainWindowTransferCoordinator`, one `PluginWindowController` per plugin ID, and one host-owned singleton native window per plugin. Exact label families are `plugin-runtime-*` for hidden handlers, `plugin-shell-*` for host chrome, and `plugin-content-*` for isolated content; capabilities must not overlap.
+**Produces:** one host-wide `MainWindowTransferCoordinator`, one `PluginWindowController` per plugin ID, and one host-owned singleton native window per plugin. Label families are exactly `plugin-runtime-*`, `plugin-shell-*`, and `plugin-content-*`, with no capability overlap.
 
-- [ ] **Step 1: Extract the shared native transfer lease and adapt `/find`.** Preserve `/find` semantics while moving serial native side effects, focus snapshots, main topmost downgrade/restore, expected blur consumption, timeout, and CAS cleanup into `MainWindowTransferCoordinator`. **Estimate:** AI coding 60-100 min; checkpoint 100-165 min.
-- [ ] **Step 2: Add plugin-window admission and update ownership.** Bind every transaction to UI intent epoch, submission token, plugin ID, generation, request ID, and target window; recheck after each await and before show/focus/clear/hide; support latest update, ready/ack timeout, pin, forced close, and stale rollback. **Estimate:** AI coding 60-100 min; checkpoint 100-165 min.
-- [ ] **Step 3: Build the isolated native window.** Use a host-owned shell WebView and a separately labelled plugin content WebView/custom source so content cannot access shell DOM or generic Tauri APIs. Keep runtime, shell, and content capability patterns non-overlapping; deny navigation, downloads, new windows, and unapproved resources. **Estimate:** AI coding 80-130 min; checkpoint 130-210 min.
-- [ ] **Step 4: Build the host shell UI.** Route shell startup by exact label, render fixed-size icon-only pin/close controls with tooltips and accessible names, provide drag region, apply host theme tokens before content update, persist position by plugin ID, and keep pin process-local/non-topmost. **Estimate:** AI coding 55-90 min; checkpoint 90-145 min.
-- [ ] **Step 5: Add ordered failure and cross-window tests.** Cover edit-during-ready, repeated submission, `/find` vs plugin serialization, stale show/focus/clear, conditional native cleanup, focus refusal, close/pin blur, update ack failure, display topology change, upgrade/disable/uninstall destruction, and no lock across native/emit/ack work. **Estimate:** AI coding 50-80 min; checkpoint 80-130 min.
+- [ ] **Step 1: Extract the shared native transfer lease and adapt `/find`.** Serialize native side effects while preserving `/find`; capture focus/topmost state, consume the expected main blur, revalidate ownership after async points, and restore only through a current-owner CAS. **Estimate:** AI coding 55-80 min.
+- [ ] **Step 2: Implement plugin-window admission and lifecycle state.** Bind each transaction to UI intent epoch, submission token, plugin/generation/request, and target window; support singleton reuse, latest update/ack, pin, forced close, upgrade/disable/uninstall teardown, and stale completion suppression. **Estimate:** AI coding 50-75 min.
+- [ ] **Step 3: Build and authorize the isolated native window.** Use a host shell WebView and separately labelled plugin-content WebView/custom source; deny generic Tauri access, navigation, downloads, new windows, and unapproved resources. Keep all native/WebView work outside controller locks. **Estimate:** AI coding 80-120 min.
+- [ ] **Step 4: Build the host shell UI and persistence.** Add fixed-size icon pin/close controls, accessible tooltips, drag region, host theme tokens before content update, and per-plugin position correction/restoration. Pin remains process-local and never enables always-on-top. **Estimate:** AI coding 40-60 min.
+- [ ] **Step 5: Add two deterministic handoff tests plus caller-guard checks.** Test with mocked native ports/handles only; automated Task 5 tests must not move real focus or synthesize input. **Estimate:** AI coding 15-25 min.
 
-**Distinct test coverage:** `/find` retains existing transfer behavior; `/demo A -> user edit -> A ready` is inert; `/demo A -> /find B` serializes to B; stale rollback cannot overwrite B; current failure restores captured state; singleton reuse; fixed is not topmost; position correction; exact capability caller guards.
+**Core test coverage:** (1) `A ready pending -> user edit or /find B -> A completes` leaves A unable to show, focus, clear, or hide and B remains owner; (2) `A begins focus -> B supersedes A -> A fails` prevents stale rollback, while a current unsuperseded failure restores the captured state. Also verify singleton reuse and exact shell/content caller guards.
 
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml window_transfer::tests plugin_window::tests find_window::tests lifecycle::tests commands::tests -- --nocapture`, then `npm.cmd test -- src/plugin-window-core.test.ts src/plugin-window-view.test.tsx src/find-core.test.ts src/find-view.test.tsx` and `npm.cmd run build`
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml window_transfer::tests plugin_window::tests find_window::tests lifecycle::tests commands::tests -- --nocapture`, then `npm.cmd test -- src/plugin-window-core.test.ts src/plugin-window-view.test.tsx src/find-core.test.ts src/find-view.test.tsx`, then `npm.cmd run build`
 
 ### Task 6: `/demo`, SDK Artifacts, and Acceptance
 
-**Files:** create `examples/public-plugins/com.uipilot.demo/package/plugin.json`, `examples/public-plugins/com.uipilot.demo/package/dist/runtime.js`, `examples/public-plugins/com.uipilot.demo/package/dist/window.html`, `examples/public-plugins/com.uipilot.demo/package/dist/window.js`, `examples/public-plugins/com.uipilot.demo/package/dist/window.css`, `examples/public-plugins/com.uipilot.demo/tests/runtime.test.js`, `examples/public-plugins/com.uipilot.demo/README.md`, `scripts/package-demo-plugin.ps1`, `docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/uipilot-plugin-v1.schema.json`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`, `src-tauri/tests/public_plugin_window_events.rs`; modify `package.json` and `package-lock.json` to add a pinned JSON Schema test dependency, plus only wiring/tests discovered necessary during integration.
+**Files:** create `examples/public-plugins/com.uipilot.demo/package/plugin.json`, `examples/public-plugins/com.uipilot.demo/package/dist/runtime.js`, `examples/public-plugins/com.uipilot.demo/package/dist/window.html`, `examples/public-plugins/com.uipilot.demo/package/dist/window.js`, `examples/public-plugins/com.uipilot.demo/package/dist/window.css`, `examples/public-plugins/com.uipilot.demo/tests/runtime.test.js`, `examples/public-plugins/com.uipilot.demo/tests/sdk-contract.ts`, `examples/public-plugins/com.uipilot.demo/README.md`, `scripts/package-demo-plugin.ps1`, `src-tauri/src/bin/generate_public_plugin_schema.rs`, `docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/uipilot-plugin-v1.schema.json`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`, `src-tauri/tests/public_plugin_window_events.rs`; modify only integration wiring discovered necessary within the approved contract.
 
 **Dependencies:** Tasks 1-5; design sections `15 /demo 参考插件`, `16 测试`, `17 非目标`, and `18 完成标准`.
 
-**Produces:** an independently removable `/demo` package, public schema/types/developer guide, complete automated gates, and a user-operated acceptance script.
+**Produces:** an independently removable `/demo` package, generated data Schema, a compact TypeScript API declaration, developer guide, one process-isolation probe, and a user-operated acceptance flow.
 
-- [ ] **Step 1: Implement `/demo` as a standalone public package.** Keep README/tests outside the strict package root. Default to `submit + window`; `onCommand` returns `str yyyy-mm-dd`; the content page displays input, platform, current theme, instance `1`, and return text using only HTML/JS/CSS. Add a packaging script that includes only the contents of `package/` with `plugin.json` at archive root. No `/demo` literal or fallback enters host source. **Estimate:** AI coding 35-55 min; checkpoint 55-90 min.
-- [ ] **Step 2: Verify the static `mainResult` variant.** Test the same package configuration with `submit + mainResult`, one pure-text result, and one `copyText` default action; the mode changes only after reload. **Estimate:** AI coding 20-35 min; checkpoint 35-60 min.
-- [ ] **Step 3: Publish SDK artifacts from the implemented contract.** Document package layout, manifest schema, `onCommand`, frozen API, errors, limits, permissions, examples, and unsupported background/multi-action capabilities. Validate the example manifest against the checked-in JSON Schema. **Estimate:** AI coding 30-50 min; checkpoint 50-80 min.
-- [ ] **Step 4: Run all non-interactive quality gates and fix only in-scope failures.** Include a process-failure isolation probe proving one public Runtime/window can be reclaimed without blocking the launcher, other plugins, `/math`, or `/find`. If the WebView2 topology cannot prove that isolation, mark public plugin release No-Go and stop rather than weakening the boundary. Do not absorb unrelated dirty-worktree failures; report them separately. **Estimate:** AI coding 30-60 min; checkpoint 90-180 min.
-- [ ] **Step 5: Run real-window and manual acceptance only after permission.** First notify the user that native APIs will briefly change foreground focus but will not control mouse or keyboard. Treat an unavailable interactive-session precondition as inconclusive, not pass. The user alone types `/demo str`, tests singleton reuse/pin/close/drag/position/theme, switches mode/reloads, and confirms second-Enter copy. **Estimate:** AI preparation 10-20 min; automated focus harness 15-30 min; user acceptance 20-40 min.
+- [ ] **Step 1: Implement `/demo` in both static package modes.** Default to `submit + window`; display input, platform, current theme, instance `1`, and `str yyyy-mm-dd`, with host-owned pin/close controls. Switch the package metadata to `mainResult` only on reload and return one `copyText` action. Keep README/tests outside the strict package root and add no host-side `/demo` fallback. **Estimate:** AI coding 35-55 min.
+- [ ] **Step 2: Generate data Schema and publish the SDK contract.** Use `schemars` for deterministic manifest/data DTO JSON Schema. Keep `PluginHandler` and `Readonly<UiPilotPluginApiV1>` in a small checked-in `.d.ts`, compile the demo fixture against it, and document package layout, identity, errors, limits, permissions, and unsupported background/multi-action behavior. **Estimate:** AI coding 25-40 min.
+- [ ] **Step 3: Run the non-interactive gates and WebView2 isolation probe.** Run the full test/build/lint suite once. Prove a failed public Runtime/window can be reclaimed without blocking the launcher, another plugin, `/math`, or `/find`; inability to prove process isolation remains a public-release No-Go. Report unrelated dirty-worktree failures without fixing them. **Estimate:** AI coding 20-35 min.
+- [ ] **Step 4: Prepare one real-window diagnostic and manual acceptance pass.** Run the gated harness only after explicit permission; it may briefly change foreground focus but never controls mouse or keyboard. The user alone types `/demo str` and verifies singleton reuse, pin/close, drag/position, theme, reload mode change, and second-Enter copy. An unavailable interactive-session precondition is inconclusive, not a failure or pass. **Estimate:** AI preparation 10-20 min; checkpoint allowance includes 20-40 min of user acceptance.
 
-**Distinct test coverage:** no host `/demo` hardcoding; package removal removes command; five window fields; static mode switch; 64 KiB and permission failures; runtime crash isolation; normal-permission dev launch; `/math` and `/find` full regression; real native transaction behavior without input synthesis.
+**Core test coverage:** removing the package removes `/demo`; window/main-result modes expose the required fields/action; generated Schema matches Rust DTOs; `.d.ts` compiles against the demo; runtime/window failure isolation meets the No-Go gate; manual focus behavior is checked once without input synthesis.
 
 **Verify:**
 
@@ -174,7 +167,9 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo check --manifest-path src-tauri/Cargo.toml
+cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_schema -- --check
 node --test examples/public-plugins/com.uipilot.demo/tests/runtime.test.js
+npm exec tsc -- --noEmit --strict examples/public-plugins/com.uipilot.demo/tests/sdk-contract.ts
 ```
 
 After explicit user approval only:
