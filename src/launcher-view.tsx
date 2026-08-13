@@ -28,6 +28,7 @@ import ReactMarkdown from 'react-markdown'
 
 import type { LauncherCore } from './launcher-core'
 import { bindNativeTextInput } from './native-input'
+import { PublicPluginPanel } from './public-plugin-panel'
 import type { ControlKey, FileCategory, FileResultKind, ThemePreference } from './protocol'
 import {
   formatHotkeyDisplay,
@@ -371,6 +372,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 role="option"
                 aria-selected={snapshot.selectedIndex === index}
                 className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
+                onClick={() => core.activateResult(index)}
                 ref={(element) => {
                   if (element) optionRefs.current.set(item.key, element)
                   else optionRefs.current.delete(item.key)
@@ -396,6 +398,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 <span className="result-copy">
                   <span className="result-title">{item.title}</span>
                   {item.subtitle ? <span className="result-subtitle">{item.subtitle}</span> : null}
+                  {item.detail ? <span className="result-detail">{item.detail}</span> : null}
                 </span>
               </div>
             ))}
@@ -610,6 +613,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
   const pluginSettingsPanel = (
     <div className="settings-tab-panel settings-plugin-panel">
+      <PublicPluginPanel client={core.client} />
       <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
           <h2 id="plugin-inventory-title">插件</h2>

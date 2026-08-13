@@ -1635,6 +1635,8 @@ impl PluginManager {
                     title: item.title,
                     subtitle: item.subtitle,
                     icon: None,
+                    detail: None,
+                    has_default_action: true,
                 },
                 action,
             ));
@@ -7464,6 +7466,8 @@ mod tests {
                             title: "late".into(),
                             subtitle: None,
                             icon: None,
+                            detail: None,
+                            has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
                             plugin_id: "plugin".into(),
@@ -7542,6 +7546,8 @@ mod tests {
                             title: "2".into(),
                             subtitle: None,
                             icon: None,
+                            detail: None,
+                            has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
                             plugin_id: "plugin".into(),
@@ -7686,7 +7692,12 @@ mod tests {
                 .unwrap()
                 .contains(&promoted.window_label));
             assert!(registry
-                .publish_if_latest(old_token, Vec::<((), _)>::new(), || true, |_, _| ())
+                .publish_if_latest(
+                    old_token,
+                    Vec::<((), crate::result_registry::ResultAction)>::new(),
+                    || true,
+                    |_, _| ()
+                )
                 .is_none());
         }
 

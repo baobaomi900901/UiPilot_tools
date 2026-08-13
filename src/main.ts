@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { open } from '@tauri-apps/plugin-dialog'
 import { createElement } from 'react'
 import { createRoot } from 'react-dom/client'
 
@@ -11,6 +12,7 @@ import { LauncherView } from './launcher-view'
 import {
   parseFileSearchResponse,
   parsePluginInventorySnapshot,
+  parsePublicPluginInventory,
   parseFindPreviewPreferenceResult,
   parseFindReadyOutcome,
   type FindClient,
@@ -30,7 +32,27 @@ export const client: LauncherClient = {
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', input),
   openFind: (input) => invoke('open_find_window', { input }),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
-  listPlugins: async () => {
+  listPublicPlugins: async () => {
+    const value = await invoke<unknown>('list_public_plugins')
+    const inventory = parsePublicPluginInventory(value)
+    if (!inventory) throw { code: 'pluginListFailed', message: 'public plugin list failed' }
+    return inventory
+  },
+  selectPublicPluginArchive: async () => {
+    const selected = await open({ multiple: false, directory: false, filters: [{ name: 'UiPilot Plugin', extensions: ['uipilot-plugin'] }] })
+    return typeof selected === 'string' ? selected : null
+  },
+  selectPublicPluginDirectory: async () => {
+    const selected = await open({ multiple: false, directory: true })
+    return typeof selected === 'string' ? selected : null
+  },
+  preparePublicPlugin: (input) => invoke('prepare_public_plugin_install', input),
+  commitPublicPlugin: async (input) => { await invoke('commit_public_plugin_install', input) },
+  cancelPublicPlugin: async (input) => { await invoke('cancel_public_plugin_install', input) },
+  setPublicPluginEnabled: async (input) => { await invoke('set_plugin_enabled', input) },
+  setPublicPluginEffectiveName: async (input) => { await invoke('set_plugin_effective_name', input) },
+  savePublicPluginSettings: async (input) => { await invoke('save_plugin_settings', input) },
+  uninstallPublicPlugin: async (input) => { await invoke('uninstall_plugin', input) },  listPlugins: async () => {
     const value = await invoke<unknown>('list_plugins')
     const snapshot = parsePluginInventorySnapshot(value)
     if (!snapshot) throw { code: 'pluginListFailed', message: 'plugin list failed' }

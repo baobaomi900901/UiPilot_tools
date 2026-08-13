@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    manifest::PublicPermission, package, runtime_label, stage_public_package,
-    EffectivePluginConfig, PluginApiRequest, PluginCommandCompletion, PluginCompletionOutcome,
-    PluginRequestScheduler, PluginRuntimeApi, PluginRuntimeError, PluginSecretStore,
-    PluginStateError, PluginStateStore, PluginStorageStore, PreparedPublicPlugin, PublicManifestV1,
-    PublicPackageError, PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource,
+    manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
+    package, runtime_label, stage_public_package, EffectivePluginConfig, PluginApiRequest,
+    PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler,
+    PluginRuntimeApi, PluginRuntimeError, PluginSecretStore, PluginStateError, PluginStateStore,
+    PluginStorageStore, PreparedPublicPlugin, PublicManifestV1, PublicPackageError,
+    PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource,
 };
 
 const PREPARE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -58,6 +59,68 @@ pub(crate) struct PublicPluginMutation {
     pub(crate) generation: u64,
     pub(crate) inventory_revision: u64,
     pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPluginInventory {
+    pub(crate) revision: String,
+    pub(crate) items: Vec<PublicPluginInventoryItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPluginInventoryItem {
+    pub(crate) plugin_id: String,
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) version: String,
+    pub(crate) source: &'static str,
+    pub(crate) default_name: String,
+    pub(crate) effective_name: String,
+    pub(crate) enabled: bool,
+    pub(crate) fault: Option<PublicPluginFault>,
+    pub(crate) generation: u64,
+    pub(crate) permissions: Vec<PublicPermissionView>,
+    pub(crate) settings: Vec<PublicSettingView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPermissionView {
+    pub(crate) permission: PublicPermission,
+    pub(crate) supported: bool,
+    pub(crate) granted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicSettingView {
+    pub(crate) definition: PublicSettingV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) value: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) secret_configured: Option<bool>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicPluginRoute {
+    pub(crate) plugin_id: String,
+    pub(crate) generation: u64,
+    pub(crate) runtime_label: String,
+    pub(crate) activation_mode: PublicActivationMode,
+    pub(crate) output_mode: PublicOutputMode,
+    pub(crate) input: String,
+    pub(crate) input_required: bool,
+    pub(crate) input_placeholder: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicMainResult {
+    pub(crate) plugin_result_id: String,
+    pub(crate) title: String,
+    pub(crate) subtitle: Option<String>,
+    pub(crate) detail: Option<String>,
+    pub(crate) copy_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -633,6 +696,118 @@ impl PublicPluginManager {
         Ok(runtime_label)
     }
 
+    pub(crate) fn inventory(&self) -> Result<PublicPluginInventory, PublicPluginManagementError> {
+        let configs = self.state.configs()?;
+        let data = self.lock_data()?;
+        let revision = configs
+            .iter()
+            .map(|config| config.inventory_revision)
+            .max()
+            .unwrap_or(0);
+        let mut items = Vec::new();
+        for config in configs.into_iter().filter(|config| config.installed) {
+            let Some(snapshot) = data.active_by_plugin.get(&config.plugin_id) else {
+                continue;
+            };
+            let scope = super::PluginDataScope::new(&config.plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let settings = snapshot
+                .manifest
+                .settings
+                .iter()
+                .cloned()
+                .map(|definition| {
+                    let key = definition.key();
+                    if definition.is_secret() {
+                        let configured = self
+                            .secrets
+                            .is_configured(&scope, &config.plugin_id, key)
+                            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                        Ok(PublicSettingView {
+                            definition,
+                            value: None,
+                            secret_configured: Some(configured),
+                        })
+                    } else {
+                        Ok(PublicSettingView {
+                            value: config.settings.get(key).cloned(),
+                            definition,
+                            secret_configured: None,
+                        })
+                    }
+                })
+                .collect::<Result<Vec<_>, PublicPluginManagementError>>()?;
+            items.push(PublicPluginInventoryItem {
+                plugin_id: config.plugin_id.clone(),
+                name: snapshot.manifest.name.clone(),
+                description: snapshot.manifest.description.clone(),
+                version: config.version,
+                source: "localPackage",
+                default_name: snapshot.manifest.command.default_name.clone(),
+                effective_name: config.effective_name,
+                enabled: config.enabled,
+                fault: config.fault,
+                generation: config.active_generation,
+                permissions: snapshot
+                    .manifest
+                    .permissions
+                    .iter()
+                    .copied()
+                    .map(|permission| PublicPermissionView {
+                        permission,
+                        supported: permission.is_available(),
+                        granted: config.permission_grants.contains(&permission),
+                    })
+                    .collect(),
+                settings,
+            });
+        }
+        items.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        Ok(PublicPluginInventory {
+            revision: revision.to_string(),
+            items,
+        })
+    }
+    pub(crate) fn route(
+        &self,
+        query: &str,
+    ) -> Result<Option<PublicPluginRoute>, PublicPluginManagementError> {
+        let Some(command) = query.strip_prefix('/') else {
+            return Ok(None);
+        };
+        let (effective_name, input) = command
+            .split_once(' ')
+            .map_or((command, ""), |(name, body)| (name, body.trim()));
+        if effective_name.is_empty() {
+            return Ok(None);
+        }
+        let data = self.lock_data()?;
+        for (plugin_id, snapshot) in &data.active_by_plugin {
+            let Some(config) = self.state.config(plugin_id)? else {
+                continue;
+            };
+            if !config.installed
+                || !config.enabled
+                || config.fault.is_some()
+                || config.active_generation != snapshot.generation
+                || config.effective_name != effective_name
+            {
+                continue;
+            }
+            let command = &snapshot.manifest.command;
+            return Ok(Some(PublicPluginRoute {
+                plugin_id: plugin_id.clone(),
+                generation: snapshot.generation,
+                runtime_label: snapshot.label.clone(),
+                activation_mode: command.activation_mode,
+                output_mode: command.output_mode,
+                input: input.to_owned(),
+                input_required: command.input_required,
+                input_placeholder: command.input_placeholder.clone(),
+            }));
+        }
+        Ok(None)
+    }
     pub(crate) fn runtime_candidates(
         &self,
     ) -> Result<Vec<PublicRuntimeCandidate>, PublicPluginManagementError> {
@@ -674,6 +849,26 @@ impl PublicPluginManager {
         })
     }
 
+    pub(crate) fn can_copy_text(&self, plugin_id: &str, generation: u64) -> bool {
+        self.state
+            .config(plugin_id)
+            .ok()
+            .flatten()
+            .is_some_and(|config| {
+                config.installed
+                    && config.enabled
+                    && config.fault.is_none()
+                    && config.active_generation == generation
+                    && config
+                        .permission_grants
+                        .contains(&PublicPermission::ClipboardWrite)
+            })
+            && self
+                .lock_data()
+                .ok()
+                .and_then(|data| data.active_by_plugin.get(plugin_id).cloned())
+                .is_some_and(|snapshot| snapshot.generation == generation)
+    }
     pub(crate) fn execute_api(
         &self,
         caller_label: &str,
@@ -899,6 +1094,88 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+const MAX_MAIN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_MAIN_RESULTS: usize = 20;
+const MAX_RESULT_TITLE_CHARS: usize = 256;
+const MAX_RESULT_SUBTITLE_CHARS: usize = 512;
+const MAX_RESULT_DETAIL_BYTES: usize = 16 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MainResultResponseWire {
+    request_id: String,
+    results: Vec<MainResultWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MainResultWire {
+    id: String,
+    title: String,
+    #[serde(default)]
+    subtitle: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    default_action: Option<CopyTextActionWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum CopyTextActionWire {
+    #[serde(rename = "copyText")]
+    CopyText { text: String },
+}
+
+pub(crate) fn parse_main_result_response(
+    context: &PluginRequestContext,
+    value: Value,
+) -> Result<Vec<PublicMainResult>, PluginRuntimeError> {
+    if serde_json::to_vec(&value)
+        .map_err(|_| PluginRuntimeError::InvalidOperation)?
+        .len()
+        > MAX_MAIN_RESPONSE_BYTES
+    {
+        return Err(PluginRuntimeError::InvalidOperation);
+    }
+    let response = serde_json::from_value::<MainResultResponseWire>(value)
+        .map_err(|_| PluginRuntimeError::InvalidOperation)?;
+    if response.request_id != context.request_id || response.results.len() > MAX_MAIN_RESULTS {
+        return Err(PluginRuntimeError::InvalidOperation);
+    }
+    let mut ids = BTreeSet::new();
+    response
+        .results
+        .into_iter()
+        .map(|result| {
+            if result.id.is_empty()
+                || !ids.insert(result.id.clone())
+                || result.title.chars().count() > MAX_RESULT_TITLE_CHARS
+                || result
+                    .subtitle
+                    .as_ref()
+                    .is_some_and(|value| value.chars().count() > MAX_RESULT_SUBTITLE_CHARS)
+                || result
+                    .detail
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_RESULT_DETAIL_BYTES)
+            {
+                return Err(PluginRuntimeError::InvalidOperation);
+            }
+            let copy_text = result.default_action.map(|action| match action {
+                CopyTextActionWire::CopyText { text } => text,
+            });
+            Ok(PublicMainResult {
+                plugin_result_id: result.id,
+                title: result.title,
+                subtitle: result.subtitle,
+                detail: result.detail,
+                copy_text,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1145,5 +1422,102 @@ mod tests {
                 .enabled
         );
         assert!(runtime_staging_is_empty(&manager));
+    }
+
+    #[test]
+    fn inventory_exposes_settings_and_secret_presence_without_runtime_paths_or_secret_values() {
+        let dir = TestDir::new("inventory");
+        write_package(&dir.source(), "1.0.0", "inventory");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+
+        let value = serde_json::to_value(manager.inventory().unwrap()).unwrap();
+        assert_eq!(value["items"][0]["pluginId"], "com.example.activation");
+        assert_eq!(value["items"][0]["effectiveName"], "activation");
+        assert_eq!(value["items"][0]["source"], "localPackage");
+        assert!(value["items"][0].get("runtime").is_none());
+        assert!(value["items"][0].get("outputMode").is_none());
+        assert!(value.to_string().find("runtime.js").is_none());
+    }
+    #[test]
+    fn public_route_preserves_internal_spaces_and_honors_activation_mode() {
+        let dir = TestDir::new("route");
+        write_package(&dir.source(), "1.0.0", "route");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .route("/activation   I am  Jack  ")
+                .unwrap()
+                .unwrap(),
+            PublicPluginRoute {
+                plugin_id: "com.example.activation".into(),
+                generation: 1,
+                runtime_label: runtime_label("com.example.activation", 1).unwrap(),
+                activation_mode: PublicActivationMode::Live,
+                output_mode: PublicOutputMode::MainResult,
+                input: "I am  Jack".into(),
+                input_required: false,
+                input_placeholder: None,
+            }
+        );
+        assert!(manager.route("/activationX nope").unwrap().is_none());
+        manager
+            .set_enabled_with_readiness("com.example.activation", false, |_| false)
+            .unwrap();
+        assert!(manager.route("/activation").unwrap().is_none());
+    }
+
+    #[test]
+    fn main_results_reject_unknown_fields_and_keep_copy_payload_private() {
+        let context = PluginRequestContext {
+            plugin_id: "com.example.activation".into(),
+            plugin_generation: 3,
+            request_id: "public-request-1".into(),
+        };
+        assert_eq!(
+            parse_main_result_response(
+                &context,
+                json!({
+                    "requestId": "public-request-1",
+                    "results": [{
+                        "id": "answer",
+                        "title": "Answer",
+                        "subtitle": "plain text",
+                        "defaultAction": { "type": "copyText", "text": "42" }
+                    }]
+                })
+            )
+            .unwrap(),
+            vec![PublicMainResult {
+                plugin_result_id: "answer".into(),
+                title: "Answer".into(),
+                subtitle: Some("plain text".into()),
+                detail: None,
+                copy_text: Some("42".into()),
+            }]
+        );
+        assert!(parse_main_result_response(
+            &context,
+            json!({
+                "requestId": "public-request-1",
+                "results": [{ "id": "answer", "title": "Answer", "actions": [] }]
+            })
+        )
+        .is_err());
+        assert!(parse_main_result_response(
+            &context,
+            json!({ "requestId": "wrong", "results": [] })
+        )
+        .is_err());
     }
 }

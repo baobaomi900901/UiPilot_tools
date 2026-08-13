@@ -82,7 +82,7 @@ pub(crate) enum PluginScheduleOutcome {
     Dispatched(ScheduledPluginRequest),
     Waiting {
         expired: PluginRequestContext,
-        replaced_waiting: bool,
+        replaced_submission_token: Option<String>,
     },
 }
 
@@ -192,7 +192,10 @@ impl PluginRequestScheduler {
             return Err(PluginScheduleError::GenerationMismatch);
         }
         if queue.rebuilding {
-            let replaced_waiting = queue.waiting.replace(candidate).is_some();
+            let replaced_submission_token = queue
+                .waiting
+                .replace(candidate)
+                .map(|candidate| candidate.owner.submission_token);
             let expired = queue
                 .running
                 .as_ref()
@@ -200,16 +203,19 @@ impl PluginRequestScheduler {
                 .ok_or(PluginScheduleError::Unavailable)?;
             return Ok(PluginScheduleOutcome::Waiting {
                 expired,
-                replaced_waiting,
+                replaced_submission_token,
             });
         }
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
             let expired = running.request.context.clone();
-            let replaced_waiting = queue.waiting.replace(candidate).is_some();
+            let replaced_submission_token = queue
+                .waiting
+                .replace(candidate)
+                .map(|candidate| candidate.owner.submission_token);
             return Ok(PluginScheduleOutcome::Waiting {
                 expired,
-                replaced_waiting,
+                replaced_submission_token,
             });
         }
         let request = dispatch(&mut state, candidate, now)?;
@@ -493,7 +499,7 @@ mod tests {
                 .unwrap(),
             PluginScheduleOutcome::Waiting {
                 expired: a.context.clone(),
-                replaced_waiting: false,
+                replaced_submission_token: None,
             }
         );
         assert_eq!(
@@ -508,9 +514,9 @@ mod tests {
                 )
                 .unwrap(),
             PluginScheduleOutcome::Waiting {
-                replaced_waiting: true,
+                replaced_submission_token: Some(token),
                 ..
-            }
+            } if token == "submission-B"
         ));
 
         let completed = scheduler

@@ -25,6 +25,7 @@ import {
   parseLauncherShown,
   parsePluginInventorySnapshot,
   parsePluginMutationOutcome,
+  parsePublicPluginInventory,
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
@@ -109,6 +110,24 @@ describe('plugin protocol', () => {
     expect(parsePluginInventorySnapshot(Object.assign(Object.create({}), pluginInventory()))).toBeNull()
   })
 
+  it('strictly parses public inventory settings and rejects output mode or secret value leaks', () => {
+    const item = {
+      pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
+      source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
+      fault: null, generation: 1,
+      permissions: [{ permission: 'clipboard.write', supported: true, granted: true }],
+      settings: [
+        { definition: { type: 'text', key: 'prefix', label: 'Prefix', default: 'Hi' }, value: 'Hello' },
+        { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 20, step: 1 }, value: 3 },
+        { definition: { type: 'boolean', key: 'loud', label: 'Loud' }, value: true },
+        { definition: { type: 'select', key: 'style', label: 'Style', options: [{ value: 'short', label: 'Short' }] }, value: 'short' },
+        { definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: false },
+      ],
+    }
+    expect(parsePublicPluginInventory({ revision: '1', items: [item] })).toEqual({ revision: '1', items: [item] })
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, outputMode: 'mainResult' }] })).toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, settings: [{ definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true, value: 'leak' }] }] })).toBeNull()
+  })
   it('parses mutation revisions and compares the full u64 range without Number', () => {
     expect(parsePluginMutationOutcome({ revision: '18446744073709551615' })).toEqual({
       revision: '18446744073709551615',
@@ -192,7 +211,16 @@ function fakeClient() {
     setFilePreviewPreference: vi.fn(async () => undefined),
     setThemePreference: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
-    listPlugins: vi.fn(async () => pluginInventory()),
+    listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
+    selectPublicPluginArchive: vi.fn(async () => null),
+    selectPublicPluginDirectory: vi.fn(async () => null),
+    preparePublicPlugin: vi.fn(async () => { throw new Error('not prepared') }),
+    commitPublicPlugin: vi.fn(async () => undefined),
+    cancelPublicPlugin: vi.fn(async () => undefined),
+    setPublicPluginEnabled: vi.fn(async () => undefined),
+    setPublicPluginEffectiveName: vi.fn(async () => undefined),
+    savePublicPluginSettings: vi.fn(async () => undefined),
+    uninstallPublicPlugin: vi.fn(async () => undefined),    listPlugins: vi.fn(async () => pluginInventory()),
     installPlugin: vi.fn(async () => ({ revision: '2' })),
     reloadPlugin: vi.fn(async () => ({ revision: '2' })),
     deletePlugin: vi.fn(async () => ({ revision: '2' })),
@@ -602,6 +630,50 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().status).toBe('')
   })
 
+  it('debounces slash live edits, submits on first Enter, and keeps actionless results inert', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const live = deferred<SearchResponse | null>()
+      const submit = deferred<SearchResponse | null>()
+      vi.mocked(client.searchApps).mockReturnValueOnce(live.promise).mockReturnValueOnce(submit.promise)
+      emit(shown('public-plugin'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo   I am  Jack  ', inputType: 'insertText' })
+
+      expect(client.searchApps).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(149)
+      expect(client.searchApps).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(client.searchApps).toHaveBeenCalledWith({
+        query: '/demo   I am  Jack  ',
+        invocationId: 'public-plugin',
+        querySequence: 1,
+        submit: false,
+      })
+      live.resolve(null)
+      await vi.runAllTicks()
+      await Promise.resolve()
+
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenLastCalledWith({
+        query: '/demo   I am  Jack  ',
+        invocationId: 'public-plugin',
+        querySequence: 2,
+        submit: true,
+      })
+      submit.resolve({
+        requestId: 'public-request',
+        items: [{ resultId: 'answer', title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false }],
+      })
+      await submit.promise
+      await Promise.resolve()
+      expect(core.getSnapshot().results).toMatchObject([{ title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false }])
+      core.keyDown('Enter', false)
+      expect(client.executeResult).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   it('keeps only strict bounded PNG data icons', async () => {
     const { core, client, emit } = await startedCore()
     const valid = `data:image/png;base64,${'A'.repeat(65_512)}`
@@ -658,6 +730,29 @@ describe('execute and hide ownership', () => {
     expect(client.hideLauncher).not.toHaveBeenCalled()
   })
 
+  it('executes a current public copy action by Enter or row activation and ignores actionless rows', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'public-copy-request',
+      items: [
+        { resultId: 'copy', title: 'Copy', hasDefaultAction: true },
+        { resultId: 'info', title: 'Info', hasDefaultAction: false },
+      ],
+    })
+    emit(shown('public-copy'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'public', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    core.keyDown('ArrowDown', false)
+    core.keyDown('Enter', false)
+    expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'public-copy-request', resultId: 'copy' })
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    vi.mocked(client.executeResult).mockClear()
+    core.activateResult(2)
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.activateResult(1)
+    expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'public-copy-request', resultId: 'copy' })
+  })
   it('treats host-owned text copy as execute success without frontend hide', async () => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValueOnce({
@@ -988,7 +1083,7 @@ describe('R3 correlated composition boundary', () => {
     })
     expect(core.getSnapshot().shownNotice).toBeUndefined()
     expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
-    expect(client.searchApps).toHaveBeenLastCalledWith({ query: '/unknown', invocationId: 'idempotent-rerun', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenLastCalledWith({ query: '/unknown', invocationId: 'idempotent-rerun', querySequence: 2, submit: true })
     expect(client.executeResult).not.toHaveBeenCalled()
 
     core.keyDown('Enter', false)
@@ -2531,6 +2626,56 @@ describe('React view and accessibility', () => {
     }
   })
 
+  it('submits generated public settings once without exposing an existing secret', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValueOnce({
+      revision: '1',
+      items: [{
+        pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
+        source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
+        fault: null, generation: 1, permissions: [],
+        settings: [
+          { definition: { type: 'text', key: 'prefix', label: 'Prefix' }, value: 'Hello' },
+          { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 9 }, value: 3 },
+          { definition: { type: 'boolean', key: 'loud', label: 'Loud' }, value: false },
+          { definition: { type: 'select', key: 'style', label: 'Style', options: [{ value: 'short', label: 'Short' }] }, value: 'short' },
+          { definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true },
+        ],
+      }],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-settings', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+
+    const prefix = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Prefix"]')!
+    const secret = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Token"]')!
+    expect(secret.value).toBe('')
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setter.call(prefix, 'Welcome')
+      prefix.dispatchEvent(new Event('input', { bubbles: true }))
+      prefix.dispatchEvent(new Event('change', { bubbles: true }))
+      setter.call(secret, 'new-token')
+      secret.dispatchEvent(new Event('input', { bubbles: true }))
+      secret.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    const save = [...mounted.host.querySelectorAll<HTMLButtonElement>('.public-plugin-form button')]
+      .find((button) => button.textContent?.includes('保存设置'))!
+    await act(async () => save.click())
+    await vi.waitFor(() => expect(fake.client.savePublicPluginSettings).toHaveBeenCalledOnce())
+    expect(fake.client.savePublicPluginSettings).toHaveBeenCalledWith({ input: {
+      pluginId: 'com.example.demo',
+      settings: { prefix: 'Welcome', limit: 3, loud: false, style: 'short' },
+      secrets: { token: 'new-token' },
+    } })
+    await mounted.unmount()
+    core.destroy()
+  })
   it('renders plugin metadata and safe markdown without links images or raw HTML', async () => {
     installMatchMedia(false)
     const fake = fakeClient()

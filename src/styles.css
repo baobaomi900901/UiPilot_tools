@@ -312,6 +312,13 @@ label,
   color: #595959;
   font-size: 0.875rem;
 }
+.result-detail {
+  max-height: 48px;
+  overflow: hidden;
+  color: #404040;
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
+}
 
 .status-region {
   min-height: 24px;
@@ -418,6 +425,58 @@ label,
   padding-bottom: 14px;
 }
 
+.public-plugin-inventory {
+  min-width: 0;
+  margin-bottom: 18px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #d9d9d9;
+}
+
+.public-install-actions,
+.public-prepare,
+.public-name-control,
+.public-secret-control,
+.public-permissions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.public-prepare,
+.public-permissions {
+  flex-wrap: wrap;
+}
+
+.public-prepare {
+  padding: 8px 0 12px;
+}
+
+.public-permissions {
+  margin-top: 6px;
+  color: #595959;
+  font-size: 0.75rem;
+}
+
+.public-plugin-form {
+  max-width: 560px;
+  margin-top: 12px;
+}
+
+.public-name-control > .ant-input,
+.public-secret-control > .ant-input-affix-wrapper {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.public-plugin-form .ant-select,
+.public-plugin-form .ant-input-number {
+  width: 100%;
+}
+
+.public-plugin-actions {
+  flex-wrap: wrap;
+}
 .plugin-inventory {
   min-width: 0;
 }
@@ -635,6 +694,12 @@ label,
   }
 
   .plugin-item {
+    flex-direction: column;
+  }
+  .public-name-control,
+  .public-secret-control,
+  .public-prepare {
+    align-items: stretch;
     flex-direction: column;
   }
 

@@ -272,6 +272,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
@@ -300,6 +301,7 @@ pub fn run() {
             commands::set_find_pinned,
             commands::set_find_preview_preference,
             commands::hide_find_window,
+            commands::list_public_plugins,
             commands::prepare_public_plugin_install,
             commands::commit_public_plugin_install,
             commands::cancel_public_plugin_install,
@@ -532,7 +534,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 30);
+        assert_eq!(production.matches("commands::").count(), 31);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -541,6 +543,7 @@ mod tests {
             "set_find_pinned",
             "set_find_preview_preference",
             "hide_find_window",
+            "list_public_plugins",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
@@ -626,6 +629,7 @@ mod tests {
         let main = include_str!("../capabilities/main.json");
         let runtime = include_str!("../capabilities/plugin-runtime.json");
         for command in [
+            "list_public_plugins",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",

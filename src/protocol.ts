@@ -3,8 +3,9 @@ export interface ResultItem {
   title: string
   subtitle?: string
   icon?: string
+  detail?: string
+  hasDefaultAction?: boolean
 }
-
 export interface SearchResponse {
   requestId: string
   items: ResultItem[]
@@ -61,6 +62,65 @@ export interface PluginInventorySnapshot {
   items: PluginInventoryView[]
 }
 
+export type PublicPluginFault = 'runtimeUnavailable' | 'consecutiveFailures'
+export type PublicPermission =
+  | 'ui.window'
+  | 'clipboard.write'
+  | 'clipboard.read'
+  | 'network.https'
+  | 'files.userSelected'
+  | 'files.index.readAll'
+  | 'notifications.publish'
+  | 'background.schedule'
+
+export interface PublicPermissionView {
+  permission: PublicPermission
+  supported: boolean
+  granted: boolean
+}
+
+export type PublicSettingDefinition =
+  | { type: 'text'; key: string; label: string; default?: string }
+  | { type: 'secret'; key: string; label: string }
+  | { type: 'number'; key: string; label: string; default?: number; min?: number; max?: number; step?: number }
+  | { type: 'boolean'; key: string; label: string; default?: boolean }
+  | { type: 'select'; key: string; label: string; options: readonly { value: string; label: string }[]; default?: string }
+
+export interface PublicSettingView {
+  definition: PublicSettingDefinition
+  value?: string | number | boolean
+  secretConfigured?: boolean
+}
+
+export interface PublicPluginInventoryItem {
+  pluginId: string
+  name: string
+  description: string | null
+  version: string
+  source: 'localPackage'
+  defaultName: string
+  effectiveName: string
+  enabled: boolean
+  fault: PublicPluginFault | null
+  generation: number
+  permissions: readonly PublicPermissionView[]
+  settings: readonly PublicSettingView[]
+}
+
+export interface PublicPluginInventory {
+  revision: string
+  items: readonly PublicPluginInventoryItem[]
+}
+
+export interface PublicPluginPrepareSummary {
+  token: string
+  pluginId: string
+  name: string
+  version: string
+  permissions: readonly PublicPermission[]
+  isUpdate: boolean
+  sourceVerified: boolean
+}
 export interface PluginMutationOutcome {
   revision: string
 }
@@ -116,9 +176,19 @@ export type ClassifiedTextRecord =
 
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
-  searchApps(input: { query: string; invocationId: string; querySequence: number }): Promise<SearchResponse | null>
+  searchApps(input: { query: string; invocationId: string; querySequence: number; submit?: boolean }): Promise<SearchResponse | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  listPublicPlugins(): Promise<PublicPluginInventory>
+  selectPublicPluginArchive(): Promise<string | null>
+  selectPublicPluginDirectory(): Promise<string | null>
+  preparePublicPlugin(input: { source: { kind: 'archive' | 'developmentDirectory'; path: string } }): Promise<PublicPluginPrepareSummary>
+  commitPublicPlugin(input: { input: { token: string; permissionGrants: readonly PublicPermission[] } }): Promise<void>
+  cancelPublicPlugin(input: { token: string }): Promise<void>
+  setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
+  setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
+  savePublicPluginSettings(input: { input: { pluginId: string; settings: Readonly<Record<string, string | number | boolean>>; secrets: Readonly<Record<string, string | null>> } }): Promise<void>
+  uninstallPublicPlugin(input: { pluginId: string; retainData: boolean }): Promise<void>
   listPlugins(): Promise<PluginInventorySnapshot>
   installPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
   reloadPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
@@ -172,8 +242,9 @@ export interface ViewResult {
   title: string
   subtitle?: string
   icon?: string
+  detail?: string
+  hasDefaultAction?: boolean
 }
-
 export interface TextControlView {
   key: ControlKey
   value: string
@@ -267,6 +338,7 @@ export interface LauncherSnapshot {
   settingsLoadStatus?: SettingsLoadStatus
   settings?: SettingsSnapshot
   plugins?: PluginListSnapshot
+  publicPlugins?: PublicPluginInventory
   file?: FileSnapshot
 }
 
@@ -407,6 +479,87 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
   return { revision: snapshot.revision, items }
 }
 
+const publicPermissions = new Set<PublicPermission>([
+  'ui.window', 'clipboard.write', 'clipboard.read', 'network.https',
+  'files.userSelected', 'files.index.readAll', 'notifications.publish', 'background.schedule',
+])
+const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])
+
+function parsePublicSettingDefinition(value: unknown): PublicSettingDefinition | null {
+  const setting = plainRecord(value)
+  if (!setting || typeof setting.type !== 'string' || typeof setting.key !== 'string' || setting.key.length === 0 || typeof setting.label !== 'string') return null
+  const optional = (key: string, type: 'string' | 'number' | 'boolean') => setting[key] === undefined || typeof setting[key] === type
+  if (setting.type === 'text' && exactKeys(setting, setting.default === undefined ? ['key', 'label', 'type'] : ['default', 'key', 'label', 'type']) && optional('default', 'string')) return setting as unknown as PublicSettingDefinition
+  if (setting.type === 'secret' && exactKeys(setting, ['key', 'label', 'type'])) return setting as unknown as PublicSettingDefinition
+  if (setting.type === 'boolean' && exactKeys(setting, setting.default === undefined ? ['key', 'label', 'type'] : ['default', 'key', 'label', 'type']) && optional('default', 'boolean')) return setting as unknown as PublicSettingDefinition
+  if (setting.type === 'number') {
+    const keys = ['key', 'label', 'type', ...['default', 'min', 'max', 'step'].filter((key) => setting[key] !== undefined)].sort()
+    if (!exactKeys(setting, keys) || !['default', 'min', 'max', 'step'].every((key) => optional(key, 'number'))) return null
+    if (['default', 'min', 'max', 'step'].some((key) => typeof setting[key] === 'number' && !Number.isFinite(setting[key]))) return null
+    return setting as unknown as PublicSettingDefinition
+  }
+  if (setting.type === 'select') {
+    const keys = setting.default === undefined ? ['key', 'label', 'options', 'type'] : ['default', 'key', 'label', 'options', 'type']
+    if (!exactKeys(setting, keys) || !optional('default', 'string') || !Array.isArray(setting.options) || !exactDenseArray(setting.options)) return null
+    const seen = new Set<string>()
+    for (const option of setting.options) {
+      const record = plainRecord(option)
+      if (!record || !exactKeys(record, ['label', 'value']) || typeof record.value !== 'string' || typeof record.label !== 'string' || !seen.add(record.value)) return null
+    }
+    return setting as unknown as PublicSettingDefinition
+  }
+  return null
+}
+
+function parsePublicSettingView(value: unknown): PublicSettingView | null {
+  const view = plainRecord(value)
+  if (!view || !Object.prototype.hasOwnProperty.call(view, 'definition')) return null
+  const definition = parsePublicSettingDefinition(view.definition)
+  if (!definition) return null
+  if (definition.type === 'secret') {
+    if (!exactKeys(view, ['definition', 'secretConfigured']) || typeof view.secretConfigured !== 'boolean') return null
+    return { definition, secretConfigured: view.secretConfigured }
+  }
+  const expected = view.value === undefined ? ['definition'] : ['definition', 'value']
+  if (!exactKeys(view, expected)) return null
+  const valueType = definition.type === 'text' || definition.type === 'select' ? 'string' : definition.type
+  if (view.value !== undefined && (typeof view.value !== valueType || (valueType === 'number' && !Number.isFinite(view.value)))) return null
+  return view.value === undefined ? { definition } : { definition, value: view.value as string | number | boolean }
+}
+
+function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null {
+  const item = plainRecord(value)
+  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'name', 'permissions', 'pluginId', 'settings', 'source', 'version']
+  if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.defaultName !== 'string' || typeof item.effectiveName !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
+  if (!Array.isArray(item.permissions) || !exactDenseArray(item.permissions) || !Array.isArray(item.settings) || !exactDenseArray(item.settings)) return null
+  const permissions: PublicPermissionView[] = []
+  for (const valuePermission of item.permissions) {
+    const permission = plainRecord(valuePermission)
+    if (!permission || !exactKeys(permission, ['granted', 'permission', 'supported']) || typeof permission.permission !== 'string' || !publicPermissions.has(permission.permission as PublicPermission) || typeof permission.supported !== 'boolean' || typeof permission.granted !== 'boolean') return null
+    permissions.push(permission as unknown as PublicPermissionView)
+  }
+  const settings: PublicSettingView[] = []
+  const settingKeys = new Set<string>()
+  for (const valueSetting of item.settings) {
+    const setting = parsePublicSettingView(valueSetting)
+    if (!setting || !settingKeys.add(setting.definition.key)) return null
+    settings.push(setting)
+  }
+  return { ...(item as unknown as PublicPluginInventoryItem), permissions, settings }
+}
+
+export function parsePublicPluginInventory(value: unknown): PublicPluginInventory | null {
+  const inventory = plainRecord(value)
+  if (!inventory || !exactKeys(inventory, ['items', 'revision']) || !canonicalU64(inventory.revision) || !Array.isArray(inventory.items) || !exactDenseArray(inventory.items)) return null
+  const items: PublicPluginInventoryItem[] = []
+  const ids = new Set<string>()
+  for (const valueItem of inventory.items) {
+    const item = parsePublicPluginItem(valueItem)
+    if (!item || !ids.add(item.pluginId)) return null
+    items.push(item)
+  }
+  return { revision: inventory.revision, items }
+}
 export function parsePluginMutationOutcome(value: unknown): PluginMutationOutcome | null {
   const outcome = plainRecord(value)
   return outcome && exactKeys(outcome, ['revision']) && canonicalU64(outcome.revision)

@@ -34,7 +34,7 @@ pub(crate) enum PublicPermission {
 }
 
 impl PublicPermission {
-    fn is_available(self) -> bool {
+    pub(super) fn is_available(self) -> bool {
         matches!(self, Self::UiWindow | Self::ClipboardWrite)
     }
 }

@@ -268,14 +268,15 @@ impl ResultRegistry {
         })
     }
 
-    pub(crate) fn publish_if_latest<T, R, A, F>(
+    pub(crate) fn publish_if_latest<T, R, E, A, F>(
         &self,
         token: QueryToken,
-        entries: Vec<(T, ResultAction)>,
+        entries: Vec<(T, E)>,
         authorize: A,
         response: F,
     ) -> Option<R>
     where
+        E: Into<Option<ResultAction>>,
         A: FnOnce() -> bool,
         F: FnOnce(String, Vec<(String, T)>) -> R,
     {
@@ -332,7 +333,9 @@ impl ResultRegistry {
                 .checked_add(1)
                 .expect("reserved opaque identifier range must be contiguous");
             let result_id = Self::format_id("item", allocated_id);
-            actions.insert(result_id.clone(), action);
+            if let Some(action) = action.into() {
+                actions.insert(result_id.clone(), action);
+            }
             items.push((result_id, item));
         }
 
@@ -711,9 +714,10 @@ mod tests {
             title: title.to_owned(),
             subtitle: None,
             icon: None,
+            detail: None,
+            has_default_action: true,
         }
     }
-
     fn action(name: &str) -> ResultAction {
         ResultAction::LaunchApplication {
             app_id: format!("app-{name}"),

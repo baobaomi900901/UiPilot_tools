@@ -16,4 +16,8 @@ pub(crate) struct ResultItem {
     pub(crate) subtitle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) has_default_action: bool,
 }

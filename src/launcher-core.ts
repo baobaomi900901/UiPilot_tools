@@ -27,6 +27,7 @@ import {
 } from './protocol'
 
 export interface LauncherCore {
+  readonly client: LauncherClient
   readonly getSnapshot: () => LauncherSnapshot
   readonly subscribe: (listener: () => void) => () => void
   readonly start: () => Promise<void>
@@ -36,6 +37,7 @@ export interface LauncherCore {
   readonly retireControl: (control: ControlKey) => void
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
   readonly requestHide: () => Promise<void>
+  readonly activateResult: (index: number) => void
   readonly setAutostart: (checked: boolean) => void
   readonly setThemePreference: (theme: ThemePreference) => void
   readonly setHotkeyCanonical: (value: string) => void
@@ -244,12 +246,14 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon }) =>
+    model.results.map(({ key, title, subtitle, icon, detail, hasDefaultAction }) =>
       Object.freeze({
         key,
         title,
         ...(subtitle === undefined ? {} : { subtitle }),
         ...(icon === undefined ? {} : { icon }),
+        ...(detail === undefined ? {} : { detail }),
+        ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
       }),
     ),
   )
@@ -360,6 +364,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let durableTheme: ThemePreference = 'system'
   let token = 0
   let searchToken = 0
+  let slashSearchTimer: ReturnType<typeof setTimeout> | undefined
   let executeToken = 0
   let hideToken = 0
   let resultKey = 1
@@ -724,7 +729,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     beginFileSearch()
   }
 
-  function beginSearch(): void {
+  function cancelSlashSearch(): void {
+    if (slashSearchTimer === undefined) return
+    clearTimeout(slashSearchTimer)
+    slashSearchTimer = undefined
+  }
+
+  function beginSearch(submit = false): void {
     const invocationId = model.invocationId
     if (!invocationId || model.query === '' || fileCommand(model.query) !== null) return
     if (!model.query.startsWith('/')) {
@@ -742,7 +753,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = true
     let pending: Promise<import('./protocol').SearchResponse | null>
     try {
-      pending = client.searchApps({ query: captured.query, invocationId, querySequence: captured.sequence })
+      pending = client.searchApps({
+        query: captured.query,
+        invocationId,
+        querySequence: captured.sequence,
+        ...(captured.query.startsWith('/') ? { submit } : {}),
+      })
     } catch (error) {
       pending = Promise.reject(error)
     }
@@ -752,6 +768,30 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function scheduleSearch(): void {
+    cancelSlashSearch()
+    if (!model.query.startsWith('/')) {
+      beginSearch()
+      return
+    }
+    const epoch = model.viewEpoch
+    const invocationId = model.invocationId
+    const sequence = model.querySequence
+    const query = model.query
+    slashSearchTimer = setTimeout(() => {
+      slashSearchTimer = undefined
+      if (
+        destroyed ||
+        epoch !== model.viewEpoch ||
+        invocationId !== model.invocationId ||
+        sequence !== model.querySequence ||
+        query !== model.query ||
+        query !== model.queryControlValue
+      ) return
+      beginSearch(false)
+      publish(true)
+    }, 150)
+  }
   function ownsSearch(captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string }): boolean {
     return (
       !destroyed &&
@@ -782,6 +822,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           title: item.title,
           ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
           ...(icon === undefined ? {} : { icon }),
+          ...(item.detail === undefined ? {} : { detail: item.detail }),
+          ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
         }
       })
       model.results = findResult ? [findResult, ...applications] : applications
@@ -814,7 +856,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     model.status = ''
     clearResults()
-    if (value !== '') beginSearch()
+    if (value !== '') scheduleSearch()
     publish(true)
   }
 
@@ -980,6 +1022,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     pluginInventoryActive = false
     model.queryControlValue = model.query
     model.querySequence = 0
+    cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
@@ -997,7 +1040,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     if (event.target === 'launcher' && model.query !== '') {
       model.querySequence = 1
-      beginSearch()
+      scheduleSearch()
     }
     publish(true)
     if (event.target === 'settings') {
@@ -1319,6 +1362,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         submitFind(selected.query)
         return
       }
+      if (selected.hasDefaultAction === false) return
       resultId = selected.resultId
     } else {
       resultId = model.file?.results[model.file.selectedIndex]?.resultId
@@ -1353,6 +1397,18 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function activateResult(index: number): void {
+    if (
+      model.view !== 'launcher' ||
+      model.launcherMode !== 'applications' ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= model.results.length
+    ) return
+    model.selectedIndex = index
+    publish(true)
+    executeSelection()
+  }
   async function requestHide(): Promise<void> {
     if (destroyed || model.hidePending) return
     model.shownNotice = undefined
@@ -1396,7 +1452,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         model.query !== '' &&
         model.queryControlValue === model.query
       ) {
-        applyEdit(model.query)
+        model.shownNotice = undefined
+        cancelSlashSearch()
+        if (model.query.startsWith('/')) {
+          model.querySequence += 1
+          beginSearch(true)
+        } else applyEdit(model.query)
+        publish(true)
         return
       }
       executeSelection()
@@ -1473,6 +1535,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function destroy(): void {
     if (destroyed) return
     destroyed = true
+    cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
@@ -1569,6 +1632,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   return {
+    client,
     getSnapshot,
     subscribe,
     start,
@@ -1578,6 +1642,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     retireControl,
     keyDown,
     requestHide,
+    activateResult,
     setAutostart,
     setThemePreference,
     setHotkeyCanonical,

@@ -31,9 +31,10 @@ use crate::{
         PluginMutationOutcome, PluginQueryError, PluginQueryStart,
     },
     public_plugins::{
-        PluginApiRequest, PluginCommandCompletion, PluginRuntimeError, PublicPermission,
-        PublicPluginInstallSource, PublicPluginManagementError, PublicPluginMutation,
-        PublicPluginPrepareSummary, PublicPluginService,
+        PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
+        PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
+        PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
+        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginService,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -665,6 +666,14 @@ pub(crate) async fn delete_plugin(
 }
 
 #[tauri::command]
+pub(crate) fn list_public_plugins(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+) -> Result<PublicPluginInventory, CommandError> {
+    require_main_window(&window)?;
+    Ok(service.manager()?.inventory()?)
+}
+#[tauri::command]
 pub(crate) fn prepare_public_plugin_install(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
@@ -808,30 +817,89 @@ pub(crate) fn plugin_api_call(
 #[tauri::command]
 pub(crate) fn complete_plugin_command(
     window: WebviewWindow,
+    app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    settings: State<'_, SettingsStore>,
     completion: PluginCommandCompletion,
 ) -> Result<PluginCommandCompletionResult, CommandError> {
     let outcome = service
         .manager()?
         .complete(window.label(), &completion, Instant::now())?;
-    Ok(PluginCommandCompletionResult {
-        accepted: outcome.accepted,
-    })
+    let accepted = outcome.accepted;
+    if let Some(next) = service.complete_submission(&completion, outcome)? {
+        service.dispatch(
+            &app,
+            &next,
+            invocation_theme(settings.snapshot().theme),
+            invoked_at_rfc3339(),
+        )?;
+    }
+    Ok(PluginCommandCompletionResult { accepted })
 }
-
 #[tauri::command]
 pub(crate) async fn search_apps(
     window: WebviewWindow,
     query: String,
     invocation_id: String,
     query_sequence: u64,
+    submit: Option<bool>,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
+    let submit = submit.unwrap_or(false);
     let app = window.app_handle();
     let registries = app.state::<ResultRegistries>();
     let registry = registries.main();
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
+    let public = app.state::<Arc<PublicPluginService>>();
+    if let Some(route) = public.manager()?.route(&query)? {
+        if route.output_mode != PublicOutputMode::MainResult
+            || (route.activation_mode == PublicActivationMode::Submit && !submit)
+            || (route.activation_mode == PublicActivationMode::Live && submit)
+        {
+            return Ok(None);
+        }
+        if route.input_required && route.input.is_empty() {
+            return Ok(public_plugin_prompt(
+                registry,
+                &invocation_id,
+                query_sequence,
+                route.input_placeholder,
+            ));
+        }
+        let Some(token) = registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
+        else {
+            return Ok(None);
+        };
+        let submission = public.schedule_main_result(
+            route.clone(),
+            query_sequence,
+            query.clone(),
+            Instant::now(),
+        )?;
+        if let Some(dispatch) = submission.dispatch.as_ref() {
+            if let Err(error) = public.dispatch(
+                app,
+                dispatch,
+                invocation_theme(settings.snapshot().theme),
+                invoked_at_rfc3339(),
+            ) {
+                public.fail_submission(&submission.token);
+                return Err(error.into());
+            }
+        }
+        let received = tauri::async_runtime::spawn_blocking(move || submission.receiver.recv())
+            .await
+            .map_err(|_| CommandError::plugin_query_failed())?
+            .map_err(|_| CommandError::plugin_query_failed())?;
+        let Some(results) = received else {
+            return Ok(None);
+        };
+        let results = results.map_err(CommandError::from)?;
+        return Ok(publish_public_main_results(
+            registry, token, &route, results,
+        ));
+    }
     let plugins = app.state::<Arc<PluginManager>>();
     match plugins.begin_routed_query(&query, registry, &invocation_id, query_sequence) {
         PluginQueryStart::Started { route, token } => {
@@ -855,6 +923,87 @@ pub(crate) async fn search_apps(
     ))
 }
 
+fn invocation_theme(preference: ThemePreference) -> PluginInvocationTheme {
+    match preference {
+        ThemePreference::Dark => PluginInvocationTheme::Dark,
+        ThemePreference::System | ThemePreference::Light => PluginInvocationTheme::Light,
+    }
+}
+
+fn invoked_at_rfc3339() -> String {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    now.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+fn public_plugin_prompt(
+    registry: &ResultRegistry,
+    invocation_id: &str,
+    query_sequence: u64,
+    placeholder: Option<String>,
+) -> Option<SearchResponse> {
+    let token = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)?;
+    let item = crate::model::ResultItem {
+        result_id: String::new(),
+        title: placeholder.unwrap_or_else(|| "请输入内容".into()),
+        subtitle: None,
+        icon: None,
+        detail: None,
+        has_default_action: false,
+    };
+    registry.publish_if_latest(
+        token,
+        vec![(item, None::<ResultAction>)],
+        || true,
+        search_response,
+    )
+}
+
+fn publish_public_main_results(
+    registry: &ResultRegistry,
+    token: QueryToken,
+    route: &crate::public_plugins::PublicPluginRoute,
+    results: Vec<PublicMainResult>,
+) -> Option<SearchResponse> {
+    let entries = results
+        .into_iter()
+        .map(|result| {
+            let action = result.copy_text.clone().map(|text| ResultAction::CopyText {
+                plugin_id: route.plugin_id.clone(),
+                generation: route.generation,
+                text,
+            });
+            (
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    title: result.title,
+                    subtitle: result.subtitle,
+                    icon: None,
+                    detail: result.detail,
+                    has_default_action: action.is_some(),
+                },
+                action,
+            )
+        })
+        .collect();
+    registry.publish_if_latest(token, entries, || true, search_response)
+}
+
+fn search_response(
+    request_id: String,
+    items: Vec<(String, crate::model::ResultItem)>,
+) -> SearchResponse {
+    SearchResponse {
+        request_id,
+        items: items
+            .into_iter()
+            .map(|(result_id, mut item)| {
+                item.result_id = result_id;
+                item
+            })
+            .collect(),
+    }
+}
 #[tauri::command]
 pub(crate) fn publish_plugin_results(
     window: WebviewWindow,
@@ -1437,6 +1586,7 @@ pub(crate) async fn execute_result(
 
     let registry = registries.main();
     let plugins = app.state::<Arc<PluginManager>>();
+    let public_plugins = app.state::<Arc<PublicPluginService>>();
     let settings = app.state::<SettingsStore>();
     let cache = app.state::<Arc<AppCache>>();
     let worker_index = Arc::clone(file_index.inner());
@@ -1461,6 +1611,15 @@ pub(crate) async fn execute_result(
                 }
             },
             copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
+                if public_plugins
+                    .manager()
+                    .is_ok_and(|manager| manager.can_copy_text(plugin_id, generation))
+                {
+                    return app
+                        .clipboard()
+                        .write_text(text.to_owned())
+                        .map_err(|_| PluginCopyError::SideEffectFailed);
+                }
                 plugins.copy_text(plugin_id, generation, || {
                     app.clipboard().write_text(text.to_owned()).map_err(|_| ())
                 })
@@ -1902,6 +2061,7 @@ mod tests {
             "save_hotkey",
             "set_file_preview_preference",
             "hide_launcher",
+            "list_public_plugins",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
@@ -1924,6 +2084,7 @@ mod tests {
     fn public_plugin_command_callers_are_guarded_by_exact_labels() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         for command in [
+            "list_public_plugins",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",

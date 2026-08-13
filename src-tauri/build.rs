@@ -8,6 +8,7 @@ fn main() {
             "set_find_pinned",
             "set_find_preview_preference",
             "hide_find_window",
+            "list_public_plugins",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",

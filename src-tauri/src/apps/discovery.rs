@@ -384,6 +384,8 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
                 .into(),
             ),
             icon: application.icon.clone(),
+            detail: None,
+            has_default_action: true,
         },
         ResultAction::LaunchApplication {
             app_id: application.app_id.clone(),

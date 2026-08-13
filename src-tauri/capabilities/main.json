@@ -4,7 +4,9 @@
   "description": "Exact permissions for the local launcher WebView",
   "windows": ["main"],
   "permissions": [
+    "dialog:allow-open",
     "allow-open-find-window",
+    "allow-list-public-plugins",
     "allow-prepare-public-plugin-install",
     "allow-commit-public-plugin-install",
     "allow-cancel-public-plugin-install",

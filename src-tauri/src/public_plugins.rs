@@ -11,31 +11,37 @@ mod storage;
 mod tests;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 use tauri::{
     http::Response,
     webview::{NewWindowResponse, WebviewWindow},
-    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
 pub(crate) use activation::{
-    PublicPluginInstallSource, PublicPluginManagementError, PublicPluginManager,
-    PublicPluginMutation, PublicPluginPrepareSummary, PublicRuntimeCandidate,
+    parse_main_result_response, PublicMainResult, PublicPluginInstallSource, PublicPluginInventory,
+    PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
+    PublicPluginPrepareSummary, PublicPluginRoute, PublicRuntimeCandidate,
 };
-#[cfg(test)]
-pub(crate) use manifest::PublicActivationMode;
-pub(crate) use manifest::{PublicManifestV1, PublicPermission, PublicPlatform};
+pub(crate) use manifest::{
+    PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
+};
 pub(crate) use runtime::{
     parse_runtime_label, runtime_label, PluginApiRequest, PluginCommandCompletion,
-    PluginRuntimeApi, PluginRuntimeError, PUBLIC_RUNTIME_BOOTSTRAP,
+    PluginCommandDispatch, PluginInvocation, PluginInvocationEnvironment, PluginInvocationPlatform,
+    PluginInvocationTheme, PluginRuntimeApi, PluginRuntimeError, PUBLIC_RUNTIME_BOOTSTRAP,
 };
 pub(crate) use scheduler::{
-    PluginCompletionOutcome, PluginContextStatus, PluginRequestContext, PluginRequestScheduler,
+    PluginCompletionOutcome, PluginContextStatus, PluginRequestCandidate, PluginRequestContext,
+    PluginRequestScheduler, PluginScheduleOutcome, PluginSubmissionOwner, ScheduledPluginRequest,
 };
 pub(crate) use secrets::PluginSecretStore;
 pub(crate) use state::{
@@ -44,11 +50,31 @@ pub(crate) use state::{
 pub(crate) use storage::PluginStorageStore;
 const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub(crate) type PublicSubmissionResult = Result<Vec<PublicMainResult>, PluginRuntimeError>;
+
+struct PendingPublicSubmission {
+    route: PublicPluginRoute,
+    sender: mpsc::Sender<Option<PublicSubmissionResult>>,
+}
+
+#[derive(Default)]
+struct PublicSubmissionState {
+    by_token: HashMap<String, PendingPublicSubmission>,
+    token_by_request: HashMap<PluginRequestContext, String>,
+}
+
 #[derive(Default)]
 pub(crate) struct PublicPluginService {
     manager: OnceLock<Arc<PublicPluginManager>>,
+    submissions: Mutex<PublicSubmissionState>,
+    next_submission: AtomicU64,
 }
 
+pub(crate) struct PublicSubmission {
+    pub(crate) token: String,
+    pub(crate) receiver: mpsc::Receiver<Option<PublicSubmissionResult>>,
+    pub(crate) dispatch: Option<ScheduledPluginRequest>,
+}
 impl PublicPluginService {
     pub(crate) fn initialize(
         &self,
@@ -72,6 +98,210 @@ impl PublicPluginService {
             .ok_or(PublicPluginManagementError::Unavailable)
     }
 
+    pub(crate) fn schedule_main_result(
+        &self,
+        route: PublicPluginRoute,
+        ui_intent_epoch: u64,
+        control_value: String,
+        now: Instant,
+    ) -> Result<PublicSubmission, PublicPluginManagementError> {
+        if route.output_mode != PublicOutputMode::MainResult {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        let number = self
+            .next_submission
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let token = format!("public-submission-{number:016x}");
+        let (sender, receiver) = mpsc::channel();
+        self.lock_submissions()?.by_token.insert(
+            token.clone(),
+            PendingPublicSubmission {
+                route: route.clone(),
+                sender,
+            },
+        );
+        let outcome = self
+            .manager()?
+            .scheduler()
+            .enqueue(
+                PluginRequestCandidate {
+                    plugin_id: route.plugin_id.clone(),
+                    plugin_generation: route.generation,
+                    activation_mode: route.activation_mode,
+                    input: route.input.clone(),
+                    owner: PluginSubmissionOwner {
+                        ui_intent_epoch,
+                        control_value,
+                        submission_token: token.clone(),
+                    },
+                },
+                now,
+            )
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let dispatch = match outcome {
+            PluginScheduleOutcome::Dispatched(request) => {
+                self.bind_request(&token, &request.context)?;
+                Some(request)
+            }
+            PluginScheduleOutcome::Waiting {
+                expired,
+                replaced_submission_token,
+            } => {
+                self.settle_request(&expired, None);
+                if let Some(replaced) = replaced_submission_token {
+                    self.settle_submission(&replaced, None);
+                }
+                None
+            }
+        };
+        Ok(PublicSubmission {
+            token,
+            receiver,
+            dispatch,
+        })
+    }
+
+    pub(crate) fn dispatch(
+        &self,
+        app: &AppHandle,
+        request: &ScheduledPluginRequest,
+        theme: PluginInvocationTheme,
+        invoked_at: String,
+    ) -> Result<(), PublicPluginManagementError> {
+        let label = runtime_label(
+            &request.context.plugin_id,
+            request.context.plugin_generation,
+        )
+        .ok_or(PublicPluginManagementError::Unavailable)?;
+        let window = app
+            .get_webview_window(&label)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        window
+            .emit(
+                "uipilot-public-plugin-command",
+                PluginCommandDispatch {
+                    context: request.context.clone(),
+                    invocation: PluginInvocation {
+                        api_version: 1,
+                        request_id: request.context.request_id.clone(),
+                        input: request.candidate.input.clone(),
+                        context: PluginInvocationEnvironment {
+                            platform: PluginInvocationPlatform::Windows,
+                            theme,
+                            invoked_at,
+                        },
+                    },
+                },
+            )
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn complete_submission(
+        &self,
+        completion: &PluginCommandCompletion,
+        outcome: PluginCompletionOutcome,
+    ) -> Result<Option<ScheduledPluginRequest>, PluginRuntimeError> {
+        let token = self
+            .lock_submissions()
+            .map_err(|_| PluginRuntimeError::Unavailable)?
+            .token_by_request
+            .remove(&completion.context);
+        if let Some(token) = token {
+            let pending = self
+                .lock_submissions()
+                .map_err(|_| PluginRuntimeError::Unavailable)?
+                .by_token
+                .remove(&token);
+            if let Some(pending) = pending {
+                let result = if !outcome.accepted {
+                    None
+                } else if completion.failed {
+                    Some(Err(PluginRuntimeError::InvalidOperation))
+                } else {
+                    let result = completion
+                        .response
+                        .clone()
+                        .ok_or(PluginRuntimeError::InvalidOperation)
+                        .and_then(|value| parse_main_result_response(&completion.context, value))
+                        .and_then(|results| {
+                            if results.iter().any(|result| result.copy_text.is_some())
+                                && !self
+                                    .manager()
+                                    .map_err(|_| PluginRuntimeError::Unavailable)?
+                                    .can_copy_text(
+                                        &pending.route.plugin_id,
+                                        pending.route.generation,
+                                    )
+                            {
+                                Err(PluginRuntimeError::InvalidOperation)
+                            } else {
+                                Ok(results)
+                            }
+                        });
+                    Some(result)
+                };
+                let _ = pending.sender.send(result);
+            }
+        }
+        if let Some(next) = outcome.next.as_ref() {
+            self.bind_request(&next.candidate.owner.submission_token, &next.context)
+                .map_err(|_| PluginRuntimeError::Unavailable)?;
+        }
+        Ok(outcome.next)
+    }
+
+    pub(crate) fn fail_submission(&self, token: &str) {
+        self.settle_submission(token, Some(Err(PluginRuntimeError::Unavailable)));
+    }
+
+    fn bind_request(
+        &self,
+        token: &str,
+        context: &PluginRequestContext,
+    ) -> Result<(), PublicPluginManagementError> {
+        let mut submissions = self.lock_submissions()?;
+        if !submissions.by_token.contains_key(token) {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        submissions
+            .token_by_request
+            .insert(context.clone(), token.to_owned());
+        Ok(())
+    }
+
+    fn settle_request(
+        &self,
+        context: &PluginRequestContext,
+        result: Option<PublicSubmissionResult>,
+    ) {
+        let token = self
+            .lock_submissions()
+            .ok()
+            .and_then(|mut submissions| submissions.token_by_request.remove(context));
+        if let Some(token) = token {
+            self.settle_submission(&token, result);
+        }
+    }
+    fn settle_submission(&self, token: &str, result: Option<PublicSubmissionResult>) {
+        let pending = self
+            .lock_submissions()
+            .ok()
+            .and_then(|mut submissions| submissions.by_token.remove(token));
+        if let Some(pending) = pending {
+            let _ = pending.sender.send(result);
+        }
+    }
+
+    fn lock_submissions(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, PublicSubmissionState>, PublicPluginManagementError> {
+        self.submissions
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
     pub(crate) fn asset_response(&self, label: &str, path: &str) -> Response<Vec<u8>> {
         let Some(asset) = self
             .manager()
