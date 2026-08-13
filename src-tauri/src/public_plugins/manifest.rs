@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Number, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use super::{PublicPackageError, PublicPluginHost};
@@ -12,7 +13,7 @@ pub(crate) enum PublicPlatform {
     Macos,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) enum PublicPermission {
     #[serde(rename = "ui.window")]
     UiWindow,
@@ -118,13 +119,44 @@ pub(crate) enum PublicSettingV1 {
 }
 
 impl PublicSettingV1 {
-    fn key(&self) -> &str {
+    pub(super) fn key(&self) -> &str {
         match self {
             Self::Text { key, .. }
             | Self::Secret { key, .. }
             | Self::Number { key, .. }
             | Self::Boolean { key, .. }
             | Self::Select { key, .. } => key,
+        }
+    }
+
+    pub(super) fn is_secret(&self) -> bool {
+        matches!(self, Self::Secret { .. })
+    }
+
+    pub(super) fn default_value(&self) -> Option<Value> {
+        match self {
+            Self::Text { default, .. } | Self::Select { default, .. } => {
+                default.clone().map(Value::String)
+            }
+            Self::Number { default, .. } => default.and_then(Number::from_f64).map(Value::Number),
+            Self::Boolean { default, .. } => default.map(Value::Bool),
+            Self::Secret { .. } => None,
+        }
+    }
+
+    pub(super) fn accepts_value(&self, value: &Value) -> bool {
+        match self {
+            Self::Text { .. } => value.as_str().is_some_and(plain_text),
+            Self::Secret { .. } => false,
+            Self::Number { min, max, .. } => value.as_f64().is_some_and(|value| {
+                value.is_finite()
+                    && min.is_none_or(|min| value >= min)
+                    && max.is_none_or(|max| value <= max)
+            }),
+            Self::Boolean { .. } => value.is_boolean(),
+            Self::Select { options, .. } => value
+                .as_str()
+                .is_some_and(|value| options.iter().any(|option| option.value == value)),
         }
     }
 
@@ -289,7 +321,7 @@ fn validate_manifest(
     Ok(())
 }
 
-fn parse_canonical_version(value: &str) -> Option<[u32; 3]> {
+pub(super) fn parse_canonical_version(value: &str) -> Option<[u32; 3]> {
     let mut values = [0; 3];
     let mut parts = value.split('.');
     for value in &mut values {
@@ -302,7 +334,7 @@ fn parse_canonical_version(value: &str) -> Option<[u32; 3]> {
     parts.next().is_none().then_some(values)
 }
 
-fn valid_plugin_id(value: &str) -> bool {
+pub(super) fn valid_plugin_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .bytes()
@@ -317,7 +349,7 @@ fn valid_plugin_id(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphanumeric)
 }
 
-fn valid_command_name(value: &str) -> bool {
+pub(super) fn valid_command_name(value: &str) -> bool {
     (1..=32).contains(&value.len())
         && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
         && value
@@ -325,7 +357,11 @@ fn valid_command_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn valid_setting_key(value: &str) -> bool {
+pub(super) fn valid_storage_key(value: &str) -> bool {
+    !matches!(value, "__proto__" | "prototype" | "constructor")
+}
+
+pub(super) fn valid_setting_key(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
         && value.bytes().all(|byte| {
