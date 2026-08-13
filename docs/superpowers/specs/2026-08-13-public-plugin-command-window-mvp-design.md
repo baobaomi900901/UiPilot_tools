@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-13
-- 状态：Draft（六项 Important 已修订，等待复核）
+- 状态：Approved（六项 Important 已修订并通过独立复核，用户最终确认）
 - 产品阶段：公开插件平台第一阶段 MVP
 - 目标平台：Windows 11 x64；公开合同预留 macOS
 - 技术基线：Tauri 2、Rust、TypeScript、WebView2
