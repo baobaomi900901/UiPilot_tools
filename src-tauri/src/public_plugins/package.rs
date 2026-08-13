@@ -26,6 +26,27 @@ const MAX_COMPONENT_BYTES: usize = 100;
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 
+pub(super) fn load_existing(
+    package_root: &Path,
+    host: &PublicPluginHost,
+    expected_digest: &str,
+) -> Result<(PublicManifestV1, BTreeMap<String, PublicResource>), PublicPackageError> {
+    let snapshot = scan_snapshot(package_root)?;
+    if snapshot.digest != expected_digest {
+        return Err(PublicPackageError::InvalidPackage);
+    }
+    let manifest_bytes = fs::read(package_root.join("plugin.json"))
+        .map_err(|_| PublicPackageError::InvalidPackage)?;
+    let manifest = parse_manifest(&manifest_bytes, host)?;
+    validate_manifest_entries(&manifest, &snapshot.resources)?;
+    validate_css_references(package_root, &snapshot.resources)?;
+    Ok((manifest, snapshot.resources))
+}
+
+pub(super) fn remove_package_tree(path: PathBuf) {
+    remove_transaction(path);
+}
+
 pub(super) fn stage(
     source: PublicPackageSource,
     staging_root: &Path,

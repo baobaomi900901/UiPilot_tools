@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -28,6 +29,11 @@ use crate::{
     plugins::{
         PluginCopyError, PluginInventorySnapshot, PluginManagementError, PluginManager,
         PluginMutationOutcome, PluginQueryError, PluginQueryStart,
+    },
+    public_plugins::{
+        PluginApiRequest, PluginCommandCompletion, PluginRuntimeError, PublicPermission,
+        PublicPluginInstallSource, PublicPluginManagementError, PublicPluginMutation,
+        PublicPluginPrepareSummary, PublicPluginService,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -313,6 +319,54 @@ impl From<ReservationError> for CommandError {
     fn from(_: ReservationError) -> Self {
         Self::settings_failed()
     }
+}
+
+impl From<PublicPluginManagementError> for CommandError {
+    fn from(error: PublicPluginManagementError) -> Self {
+        Self {
+            code: error.code(),
+            message: "public plugin operation failed",
+        }
+    }
+}
+
+impl From<PluginRuntimeError> for CommandError {
+    fn from(error: PluginRuntimeError) -> Self {
+        let code = match error {
+            PluginRuntimeError::InvalidContext => "invalidContext",
+            PluginRuntimeError::ExpiredRequest => "expiredRequest",
+            PluginRuntimeError::InvalidCaller => "invalidCaller",
+            PluginRuntimeError::InvalidOperation => "invalidOperation",
+            PluginRuntimeError::Storage => "storageFailed",
+            PluginRuntimeError::Unavailable => "runtimeUnavailable",
+        };
+        Self {
+            code,
+            message: "public plugin runtime operation failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct CommitPublicPluginInstallInput {
+    token: String,
+    permission_grants: BTreeSet<PublicPermission>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct SavePublicPluginSettingsInput {
+    plugin_id: String,
+    settings: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    secrets: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginCommandCompletionResult {
+    accepted: bool,
 }
 
 fn require_main_label(label: &str) -> Result<(), CommandError> {
@@ -607,6 +661,161 @@ pub(crate) async fn delete_plugin(
 ) -> Result<PluginMutationOutcome, CommandError> {
     delete_plugin_with_label(window.label(), &coordinator, || {
         plugins.delete_plugin(&app, registries.main(), &plugin_id)
+    })
+}
+
+#[tauri::command]
+pub(crate) fn prepare_public_plugin_install(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    source: PublicPluginInstallSource,
+) -> Result<PublicPluginPrepareSummary, CommandError> {
+    require_main_window(&window)?;
+    Ok(service
+        .manager()?
+        .prepare(window.label(), source, Instant::now())?)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_public_plugin_install(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    token: String,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    Ok(service
+        .manager()?
+        .cancel(window.label(), &token, Instant::now())?)
+}
+
+#[tauri::command]
+pub(crate) fn commit_public_plugin_install(
+    window: WebviewWindow,
+    app: AppHandle,
+    service: State<'_, Arc<PublicPluginService>>,
+    input: CommitPublicPluginInstallInput,
+) -> Result<PublicPluginMutation, CommandError> {
+    require_main_window(&window)?;
+    let mut created_runtime = None;
+    let result = service.manager()?.commit_with_readiness(
+        window.label(),
+        &input.token,
+        input.permission_grants,
+        Instant::now(),
+        |candidate| match service.create_runtime(&app, candidate) {
+            Ok(_) => {
+                created_runtime = Some(candidate.label.clone());
+                true
+            }
+            Err(_) => false,
+        },
+    );
+    match result {
+        Ok(commit) => {
+            PublicPluginService::destroy_runtime(&app, commit.previous_runtime_label.as_deref());
+            Ok(commit.mutation)
+        }
+        Err(error) => {
+            PublicPluginService::destroy_runtime(&app, created_runtime.as_deref());
+            Err(error.into())
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn set_plugin_enabled(
+    window: WebviewWindow,
+    app: AppHandle,
+    service: State<'_, Arc<PublicPluginService>>,
+    plugin_id: String,
+    enabled: bool,
+) -> Result<PublicPluginMutation, CommandError> {
+    require_main_window(&window)?;
+    let mut created_runtime = None;
+    let result = service
+        .manager()?
+        .set_enabled_with_readiness(&plugin_id, enabled, |candidate| {
+            match service.create_runtime(&app, candidate) {
+                Ok(_) => {
+                    created_runtime = Some(candidate.label.clone());
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+    match result {
+        Ok(commit) => {
+            PublicPluginService::destroy_runtime(&app, commit.closed_runtime_label.as_deref());
+            Ok(commit.mutation)
+        }
+        Err(error) => {
+            PublicPluginService::destroy_runtime(&app, created_runtime.as_deref());
+            Err(error.into())
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn set_plugin_effective_name(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    plugin_id: String,
+    name_override: Option<String>,
+) -> Result<PublicPluginMutation, CommandError> {
+    require_main_window(&window)?;
+    Ok(service
+        .manager()?
+        .rename(&plugin_id, name_override.as_deref())?)
+}
+
+#[tauri::command]
+pub(crate) fn save_plugin_settings(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    input: SavePublicPluginSettingsInput,
+) -> Result<PublicPluginMutation, CommandError> {
+    require_main_window(&window)?;
+    let manager = service.manager()?;
+    for (key, value) in &input.secrets {
+        manager.save_secret(&input.plugin_id, key, value.as_deref())?;
+    }
+    Ok(manager.save_settings(&input.plugin_id, &input.settings)?)
+}
+
+#[tauri::command]
+pub(crate) fn uninstall_plugin(
+    window: WebviewWindow,
+    app: AppHandle,
+    service: State<'_, Arc<PublicPluginService>>,
+    plugin_id: String,
+    retain_data: bool,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let runtime_label = service.manager()?.uninstall(&plugin_id, retain_data)?;
+    PublicPluginService::destroy_runtime(&app, runtime_label.as_deref());
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_api_call(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    request: PluginApiRequest,
+) -> Result<serde_json::Value, CommandError> {
+    Ok(service.manager()?.execute_api(window.label(), request)?)
+}
+
+#[tauri::command]
+pub(crate) fn complete_plugin_command(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    completion: PluginCommandCompletion,
+) -> Result<PluginCommandCompletionResult, CommandError> {
+    let outcome = service
+        .manager()?
+        .complete(window.label(), &completion, Instant::now())?;
+    Ok(PluginCommandCompletionResult {
+        accepted: outcome.accepted,
     })
 }
 
@@ -1693,6 +1902,13 @@ mod tests {
             "save_hotkey",
             "set_file_preview_preference",
             "hide_launcher",
+            "prepare_public_plugin_install",
+            "commit_public_plugin_install",
+            "cancel_public_plugin_install",
+            "set_plugin_enabled",
+            "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
         ] {
             let trace = RefCell::new(Vec::new());
             let result = require_main_label("secondary").map(|()| {
@@ -1702,6 +1918,52 @@ mod tests {
             assert_eq!(result, Err(CommandError::invalid_caller()), "{command}");
             assert!(trace.borrow().is_empty(), "{command} touched state");
         }
+    }
+
+    #[test]
+    fn public_plugin_command_callers_are_guarded_by_exact_labels() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        for command in [
+            "prepare_public_plugin_install",
+            "commit_public_plugin_install",
+            "cancel_public_plugin_install",
+            "set_plugin_enabled",
+            "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
+        ] {
+            let marker = format!("pub(crate) fn {command}(");
+            let body = source
+                .split(&marker)
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .expect("public management command markers are missing");
+            let statements = body
+                .split_once("{\n")
+                .map(|(_, statements)| statements)
+                .expect("public management command body is missing");
+            let guard = statements
+                .find("require_main_window(&window)?;")
+                .expect("public management command must guard main caller");
+            let state_access = statements
+                .find("service")
+                .unwrap_or_else(|| panic!("{command} must reach public plugin service"));
+            assert!(guard < state_access, "{command} reaches state before guard");
+        }
+        let api = source
+            .split("pub(crate) fn plugin_api_call(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .unwrap();
+        assert!(api.contains("execute_api(window.label(), request)"));
+        assert!(!api.contains("starts_with(\"plugin-\")"));
+        let complete = source
+            .split("pub(crate) fn complete_plugin_command(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .unwrap();
+        assert!(complete.contains(".complete(window.label(), &completion, Instant::now())"));
+        assert!(!complete.contains("starts_with(\"plugin-\")"));
     }
 
     #[test]

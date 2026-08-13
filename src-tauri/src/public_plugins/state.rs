@@ -37,6 +37,8 @@ pub(crate) struct EffectivePluginConfig {
     pub(crate) fault: Option<PublicPluginFault>,
     pub(crate) permission_grants: BTreeSet<PublicPermission>,
     pub(crate) inventory_revision: u64,
+    pub(crate) active_generation: u64,
+    pub(crate) package_digest: Option<String>,
     pub(crate) settings: BTreeMap<String, Value>,
 }
 
@@ -80,6 +82,10 @@ struct PluginStateDocument {
     fault: Option<PublicPluginFault>,
     permission_grants: BTreeSet<PublicPermission>,
     inventory_revision: u64,
+    #[serde(default)]
+    active_generation: u64,
+    #[serde(default)]
+    package_digest: Option<String>,
     settings: BTreeMap<String, Value>,
 }
 
@@ -99,6 +105,8 @@ impl PluginStateDocument {
             fault: self.fault,
             permission_grants: self.permission_grants.clone(),
             inventory_revision: self.inventory_revision,
+            active_generation: self.active_generation,
+            package_digest: self.package_digest.clone(),
             settings: self.settings.clone(),
         }
     }
@@ -175,6 +183,30 @@ impl PluginStateStore {
         manifest: &PublicManifestV1,
         permission_grants: BTreeSet<PublicPermission>,
     ) -> Result<EffectivePluginConfig, PluginStateError> {
+        let generation = self
+            .config(&manifest.plugin_id)?
+            .map_or(Some(1), |config| config.active_generation.checked_add(1))
+            .ok_or(PluginStateError::RevisionExhausted)?;
+        self.activate(manifest, permission_grants, generation, None)
+    }
+
+    pub(crate) fn activate(
+        &self,
+        manifest: &PublicManifestV1,
+        permission_grants: BTreeSet<PublicPermission>,
+        generation: u64,
+        package_digest: Option<String>,
+    ) -> Result<EffectivePluginConfig, PluginStateError> {
+        if generation == 0
+            || package_digest.as_deref().is_some_and(|digest| {
+                digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(PluginStateError::InvalidPlugin);
+        }
         let declared = manifest
             .permissions
             .iter()
@@ -185,6 +217,9 @@ impl PluginStateStore {
         }
         let mut state = self.lock()?;
         let previous = state.by_plugin.get(&manifest.plugin_id);
+        if previous.is_some_and(|stored| generation <= stored.document.active_generation) {
+            return Err(PluginStateError::InvalidPlugin);
+        }
         let override_name = previous.and_then(|stored| stored.document.name_override.clone());
         let effective_name = override_name
             .as_deref()
@@ -211,6 +246,8 @@ impl PluginStateStore {
             fault,
             permission_grants,
             inventory_revision: revision,
+            active_generation: generation,
+            package_digest,
             settings,
         };
         self.persist_revision(revision)?;
@@ -339,6 +376,15 @@ impl PluginStateStore {
             document.enabled = false;
             document.fault = Some(fault);
         })
+    }
+
+    pub(crate) fn configs(&self) -> Result<Vec<EffectivePluginConfig>, PluginStateError> {
+        Ok(self
+            .lock()?
+            .by_plugin
+            .values()
+            .map(|stored| stored.document.view())
+            .collect())
     }
 
     pub(crate) fn config(
@@ -525,6 +571,14 @@ fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> 
             .name_override
             .as_deref()
             .is_none_or(valid_command_name)
+        && (document.package_digest.is_none()
+            || (document.active_generation != 0
+                && document.package_digest.as_deref().is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })))
         && document
             .settings
             .iter()

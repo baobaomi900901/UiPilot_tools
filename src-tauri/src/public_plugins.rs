@@ -1,5 +1,8 @@
+mod activation;
 mod manifest;
 mod package;
+mod runtime;
+mod scheduler;
 mod secrets;
 mod state;
 mod storage;
@@ -10,14 +13,153 @@ mod tests;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    time::Duration,
 };
 
-pub(crate) use manifest::{PublicManifestV1, PublicPlatform};
-pub(crate) use secrets::{PluginSecretError, PluginSecretStore};
+use tauri::{
+    http::Response,
+    webview::{NewWindowResponse, WebviewWindow},
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
+};
+
+pub(crate) use activation::{
+    PublicPluginInstallSource, PublicPluginManagementError, PublicPluginManager,
+    PublicPluginMutation, PublicPluginPrepareSummary, PublicRuntimeCandidate,
+};
+#[cfg(test)]
+pub(crate) use manifest::PublicActivationMode;
+pub(crate) use manifest::{PublicManifestV1, PublicPermission, PublicPlatform};
+pub(crate) use runtime::{
+    parse_runtime_label, runtime_label, PluginApiRequest, PluginCommandCompletion,
+    PluginRuntimeApi, PluginRuntimeError, PUBLIC_RUNTIME_BOOTSTRAP,
+};
+pub(crate) use scheduler::{
+    PluginCompletionOutcome, PluginContextStatus, PluginRequestContext, PluginRequestScheduler,
+};
+pub(crate) use secrets::PluginSecretStore;
 pub(crate) use state::{
     EffectivePluginConfig, PluginStateError, PluginStateStore, PublicPluginFault,
 };
-pub(crate) use storage::{PluginStorageError, PluginStorageStore};
+pub(crate) use storage::PluginStorageStore;
+const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+pub(crate) struct PublicPluginService {
+    manager: OnceLock<Arc<PublicPluginManager>>,
+}
+
+impl PublicPluginService {
+    pub(crate) fn initialize(
+        &self,
+        app_data_dir: &Path,
+        reserved_names: impl IntoIterator<Item = String>,
+    ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
+        let manager = Arc::new(PublicPluginManager::load(
+            app_data_dir,
+            PublicPluginHost::current(PublicPlatform::Windows),
+            reserved_names,
+        )?);
+        self.manager
+            .set(Arc::clone(&manager))
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        Ok(manager)
+    }
+
+    pub(crate) fn manager(&self) -> Result<&Arc<PublicPluginManager>, PublicPluginManagementError> {
+        self.manager
+            .get()
+            .ok_or(PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn asset_response(&self, label: &str, path: &str) -> Response<Vec<u8>> {
+        let Some(asset) = self
+            .manager()
+            .ok()
+            .and_then(|manager| manager.asset(label, path))
+        else {
+            return Response::builder().status(403).body(Vec::new()).unwrap();
+        };
+        Response::builder()
+            .status(200)
+            .header("content-type", asset.mime)
+            .header("x-content-type-options", "nosniff")
+            .body(asset.bytes)
+            .unwrap()
+    }
+
+    pub(crate) fn create_runtime(
+        &self,
+        app: &AppHandle,
+        candidate: &PublicRuntimeCandidate,
+    ) -> Result<WebviewWindow, PublicPluginManagementError> {
+        let url = tauri::Url::parse("uipilot-public-plugin://localhost/__uipilot_runtime.html")
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let ready = Arc::new((Mutex::new(None), Condvar::new()));
+        let title_ready = Arc::clone(&ready);
+        let window = WebviewWindowBuilder::new(
+            app,
+            candidate.label.clone(),
+            WebviewUrl::CustomProtocol(url),
+        )
+        .visible(false)
+        .focusable(false)
+        .skip_taskbar(true)
+        .incognito(true)
+        .initialization_script(PUBLIC_RUNTIME_BOOTSTRAP)
+        .on_navigation(public_runtime_navigation_allowed)
+        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .on_download(|_, _| false)
+        .on_document_title_changed(move |_, title| {
+            let settled = match title.as_str() {
+                "uipilot-public-plugin-ready" => Some(true),
+                "uipilot-public-plugin-failed" => Some(false),
+                _ => None,
+            };
+            if let Some(settled) = settled {
+                if let Ok(mut state) = title_ready.0.lock() {
+                    *state = Some(settled);
+                    title_ready.1.notify_all();
+                }
+            }
+        })
+        .build()
+        .map_err(|_| PublicPluginManagementError::RuntimeNotReady)?;
+        let settled = ready
+            .1
+            .wait_timeout_while(
+                ready
+                    .0
+                    .lock()
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?,
+                PUBLIC_RUNTIME_READY_TIMEOUT,
+                |state| state.is_none(),
+            )
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+            .0;
+        if *settled == Some(true) {
+            Ok(window)
+        } else {
+            let _ = window.destroy();
+            Err(PublicPluginManagementError::RuntimeNotReady)
+        }
+    }
+
+    pub(crate) fn destroy_runtime(app: &AppHandle, label: Option<&str>) {
+        if let Some(window) = label.and_then(|label| app.get_webview_window(label)) {
+            let _ = window.destroy();
+        }
+    }
+}
+
+fn public_runtime_navigation_allowed(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "uipilot-public-plugin" | "http")
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case("uipilot-public-plugin.localhost")
+        })
+        && url.port().is_none()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginDataScope {
@@ -132,12 +274,26 @@ impl PreparedPublicPlugin {
         package::revalidate_snapshot(&self.package_root, &self.digest, &self.resources)
     }
 
-    pub(crate) fn disarm_cleanup(mut self) -> Result<PathBuf, PublicPackageError> {
+    pub(crate) fn persist(mut self, destination: &Path) -> Result<bool, PublicPackageError> {
         self.revalidate()?;
-        Ok(self
+        if destination.exists() {
+            package::revalidate_snapshot(destination, &self.digest, &self.resources)?;
+            return Ok(false);
+        }
+        let parent = destination
+            .parent()
+            .ok_or(PublicPackageError::InvalidPackage)?;
+        std::fs::create_dir_all(parent).map_err(|_| PublicPackageError::InvalidPackage)?;
+        let transaction_root = self
             .transaction_root
             .take()
-            .expect("prepared transaction root missing"))
+            .expect("prepared transaction root missing");
+        if std::fs::rename(&self.package_root, destination).is_err() {
+            package::remove_transaction(transaction_root);
+            return Err(PublicPackageError::InvalidPackage);
+        }
+        package::remove_transaction(transaction_root);
+        Ok(true)
     }
 }
 

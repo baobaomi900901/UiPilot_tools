@@ -77,10 +77,21 @@ fn setup_production_lifecycle(
     app_cache: &Arc<apps::AppCache>,
     coordinator: &Arc<lifecycle::LifecycleCoordinator>,
     plugin_manager: &Arc<PluginManager>,
+    public_plugin_service: &Arc<public_plugins::PublicPluginService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
     plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
     plugin_manager.create_runtimes(app, &app_data_dir)?;
+    let public_plugin_manager =
+        public_plugin_service.initialize(&app_data_dir, ["find".into(), "math".into()])?;
+    for candidate in public_plugin_manager.runtime_candidates()? {
+        if public_plugin_service
+            .create_runtime(app.handle(), &candidate)
+            .is_err()
+        {
+            public_plugin_manager.mark_runtime_unavailable(&candidate.plugin_id)?;
+        }
+    }
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -232,6 +243,9 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let plugin_manager = Arc::new(PluginManager::new());
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());
+
     let builder = tauri::Builder::default();
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -263,6 +277,13 @@ pub fn run() {
         .manage(Arc::clone(&file_index))
         .manage(everything_search)
         .manage(Arc::clone(&plugin_manager))
+        .register_uri_scheme_protocol("uipilot-public-plugin", {
+            let public_plugin_service = Arc::clone(&public_plugin_service);
+            move |ctx, request| {
+                public_plugin_service.asset_response(ctx.webview_label(), request.uri().path())
+            }
+        })
+        .manage(Arc::clone(&public_plugin_service))
         .register_uri_scheme_protocol("uipilot-plugin", {
             let plugin_manager = Arc::clone(&plugin_manager);
             move |ctx, request| {
@@ -279,6 +300,15 @@ pub fn run() {
             commands::set_find_pinned,
             commands::set_find_preview_preference,
             commands::hide_find_window,
+            commands::prepare_public_plugin_install,
+            commands::commit_public_plugin_install,
+            commands::cancel_public_plugin_install,
+            commands::set_plugin_enabled,
+            commands::set_plugin_effective_name,
+            commands::save_plugin_settings,
+            commands::uninstall_plugin,
+            commands::plugin_api_call,
+            commands::complete_plugin_command,
             commands::search_apps,
             commands::publish_plugin_results,
             commands::search_files,
@@ -313,7 +343,13 @@ pub fn run() {
             security_probe::setup(_app)?;
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
-            setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;
+            setup_production_lifecycle(
+                _app,
+                &app_cache,
+                &coordinator,
+                &plugin_manager,
+                &public_plugin_service,
+            )?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -496,7 +532,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 21);
+        assert_eq!(production.matches("commands::").count(), 30);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -505,6 +541,15 @@ mod tests {
             "set_find_pinned",
             "set_find_preview_preference",
             "hide_find_window",
+            "prepare_public_plugin_install",
+            "commit_public_plugin_install",
+            "cancel_public_plugin_install",
+            "set_plugin_enabled",
+            "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
+            "plugin_api_call",
+            "complete_plugin_command",
             "search_apps",
             "publish_plugin_results",
             "search_files",
@@ -576,6 +621,37 @@ mod tests {
     }
 
     #[test]
+    fn public_plugin_commands_have_non_overlapping_exact_capabilities() {
+        let build = include_str!("../build.rs");
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        for command in [
+            "prepare_public_plugin_install",
+            "commit_public_plugin_install",
+            "cancel_public_plugin_install",
+            "set_plugin_enabled",
+            "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
+        ] {
+            assert!(build.contains(&format!("\"{command}\",")));
+            let permission = format!("\"allow-{}\"", command.replace('_', "-"));
+            assert!(main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+        }
+        for command in ["plugin_api_call", "complete_plugin_command"] {
+            assert!(build.contains(&format!("\"{command}\",")));
+            let permission = format!("\"allow-{}\"", command.replace('_', "-"));
+            assert!(runtime.contains(&permission));
+            assert!(!main.contains(&permission));
+        }
+        assert!(runtime.contains("\"windows\": [\"plugin-runtime-*\"]"));
+        assert!(!runtime.contains("\"plugin-*\""));
+        assert!(!runtime.contains("plugin-shell-"));
+        assert!(!runtime.contains("plugin-content-"));
+    }
+
+    #[test]
     fn production_lifecycle_wires_one_coordinator_and_exact_event_sources() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let production = source
@@ -601,7 +677,12 @@ mod tests {
             "move |app, _args, _cwd|",
             "tauri_plugin_global_shortcut::Builder::new()",
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
-            "setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;",
+            "setup_production_lifecycle(",
+            "&public_plugin_service,",
+            "let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());",
+            "public_plugin_service.initialize(",
+            ".register_uri_scheme_protocol(\"uipilot-public-plugin\"",
+            ".manage(Arc::clone(&public_plugin_service))",
             "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
             "plugin_manager.create_runtimes(app, &app_data_dir)?;",
             "lifecycle::install_session_end_hook",
@@ -920,11 +1001,20 @@ mod tests {
     #[test]
     fn plugin_runtime_capability_is_narrow() {
         let capability = include_str!("../capabilities/plugin-runtime.json");
-        assert!(capability.contains("\"windows\": [\"plugin-*\"]"));
-        assert!(capability.contains("\"allow-publish-plugin-results\""));
+        assert!(capability.contains("\"windows\": [\"plugin-runtime-*\"]"));
+        assert!(capability.contains("\"allow-plugin-api-call\""));
+        assert!(capability.contains("\"allow-complete-plugin-command\""));
         assert!(capability.contains("\"core:event:allow-listen\""));
         assert!(capability.contains("\"core:event:allow-unlisten\""));
-        for forbidden in ["\"*\"", "clipboard", "allow-search-apps", "main"] {
+        for forbidden in [
+            "\"*\"",
+            "clipboard",
+            "allow-search-apps",
+            "allow-publish-plugin-results",
+            "plugin-shell-",
+            "plugin-content-",
+            "main",
+        ] {
             assert!(!capability.contains(forbidden));
         }
     }

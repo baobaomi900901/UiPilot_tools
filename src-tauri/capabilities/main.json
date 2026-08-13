@@ -5,6 +5,13 @@
   "windows": ["main"],
   "permissions": [
     "allow-open-find-window",
+    "allow-prepare-public-plugin-install",
+    "allow-commit-public-plugin-install",
+    "allow-cancel-public-plugin-install",
+    "allow-set-plugin-enabled",
+    "allow-set-plugin-effective-name",
+    "allow-save-plugin-settings",
+    "allow-uninstall-plugin",
     "allow-search-apps",
     "allow-execute-result",
     "allow-list-plugins",
