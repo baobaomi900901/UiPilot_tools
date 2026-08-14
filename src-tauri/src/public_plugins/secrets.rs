@@ -8,11 +8,12 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::{LocalFree, HLOCAL},
-        Security::Cryptography::{
-            CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-        },
+        Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
     },
 };
+
+#[cfg(test)]
+use windows::Win32::Security::Cryptography::CryptUnprotectData;
 
 use crate::atomic_file::replace_current;
 
@@ -192,6 +193,7 @@ fn protect(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, PluginSecretErro
     take_output(output)
 }
 
+#[cfg(test)]
 fn unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, PluginSecretError> {
     let input = blob(ciphertext)?;
     let entropy = blob(entropy)?;

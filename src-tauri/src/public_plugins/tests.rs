@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{
-    manifest::PublicOutputMode, stage_public_package, PublicPackageError, PublicPackageSource,
-    PublicPlatform, PublicPluginHost,
+    manifest::PublicOutputMode, package, stage_public_package, PublicPackageError,
+    PublicPackageSource, PublicPlatform, PublicPluginHost,
 };
 use crate::plugins::{PluginCatalog, Version};
 
@@ -76,9 +76,7 @@ fn accepts_archive_and_directory_packages() {
         assert_eq!(prepared.revalidate(), Ok(()));
         if archive {
             let runtime = prepared.package_root.join("dist/runtime.js");
-            let mut permissions = fs::metadata(&runtime).unwrap().permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(&runtime, permissions).unwrap();
+            package::make_file_writable(&runtime);
             fs::write(&runtime, "tampered").unwrap();
             assert_eq!(
                 prepared.revalidate(),
@@ -301,4 +299,63 @@ fn write_archive(destination: &Path, entries: &[(&str, &[u8])]) {
         archive.write_all(bytes).unwrap();
     }
     archive.finish().unwrap();
+}
+#[test]
+fn repository_demo_stages_as_an_independently_removable_public_plugin() {
+    let root = TestRoot::new("repository-demo");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("examples/public-plugins/com.uipilot.demo/package");
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo");
+    assert_eq!(prepared.manifest.command.default_name, "demo");
+    assert_eq!(
+        prepared.manifest.command.output_mode,
+        PublicOutputMode::Window
+    );
+    assert!(prepared.manifest.window.is_some());
+    assert_eq!(prepared.resources.len(), 5);
+
+    for production in [
+        include_str!("../commands.rs"),
+        include_str!("../public_plugins.rs"),
+        include_str!("../../../src/launcher-core.ts"),
+    ] {
+        assert!(!production.contains("/demo"));
+    }
+}
+#[cfg(windows)]
+#[test]
+fn demo_packaging_script_writes_an_installable_archive() {
+    let root = TestRoot::new("demo-package-script");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let output = root.0.join("com.uipilot.demo.uipilot-plugin");
+    let status = std::process::Command::new("powershell.exe")
+        .current_dir(workspace)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "scripts/package-demo-plugin.ps1",
+            "-OutputPath",
+        ])
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let prepared = stage_public_package(
+        PublicPackageSource::Archive(output),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo");
+    assert_eq!(prepared.resources.len(), 5);
 }

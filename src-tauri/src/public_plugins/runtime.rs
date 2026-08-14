@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -348,8 +348,6 @@ pub(crate) struct PluginCommandCompletion {
     #[serde(default)]
     pub(crate) failed: bool,
 }
-
-pub(crate) type PluginManifestMap = BTreeMap<String, PublicManifestV1>;
 
 #[cfg(test)]
 mod tests {

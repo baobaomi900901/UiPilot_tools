@@ -249,7 +249,7 @@ fn label_component(plugin_id: &str) -> Option<String> {
 }
 
 fn decode_label_component(value: &str) -> Option<String> {
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes = (0..value.len())

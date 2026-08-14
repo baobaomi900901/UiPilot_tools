@@ -1,0 +1,361 @@
+{
+  "$defs": {
+    "PublicActivationMode": {
+      "enum": [
+        "live",
+        "submit"
+      ],
+      "type": "string"
+    },
+    "PublicCommandV1": {
+      "additionalProperties": false,
+      "properties": {
+        "activationMode": {
+          "$ref": "#/$defs/PublicActivationMode"
+        },
+        "defaultName": {
+          "type": "string"
+        },
+        "inputPlaceholder": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inputRequired": {
+          "type": "boolean"
+        },
+        "outputMode": {
+          "$ref": "#/$defs/PublicOutputMode"
+        }
+      },
+      "required": [
+        "defaultName",
+        "activationMode",
+        "outputMode",
+        "inputRequired"
+      ],
+      "type": "object"
+    },
+    "PublicOutputMode": {
+      "enum": [
+        "mainResult",
+        "window"
+      ],
+      "type": "string"
+    },
+    "PublicPermission": {
+      "enum": [
+        "ui.window",
+        "clipboard.write",
+        "clipboard.read",
+        "network.https",
+        "files.userSelected",
+        "files.index.readAll",
+        "notifications.publish",
+        "background.schedule"
+      ],
+      "type": "string"
+    },
+    "PublicPlatform": {
+      "enum": [
+        "windows",
+        "macos"
+      ],
+      "type": "string"
+    },
+    "PublicRuntimeV1": {
+      "additionalProperties": false,
+      "properties": {
+        "entry": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry"
+      ],
+      "type": "object"
+    },
+    "PublicSelectOptionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ],
+      "type": "object"
+    },
+    "PublicSettingV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "key": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "const": "secret",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "key": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "max": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "min": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "step": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "number",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "key": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "const": "boolean",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "key": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "options": {
+              "items": {
+                "$ref": "#/$defs/PublicSelectOptionV1"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "select",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "label",
+            "options"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PublicWindowV1": {
+      "additionalProperties": false,
+      "properties": {
+        "entry": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "command": {
+      "$ref": "#/$defs/PublicCommandV1"
+    },
+    "description": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "minimumHostVersion": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "permissions": {
+      "items": {
+        "$ref": "#/$defs/PublicPermission"
+      },
+      "type": "array"
+    },
+    "pluginId": {
+      "type": "string"
+    },
+    "runtime": {
+      "$ref": "#/$defs/PublicRuntimeV1"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "settings": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/PublicSettingV1"
+      },
+      "type": "array"
+    },
+    "supportedPlatforms": {
+      "items": {
+        "$ref": "#/$defs/PublicPlatform"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    },
+    "window": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PublicWindowV1"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "pluginId",
+    "version",
+    "apiVersion",
+    "minimumHostVersion",
+    "name",
+    "supportedPlatforms",
+    "command",
+    "runtime",
+    "permissions"
+  ],
+  "title": "PublicManifestV1",
+  "type": "object"
+}

@@ -24,6 +24,7 @@ tauri-build = { version = "2.6.3", features = [] }
 everything-ipc = { package = "everything-ipc-spike", path = "../spikes/everything-ipc" }
 icu_casemap = { version = "=1.5.1", default-features = false, features = ["compiled_data"] }
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
+schemars = "=1.2.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "=0.10.9"

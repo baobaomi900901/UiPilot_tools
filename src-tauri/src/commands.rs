@@ -845,11 +845,12 @@ pub(crate) fn complete_plugin_command(
     settings: State<'_, SettingsStore>,
     completion: PluginCommandCompletion,
 ) -> Result<PluginCommandCompletionResult, CommandError> {
+    let now = Instant::now();
     let outcome = service
         .manager()?
-        .complete(window.label(), &completion, Instant::now())?;
+        .complete(window.label(), &completion, now)?;
     let accepted = outcome.accepted;
-    if let Some(next) = service.complete_submission(&completion, outcome)? {
+    if let Some(next) = service.complete_submission(&app, &completion, outcome, now)? {
         service.dispatch(
             &app,
             &next,
@@ -1050,14 +1051,14 @@ pub(crate) async fn search_apps(
     ))
 }
 
-fn invocation_theme(preference: ThemePreference) -> PluginInvocationTheme {
+pub(crate) fn invocation_theme(preference: ThemePreference) -> PluginInvocationTheme {
     match preference {
         ThemePreference::Dark => PluginInvocationTheme::Dark,
         ThemePreference::System | ThemePreference::Light => PluginInvocationTheme::Light,
     }
 }
 
-fn invoked_at_rfc3339() -> String {
+pub(crate) fn invoked_at_rfc3339() -> String {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     now.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
@@ -2253,7 +2254,9 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("\n#[tauri::command]").next())
             .unwrap();
-        assert!(complete.contains(".complete(window.label(), &completion, Instant::now())"));
+        assert!(complete.contains("let now = Instant::now();"));
+        assert!(complete.contains(".complete(window.label(), &completion, now)"));
+        assert!(complete.contains("complete_submission(&app, &completion, outcome, now)"));
         assert!(!complete.contains("starts_with(\"plugin-\")"));
     }
 

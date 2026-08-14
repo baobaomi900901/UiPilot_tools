@@ -178,6 +178,7 @@ impl PluginStateStore {
         Ok(store)
     }
 
+    #[cfg(test)]
     pub(crate) fn install_or_upgrade(
         &self,
         manifest: &PublicManifestV1,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -23,6 +23,8 @@ use super::{
 
 const PREPARE_TTL: Duration = Duration::from_secs(5 * 60);
 const RUNTIME_HOST_PATH: &str = "__uipilot_runtime.html";
+const RUNTIME_FAULT_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RUNTIME_FAULT_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
@@ -223,7 +225,6 @@ struct RuntimeResource {
 struct RuntimeSnapshot {
     manifest: PublicManifestV1,
     digest: String,
-    package_root: PathBuf,
     generation: u64,
     label: String,
     resources: BTreeMap<String, RuntimeResource>,
@@ -240,6 +241,25 @@ impl RuntimeSnapshot {
     }
 }
 
+#[derive(Default)]
+struct RuntimeFaultWindow {
+    recent: VecDeque<Instant>,
+}
+
+impl RuntimeFaultWindow {
+    fn record(&mut self, now: Instant) -> bool {
+        self.recent.retain(|fault| {
+            now.checked_duration_since(*fault)
+                .is_some_and(|age| age <= RUNTIME_FAULT_WINDOW)
+        });
+        self.recent.push_back(now);
+        self.recent.len() >= RUNTIME_FAULT_LIMIT
+    }
+
+    fn clear(&mut self) {
+        self.recent.clear();
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicRuntimeAsset {
     pub(crate) mime: &'static str,
@@ -270,6 +290,7 @@ pub(crate) struct PublicPluginManager {
     api: PluginRuntimeApi,
     mutation: Mutex<()>,
     data: Mutex<ActivationData>,
+    runtime_faults: Mutex<HashMap<String, RuntimeFaultWindow>>,
     next_token: AtomicU64,
 }
 
@@ -340,6 +361,7 @@ impl PublicPluginManager {
                 active_by_plugin,
                 ..ActivationData::default()
             }),
+            runtime_faults: Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(1),
         })
     }
@@ -532,6 +554,7 @@ impl PublicPluginManager {
             data.active_by_plugin
                 .insert(runtime.plugin_id.clone(), staged);
         }
+        self.clear_runtime_faults(&runtime.plugin_id)?;
         Ok(PublicActivationCommit {
             mutation: mutation_from_config(&config),
             runtime,
@@ -610,6 +633,7 @@ impl PublicPluginManager {
         }
         self.unstage(&runtime.label);
         let config = self.state.set_enabled(plugin_id, true)?;
+        self.clear_runtime_faults(plugin_id)?;
         Ok(PublicEnabledCommit {
             mutation: mutation_from_config(&config),
             runtime: Some(runtime),
@@ -678,6 +702,7 @@ impl PublicPluginManager {
         retain_data: bool,
     ) -> Result<Option<String>, PublicPluginManagementError> {
         let _mutation = self.lock_mutation()?;
+        self.clear_runtime_faults(plugin_id)?;
         self.state.uninstall(plugin_id, retain_data)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
@@ -951,10 +976,89 @@ impl PublicPluginManager {
         &self.scheduler
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &Arc<PluginStateStore> {
         &self.state
     }
 
+    pub(crate) fn replace_runtime_generation(
+        &self,
+        plugin_id: &str,
+        previous_generation: u64,
+        new_generation: u64,
+    ) -> Result<PublicRuntimeCandidate, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        let config = self
+            .state
+            .config(plugin_id)?
+            .filter(|config| {
+                config.installed
+                    && config.enabled
+                    && config.fault.is_none()
+                    && config.active_generation == previous_generation
+            })
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let mut data = self.lock_data()?;
+        let current = data
+            .active_by_plugin
+            .get(plugin_id)
+            .filter(|snapshot| snapshot.generation == previous_generation)
+            .cloned()
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let mut replacement = (*current).clone();
+        replacement.generation = new_generation;
+        replacement.label = runtime_label(plugin_id, new_generation)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        self.state.activate(
+            &replacement.manifest,
+            config.permission_grants,
+            new_generation,
+            Some(replacement.digest.clone()),
+        )?;
+        let replacement = Arc::new(replacement);
+        let candidate = replacement.candidate();
+        data.active_by_plugin.insert(plugin_id.into(), replacement);
+        Ok(candidate)
+    }
+
+    pub(crate) fn record_runtime_result(
+        &self,
+        plugin_id: &str,
+        success: bool,
+        now: Instant,
+    ) -> Result<bool, PublicPluginManagementError> {
+        let disable = {
+            let mut faults = self
+                .runtime_faults
+                .lock()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let window = faults.entry(plugin_id.into()).or_default();
+            if success {
+                window.clear();
+                false
+            } else {
+                window.record(now)
+            }
+        };
+        if !disable {
+            return Ok(false);
+        }
+        let _mutation = self.lock_mutation()?;
+        self.state
+            .disable_for_fault(plugin_id, PublicPluginFault::RuntimeUnavailable)?;
+        self.scheduler
+            .invalidate_plugin(plugin_id, None)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        Ok(true)
+    }
+
+    fn clear_runtime_faults(&self, plugin_id: &str) -> Result<(), PublicPluginManagementError> {
+        self.runtime_faults
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+            .remove(plugin_id);
+        Ok(())
+    }
     pub(crate) fn mark_runtime_unavailable(
         &self,
         plugin_id: &str,
@@ -1086,7 +1190,6 @@ fn snapshot_from_parts(
     Ok(RuntimeSnapshot {
         manifest,
         digest,
-        package_root: package_root.to_path_buf(),
         generation,
         label,
         resources: loaded,
@@ -1626,5 +1729,82 @@ mod tests {
             json!({ "requestId": "public-request-1", "data": "x".repeat(65_536) })
         )
         .is_err());
+    }
+
+    #[test]
+    fn runtime_fault_window_disables_on_third_recent_fault_and_success_resets() {
+        let start = Instant::now();
+        let mut faults = RuntimeFaultWindow::default();
+        assert!(!faults.record(start));
+        assert!(!faults.record(start + Duration::from_secs(30)));
+        assert!(faults.record(start + Duration::from_secs(60)));
+
+        faults.clear();
+        assert!(!faults.record(start + Duration::from_secs(90)));
+        assert!(!faults.record(start + Duration::from_secs(7 * 60)));
+        assert!(!faults.record(start + Duration::from_secs(7 * 60 + 1)));
+    }
+    #[test]
+    fn runtime_replacement_updates_route_and_third_fault_persistently_disables() {
+        let dir = TestDir::new("runtime-replacement-faults");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let committed = manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        assert_eq!(committed.runtime.generation, 1);
+
+        let replacement = manager
+            .replace_runtime_generation("com.example.activation", 1, 2)
+            .unwrap();
+        assert_eq!(replacement.generation, 2);
+        assert_eq!(manager.route("/activation").unwrap().unwrap().generation, 2);
+        assert_eq!(
+            manager
+                .state()
+                .config("com.example.activation")
+                .unwrap()
+                .unwrap()
+                .active_generation,
+            2
+        );
+
+        assert!(!manager
+            .record_runtime_result("com.example.activation", false, now)
+            .unwrap());
+        assert!(!manager
+            .record_runtime_result(
+                "com.example.activation",
+                false,
+                now + Duration::from_secs(10),
+            )
+            .unwrap());
+        assert!(manager
+            .record_runtime_result(
+                "com.example.activation",
+                false,
+                now + Duration::from_secs(20),
+            )
+            .unwrap());
+        let disabled = manager
+            .state()
+            .config("com.example.activation")
+            .unwrap()
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.fault, Some(PublicPluginFault::RuntimeUnavailable));
+
+        manager
+            .set_enabled_with_readiness("com.example.activation", true, |_| true)
+            .unwrap();
+        assert!(!manager
+            .record_runtime_result(
+                "com.example.activation",
+                false,
+                now + Duration::from_secs(30),
+            )
+            .unwrap());
     }
 }

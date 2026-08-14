@@ -578,4 +578,59 @@ mod tests {
         assert_eq!(b.context.plugin_generation, 8);
         assert_eq!(b.dispatched_at, start + Duration::from_secs(6));
     }
+
+    #[test]
+    fn one_plugin_timeout_rebuild_does_not_block_another_plugin() {
+        let scheduler = PluginRequestScheduler::default();
+        let start = Instant::now();
+        let candidate = |plugin_id: &str, value: &str, generation: u64| PluginRequestCandidate {
+            plugin_id: plugin_id.into(),
+            plugin_generation: generation,
+            activation_mode: PublicActivationMode::Live,
+            input: value.into(),
+            owner: owner(value),
+        };
+        let failed = match scheduler
+            .enqueue(candidate("com.example.failed", "A", 1), start)
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("failed plugin must dispatch"),
+        };
+        scheduler
+            .enqueue(candidate("com.example.failed", "latest", 1), start)
+            .unwrap();
+        let healthy = match scheduler
+            .enqueue(
+                candidate("com.example.healthy", "ready", 4),
+                start + Duration::from_secs(1),
+            )
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("healthy plugin must dispatch"),
+        };
+
+        let replacements = scheduler.expire_timeouts(start + LIVE_TIMEOUT).unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].plugin_id, "com.example.failed");
+        assert_eq!(replacements[0].expired, failed.context);
+        assert_eq!(
+            scheduler.context_status(&healthy.context),
+            PluginContextStatus::Current
+        );
+        assert!(
+            scheduler
+                .complete(&healthy.context, start + LIVE_TIMEOUT)
+                .unwrap()
+                .accepted
+        );
+
+        let latest = scheduler
+            .runtime_replaced("com.example.failed", 2, start + LIVE_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.candidate.input, "latest");
+        assert_eq!(latest.context.plugin_generation, 2);
+    }
 }

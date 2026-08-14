@@ -557,12 +557,47 @@ fn make_tree_writable(path: &Path) {
             }
         }
     } else if metadata.is_file() && !is_reparse_point(&metadata) {
-        let mut permissions = metadata.permissions();
-        permissions.set_readonly(false);
-        let _ = fs::set_permissions(path, permissions);
+        make_file_writable(path);
     }
 }
 
+pub(super) fn make_file_writable(path: &Path) {
+    #[cfg(unix)]
+    if let Ok(metadata) = fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o200);
+        let _ = fs::set_permissions(path, permissions);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            core::PCWSTR,
+            Win32::Storage::FileSystem::{
+                GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+                FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
+            },
+        };
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let path = PCWSTR(wide.as_ptr());
+        let attributes = unsafe { GetFileAttributesW(path) };
+        if attributes != INVALID_FILE_ATTRIBUTES {
+            let _ = unsafe {
+                SetFileAttributesW(
+                    path,
+                    FILE_FLAGS_AND_ATTRIBUTES(attributes & !FILE_ATTRIBUTE_READONLY.0),
+                )
+            };
+        }
+    }
+}
 fn canonical_relative_path(value: &str) -> Result<String, PublicPackageError> {
     if value.is_empty()
         || value.starts_with('/')

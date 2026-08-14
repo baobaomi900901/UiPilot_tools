@@ -55,8 +55,17 @@ mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_window;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugins;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod window_transfer;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+#[doc(hidden)]
+pub fn public_plugin_manifest_schema() -> serde_json::Value {
+    serde_json::to_value(public_plugins::public_manifest_v1_schema())
+        .expect("public plugin schema must serialize")
+}
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;

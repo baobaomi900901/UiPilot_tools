@@ -1,19 +1,22 @@
 use std::collections::HashSet;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use super::{PublicPackageError, PublicPluginHost};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PublicPlatform {
     Windows,
     Macos,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub(crate) enum PublicPermission {
     #[serde(rename = "ui.window")]
     UiWindow,
@@ -39,21 +42,21 @@ impl PublicPermission {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum PublicActivationMode {
     Live,
     Submit,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum PublicOutputMode {
     MainResult,
     Window,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicCommandV1 {
     pub(crate) default_name: String,
@@ -64,19 +67,19 @@ pub(crate) struct PublicCommandV1 {
     pub(crate) input_placeholder: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicRuntimeV1 {
     pub(crate) entry: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicWindowV1 {
     pub(crate) entry: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum PublicSettingV1 {
     #[serde(rename = "text")]
@@ -210,14 +213,14 @@ impl PublicSettingV1 {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicSelectOptionV1 {
     pub(crate) value: String,
     pub(crate) label: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicManifestV1 {
     pub(crate) schema_version: u32,
@@ -236,6 +239,10 @@ pub(crate) struct PublicManifestV1 {
     pub(crate) permissions: Vec<PublicPermission>,
     #[serde(default)]
     pub(crate) settings: Vec<PublicSettingV1>,
+}
+
+pub(crate) fn public_manifest_v1_schema() -> schemars::Schema {
+    schemars::schema_for!(PublicManifestV1)
 }
 
 pub(super) fn parse_manifest(
@@ -416,4 +423,30 @@ fn plain_text(value: &str) -> bool {
     !value.chars().any(|character| {
         character == '\0' || (character.is_control() && !"\r\n\t".contains(character))
     })
+}
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn generated_schema_covers_manifest_commands_settings_and_window_contracts() {
+        let schema = serde_json::to_value(public_manifest_v1_schema()).unwrap();
+        let serialized = serde_json::to_string(&schema).unwrap();
+        for required in [
+            "PublicManifestV1",
+            "PublicCommandV1",
+            "PublicSettingV1",
+            "PublicPermission",
+            "PublicWindowV1",
+            "additionalProperties",
+            "ui.window",
+            "clipboard.write",
+        ] {
+            assert!(
+                serialized.contains(required),
+                "missing schema fragment: {required}"
+            );
+        }
+        assert_eq!(schema["additionalProperties"], false);
+    }
 }

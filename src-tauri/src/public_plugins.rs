@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex, OnceLock,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -32,7 +33,8 @@ pub(crate) use activation::{
     PublicPluginPrepareSummary, PublicPluginRoute, PublicRuntimeCandidate, PublicWindowResponse,
 };
 pub(crate) use manifest::{
-    PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
+    public_manifest_v1_schema, PublicActivationMode, PublicManifestV1, PublicOutputMode,
+    PublicPermission, PublicPlatform,
 };
 pub(crate) use runtime::{
     parse_runtime_label, runtime_label, PluginApiRequest, PluginCommandCompletion,
@@ -168,7 +170,7 @@ impl PublicPluginService {
     }
 
     pub(crate) fn dispatch(
-        &self,
+        self: &Arc<Self>,
         app: &AppHandle,
         request: &ScheduledPluginRequest,
         theme: PluginInvocationTheme,
@@ -199,14 +201,25 @@ impl PublicPluginService {
                     },
                 },
             )
-            .map_err(|_| PublicPluginManagementError::Unavailable)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let service = Arc::clone(self);
+        let app = app.clone();
+        let deadline = request.deadline;
+        thread::spawn(move || {
+            thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let _ = service.expire_runtime_timeouts(&app, Instant::now());
+        });
+        Ok(())
     }
 
     pub(crate) fn complete_submission(
         &self,
+        app: &AppHandle,
         completion: &PluginCommandCompletion,
         outcome: PluginCompletionOutcome,
+        now: Instant,
     ) -> Result<Option<ScheduledPluginRequest>, PluginRuntimeError> {
+        let mut runtime_success = None;
         let token = self
             .lock_submissions()
             .map_err(|_| PluginRuntimeError::Unavailable)?
@@ -254,7 +267,38 @@ impl PublicPluginService {
                     };
                     Some(result)
                 };
+                runtime_success = result.as_ref().map(Result::is_ok);
                 let _ = pending.sender.send(result);
+            }
+        }
+        if let Some(success) = runtime_success {
+            let disabled = self
+                .manager()
+                .map_err(|_| PluginRuntimeError::Unavailable)?
+                .record_runtime_result(&completion.context.plugin_id, success, now)
+                .map_err(|_| PluginRuntimeError::Unavailable)?;
+            if disabled {
+                if let Some(next) = outcome.next.as_ref() {
+                    self.settle_submission(&next.candidate.owner.submission_token, None);
+                }
+                Self::destroy_runtime(
+                    app,
+                    runtime_label(
+                        &completion.context.plugin_id,
+                        completion.context.plugin_generation,
+                    )
+                    .as_deref(),
+                );
+                if let Some(controller) =
+                    app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
+                {
+                    crate::plugin_window::teardown_current(
+                        app,
+                        controller.inner().as_ref(),
+                        &completion.context.plugin_id,
+                    );
+                }
+                return Ok(None);
             }
         }
         if let Some(next) = outcome.next.as_ref() {
@@ -264,6 +308,109 @@ impl PublicPluginService {
         Ok(outcome.next)
     }
 
+    fn expire_runtime_timeouts(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        now: Instant,
+    ) -> Result<(), PublicPluginManagementError> {
+        let replacements = self
+            .manager()?
+            .scheduler()
+            .expire_timeouts(now)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        for replacement in replacements {
+            self.settle_request(
+                &replacement.expired,
+                Some(Err(PluginRuntimeError::Unavailable)),
+            );
+            Self::destroy_runtime(
+                app,
+                runtime_label(&replacement.plugin_id, replacement.previous_generation).as_deref(),
+            );
+            if let Some(controller) =
+                app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
+            {
+                crate::plugin_window::teardown_current(
+                    app,
+                    controller.inner().as_ref(),
+                    &replacement.plugin_id,
+                );
+            }
+            if replacement.counts_as_fault
+                && self
+                    .manager()?
+                    .record_runtime_result(&replacement.plugin_id, false, now)?
+            {
+                self.settle_plugin_submissions(&replacement.plugin_id);
+                continue;
+            }
+            let candidate = match self.manager()?.replace_runtime_generation(
+                &replacement.plugin_id,
+                replacement.previous_generation,
+                replacement.new_generation,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    let _ = self
+                        .manager()?
+                        .mark_runtime_unavailable(&replacement.plugin_id);
+                    self.settle_plugin_submissions(&replacement.plugin_id);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.create_runtime(app, &candidate) {
+                let _ = self
+                    .manager()?
+                    .mark_runtime_unavailable(&replacement.plugin_id);
+                self.settle_plugin_submissions(&replacement.plugin_id);
+                return Err(error);
+            }
+            let next = self
+                .manager()?
+                .scheduler()
+                .runtime_replaced(&replacement.plugin_id, replacement.new_generation, now)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            if let Some(next) = next {
+                self.bind_request(&next.candidate.owner.submission_token, &next.context)?;
+                let settings = app.state::<crate::settings::SettingsStore>();
+                let theme = crate::commands::invocation_theme(settings.snapshot().theme);
+                let invoked_at = crate::commands::invoked_at_rfc3339();
+                if let Err(error) = self.dispatch(app, &next, theme, invoked_at) {
+                    self.fail_submission(&next.candidate.owner.submission_token);
+                    let _ = self
+                        .manager()?
+                        .mark_runtime_unavailable(&replacement.plugin_id);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_plugin_submissions(&self, plugin_id: &str) {
+        let pending = self.lock_submissions().ok().map(|mut submissions| {
+            let tokens = submissions
+                .by_token
+                .iter()
+                .filter(|(_, pending)| pending.route.plugin_id == plugin_id)
+                .map(|(token, _)| token.clone())
+                .collect::<Vec<_>>();
+            submissions
+                .token_by_request
+                .retain(|context, _| context.plugin_id != plugin_id);
+            tokens
+                .into_iter()
+                .filter_map(|token| submissions.by_token.remove(&token))
+                .collect::<Vec<_>>()
+        });
+        if let Some(pending) = pending {
+            for pending in pending {
+                let _ = pending
+                    .sender
+                    .send(Some(Err(PluginRuntimeError::Unavailable)));
+            }
+        }
+    }
     pub(crate) fn fail_submission(&self, token: &str) {
         self.settle_submission(token, Some(Err(PluginRuntimeError::Unavailable)));
     }
@@ -510,6 +657,7 @@ impl PreparedPublicPlugin {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn transaction_root(&self) -> &Path {
         self.transaction_root
             .as_deref()
