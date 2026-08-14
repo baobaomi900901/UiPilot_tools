@@ -54,7 +54,9 @@ mod file_index;
 mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod plugin_window;
 mod plugins;
+mod window_transfer;
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
@@ -106,6 +108,11 @@ fn setup_production_lifecycle(
     let event_coordinator = Arc::clone(coordinator);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
+            let transfers =
+                event_app.state::<Arc<window_transfer::MainWindowTransferCoordinator>>();
+            if !*focused && transfers.consume_expected_main_blur() {
+                return;
+            }
             let registries = event_app.state::<result_registry::ResultRegistries>();
             let controller = event_app.state::<Arc<find_window::FindWindowController>>();
             let effect = controller.observe_focus(WindowLabel::Main, *focused);
@@ -232,6 +239,12 @@ pub fn run() {
     let find_controller = Arc::new(find_window::FindWindowController::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let plugin_window_controller = Arc::new(plugin_window::PluginWindowController::default());
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let main_window_transfers = Arc::new(window_transfer::MainWindowTransferCoordinator::default());
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
     let file_index = Arc::new(file_index::FileIndex::new(
         Arc::clone(&coordinator),
         result_registries.find().clone(),
@@ -293,6 +306,8 @@ pub fn run() {
         })
         .manage(result_registries)
         .manage(Arc::clone(&find_controller))
+        .manage(Arc::clone(&plugin_window_controller))
+        .manage(Arc::clone(&main_window_transfers))
         .invoke_handler(tauri::generate_handler![
             commands::open_find_window,
             commands::prepare_find_initialization,
@@ -311,6 +326,11 @@ pub fn run() {
             commands::uninstall_plugin,
             commands::plugin_api_call,
             commands::complete_plugin_command,
+            commands::plugin_window_content_ready,
+            commands::plugin_window_content_ack,
+            commands::commit_plugin_window_transfer,
+            commands::set_plugin_window_pinned,
+            commands::close_plugin_window,
             commands::search_apps,
             commands::publish_plugin_results,
             commands::search_files,
@@ -534,7 +554,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 31);
+        assert_eq!(production.matches("commands::").count(), 36);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -553,6 +573,11 @@ mod tests {
             "uninstall_plugin",
             "plugin_api_call",
             "complete_plugin_command",
+            "plugin_window_content_ready",
+            "plugin_window_content_ack",
+            "commit_plugin_window_transfer",
+            "set_plugin_window_pinned",
+            "close_plugin_window",
             "search_apps",
             "publish_plugin_results",
             "search_files",
@@ -628,6 +653,8 @@ mod tests {
         let build = include_str!("../build.rs");
         let main = include_str!("../capabilities/main.json");
         let runtime = include_str!("../capabilities/plugin-runtime.json");
+        let shell = include_str!("../capabilities/plugin-window-shell.json");
+        let content = include_str!("../capabilities/plugin-window-content.json");
         for command in [
             "list_public_plugins",
             "prepare_public_plugin_install",
@@ -648,6 +675,30 @@ mod tests {
             let permission = format!("\"allow-{}\"", command.replace('_', "-"));
             assert!(runtime.contains(&permission));
             assert!(!main.contains(&permission));
+        }
+        assert!(main.contains("allow-commit-plugin-window-transfer"));
+        assert!(!shell.contains("commit-plugin-window-transfer"));
+        assert!(!content.contains("commit-plugin-window-transfer"));
+        assert!(shell.contains("\"webviews\": [\"plugin-shell-*\"]"));
+        for command in ["set_plugin_window_pinned", "close_plugin_window"] {
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")));
+            assert!(shell.contains(&permission));
+            assert!(!main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+            assert!(!content.contains(&permission));
+        }
+        assert!(content.contains("\"webviews\": [\"plugin-content-*\"]"));
+        for command in ["plugin_window_content_ready", "plugin_window_content_ack"] {
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")));
+            assert!(content.contains(&permission));
+            assert!(!main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+            assert!(!shell.contains(&permission));
+        }
+        for capability in [main, runtime, shell, content] {
+            assert!(!capability.contains("\"shell:"));
         }
         assert!(runtime.contains("\"windows\": [\"plugin-runtime-*\"]"));
         assert!(!runtime.contains("\"plugin-*\""));
@@ -684,6 +735,11 @@ mod tests {
             "setup_production_lifecycle(",
             "&public_plugin_service,",
             "let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());",
+            "let plugin_window_controller = Arc::new(plugin_window::PluginWindowController::default());",
+            "window_transfer::MainWindowTransferCoordinator::default()",
+            ".manage(Arc::clone(&plugin_window_controller))",
+            ".manage(Arc::clone(&main_window_transfers))",
+            "transfers.consume_expected_main_blur()",
             "public_plugin_service.initialize(",
             ".register_uri_scheme_protocol(\"uipilot-public-plugin\"",
             ".manage(Arc::clone(&public_plugin_service))",

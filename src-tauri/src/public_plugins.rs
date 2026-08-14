@@ -27,9 +27,9 @@ use tauri::{
 };
 
 pub(crate) use activation::{
-    parse_main_result_response, PublicMainResult, PublicPluginInstallSource, PublicPluginInventory,
-    PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
-    PublicPluginPrepareSummary, PublicPluginRoute, PublicRuntimeCandidate,
+    parse_main_result_response, parse_window_response, PublicMainResult, PublicPluginInstallSource,
+    PublicPluginInventory, PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
+    PublicPluginPrepareSummary, PublicPluginRoute, PublicRuntimeCandidate, PublicWindowResponse,
 };
 pub(crate) use manifest::{
     PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
@@ -50,7 +50,13 @@ pub(crate) use state::{
 pub(crate) use storage::PluginStorageStore;
 const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) type PublicSubmissionResult = Result<Vec<PublicMainResult>, PluginRuntimeError>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PublicPluginResponse {
+    MainResults(Vec<PublicMainResult>),
+    Window(PublicWindowResponse),
+}
+
+pub(crate) type PublicSubmissionResult = Result<PublicPluginResponse, PluginRuntimeError>;
 
 struct PendingPublicSubmission {
     route: PublicPluginRoute,
@@ -98,16 +104,13 @@ impl PublicPluginService {
             .ok_or(PublicPluginManagementError::Unavailable)
     }
 
-    pub(crate) fn schedule_main_result(
+    pub(crate) fn schedule_command(
         &self,
         route: PublicPluginRoute,
         ui_intent_epoch: u64,
         control_value: String,
         now: Instant,
     ) -> Result<PublicSubmission, PublicPluginManagementError> {
-        if route.output_mode != PublicOutputMode::MainResult {
-            return Err(PublicPluginManagementError::Unavailable);
-        }
         let number = self
             .next_submission
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -221,26 +224,34 @@ impl PublicPluginService {
                 } else if completion.failed {
                     Some(Err(PluginRuntimeError::InvalidOperation))
                 } else {
-                    let result = completion
+                    let value = completion
                         .response
                         .clone()
-                        .ok_or(PluginRuntimeError::InvalidOperation)
-                        .and_then(|value| parse_main_result_response(&completion.context, value))
-                        .and_then(|results| {
-                            if results.iter().any(|result| result.copy_text.is_some())
-                                && !self
-                                    .manager()
-                                    .map_err(|_| PluginRuntimeError::Unavailable)?
-                                    .can_copy_text(
-                                        &pending.route.plugin_id,
-                                        pending.route.generation,
-                                    )
-                            {
-                                Err(PluginRuntimeError::InvalidOperation)
-                            } else {
-                                Ok(results)
-                            }
-                        });
+                        .ok_or(PluginRuntimeError::InvalidOperation);
+                    let result = match pending.route.output_mode {
+                        PublicOutputMode::MainResult => value
+                            .and_then(|value| {
+                                parse_main_result_response(&completion.context, value)
+                            })
+                            .and_then(|results| {
+                                if results.iter().any(|result| result.copy_text.is_some())
+                                    && !self
+                                        .manager()
+                                        .map_err(|_| PluginRuntimeError::Unavailable)?
+                                        .can_copy_text(
+                                            &pending.route.plugin_id,
+                                            pending.route.generation,
+                                        )
+                                {
+                                    Err(PluginRuntimeError::InvalidOperation)
+                                } else {
+                                    Ok(PublicPluginResponse::MainResults(results))
+                                }
+                            }),
+                        PublicOutputMode::Window => value
+                            .and_then(|value| parse_window_response(&completion.context, value))
+                            .map(PublicPluginResponse::Window),
+                    };
                     Some(result)
                 };
                 let _ = pending.sender.send(result);
@@ -303,17 +314,22 @@ impl PublicPluginService {
             .map_err(|_| PublicPluginManagementError::Unavailable)
     }
     pub(crate) fn asset_response(&self, label: &str, path: &str) -> Response<Vec<u8>> {
-        let Some(asset) = self
-            .manager()
-            .ok()
-            .and_then(|manager| manager.asset(label, path))
-        else {
+        let Some(asset) = self.manager().ok().and_then(|manager| {
+            manager.asset(label, path).or_else(|| {
+                crate::plugin_window::plugin_id_from_content_label(label)
+                    .and_then(|plugin_id| manager.window_asset(&plugin_id, path))
+            })
+        }) else {
             return Response::builder().status(403).body(Vec::new()).unwrap();
         };
         Response::builder()
             .status(200)
             .header("content-type", asset.mime)
             .header("x-content-type-options", "nosniff")
+            .header(
+                "content-security-policy",
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'",
+            )
             .body(asset.bytes)
             .unwrap()
     }

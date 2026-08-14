@@ -9,6 +9,7 @@ export interface ResultItem {
 export interface SearchResponse {
   requestId: string
   items: ResultItem[]
+  windowTransferToken?: string
 }
 
 export type ThemePreference = 'system' | 'dark' | 'light'
@@ -179,6 +180,7 @@ export interface LauncherClient {
   searchApps(input: { query: string; invocationId: string; querySequence: number; submit?: boolean }): Promise<SearchResponse | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
   selectPublicPluginDirectory(): Promise<string | null>
@@ -200,6 +202,10 @@ export interface LauncherClient {
   hideLauncher(): Promise<void>
 }
 
+export interface PluginWindowClient {
+  setPinned(input: { pinned: boolean }): Promise<{ pinned: boolean }>
+  close(): Promise<void>
+}
 export type U64Decimal = string & { readonly __u64Decimal: unique symbol }
 export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string }
 export type OpenFindOutcome = { status: 'forwarded' } | { status: 'superseded' }

@@ -26,6 +26,9 @@ use crate::{
     hotkey::HotkeyKind,
     lifecycle::{self, CriticalReservation, LifecycleCoordinator, ReservationError},
     model::SearchResponse,
+    plugin_window::{
+        self, PluginWindowController, PluginWindowOwner, PluginWindowPinState, PluginWindowUpdate,
+    },
     plugins::{
         PluginCopyError, PluginInventorySnapshot, PluginManagementError, PluginManager,
         PluginMutationOutcome, PluginQueryError, PluginQueryStart,
@@ -34,12 +37,14 @@ use crate::{
         PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
         PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
         PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
-        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginService,
+        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse,
+        PublicPluginService,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
     },
     settings::{SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WindowPosition},
+    window_transfer::MainWindowTransferCoordinator,
 };
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
@@ -702,6 +707,7 @@ pub(crate) fn commit_public_plugin_install(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    window_controller: State<'_, Arc<PluginWindowController>>,
     input: CommitPublicPluginInstallInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
@@ -722,6 +728,11 @@ pub(crate) fn commit_public_plugin_install(
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.previous_runtime_label.as_deref());
+            plugin_window::teardown_current(
+                &app,
+                window_controller.inner().as_ref(),
+                &commit.mutation.plugin_id,
+            );
             Ok(commit.mutation)
         }
         Err(error) => {
@@ -736,6 +747,7 @@ pub(crate) fn set_plugin_enabled(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
     enabled: bool,
 ) -> Result<PublicPluginMutation, CommandError> {
@@ -755,6 +767,11 @@ pub(crate) fn set_plugin_enabled(
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.closed_runtime_label.as_deref());
+            plugin_window::teardown_current(
+                &app,
+                window_controller.inner().as_ref(),
+                &commit.mutation.plugin_id,
+            );
             Ok(commit.mutation)
         }
         Err(error) => {
@@ -796,12 +813,18 @@ pub(crate) fn uninstall_plugin(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
     retain_data: bool,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
     let runtime_label = service.manager()?.uninstall(&plugin_id, retain_data)?;
     PublicPluginService::destroy_runtime(&app, runtime_label.as_deref());
+    plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
+    if !retain_data {
+        app.state::<SettingsStore>()
+            .remove_plugin_window_position(&plugin_id)?;
+    }
     Ok(())
 }
 
@@ -837,6 +860,69 @@ pub(crate) fn complete_plugin_command(
     Ok(PluginCommandCompletionResult { accepted })
 }
 #[tauri::command]
+pub(crate) fn plugin_window_content_ready(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginWindowController>>,
+) -> Result<(), CommandError> {
+    plugin_window::content_ready(controller.inner().as_ref(), webview.label())
+        .then_some(())
+        .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_content_ack(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginWindowController>>,
+    request_id: String,
+) -> Result<(), CommandError> {
+    plugin_window::content_ack(controller.inner().as_ref(), webview.label(), &request_id)
+        .then_some(())
+        .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+#[tauri::command]
+pub(crate) fn commit_plugin_window_transfer(
+    window: WebviewWindow,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    transfers: State<'_, Arc<MainWindowTransferCoordinator>>,
+    transfer_token: String,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    plugin_window::commit(
+        &app,
+        controller.inner().as_ref(),
+        transfers.inner().as_ref(),
+        &transfer_token,
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn set_plugin_window_pinned(
+    window: WebviewWindow,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    pinned: bool,
+) -> Result<PluginWindowPinState, CommandError> {
+    Ok(plugin_window::set_pinned(
+        &app,
+        controller.inner().as_ref(),
+        window.label(),
+        pinned,
+    )?)
+}
+
+#[tauri::command]
+pub(crate) fn close_plugin_window(
+    window: WebviewWindow,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+) -> Result<(), CommandError> {
+    plugin_window::close(&app, controller.inner().as_ref(), window.label())?;
+    Ok(())
+}
+#[tauri::command]
 pub(crate) async fn search_apps(
     window: WebviewWindow,
     query: String,
@@ -853,8 +939,7 @@ pub(crate) async fn search_apps(
     let settings = app.state::<SettingsStore>();
     let public = app.state::<Arc<PublicPluginService>>();
     if let Some(route) = public.manager()?.route(&query)? {
-        if route.output_mode != PublicOutputMode::MainResult
-            || (route.activation_mode == PublicActivationMode::Submit && !submit)
+        if (route.activation_mode == PublicActivationMode::Submit && !submit)
             || (route.activation_mode == PublicActivationMode::Live && submit)
         {
             return Ok(None);
@@ -867,38 +952,80 @@ pub(crate) async fn search_apps(
                 route.input_placeholder,
             ));
         }
-        let Some(token) = registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
+        let Some(registry_token) =
+            registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
         else {
             return Ok(None);
         };
-        let submission = public.schedule_main_result(
+        let theme = invocation_theme(settings.snapshot().theme);
+        let invoked_at = invoked_at_rfc3339();
+        let submission = public.schedule_command(
             route.clone(),
             query_sequence,
             query.clone(),
             Instant::now(),
         )?;
+        let submission_token = submission.token.clone();
         if let Some(dispatch) = submission.dispatch.as_ref() {
-            if let Err(error) = public.dispatch(
-                app,
-                dispatch,
-                invocation_theme(settings.snapshot().theme),
-                invoked_at_rfc3339(),
-            ) {
+            if let Err(error) = public.dispatch(app, dispatch, theme, invoked_at.clone()) {
                 public.fail_submission(&submission.token);
                 return Err(error.into());
             }
         }
-        let received = tauri::async_runtime::spawn_blocking(move || submission.receiver.recv())
+        let receiver = submission.receiver;
+        let received = tauri::async_runtime::spawn_blocking(move || receiver.recv())
             .await
             .map_err(|_| CommandError::plugin_query_failed())?
             .map_err(|_| CommandError::plugin_query_failed())?;
-        let Some(results) = received else {
+        let Some(response) = received else {
             return Ok(None);
         };
-        let results = results.map_err(CommandError::from)?;
-        return Ok(publish_public_main_results(
-            registry, token, &route, results,
-        ));
+        return match response.map_err(CommandError::from)? {
+            PublicPluginResponse::MainResults(results) => Ok(publish_public_main_results(
+                registry,
+                registry_token,
+                &route,
+                results,
+            )),
+            PublicPluginResponse::Window(response) => {
+                if route.output_mode != PublicOutputMode::Window {
+                    return Err(CommandError::plugin_query_failed());
+                }
+                let window_entry = route
+                    .window_entry
+                    .clone()
+                    .ok_or_else(CommandError::plugin_query_failed)?;
+                let controller = Arc::clone(app.state::<Arc<PluginWindowController>>().inner());
+                let owner = PluginWindowOwner {
+                    ui_intent_epoch: query_sequence,
+                    submission_token,
+                    plugin_id: route.plugin_id.clone(),
+                    plugin_generation: route.generation,
+                    request_id: response.request_id.clone(),
+                    control_value: query.clone(),
+                };
+                let update = PluginWindowUpdate {
+                    request_id: response.request_id.clone(),
+                    input: route.input.clone(),
+                    platform: "windows",
+                    theme,
+                    invoked_at,
+                    instance_number: 1,
+                    data: response.data,
+                };
+                let app_handle = app.clone();
+                let prepared = tauri::async_runtime::spawn_blocking(move || {
+                    plugin_window::prepare(&app_handle, controller, owner, update, &window_entry)
+                })
+                .await
+                .map_err(|_| CommandError::plugin_query_failed())??;
+                Ok(Some(SearchResponse {
+                    request_id: response.request_id,
+                    items: Vec::new(),
+                    window_transfer_token: Some(prepared.transfer_token),
+                }))
+            }
+        };
     }
     let plugins = app.state::<Arc<PluginManager>>();
     match plugins.begin_routed_query(&query, registry, &invocation_id, query_sequence) {
@@ -1002,6 +1129,7 @@ fn search_response(
                 item
             })
             .collect(),
+        window_transfer_token: None,
     }
 }
 #[tauri::command]
@@ -1057,6 +1185,7 @@ where
                     item
                 })
                 .collect(),
+            window_transfer_token: None,
         },
     )
 }
@@ -2032,6 +2161,7 @@ mod tests {
             file_preview_enabled: true,
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
+            plugin_window_positions: BTreeMap::new(),
         };
         fs::write(
             dir.path().join("settings.json"),
@@ -2127,6 +2257,32 @@ mod tests {
         assert!(!complete.contains("starts_with(\"plugin-\")"));
     }
 
+    #[test]
+    fn plugin_window_commands_derive_identity_from_exact_caller_labels() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let command_body = |name: &str| {
+            source
+                .split(&format!("pub(crate) fn {name}("))
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .unwrap_or_else(|| panic!("missing command {name}"))
+        };
+        let ready = command_body("plugin_window_content_ready");
+        assert!(ready.contains("webview.label()"));
+        assert!(!ready.contains("plugin_id:"));
+        let ack = command_body("plugin_window_content_ack");
+        assert!(ack.contains("webview.label(), &request_id"));
+        assert!(!ack.contains("plugin_id:"));
+        let commit = command_body("commit_plugin_window_transfer");
+        let guard = commit.find("require_main_window(&window)?;").unwrap();
+        let transfer = commit.find("plugin_window::commit(").unwrap();
+        assert!(guard < transfer);
+        for command in ["set_plugin_window_pinned", "close_plugin_window"] {
+            let body = command_body(command);
+            assert!(body.contains("window.label()"));
+            assert!(!body.contains("plugin_id:"));
+        }
+    }
     #[test]
     fn search_rejects_old_or_hidden_queries_before_state_reads() {
         let registry = ResultRegistry::default();

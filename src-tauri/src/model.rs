@@ -5,6 +5,8 @@ use serde::Serialize;
 pub(crate) struct SearchResponse {
     pub(crate) request_id: String,
     pub(crate) items: Vec<ResultItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window_transfer_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

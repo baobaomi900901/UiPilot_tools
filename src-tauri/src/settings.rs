@@ -43,6 +43,8 @@ pub(crate) struct Settings {
     pub(crate) use_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window_position: Option<WindowPosition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) plugin_window_positions: BTreeMap<String, WindowPosition>,
 }
 
 pub(crate) struct SettingsUpdate {
@@ -88,6 +90,7 @@ impl Default for Settings {
             file_preview_enabled: default_file_preview_enabled(),
             use_counts: BTreeMap::new(),
             window_position: None,
+            plugin_window_positions: BTreeMap::new(),
         }
     }
 }
@@ -264,6 +267,38 @@ impl SettingsStore {
             .window_position
     }
 
+    pub(crate) fn set_plugin_window_position(
+        &self,
+        plugin_id: &str,
+        position: WindowPosition,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate
+            .plugin_window_positions
+            .insert(plugin_id.to_owned(), position);
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn plugin_window_position(&self, plugin_id: &str) -> Option<WindowPosition> {
+        self.state
+            .lock()
+            .expect("settings lock poisoned")
+            .value
+            .plugin_window_positions
+            .get(plugin_id)
+            .copied()
+    }
+
+    pub(crate) fn remove_plugin_window_position(
+        &self,
+        plugin_id: &str,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.plugin_window_positions.remove(plugin_id);
+        self.persist(&mut state, candidate)
+    }
     pub(crate) fn snapshot(&self) -> Settings {
         self.state
             .lock()
@@ -685,6 +720,36 @@ mod tests {
     }
 
     #[test]
+    fn plugin_window_positions_are_plugin_scoped_and_delete_independently() {
+        let dir = TestDir::new("plugin-window-positions");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let first = WindowPosition { x: 120, y: 240 };
+        let second = WindowPosition { x: -20, y: 80 };
+        store
+            .set_plugin_window_position("com.example.first", first)
+            .unwrap();
+        store
+            .set_plugin_window_position("com.example.second", second)
+            .unwrap();
+        assert_eq!(
+            store.plugin_window_position("com.example.first"),
+            Some(first)
+        );
+        assert_eq!(
+            store.plugin_window_position("com.example.second"),
+            Some(second)
+        );
+        store
+            .remove_plugin_window_position("com.example.first")
+            .unwrap();
+        assert_eq!(store.plugin_window_position("com.example.first"), None);
+        assert_eq!(
+            store.plugin_window_position("com.example.second"),
+            Some(second)
+        );
+        assert_eq!(read_current(&dir), store.snapshot());
+    }
+    #[test]
     fn find_preference_revisions_advance_independently_after_durable_writes() {
         let dir = TestDir::new("find-preference-revisions");
         let store = SettingsStore::load(dir.path()).unwrap();
@@ -886,6 +951,7 @@ mod tests {
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             window_position: None,
+            plugin_window_positions: BTreeMap::new(),
         };
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();

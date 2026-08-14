@@ -34,6 +34,7 @@ use crate::{
     hotkey_hook::HotkeyHook,
     result_registry::ResultRegistries,
     settings::{Settings, SettingsStore, SettingsUpdate, WindowPosition},
+    window_transfer::{MainWindowSnapshot, MainWindowTransferCoordinator, TransferTarget},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -466,7 +467,10 @@ fn centered_position(
     })
 }
 
-fn place_main_window(window: &WebviewWindow, saved: Option<WindowPosition>) -> Result<(), ()> {
+pub(crate) fn place_main_window(
+    window: &WebviewWindow,
+    saved: Option<WindowPosition>,
+) -> Result<(), ()> {
     let window_size = match window.outer_size() {
         Ok(size) => size,
         Err(_) => return window.center().map_err(|_| ()),
@@ -1555,32 +1559,47 @@ pub(crate) fn start_find_transfer(
     let main_topmost = main
         .is_always_on_top()
         .map_err(|_| LifecycleError::WindowFailed)?;
+    let transfer_target = TransferTarget::Find {
+        transfer_id: plan.transfer_id,
+    };
+    let transfers = app.state::<Arc<MainWindowTransferCoordinator>>();
+    let lease = transfers
+        .begin(
+            transfer_target,
+            MainWindowSnapshot {
+                visible: main_visible,
+                focused: initial.main_focused,
+                always_on_top: main_topmost,
+            },
+        )
+        .ok_or(LifecycleError::WindowFailed)?;
 
     let native_result = main
         .set_always_on_top(false)
         .and_then(|()| find.show())
         .and_then(|()| find.set_focus());
     if native_result.is_err() {
-        let _ = main.set_always_on_top(main_topmost);
-        if main_visible {
-            let _ = main.show();
-        } else {
-            let _ = main.hide();
-        }
-        if find_visible {
-            let _ = find.show();
-        } else {
-            let _ = find.hide();
-        }
-        if initial.main_focused {
-            let _ = main.set_focus();
-        } else if initial.find_focused {
-            let _ = find.set_focus();
+        if let Some(snapshot) = transfers.rollback(&lease) {
+            let _ = main.set_always_on_top(snapshot.always_on_top);
+            let _ = if snapshot.visible {
+                main.show()
+            } else {
+                main.hide()
+            };
+            if find_visible {
+                let _ = find.show();
+            } else {
+                let _ = find.hide();
+            }
+            if snapshot.focused {
+                let _ = main.set_focus();
+            } else if initial.find_focused {
+                let _ = find.set_focus();
+            }
         }
         controller.fail_transfer_before_ownership(plan.transfer_id);
         return Err(LifecycleError::WindowFailed);
     }
-
     advance_find_transfer(app, controller, registries, plan.transfer_id)
 }
 
@@ -1590,6 +1609,11 @@ pub(crate) fn advance_find_transfer(
     registries: &ResultRegistries,
     transfer_id: u64,
 ) -> Result<(), LifecycleError> {
+    let transfers = app.state::<Arc<MainWindowTransferCoordinator>>();
+    let target = TransferTarget::Find { transfer_id };
+    let Some(lease) = transfers.current_lease(&target) else {
+        return Ok(());
+    };
     let snapshot = find_native_snapshot(app)?;
     if controller.confirm_transfer_focus(transfer_id, snapshot)
         != TransferFocusResult::CommitFindScope
@@ -1606,7 +1630,23 @@ pub(crate) fn advance_find_transfer(
     let finish = controller.finish_forward_emit(transfer_id, emitted, registries);
     if !emitted {
         let _ = find.hide();
+        if let Some(snapshot) = transfers.rollback(&lease) {
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.set_always_on_top(snapshot.always_on_top);
+                let _ = if snapshot.visible {
+                    main.show()
+                } else {
+                    main.hide()
+                };
+                if snapshot.focused {
+                    let _ = main.set_focus();
+                }
+            }
+        }
         return Err(LifecycleError::WindowFailed);
+    }
+    if !transfers.commit(&lease) {
+        return Ok(());
     }
     if matches!(
         finish,
@@ -3689,6 +3729,7 @@ mod tests {
             .and_then(|tail| tail.split("pub(crate) fn install_session_end_hook").next())
             .expect("session callback source markers are missing");
         assert!(session_callback.contains("save_window_position"));
+
         assert!(!production.contains("windows_link::link!"));
         assert!(!production.contains("#[link("));
         assert!(!production.contains("struct SessionHookContext"));

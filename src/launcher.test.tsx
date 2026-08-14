@@ -206,6 +206,7 @@ function fakeClient() {
       return unlisten
     }),
     searchApps: vi.fn(async () => null),
+    commitPluginWindowTransfer: vi.fn(async () => {}),
     openFind: vi.fn(async () => ({ status: 'forwarded' as const })),
     searchFiles: vi.fn(async () => null),
     setFilePreviewPreference: vi.fn(async () => undefined),
@@ -670,6 +671,33 @@ describe('shown and search ownership', () => {
       expect(core.getSnapshot().results).toMatchObject([{ title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false }])
       core.keyDown('Enter', false)
       expect(client.executeResult).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+  it('commits a prepared plugin window only for the still-current query owner', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const response = deferred<SearchResponse | null>()
+      const commit = deferred<void>()
+      vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
+      vi.mocked(client.commitPluginWindowTransfer).mockReturnValueOnce(commit.promise)
+      emit(shown('window-owner'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo A', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      response.resolve({ requestId: 'window-request-a', items: [], windowTransferToken: 'window-transfer-a' })
+      await response.promise
+      await Promise.resolve()
+      expect(client.commitPluginWindowTransfer).toHaveBeenCalledWith({ transferToken: 'window-transfer-a' })
+
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo B', inputType: 'insertText' })
+      const edited = core.getSnapshot()
+      commit.resolve()
+      await commit.promise
+      await Promise.resolve()
+      expect(core.getSnapshot()).toBe(edited)
+      expect(core.getSnapshot().query).toBe('/demo B')
     } finally {
       vi.useRealTimers()
     }
@@ -2965,7 +2993,7 @@ describe('real adapter and startup', () => {
     expect(mainSource).toContain('getCurrentWindow().label')
     expect(mainSource).not.toContain('.hide(')
     expect(mainSource).not.toMatch(/\b(?:path|pid|hwnd|appId)\b/i)
-    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(2)
+    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(3)
   })
 })
 

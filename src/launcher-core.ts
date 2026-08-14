@@ -809,6 +809,35 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     response: import('./protocol').SearchResponse | null,
   ): void {
     if (!ownsSearch(captured)) return
+    const transferToken = response?.windowTransferToken
+    if (transferToken !== undefined) {
+      let pending: Promise<void>
+      try {
+        pending = client.commitPluginWindowTransfer({ transferToken })
+      } catch (error) {
+        pending = Promise.reject(error)
+      }
+      void pending.then(
+        () => {
+          if (!ownsSearch(captured)) return
+          model.searchPending = false
+          model.query = ''
+          model.queryControlValue = ''
+          model.requestId = undefined
+          model.status = ''
+          clearResults()
+          publish(true)
+        },
+        (error: unknown) => {
+          if (!ownsSearch(captured)) return
+          model.searchPending = false
+          model.status = errorText(error)
+          publish(true)
+        },
+      )
+      publish(true)
+      return
+    }
     model.searchPending = false
     if (response !== null) {
       model.requestId = response.requestId

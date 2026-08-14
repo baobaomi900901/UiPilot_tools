@@ -780,6 +780,8 @@ mod tests {
                         item
                     })
                     .collect(),
+
+                window_transfer_token: None,
             },
         )
     }

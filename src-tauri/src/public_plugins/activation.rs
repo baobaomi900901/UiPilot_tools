@@ -112,6 +112,7 @@ pub(crate) struct PublicPluginRoute {
     pub(crate) input: String,
     pub(crate) input_required: bool,
     pub(crate) input_placeholder: Option<String>,
+    pub(crate) window_entry: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +124,11 @@ pub(crate) struct PublicMainResult {
     pub(crate) copy_text: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicWindowResponse {
+    pub(crate) request_id: String,
+    pub(crate) data: Value,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicRuntimeCandidate {
     pub(crate) plugin_id: String,
@@ -804,6 +810,11 @@ impl PublicPluginManager {
                 input: input.to_owned(),
                 input_required: command.input_required,
                 input_placeholder: command.input_placeholder.clone(),
+                window_entry: snapshot
+                    .manifest
+                    .window
+                    .as_ref()
+                    .map(|window| window.entry.clone()),
             }));
         }
         Ok(None)
@@ -849,6 +860,38 @@ impl PublicPluginManager {
         })
     }
 
+    pub(crate) fn window_asset(
+        &self,
+        plugin_id: &str,
+        request_path: &str,
+    ) -> Option<PublicRuntimeAsset> {
+        let snapshot = self
+            .data
+            .lock()
+            .ok()?
+            .active_by_plugin
+            .get(plugin_id)
+            .cloned()?;
+        let config = self.state.config(plugin_id).ok()??;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || config.active_generation != snapshot.generation
+            || snapshot.manifest.command.output_mode != PublicOutputMode::Window
+            || !snapshot
+                .manifest
+                .permissions
+                .contains(&PublicPermission::UiWindow)
+        {
+            return None;
+        }
+        let relative = decode_request_path(request_path)?;
+        let resource = snapshot.resources.get(&relative)?;
+        Some(PublicRuntimeAsset {
+            mime: resource.mime,
+            bytes: resource.bytes.clone(),
+        })
+    }
     pub(crate) fn can_copy_text(&self, plugin_id: &str, generation: u64) -> bool {
         self.state
             .config(plugin_id)
@@ -1129,6 +1172,34 @@ enum CopyTextActionWire {
     CopyText { text: String },
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WindowResponseWire {
+    request_id: String,
+    data: Value,
+}
+
+pub(crate) fn parse_window_response(
+    context: &PluginRequestContext,
+    value: Value,
+) -> Result<PublicWindowResponse, PluginRuntimeError> {
+    if serde_json::to_vec(&value)
+        .map_err(|_| PluginRuntimeError::InvalidOperation)?
+        .len()
+        > MAX_MAIN_RESPONSE_BYTES
+    {
+        return Err(PluginRuntimeError::InvalidOperation);
+    }
+    let response = serde_json::from_value::<WindowResponseWire>(value)
+        .map_err(|_| PluginRuntimeError::InvalidOperation)?;
+    if response.request_id != context.request_id || !super::valid_json_value(&response.data) {
+        return Err(PluginRuntimeError::InvalidOperation);
+    }
+    Ok(PublicWindowResponse {
+        request_id: response.request_id,
+        data: response.data,
+    })
+}
 pub(crate) fn parse_main_result_response(
     context: &PluginRequestContext,
     value: Value,
@@ -1468,6 +1539,7 @@ mod tests {
                 input: "I am  Jack".into(),
                 input_required: false,
                 input_placeholder: None,
+                window_entry: None,
             }
         );
         assert!(manager.route("/activationX nope").unwrap().is_none());
@@ -1517,6 +1589,41 @@ mod tests {
         assert!(parse_main_result_response(
             &context,
             json!({ "requestId": "wrong", "results": [] })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn window_response_is_bounded_exact_and_request_owned() {
+        let context = PluginRequestContext {
+            plugin_id: "com.example.activation".into(),
+            plugin_generation: 3,
+            request_id: "public-request-1".into(),
+        };
+        assert_eq!(
+            parse_window_response(
+                &context,
+                json!({
+                    "requestId": "public-request-1",
+                    "data": { "message": "hello", "items": [1, true, null] }
+                })
+            )
+            .unwrap(),
+            PublicWindowResponse {
+                request_id: "public-request-1".into(),
+                data: json!({ "message": "hello", "items": [1, true, null] }),
+            }
+        );
+        for invalid in [
+            json!({ "requestId": "wrong", "data": {} }),
+            json!({ "requestId": "public-request-1", "data": {}, "actions": [] }),
+            json!({ "requestId": "public-request-1", "data": { "__proto__": true } }),
+        ] {
+            assert!(parse_window_response(&context, invalid).is_err());
+        }
+        assert!(parse_window_response(
+            &context,
+            json!({ "requestId": "public-request-1", "data": "x".repeat(65_536) })
         )
         .is_err());
     }

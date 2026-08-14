@@ -27,7 +27,7 @@ rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "=0.10.9"
-tauri = { version = "2.11.3", features = ["tray-icon"] }
+tauri = { version = "2.11.3", features = ["tray-icon", "unstable"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 unicode-normalization = { version = "=0.1.23", default-features = false, features = ["std"] }
 zip = { version = "=2.4.2", default-features = false, features = ["flate2", "deflate-flate2"] }

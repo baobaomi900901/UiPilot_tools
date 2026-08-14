@@ -396,6 +396,7 @@ impl PluginManager {
                         item
                     })
                     .collect(),
+                window_transfer_token: None,
             },
         )
     }
