@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex, OnceLock,
     },
     thread,
@@ -76,6 +76,7 @@ pub(crate) struct PublicPluginService {
     manager: OnceLock<Arc<PublicPluginManager>>,
     submissions: Mutex<PublicSubmissionState>,
     next_submission: AtomicU64,
+    startup_runtimes_started: AtomicBool,
 }
 
 pub(crate) struct PublicSubmission {
@@ -104,6 +105,32 @@ impl PublicPluginService {
         self.manager
             .get()
             .ok_or(PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn start_enabled_runtimes(
+        self: &Arc<Self>,
+        app: &AppHandle,
+    ) -> Result<(), PublicPluginManagementError> {
+        let manager = Arc::clone(self.manager()?);
+        let candidates = manager.runtime_candidates()?;
+        if self
+            .startup_runtimes_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let app = app.clone();
+        let service = Arc::clone(self);
+        tauri::async_runtime::spawn_blocking(move || {
+            for candidate in candidates {
+                let ready = service.create_runtime(&app, &candidate).is_ok();
+                if !ready {
+                    let _ = manager.mark_runtime_unavailable(&candidate.plugin_id);
+                }
+            }
+        });
+        Ok(())
     }
 
     pub(crate) fn schedule_command(
@@ -373,7 +400,7 @@ impl PublicPluginService {
             if let Some(next) = next {
                 self.bind_request(&next.candidate.owner.submission_token, &next.context)?;
                 let settings = app.state::<crate::settings::SettingsStore>();
-                let theme = crate::commands::invocation_theme(settings.snapshot().theme);
+                let theme = crate::commands::invocation_theme(app, settings.snapshot().theme);
                 let invoked_at = crate::commands::invoked_at_rfc3339();
                 if let Err(error) = self.dispatch(app, &next, theme, invoked_at) {
                     self.fail_submission(&next.candidate.owner.submission_token);

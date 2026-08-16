@@ -332,7 +332,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         prepared = null
       }
       if (!prepared || prepared.status !== 'prepared') {
-        await Promise.resolve()
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
         continue
       }
       reconcileInitialization(prepared.initialization)
@@ -367,9 +367,10 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         model.ready = true
         model.status = ''
         publish()
+        if (model.query) beginSearch()
         return
       }
-      await Promise.resolve()
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
     }
   }
 
@@ -445,8 +446,11 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const invocationId = model.invocationId
     if (!model.ready || !invocationId || model.executePending || model.pinPending || pinned === model.pinned) return
     const owner = ++operationToken
+    const previousPinned = model.pinned
     pinOwner = owner
+    model.pinned = pinned
     model.pinPending = true
+    model.status = ''
     publish()
     void client.setPinned({ invocationId, pinned }).then(
       (result) => {
@@ -458,6 +462,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       (error: unknown) => {
         if (destroyed || owner !== pinOwner || invocationId !== model.invocationId) return
         model.pinPending = false
+        model.pinned = previousPinned
         model.status = errorText(error)
         publish()
       },
@@ -507,6 +512,11 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       await client.hide({ invocationId, force })
       if (destroyed || owner !== hideOwner || invocationId !== model.invocationId) return
       model.hidePending = false
+      if (force) {
+        pinOwner = ++operationToken
+        model.pinPending = false
+        model.pinned = false
+      }
       publish()
     } catch (error) {
       if (destroyed || owner !== hideOwner || invocationId !== model.invocationId) return

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -8,6 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     apps::{self, AppCache, Application},
@@ -117,7 +119,11 @@ pub(crate) struct FindInitializationPrepared {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum FindReadyOutcome {
     Prepared {
         initialization: FindInitializationPrepared,
@@ -411,17 +417,25 @@ pub(crate) async fn open_find_window(
     {
         return Err(CommandError::invalid_file_query());
     }
-    let retirement = registries
+    let retirement = match registries
         .main()
         .prepare_application_query_retirement(&input.invocation_id, input.query_sequence)
-        .map_err(|_| CommandError::stale_request())?
-        .ok_or_else(CommandError::stale_request)?;
+    {
+        Ok(Some(retirement)) => retirement,
+        Ok(None) => {
+            return Err(CommandError::stale_request());
+        }
+        Err(_) => {
+            return Err(CommandError::stale_request());
+        }
+    };
     let submission = controller
         .submit_open(input.query, retirement, Instant::now())
         .map_err(|_| CommandError::window_failed())?;
-    if submission.snapshot_required {
-        lifecycle::start_find_transfer(&app, controller.inner().as_ref(), &registries)
-            .map_err(|_| CommandError::window_failed())?;
+    if submission.snapshot_required
+        && lifecycle::start_find_transfer(&app, controller.inner().as_ref(), &registries).is_err()
+    {
+        return Err(CommandError::window_failed());
     }
     let wait_controller = Arc::clone(controller.inner());
     let completion = tauri::async_runtime::spawn_blocking(move || loop {
@@ -670,6 +684,37 @@ pub(crate) async fn delete_plugin(
     })
 }
 
+fn select_public_plugin_source_with<S>(
+    label: &str,
+    coordinator: &Arc<LifecycleCoordinator>,
+    select: S,
+) -> Result<Option<PathBuf>, CommandError>
+where
+    S: FnOnce() -> Option<PathBuf>,
+{
+    require_main_label(label)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| CommandError::plugin_install_failed())?;
+    Ok(select())
+}
+
+#[tauri::command]
+pub(crate) async fn select_public_plugin_directory(
+    window: WebviewWindow,
+    app: AppHandle,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
+) -> Result<Option<PathBuf>, CommandError> {
+    select_public_plugin_source_with(window.label(), coordinator.inner(), || {
+        app.dialog()
+            .file()
+            .set_parent(&window)
+            .set_title("选择插件开发目录")
+            .blocking_pick_folder()
+            .and_then(|path| path.into_path().ok())
+    })
+}
+
 #[tauri::command]
 pub(crate) fn list_public_plugins(
     window: WebviewWindow,
@@ -703,14 +748,18 @@ pub(crate) fn cancel_public_plugin_install(
 }
 
 #[tauri::command]
-pub(crate) fn commit_public_plugin_install(
+pub(crate) async fn commit_public_plugin_install(
     window: WebviewWindow,
     app: AppHandle,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     input: CommitPublicPluginInstallInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| CommandError::plugin_install_failed())?;
     let mut created_runtime = None;
     let result = service.manager()?.commit_with_readiness(
         window.label(),
@@ -743,15 +792,19 @@ pub(crate) fn commit_public_plugin_install(
 }
 
 #[tauri::command]
-pub(crate) fn set_plugin_enabled(
+pub(crate) async fn set_plugin_enabled(
     window: WebviewWindow,
     app: AppHandle,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
     enabled: bool,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| PublicPluginManagementError::Unavailable)?;
     let mut created_runtime = None;
     let result = service
         .manager()?
@@ -854,7 +907,7 @@ pub(crate) fn complete_plugin_command(
         service.dispatch(
             &app,
             &next,
-            invocation_theme(settings.snapshot().theme),
+            invocation_theme(&app, settings.snapshot().theme),
             invoked_at_rfc3339(),
         )?;
     }
@@ -882,7 +935,7 @@ pub(crate) fn plugin_window_content_ack(
 }
 
 #[tauri::command]
-pub(crate) fn commit_plugin_window_transfer(
+pub(crate) async fn commit_plugin_window_transfer(
     window: WebviewWindow,
     app: AppHandle,
     controller: State<'_, Arc<PluginWindowController>>,
@@ -890,18 +943,24 @@ pub(crate) fn commit_plugin_window_transfer(
     transfer_token: String,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    plugin_window::commit(
-        &app,
-        controller.inner().as_ref(),
-        transfers.inner().as_ref(),
-        &transfer_token,
-    )?;
+    let controller = Arc::clone(controller.inner());
+    let transfers = Arc::clone(transfers.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        plugin_window::commit(
+            &app,
+            controller.as_ref(),
+            transfers.as_ref(),
+            &transfer_token,
+        )
+    })
+    .await
+    .map_err(|_| PublicPluginManagementError::Unavailable)??;
     Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn set_plugin_window_pinned(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     controller: State<'_, Arc<PluginWindowController>>,
     pinned: bool,
@@ -909,18 +968,18 @@ pub(crate) fn set_plugin_window_pinned(
     Ok(plugin_window::set_pinned(
         &app,
         controller.inner().as_ref(),
-        window.label(),
+        webview.label(),
         pinned,
     )?)
 }
 
 #[tauri::command]
 pub(crate) fn close_plugin_window(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     controller: State<'_, Arc<PluginWindowController>>,
 ) -> Result<(), CommandError> {
-    plugin_window::close(&app, controller.inner().as_ref(), window.label())?;
+    plugin_window::close(&app, controller.inner().as_ref(), webview.label())?;
     Ok(())
 }
 #[tauri::command]
@@ -958,7 +1017,7 @@ pub(crate) async fn search_apps(
         else {
             return Ok(None);
         };
-        let theme = invocation_theme(settings.snapshot().theme);
+        let theme = invocation_theme(app, settings.snapshot().theme);
         let invoked_at = invoked_at_rfc3339();
         let submission = public.schedule_command(
             route.clone(),
@@ -1014,6 +1073,10 @@ pub(crate) async fn search_apps(
                     instance_number: 1,
                     data: response.data,
                 };
+                let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+                let _focus = coordinator
+                    .suppress_transient_focus_loss()
+                    .map_err(|_| CommandError::plugin_query_failed())?;
                 let app_handle = app.clone();
                 let prepared = tauri::async_runtime::spawn_blocking(move || {
                     plugin_window::prepare(&app_handle, controller, owner, update, &window_entry)
@@ -1051,10 +1114,27 @@ pub(crate) async fn search_apps(
     ))
 }
 
-pub(crate) fn invocation_theme(preference: ThemePreference) -> PluginInvocationTheme {
+pub(crate) fn invocation_theme(
+    app: &AppHandle,
+    preference: ThemePreference,
+) -> PluginInvocationTheme {
+    let system_theme = app
+        .get_window("main")
+        .and_then(|window| window.theme().ok());
+    resolve_invocation_theme(preference, system_theme)
+}
+
+fn resolve_invocation_theme(
+    preference: ThemePreference,
+    system_theme: Option<tauri::Theme>,
+) -> PluginInvocationTheme {
     match preference {
         ThemePreference::Dark => PluginInvocationTheme::Dark,
-        ThemePreference::System | ThemePreference::Light => PluginInvocationTheme::Light,
+        ThemePreference::Light => PluginInvocationTheme::Light,
+        ThemePreference::System if matches!(system_theme, Some(tauri::Theme::Dark)) => {
+            PluginInvocationTheme::Dark
+        }
+        ThemePreference::System => PluginInvocationTheme::Light,
     }
 }
 
@@ -1328,16 +1408,19 @@ pub(crate) fn load_settings(
     app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     settings: State<'_, SettingsStore>,
+    public_plugins: State<'_, Arc<PublicPluginService>>,
 ) -> Result<SettingsView, CommandError> {
     require_main_window(&window)?;
-    load_settings_ready_with(
+    let view = load_settings_ready_with(
         || {
             coordinator
                 .mark_frontend_ready(&app)
                 .map_err(|_| CommandError::window_failed())
         },
         || load_settings_core(&settings),
-    )
+    )?;
+    public_plugins.inner().start_enabled_runtimes(&app)?;
+    Ok(view)
 }
 
 fn load_settings_ready_with<R, L, T>(mark_ready: R, load: L) -> Result<T, CommandError>
@@ -2022,10 +2105,11 @@ mod tests {
         map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
         map_theme_preference_worker_result, prepare_file_query, prepare_hotkey_save,
         prepare_settings_save, publish_everything_search, require_find_label, require_main_label,
-        save_settings_core, save_settings_with, save_settings_worker_with, search_apps_with,
-        search_files_with, set_file_preview_preference_with, CommandError, ExecuteOutcome,
-        FilePreviewPreferenceUpdate, HotkeySettingsUpdate, PreparedFileQuery,
-        ThemePreferenceUpdate, UserSettingsUpdate,
+        resolve_invocation_theme, save_settings_core, save_settings_with,
+        save_settings_worker_with, search_apps_with, search_files_with,
+        select_public_plugin_source_with, set_file_preview_preference_with, CommandError,
+        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HotkeySettingsUpdate,
+        PreparedFileQuery, ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -2039,10 +2123,54 @@ mod tests {
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
+        public_plugins::PluginInvocationTheme,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference},
     };
     use tauri_plugin_global_shortcut::Shortcut;
+
+    #[test]
+    fn find_ready_outcome_uses_camel_case_fields() {
+        assert_eq!(
+            serde_json::to_value(FindReadyOutcome::Ready {
+                initialization_token: "find-initialization-1".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "status": "ready",
+                "initializationToken": "find-initialization-1"
+            })
+        );
+    }
+
+    #[test]
+    fn public_plugin_theme_uses_the_effective_system_scheme() {
+        for (preference, system_theme, expected) in [
+            (
+                ThemePreference::System,
+                Some(tauri::Theme::Dark),
+                PluginInvocationTheme::Dark,
+            ),
+            (
+                ThemePreference::System,
+                Some(tauri::Theme::Light),
+                PluginInvocationTheme::Light,
+            ),
+            (
+                ThemePreference::Dark,
+                Some(tauri::Theme::Light),
+                PluginInvocationTheme::Dark,
+            ),
+            (
+                ThemePreference::Light,
+                Some(tauri::Theme::Dark),
+                PluginInvocationTheme::Light,
+            ),
+            (ThemePreference::System, None, PluginInvocationTheme::Light),
+        ] {
+            assert_eq!(resolve_invocation_theme(preference, system_theme), expected);
+        }
+    }
 
     const APP_CURRENT: &str =
         "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2162,6 +2290,7 @@ mod tests {
             file_preview_enabled: true,
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
+            find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
         };
         fs::write(
@@ -2224,7 +2353,17 @@ mod tests {
             "save_plugin_settings",
             "uninstall_plugin",
         ] {
-            let marker = format!("pub(crate) fn {command}(");
+            let marker = format!(
+                "pub(crate) {}fn {command}(",
+                if matches!(
+                    command,
+                    "commit_public_plugin_install" | "set_plugin_enabled"
+                ) {
+                    "async "
+                } else {
+                    ""
+                }
+            );
             let body = source
                 .split(&marker)
                 .nth(1)
@@ -2261,11 +2400,147 @@ mod tests {
     }
 
     #[test]
+    fn public_plugin_picker_suppresses_focus_loss_only_while_the_dialog_is_open() {
+        let coordinator = Arc::new(LifecycleCoordinator::default());
+        let hides = Cell::new(0);
+        let expected = PathBuf::from(r"C:\Plugins\demo");
+
+        let selected = select_public_plugin_source_with("main", &coordinator, || {
+            coordinator
+                .handle_focus_event_with(false, || {
+                    hides.set(hides.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            Some(expected.clone())
+        });
+
+        assert_eq!(selected, Ok(Some(expected)));
+        assert_eq!(hides.get(), 0);
+
+        coordinator
+            .handle_focus_event_with(false, || {
+                hides.set(hides.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(hides.get(), 1);
+    }
+
+    #[test]
+    fn public_plugin_install_commit_suppresses_focus_before_runtime_creation() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let body = source
+            .split("pub(crate) async fn commit_public_plugin_install(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("commit command is missing");
+        let suppression = body
+            .find("suppress_transient_focus_loss()")
+            .expect("commit must suppress transient focus loss");
+        let runtime = body
+            .find("commit_with_readiness(")
+            .expect("commit readiness call is missing");
+        assert!(suppression < runtime);
+    }
+
+    #[test]
+    fn public_plugin_enable_suppresses_focus_before_runtime_creation() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let body = source
+            .split("pub(crate) async fn set_plugin_enabled(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("enable command is missing");
+        let suppression = body
+            .find("suppress_transient_focus_loss()")
+            .expect("enable must suppress transient focus loss");
+        let runtime = body
+            .find("set_enabled_with_readiness(")
+            .expect("enable readiness call is missing");
+        assert!(suppression < runtime);
+    }
+
+    #[test]
+    fn public_plugin_window_prepare_suppresses_transient_main_blur() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let search = source
+            .split("pub(crate) async fn search_apps(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn invocation_theme(").next())
+            .expect("search_apps command is missing");
+        let window_branch = search
+            .split("PublicPluginResponse::Window(response) =>")
+            .nth(1)
+            .expect("public plugin window branch is missing");
+        let suppression = window_branch
+            .find("let _focus = coordinator")
+            .expect("plugin window prepare must hold a focus suppression guard");
+        let prepare = window_branch
+            .find("plugin_window::prepare(")
+            .expect("plugin window prepare call is missing");
+        let wait = window_branch[prepare..]
+            .find(".await")
+            .map(|index| prepare + index)
+            .expect("plugin window prepare must remain asynchronous");
+
+        assert!(suppression < prepare);
+        assert!(prepare < wait);
+    }
+
+    #[test]
+    fn public_plugin_every_runtime_creation_from_management_commands_is_focus_suppressed() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let runtime_call = "service.create_runtime(&app, candidate)";
+        let mut remaining = production;
+        let mut checked = 0;
+        while let Some(index) = remaining.find(runtime_call) {
+            let command_prefix = &remaining[..index];
+            let command = command_prefix
+                .rsplit("#[tauri::command]")
+                .next()
+                .expect("runtime creation must belong to a Tauri command");
+            assert!(
+                command.contains("suppress_transient_focus_loss()"),
+                "public Runtime creation is missing transient focus suppression"
+            );
+            checked += 1;
+            remaining = &remaining[index + runtime_call.len()..];
+        }
+        assert!(
+            checked >= 2,
+            "expected install and enable Runtime creation paths"
+        );
+    }
+
+    #[test]
+    fn public_plugin_install_commit_is_async_so_runtime_events_can_settle() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        assert!(
+            source.contains("#[tauri::command]\npub(crate) async fn commit_public_plugin_install(")
+        );
+    }
+
+    #[test]
+    fn public_plugin_enable_is_async_so_runtime_events_can_settle() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        assert!(source.contains("#[tauri::command]\npub(crate) async fn set_plugin_enabled("));
+    }
+
+    #[test]
     fn plugin_window_commands_derive_identity_from_exact_caller_labels() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         let command_body = |name: &str| {
+            let synchronous = format!("pub(crate) fn {name}(");
+            let asynchronous = format!("pub(crate) async fn {name}(");
+            let marker = if source.contains(&asynchronous) {
+                asynchronous.as_str()
+            } else {
+                synchronous.as_str()
+            };
             source
-                .split(&format!("pub(crate) fn {name}("))
+                .split(marker)
                 .nth(1)
                 .and_then(|tail| tail.split("\n#[tauri::command]").next())
                 .unwrap_or_else(|| panic!("missing command {name}"))
@@ -2280,11 +2555,15 @@ mod tests {
         let guard = commit.find("require_main_window(&window)?;").unwrap();
         let transfer = commit.find("plugin_window::commit(").unwrap();
         assert!(guard < transfer);
-        for command in ["set_plugin_window_pinned", "close_plugin_window"] {
-            let body = command_body(command);
-            assert!(body.contains("window.label()"));
-            assert!(!body.contains("plugin_id:"));
-        }
+        let pin = command_body("set_plugin_window_pinned");
+        assert!(source
+            .contains("pub(crate) fn set_plugin_window_pinned(\n    webview: tauri::Webview,"));
+        assert!(pin.contains("webview.label()"));
+        assert!(!pin.contains("plugin_id:"));
+        let close = command_body("close_plugin_window");
+        assert!(source.contains("pub(crate) fn close_plugin_window(\n    webview: tauri::Webview,"));
+        assert!(close.contains("webview.label()"));
+        assert!(!close.contains("plugin_id:"));
     }
     #[test]
     fn search_rejects_old_or_hidden_queries_before_state_reads() {

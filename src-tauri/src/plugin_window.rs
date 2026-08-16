@@ -20,6 +20,8 @@ use crate::{
 
 const CONTENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const PLUGIN_BLUR_RECHECK_DELAY: Duration = Duration::from_millis(50);
 const PLUGIN_WINDOW_WIDTH: f64 = 520.0;
 const PLUGIN_WINDOW_HEIGHT: f64 = 360.0;
 const PLUGIN_SHELL_HEIGHT: f64 = 44.0;
@@ -65,6 +67,7 @@ struct ControllerCore {
 struct WindowState {
     generation: u64,
     pinned: bool,
+    focused: bool,
     phase: PluginWindowPhase,
     owner: PluginWindowOwner,
 }
@@ -88,6 +91,7 @@ impl PluginWindowController {
             WindowState {
                 generation: owner.plugin_generation,
                 pinned,
+                focused: false,
                 phase,
                 owner: owner.clone(),
             },
@@ -133,6 +137,60 @@ impl PluginWindowController {
             .unwrap_or(false)
     }
 
+    pub(crate) fn begin_focus_confirmation(&self, owner: &PluginWindowOwner) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(window) = core.windows.get_mut(&owner.plugin_id) else {
+            return false;
+        };
+        if window.owner != *owner || window.phase != PluginWindowPhase::AwaitingCommit {
+            return false;
+        }
+        window.focused = false;
+        true
+    }
+
+    pub(crate) fn observe_focus(&self, plugin_id: &str, focused: bool) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(window) = core.windows.get_mut(plugin_id) else {
+            return false;
+        };
+        window.focused = focused;
+        self.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn has_focus(&self, plugin_id: &str) -> bool {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| core.windows.get(plugin_id).map(|window| window.focused))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn wait_for_focus(&self, owner: &PluginWindowOwner, timeout: Duration) -> bool {
+        let Ok(core) = self.core.lock() else {
+            return false;
+        };
+        let Ok((core, _)) = self.changed.wait_timeout_while(core, timeout, |core| {
+            core.windows.get(&owner.plugin_id).is_some_and(|window| {
+                window.owner == *owner
+                    && window.phase == PluginWindowPhase::AwaitingCommit
+                    && !window.focused
+            })
+        }) else {
+            return false;
+        };
+        core.windows.get(&owner.plugin_id).is_some_and(|window| {
+            window.owner == *owner
+                && window.phase == PluginWindowPhase::AwaitingCommit
+                && window.focused
+        })
+    }
+
     pub(crate) fn set_pinned(&self, plugin_id: &str, pinned: bool) -> bool {
         self.core
             .lock()
@@ -149,7 +207,11 @@ impl PluginWindowController {
         self.core
             .lock()
             .ok()
-            .and_then(|core| core.windows.get(plugin_id).map(|window| !window.pinned))
+            .and_then(|core| {
+                core.windows.get(plugin_id).map(|window| {
+                    window.phase == PluginWindowPhase::Visible && !window.pinned && !window.focused
+                })
+            })
             .unwrap_or(false)
     }
 
@@ -353,13 +415,22 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
 
 pub(crate) fn content_ready(controller: &PluginWindowController, label: &str) -> bool {
     let Some(owner) = controller.owner_for_content(label) else {
+        eprintln!(
+            "[DEBUG-plugin-window-focus] content-ready label={} accepted=false reason=unknown-owner",
+            label
+        );
         return false;
     };
-    controller.advance(
+    let accepted = controller.advance(
         &owner,
         PluginWindowPhase::AwaitingReady,
         PluginWindowPhase::AwaitingAck,
-    ) || controller.is_current(&owner, PluginWindowPhase::AwaitingAck)
+    ) || controller.is_current(&owner, PluginWindowPhase::AwaitingAck);
+    eprintln!(
+        "[DEBUG-plugin-window-focus] content-ready plugin_id={} accepted={accepted}",
+        owner.plugin_id
+    );
+    accepted
 }
 
 pub(crate) fn content_ack(
@@ -368,14 +439,24 @@ pub(crate) fn content_ack(
     request_id: &str,
 ) -> bool {
     let Some(owner) = controller.owner_for_content(label) else {
+        eprintln!(
+            "[DEBUG-plugin-window-focus] content-ack label={} accepted=false reason=unknown-owner",
+            label
+        );
         return false;
     };
-    owner.request_id == request_id
+    let request_matches = owner.request_id == request_id;
+    let accepted = request_matches
         && controller.advance(
             &owner,
             PluginWindowPhase::AwaitingAck,
             PluginWindowPhase::AwaitingFocus,
-        )
+        );
+    eprintln!(
+        "[DEBUG-plugin-window-focus] content-ack plugin_id={} request_matches={request_matches} accepted={accepted}",
+        owner.plugin_id
+    );
+    accepted
 }
 
 pub(crate) fn prepare(
@@ -388,61 +469,118 @@ pub(crate) fn prepare(
     let transaction = controller
         .submit(owner.clone())
         .ok_or(PublicPluginManagementError::Unavailable)?;
-    if app.get_webview_window(&transaction.shell_label).is_none() {
-        create_window(app, Arc::clone(&controller), &transaction, window_entry)?;
+    let shell_exists = app.get_window(&transaction.shell_label).is_some();
+    eprintln!(
+        "[DEBUG-plugin-window-focus] prepare-start plugin_id={} shell_exists={shell_exists}",
+        owner.plugin_id
+    );
+    if !shell_exists {
+        let created = create_window(app, Arc::clone(&controller), &transaction, window_entry);
+        eprintln!(
+            "[DEBUG-plugin-window-focus] create-window-result plugin_id={} ok={}",
+            owner.plugin_id,
+            created.is_ok()
+        );
+        created?;
     }
-    if controller.is_current(&owner, PluginWindowPhase::AwaitingReady)
-        && !controller.wait_for(
+
+    let awaiting_ready = controller.is_current(&owner, PluginWindowPhase::AwaitingReady);
+    let ready = !awaiting_ready
+        || controller.wait_for(
             &owner,
             PluginWindowPhase::AwaitingAck,
             CONTENT_READY_TIMEOUT,
-        )
-    {
+        );
+    eprintln!(
+        "[DEBUG-plugin-window-focus] ready-wait plugin_id={} awaiting_ready={awaiting_ready} ready={ready}",
+        owner.plugin_id
+    );
+    if !ready {
         teardown(app, &controller, &owner.plugin_id, owner.plugin_generation);
         return Err(PublicPluginManagementError::RuntimeNotReady);
     }
-    if !controller.is_current(&owner, PluginWindowPhase::AwaitingAck) {
+
+    let awaiting_ack = controller.is_current(&owner, PluginWindowPhase::AwaitingAck);
+    eprintln!(
+        "[DEBUG-plugin-window-focus] ready-state plugin_id={} awaiting_ack={awaiting_ack}",
+        owner.plugin_id
+    );
+    if !awaiting_ack {
         return Err(PublicPluginManagementError::Unavailable);
     }
+
+    eprintln!(
+        "[DEBUG-plugin-window-focus] shell-lookup-start plugin_id={}",
+        owner.plugin_id
+    );
     let shell = app
-        .get_webview_window(&transaction.shell_label)
+        .get_webview(&transaction.shell_label)
         .ok_or(PublicPluginManagementError::Unavailable)?;
+    eprintln!(
+        "[DEBUG-plugin-window-focus] shell-lookup-found plugin_id={}",
+        owner.plugin_id
+    );
     let theme = match update.theme {
         PluginInvocationTheme::Dark => "dark",
         PluginInvocationTheme::Light => "light",
     };
-    shell
-        .eval(format!(
-            "document.documentElement.dataset.colorScheme={};",
-            serde_json::to_string(theme).expect("static theme serializes")
-        ))
-        .map_err(|_| PublicPluginManagementError::Unavailable)?;
-    let content = app
-        .get_webview(&transaction.content_label)
-        .ok_or(PublicPluginManagementError::Unavailable)?;
+    eprintln!(
+        "[DEBUG-plugin-window-focus] theme-eval-start plugin_id={}",
+        owner.plugin_id
+    );
+    let theme_eval = shell.eval(format!(
+        "document.documentElement.dataset.colorScheme={};",
+        serde_json::to_string(theme).expect("static theme serializes")
+    ));
+    eprintln!(
+        "[DEBUG-plugin-window-focus] theme-eval plugin_id={} ok={}",
+        owner.plugin_id,
+        theme_eval.is_ok()
+    );
+    theme_eval.map_err(|_| PublicPluginManagementError::Unavailable)?;
+
+    let content = app.get_webview(&transaction.content_label);
+    eprintln!(
+        "[DEBUG-plugin-window-focus] content-lookup plugin_id={} found={}",
+        owner.plugin_id,
+        content.is_some()
+    );
+    let content = content.ok_or(PublicPluginManagementError::Unavailable)?;
     let payload =
         serde_json::to_string(&update).map_err(|_| PublicPluginManagementError::Unavailable)?;
-    content
-        .eval(format!(
-            "window.__UIPILOT_PLUGIN_WINDOW_UPDATE__({payload});"
-        ))
-        .map_err(|_| PublicPluginManagementError::Unavailable)?;
-    if !controller.wait_for(
+    let update_eval = content.eval(format!(
+        "window.__UIPILOT_PLUGIN_WINDOW_UPDATE__({payload});"
+    ));
+    eprintln!(
+        "[DEBUG-plugin-window-focus] update-eval plugin_id={} ok={}",
+        owner.plugin_id,
+        update_eval.is_ok()
+    );
+    update_eval.map_err(|_| PublicPluginManagementError::Unavailable)?;
+
+    let acked = controller.wait_for(
         &owner,
         PluginWindowPhase::AwaitingFocus,
         CONTENT_ACK_TIMEOUT,
-    ) || !controller.advance(
-        &owner,
-        PluginWindowPhase::AwaitingFocus,
-        PluginWindowPhase::AwaitingCommit,
-    ) {
+    );
+    let advanced = acked
+        && controller.advance(
+            &owner,
+            PluginWindowPhase::AwaitingFocus,
+            PluginWindowPhase::AwaitingCommit,
+        );
+    eprintln!(
+        "[DEBUG-plugin-window-focus] ack-wait plugin_id={} acked={acked} advanced={advanced}",
+        owner.plugin_id
+    );
+    if !advanced {
         return Err(PublicPluginManagementError::Unavailable);
     }
+
     Ok(PluginWindowPrepared {
         transfer_token: owner.submission_token,
     })
 }
-
 fn create_window(
     app: &AppHandle,
     controller: Arc<PluginWindowController>,
@@ -505,8 +643,43 @@ fn create_window(
     let event_shell = shell.clone();
     let event_app = app.clone();
     shell.on_window_event(move |event| match event {
-        tauri::WindowEvent::Focused(false) if event_controller.should_hide_on_blur(&plugin_id) => {
-            let _ = event_shell.hide();
+        tauri::WindowEvent::Focused(true) => {
+            let observed = event_controller.observe_focus(&plugin_id, true);
+            eprintln!(
+                "[DEBUG-plugin-window-focus] focus-event plugin_id={} focused=true observed={observed} hide_admitted={}",
+                plugin_id,
+                event_controller.should_hide_on_blur(&plugin_id)
+            );
+        }
+        tauri::WindowEvent::Focused(false) => {
+            let observed = event_controller.observe_focus(&plugin_id, false);
+            eprintln!(
+                "[DEBUG-plugin-window-focus] focus-event plugin_id={} focused=false observed={observed} hide_admitted={}",
+                plugin_id,
+                event_controller.should_hide_on_blur(&plugin_id)
+            );
+            let blur_controller = Arc::clone(&event_controller);
+            let blur_shell = event_shell.clone();
+            let blur_plugin_id = plugin_id.clone();
+            let blur_app = event_app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(PLUGIN_BLUR_RECHECK_DELAY);
+                let _ = blur_app.run_on_main_thread(move || {
+                    let focused = blur_controller.has_focus(&blur_plugin_id);
+                    let hide_admitted = blur_controller.should_hide_on_blur(&blur_plugin_id);
+                    eprintln!(
+                        "[DEBUG-plugin-window-focus] blur-recheck plugin_id={} focused={focused} hide_admitted={hide_admitted}",
+                        blur_plugin_id
+                    );
+                    if !focused && hide_admitted {
+                        let result = blur_shell.hide();
+                        eprintln!(
+                            "[DEBUG-plugin-window-focus] auto-hide plugin_id={} result={result:?}",
+                            blur_plugin_id
+                        );
+                    }
+                });
+            });
         }
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -543,9 +716,18 @@ pub(crate) fn commit(
         .ok_or(PublicPluginManagementError::Unavailable)?;
     let shell_label =
         plugin_shell_label(&owner.plugin_id).ok_or(PublicPluginManagementError::Unavailable)?;
+    let content_label =
+        plugin_content_label(&owner.plugin_id).ok_or(PublicPluginManagementError::Unavailable)?;
     let shell = app
-        .get_webview_window(&shell_label)
+        .get_window(&shell_label)
         .ok_or(PublicPluginManagementError::Unavailable)?;
+    let content = app
+        .get_webview(&content_label)
+        .ok_or(PublicPluginManagementError::Unavailable)?;
+    eprintln!(
+        "[DEBUG-plugin-window-focus] commit-start plugin_id={}",
+        owner.plugin_id
+    );
     let snapshot = MainWindowSnapshot {
         visible: main
             .is_visible()
@@ -578,20 +760,45 @@ pub(crate) fn commit(
             return Err(());
         }
         shell.show().map_err(|_| ())?;
+        eprintln!(
+            "[DEBUG-plugin-window-focus] shell-show-ok plugin_id={}",
+            owner.plugin_id
+        );
         if !still_current() {
             return Err(());
         }
+        if !controller.begin_focus_confirmation(&owner) {
+            return Err(());
+        }
         shell.set_focus().map_err(|_| ())?;
-        if !still_current() || !shell.is_focused().map_err(|_| ())? {
+        content.set_focus().map_err(|_| ())?;
+        eprintln!(
+            "[DEBUG-plugin-window-focus] content-focus-request-ok plugin_id={}",
+            owner.plugin_id
+        );
+        let shell_focused = controller.wait_for_focus(&owner, PLUGIN_FOCUS_CONFIRM_TIMEOUT);
+        eprintln!(
+            "[DEBUG-plugin-window-focus] shell-focus-check plugin_id={} focused={shell_focused}",
+            owner.plugin_id
+        );
+        if !shell_focused || !still_current() {
             return Err(());
         }
         main.hide().map_err(|_| ())?;
+        eprintln!(
+            "[DEBUG-plugin-window-focus] main-hide-ok plugin_id={}",
+            owner.plugin_id
+        );
         if !still_current() {
             return Err(());
         }
         Ok(())
     })();
     if native.is_err() {
+        eprintln!(
+            "[DEBUG-plugin-window-focus] commit-native-failed plugin_id={}",
+            owner.plugin_id
+        );
         if let Some(snapshot) = transfers.rollback(&lease) {
             let _ = main.set_always_on_top(snapshot.always_on_top);
             let _ = if snapshot.visible {
@@ -606,12 +813,17 @@ pub(crate) fn commit(
         let _ = shell.hide();
         return Err(PublicPluginManagementError::Unavailable);
     }
-    if !controller.advance(
+    let advanced = controller.advance(
         &owner,
         PluginWindowPhase::AwaitingCommit,
         PluginWindowPhase::Visible,
-    ) || !transfers.commit(&lease)
-    {
+    );
+    let committed = advanced && transfers.commit(&lease);
+    eprintln!(
+        "[DEBUG-plugin-window-focus] commit-finish plugin_id={} advanced={advanced} committed={committed}",
+        owner.plugin_id
+    );
+    if !advanced || !committed {
         let _ = shell.hide();
         return Err(PublicPluginManagementError::Unavailable);
     }
@@ -631,7 +843,7 @@ pub(crate) fn set_pinned(
         return Err(PublicPluginManagementError::Unavailable);
     }
     let shell = app
-        .get_webview_window(shell_label)
+        .get_window(shell_label)
         .ok_or(PublicPluginManagementError::Unavailable)?;
     shell
         .set_always_on_top(false)
@@ -647,13 +859,14 @@ pub(crate) fn close(
     let owner = controller
         .owner_for_shell(shell_label)
         .ok_or(PublicPluginManagementError::InvalidCaller)?;
+    app.get_window(shell_label)
+        .ok_or(PublicPluginManagementError::Unavailable)?
+        .hide()
+        .map_err(|_| PublicPluginManagementError::Unavailable)?;
     if !controller.close(&owner.plugin_id) {
         return Err(PublicPluginManagementError::Unavailable);
     }
-    app.get_webview_window(shell_label)
-        .ok_or(PublicPluginManagementError::Unavailable)?
-        .hide()
-        .map_err(|_| PublicPluginManagementError::Unavailable)
+    Ok(())
 }
 
 pub(crate) fn teardown_current(
@@ -663,7 +876,7 @@ pub(crate) fn teardown_current(
 ) {
     if controller.remove_plugin(plugin_id) {
         if let Some(label) = plugin_shell_label(plugin_id) {
-            if let Some(window) = app.get_webview_window(&label) {
+            if let Some(window) = app.get_window(&label) {
                 let _ = window.destroy();
             }
         }
@@ -677,7 +890,7 @@ pub(crate) fn teardown(
 ) {
     if controller.invalidate_generation(plugin_id, generation) {
         if let Some(label) = plugin_shell_label(plugin_id) {
-            if let Some(window) = app.get_webview_window(&label) {
+            if let Some(window) = app.get_window(&label) {
                 let _ = window.destroy();
             }
         }
@@ -727,16 +940,148 @@ mod tests {
     }
 
     #[test]
+    fn blur_hiding_is_disallowed_until_the_window_is_visible() {
+        let controller = PluginWindowController::default();
+        let current = owner("blur", 4, "request-blur");
+        controller.submit(current.clone()).unwrap();
+
+        for (expected, next) in [
+            (
+                PluginWindowPhase::AwaitingReady,
+                PluginWindowPhase::AwaitingAck,
+            ),
+            (
+                PluginWindowPhase::AwaitingAck,
+                PluginWindowPhase::AwaitingFocus,
+            ),
+            (
+                PluginWindowPhase::AwaitingFocus,
+                PluginWindowPhase::AwaitingCommit,
+            ),
+            (
+                PluginWindowPhase::AwaitingCommit,
+                PluginWindowPhase::Visible,
+            ),
+        ] {
+            assert!(!controller.should_hide_on_blur(&current.plugin_id));
+            assert!(controller.advance(&current, expected, next));
+        }
+
+        assert!(controller.should_hide_on_blur(&current.plugin_id));
+    }
+
+    #[test]
+    fn focus_event_confirms_current_commit() {
+        let controller = PluginWindowController::default();
+        let current = owner("focus", 4, "request-focus");
+        controller.submit(current.clone()).unwrap();
+        for (expected, next) in [
+            (
+                PluginWindowPhase::AwaitingReady,
+                PluginWindowPhase::AwaitingAck,
+            ),
+            (
+                PluginWindowPhase::AwaitingAck,
+                PluginWindowPhase::AwaitingFocus,
+            ),
+            (
+                PluginWindowPhase::AwaitingFocus,
+                PluginWindowPhase::AwaitingCommit,
+            ),
+        ] {
+            assert!(controller.advance(&current, expected, next));
+        }
+        assert!(controller.begin_focus_confirmation(&current));
+        assert!(!controller.wait_for_focus(&current, Duration::ZERO));
+        assert!(controller.observe_focus(&current.plugin_id, true));
+        assert!(controller.wait_for_focus(&current, Duration::ZERO));
+    }
+
+    #[test]
+    fn refocus_cancels_blur_hiding() {
+        let controller = PluginWindowController::default();
+        let current = owner("refocus", 4, "request-refocus");
+        controller.submit(current.clone()).unwrap();
+        for (expected, next) in [
+            (
+                PluginWindowPhase::AwaitingReady,
+                PluginWindowPhase::AwaitingAck,
+            ),
+            (
+                PluginWindowPhase::AwaitingAck,
+                PluginWindowPhase::AwaitingFocus,
+            ),
+            (
+                PluginWindowPhase::AwaitingFocus,
+                PluginWindowPhase::AwaitingCommit,
+            ),
+            (
+                PluginWindowPhase::AwaitingCommit,
+                PluginWindowPhase::Visible,
+            ),
+        ] {
+            assert!(controller.advance(&current, expected, next));
+        }
+        assert!(controller.observe_focus(&current.plugin_id, false));
+        assert!(controller.should_hide_on_blur(&current.plugin_id));
+        assert!(controller.observe_focus(&current.plugin_id, true));
+        assert!(controller.has_focus(&current.plugin_id));
+        assert!(!controller.should_hide_on_blur(&current.plugin_id));
+    }
+
+    #[test]
     fn pin_close_and_generation_invalidation_are_host_owned() {
         let controller = PluginWindowController::default();
         let current = owner("current", 4, "request-current");
         controller.submit(current.clone()).unwrap();
+        assert!(controller.advance(
+            &current,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::AwaitingAck
+        ));
+        assert!(controller.advance(
+            &current,
+            PluginWindowPhase::AwaitingAck,
+            PluginWindowPhase::AwaitingFocus
+        ));
+        assert!(controller.advance(
+            &current,
+            PluginWindowPhase::AwaitingFocus,
+            PluginWindowPhase::AwaitingCommit
+        ));
+        assert!(controller.advance(
+            &current,
+            PluginWindowPhase::AwaitingCommit,
+            PluginWindowPhase::Visible
+        ));
         assert!(controller.set_pinned(&current.plugin_id, true));
         assert!(!controller.should_hide_on_blur(&current.plugin_id));
         assert!(controller.close(&current.plugin_id));
         assert!(controller.should_hide_on_blur(&current.plugin_id));
         assert!(controller.invalidate_generation(&current.plugin_id, 4));
         assert!(!controller.is_current(&current, PluginWindowPhase::AwaitingReady));
+    }
+
+    #[test]
+    fn explicit_close_resets_pin_only_after_native_hide_succeeds() {
+        let source = include_str!("plugin_window.rs").replace(
+            "
+", "
+",
+        );
+        let close = source
+            .split(
+                "pub(crate) fn close(
+    app: &AppHandle,",
+            )
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn teardown_current(").next())
+            .expect("plugin window close function is missing");
+        let hide = close.find(".hide()").expect("native hide is missing");
+        let reset = close
+            .find("controller.close(&owner.plugin_id)")
+            .expect("pin reset is missing");
+        assert!(hide < reset);
     }
 
     #[test]
@@ -823,6 +1168,83 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn multi_webview_plugin_shell_avoids_webview_window_lookup() {
+        let source = include_str!("plugin_window.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("plugin window test module marker is missing");
+
+        assert_eq!(production.matches("get_webview_window(").count(), 1);
+        assert!(production.contains(".get_webview_window(\"main\")"));
+        assert!(production.contains(".get_webview(&transaction.shell_label)"));
+    }
+
+    #[test]
+    fn plugin_window_commit_waits_for_focus_event_before_hiding_main() {
+        let commands = include_str!("commands.rs").replace("\r\n", "\n");
+        assert!(commands
+            .contains("#[tauri::command]\npub(crate) async fn commit_plugin_window_transfer("));
+        let command = commands
+            .split("pub(crate) async fn commit_plugin_window_transfer(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("async plugin window commit command is missing");
+        assert!(command.contains("tauri::async_runtime::spawn_blocking"));
+
+        let source = include_str!("plugin_window.rs").replace("\r\n", "\n");
+        let commit = source
+            .split("pub(crate) fn commit(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn set_pinned(").next())
+            .expect("plugin window commit source markers are missing");
+        let reset = commit
+            .find("controller.begin_focus_confirmation(&owner)")
+            .expect("focus confirmation reset is missing");
+        let request = commit
+            .find("shell.set_focus()")
+            .expect("native focus request is missing");
+        let content_request = commit
+            .find("content.set_focus()")
+            .expect("content webview focus request is missing");
+        let evidence = commit
+            .find("controller.wait_for_focus(")
+            .expect("focus event wait is missing");
+        let hide = commit.find("main.hide()").expect("main hide is missing");
+        assert!(reset < request && request < content_request && content_request < evidence);
+        assert!(evidence < hide);
+        assert!(!commit.contains("shell.is_focused()"));
+    }
+
+    #[test]
+    fn blur_event_rechecks_observed_focus_before_hiding() {
+        let source = include_str!("plugin_window.rs").replace("\r\n", "\n");
+        let handler = source
+            .split("shell.on_window_event(move |event|")
+            .nth(1)
+            .and_then(|tail| tail.split("    Ok(())").next())
+            .expect("plugin window event handler source markers are missing");
+        assert!(handler.contains("event_controller.observe_focus(&plugin_id, true)"));
+        assert!(handler.contains("event_controller.observe_focus(&plugin_id, false)"));
+        let deferred = handler
+            .find("std::thread::spawn")
+            .expect("blur handling must leave the event callback");
+        let wait = handler
+            .find("std::thread::sleep(PLUGIN_BLUR_RECHECK_DELAY)")
+            .expect("blur handling must allow transient child focus to settle");
+        let focus_recheck = handler
+            .find("blur_controller.has_focus(&blur_plugin_id)")
+            .expect("blur handling must recheck observed focus");
+        let hide = handler
+            .find(".hide()")
+            .expect("blur handling must retain unpinned auto-hide");
+
+        assert!(deferred < wait && wait < focus_recheck && focus_recheck < hide);
+        assert!(!handler.contains("blur_shell.is_focused()"));
+    }
+
     #[test]
     fn shell_and_content_labels_are_disjoint_and_plugin_owned() {
         let shell = plugin_shell_label("com.example.demo").unwrap();

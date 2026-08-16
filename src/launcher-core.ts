@@ -19,6 +19,7 @@ import {
   type PluginListStatus,
   type PluginMutationKind,
   type ResultItem,
+  type SearchResponse,
   type SettingsLoadStatus,
   type SettingsView,
   type ThemePreference,
@@ -381,6 +382,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let pluginInventoryActive = false
   const legacyFindClient = client as unknown as Pick<FindClient, 'searchFiles' | 'setPreviewPreference'>
   let findSubmissionToken = 0
+  let applicationSearch: {
+    invocationId: string
+    sequence: number
+    query: string
+    completion: Promise<SearchResponse | null>
+  } | undefined
 
 
   function publish(mutated: boolean): void {
@@ -539,36 +546,63 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.status = ''
     model.shownNotice = undefined
     publish(true)
-    let pending
-    try {
-      pending = client.openFind({ query, invocationId, querySequence: owner.querySequence })
-    } catch (error) {
-      pending = Promise.reject(error)
+    const ownsSubmission = () =>
+      !destroyed && owner.token === findSubmissionToken && owner.epoch === model.viewEpoch &&
+      owner.control === model.queryControl && owner.value === model.queryControlValue &&
+      owner.invocationId === model.invocationId && owner.querySequence === model.querySequence
+    const fail = () => {
+      if (!ownsSubmission()) return
+      model.status = '文件搜索窗口暂不可用。'
+      publish(true)
     }
-    void pending.then(
-      (outcome) => {
-        if (destroyed || outcome.status !== 'forwarded' || owner.token !== findSubmissionToken ||
-            owner.epoch !== model.viewEpoch || owner.control !== model.queryControl ||
-            owner.value !== model.queryControlValue || owner.invocationId !== model.invocationId ||
-            owner.querySequence !== model.querySequence) return
-        searchToken = ++token
-        model.searchPending = false
-        model.query = ''
-        model.queryControlValue = ''
-        model.status = ''
-        clearResults()
-        publish(true)
-      },
+    const matchingSearch = applicationSearch?.invocationId === invocationId &&
+      applicationSearch.sequence === owner.querySequence && applicationSearch.query === owner.value
+      ? applicationSearch.completion
+      : undefined
+    let ownership = matchingSearch
+    if (!ownership) {
+      try {
+        ownership = client.searchApps({
+          query: owner.value,
+          invocationId,
+          querySequence: owner.querySequence,
+        })
+      } catch (error) {
+        ownership = Promise.reject(error)
+      }
+      applicationSearch = {
+        invocationId,
+        sequence: owner.querySequence,
+        query: owner.value,
+        completion: ownership,
+      }
+    }
+    void ownership.then(
       () => {
-        if (destroyed || owner.token !== findSubmissionToken || owner.epoch !== model.viewEpoch ||
-            owner.control !== model.queryControl || owner.value !== model.queryControlValue ||
-            owner.invocationId !== model.invocationId || owner.querySequence !== model.querySequence) return
-        model.status = '文件搜索窗口暂不可用。'
-        publish(true)
+        if (!ownsSubmission()) return
+        let pending
+        try {
+          pending = client.openFind({ query, invocationId, querySequence: owner.querySequence })
+        } catch (error) {
+          pending = Promise.reject(error)
+        }
+        void pending.then(
+          (outcome) => {
+            if (!ownsSubmission() || outcome.status !== 'forwarded') return
+            searchToken = ++token
+            model.searchPending = false
+            model.query = ''
+            model.queryControlValue = ''
+            model.status = ''
+            clearResults()
+            publish(true)
+          },
+          fail,
+        )
       },
+      fail,
     )
   }
-
   function fileStatusText(status: FileIndexStatus, hasResults = true): string {
     if (status === 'building') return '正在索引。'
     if (status === 'partial') return '部分位置无法访问。'
@@ -751,7 +785,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     searchToken = captured.token
     model.searchPending = true
-    let pending: Promise<import('./protocol').SearchResponse | null>
+    let pending: Promise<SearchResponse | null>
     try {
       pending = client.searchApps({
         query: captured.query,
@@ -762,12 +796,19 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     } catch (error) {
       pending = Promise.reject(error)
     }
+    if (!captured.query.startsWith('/')) {
+      applicationSearch = {
+        invocationId,
+        sequence: captured.sequence,
+        query: captured.query,
+        completion: pending,
+      }
+    }
     void pending.then(
       (response) => finishSearch(captured, response),
       (error: unknown) => failSearch(captured, error),
     )
   }
-
   function scheduleSearch(): void {
     cancelSlashSearch()
     if (!model.query.startsWith('/')) {

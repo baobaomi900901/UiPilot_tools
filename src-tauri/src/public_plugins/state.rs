@@ -368,6 +368,36 @@ impl PluginStateStore {
         })
     }
 
+    pub(crate) fn enable_with_generation(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Result<EffectivePluginConfig, PluginStateError> {
+        if generation == 0 {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed || generation <= previous.document.active_generation {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let revision = next_revision(state.revision)?;
+        let mut document = previous.document.clone();
+        document.enabled = true;
+        document.fault = None;
+        document.active_generation = generation;
+        document.inventory_revision = revision;
+        self.persist_revision(revision)?;
+        let stored = self.persist(&document, Some(previous))?;
+        let view = document.view();
+        state.revision = revision;
+        state.by_plugin.insert(plugin_id.into(), stored);
+        Ok(view)
+    }
+
     pub(crate) fn disable_for_fault(
         &self,
         plugin_id: &str,

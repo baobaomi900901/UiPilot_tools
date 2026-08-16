@@ -48,6 +48,7 @@ pub(crate) const TRAY_OPEN_LAUNCHER: &str = "uipilot.tray.open-launcher";
 pub(crate) const TRAY_OPEN_SETTINGS: &str = "uipilot.tray.open-settings";
 pub(crate) const TRAY_QUIT: &str = "uipilot.tray.quit";
 const SESSION_SUBCLASS_ID: usize = 0x5550_494c;
+const FIND_POSITION_SUBCLASS_ID: usize = 0x5550_494d;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrayAction {
@@ -859,13 +860,14 @@ impl LifecycleCoordinator {
     ) -> Result<(), LifecycleError> {
         let dispatcher = app.clone();
         let app_for_show = app.clone();
-        self.request_show_with(target, move |coordinator, target| {
+        let result = self.request_show_with(target, move |coordinator, target| {
             dispatcher
                 .run_on_main_thread(move || {
                     coordinator.handle_request_main(&app_for_show, target);
                 })
                 .map_err(|_| ())
-        })
+        });
+        result
     }
 
     pub(crate) fn mark_setup_ready(
@@ -894,11 +896,10 @@ impl LifecycleCoordinator {
     }
 
     fn handle_request_main(self: &Arc<Self>, app: &AppHandle, target: ShowTarget) {
-        let target = self
-            .readiness
-            .lock()
-            .expect("readiness lock poisoned")
-            .request(target);
+        let target = {
+            let mut readiness = self.readiness.lock().expect("readiness lock poisoned");
+            readiness.request(target)
+        };
         if let Some(target) = target {
             let _ = self.show_main(app, target);
         }
@@ -985,7 +986,10 @@ impl LifecycleCoordinator {
         let mut place_window = || place_main_window(&window, saved_position);
         let mut always_on_top = || window.set_always_on_top(true).map_err(|_| ());
         let mut show = || window.show().map_err(|_| ());
-        let mut focus = || window.set_focus().map_err(|_| ());
+        let mut focus = || {
+            window.set_focus().map_err(|_| ())?;
+            window.as_ref().set_focus().map_err(|_| ())
+        };
         let mut registry_on_show = |invocation_id| registry.on_show(invocation_id);
         let mut emit =
             |payload: &LauncherShown| window.emit("launcher://shown", payload).map_err(|_| ());
@@ -1505,6 +1509,86 @@ fn save_window_position(app: &AppHandle) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+fn save_find_window_position(app: &AppHandle) -> Result<(), ()> {
+    let position = app
+        .get_webview_window("find")
+        .ok_or(())?
+        .outer_position()
+        .map_err(|_| ())?;
+    app.state::<SettingsStore>()
+        .set_find_window_position(WindowPosition {
+            x: position.x,
+            y: position.y,
+        })
+        .map_err(|_| ())
+}
+
+unsafe extern "system" fn find_position_subclass_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    context: usize,
+) -> LRESULT {
+    let app = unsafe { (&*(context as *const AppHandle)).clone() };
+    match message {
+        WM_ENTERSIZEMOVE => {
+            app.state::<Arc<FindWindowController>>().begin_native_move();
+        }
+        WM_EXITSIZEMOVE => {
+            let _ = save_find_window_position(&app);
+            let focused = app
+                .get_webview_window("find")
+                .and_then(|window| window.is_focused().ok())
+                .unwrap_or(true);
+            let registries = app.state::<ResultRegistries>();
+            let controller = app.state::<Arc<FindWindowController>>();
+            let effect = controller.finish_native_move(focused);
+            let _ =
+                handle_find_focus_effect(&app, controller.inner().as_ref(), &registries, effect);
+        }
+        WM_NCDESTROY => {
+            let _ = unsafe {
+                remove_subclass_context_with::<AppHandle, _>(context, || {
+                    RemoveWindowSubclass(
+                        hwnd,
+                        Some(find_position_subclass_proc),
+                        FIND_POSITION_SUBCLASS_ID,
+                    )
+                    .as_bool()
+                })
+            };
+        }
+        _ => {}
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+fn normalize_native_focus_snapshot(
+    main_focused: bool,
+    find_focused: bool,
+    foreground: ForegroundWindow,
+) -> NativeFocusSnapshot {
+    match foreground {
+        ForegroundWindow::Main => NativeFocusSnapshot {
+            main_focused: true,
+            find_focused: false,
+            foreground,
+        },
+        ForegroundWindow::Find => NativeFocusSnapshot {
+            main_focused: false,
+            find_focused: true,
+            foreground,
+        },
+        ForegroundWindow::Other => NativeFocusSnapshot {
+            main_focused,
+            find_focused,
+            foreground,
+        },
+    }
+}
+
 fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, LifecycleError> {
     let main = app
         .get_webview_window("main")
@@ -1528,11 +1612,11 @@ fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, Lifecycl
     } else {
         ForegroundWindow::Other
     };
-    Ok(NativeFocusSnapshot {
+    Ok(normalize_native_focus_snapshot(
         main_focused,
         find_focused,
         foreground,
-    })
+    ))
 }
 
 pub(crate) fn start_find_transfer(
@@ -1574,10 +1658,16 @@ pub(crate) fn start_find_transfer(
         )
         .ok_or(LifecycleError::WindowFailed)?;
 
+    if !find_visible {
+        let saved_position = app.state::<SettingsStore>().find_window_position();
+        let _ = place_main_window(&find, saved_position);
+    }
+
     let native_result = main
         .set_always_on_top(false)
         .and_then(|()| find.show())
-        .and_then(|()| find.set_focus());
+        .and_then(|()| find.set_focus())
+        .and_then(|()| find.as_ref().set_focus());
     if native_result.is_err() {
         if let Some(snapshot) = transfers.rollback(&lease) {
             let _ = main.set_always_on_top(snapshot.always_on_top);
@@ -1615,9 +1705,8 @@ pub(crate) fn advance_find_transfer(
         return Ok(());
     };
     let snapshot = find_native_snapshot(app)?;
-    if controller.confirm_transfer_focus(transfer_id, snapshot)
-        != TransferFocusResult::CommitFindScope
-    {
+    let focus_result = controller.confirm_transfer_focus(transfer_id, snapshot);
+    if focus_result != TransferFocusResult::CommitFindScope {
         return Ok(());
     }
     let payload = controller
@@ -1669,11 +1758,6 @@ pub(crate) fn handle_find_focus_effect(
         FocusEffect::RecheckNativeSnapshot(transfer_id) => {
             advance_find_transfer(app, controller, registries, transfer_id)
         }
-        FocusEffect::RefocusFind => app
-            .get_webview_window("find")
-            .ok_or(LifecycleError::WindowFailed)?
-            .set_focus()
-            .map_err(|_| LifecycleError::WindowFailed),
         FocusEffect::RestoreMainTopmost => app
             .get_webview_window("main")
             .ok_or(LifecycleError::WindowFailed)?
@@ -1708,6 +1792,26 @@ pub(crate) fn install_session_end_hook(
             hwnd,
             Some(session_subclass_proc),
             SESSION_SUBCLASS_ID,
+            context,
+        )
+        .as_bool()
+    })
+    .map(|_| ())
+    .map_err(|_| LifecycleError::SessionHookFailed)
+}
+
+pub(crate) fn install_find_position_hook(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<(), LifecycleError> {
+    let hwnd = window
+        .hwnd()
+        .map_err(|_| LifecycleError::SessionHookFailed)?;
+    install_subclass_context_with(app.clone(), |context| unsafe {
+        SetWindowSubclass(
+            hwnd,
+            Some(find_position_subclass_proc),
+            FIND_POSITION_SUBCLASS_ID,
             context,
         )
         .as_bool()
@@ -1757,6 +1861,47 @@ mod tests {
             ReadyOrder::FrontendFirst => [state.mark_frontend_ready(), state.mark_setup_ready()],
         };
         results.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn foreground_window_normalizes_webview_child_focus_false_negatives() {
+        for (main_focused, find_focused, foreground, expected) in [
+            (
+                false,
+                false,
+                ForegroundWindow::Main,
+                NativeFocusSnapshot {
+                    main_focused: true,
+                    find_focused: false,
+                    foreground: ForegroundWindow::Main,
+                },
+            ),
+            (
+                false,
+                false,
+                ForegroundWindow::Find,
+                NativeFocusSnapshot {
+                    main_focused: false,
+                    find_focused: true,
+                    foreground: ForegroundWindow::Find,
+                },
+            ),
+            (
+                true,
+                true,
+                ForegroundWindow::Main,
+                NativeFocusSnapshot {
+                    main_focused: true,
+                    find_focused: false,
+                    foreground: ForegroundWindow::Main,
+                },
+            ),
+        ] {
+            assert_eq!(
+                normalize_native_focus_snapshot(main_focused, find_focused, foreground),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1966,6 +2111,49 @@ mod tests {
             .expect("show_main source markers are missing");
         assert!(show_main.contains("app.state::<ResultRegistries>().main().clone()"));
         assert!(!show_main.contains("app.state::<ResultRegistry>()"));
+    }
+
+    #[test]
+    fn production_find_transfer_focuses_window_then_webview_before_confirmation() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let transfer = production
+            .split("pub(crate) fn start_find_transfer(\n")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn advance_find_transfer(").next())
+            .expect("find transfer source markers are missing");
+        let show = transfer
+            .find(".and_then(|()| find.show())")
+            .expect("find show is missing");
+        let window_focus = transfer
+            .find(".and_then(|()| find.set_focus())")
+            .expect("find native window focus is missing");
+        let webview_focus = transfer
+            .find(".and_then(|()| find.as_ref().set_focus())")
+            .expect("find webview focus is missing");
+        let confirmation = transfer
+            .rfind("advance_find_transfer(app, controller, registries, plan.transfer_id)")
+            .expect("find transfer confirmation is missing");
+        assert!(show < window_focus && window_focus < webview_focus);
+        assert!(webview_focus < confirmation);
+    }
+
+    #[test]
+    fn production_show_main_focuses_the_window_then_its_webview() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let show_main = production
+            .split("    fn show_main(\n")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn show_main_with_resolver").next())
+            .expect("show_main source markers are missing");
+        let window_focus = show_main
+            .find("window.set_focus()")
+            .expect("main native window focus is missing");
+        let webview_focus = show_main
+            .find("window.as_ref().set_focus()")
+            .expect("main webview focus is missing");
+        assert!(window_focus < webview_focus);
     }
 
     #[test]
@@ -3730,6 +3918,26 @@ mod tests {
             .expect("session callback source markers are missing");
         assert!(session_callback.contains("save_window_position"));
 
+        let find_callback = production
+            .split(r#"unsafe extern "system" fn find_position_subclass_proc"#)
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn install_find_position_hook")
+                    .next()
+            })
+            .expect("find position callback source markers are missing");
+        assert!(find_callback.contains("save_find_window_position"));
+
+        let transfer = production
+            .split("pub(crate) fn start_find_transfer")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn advance_find_transfer").next())
+            .expect("find transfer source markers are missing");
+        let place = transfer
+            .find("place_main_window")
+            .expect("find placement is missing");
+        let show = transfer.find("find.show()").expect("find show is missing");
+        assert!(place < show);
         assert!(!production.contains("windows_link::link!"));
         assert!(!production.contains("#[link("));
         assert!(!production.contains("struct SessionHookContext"));

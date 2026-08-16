@@ -93,7 +93,6 @@ pub(crate) enum FocusEffect {
     None,
     RecheckNativeSnapshot(u64),
     ExpectedHideConsumed,
-    RefocusFind,
     HideFind,
     RestoreMainTopmost,
     ClearAndHideMain,
@@ -217,6 +216,7 @@ struct ControllerCore {
     confirmed_main_focus: Option<bool>,
     confirmed_find_focus: Option<bool>,
     pinned: bool,
+    native_move_active: bool,
     shutdown: bool,
     counters: Counters,
 }
@@ -230,6 +230,7 @@ impl Default for ControllerCore {
             confirmed_main_focus: None,
             confirmed_find_focus: None,
             pinned: false,
+            native_move_active: false,
             shutdown: false,
             counters: Counters::default(),
         }
@@ -415,15 +416,32 @@ impl FindWindowController {
         if let AdmissionState::Transferring(transfer) = &core.state {
             return FocusEffect::RecheckNativeSnapshot(transfer.transaction.transfer_id);
         }
+        if label == WindowLabel::Find && !focused && core.native_move_active {
+            return FocusEffect::None;
+        }
         match (&core.state, label, focused) {
             (AdmissionState::VisibleReady { .. }, WindowLabel::Find, false) if core.pinned => {
-                FocusEffect::RefocusFind
+                FocusEffect::None
             }
             (AdmissionState::VisibleReady { .. }, WindowLabel::Find, false) => {
                 FocusEffect::HideFind
             }
             (_, WindowLabel::Main, true) => FocusEffect::RestoreMainTopmost,
             (_, WindowLabel::Main, false) => FocusEffect::ClearAndHideMain,
+            _ => FocusEffect::None,
+        }
+    }
+
+    pub(crate) fn begin_native_move(&self) {
+        self.lock().native_move_active = true;
+    }
+
+    pub(crate) fn finish_native_move(&self, focused: bool) -> FocusEffect {
+        let mut core = self.lock();
+        core.native_move_active = false;
+        core.confirmed_find_focus = Some(focused);
+        match (&core.state, focused, core.pinned) {
+            (AdmissionState::VisibleReady { .. }, false, false) => FocusEffect::HideFind,
             _ => FocusEffect::None,
         }
     }
@@ -592,6 +610,7 @@ impl FindWindowController {
         }
         if hide_succeeded {
             registries.find().hide_and_clear();
+            core.pinned = false;
             core.state = AdmissionState::Hidden;
         }
         true
@@ -909,6 +928,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_close_resets_pin_only_after_hide_succeeds() {
+        let now = Instant::now();
+        let controller = FindWindowController::default();
+        let registries = ResultRegistries::default();
+        let invocation_id = make_ready(&controller, &registries, now);
+
+        assert!(controller.set_pin(&invocation_id, true));
+        assert!(!controller.request_explicit_hide(&invocation_id, false));
+        assert!(controller.request_explicit_hide(&invocation_id, true));
+        assert!(controller.finish_explicit_hide(&invocation_id, false, &registries));
+        assert!(controller.pinned());
+
+        assert!(controller.request_explicit_hide(&invocation_id, true));
+        assert!(controller.finish_explicit_hide(&invocation_id, true, &registries));
+        assert!(!controller.pinned());
+    }
+
+    #[test]
     fn readiness_transition_table_is_listener_first_and_idempotent() {
         let now = Instant::now();
         let controller = FindWindowController::default();
@@ -1139,6 +1176,10 @@ mod tests {
         let current = current_find_ticket(&registries, &invocation);
         assert!(controller.set_pin(&invocation, true));
         assert_eq!(
+            controller.observe_focus(WindowLabel::Find, false),
+            FocusEffect::None
+        );
+        assert_eq!(
             controller.begin_execution_hide(&current, registries.find()),
             ExecutionHideAdmission::Pinned
         );
@@ -1171,6 +1212,21 @@ mod tests {
             controller.observe_focus(WindowLabel::Find, false),
             FocusEffect::None
         );
+    }
+
+    #[test]
+    fn native_move_suppresses_focus_loss_until_drag_finishes() {
+        let now = Instant::now();
+        let controller = FindWindowController::default();
+        let registries = ResultRegistries::default();
+        make_ready(&controller, &registries, now);
+
+        controller.begin_native_move();
+        assert_eq!(
+            controller.observe_focus(WindowLabel::Find, false),
+            FocusEffect::None
+        );
+        assert_eq!(controller.finish_native_move(false), FocusEffect::HideFind);
     }
 
     #[test]

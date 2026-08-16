@@ -1,5 +1,6 @@
 [package]
 name = "uipilot"
+default-run = "uipilot"
 version = "0.2.0"
 description = "Keyboard-first Windows application launcher"
 authors = []

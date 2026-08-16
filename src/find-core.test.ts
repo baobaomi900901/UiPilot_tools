@@ -109,6 +109,57 @@ describe('find readiness', () => {
     expect(core.getSnapshot().ready).toBe(true)
   })
 
+  it('yields to a timer turn before retrying a failed preparation', async () => {
+    vi.useFakeTimers()
+    const fake = fakeClient()
+    const first = deferred<unknown>()
+    const retry = deferred<unknown>()
+    vi.mocked(fake.client.prepareInitialization)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(retry.promise)
+    const core = createFindCore(fake.client)
+    const starting = core.start()
+    try {
+      await vi.waitFor(() => expect(fake.client.prepareInitialization).toHaveBeenCalledOnce())
+      first.reject(new Error('prepare failed'))
+      await first.promise.catch(() => undefined)
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(fake.client.prepareInitialization).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fake.client.prepareInitialization).toHaveBeenCalledTimes(2)
+      retry.resolve(ready())
+      await starting
+      expect(core.getSnapshot().ready).toBe(true)
+    } finally {
+      core.destroy()
+      retry.resolve(ready())
+      vi.useRealTimers()
+    }
+  })
+
+  it('searches a forward received before readiness as soon as ready is confirmed', async () => {
+    const fake = fakeClient()
+    const preparation = deferred<unknown>()
+    vi.mocked(fake.client.prepareInitialization).mockReturnValueOnce(preparation.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse())
+    const core = createFindCore(fake.client)
+    const starting = core.start()
+    await vi.waitFor(() => expect(fake.client.listenThemeChanged).toHaveBeenCalledOnce())
+
+    fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' })
+    expect(core.getSnapshot()).toMatchObject({ ready: false, query: 'windows' })
+    expect(fake.client.searchFiles).not.toHaveBeenCalled()
+
+    preparation.resolve(ready())
+    await starting
+
+    expect(core.getSnapshot().ready).toBe(true)
+    expect(fake.client.searchFiles).toHaveBeenCalledWith({
+      query: 'windows', category: 'all', sort: 'modifiedDesc', invocationId: 'inv-1', querySequence: 1,
+    })
+  })
+
   it('reconciles theme event and initialization by independent revision', async () => {
     const fake = fakeClient()
     const preparation = deferred<unknown>()
@@ -184,6 +235,21 @@ describe('find forwarding and query ownership', () => {
 })
 
 describe('find execution and preferences', () => {
+  it('shows the pinned state immediately while persistence is pending', async () => {
+    const fake = fakeClient()
+    const pending = deferred<{ pinned: boolean }>()
+    vi.mocked(fake.client.setPinned).mockReturnValueOnce(pending.promise)
+    const core = createFindCore(fake.client)
+    await core.start()
+    fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: '' })
+
+    core.setPinned(true)
+
+    expect(core.getSnapshot()).toMatchObject({ pinned: true, pinPending: true })
+    pending.resolve({ pinned: true })
+    await vi.waitFor(() => expect(core.getSnapshot().pinPending).toBe(false))
+  })
+
   it('does not issue a second hide after authenticated execution', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse())
@@ -221,5 +287,6 @@ describe('find execution and preferences', () => {
     expect(fake.client.hide).not.toHaveBeenCalled()
     await core.requestHide(true)
     expect(fake.client.hide).toHaveBeenCalledWith({ invocationId: 'inv-1', force: true })
+    expect(core.getSnapshot()).toMatchObject({ pinned: false, pinPending: false })
   })
 })

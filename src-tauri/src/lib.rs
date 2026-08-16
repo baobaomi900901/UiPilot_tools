@@ -93,16 +93,7 @@ fn setup_production_lifecycle(
     let app_data_dir = app.path().app_data_dir()?;
     plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
     plugin_manager.create_runtimes(app, &app_data_dir)?;
-    let public_plugin_manager =
-        public_plugin_service.initialize(&app_data_dir, ["find".into(), "math".into()])?;
-    for candidate in public_plugin_manager.runtime_candidates()? {
-        if public_plugin_service
-            .create_runtime(app.handle(), &candidate)
-            .is_err()
-        {
-            public_plugin_manager.mark_runtime_unavailable(&candidate.plugin_id)?;
-        }
-    }
+    public_plugin_service.initialize(&app_data_dir, ["find".into(), "math".into()])?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -119,7 +110,8 @@ fn setup_production_lifecycle(
         tauri::WindowEvent::Focused(focused) => {
             let transfers =
                 event_app.state::<Arc<window_transfer::MainWindowTransferCoordinator>>();
-            if !*focused && transfers.consume_expected_main_blur() {
+            let expected_blur = !*focused && transfers.consume_expected_main_blur();
+            if expected_blur {
                 return;
             }
             let registries = event_app.state::<result_registry::ResultRegistries>();
@@ -221,6 +213,8 @@ fn setup_production_lifecycle(
         .map_err(|_| lifecycle_setup_error())?;
 
     lifecycle::install_session_end_hook(app.handle(), &window)
+        .map_err(|_| lifecycle_setup_error())?;
+    lifecycle::install_find_position_hook(app.handle(), &find)
         .map_err(|_| lifecycle_setup_error())?;
     let hwnd = window.hwnd().map_err(|_| lifecycle_setup_error())?;
     app.state::<Arc<file_index::FileIndex>>()
@@ -325,6 +319,7 @@ pub fn run() {
             commands::set_find_pinned,
             commands::set_find_preview_preference,
             commands::hide_find_window,
+            commands::select_public_plugin_directory,
             commands::list_public_plugins,
             commands::prepare_public_plugin_install,
             commands::commit_public_plugin_install,
@@ -563,7 +558,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 36);
+        assert_eq!(production.matches("commands::").count(), 37);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -572,6 +567,7 @@ mod tests {
             "set_find_pinned",
             "set_find_preview_preference",
             "hide_find_window",
+            "select_public_plugin_directory",
             "list_public_plugins",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
@@ -755,6 +751,7 @@ mod tests {
             "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
             "plugin_manager.create_runtimes(app, &app_data_dir)?;",
             "lifecycle::install_session_end_hook",
+            "lifecycle::install_find_position_hook",
             "tauri::tray::TrayIconBuilder::new()",
             "tauri::WindowEvent::Focused(focused)",
             "handle_focus_event_with(",
@@ -790,6 +787,55 @@ mod tests {
         assert!(production.contains("lifecycle::TRAY_OPEN_SETTINGS"));
     }
 
+    #[test]
+    fn startup_public_plugin_runtime_waits_for_main_frontend_ready() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
+        let commands = commands_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
+        let public_source = include_str!("public_plugins.rs").replace("\r\n", "\n");
+        let starter = public_source
+            .split("pub(crate) fn start_enabled_runtimes(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    pub(crate) fn ").next())
+            .expect("public plugin frontend-ready starter is missing");
+        let setup = production
+            .split("fn setup_production_lifecycle(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn run() {").next())
+            .expect("production setup markers are missing");
+        let load_settings = commands
+            .split("pub(crate) fn load_settings(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("load_settings command is missing");
+        let ready = load_settings
+            .find("mark_frontend_ready")
+            .expect("main frontend ready signal is missing");
+        let start = load_settings
+            .find("start_enabled_runtimes")
+            .expect("public Runtime startup must follow main frontend readiness");
+        let claim = starter
+            .find("compare_exchange")
+            .expect("public Runtime startup must be one-shot");
+        let spawn = starter
+            .find("tauri::async_runtime::spawn_blocking")
+            .expect("public Runtime readiness must leave the command thread");
+        let create = starter
+            .find(".create_runtime(")
+            .expect("public Runtime startup creation is missing");
+
+        assert!(ready < start);
+        assert!(claim < spawn && spawn < create);
+        assert!(!setup.contains("start_enabled_runtimes"));
+        assert!(!setup.contains(".create_runtime("));
+    }
     #[test]
     fn tray_show_does_not_wait_for_application_discovery() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");

@@ -2200,6 +2200,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+
   it('keeps empty startup quiet, announces no results, and gives composing Escape to IME', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
@@ -2806,6 +2807,7 @@ describe('real adapter and startup', () => {
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
+    await main.client.selectPublicPluginDirectory()
     await main.client.listPlugins()
     await main.client.installPlugin({ pluginId: 'internal.math' })
     await main.client.reloadPlugin({ pluginId: 'internal.math' })
@@ -2817,6 +2819,7 @@ describe('real adapter and startup', () => {
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
+      ['select_public_plugin_directory', []],
       ['list_plugins', []],
       ['install_plugin', [{ pluginId: 'internal.math' }]],
       ['reload_plugin', [{ pluginId: 'internal.math' }]],
@@ -3025,15 +3028,36 @@ describe('launcher find forwarding ownership', () => {
 
     const querySequence = core.getSnapshot().querySequence
     core.keyDown('Enter', false)
-    expect(fake.client.openFind).toHaveBeenCalledWith({
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
       query: 'windows',
       invocationId: 'find-suggestion',
       querySequence,
-    })
+    }))
     expect(fake.client.executeResult).not.toHaveBeenCalled()
   })
 
-  it('keeps explicit find commands free of suggestions and application searches', async () => {
+  it('waits for the ordinary application query ownership before forwarding find', async () => {
+    const fake = fakeClient()
+    const applications = deferred<SearchResponse | null>()
+    vi.mocked(fake.client.searchApps).mockReturnValueOnce(applications.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('find-pending-ownership'))
+    const control = core.getSnapshot().queryControl
+
+    core.text({ kind: 'ordinaryInput', control, value: 'windows', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    expect(fake.client.openFind).not.toHaveBeenCalled()
+
+    applications.resolve({ requestId: 'application-request', items: [] })
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'find-pending-ownership',
+      querySequence: core.getSnapshot().querySequence,
+    }))
+  })
+
+  it('keeps explicit find commands free of suggestions and establishes ownership only on Enter', async () => {
     for (const [value, query] of [['/find windows', 'windows'], ['/find', '']] as const) {
       const fake = fakeClient()
       const core = createLauncherCore(fake.client)
@@ -3046,11 +3070,16 @@ describe('launcher find forwarding ownership', () => {
       expect(fake.client.searchApps).not.toHaveBeenCalled()
 
       core.keyDown('Enter', false)
-      expect(fake.client.openFind).toHaveBeenCalledWith({
-        query,
+      expect(fake.client.searchApps).toHaveBeenCalledWith({
+        query: value,
         invocationId: `explicit-${query || 'empty'}`,
         querySequence: core.getSnapshot().querySequence,
       })
+      await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+        query,
+        invocationId: `explicit-${query || 'empty'}`,
+        querySequence: core.getSnapshot().querySequence,
+      }))
       core.destroy()
     }
   })
@@ -3065,11 +3094,11 @@ describe('launcher find forwarding ownership', () => {
       core.text({ kind: 'ordinaryInput', control, value, inputType: 'insertText' })
       const sequence = core.getSnapshot().querySequence
       core.keyDown('Enter', false)
-      expect(fake.client.openFind).toHaveBeenCalledWith({
+      await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
         query,
         invocationId: `forward-${query || 'empty'}`,
         querySequence: sequence,
-      })
+      }))
       await vi.waitFor(() => expect(core.getSnapshot().query).toBe(''))
       core.destroy()
     }

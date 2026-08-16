@@ -43,6 +43,8 @@ pub(crate) struct Settings {
     pub(crate) use_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window_position: Option<WindowPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) find_window_position: Option<WindowPosition>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) plugin_window_positions: BTreeMap<String, WindowPosition>,
 }
@@ -90,6 +92,7 @@ impl Default for Settings {
             file_preview_enabled: default_file_preview_enabled(),
             use_counts: BTreeMap::new(),
             window_position: None,
+            find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
         }
     }
@@ -267,6 +270,23 @@ impl SettingsStore {
             .window_position
     }
 
+    pub(crate) fn set_find_window_position(
+        &self,
+        position: WindowPosition,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.find_window_position = Some(position);
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn find_window_position(&self) -> Option<WindowPosition> {
+        self.state
+            .lock()
+            .expect("settings lock poisoned")
+            .value
+            .find_window_position
+    }
     pub(crate) fn set_plugin_window_position(
         &self,
         plugin_id: &str,
@@ -720,6 +740,33 @@ mod tests {
     }
 
     #[test]
+    fn find_window_position_defaults_and_updates_only_that_field() {
+        let dir = TestDir::new("find-window-position");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Ctrl+Space","autostart":true,"filePreviewEnabled":false,"useCounts":{},"windowPosition":{"x":12,"y":34}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let before = store.snapshot();
+
+        assert_eq!(store.find_window_position(), None);
+        let position = WindowPosition { x: 640, y: -240 };
+        store.set_find_window_position(position).unwrap();
+
+        assert_eq!(store.find_window_position(), Some(position));
+        assert_eq!(store.window_position(), before.window_position);
+        assert_eq!(
+            store.snapshot(),
+            Settings {
+                find_window_position: Some(position),
+                ..before
+            }
+        );
+        assert_eq!(read_current(&dir), store.snapshot());
+    }
+
+    #[test]
     fn plugin_window_positions_are_plugin_scoped_and_delete_independently() {
         let dir = TestDir::new("plugin-window-positions");
         let store = SettingsStore::load(dir.path()).unwrap();
@@ -951,6 +998,7 @@ mod tests {
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             window_position: None,
+            find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
         };
         write_settings(&dir.current(), &persisted);

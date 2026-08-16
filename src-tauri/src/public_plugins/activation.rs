@@ -570,24 +570,24 @@ impl PublicPluginManager {
     where
         F: FnOnce(&PublicRuntimeCandidate) -> bool,
     {
-        let (before, snapshot, runtime) = {
+        let (before, snapshot, runtime, previous_runtime_label) = {
             let _mutation = self.lock_mutation()?;
             let before = self
                 .state
                 .config(plugin_id)?
                 .filter(|config| config.installed)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let snapshot = self
+            let current_snapshot = self
                 .lock_data()?
                 .active_by_plugin
                 .get(plugin_id)
                 .cloned()
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let runtime = snapshot.candidate();
+            let current_runtime = current_snapshot.candidate();
             if before.enabled == enabled {
                 return Ok(PublicEnabledCommit {
                     mutation: mutation_from_config(&before),
-                    runtime: enabled.then_some(runtime),
+                    runtime: enabled.then_some(current_runtime),
                     closed_runtime_label: None,
                 });
             }
@@ -599,9 +599,19 @@ impl PublicPluginManager {
                 return Ok(PublicEnabledCommit {
                     mutation: mutation_from_config(&config),
                     runtime: None,
-                    closed_runtime_label: Some(runtime.label),
+                    closed_runtime_label: Some(current_runtime.label),
                 });
             }
+            let generation = before
+                .active_generation
+                .checked_add(1)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let mut next_snapshot = (*current_snapshot).clone();
+            next_snapshot.generation = generation;
+            next_snapshot.label = runtime_label(plugin_id, generation)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let snapshot = Arc::new(next_snapshot);
+            let runtime = snapshot.candidate();
             let replaced = self
                 .lock_data()?
                 .staged_by_label
@@ -609,7 +619,7 @@ impl PublicPluginManager {
             if replaced.is_some() {
                 return Err(PublicPluginManagementError::Unavailable);
             }
-            (before, snapshot, runtime)
+            (before, snapshot, runtime, Some(current_runtime.label))
         };
 
         if !readiness(&runtime) {
@@ -622,22 +632,44 @@ impl PublicPluginManager {
             self.unstage(&runtime.label);
             return Err(PublicPluginManagementError::Unavailable);
         }
-        let staged_matches = self
-            .lock_data()?
+        let mut data = self.lock_data()?;
+        let staged_matches = data
             .staged_by_label
             .get(&runtime.label)
             .is_some_and(|staged| Arc::ptr_eq(staged, &snapshot));
         if !staged_matches {
-            self.unstage(&runtime.label);
             return Err(PublicPluginManagementError::Unavailable);
         }
-        self.unstage(&runtime.label);
-        let config = self.state.set_enabled(plugin_id, true)?;
+        if self
+            .scheduler
+            .invalidate_plugin(plugin_id, Some(runtime.generation))
+            .is_err()
+        {
+            data.staged_by_label.remove(&runtime.label);
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        let config = match self
+            .state
+            .enable_with_generation(plugin_id, runtime.generation)
+        {
+            Ok(config) => config,
+            Err(error) => {
+                data.staged_by_label.remove(&runtime.label);
+                return Err(error.into());
+            }
+        };
+        let staged = data
+            .staged_by_label
+            .remove(&runtime.label)
+            .filter(|staged| Arc::ptr_eq(staged, &snapshot))
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        data.active_by_plugin.insert(plugin_id.into(), staged);
+        drop(data);
         self.clear_runtime_faults(plugin_id)?;
         Ok(PublicEnabledCommit {
             mutation: mutation_from_config(&config),
             runtime: Some(runtime),
-            closed_runtime_label: None,
+            closed_runtime_label: previous_runtime_label,
         })
     }
     pub(crate) fn rename(
@@ -1795,10 +1827,36 @@ mod tests {
             .unwrap();
         assert!(!disabled.enabled);
         assert_eq!(disabled.fault, Some(PublicPluginFault::RuntimeUnavailable));
+        let reenabled_generation = disabled.active_generation.checked_add(1).unwrap();
 
-        manager
-            .set_enabled_with_readiness("com.example.activation", true, |_| true)
+        let reenabled_commit = manager
+            .set_enabled_with_readiness("com.example.activation", true, |candidate| {
+                assert_eq!(candidate.generation, reenabled_generation);
+                true
+            })
             .unwrap();
+        assert_eq!(
+            reenabled_commit.closed_runtime_label,
+            runtime_label("com.example.activation", disabled.active_generation)
+        );
+        assert_eq!(
+            reenabled_commit
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.generation),
+            Some(reenabled_generation)
+        );
+        let reenabled = manager
+            .state()
+            .config("com.example.activation")
+            .unwrap()
+            .unwrap();
+        assert!(reenabled.enabled);
+        assert_eq!(reenabled.active_generation, reenabled_generation);
+        assert_eq!(
+            manager.route("/activation").unwrap().unwrap().generation,
+            reenabled_generation
+        );
         assert!(!manager
             .record_runtime_result(
                 "com.example.activation",

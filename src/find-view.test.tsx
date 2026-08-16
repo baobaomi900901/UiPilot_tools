@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -6,6 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createFindCore, type FindCore } from './find-core'
 import { FindView } from './find-view'
 import type { ExecuteOutcome, FileSearchResponse, FindClient } from './protocol'
+
+const stylesSource = readFileSync('src/styles.css', 'utf8')
 
 function response(): FileSearchResponse {
   return {
@@ -114,6 +117,34 @@ describe('FindView', () => {
     expect(fake.client.hide).toHaveBeenCalledWith({ invocationId: 'inv-1', force: true })
   })
 
+  it('reuses the launcher file workspace visual language', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward())
+    await vi.waitFor(() => expect(host.querySelectorAll('#find-results [role="option"]')).toHaveLength(1))
+
+    expect(host.querySelector('.find-categories')?.classList.contains('file-categories')).toBe(true)
+    expect([...host.querySelectorAll('.find-category')].every((item) => item.classList.contains('file-category'))).toBe(true)
+    expect(host.querySelector('.find-preview')?.classList.contains('file-preview')).toBe(true)
+    expect(host.querySelector('.find-footer')?.classList.contains('file-toolbar')).toBe(true)
+    const kindMark = host.querySelector('#find-results [aria-hidden="true"]')
+    expect(kindMark?.classList.contains('result-icon')).toBe(true)
+    expect(kindMark?.classList.contains('file-kind-mark')).toBe(true)
+  })
+
+  it('provides a native drag handle while keeping category interactions clickable', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+
+    expect(host.querySelector('.find-drag-handle')).toBeTruthy()
+    const normalizedStyles = stylesSource.split(String.fromCharCode(13) + String.fromCharCode(10)).join(String.fromCharCode(10))
+    expect(normalizedStyles).toContain(['.find-surface,', '.find-header,', '.find-drag-handle {', '  app-region: drag;'].join(String.fromCharCode(10)))
+    expect(normalizedStyles).toContain(['.find-categories {', '  app-region: no-drag;', '}'].join(String.fromCharCode(10)))
+  })
+
   it('keeps pinned Escape inert and sends ordinary hide when unpinned', async () => {
     const fake = fakeClient()
     const core = createFindCore(fake.client)
@@ -128,6 +159,66 @@ describe('FindView', () => {
     await vi.waitFor(() => expect(core.getSnapshot().pinned).toBe(true))
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
     expect(fake.client.hide).not.toHaveBeenCalled()
+  })
+
+  it('keeps the query input as the category keyboard focus owner', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
+    const input = host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const categories = host.querySelector<HTMLElement>('.find-categories')!
+    const buttons = [...categories.querySelectorAll<HTMLButtonElement>('.find-category')]
+    buttons[0]!.focus()
+
+    await act(async () => categories.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })))
+
+    expect(buttons.every((button) => button.tabIndex === -1)).toBe(true)
+    expect(document.activeElement).toBe(input)
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })))
+    expect(core.getSnapshot().category).toBe('folder')
+    expect(document.activeElement).toBe(input)
+  })
+
+  it('navigates file results with arrow keys from any focused control', async () => {
+    const fake = fakeClient()
+    const first = response()
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce({
+      ...first,
+      total: '2',
+      items: [
+        ...first.items,
+        {
+          resultId: 'second-result-id',
+          name: 'Roadmap.docx',
+          kind: 'file',
+          sizeBytes: '84',
+          modifiedUtc: '2026-08-12T01:02:03Z',
+          fullPath: String.raw`C:\Private\Roadmap.docx`,
+        },
+      ],
+    })
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward())
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+
+    const pin = host.querySelector<HTMLButtonElement>('button[aria-label="固定窗口"]')!
+    pin.focus()
+    expect(document.activeElement).toBe(pin)
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+
+    await act(async () => pin.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'ArrowDown', bubbles: true, cancelable: true,
+    })))
+    expect(core.getSnapshot().selectedIndex).toBe(1)
+
+    await act(async () => pin.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'ArrowUp', bubbles: true, cancelable: true,
+    })))
+    expect(core.getSnapshot().selectedIndex).toBe(0)
   })
 
   it('keeps result identity private while category, list, and preview interact', async () => {

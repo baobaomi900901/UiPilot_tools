@@ -1,6 +1,6 @@
 import { CloseOutlined, PushpinFilled, PushpinOutlined } from '@ant-design/icons'
 import { App, Button, ConfigProvider, Input, Spin, Switch, Tooltip, theme } from 'antd'
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 
 import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
 import type { FileCategory, FileResultKind, ThemePreference } from './protocol'
@@ -47,21 +47,33 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
     if (snapshot.ready) inputRef.current?.focus()
   }, [snapshot.ready, snapshot.invocationId])
 
+  useEffect(() => {
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+      if (event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
+      event.preventDefault()
+      event.stopPropagation()
+      core.keyDown(event.key, false)
+    }
+    window.addEventListener('keydown', onWindowKeyDown, true)
+    return () => window.removeEventListener('keydown', onWindowKeyDown, true)
+  }, [core])
+
   useLayoutEffect(() => {
     const option = snapshot.selectedIndex >= 0 ? optionRefs.current.get(snapshot.selectedIndex) : undefined
     if (typeof option?.scrollIntoView === 'function') option.scrollIntoView({ block: 'nearest' })
   }, [snapshot.selectedIndex])
 
-  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey) {
       if (event.nativeEvent.isComposing) return
       event.preventDefault()
       core.cycleCategory(event.shiftKey ? 'previous' : 'next')
       return
     }
-    if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
+    if (!['Enter', 'Escape'].includes(event.key)) return
     if (event.key === 'Escape' && !event.nativeEvent.isComposing) event.preventDefault()
-    core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', event.nativeEvent.isComposing)
+    core.keyDown(event.key as 'Enter' | 'Escape', event.nativeEvent.isComposing)
   }
 
   return (
@@ -69,6 +81,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
       <App>
         <main className="find-surface" data-color-scheme={colorScheme(snapshot.theme, systemDark)}>
           <header className="find-header">
+            <span className="find-drag-handle" aria-hidden="true" />
             <Input
               ref={(node) => { inputRef.current = node?.input ?? null }}
               value={snapshot.query}
@@ -107,13 +120,21 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             </Tooltip>
           </header>
 
-          <nav className="find-categories" aria-label="文件类型">
+          <nav
+            className="find-categories file-categories"
+            aria-label="文件类型"
+            onMouseDown={(event) => {
+              event.preventDefault()
+              inputRef.current?.focus()
+            }}
+          >
             {FIND_CATEGORY_ORDER.map((category) => (
               <button
                 key={category}
                 type="button"
-                className={snapshot.category === category ? 'find-category is-selected' : 'find-category'}
+                className={snapshot.category === category ? 'find-category file-category is-selected' : 'find-category file-category'}
                 aria-pressed={snapshot.category === category}
+                tabIndex={-1}
                 disabled={disabled || !snapshot.invocationId}
                 onClick={() => core.setCategory(category)}
               >
@@ -142,7 +163,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                     core.keyDown('Enter', false)
                   }}
                 >
-                  <span className="file-kind" aria-hidden="true">{item.kind === 'folder' ? 'DIR' : 'FILE'}</span>
+                  <span className="result-icon file-kind-mark" aria-hidden="true">{item.kind === 'folder' ? '□' : '◇'}</span>
                   <span className="result-copy">
                     <Tooltip title={item.name}><span className="result-title">{item.name}</span></Tooltip>
                     <span className="result-subtitle">{item.fullPath}</span>
@@ -152,7 +173,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             </div>
           </Spin>
 
-          <aside className="find-preview" aria-label="文件预览">
+          <aside className="find-preview file-preview" aria-label="文件预览">
             {snapshot.previewEnabled && selected ? (
               <>
                 <Tooltip title={selected.name}><h2>{selected.name}</h2></Tooltip>
@@ -166,7 +187,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             ) : <p>{snapshot.previewEnabled ? '请选择文件' : '预览已关闭'}</p>}
           </aside>
 
-          <footer className="find-footer">
+          <footer className="find-footer file-toolbar">
             <span>{snapshot.indexStatus === 'building' ? `正在索引，已有 ${snapshot.total} 条结果` : `共 ${snapshot.total} 条结果`}</span>
             <Switch
               aria-label="文件预览"

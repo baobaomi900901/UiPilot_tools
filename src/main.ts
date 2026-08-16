@@ -46,10 +46,7 @@ export const client: LauncherClient = {
     const selected = await open({ multiple: false, directory: false, filters: [{ name: 'UiPilot Plugin', extensions: ['uipilot-plugin'] }] })
     return typeof selected === 'string' ? selected : null
   },
-  selectPublicPluginDirectory: async () => {
-    const selected = await open({ multiple: false, directory: true })
-    return typeof selected === 'string' ? selected : null
-  },
+  selectPublicPluginDirectory: () => invoke<string | null>('select_public_plugin_directory'),
   preparePublicPlugin: (input) => invoke('prepare_public_plugin_install', input),
   commitPublicPlugin: async (input) => { await invoke('commit_public_plugin_install', input) },
   cancelPublicPlugin: async (input) => { await invoke('cancel_public_plugin_install', input) },
