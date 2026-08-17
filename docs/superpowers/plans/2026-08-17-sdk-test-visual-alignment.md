@@ -32,7 +32,7 @@
 
 ### Task 1: Shared Theme Foundation
 
-**Files:** Create `src/ui-theme.ts`, `src/ui-theme.test.ts`, `src/ui-theme.css`; modify `src/main.ts`, `package.json`, `package-lock.json`.
+**Files:** Create `src/ui-theme.ts`, `src/ui-theme.test.ts`, `src/ui-theme.css`; modify `index.html`, `package.json`, `package-lock.json`.
 
 **Dependencies:** Approved design sections `Theme Architecture`, `Typography And Geometry`, and `Failure And Compatibility Behavior`.
 
