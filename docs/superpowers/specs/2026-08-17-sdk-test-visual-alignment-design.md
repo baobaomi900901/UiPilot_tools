@@ -1,6 +1,6 @@
 # sdk-test Visual Alignment Design
 
-**Status:** Draft - awaiting written review
+**Status:** Approved - user confirmed 2026-08-17
 
 ## Goal
 
