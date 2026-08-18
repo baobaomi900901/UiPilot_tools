@@ -13,6 +13,8 @@ import { createPluginWindowCore } from './plugin-window-core'
 import { PluginWindowView } from './plugin-window-view'
 import {
   parseFileSearchResponse,
+  parseMessageCenterSnapshot,
+  parseMessageSummary,
   parsePluginInventorySnapshot,
   parsePublicPluginInventory,
   parseFindPreviewPreferenceResult,
@@ -33,6 +35,32 @@ import {
 export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', input),
+  listenMessageStateChanged: (handler) =>
+    listen('message-center://state-changed', (event) => handler(event.payload)),
+  getMessageSummary: async () => {
+    const value = await invoke<unknown>('get_message_summary')
+    const summary = parseMessageSummary(value)
+    if (!summary) throw { code: 'MessageOperationFailed', storeStatus: 'ready' }
+    return summary
+  },
+  openMessageCenter: async () => {
+    const value = await invoke<unknown>('open_message_center')
+    const snapshot = parseMessageCenterSnapshot(value)
+    if (!snapshot) throw { code: 'MessageOperationFailed', storeStatus: 'ready' }
+    return snapshot
+  },
+  readMessageCenter: async () => {
+    const value = await invoke<unknown>('read_message_center')
+    const snapshot = parseMessageCenterSnapshot(value)
+    if (!snapshot) throw { code: 'MessageOperationFailed', storeStatus: 'ready' }
+    return snapshot
+  },
+  clearMessages: async () => {
+    const value = await invoke<unknown>('clear_messages')
+    const snapshot = parseMessageCenterSnapshot(value)
+    if (!snapshot) throw { code: 'MessageOperationFailed', storeStatus: 'ready' }
+    return snapshot
+  },
   openFind: (input) => invoke('open_find_window', { input }),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   commitPluginWindowTransfer: (input) => invoke<void>('commit_plugin_window_transfer', input),

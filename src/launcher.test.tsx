@@ -199,12 +199,21 @@ type TestLauncherClient = LauncherClient & {
 
 function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
+  let messageStateHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
       shownHandler = handler
       return unlisten
     }),
+    listenMessageStateChanged: vi.fn(async (handler) => {
+      messageStateHandler = handler
+      return vi.fn()
+    }),
+    getMessageSummary: vi.fn(async () => ({ revision: '0', unreadCount: 0 })),
+    openMessageCenter: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
+    readMessageCenter: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
+    clearMessages: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
     searchApps: vi.fn(async () => null),
     commitPluginWindowTransfer: vi.fn(async () => {}),
     openFind: vi.fn(async () => ({ status: 'forwarded' as const })),
@@ -235,6 +244,10 @@ function fakeClient() {
     emit(payload: unknown) {
       if (!shownHandler) throw new Error('shown listener is not installed')
       shownHandler(payload)
+    },
+    emitMessageState(payload: unknown) {
+      if (!messageStateHandler) throw new Error('message state listener is not installed')
+      messageStateHandler(payload)
     },
     unlisten,
   }
@@ -278,7 +291,7 @@ function fileResponse(
   }
 }
 
-function shown(invocationId: string, target: 'launcher' | 'settings' = 'launcher', notice: LauncherShown['notice'] = null) {
+function shown(invocationId: string, target: LauncherShown['target'] = 'launcher', notice: LauncherShown['notice'] = null) {
   return { invocationId, target, notice }
 }
 
@@ -403,7 +416,7 @@ function r3(record: R3TextRecord): ClassifiedTextRecord {
 
 describe('protocol and cached store', () => {
   it('strictly parses only the frozen launcher shown shape', () => {
-    for (const target of ['launcher', 'settings'] as const) {
+    for (const target of ['launcher', 'settings', 'messages'] as const) {
       for (const notice of [null, 'settingsFailed'] as const) {
         const value = shown('invocation', target, notice)
         expect(parseLauncherShown(value)).toEqual(value)
@@ -543,6 +556,25 @@ describe('startup ownership', () => {
 })
 
 describe('shown and search ownership', () => {
+  it('routes the messages target to its settings tab and rereads later events without marking', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+
+    fake.emit(shown('notification-click', 'messages'))
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      settingsTab: 'messages',
+      messageCenter: { status: 'ready', unreadCount: 0 },
+    })
+    await vi.waitFor(() => expect(fake.client.openMessageCenter).toHaveBeenCalledOnce())
+
+    fake.emitMessageState({ status: 'ready', revision: '1', unreadCount: 1 })
+    await vi.waitFor(() => expect(fake.client.readMessageCenter).toHaveBeenCalledOnce())
+    expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
+    core.destroy()
+  })
+
   it('uses the exact shown reset and preserved-query search rules', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('first'))
@@ -2768,11 +2800,15 @@ describe('real adapter and startup', () => {
     tauriCapture.listen.mockImplementation((event, handler) => {
       expect(document.querySelector('[role="combobox"]')).toBeInstanceOf(HTMLInputElement)
       order.push(String(event))
-      shownHandler = handler as (event: { payload: unknown }) => void
-      return registration.promise
+      if (event === 'launcher://shown') {
+        shownHandler = handler as (event: { payload: unknown }) => void
+        return registration.promise
+      }
+      return Promise.resolve(vi.fn())
     })
     tauriCapture.invoke.mockImplementation((command) => {
       order.push(String(command))
+      if (command === 'get_message_summary') return Promise.resolve({ revision: '0', unreadCount: 0 })
       return command === 'load_settings' ? load.promise : Promise.resolve(undefined)
     })
 
@@ -2784,7 +2820,12 @@ describe('real adapter and startup', () => {
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 2)).toEqual(['launcher://shown', 'load_settings'])
+    expect(order.slice(0, 4)).toEqual([
+      'launcher://shown',
+      'message-center://state-changed',
+      'get_message_summary',
+      'load_settings',
+    ])
 
     await act(async () => shownHandler?.({ payload: shown('during-adapter-load', 'settings') }))
     expect(document.querySelector('.settings-view h1')?.textContent).toBe('设置')
@@ -2900,7 +2941,8 @@ describe('real adapter and startup', () => {
     resetAdapterDocument()
     const privateError = 'private post-start render sentinel'
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const unlisten = vi.fn()
+    const shownUnlisten = vi.fn()
+    const messageUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
@@ -2916,12 +2958,23 @@ describe('real adapter and startup', () => {
         },
       }
     })
-    tauriCapture.listen.mockImplementation(async (_event, handler) => {
-      shownHandler = handler as (event: { payload: unknown }) => void
-      return unlisten
+    tauriCapture.listen.mockImplementation(async (event, handler) => {
+      if (event === 'launcher://shown') {
+        shownHandler = handler as (event: { payload: unknown }) => void
+        return shownUnlisten
+      }
+      return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
-      Promise.resolve(command === 'load_settings' ? emptySettings : command === 'search_apps' ? null : undefined),
+      Promise.resolve(
+        command === 'get_message_summary'
+          ? { revision: '0', unreadCount: 0 }
+          : command === 'load_settings'
+            ? emptySettings
+            : command === 'search_apps'
+              ? null
+              : undefined,
+      ),
     )
     try {
       await act(async () => {
@@ -2938,7 +2991,8 @@ describe('real adapter and startup', () => {
 
       throwFatal = true
       mountedCore!.failInitialization()
-      await vi.waitFor(() => expect(unlisten).toHaveBeenCalledOnce())
+      await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
+      expect(messageUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -2948,7 +3002,8 @@ describe('real adapter and startup', () => {
       expect(tauriCapture.invoke.mock.calls.filter(([command]) => command === 'search_apps')).toHaveLength(searchCalls)
       await pagehide()
       await pagehide()
-      expect(unlisten).toHaveBeenCalledOnce()
+      expect(shownUnlisten).toHaveBeenCalledOnce()
+      expect(messageUnlisten).toHaveBeenCalledOnce()
     } finally {
       await pagehide()
       vi.doUnmock('./launcher-view')

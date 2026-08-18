@@ -15,17 +15,20 @@ import {
   type FindClient,
   type LauncherClient,
   type LauncherSnapshot,
+  type MessageCenterStateSnapshot,
   type PluginInventoryView,
   type PluginListStatus,
   type PluginMutationKind,
   type ResultItem,
   type SearchResponse,
+  type SettingsTabKey,
   type SettingsLoadStatus,
   type SettingsView,
   type ThemePreference,
   type UserSettingsUpdate,
   type ViewResult,
 } from './protocol'
+import { createMessageCenterCore } from './message-center-core'
 
 export interface LauncherCore {
   readonly client: LauncherClient
@@ -43,6 +46,7 @@ export interface LauncherCore {
   readonly setThemePreference: (theme: ThemePreference) => void
   readonly setHotkeyCanonical: (value: string) => void
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
+  readonly clearMessages: () => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
   readonly cycleFileCategory: (direction: 'next' | 'previous') => void
   readonly setFileSort: (sort: FileSort) => void
@@ -90,6 +94,8 @@ interface PrivateFileState {
 
 interface Model {
   view: 'launcher' | 'settings'
+  settingsTab: SettingsTabKey
+  messageCenter: MessageCenterStateSnapshot
   launcherMode: 'applications' | 'files'
   viewEpoch: number
   theme: ThemePreference
@@ -307,6 +313,8 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   })
   return Object.freeze({
     view: model.view,
+    settingsTab: model.settingsTab,
+    messageCenter: model.messageCenter,
     viewEpoch: model.viewEpoch,
     theme: model.theme,
     ...(model.invocationId === undefined ? {} : { invocationId: model.invocationId }),
@@ -333,8 +341,11 @@ function projectSnapshot(model: Model): LauncherSnapshot {
 }
 
 export function createLauncherCore(client: LauncherClient, maximumQuerySequence = Number.MAX_SAFE_INTEGER): LauncherCore {
+  const messageCenter = createMessageCenterCore(client)
   const model: Model = {
     view: 'launcher',
+    settingsTab: 'general',
+    messageCenter: messageCenter.getSnapshot(),
     launcherMode: 'applications',
     viewEpoch: 0,
     theme: 'system',
@@ -357,6 +368,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let destroyed = false
   let started = false
   let unlisten: (() => void) | undefined
+  let unsubscribeMessages: (() => void) | undefined
   let previewPreferenceToken = 0
   let previewPreferencePending: PreviewPreferenceOwner | undefined
   let previewPreferenceDurableGeneration = 0
@@ -406,6 +418,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       listeners.delete(listener)
     }
   }
+  unsubscribeMessages = messageCenter.subscribe(() => {
+    model.messageCenter = messageCenter.getSnapshot()
+    publish(true)
+  })
 
   function newTextControl(value: string): TextControl {
     return { key: controlKey++, value, draft: value }
@@ -1082,13 +1098,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    const nextView = event.target === 'launcher' ? 'launcher' : 'settings'
+    messageCenter.leave()
     if (event.notice === 'settingsFailed') model.settingsUncertain = true
     if (composition) restoreControl(composition.control)
     composition = undefined
     leaveFileMode()
     model.viewEpoch += 1
     model.invocationId = event.invocationId
-    model.view = event.target
+    model.view = nextView
+    model.settingsTab = event.target === 'messages' ? 'messages' : 'general'
     pluginInventoryActive = false
     model.queryControlValue = model.query
     model.querySequence = 0
@@ -1102,7 +1121,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.status = ''
     clearResults()
     model.shownNotice = event.notice === null ? undefined : NOTICE_TEXT[event.notice]
-    if (event.target === 'launcher') pendingSettingsLoadEpoch = undefined
+    if (nextView === 'launcher') pendingSettingsLoadEpoch = undefined
     else queueSettingsLoad()
     if (event.target === 'launcher' && event.notice === null && activationNoticePending) {
       activationNoticePending = false
@@ -1113,9 +1132,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       scheduleSearch()
     }
     publish(true)
-    if (event.target === 'settings') {
+    if (nextView === 'settings') {
       void drainSettingsLoad()
     }
+    if (event.target === 'messages') void messageCenter.enter()
   }
 
   function text(record: ClassifiedTextRecord): void {
@@ -1573,6 +1593,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     unlisten = registered
+    await messageCenter.start()
+    if (destroyed) return
     const operation = startSettingsOperation('load', {
       scope: 'startup',
       previewGeneration: previewPreferenceDurableGeneration,
@@ -1613,6 +1635,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     pendingSettingsLoadEpoch = undefined
     pluginListOwner = undefined
     pluginMutationOwners.clear()
+    unsubscribeMessages?.()
+    unsubscribeMessages = undefined
+    messageCenter.destroy()
     unlisten?.()
     unlisten = undefined
     listeners.clear()
@@ -1701,6 +1726,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  async function clearMessages(): Promise<void> {
+    await messageCenter.clear()
+  }
+
   return {
     client,
     getSnapshot,
@@ -1717,6 +1746,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setThemePreference,
     setHotkeyCanonical,
     saveHotkeyCanonical,
+    clearMessages,
     setFileCategory,
     cycleFileCategory,
     setFileSort,

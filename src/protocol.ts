@@ -158,7 +158,7 @@ export interface CommandError {
   message: string
 }
 
-export type ShowTarget = 'launcher' | 'settings'
+export type ShowTarget = 'launcher' | 'settings' | 'messages'
 export type LifecycleNotice = 'settingsFailed'
 
 export interface LauncherShown {
@@ -166,6 +166,33 @@ export interface LauncherShown {
   target: ShowTarget
   notice: LifecycleNotice | null
 }
+
+export interface MessageSummary {
+  revision: U64Decimal
+  unreadCount: number
+}
+
+export interface MessageView {
+  id: U64Decimal
+  pluginId: string
+  pluginNameSnapshot: string
+  pluginIconUrl: string | null
+  createdAt: string
+  content: string
+  readAt: string | null
+}
+
+export interface MessageCenterSnapshot extends MessageSummary {
+  messages: readonly MessageView[]
+}
+
+export type MessageHostStateChanged =
+  | { status: 'ready'; revision: U64Decimal; unreadCount: number }
+  | { status: 'unavailable'; error: 'MessageStoreUnavailable' }
+
+export type MessageHostCommandError =
+  | { code: 'MessageOperationFailed'; storeStatus: 'ready' }
+  | { code: 'MessageStoreUnavailable'; storeStatus: 'unavailable' }
 
 export type ControlKey = number
 
@@ -177,6 +204,11 @@ export type ClassifiedTextRecord =
 
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
+  listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
+  getMessageSummary(): Promise<unknown>
+  openMessageCenter(): Promise<unknown>
+  readMessageCenter(): Promise<unknown>
+  clearMessages(): Promise<unknown>
   searchApps(input: { query: string; invocationId: string; querySequence: number; submit?: boolean }): Promise<SearchResponse | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
@@ -325,8 +357,22 @@ export interface FileSnapshot {
   selected?: FileResultView
 }
 
+export type SettingsTabKey = 'general' | 'plugins' | 'messages'
+
+export interface MessageCenterStateSnapshot {
+  readonly status: 'unknown' | 'ready' | 'unavailable'
+  readonly unreadCount?: number
+  readonly summaryRevision?: U64Decimal
+  readonly snapshotRevision?: U64Decimal
+  readonly messages: readonly MessageView[]
+  readonly clearPending: boolean
+  readonly operationError: boolean
+}
+
 export interface LauncherSnapshot {
   view: 'launcher' | 'settings'
+  settingsTab: SettingsTabKey
+  messageCenter: MessageCenterStateSnapshot
   viewEpoch: number
   theme: ThemePreference
   invocationId?: string
@@ -358,7 +404,7 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
   const keys = Object.keys(candidate).sort()
   if (keys.length !== shownKeys.length || keys.some((key, index) => key !== shownKeys[index])) return null
   if (typeof candidate.invocationId !== 'string') return null
-  if (candidate.target !== 'launcher' && candidate.target !== 'settings') return null
+  if (candidate.target !== 'launcher' && candidate.target !== 'settings' && candidate.target !== 'messages') return null
   if (candidate.notice !== null && candidate.notice !== 'settingsFailed') return null
   return candidate as unknown as LauncherShown
 }
@@ -573,11 +619,13 @@ export function parsePluginMutationOutcome(value: unknown): PluginMutationOutcom
     : null
 }
 
-export function compareDecimalRevision(left: string, right: string): -1 | 0 | 1 {
+export function compareU64Decimal(left: string, right: string): -1 | 0 | 1 {
   if (!canonicalU64(left) || !canonicalU64(right)) throw new TypeError('invalid decimal revision')
   if (left.length !== right.length) return left.length < right.length ? -1 : 1
   return left === right ? 0 : left < right ? -1 : 1
 }
+
+export const compareDecimalRevision = compareU64Decimal
 
 export function parseU64Decimal(value: unknown): U64Decimal | null {
   if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return null
@@ -586,6 +634,107 @@ export function parseU64Decimal(value: unknown): U64Decimal | null {
 
 function canonicalU64(value: unknown): value is string {
   return parseU64Decimal(value) !== null
+}
+
+function validUnreadCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100
+}
+
+export function parseMessageSummary(value: unknown): MessageSummary | null {
+  const summary = plainRecord(value)
+  const revision = summary ? parseU64Decimal(summary.revision) : null
+  if (!summary || !revision || !exactKeys(summary, ['revision', 'unreadCount']) || !validUnreadCount(summary.unreadCount)) {
+    return null
+  }
+  return { revision, unreadCount: summary.unreadCount }
+}
+
+export function parseMessageView(value: unknown): MessageView | null {
+  const message = plainRecord(value)
+  const id = message ? parseU64Decimal(message.id) : null
+  if (
+    !message ||
+    !id ||
+    !exactKeys(message, [
+      'content', 'createdAt', 'id', 'pluginIconUrl', 'pluginId', 'pluginNameSnapshot', 'readAt',
+    ]) ||
+    typeof message.pluginId !== 'string' ||
+    message.pluginId.length === 0 ||
+    typeof message.pluginNameSnapshot !== 'string' ||
+    message.pluginNameSnapshot.length === 0 ||
+    (message.pluginIconUrl !== null &&
+      (typeof message.pluginIconUrl !== 'string' || message.pluginIconUrl.length === 0)) ||
+    typeof message.createdAt !== 'string' ||
+    !strictUtcRfc3339(message.createdAt) ||
+    typeof message.content !== 'string' ||
+    message.content.length === 0 ||
+    (message.readAt !== null && (typeof message.readAt !== 'string' || !strictUtcRfc3339(message.readAt)))
+  ) {
+    return null
+  }
+  return {
+    id,
+    pluginId: message.pluginId,
+    pluginNameSnapshot: message.pluginNameSnapshot,
+    pluginIconUrl: message.pluginIconUrl,
+    createdAt: message.createdAt,
+    content: message.content,
+    readAt: message.readAt,
+  }
+}
+
+export function parseMessageCenterSnapshot(value: unknown): MessageCenterSnapshot | null {
+  const snapshot = plainRecord(value)
+  const revision = snapshot ? parseU64Decimal(snapshot.revision) : null
+  if (
+    !snapshot ||
+    !revision ||
+    !exactKeys(snapshot, ['messages', 'revision', 'unreadCount']) ||
+    !validUnreadCount(snapshot.unreadCount) ||
+    !Array.isArray(snapshot.messages) ||
+    Object.getPrototypeOf(snapshot.messages) !== Array.prototype ||
+    !exactDenseArray(snapshot.messages)
+  ) {
+    return null
+  }
+  const ids = new Set<string>()
+  const messages: MessageView[] = []
+  for (const valueMessage of snapshot.messages) {
+    const message = parseMessageView(valueMessage)
+    if (!message || ids.has(message.id)) return null
+    ids.add(message.id)
+    messages.push(message)
+  }
+  return { revision, unreadCount: snapshot.unreadCount, messages }
+}
+
+export function parseMessageHostStateChanged(value: unknown): MessageHostStateChanged | null {
+  const event = plainRecord(value)
+  if (!event || typeof event.status !== 'string') return null
+  if (event.status === 'unavailable') {
+    return exactKeys(event, ['error', 'status']) && event.error === 'MessageStoreUnavailable'
+      ? { status: 'unavailable', error: 'MessageStoreUnavailable' }
+      : null
+  }
+  const revision = parseU64Decimal(event.revision)
+  return event.status === 'ready' &&
+    revision !== null &&
+    exactKeys(event, ['revision', 'status', 'unreadCount']) &&
+    validUnreadCount(event.unreadCount)
+    ? { status: 'ready', revision, unreadCount: event.unreadCount }
+    : null
+}
+
+export function parseMessageHostCommandError(value: unknown): MessageHostCommandError | null {
+  const error = plainRecord(value)
+  if (!error || !exactKeys(error, ['code', 'storeStatus'])) return null
+  if (error.code === 'MessageOperationFailed' && error.storeStatus === 'ready') {
+    return { code: 'MessageOperationFailed', storeStatus: 'ready' }
+  }
+  if (error.code === 'MessageStoreUnavailable' && error.storeStatus === 'unavailable') {
+    return { code: 'MessageStoreUnavailable', storeStatus: 'unavailable' }
+  }
+  return null
 }
 
 export function parseFindForwardPayload(value: unknown): FindForwardPayload | null {
