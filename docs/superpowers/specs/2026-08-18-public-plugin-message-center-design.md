@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-18
-- 状态：Approved in conversation; written review pending
+- 状态：Approved; final written review passed on 2026-08-18
 - 产品阶段：公开插件平台后续 MVP
 - 目标平台：Windows 11 x64
 - 技术基线：Tauri 2、Rust、TypeScript、WebView2
