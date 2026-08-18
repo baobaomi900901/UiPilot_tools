@@ -85,7 +85,8 @@ UiPilot 负责持久化消息、维护未读状态、显示 Windows 通知、短
 设置页关闭或主窗口隐藏时，未读状态仍由宿主持久化并在下次显示时恢复。
 
 程序运行期间消息存储从可用转为不可用时，当前已经显示的数字徽标必须立即切换为 `!`；不能等待用户
-重新打开主窗口或再次读取摘要后才发现状态变化。
+重新打开主窗口或再次读取摘要后才发现状态变化。此后到达的旧 ready 事件或成功响应不能把 `!` 改回
+数字，也不能恢复旧消息列表。
 
 ### 4.4 Windows 通知与托盘
 
@@ -114,6 +115,8 @@ Windows 通知被系统关闭、权限被拒绝或发送失败时，已保存的
   不能推进该游标。
 - **宿主状态事件（host state event）**：只发送给 `main` 的 `MessageHostStateChangedEvent`。其 ready
   分支携带摘要修订和未读数，其 unavailable 分支只通知消息子系统进入会话终态。
+- **前端会话状态（frontend session state）**：主前端维护的 `unknown | ready | unavailable` 状态。
+  `unavailable` 是吸收终态；同一 UiPilot 原生进程中不能再转回 ready。
 - **发布提交点（publish commit point）**：消息文档原子替换成功的时刻。到达该点后，本次发布不可撤销
   且 `publish()` 的结果固定为成功。
 - **进入截止点（open cutoff）**：打开消息页操作在线性化点观察到的最高消息 ID；只有不高于该 ID 的
@@ -281,6 +284,9 @@ interface MessageRecord {
   清空结果仍能补全界面；
 - 完整快照的修订高于摘要修订游标时同时推进两个游标；同修订完整快照可幂等替换当前列表。
 
+以上修订规则只适用于前端会话状态仍为 `unknown` 或 `ready` 时。一旦状态为 `unavailable`，不再比较任何
+迟到 ready 事件或成功快照的修订；这些结果无条件丢弃。
+
 如果截止点前没有未读消息，打开操作直接返回当前快照，不写文件也不递增修订。
 
 “清空全部”也是 main-caller-only 原子操作：删除当前全部消息、递增修订并返回空快照。清空线性化点
@@ -363,6 +369,27 @@ JavaScript 整数，不使用字符串。读取摘要返回 `MessageSummaryDto`�
 公开插件的 `publish()` 仍按第 7 节把任何无法完成的消息持久化映射为 `MessageStoreUnavailable`，但只有
 宿主状态实际转换时才发送 unavailable 事件。
 
+主前端必须实现以下单向状态机：
+
+```text
+unknown -> ready
+unknown -> unavailable
+ready -> unavailable
+unavailable -> unavailable
+```
+
+收到 `status: 'unavailable'` 事件，或任一消息管理命令返回 `storeStatus: 'unavailable'`，都是进入前端
+unavailable 吸收终态的线性化点。从该点起直到 UiPilot 原生进程重启，前端必须忽略：
+
+- 所有迟到的 `status: 'ready'` 事件，无论 revision 多高；
+- 所有迟到的成功摘要和 `MessageCenterSnapshotDto` 响应；
+- 所有迟到的 `MessageOperationFailed` / `storeStatus: 'ready'` 错误响应；
+- 任何会恢复数字徽标、消息列表、摘要游标或快照游标的异步完成。
+
+前端 WebView 在同一原生进程中 reload 后必须先从宿主读取状态，再渲染徽标或消息页；不能把 WebView
+内存重置视为 UiPilot 进程重启。只有新的原生进程完成 current/backup 恢复后，新的前端会话才能从
+`unknown` 进入 ready。
+
 消息提交、已读和清空后，宿主向 `main` 发出 `status: 'ready'` 且只含消息修订和未读数的状态事件。
 ready 事件不是消息持久化的完成条件，也不是完整列表快照；它只是一条摘要更新和快照失效提示。
 unavailable 事件没有修订或未读数，前端收到后必须立即停止显示旧数字徽标、显示 `!`，并把已打开的消息
@@ -404,6 +431,16 @@ request scheduler current guard
 主窗口的打开、读取或清空命令触发同一转换时没有 request scheduler guard，但仍必须先释放消息存储锁，
 再发 unavailable 状态事件并返回错误。
 
+以下乱序是合法的，前端吸收终态必须保证最终 UI 仍为 unavailable：
+
+```text
+operation A commits or prepares a ready response
+-> operation B transitions store to unavailable
+-> frontend observes unavailable event or command error
+-> delayed ready event / summary / snapshot / ready error from A arrives
+-> frontend discards A completion and keeps the ! badge
+```
+
 消息存储代码不能反向获取 scheduler、插件管理或窗口生命周期锁。任何锁都不能跨越 frontend emit、
 Windows 通知、托盘图标操作、窗口 show/focus 或等待前端 ack。
 
@@ -426,9 +463,14 @@ Windows 通知或托盘；如果失败同时产生首次 `ready -> unavailable` 
 如果宿主仍为 ready，则保留列表并显示固定的 `MessageOperationFailed`，不泄露磁盘路径；如果宿主已经
 转为 unavailable，则切换到下述不可用状态。
 
-消息存储不可用时，消息页显示独立的“消息不可用，请重试”状态和重试命令，禁用“清空全部”，不能显示
-“暂无消息”。摘要读取失败时，设置按钮显示固定尺寸的非数字 `!` 状态徽标，而不是隐藏徽标或显示未读
-为零；后续主窗口显示或用户重试时重新读取宿主状态。已有的最后成功列表不得被伪装成当前空列表。
+消息存储不可用时，消息页显示独立的“消息不可用，请重启 UiPilot”，不提供重试命令，禁用“清空全部”，
+不能显示“暂无消息”。前端观察到终态后，设置按钮显示固定尺寸的非数字 `!` 状态徽标，而不是隐藏徽标
+或显示未读为零；同一前端会话后续显示主窗口时不重复调用消息读取命令。已有的最后成功列表不得被伪装
+成当前空列表。
+
+只有尚未观察到终态的前端才能在首次启动、事件可能丢失后的主窗口显示或 WebView reload 初始化时读取
+宿主状态。一旦读取结果确认 unavailable，本次原生进程内不再提供普通重试；用户必须重启 UiPilot 才能
+触发下一次存储恢复。
 
 启动器设置按钮使用现有图标按钮，并在固定尺寸容器内叠加未读徽标，避免徽标出现时改变输入框尺寸。
 徽标不遮挡设置图标的可点击区域和焦点轮廓。
@@ -508,6 +550,10 @@ Promise 拒绝时，Runtime Promise 必须拒绝且不能返回窗口响应。
   徽标显示 `!`，不能伪装成空列表或未读为零。
 - 运行中首次进入 unavailable：释放所有锁后只向 `main` 发一次 unavailable 状态事件；事件失败时，下次
   摘要读取或主窗口显示仍必须发现不可用，旧数字徽标不能被当作当前状态。
+- 前端已观察到 unavailable 后收到迟到 ready 事件、成功摘要、完整快照或 `storeStatus: 'ready'` 错误：
+  全部丢弃，保持 `!` 和不可用页面；只有 UiPilot 原生进程重启可以解除该状态。
+- unavailable 页面不提供重试命令，固定提示“消息不可用，请重启 UiPilot”；重复显示主窗口不能在同一
+  进程内重新初始化消息存储。
 - Windows 通知失败：消息、未读和插件响应保持成功。
 - Windows 通知点击或关闭回调失败：释放可释放的活动句柄，消息和未读状态保持。
 - 干净退出取消活动通知失败：记录脱敏诊断并继续退出，不改变已保存消息。
@@ -553,8 +599,11 @@ Promise 拒绝时，Runtime Promise 必须拒绝且不能返回窗口响应。
 - 事件先于命令响应、同修订空列表、低修订响应和重读四种乱序路径；
 - 设置按钮徽标的 0、1、99、100 边界；
 - 消息存储不可用显示独立错误页和 `!` 徽标，不显示“暂无消息”或未读零；
+- unavailable 页面显示“消息不可用，请重启 UiPilot”，没有重试按钮或重试命令；
 - 主窗口已显示数字徽标时收到 unavailable 状态事件，立即切换为 `!` 并使已打开消息页进入不可用状态；
 - `MessageOperationFailed` 保留当前列表和数字徽标，不能误切换成 unavailable；
+- operation A 的 ready 事件或命令响应延迟，operation B 先使前端进入 unavailable 后，A 的 ready 事件、
+  成功摘要、完整快照和 `storeStatus: 'ready'` 错误均不能恢复数字徽标或列表；
 - 清空成功和失败都不关闭设置页；
 - 消息到达不改变当前视图、焦点、查询或输入值。
 
@@ -601,14 +650,16 @@ SDK 与 Demo 覆盖：
    所有 ID 与修订高低判断在 `u64` 全范围内准确。
 6. 设置消息页、清空全部、持久化历史和插件卸载保留符合用户合同；历史使用当前安装图标或默认图标。
 7. 设置按钮徽标准确显示未读数量并在 100 条时显示 `99+`；存储在运行中转为不可用时通过 main-only
-   状态事件立即显示 `!`，而不是继续显示旧数字或未读零。
-8. 每条消息尝试显示 Windows 通知并触发 6 秒单计时器托盘闪烁。
-9. Windows 原生适配器能观测系统禁用、发送失败和点击，并在干净退出时尽力取消活动通知；正式身份、
+   状态事件立即显示 `!`，而不是继续显示旧数字或未读零；同一进程内所有迟到 ready 结果都不能解除
+   unavailable 吸收终态。
+8. unavailable 页面明确要求重启 UiPilot，不提供当前会话内必然失败的重试入口。
+9. 每条消息尝试显示 Windows 通知并触发 6 秒单计时器托盘闪烁。
+10. Windows 原生适配器能观测系统禁用、发送失败和点击，并在干净退出时尽力取消活动通知；正式身份、
    图标和点击路由通过普通权限安装产物验收。
-10. 插件名称和正文只能作为 Toast DOM 文本节点写入；XML 敏感字符和伪造标签不能改变节点、动作或路由。
-11. 消息到达绝不抢焦点；用户点击通知才打开并聚焦设置消息页。
-12. `demo-win` 的消息内容与子窗口 `Return text` 完全相同，消息失败时窗口不部分成功。
-13. `demo-return`、`/find`、计算、浏览器搜索及现有窗口行为没有回归。
+11. 插件名称和正文只能作为 Toast DOM 文本节点写入；XML 敏感字符和伪造标签不能改变节点、动作或路由。
+12. 消息到达绝不抢焦点；用户点击通知才打开并聚焦设置消息页。
+13. `demo-win` 的消息内容与子窗口 `Return text` 完全相同，消息失败时窗口不部分成功。
+14. `demo-return`、`/find`、计算、浏览器搜索及现有窗口行为没有回归。
 
 ## 18. 非目标
 
