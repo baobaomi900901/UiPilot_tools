@@ -37,8 +37,9 @@ pub(crate) enum PublicPermission {
 }
 
 impl PublicPermission {
-    pub(super) fn is_available(self) -> bool {
+    pub(super) fn is_available(self, platform: PublicPlatform) -> bool {
         matches!(self, Self::UiWindow | Self::ClipboardWrite)
+            || (self == Self::NotificationsPublish && platform == PublicPlatform::Windows)
     }
 }
 
@@ -321,7 +322,7 @@ fn validate_manifest(
     if manifest
         .permissions
         .iter()
-        .any(|permission| !permission.is_available())
+        .any(|permission| !permission.is_available(host.platform))
     {
         return Err(PublicPackageError::UnsupportedPermission);
     }

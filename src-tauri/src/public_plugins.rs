@@ -27,6 +27,8 @@ use tauri::{
     AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
+use crate::message_center::MessageCenterService;
+
 pub(crate) use activation::{
     parse_main_result_response, parse_window_response, PublicMainResult, PublicPluginInstallSource,
     PublicPluginInventory, PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
@@ -37,9 +39,10 @@ pub(crate) use manifest::{
     PublicPermission, PublicPlatform,
 };
 pub(crate) use runtime::{
-    parse_runtime_label, runtime_label, PluginApiRequest, PluginCommandCompletion,
-    PluginCommandDispatch, PluginInvocation, PluginInvocationEnvironment, PluginInvocationPlatform,
-    PluginInvocationTheme, PluginRuntimeApi, PluginRuntimeError, PUBLIC_RUNTIME_BOOTSTRAP,
+    parse_runtime_label, runtime_label, PluginApiExecution, PluginApiRequest,
+    PluginCommandCompletion, PluginCommandDispatch, PluginInvocation, PluginInvocationEnvironment,
+    PluginInvocationPlatform, PluginInvocationTheme, PluginRuntimeApi, PluginRuntimeError,
+    PUBLIC_RUNTIME_BOOTSTRAP,
 };
 pub(crate) use scheduler::{
     PluginCompletionOutcome, PluginContextStatus, PluginRequestCandidate, PluginRequestContext,
@@ -90,10 +93,12 @@ impl PublicPluginService {
         app_data_dir: &Path,
         reserved_names: impl IntoIterator<Item = String>,
     ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
+        let message_center = Arc::new(MessageCenterService::load(app_data_dir));
         let manager = Arc::new(PublicPluginManager::load(
             app_data_dir,
             PublicPluginHost::current(PublicPlatform::Windows),
             reserved_names,
+            message_center,
         )?);
         self.manager
             .set(Arc::clone(&manager))

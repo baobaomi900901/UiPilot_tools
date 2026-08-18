@@ -119,6 +119,21 @@ pub(crate) enum PluginContextAccessError {
 struct RunningRequest {
     request: ScheduledPluginRequest,
     current: bool,
+    notification_published: bool,
+}
+
+pub(crate) struct PluginCurrentRequest<'a> {
+    notification_published: &'a mut bool,
+}
+
+impl PluginCurrentRequest<'_> {
+    pub(crate) fn notification_published(&self) -> bool {
+        *self.notification_published
+    }
+
+    pub(crate) fn mark_notification_published(&mut self) {
+        *self.notification_published = true;
+    }
 }
 
 struct PluginQueue {
@@ -284,25 +299,31 @@ impl PluginRequestScheduler {
     pub(crate) fn with_current<T>(
         &self,
         context: &PluginRequestContext,
-        operation: impl FnOnce() -> T,
+        operation: impl FnOnce(&mut PluginCurrentRequest<'_>) -> T,
     ) -> Result<T, PluginContextAccessError> {
         if !context.valid_shape() {
             return Err(PluginContextAccessError::Invalid);
         }
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| PluginContextAccessError::Unavailable)?;
         let queue = state
             .by_plugin
-            .get(&context.plugin_id)
+            .get_mut(&context.plugin_id)
             .ok_or(PluginContextAccessError::Invalid)?;
         if queue.running.as_ref().is_some_and(|running| {
             running.current
                 && running.request.context == *context
                 && queue.generation == context.plugin_generation
         }) {
-            Ok(operation())
+            let running = queue
+                .running
+                .as_mut()
+                .ok_or(PluginContextAccessError::Unavailable)?;
+            Ok(operation(&mut PluginCurrentRequest {
+                notification_published: &mut running.notification_published,
+            }))
         } else if queue.issued.contains(context) {
             Err(PluginContextAccessError::Expired)
         } else {
@@ -443,6 +464,7 @@ fn dispatch(
     queue.running = Some(RunningRequest {
         request: request.clone(),
         current: true,
+        notification_published: false,
     });
     Ok(request)
 }
@@ -632,5 +654,43 @@ mod tests {
             .unwrap();
         assert_eq!(latest.candidate.input, "latest");
         assert_eq!(latest.context.plugin_generation, 2);
+    }
+
+    #[test]
+    fn notification_publish_state_belongs_to_each_running_request() {
+        let scheduler = PluginRequestScheduler::default();
+        let start = Instant::now();
+        let first = match scheduler
+            .enqueue(candidate("first", 1, PublicActivationMode::Submit), start)
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("first request must dispatch"),
+        };
+
+        scheduler
+            .with_current(&first.context, |current| {
+                assert!(!current.notification_published());
+                current.mark_notification_published();
+                assert!(current.notification_published());
+            })
+            .unwrap();
+        scheduler
+            .enqueue(
+                candidate("second", 1, PublicActivationMode::Submit),
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        let second = scheduler
+            .complete(&first.context, start + Duration::from_secs(2))
+            .unwrap()
+            .next
+            .unwrap();
+
+        scheduler
+            .with_current(&second.context, |current| {
+                assert!(!current.notification_published());
+            })
+            .unwrap();
     }
 }

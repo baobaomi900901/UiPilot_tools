@@ -12,11 +12,14 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::message_center::MessageCenterService;
+
 use super::{
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
     package, runtime_label, stage_public_package, EffectivePluginConfig, PluginApiRequest,
-    PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler,
-    PluginRuntimeApi, PluginRuntimeError, PluginSecretStore, PluginStateError, PluginStateStore,
+    PluginApiExecution, PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext,
+    PluginRequestScheduler, PluginRuntimeApi, PluginRuntimeError, PluginSecretStore,
+    PluginStateError, PluginStateStore,
     PluginStorageStore, PreparedPublicPlugin, PublicManifestV1, PublicPackageError,
     PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource,
 };
@@ -287,6 +290,7 @@ pub(crate) struct PublicPluginManager {
     storage: Arc<PluginStorageStore>,
     secrets: Arc<PluginSecretStore>,
     scheduler: Arc<PluginRequestScheduler>,
+    message_center: Arc<MessageCenterService>,
     api: PluginRuntimeApi,
     mutation: Mutex<()>,
     data: Mutex<ActivationData>,
@@ -299,6 +303,7 @@ impl PublicPluginManager {
         app_data_dir: &Path,
         host: PublicPluginHost,
         reserved_names: impl IntoIterator<Item = String>,
+        message_center: Arc<MessageCenterService>,
     ) -> Result<Self, PublicPluginManagementError> {
         let root = app_data_dir.join("public-plugins");
         let staging_root = root.join("staging");
@@ -320,6 +325,7 @@ impl PublicPluginManager {
             Arc::clone(&state),
             Arc::clone(&storage),
             Arc::clone(&secrets),
+            message_center.clone(),
         );
         let mut active_by_plugin = HashMap::new();
         for config in state.configs()? {
@@ -355,6 +361,7 @@ impl PublicPluginManager {
             storage,
             secrets,
             scheduler,
+            message_center,
             api,
             mutation: Mutex::new(()),
             data: Mutex::new(ActivationData {
@@ -818,7 +825,7 @@ impl PublicPluginManager {
                     .copied()
                     .map(|permission| PublicPermissionView {
                         permission,
-                        supported: permission.is_available(),
+                        supported: permission.is_available(self.host.platform),
                         granted: config.permission_grants.contains(&permission),
                     })
                     .collect(),
@@ -973,11 +980,15 @@ impl PublicPluginManager {
         &self,
         caller_label: &str,
         request: PluginApiRequest,
-    ) -> Result<Value, PluginRuntimeError> {
-        let manifest = self
-            .manifest_for_label(caller_label)
-            .ok_or(PluginRuntimeError::InvalidCaller)?;
+    ) -> PluginApiExecution {
+        let Some(manifest) = self.manifest_for_label(caller_label) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidCaller);
+        };
         self.api.execute(caller_label, request, &manifest)
+    }
+
+    pub(crate) fn message_center(&self) -> &Arc<MessageCenterService> {
+        &self.message_center
     }
 
     pub(crate) fn complete(
@@ -1430,10 +1441,12 @@ mod tests {
     }
 
     fn manager(dir: &TestDir) -> PublicPluginManager {
+        let message_center = Arc::new(MessageCenterService::load(dir.path()));
         PublicPluginManager::load(
             dir.path(),
             PublicPluginHost::current(PublicPlatform::Windows),
             ["find".into(), "math".into()],
+            message_center,
         )
         .unwrap()
     }

@@ -210,6 +210,32 @@ fn rejects_incompatible_or_malformed_and_preserves_legacy_loader() {
     );
 }
 
+#[test]
+fn notifications_publish_permission_is_available_only_on_windows() {
+    for (label, platform, expected) in [
+        ("notifications-windows", PublicPlatform::Windows, Ok(())),
+        (
+            "notifications-macos",
+            PublicPlatform::Macos,
+            Err(PublicPackageError::UnsupportedPermission),
+        ),
+    ] {
+        let root = TestRoot::new(label);
+        let source = root.package();
+        let mut candidate = manifest("mainResult");
+        candidate["supportedPlatforms"] = json!(["windows", "macos"]);
+        candidate["permissions"] = json!(["notifications.publish"]);
+        write_package(&source, &candidate);
+        let result = stage_public_package(
+            PublicPackageSource::DevelopmentDirectory(source),
+            &root.staging(),
+            &PublicPluginHost::current(platform),
+        )
+        .map(|_| ());
+        assert_eq!(result, expected);
+    }
+}
+
 fn host() -> PublicPluginHost {
     PublicPluginHost::current(PublicPlatform::Windows)
 }

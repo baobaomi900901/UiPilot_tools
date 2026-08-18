@@ -3,10 +3,14 @@ use std::{fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::message_center::{
+    MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest, MessagePublisher,
+};
+
 use super::{
-    scheduler::{PluginContextAccessError, PluginRequestScheduler},
+    scheduler::{PluginContextAccessError, PluginCurrentRequest, PluginRequestScheduler},
     PluginDataScope, PluginRequestContext, PluginSecretStore, PluginStateStore, PluginStorageStore,
-    PublicManifestV1,
+    PublicManifestV1, PublicPermission,
 };
 
 pub(crate) const PUBLIC_RUNTIME_LABEL_PREFIX: &str = "plugin-runtime-";
@@ -43,8 +47,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
         if (!current) throw fail('ExpiredRequestError');
         return requestContext;
       };
-      const operation = (operation, key, value) => invoke('plugin_api_call', {
-        request: { context: context(), operation, key, value },
+      const operation = (operation, key, value, notification) => invoke('plugin_api_call', {
+        request: { context: context(), operation, key, value, notification },
       });
       const api = deepFreeze({
         storage: {
@@ -55,6 +59,14 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
         settings: {
           get: (key) => operation('settingGet', key),
           isSecretConfigured: (key) => operation('secretConfigured', key),
+        },
+        notifications: {
+          publish: (input) => {
+            const snapshot = input && typeof input === 'object' && !Array.isArray(input)
+              ? deepFreeze({ ...input })
+              : input;
+            return operation('notificationPublish', undefined, undefined, snapshot);
+          },
         },
       });
       try {
@@ -88,6 +100,8 @@ pub(crate) struct PluginApiRequest {
     pub(crate) key: Option<String>,
     #[serde(default)]
     pub(crate) value: Option<Value>,
+    #[serde(default)]
+    pub(crate) notification: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,6 +112,13 @@ pub(crate) enum PluginApiOperation {
     StorageRemove,
     SettingGet,
     SecretConfigured,
+    NotificationPublish,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginNotificationPublishInput {
+    content: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +127,10 @@ pub(crate) enum PluginRuntimeError {
     ExpiredRequest,
     InvalidCaller,
     InvalidOperation,
+    PermissionDenied,
+    InvalidNotification,
+    AlreadyPublished,
+    MessageStoreUnavailable,
     Storage,
     Unavailable,
 }
@@ -117,6 +142,10 @@ impl fmt::Display for PluginRuntimeError {
             Self::ExpiredRequest => "ExpiredRequestError",
             Self::InvalidCaller => "InvalidCaller",
             Self::InvalidOperation => "InvalidOperation",
+            Self::PermissionDenied => "PermissionDenied",
+            Self::InvalidNotification => "InvalidNotification",
+            Self::AlreadyPublished => "AlreadyPublished",
+            Self::MessageStoreUnavailable => "MessageStoreUnavailable",
             Self::Storage => "StorageError",
             Self::Unavailable => "RuntimeUnavailable",
         })
@@ -130,6 +159,32 @@ pub(crate) struct PluginRuntimeApi {
     state: Arc<PluginStateStore>,
     storage: Arc<PluginStorageStore>,
     secrets: Arc<PluginSecretStore>,
+    messages: Arc<dyn MessagePublisher>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PluginApiExecution {
+    pub(crate) result: Result<Value, PluginRuntimeError>,
+    pub(crate) post_guard_effect: Option<MessagePostGuardEffect>,
+}
+
+impl PluginApiExecution {
+    pub(crate) fn failed(error: PluginRuntimeError) -> Self {
+        Self {
+            result: Err(error),
+            post_guard_effect: None,
+        }
+    }
+
+    fn complete(
+        result: Result<Value, PluginRuntimeError>,
+        post_guard_effect: Option<MessagePostGuardEffect>,
+    ) -> Self {
+        Self {
+            result,
+            post_guard_effect,
+        }
+    }
 }
 
 impl PluginRuntimeApi {
@@ -138,12 +193,14 @@ impl PluginRuntimeApi {
         state: Arc<PluginStateStore>,
         storage: Arc<PluginStorageStore>,
         secrets: Arc<PluginSecretStore>,
+        messages: Arc<dyn MessagePublisher>,
     ) -> Self {
         Self {
             scheduler,
             state,
             storage,
             secrets,
+            messages,
         }
     }
 
@@ -152,24 +209,45 @@ impl PluginRuntimeApi {
         caller_label: &str,
         request: PluginApiRequest,
         manifest: &PublicManifestV1,
-    ) -> Result<Value, PluginRuntimeError> {
-        let identity =
-            parse_runtime_label(caller_label).ok_or(PluginRuntimeError::InvalidCaller)?;
+    ) -> PluginApiExecution {
+        let Some(identity) = parse_runtime_label(caller_label) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidCaller);
+        };
         if identity.plugin_id != request.context.plugin_id
             || identity.generation != request.context.plugin_generation
             || manifest.plugin_id != request.context.plugin_id
         {
-            return Err(PluginRuntimeError::InvalidContext);
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidContext);
         }
-        let scope = PluginDataScope::new(&request.context.plugin_id)
-            .map_err(|_| PluginRuntimeError::InvalidContext)?;
+        let Ok(scope) = PluginDataScope::new(&request.context.plugin_id) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidContext);
+        };
         let context = request.context.clone();
-        self.scheduler
-            .with_current(&context, || self.execute_current(&scope, request, manifest))
-            .map_err(map_context_error)?
+        match self.scheduler.with_current(&context, |current| {
+            self.execute_current(&scope, request, manifest, current)
+        }) {
+            Ok(execution) => execution,
+            Err(error) => PluginApiExecution::failed(map_context_error(error)),
+        }
     }
 
     fn execute_current(
+        &self,
+        scope: &PluginDataScope,
+        request: PluginApiRequest,
+        manifest: &PublicManifestV1,
+        current: &mut PluginCurrentRequest<'_>,
+    ) -> PluginApiExecution {
+        if request.operation == PluginApiOperation::NotificationPublish {
+            return self.publish_notification(request, manifest, current);
+        }
+        if request.notification.is_some() {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidOperation);
+        }
+        PluginApiExecution::complete(self.execute_data_api(scope, request, manifest), None)
+    }
+
+    fn execute_data_api(
         &self,
         scope: &PluginDataScope,
         request: PluginApiRequest,
@@ -239,8 +317,80 @@ impl PluginRuntimeApi {
             | PluginApiOperation::StorageRemove
             | PluginApiOperation::SettingGet
             | PluginApiOperation::SecretConfigured => Err(PluginRuntimeError::InvalidOperation),
+            PluginApiOperation::NotificationPublish => unreachable!("handled before data APIs"),
         }
     }
+
+    fn publish_notification(
+        &self,
+        request: PluginApiRequest,
+        manifest: &PublicManifestV1,
+        current: &mut PluginCurrentRequest<'_>,
+    ) -> PluginApiExecution {
+        let plugin_id = &request.context.plugin_id;
+        let permitted = manifest
+            .permissions
+            .contains(&PublicPermission::NotificationsPublish)
+            && self
+                .state
+                .config(plugin_id)
+                .ok()
+                .flatten()
+                .is_some_and(|config| {
+                    config.installed
+                        && config.enabled
+                        && config.fault.is_none()
+                        && config.active_generation == request.context.plugin_generation
+                        && config
+                            .permission_grants
+                            .contains(&PublicPermission::NotificationsPublish)
+                });
+        if !permitted {
+            return PluginApiExecution::failed(PluginRuntimeError::PermissionDenied);
+        }
+        if request.key.is_some() || request.value.is_some() {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        }
+        let Some(value) = request.notification else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        };
+        let Ok(input) = serde_json::from_value::<PluginNotificationPublishInput>(value) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        };
+        if !valid_notification_content(&input.content) {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        }
+        if current.notification_published() {
+            return PluginApiExecution::failed(PluginRuntimeError::AlreadyPublished);
+        }
+
+        match self.messages.commit_publish(MessagePublishRequest {
+            plugin_id: plugin_id.clone(),
+            plugin_name_snapshot: manifest.name.clone(),
+            content: input.content,
+        }) {
+            MessagePublishOutcome::Published(message) => {
+                current.mark_notification_published();
+                PluginApiExecution::complete(
+                    Ok(Value::Null),
+                    Some(MessagePostGuardEffect::Published(message)),
+                )
+            }
+            MessagePublishOutcome::BecameUnavailable => PluginApiExecution::complete(
+                Err(PluginRuntimeError::MessageStoreUnavailable),
+                Some(MessagePostGuardEffect::BecameUnavailable),
+            ),
+            MessagePublishOutcome::OperationFailed | MessagePublishOutcome::Unavailable => {
+                PluginApiExecution::failed(PluginRuntimeError::MessageStoreUnavailable)
+            }
+        }
+    }
+}
+
+fn valid_notification_content(content: &str) -> bool {
+    !content.trim().is_empty()
+        && content.chars().count() <= 500
+        && !content.chars().any(char::is_control)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -352,18 +502,26 @@ pub(crate) struct PluginCommandCompletion {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeSet, VecDeque},
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex,
+        },
         time::Instant,
     };
 
     use serde_json::json;
 
     use super::*;
+    use crate::message_center::{
+        MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest,
+        MessagePublished, MessagePublisher,
+    };
     use crate::public_plugins::{
         scheduler::{PluginRequestCandidate, PluginScheduleOutcome, PluginSubmissionOwner},
-        PublicActivationMode,
+        PublicActivationMode, PublicPermission, ScheduledPluginRequest,
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -425,6 +583,120 @@ mod tests {
             operation,
             key: Some("key".into()),
             value: None,
+            notification: None,
+        }
+    }
+
+    fn notification_manifest() -> PublicManifestV1 {
+        let mut manifest = manifest();
+        manifest.permissions = vec![PublicPermission::NotificationsPublish];
+        manifest
+    }
+
+    fn notification_request(
+        context: PluginRequestContext,
+        notification: Option<Value>,
+    ) -> PluginApiRequest {
+        PluginApiRequest {
+            context,
+            operation: PluginApiOperation::NotificationPublish,
+            key: None,
+            value: None,
+            notification,
+        }
+    }
+
+    fn runtime_fixture(
+        dir: &TestDir,
+        persisted_manifest: &PublicManifestV1,
+        grants: BTreeSet<PublicPermission>,
+        publisher: Arc<dyn MessagePublisher>,
+    ) -> (
+        PluginRuntimeApi,
+        Arc<PluginRequestScheduler>,
+        ScheduledPluginRequest,
+        String,
+    ) {
+        let scheduler = Arc::new(PluginRequestScheduler::default());
+        let state = Arc::new(
+            PluginStateStore::load(&dir.path().join("state"), Vec::<String>::new()).unwrap(),
+        );
+        state
+            .install_or_upgrade(persisted_manifest, grants)
+            .unwrap();
+        let storage = Arc::new(PluginStorageStore::load(&dir.path().join("storage")).unwrap());
+        let secrets = Arc::new(PluginSecretStore::load(&dir.path().join("secrets")).unwrap());
+        let api = PluginRuntimeApi::new(Arc::clone(&scheduler), state, storage, secrets, publisher);
+        let scheduled = match scheduler
+            .enqueue(
+                PluginRequestCandidate {
+                    plugin_id: persisted_manifest.plugin_id.clone(),
+                    plugin_generation: 1,
+                    activation_mode: PublicActivationMode::Submit,
+                    input: "input".into(),
+                    owner: PluginSubmissionOwner {
+                        ui_intent_epoch: 1,
+                        control_value: "/runtime input".into(),
+                        submission_token: "submission-notification".into(),
+                    },
+                },
+                Instant::now(),
+            )
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("first request must dispatch"),
+        };
+        let label = runtime_label(&persisted_manifest.plugin_id, 1).unwrap();
+        (api, scheduler, scheduled, label)
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakePublishOutcome {
+        Succeed,
+        OperationFailed,
+    }
+
+    struct FakePublisher {
+        outcomes: Mutex<VecDeque<FakePublishOutcome>>,
+        calls: Mutex<Vec<MessagePublishRequest>>,
+    }
+
+    impl FakePublisher {
+        fn new(outcomes: impl IntoIterator<Item = FakePublishOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<MessagePublishRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl MessagePublisher for FakePublisher {
+        fn commit_publish(&self, request: MessagePublishRequest) -> MessagePublishOutcome {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(request.clone());
+            match self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(FakePublishOutcome::Succeed)
+            {
+                FakePublishOutcome::Succeed => MessagePublishOutcome::Published(MessagePublished {
+                    id: calls.len().to_string(),
+                    plugin_id: request.plugin_id,
+                    plugin_name_snapshot: request.plugin_name_snapshot,
+                    created_at: "2026-08-19T01:02:03Z".into(),
+                    content: request.content,
+                    revision: calls.len().to_string(),
+                    unread_count: calls.len(),
+                }),
+                FakePublishOutcome::OperationFailed => MessagePublishOutcome::OperationFailed,
+            }
         }
     }
 
@@ -437,7 +709,8 @@ mod tests {
         );
         let storage = Arc::new(PluginStorageStore::load(&dir.path().join("storage")).unwrap());
         let secrets = Arc::new(PluginSecretStore::load(&dir.path().join("secrets")).unwrap());
-        let api = PluginRuntimeApi::new(Arc::clone(&scheduler), state, storage, secrets);
+        let publisher = Arc::new(FakePublisher::new([]));
+        let api = PluginRuntimeApi::new(Arc::clone(&scheduler), state, storage, secrets, publisher);
         let manifest = manifest();
         let scheduled = match scheduler
             .enqueue(
@@ -461,11 +734,14 @@ mod tests {
         };
         let label = runtime_label(&manifest.plugin_id, 1).unwrap();
         let mut get = request(scheduled.context.clone(), PluginApiOperation::StorageGet);
-        assert_eq!(api.execute(&label, get.clone(), &manifest), Ok(Value::Null));
+        assert_eq!(
+            api.execute(&label, get.clone(), &manifest).result,
+            Ok(Value::Null)
+        );
 
         get.context.request_id = "forged".into();
         assert_eq!(
-            api.execute(&label, get, &manifest),
+            api.execute(&label, get, &manifest).result,
             Err(PluginRuntimeError::InvalidContext)
         );
         scheduler
@@ -489,7 +765,8 @@ mod tests {
                 &label,
                 request(scheduled.context, PluginApiOperation::StorageGet),
                 &manifest
-            ),
+            )
+            .result,
             Err(PluginRuntimeError::ExpiredRequest)
         );
         assert_eq!(
@@ -504,7 +781,8 @@ mod tests {
                     PluginApiOperation::StorageGet
                 ),
                 &manifest
-            ),
+            )
+            .result,
             Err(PluginRuntimeError::InvalidCaller)
         );
     }
@@ -525,5 +803,231 @@ mod tests {
         assert!(PUBLIC_RUNTIME_BOOTSTRAP.contains("deepFreeze"));
         assert!(PUBLIC_RUNTIME_BOOTSTRAP.contains("onCommand"));
         assert!(!PUBLIC_RUNTIME_BOOTSTRAP.contains("api.resolve"));
+    }
+
+    #[test]
+    fn notification_permission_is_checked_before_store_access() {
+        let dir = TestDir::new();
+        let persisted = manifest();
+        let declared = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
+        let (api, _, scheduled, label) =
+            runtime_fixture(&dir, &persisted, BTreeSet::new(), publisher.clone());
+        let input = Some(json!({ "content": "message" }));
+
+        assert_eq!(
+            api.execute(
+                &label,
+                notification_request(scheduled.context.clone(), input.clone()),
+                &persisted,
+            )
+            .result,
+            Err(PluginRuntimeError::PermissionDenied)
+        );
+        assert_eq!(
+            api.execute(
+                &label,
+                notification_request(scheduled.context, input),
+                &declared,
+            )
+            .result,
+            Err(PluginRuntimeError::PermissionDenied)
+        );
+        assert!(publisher.calls().is_empty());
+    }
+
+    #[test]
+    fn notification_input_validation_preserves_the_500_scalar_original() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
+        let (api, _, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher.clone(),
+        );
+
+        for invalid in [
+            None,
+            Some(json!({})),
+            Some(json!({ "content": 1 })),
+            Some(json!({ "content": "   " })),
+            Some(json!({ "content": "line one\nline two" })),
+            Some(json!({ "content": "control\u{0000}" })),
+            Some(json!({ "content": "x".repeat(501) })),
+            Some(json!({ "content": "valid", "unknown": true })),
+        ] {
+            let execution = api.execute(
+                &label,
+                notification_request(scheduled.context.clone(), invalid),
+                &manifest,
+            );
+            assert_eq!(
+                execution.result,
+                Err(PluginRuntimeError::InvalidNotification)
+            );
+            assert_eq!(execution.post_guard_effect, None);
+        }
+
+        let original = format!("  {}  ", "界".repeat(496));
+        let execution = api.execute(
+            &label,
+            notification_request(
+                scheduled.context,
+                Some(json!({ "content": original.clone() })),
+            ),
+            &manifest,
+        );
+        assert_eq!(execution.result, Ok(Value::Null));
+        assert_eq!(publisher.calls()[0].content, original);
+    }
+
+    #[test]
+    fn one_request_can_publish_only_once() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
+        let (api, _, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher.clone(),
+        );
+        let request =
+            notification_request(scheduled.context, Some(json!({ "content": "only once" })));
+
+        assert_eq!(
+            api.execute(&label, request.clone(), &manifest).result,
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            api.execute(&label, request, &manifest).result,
+            Err(PluginRuntimeError::AlreadyPublished)
+        );
+        assert_eq!(publisher.calls().len(), 1);
+    }
+
+    #[test]
+    fn failed_persistence_does_not_consume_the_request_allowance() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([
+            FakePublishOutcome::OperationFailed,
+            FakePublishOutcome::Succeed,
+        ]));
+        let (api, _, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher.clone(),
+        );
+        let request = notification_request(scheduled.context, Some(json!({ "content": "retry" })));
+
+        let failed = api.execute(&label, request.clone(), &manifest);
+        assert_eq!(
+            failed.result,
+            Err(PluginRuntimeError::MessageStoreUnavailable)
+        );
+        assert_eq!(failed.post_guard_effect, None);
+        assert_eq!(
+            api.execute(&label, request, &manifest).result,
+            Ok(Value::Null)
+        );
+        assert_eq!(publisher.calls().len(), 2);
+    }
+
+    #[test]
+    fn committed_publish_stays_successful_when_a_new_request_supersedes_it() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let message_center = Arc::new(MessageCenterService::load(dir.path()));
+        let (api, scheduler, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            message_center.clone(),
+        );
+
+        let execution = api.execute(
+            &label,
+            notification_request(
+                scheduled.context.clone(),
+                Some(json!({ "content": "committed" })),
+            ),
+            &manifest,
+        );
+        scheduler
+            .enqueue(
+                PluginRequestCandidate {
+                    plugin_id: manifest.plugin_id.clone(),
+                    plugin_generation: 1,
+                    activation_mode: PublicActivationMode::Submit,
+                    input: "new".into(),
+                    owner: PluginSubmissionOwner {
+                        ui_intent_epoch: 2,
+                        control_value: "/runtime new".into(),
+                        submission_token: "submission-new".into(),
+                    },
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(execution.result, Ok(Value::Null));
+        assert!(matches!(
+            execution.post_guard_effect,
+            Some(MessagePostGuardEffect::Published(ref message))
+                if message.content == "committed"
+        ));
+        assert_eq!(
+            scheduler.context_status(&scheduled.context),
+            crate::public_plugins::PluginContextStatus::Expired
+        );
+        assert_eq!(message_center.summary().unwrap().unread_count, 1);
+    }
+
+    #[test]
+    fn exhaustion_returns_one_deferred_unavailable_effect() {
+        let dir = TestDir::new();
+        let root = dir.path().join("message-center");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("messages.json"),
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "revision": u64::MAX.to_string(),
+                "nextMessageId": "1",
+                "messages": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = notification_manifest();
+        let message_center = Arc::new(MessageCenterService::load(dir.path()));
+        let (api, _, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            message_center,
+        );
+        let request =
+            notification_request(scheduled.context, Some(json!({ "content": "exhausted" })));
+
+        let first = api.execute(&label, request.clone(), &manifest);
+        assert_eq!(
+            first.result,
+            Err(PluginRuntimeError::MessageStoreUnavailable)
+        );
+        assert_eq!(
+            first.post_guard_effect,
+            Some(MessagePostGuardEffect::BecameUnavailable)
+        );
+        let second = api.execute(&label, request, &manifest);
+        assert_eq!(
+            second.result,
+            Err(PluginRuntimeError::MessageStoreUnavailable)
+        );
+        assert_eq!(second.post_guard_effect, None);
     }
 }

@@ -349,6 +349,10 @@ impl From<PluginRuntimeError> for CommandError {
             PluginRuntimeError::ExpiredRequest => "expiredRequest",
             PluginRuntimeError::InvalidCaller => "invalidCaller",
             PluginRuntimeError::InvalidOperation => "invalidOperation",
+            PluginRuntimeError::PermissionDenied => "permissionDenied",
+            PluginRuntimeError::InvalidNotification => "invalidNotification",
+            PluginRuntimeError::AlreadyPublished => "alreadyPublished",
+            PluginRuntimeError::MessageStoreUnavailable => "messageStoreUnavailable",
             PluginRuntimeError::Storage => "storageFailed",
             PluginRuntimeError::Unavailable => "runtimeUnavailable",
         };
@@ -884,10 +888,16 @@ pub(crate) fn uninstall_plugin(
 #[tauri::command]
 pub(crate) fn plugin_api_call(
     window: WebviewWindow,
+    app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
     request: PluginApiRequest,
 ) -> Result<serde_json::Value, CommandError> {
-    Ok(service.manager()?.execute_api(window.label(), request)?)
+    let manager = service.manager()?;
+    let execution = manager.execute_api(window.label(), request);
+    manager
+        .message_center()
+        .dispatch_post_guard(&app, execution.post_guard_effect);
+    Ok(execution.result?)
 }
 
 #[tauri::command]
