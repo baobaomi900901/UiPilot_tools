@@ -84,6 +84,9 @@ UiPilot 负责持久化消息、维护未读状态、显示 Windows 通知、短
 
 设置页关闭或主窗口隐藏时，未读状态仍由宿主持久化并在下次显示时恢复。
 
+程序运行期间消息存储从可用转为不可用时，当前已经显示的数字徽标必须立即切换为 `!`；不能等待用户
+重新打开主窗口或再次读取摘要后才发现状态变化。
+
 ### 4.4 Windows 通知与托盘
 
 每条成功持久化的消息都尝试显示一张 Windows 通知，不根据主窗口或插件窗口是否可见进行抑制。通知标题
@@ -107,8 +110,10 @@ Windows 通知被系统关闭、权限被拒绝或发送失败时，已保存的
   持久化序号。
 - **摘要修订游标（summary revision cursor）**：前端已观察到的最新消息摘要修订，只用于未读徽标和判断
   完整快照是否过期。
-- **快照修订游标（snapshot revision cursor）**：前端当前消息列表对应的完整快照修订；摘要事件不能推进
-  该游标。
+- **快照修订游标（snapshot revision cursor）**：前端当前消息列表对应的完整快照修订；ready 状态事件
+  不能推进该游标。
+- **宿主状态事件（host state event）**：只发送给 `main` 的 `MessageHostStateChangedEvent`。其 ready
+  分支携带摘要修订和未读数，其 unavailable 分支只通知消息子系统进入会话终态。
 - **发布提交点（publish commit point）**：消息文档原子替换成功的时刻。到达该点后，本次发布不可撤销
   且 `publish()` 的结果固定为成功。
 - **进入截止点（open cutoff）**：打开消息页操作在线性化点观察到的最高消息 ID；只有不高于该 ID 的
@@ -167,6 +172,9 @@ interface UiPilotPluginApiV1 {
 - 必须是单段纯文本，不允许换行、NUL 或其他控制字符；
 - 不解析 HTML、Markdown、URL、图片、动作或宿主命令。
 
+`<`、`>`、`&`、双引号和单引号是合法纯文本字符，宿主必须按原语义保存并显示相同文本。DOM 序列化器
+为生成合法 XML 所做的实体转义是必要编码，不是正文改写；这些字符不能被解释为 XML 结构。
+
 一次 request ID 最多成功发布一条消息。第二次发布返回 `AlreadyPublished`，不产生第二条记录。插件普通
 新请求可以再次发布一条。Promise 已决议后，或者请求在到达发布提交点前被新请求淘汰、超时、取消、
 禁用、卸载、升级、reload 或 Runtime generation 替换时，旧 API 调用返回 `ExpiredRequestError`。
@@ -177,7 +185,8 @@ interface UiPilotPluginApiV1 {
 - 请求在提交点之前失效时，调用返回 `ExpiredRequestError`，且不能写入消息；
 - 提交点已经完成后，新请求只能在当前请求守卫释放后淘汰旧请求；该淘汰不得把已提交的调用改报为
   `ExpiredRequestError`；
-- 提交点之后不再为了决定 `publish()` 返回值重新校验请求身份；前端事件、Windows 通知和托盘闪烁只做
+- 提交点之后不再为了决定 `publish()` 返回值重新校验请求身份；ready 宿主状态事件、Windows 通知和托盘
+  闪烁只做
   有界的尽力派发，失败不改变成功结果；
 - 旧请求随后返回的窗口或主结果仍受既有调度所有权约束，可能被新请求丢弃；这不撤销已经发布的消息。
 
@@ -216,8 +225,19 @@ interface MessageRecord {
 
 `revision`、`nextMessageId` 和 `id` 使用规范无前导零的十进制 `u64` 字符串，跨 Rust/JavaScript 边界时
 不得转换为 JavaScript `number`。计数器耗尽时消息中心进入不可用状态，不回绕或复用 ID。
-新文档的 `revision` 为 `"0"`，`nextMessageId` 为 `"1"`；首次消息 ID 为 `"1"`。ID 大小比较必须按
-解析后的 `u64` 值进行，不能按字符串字典序比较。
+新文档的 `revision` 为 `"0"`，`nextMessageId` 为 `"1"`；首次消息 ID 为 `"1"`。
+
+消息 ID、`nextMessageId`、消息修订和进入截止点共用同一套规范十进制 `u64` 比较语义：
+
+- Rust 侧验证规范格式后解析为 `u64` 比较；
+- TypeScript 业务调用点必须调用唯一的 `compareU64Decimal(a, b)` 协议 helper，禁止自行使用 `Number`、
+  `parseInt`、隐式数值转换或直接的字符串关系运算符；
+- helper 先验证 `^(0|[1-9][0-9]*)$`，再拒绝大于 `18446744073709551615` 的值；合法值先按字符串长度
+  比较，长度相同时由 helper 内部按 ASCII 数字字典序比较，返回负数、零或正数；最大值校验也使用同一
+  长度优先规则，不能先转换为 `number`；
+- 规范字符串的相等判断可以直接比较字符串，但所有高低、范围和截止点判断必须使用该 helper。
+
+因此 `"10"` 必须高于 `"9"`，超过 `Number.MAX_SAFE_INTEGER` 的合法 `u64` 也必须保持精确顺序。
 
 `createdAt` 和 `readAt` 由宿主使用 UTC RFC 3339 时间生成。插件不能指定 ID、插件名称、时间或已读
 状态。`pluginNameSnapshot` 来自本次已验证 generation 的 Manifest。
@@ -250,14 +270,15 @@ interface MessageRecord {
 3. 递增修订并原子持久化；
 4. 返回最新列表、修订和未读数。
 
-在截止点之后发布的消息不属于本次标记，即使持久化完成时页面仍然打开，也保持未读。消息事件与打开
+在截止点之后发布的消息不属于本次标记，即使持久化完成时页面仍然打开，也保持未读。ready 宿主状态
+事件与打开
 操作可以乱序到达前端；前端必须分别维护摘要修订游标和快照修订游标：
 
-- 摘要事件修订高于摘要修订游标时更新该游标与未读徽标，并把更低修订的完整列表标记为过期；等于当前
-  游标的重复事件幂等忽略，低于当前游标的事件丢弃；摘要事件不能推进快照修订游标；
+- ready 事件修订高于摘要修订游标时更新该游标与未读徽标，并把更低修订的完整列表标记为过期；等于
+  当前游标的重复事件幂等忽略，低于当前游标的事件丢弃；ready 事件不能推进快照修订游标；
 - 完整快照的修订低于摘要修订游标时必须丢弃，并立即重新读取；
-- 完整快照的修订等于摘要修订游标时必须接受，以便摘要事件先到后，同修订的列表、空列表或清空结果
-  仍能补全界面；
+- 完整快照的修订等于摘要修订游标时必须接受，以便 ready 状态事件先到后，同修订的列表、空列表或
+  清空结果仍能补全界面；
 - 完整快照的修订高于摘要修订游标时同时推进两个游标；同修订完整快照可幂等替换当前列表。
 
 如果截止点前没有未读消息，打开操作直接返回当前快照，不写文件也不递增修订。
@@ -298,21 +319,56 @@ interface MessageCenterSnapshotDto extends MessageSummaryDto {
   messages: MessageViewDto[]
 }
 
-interface MessageSummaryChangedEvent extends MessageSummaryDto {}
+type MessageHostStateChangedEvent =
+  | {
+      status: 'ready'
+      revision: U64Decimal
+      unreadCount: number
+    }
+  | {
+      status: 'unavailable'
+      error: 'MessageStoreUnavailable'
+    }
+```
+
+主窗口消息管理命令的错误 DTO 固定为：
+
+```ts
+type MessageHostCommandErrorDto =
+  | {
+      code: 'MessageOperationFailed'
+      storeStatus: 'ready'
+    }
+  | {
+      code: 'MessageStoreUnavailable'
+      storeStatus: 'unavailable'
+    }
 ```
 
 `revision` 和 `id` 必须是规范无前导零的十进制 `u64` 字符串。`unreadCount` 必须是 0 到 100 的
 JavaScript 整数，不使用字符串。读取摘要返回 `MessageSummaryDto`；打开、清空和重新读取返回完整
-`MessageCenterSnapshotDto`。
+`MessageCenterSnapshotDto`。本节所有修订游标高低判断以及消息 ID 排序必须复用第 8 节的
+`compareU64Decimal`，不能在 UI 层自行实现另一套比较规则。
 
 消息存储具有 `ready` 和 `unavailable` 两种会话状态。current/backup 都损坏或计数器耗尽时进入
 `unavailable`；所有消息管理命令统一拒绝并返回固定错误码 `MessageStoreUnavailable`，不能返回空数组或
-未读数 `0` 来伪装成功。前端必须把该错误映射为独立的“消息不可用”状态。
+未读数 `0` 来伪装成功。前端必须把该错误映射为独立的“消息不可用”状态。`unavailable` 是本次进程会话
+的终态，不在后台自动恢复；恢复只能在用户解决存储问题并重启 UiPilot 后重新执行 current/backup 恢复。
 
-消息提交、已读和清空后，宿主向 `main` 发出只含消息修订和未读数的受控事件。事件不是消息持久化的
-完成条件，也不是完整列表快照；它只是一条摘要更新和快照失效提示。前端丢失事件时，下次读取摘要或
-打开消息页必须从持久化状态恢复。插件 Runtime、插件窗口、`find` 窗口和其他 label 不能订阅消息正文
-或调用消息管理命令。
+启动时已经不可用的状态由首次摘要或消息命令的 `MessageStoreUnavailable` 返回给前端。运行期间任何操作
+因计数器耗尽或不可恢复的完整性错误首次执行 `ready -> unavailable` 转换时，宿主必须在消息存储锁和请求
+守卫释放后，向 `main` 恰好发出一次 `status: 'unavailable'` 的 `MessageHostStateChangedEvent`。普通原子
+写入失败如果仍保留有效旧快照，只使本次操作失败，不执行终态转换，也不发送 unavailable 事件。这类
+主窗口操作返回 `MessageOperationFailed` 并保留当前列表；只有终态分支返回 `MessageStoreUnavailable`。
+公开插件的 `publish()` 仍按第 7 节把任何无法完成的消息持久化映射为 `MessageStoreUnavailable`，但只有
+宿主状态实际转换时才发送 unavailable 事件。
+
+消息提交、已读和清空后，宿主向 `main` 发出 `status: 'ready'` 且只含消息修订和未读数的状态事件。
+ready 事件不是消息持久化的完成条件，也不是完整列表快照；它只是一条摘要更新和快照失效提示。
+unavailable 事件没有修订或未读数，前端收到后必须立即停止显示旧数字徽标、显示 `!`，并把已打开的消息
+页切换为不可用状态。任何状态事件丢失时，下次读取摘要、打开消息页或再次显示主窗口必须从宿主恢复
+当前状态。插件 Runtime、插件窗口、`find` 窗口和其他 label 不能订阅这些事件、消息正文或调用消息管理
+命令。
 
 Windows 通知点击通过现有主窗口生命周期协调器增加一个明确的“设置/消息”显示目标。进程正在运行时，
 点击动作复用 readiness、show、focus 和视图路由，不合成输入。干净退出时，宿主取消仍由 UiPilot 拥有的
@@ -328,15 +384,32 @@ request scheduler current guard
 -> atomic file commit [publish success linearization point]
 -> release message store lock
 -> release request guard
--> frontend event
+-> ready state event
 -> Windows notification
 -> tray flash request
 ```
 
+发布路径在提交前触发 `ready -> unavailable` 时使用独立失败顺序：
+
+```text
+request scheduler current guard
+-> message store lock
+-> mark session unavailable without changing the persisted snapshot
+-> release message store lock
+-> release request guard
+-> unavailable state event to main
+-> return MessageStoreUnavailable
+```
+
+主窗口的打开、读取或清空命令触发同一转换时没有 request scheduler guard，但仍必须先释放消息存储锁，
+再发 unavailable 状态事件并返回错误。
+
 消息存储代码不能反向获取 scheduler、插件管理或窗口生命周期锁。任何锁都不能跨越 frontend emit、
 Windows 通知、托盘图标操作、窗口 show/focus 或等待前端 ack。
 
-Windows 通知、前端事件或托盘副作用失败不回滚已持久化消息。消息持久化失败则不调用任何这些副作用。
+Windows 通知、ready 状态事件或托盘副作用失败不回滚已持久化消息。消息持久化失败不调用 ready 事件、
+Windows 通知或托盘；如果失败同时产生首次 `ready -> unavailable` 转换，则 unavailable 状态事件是唯一
+允许的前端副作用。
 三个宿主副作用相互独立，一个失败不能阻止后续副作用。`publish()` 在持久化成功并完成这些有界派发尝试
 后返回成功，不等待用户看到、点击或关闭 Windows 通知。请求守卫释放后发生的淘汰不再参与返回值判定，
 因此不允许出现“消息已保存但 `publish()` 返回 `ExpiredRequestError`”的部分失败。
@@ -350,7 +423,8 @@ Windows 通知、前端事件或托盘副作用失败不回滚已持久化消息
 插件升级后历史记录使用升级后的当前图标，卸载或图标加载失败时使用默认插件图标。
 
 “清空全部”是明确文字命令，只在列表非空且没有清空操作进行时可用。操作期间不关闭设置页；失败时
-保留列表并显示固定的宿主错误，不泄露磁盘路径。
+如果宿主仍为 ready，则保留列表并显示固定的 `MessageOperationFailed`，不泄露磁盘路径；如果宿主已经
+转为 unavailable，则切换到下述不可用状态。
 
 消息存储不可用时，消息页显示独立的“消息不可用，请重试”状态和重试命令，禁用“清空全部”，不能显示
 “暂无消息”。摘要读取失败时，设置按钮显示固定尺寸的非数字 `!` 状态徽标，而不是隐藏徽标或显示未读
@@ -370,6 +444,12 @@ Windows 通知、前端事件或托盘副作用失败不回滚已持久化消息
 
 - 使用 `ToastNotificationManager` 为 UiPilot 的已安装应用身份创建 `ToastNotifier`；
 - 在发送前读取 `ToastNotifier.Setting()`，系统禁用通知时返回可诊断的受控失败；
+- 使用不含动态插值的宿主常量创建固定 `XmlDocument` 模板。`LoadXml()` 只能接收该宿主常量，模板只包含
+  `toast/visual/binding/text` 等本设计需要的固定节点，不包含 `actions` 或插件可控占位片段；
+- 插件名称快照和消息正文一律通过 `CreateTextNode()` 后 `AppendChild()`，或等价的 DOM `InnerText`
+  写入既有 `text` 节点。禁止把它们拼接进 XML 字符串、元素名、属性名、属性值或 `launch` payload；
+- `launch` 路由由宿主设置为固定目标；如携带消息 ID，只能使用已经验证的规范十进制宿主 ID，并通过
+  DOM `SetAttribute()` 写入。接收端仍重新验证，不信任回调字符串；
 - 为每条通知创建 `ToastNotification`，在 `Show()` 前注册 `Activated`、`Failed` 和 `Dismissed` 处理器；
 - `Show()` 的同步错误和 `Failed` 的异步错误都记录脱敏诊断，但不能回滚消息；
 - `Activated` 只产生固定的“打开设置消息页”宿主意图；payload 只含不透明消息 ID，不能选择任意窗口、
@@ -426,11 +506,13 @@ Promise 拒绝时，Runtime Promise 必须拒绝且不能返回窗口响应。
 - 持久化失败：返回 `MessageStoreUnavailable`，`demo-win` 本次命令失败且窗口不更新。
 - current/backup 都损坏或计数器耗尽：消息管理命令返回 `MessageStoreUnavailable`，消息页显示“消息不可用”，
   徽标显示 `!`，不能伪装成空列表或未读为零。
+- 运行中首次进入 unavailable：释放所有锁后只向 `main` 发一次 unavailable 状态事件；事件失败时，下次
+  摘要读取或主窗口显示仍必须发现不可用，旧数字徽标不能被当作当前状态。
 - Windows 通知失败：消息、未读和插件响应保持成功。
 - Windows 通知点击或关闭回调失败：释放可释放的活动句柄，消息和未读状态保持。
 - 干净退出取消活动通知失败：记录脱敏诊断并继续退出，不改变已保存消息。
 - 托盘闪烁失败：消息、未读、通知和插件响应保持成功，并尽力恢复正常图标。
-- 前端事件失败：持久化状态保持；下次摘要或消息页读取恢复正确状态。
+- 宿主状态事件发送失败：持久化状态保持；下次摘要或消息页读取恢复正确状态。
 - 通知点击后的窗口激活失败：消息保持未读，现有窗口状态不被回滚或隐藏。
 - 清空失败：旧列表和未读状态保持，设置页保持打开。
 
@@ -446,23 +528,33 @@ Promise 拒绝时，Runtime Promise 必须拒绝且不能返回窗口响应。
 - 发布失败不改变旧文档，持久化成功后才调用原生副作用；
 - 请求 A 提交消息后释放守卫、请求 B 淘汰 A、A 的派发稍后完成时，A 的 `publish()` 仍成功且消息只保存一次；
 - 打开截止点与并发新消息，清空与并发新消息；
-- 摘要事件先于同修订打开/清空响应时接受完整快照；更高摘要先到时丢弃低修订快照并重新读取；
+- ready 状态事件先于同修订打开/清空响应时接受完整快照；更高 ready 修订先到时丢弃低修订快照并重新读取；
+- 规范十进制比较器覆盖 `9 -> 10`、`99 -> 100`、跨越 `Number.MAX_SAFE_INTEGER`、`u64::MAX`，并拒绝
+  前导零、非数字、负数和超过 `u64::MAX` 的输入；
 - 禁用、升级、reload 和卸载不删除历史；
 - 插件升级后历史使用当前图标，卸载或图标不可用时回退默认图标；
 - current/backup 都损坏时摘要、打开、读取和清空统一返回 `MessageStoreUnavailable`；
+- 计数器在运行中耗尽时，不提交消息、不发送 ready/通知/托盘副作用，释放锁后只发送一次 unavailable
+  状态事件；后续操作保持终态且不重复发送转换事件；
+- 可恢复的原子写入失败保留 ready 状态和旧快照，主窗口命令返回 `MessageOperationFailed`，不发送
+  unavailable 状态事件；
 - 通知和托盘失败不回滚消息；
 - Windows 通知适配器使用 fake trait 覆盖系统禁用、同步发送失败、异步 `Failed`、`Activated` 固定路由、
   `Dismissed` 清理和退出 `Hide`；
+- Toast DOM 测试覆盖 `<>&"'`、`</text><actions>` 和伪造 `launch` 片段，断言通知文本节点的 `InnerText`
+  与输入逐字符一致、DOM 不出现 `actions` 节点且路由属性仍完全由宿主生成；
 - 托盘单计时器、新消息重新计时和退出恢复正常图标；
 - 通知点击 payload 只能路由到固定的设置消息目标。
 
 前端聚焦覆盖：
 
 - 设置页签顺序、消息空状态、最新优先列表、时间和插件回退图标；
-- 打开页签触发已读；摘要与完整快照分别维护游标，同修订完整快照能够补全列表；
+- 打开页签触发已读；ready 事件摘要与完整快照分别维护游标，同修订完整快照能够补全列表；
 - 事件先于命令响应、同修订空列表、低修订响应和重读四种乱序路径；
 - 设置按钮徽标的 0、1、99、100 边界；
 - 消息存储不可用显示独立错误页和 `!` 徽标，不显示“暂无消息”或未读零；
+- 主窗口已显示数字徽标时收到 unavailable 状态事件，立即切换为 `!` 并使已打开消息页进入不可用状态；
+- `MessageOperationFailed` 保留当前列表和数字徽标，不能误切换成 unavailable；
 - 清空成功和失败都不关闭设置页；
 - 消息到达不改变当前视图、焦点、查询或输入值。
 
@@ -504,15 +596,19 @@ SDK 与 Demo 覆盖：
 2. 一次请求最多成功发布一条 1 到 500 字符的单段纯文本消息。
 3. 消息在任何通知、事件或托盘操作前原子持久化，并最多保留最近 100 条。
 4. 原子提交后发生的请求淘汰不能把已保存消息改报为过期；旧请求的后续 UI 结果仍会被丢弃。
-5. 打开消息页只标记进入截止点前消息已读；摘要事件与同修订完整快照乱序时不会丢列表或误清新未读。
+5. 打开消息页只标记进入截止点前消息已读；ready 状态事件与同修订完整快照乱序时不会丢列表或误清
+   新未读；
+   所有 ID 与修订高低判断在 `u64` 全范围内准确。
 6. 设置消息页、清空全部、持久化历史和插件卸载保留符合用户合同；历史使用当前安装图标或默认图标。
-7. 设置按钮徽标准确显示未读数量并在 100 条时显示 `99+`；存储不可用时显示 `!` 而不是未读零。
+7. 设置按钮徽标准确显示未读数量并在 100 条时显示 `99+`；存储在运行中转为不可用时通过 main-only
+   状态事件立即显示 `!`，而不是继续显示旧数字或未读零。
 8. 每条消息尝试显示 Windows 通知并触发 6 秒单计时器托盘闪烁。
 9. Windows 原生适配器能观测系统禁用、发送失败和点击，并在干净退出时尽力取消活动通知；正式身份、
    图标和点击路由通过普通权限安装产物验收。
-10. 消息到达绝不抢焦点；用户点击通知才打开并聚焦设置消息页。
-11. `demo-win` 的消息内容与子窗口 `Return text` 完全相同，消息失败时窗口不部分成功。
-12. `demo-return`、`/find`、计算、浏览器搜索及现有窗口行为没有回归。
+10. 插件名称和正文只能作为 Toast DOM 文本节点写入；XML 敏感字符和伪造标签不能改变节点、动作或路由。
+11. 消息到达绝不抢焦点；用户点击通知才打开并聚焦设置消息页。
+12. `demo-win` 的消息内容与子窗口 `Return text` 完全相同，消息失败时窗口不部分成功。
+13. `demo-return`、`/find`、计算、浏览器搜索及现有窗口行为没有回归。
 
 ## 18. 非目标
 
