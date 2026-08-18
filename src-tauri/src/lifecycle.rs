@@ -42,6 +42,7 @@ use crate::{
 pub(crate) enum ShowTarget {
     Launcher,
     Settings,
+    Messages,
 }
 
 pub(crate) const TRAY_OPEN_LAUNCHER: &str = "uipilot.tray.open-launcher";
@@ -2235,6 +2236,7 @@ mod tests {
         for (target, order) in [
             (ShowTarget::Launcher, ReadyOrder::SetupFirst),
             (ShowTarget::Settings, ReadyOrder::FrontendFirst),
+            (ShowTarget::Messages, ReadyOrder::SetupFirst),
         ] {
             let mut state = Readiness::default();
             assert_eq!(state.request(target), None);
@@ -2256,7 +2258,11 @@ mod tests {
         let mut state = Readiness::default();
         assert!(apply_ready_order(&mut state, ReadyOrder::SetupFirst).is_empty());
 
-        for target in [ShowTarget::Launcher, ShowTarget::Settings] {
+        for target in [
+            ShowTarget::Launcher,
+            ShowTarget::Settings,
+            ShowTarget::Messages,
+        ] {
             assert_eq!(state.request(target), Some(target));
             assert_eq!(state.pending_target, None);
         }
@@ -2678,6 +2684,7 @@ mod tests {
         for (target, expected) in [
             (ShowTarget::Launcher, "launcher"),
             (ShowTarget::Settings, "settings"),
+            (ShowTarget::Messages, "messages"),
         ] {
             let value = serde_json::to_value(LauncherShown {
                 invocation_id: "invocation-1".into(),

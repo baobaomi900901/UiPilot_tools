@@ -96,7 +96,15 @@ fn setup_production_lifecycle(
     let app_data_dir = app.path().app_data_dir()?;
     plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
     plugin_manager.create_runtimes(app, &app_data_dir)?;
-    public_plugin_service.initialize(&app_data_dir, ["find".into(), "math".into()])?;
+    let message_center = Arc::new(message_center::MessageCenterService::load(&app_data_dir));
+    if !app.manage(Arc::clone(&message_center)) {
+        return Err(lifecycle_setup_error().into());
+    }
+    public_plugin_service.initialize(
+        &app_data_dir,
+        ["find".into(), "math".into()],
+        message_center,
+    )?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -337,6 +345,10 @@ pub fn run() {
             commands::plugin_window_content_ack,
             commands::commit_plugin_window_transfer,
             commands::set_plugin_window_pinned,
+            commands::get_message_summary,
+            commands::open_message_center,
+            commands::read_message_center,
+            commands::clear_messages,
             commands::close_plugin_window,
             commands::search_apps,
             commands::publish_plugin_results,
@@ -561,7 +573,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 37);
+        assert_eq!(production.matches("commands::").count(), 41);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -586,6 +598,10 @@ mod tests {
             "commit_plugin_window_transfer",
             "set_plugin_window_pinned",
             "close_plugin_window",
+            "get_message_summary",
+            "open_message_center",
+            "read_message_center",
+            "clear_messages",
             "search_apps",
             "publish_plugin_results",
             "search_files",

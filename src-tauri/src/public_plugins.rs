@@ -92,8 +92,8 @@ impl PublicPluginService {
         &self,
         app_data_dir: &Path,
         reserved_names: impl IntoIterator<Item = String>,
+        message_center: Arc<MessageCenterService>,
     ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
-        let message_center = Arc::new(MessageCenterService::load(app_data_dir));
         let manager = Arc::new(PublicPluginManager::load(
             app_data_dir,
             PublicPluginHost::current(PublicPlatform::Windows),

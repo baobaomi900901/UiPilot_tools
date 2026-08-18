@@ -27,6 +27,9 @@ use crate::{
     },
     hotkey::HotkeyKind,
     lifecycle::{self, CriticalReservation, LifecycleCoordinator, ReservationError},
+    message_center::{
+        MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
+    },
     model::SearchResponse,
     plugin_window::{
         self, PluginWindowController, PluginWindowOwner, PluginWindowPinState, PluginWindowUpdate,
@@ -39,6 +42,7 @@ use crate::{
         PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
         PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
         PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
+        PublicPluginManager,
         PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse,
         PublicPluginService,
     },
@@ -179,6 +183,47 @@ pub(crate) struct FindHideInput {
 pub(crate) struct CommandError {
     code: &'static str,
     message: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MessageSummaryDto {
+    revision: String,
+    unread_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MessageViewDto {
+    id: String,
+    plugin_id: String,
+    plugin_name_snapshot: String,
+    plugin_icon_url: Option<String>,
+    created_at: String,
+    content: String,
+    read_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MessageCenterSnapshotDto {
+    revision: String,
+    unread_count: usize,
+    messages: Vec<MessageViewDto>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MessageHostCommandErrorDto {
+    code: &'static str,
+    store_status: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum MessageCommandError {
+    Caller(CommandError),
+    Host(MessageHostCommandErrorDto),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -403,6 +448,118 @@ fn require_find_label(label: &str) -> Result<(), CommandError> {
 
 fn require_find_window(window: &WebviewWindow) -> Result<(), CommandError> {
     require_find_label(window.label())
+}
+
+#[tauri::command]
+pub(crate) fn get_message_summary(
+    window: WebviewWindow,
+    messages: State<'_, Arc<MessageCenterService>>,
+) -> Result<MessageSummaryDto, MessageCommandError> {
+    require_main_window(&window)?;
+    messages
+        .summary()
+        .map(message_summary_dto)
+        .map_err(message_command_error)
+}
+
+#[tauri::command]
+pub(crate) fn open_message_center(
+    window: WebviewWindow,
+    app: AppHandle,
+    messages: State<'_, Arc<MessageCenterService>>,
+    public_plugins: State<'_, Arc<PublicPluginService>>,
+) -> Result<MessageCenterSnapshotDto, MessageCommandError> {
+    require_main_window(&window)?;
+    let execution = messages.open_and_mark_read();
+    messages.dispatch_post_guard(&app, execution.post_guard_effect);
+    let snapshot = execution.result.map_err(message_command_error)?;
+    Ok(message_snapshot_dto(
+        snapshot,
+        public_plugins.manager().ok().map(Arc::as_ref),
+    ))
+}
+
+#[tauri::command]
+pub(crate) fn read_message_center(
+    window: WebviewWindow,
+    messages: State<'_, Arc<MessageCenterService>>,
+    public_plugins: State<'_, Arc<PublicPluginService>>,
+) -> Result<MessageCenterSnapshotDto, MessageCommandError> {
+    require_main_window(&window)?;
+    let snapshot = messages
+        .read_snapshot()
+        .map_err(message_command_error)?;
+    Ok(message_snapshot_dto(
+        snapshot,
+        public_plugins.manager().ok().map(Arc::as_ref),
+    ))
+}
+
+#[tauri::command]
+pub(crate) fn clear_messages(
+    window: WebviewWindow,
+    app: AppHandle,
+    messages: State<'_, Arc<MessageCenterService>>,
+    public_plugins: State<'_, Arc<PublicPluginService>>,
+) -> Result<MessageCenterSnapshotDto, MessageCommandError> {
+    require_main_window(&window)?;
+    let execution = messages.clear();
+    messages.dispatch_post_guard(&app, execution.post_guard_effect);
+    let snapshot = execution.result.map_err(message_command_error)?;
+    Ok(message_snapshot_dto(
+        snapshot,
+        public_plugins.manager().ok().map(Arc::as_ref),
+    ))
+}
+
+fn message_summary_dto(summary: MessageSummary) -> MessageSummaryDto {
+    MessageSummaryDto {
+        revision: summary.revision,
+        unread_count: summary.unread_count,
+    }
+}
+
+fn message_snapshot_dto(
+    snapshot: MessageCenterSnapshot,
+    plugins: Option<&PublicPluginManager>,
+) -> MessageCenterSnapshotDto {
+    MessageCenterSnapshotDto {
+        revision: snapshot.revision,
+        unread_count: snapshot.unread_count,
+        messages: snapshot
+            .messages
+            .into_iter()
+            .map(|message| MessageViewDto {
+                plugin_icon_url: plugins
+                    .and_then(|plugins| plugins.message_icon_url(&message.plugin_id)),
+                id: message.id,
+                plugin_id: message.plugin_id,
+                plugin_name_snapshot: message.plugin_name_snapshot,
+                created_at: message.created_at,
+                content: message.content,
+                read_at: message.read_at,
+            })
+            .collect(),
+    }
+}
+
+fn message_command_error(error: MessageCenterError) -> MessageCommandError {
+    MessageCommandError::Host(match error {
+        MessageCenterError::OperationFailed => MessageHostCommandErrorDto {
+            code: "MessageOperationFailed",
+            store_status: "ready",
+        },
+        MessageCenterError::Unavailable => MessageHostCommandErrorDto {
+            code: "MessageStoreUnavailable",
+            store_status: "unavailable",
+        },
+    })
+}
+
+impl From<CommandError> for MessageCommandError {
+    fn from(error: CommandError) -> Self {
+        Self::Caller(error)
+    }
 }
 
 #[tauri::command]
@@ -2337,6 +2494,10 @@ mod tests {
             "cancel_public_plugin_install",
             "set_plugin_enabled",
             "set_plugin_effective_name",
+            "get_message_summary",
+            "open_message_center",
+            "read_message_center",
+            "clear_messages",
             "save_plugin_settings",
             "uninstall_plugin",
         ] {
@@ -2348,6 +2509,31 @@ mod tests {
             assert_eq!(result, Err(CommandError::invalid_caller()), "{command}");
             assert!(trace.borrow().is_empty(), "{command} touched state");
         }
+
+    #[test]
+    fn message_center_commands_are_main_only_and_have_exact_capabilities() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let build = include_str!("../build.rs");
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        for command in [
+            "get_message_summary",
+            "open_message_center",
+            "read_message_center",
+            "clear_messages",
+        ] {
+            let body = source
+                .split(&format!("pub(crate) fn {command}("))
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .unwrap_or_else(|| panic!("missing {command}"));
+            assert!(body.contains("require_main_window(&window)?;"));
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")));
+            assert!(main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+        }
+    }
     }
 
     #[test]

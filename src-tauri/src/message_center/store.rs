@@ -34,6 +34,7 @@ pub(super) struct MessageSnapshot {
     pub(super) revision: String,
     pub(super) unread_count: usize,
     pub(super) messages: Vec<MessageRecord>,
+    pub(super) changed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,7 +221,7 @@ impl MessageStore {
     pub(super) fn read_snapshot(&self) -> Result<MessageSnapshot, MessageStoreError> {
         let session = self.lock()?;
         match &*session {
-            StoreSession::Ready(ready) => Ok(snapshot(&ready.document)),
+            StoreSession::Ready(ready) => Ok(snapshot(&ready.document, false)),
             StoreSession::Unavailable => Err(MessageStoreError::Unavailable),
         }
     }
@@ -236,7 +237,7 @@ impl MessageStore {
                     .iter()
                     .all(|message| message.read_at.is_some())
                 {
-                    return Ok(snapshot(&ready.document));
+                    return Ok(snapshot(&ready.document, false));
                 }
                 let cutoff = ready
                     .document
@@ -264,7 +265,7 @@ impl MessageStore {
             }
         }
         self.persist(ready, candidate)?;
-        Ok(snapshot(&ready.document))
+        Ok(snapshot(&ready.document, true))
     }
 
     pub(super) fn clear(&self) -> Result<MessageSnapshot, MessageStoreError> {
@@ -272,7 +273,7 @@ impl MessageStore {
         let next_revision = match &*session {
             StoreSession::Unavailable => return Err(MessageStoreError::Unavailable),
             StoreSession::Ready(ready) if ready.document.messages.is_empty() => {
-                return Ok(snapshot(&ready.document));
+                return Ok(snapshot(&ready.document, false));
             }
             StoreSession::Ready(ready) => {
                 let Some(next_revision) = known_u64(&ready.document.revision).checked_add(1) else {
@@ -287,7 +288,7 @@ impl MessageStore {
         candidate.revision = next_revision.to_string();
         candidate.messages.clear();
         self.persist(ready, candidate)?;
-        Ok(snapshot(&ready.document))
+        Ok(snapshot(&ready.document, true))
     }
 
     fn persist(
@@ -486,12 +487,13 @@ fn summary(document: &MessageStoreV1) -> MessageSummary {
     }
 }
 
-fn snapshot(document: &MessageStoreV1) -> MessageSnapshot {
+fn snapshot(document: &MessageStoreV1, changed: bool) -> MessageSnapshot {
     let summary = summary(document);
     MessageSnapshot {
         revision: summary.revision,
         unread_count: summary.unread_count,
         messages: document.messages.clone(),
+        changed,
     }
 }
 

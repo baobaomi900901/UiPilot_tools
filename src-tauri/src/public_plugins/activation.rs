@@ -956,6 +956,35 @@ impl PublicPluginManager {
             bytes: resource.bytes.clone(),
         })
     }
+    pub(crate) fn message_icon_url(&self, plugin_id: &str) -> Option<String> {
+        let snapshot = self
+            .data
+            .lock()
+            .ok()?
+            .active_by_plugin
+            .get(plugin_id)
+            .cloned()?;
+        self.state
+            .config(plugin_id)
+            .ok()?
+            .filter(|config| {
+                config.installed
+                    && config.active_generation == snapshot.generation
+                    && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
+            })?;
+        snapshot.resources.contains_key("icon.png").then(|| {
+            let origin = if cfg!(target_os = "windows") {
+                "http://uipilot-public-plugin.localhost"
+            } else {
+                "uipilot-public-plugin://localhost"
+            };
+            format!(
+                "{origin}/__uipilot_icon/installed/{plugin_id}/{}/icon.png",
+                snapshot.generation
+            )
+        })
+    }
+
     pub(crate) fn can_copy_text(&self, plugin_id: &str, generation: u64) -> bool {
         self.state
             .config(plugin_id)
