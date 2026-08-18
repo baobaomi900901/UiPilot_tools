@@ -16,6 +16,9 @@ use plugins::{PluginManager, Version};
 mod atomic_file;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod message_center;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
