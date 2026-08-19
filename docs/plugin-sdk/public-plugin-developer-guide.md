@@ -17,7 +17,7 @@
 | 需求 | `activationMode` | `outputMode` | 权限 | 参考 Demo |
 | --- | --- | --- | --- | --- |
 | 按 Enter 后在主界面显示结果 | `submit` | `mainResult` | 复制时使用 `clipboard.write` | `demo-return` |
-| 按 Enter 后打开子窗口并发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
+| 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
 MVP 中每个插件只能注册一个启动名称。用户可以在 UiPilot 设置中修改该名称，所以 Runtime 不应硬编码 `/命令名`。
@@ -232,7 +232,7 @@ export async function onCommand(invocation, _api) {
 
 `data` 必须是可序列化 JSON。Runtime 不创建窗口；它只把数据交给宿主。
 
-### 6.2 发布请求绑定消息（仅 Windows）
+### 6.2 发布或安排请求绑定消息（仅 Windows）
 
 Manifest 同时声明 `notifications.publish` 且用户授权后，Runtime 可以在当前命令请求中发布一条消息：
 
@@ -250,6 +250,19 @@ export async function onCommand(invocation, api) {
 `content` 必须是 1 到 500 个 Unicode 字符、去除首尾空白后不变的单行纯文本，不能包含控制字符。每次请求最多成功发布一次；API 对象在请求完成、超时、被新请求淘汰、插件更新或卸载后立即失效。不要保存 API 对象给定时器或后台任务使用。
 
 `publish()` 在消息原子持久化后 resolve。此后的 Windows 系统通知或托盘提示属于宿主尽力执行的副作用，即使系统通知被关闭或发送失败，已经保存的消息和本次插件响应也不会回滚。常见拒绝包括 `InvalidNotification`、`AlreadyPublished`、`ExpiredRequestError` 和 `MessageStoreUnavailable`。
+
+需要窗口立即显示、消息稍后送达时，可把同一请求中的唯一通知动作改为宿主持有的延迟任务：
+
+```js
+await api.notifications.schedule({
+  content: returnText,
+  delayMs: 10_000,
+})
+```
+
+`delayMs` 必须是 JavaScript 安全整数，范围为 `1_000..=86_400_000`（1 秒到 24 小时）；每个插件最多同时等待 32 条消息。`schedule()` 在宿主接管任务后 resolve，不等待消息到期，因此插件可立即返回窗口或主结果。隐藏主窗口或插件窗口不取消任务；禁用、卸载或更新插件会取消等待任务，退出 UiPilot 会直接丢弃且下次启动不恢复。常见新增拒绝为 `InvalidDelay` 和 `ScheduleLimitExceeded`。
+
+不要把 API 对象交给 `setTimeout`，也不要期待插件代码在请求结束后继续运行。`schedule()` 保存的是一条纯文本宿主任务，不支持后台回调、重复定时、查询、取消、修改、失败重试或跨重启恢复。`publish()` 与 `schedule()` 合计每次请求只能成功一次，第二次调用返回 `AlreadyPublished`。
 
 ### 6.3 创建窗口页面
 
@@ -369,7 +382,12 @@ async function loadRuntime() {
   return import(runtimeUrl.href)
 }
 
-function createApiMock({ settings = {}, storage = new Map(), publish = async () => {} } = {}) {
+function createApiMock({
+  settings = {},
+  storage = new Map(),
+  publish = async () => {},
+  schedule = async () => {},
+} = {}) {
   return Object.freeze({
     storage: Object.freeze({
       async get(key) {
@@ -392,7 +410,7 @@ function createApiMock({ settings = {}, storage = new Map(), publish = async () 
         return false
       },
     }),
-    notifications: Object.freeze({ publish }),
+    notifications: Object.freeze({ publish, schedule }),
   })
 }
 
@@ -420,7 +438,7 @@ test('runtime preserves request ownership', async () => {
 node --test .\tests\runtime.test.js
 ```
 
-测试使用设置时，可传入 `createApiMock({ settings: { prefix: '[demo]' } })`；测试消息时传入 `publish` spy，并验证调用次数和纯文本内容。这个 mock 只覆盖 Runtime 单元测试需要的异步接口，不模拟宿主的权限、配额、请求过期和数据持久化检查；这些边界仍以 UiPilot 宿主为准。
+测试使用设置时，可传入 `createApiMock({ settings: { prefix: '[demo]' } })`；测试消息时传入 `publish` 或 `schedule` spy，并验证调用次数和完整 DTO。这个 mock 只覆盖 Runtime 单元测试需要的异步接口，不模拟宿主的权限、配额、请求过期和数据持久化检查；这些边界仍以 UiPilot 宿主为准。
 
 还应针对自己的业务结果添加精确断言。子窗口型插件应额外检查 `window.js` 使用 `window.uipilotPluginWindow.onUpdate`，且不包含 `invoke(`、`fetch(`、`WebSocket` 或窗口置顶逻辑。
 
@@ -545,7 +563,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 当前不支持：
 
 - 一个插件注册多个命令或多个窗口。
-- 长期后台任务、定时器、番茄钟或窗口关闭后的消息推送。
+- 插件代码长期后台运行、插件自建定时器、番茄钟产品功能或任意后台回调；延迟纯文本消息只能交给宿主的 `notifications.schedule()`。
 - 网络、任意文件、原生二进制和 Shell。
 - 输入模拟或控制鼠标键盘。
 - 多动作结果、自定义动作回调、HTML/Markdown 结果。
@@ -560,7 +578,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
 - [ ] `outputMode`、权限和 `window` 入口组合正确。
 - [ ] Runtime 始终原样返回 `requestId`。
-- [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只发布一次。
+- [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 内部空格不会被插件意外压缩。
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
 - [ ] `icon.png` 满足固定规则。

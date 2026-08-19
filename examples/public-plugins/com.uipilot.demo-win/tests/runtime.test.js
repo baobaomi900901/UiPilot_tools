@@ -29,7 +29,7 @@ test('manifest declares the fixed demo-win window contract', async () => {
   assert.equal(manifest.command.defaultName, 'demo-win')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'window')
-  assert.equal(manifest.version, '1.0.3')
+  assert.equal(manifest.version, '1.0.4')
   assert.deepEqual(manifest.supportedPlatforms, ['windows'])
   assert.deepEqual(manifest.permissions, ['ui.window', 'notifications.publish'])
   assert.deepEqual(manifest.window, { entry: 'dist/window.html' })
@@ -42,13 +42,13 @@ test('strict package root contains only the demo-win assets', async () => {
   assert.deepEqual(distFiles, ['runtime.js', 'window.css', 'window.html', 'window.js'])
 })
 
-test('window mode echoes ownership and returns the local date text', async () => {
+test('window mode schedules the local date text and returns after acceptance', async () => {
   const runtime = await loadRuntime()
-  const published = []
+  const scheduled = []
   const api = Object.freeze({
     notifications: Object.freeze({
-      async publish(input) {
-        published.push(input)
+      async schedule(input) {
+        scheduled.push(input)
       },
     }),
   })
@@ -56,15 +56,15 @@ test('window mode echoes ownership and returns the local date text', async () =>
     requestId: 'demo-win-request-1',
     data: { returnText: 'str 2026-08-13' },
   })
-  assert.deepEqual(published, [{ content: 'str 2026-08-13' }])
+  assert.deepEqual(scheduled, [{ content: 'str 2026-08-13', delayMs: 10_000 }])
 })
 
-test('notification rejection prevents a window response', async () => {
+test('schedule rejection prevents a window response', async () => {
   const runtime = await loadRuntime()
   const failure = new Error('notification unavailable')
   const api = Object.freeze({
     notifications: Object.freeze({
-      async publish() {
+      async schedule() {
         throw failure
       },
     }),

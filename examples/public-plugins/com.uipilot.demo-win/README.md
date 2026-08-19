@@ -9,7 +9,7 @@ This independently removable public plugin demonstrates UiPilot's host-owned sin
 3. Confirm the `ui.window` and `notifications.publish` permissions.
 4. Run `/demo-win str` and press Enter.
 
-The Runtime first publishes `str yyyy-mm-dd` to UiPilot's message center, then opens the content window with the same return text. Notification publishing is Windows-only, request-bound, and limited to one message per command request. Pin, close, drag, focus transfer, and position restore belong to the host shell, not the content page.
+The Runtime asks UiPilot to publish `str yyyy-mm-dd` after 10 seconds, then immediately opens the content window with the same return text. Scheduling is Windows-only, request-bound, process-local, and limited to one notification action per command request. Hiding either window does not cancel an accepted task; disabling, uninstalling, or updating the plugin does, and pending tasks are lost when UiPilot exits. Pin, close, drag, focus transfer, and position restore belong to the host shell, not the content page.
 
 ## Verify And Package
 

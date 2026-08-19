@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "pluginId": "com.uipilot.demo-win",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "apiVersion": 1,
   "minimumHostVersion": "0.2.0",
   "name": "Public Plugin Demo Window",

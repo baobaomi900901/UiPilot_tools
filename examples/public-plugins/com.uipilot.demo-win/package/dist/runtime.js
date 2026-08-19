@@ -8,7 +8,7 @@ function returnedText(invocation) {
 
 export async function onCommand(invocation, api) {
   const returnText = returnedText(invocation)
-  await api.notifications.publish({ content: returnText })
+  await api.notifications.schedule({ content: returnText, delayMs: 10_000 })
   return {
     requestId: invocation.requestId,
     data: { returnText },

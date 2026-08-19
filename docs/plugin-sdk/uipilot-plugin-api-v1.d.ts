@@ -24,11 +24,17 @@ export interface UiPilotPluginApiV1 {
   }
   readonly notifications: {
     publish(input: Readonly<PluginNotificationPublishInput>): Promise<void>
+    schedule(input: Readonly<PluginNotificationScheduleInput>): Promise<void>
   }
 }
 
 export interface PluginNotificationPublishInput {
   readonly content: string
+}
+
+export interface PluginNotificationScheduleInput {
+  readonly content: string
+  readonly delayMs: number
 }
 
 export interface CopyTextDefaultAction {
