@@ -104,8 +104,8 @@ generation、安装原子性、窗口交接和 UI 焦点合同不变。
 
 主窗口获得原生焦点时，托盘提醒立即停止并恢复原始图标，但该动作绝不读取消息、修改 `readAt` 或减少
 未读数。如果消息到达时主窗口已经拥有原生焦点，本次消息不启动托盘提醒，两个未读徽标仍正常增加。
-进入“设置 -> 消息”才执行第 4.2 节的标记已读操作并让两个徽标同步清零。程序退出、托盘重建或适配器
-失败也必须幂等恢复原始图标。
+进入“设置 -> 消息”才执行第 4.2 节的标记已读操作并让两个徽标同步清零。程序退出、托盘适配器替换或
+适配器失败都使当前提醒停止或进入终态，并尽力恢复原始图标；原生图标 API 失败时不承诺恢复成功。
 
 Windows 通知被系统关闭、权限被拒绝或发送失败时，已保存的消息、未读徽标和托盘闪烁不受影响。
 
@@ -422,8 +422,21 @@ request scheduler current guard
 -> release request guard
 -> ready state event
 -> Windows notification
--> tray flash request
+-> enqueue TrayAttentionEvent::MessageArrived
 ```
+
+主窗口的每个 `WindowEvent::Focused(focused)` 在任何“预期 blur”提前返回和既有窗口生命周期处理之前，
+向同一个托盘注意控制器排入 `TrayAttentionEvent::MainFocusChanged(focused)`。`MessageArrived` 与
+`MainFocusChanged` 共用一个串行事件队列和一个状态机；消息发布路径不得先查询焦点再发送无条件开始意图。
+状态机事件入队成功是托盘注意顺序的线性化点：
+
+- `MessageArrived -> MainFocusChanged(true)`：允许短暂开始，但后一个事件必须停止并恢复原图；
+- `MainFocusChanged(true) -> MessageArrived`：后一个事件观察到当前聚焦状态，不得开始；
+- `MainFocusChanged(false)` 只更新当前焦点状态，不自行开始；之后到达的新消息可以开始；
+- 同一事件队列中已经确认聚焦后，不存在能绕过当前焦点状态的“迟到开始”命令。
+
+控制器在主窗口仍隐藏、生产焦点钩子已经安装且 readiness 尚未放行时创建，初始焦点状态固定为
+`false`。此后焦点真值只由上述 `Focused(bool)` 事件更新，避免焦点查询与事件投递之间的竞态。
 
 发布路径在提交前触发 `ready -> unavailable` 时使用独立失败顺序：
 
@@ -516,15 +529,24 @@ Windows 通知或托盘；如果失败同时产生首次 `ready -> unavailable` 
 操作系统通知被禁用、`Show()`/`Failed` 错误或 `Hide()` 失败时记录脱敏诊断，但 `publish()` 仍以持久化
 成功返回。消息内容不得写入普通诊断日志。
 
-托盘适配器只接受“开始/保持提醒”“确认提醒”和“退出”三种意图。开始后由一个工作线程在原始图标与
-同尺寸全透明图标之间持续切换；重复开始幂等保持单循环。确认提醒和退出都会停止循环并恢复原始图标。
-适配器不持久化提醒状态，也不读取或修改未读消息。
+托盘适配器只接受 `MessageArrived`、`MainFocusChanged(bool)` 和 `Shutdown` 三类事件。一个工作线程同时
+拥有 `mainFocused`、`active`、当前视觉帧和 `running | degraded | terminal` 会话状态，并按第 11 节的
+单一顺序域处理事件和 500 毫秒 tick。`MessageArrived` 仅在 `mainFocused == false` 且状态为 `running` 时
+开始或保持单循环；`MainFocusChanged(true)` 停止循环并尝试恢复原图；重复事件均幂等。适配器不持久化
+提醒状态，也不读取或修改未读消息。
 
-发布后派发原生副作用时，宿主在任何消息、插件或请求锁之外查询主窗口原生焦点；已聚焦时跳过托盘开始
-意图。主窗口 `Focused(true)` 事件在既有焦点生命周期处理之外独立发送确认提醒意图。查询或确认失败只
-记录受控诊断，不能改变消息、徽标或窗口生命周期。
+失败行为固定如下：
 
-消息到达路径不得调用主窗口 show/focus。只有经过验证的用户通知点击动作可以请求显示“设置/消息”。
+| 失败或边界 | 托盘注意状态 | 其他合同 |
+| --- | --- | --- |
+| 向控制器发送事件失败 | 记录一次受控诊断，不重试；控制器已经退出时保持其终态 | 不改变消息、未读、窗口或插件结果 |
+| 切换到透明帧或原图失败 | 当前控制器进入 `degraded`，停止 tick，立即尽力设置一次原图；后续 `MessageArrived` 全部忽略 | 消息和两处徽标保持成功 |
+| `degraded` 后收到 `MainFocusChanged(true)` | 再尽力设置一次原图，仍保持 `degraded` | 不标记消息已读 |
+| `Shutdown` 或适配器替换 | 进入 `terminal`，尽力设置原图并拒绝队列中或之后的 `MessageArrived`；替换时旧控制器终止后才创建新控制器 | 不把旧提醒状态转移到新控制器 |
+| 任意恢复原图调用失败 | 只记录脱敏诊断；不能声称图标已经恢复 | 不回滚消息、通知或徽标 |
+
+上述事件发送、图标更新和线程收尾均发生在消息、插件、请求和窗口生命周期锁之外。消息到达路径不得调用
+主窗口 show/focus。只有经过验证的用户通知点击动作可以请求显示“设置/消息”。
 
 ## 14. `demo-win` 参考插件
 
@@ -604,8 +626,11 @@ Promise 拒绝时，Runtime Promise 必须拒绝且不能返回窗口响应。
   `Dismissed` 清理和退出 `Hide`；
 - Toast DOM 测试覆盖 `<>&"'`、`</text><actions>` 和伪造 `launch` 片段，断言通知文本节点的 `InnerText`
   与输入逐字符一致、DOM 不出现 `actions` 节点且路由属性仍完全由宿主生成；
-- 托盘单循环持续闪烁、重复消息不叠加、主窗口焦点确认、消息到达时主窗口已聚焦不启动，以及退出恢复
-  原始图标；
+- 托盘单循环持续闪烁、重复消息不叠加、所有 `Focused(bool)` 在预期 blur 返回前入队，以及以下确定性
+  顺序：`MessageArrived -> MainFocusChanged(true)` 最终停止，`MainFocusChanged(true) -> MessageArrived`
+  不启动，失焦后的新消息重新启动；
+- fake 托盘适配器覆盖透明帧失败、原图失败、事件发送失败、`degraded` 后确认、适配器替换/退出以及终态
+  后迟到 `MessageArrived`，断言停止 tick、只做规定的原图恢复尝试且不改变消息状态；
 - 通知点击 payload 只能路由到固定的设置消息目标。
 
 前端聚焦覆盖：
