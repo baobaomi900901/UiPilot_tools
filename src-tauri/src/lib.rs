@@ -103,7 +103,7 @@ fn setup_production_lifecycle(
     public_plugin_service.initialize(
         &app_data_dir,
         ["find".into(), "math".into()],
-        message_center,
+        Arc::clone(&message_center),
     )?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
@@ -206,10 +206,11 @@ fn setup_production_lifecycle(
     let icon = app
         .default_window_icon()
         .cloned()
+        .map(tauri::image::Image::to_owned)
         .ok_or_else(lifecycle_setup_error)?;
     let tray_coordinator = Arc::clone(coordinator);
-    tauri::tray::TrayIconBuilder::new()
-        .icon(icon)
+    let tray = tauri::tray::TrayIconBuilder::new()
+        .icon(icon.clone())
         .menu(&menu)
         .on_menu_event(
             move |app, event| match lifecycle::tray_action(event.id().as_ref()) {
@@ -221,6 +222,23 @@ fn setup_production_lifecycle(
             },
         )
         .build(app)
+        .map_err(|_| lifecycle_setup_error())?;
+
+    let reminder_icon =
+        tauri::image::Image::from_bytes(include_bytes!("../icons/tray-reminder.png"))?.to_owned();
+    let notification_app = app.handle().clone();
+    let notification_coordinator = Arc::clone(coordinator);
+    let toast: Arc<dyn message_center::MessageToast> = Arc::new(
+        message_center::WindowsNotificationAdapter::new(Arc::new(move || {
+            let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
+        })),
+    );
+    let tray_reminder: Arc<dyn message_center::MessageTray> = Arc::new(
+        message_center::TauriTrayReminder::new(tray, icon, reminder_icon)
+            .map_err(|_| lifecycle_setup_error())?,
+    );
+    message_center
+        .install_native_effects(toast, tray_reminder)
         .map_err(|_| lifecycle_setup_error())?;
 
     lifecycle::install_session_end_hook(app.handle(), &window)
@@ -403,6 +421,8 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                _app.state::<Arc<message_center::MessageCenterService>>()
+                    .shutdown();
                 run_find_controller.shutdown();
                 run_file_index.enter_terminal();
                 run_coordinator.uninstall_hook_for_exit();

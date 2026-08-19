@@ -1,6 +1,14 @@
 mod store;
+mod tray_flash;
+mod windows_notification;
 
-use std::path::Path;
+pub(crate) use tray_flash::TauriTrayReminder;
+pub(crate) use windows_notification::WindowsNotificationAdapter;
+
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -81,15 +89,45 @@ pub(crate) trait MessagePublisher: Send + Sync {
     fn commit_publish(&self, request: MessagePublishRequest) -> MessagePublishOutcome;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeEffectError;
+
+pub(crate) trait MessageToast: Send + Sync {
+    fn show_message(&self, message: &MessagePublished) -> Result<(), NativeEffectError>;
+    fn shutdown(&self);
+}
+
+pub(crate) trait MessageTray: Send + Sync {
+    fn restart(&self) -> Result<(), NativeEffectError>;
+    fn shutdown(&self);
+}
+
+struct NativeEffects {
+    toast: Arc<dyn MessageToast>,
+    tray: Arc<dyn MessageTray>,
+}
+
 pub(crate) struct MessageCenterService {
     store: MessageStore,
+    native_effects: OnceLock<NativeEffects>,
 }
 
 impl MessageCenterService {
     pub(crate) fn load(app_data_dir: &Path) -> Self {
         Self {
             store: MessageStore::load(&app_data_dir.join("message-center")),
+            native_effects: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn install_native_effects(
+        &self,
+        toast: Arc<dyn MessageToast>,
+        tray: Arc<dyn MessageTray>,
+    ) -> Result<(), NativeEffectError> {
+        self.native_effects
+            .set(NativeEffects { toast, tray })
+            .map_err(|_| NativeEffectError)
     }
 
     pub(crate) fn summary(&self) -> Result<MessageSummary, MessageCenterError> {
@@ -122,15 +160,15 @@ impl MessageCenterService {
         app: &AppHandle,
         effect: Option<MessagePostGuardEffect>,
     ) {
-        let event = match effect {
+        let event = match effect.as_ref() {
             Some(MessagePostGuardEffect::Published(message)) => {
                 MessageHostStateChangedEvent::Ready {
-                    revision: message.revision,
+                    revision: message.revision.clone(),
                     unread_count: message.unread_count,
                 }
             }
             Some(MessagePostGuardEffect::Ready(summary)) => MessageHostStateChangedEvent::Ready {
-                revision: summary.revision,
+                revision: summary.revision.clone(),
                 unread_count: summary.unread_count,
             },
             Some(MessagePostGuardEffect::BecameUnavailable) => {
@@ -141,6 +179,35 @@ impl MessageCenterService {
             None => return,
         };
         let _ = app.emit_to("main", MESSAGE_STATE_CHANGED_EVENT, event);
+        if let (Some(MessagePostGuardEffect::Published(message)), Some(native_effects)) =
+            (effect.as_ref(), self.native_effects.get())
+        {
+            dispatch_native_effects(
+                Some(&native_effects.toast),
+                Some(&native_effects.tray),
+                message,
+            );
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if let Some(native_effects) = self.native_effects.get() {
+            native_effects.toast.shutdown();
+            native_effects.tray.shutdown();
+        }
+    }
+}
+
+fn dispatch_native_effects(
+    toast: Option<&Arc<dyn MessageToast>>,
+    tray: Option<&Arc<dyn MessageTray>>,
+    message: &MessagePublished,
+) {
+    if toast.is_some_and(|adapter| adapter.show_message(message).is_err()) {
+        eprintln!("[message-center] Windows notification dispatch failed");
+    }
+    if tray.is_some_and(|adapter| adapter.restart().is_err()) {
+        eprintln!("[message-center] tray reminder dispatch failed");
     }
 }
 
@@ -244,7 +311,10 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use super::*;
@@ -283,6 +353,48 @@ mod tests {
             plugin_name_snapshot: "Messages".into(),
             content: "hello".into(),
         })
+    }
+
+    struct FailingToast(Arc<Mutex<Vec<&'static str>>>);
+
+    impl MessageToast for FailingToast {
+        fn show_message(&self, _message: &MessagePublished) -> Result<(), NativeEffectError> {
+            self.0.lock().unwrap().push("toast");
+            Err(NativeEffectError)
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    struct RecordingTray(Arc<Mutex<Vec<&'static str>>>);
+
+    impl MessageTray for RecordingTray {
+        fn restart(&self) -> Result<(), NativeEffectError> {
+            self.0.lock().unwrap().push("tray");
+            Ok(())
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn native_publish_effects_are_ordered_and_independent() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let toast: Arc<dyn MessageToast> = Arc::new(FailingToast(Arc::clone(&calls)));
+        let tray: Arc<dyn MessageTray> = Arc::new(RecordingTray(Arc::clone(&calls)));
+        let message = MessagePublished {
+            id: "1".into(),
+            plugin_id: "com.example.messages".into(),
+            plugin_name_snapshot: "Messages".into(),
+            created_at: "2026-08-19T00:00:00Z".into(),
+            content: "private content".into(),
+            revision: "1".into(),
+            unread_count: 1,
+        };
+
+        dispatch_native_effects(Some(&toast), Some(&tray), &message);
+
+        assert_eq!(*calls.lock().unwrap(), ["toast", "tray"]);
     }
 
     #[test]
