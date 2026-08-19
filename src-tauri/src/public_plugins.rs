@@ -1,4 +1,5 @@
 mod activation;
+mod delayed_messages;
 mod manifest;
 mod package;
 mod runtime;
