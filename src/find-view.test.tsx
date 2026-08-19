@@ -9,6 +9,7 @@ import { FindView } from './find-view'
 import type { ExecuteOutcome, FileSearchResponse, FindClient } from './protocol'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
+const findViewSource = readFileSync('src/find-view.tsx', 'utf8')
 
 function response(): FileSearchResponse {
   return {
@@ -110,11 +111,25 @@ describe('FindView', () => {
     const pin = host.querySelector<HTMLButtonElement>('button[aria-label="固定窗口"]')!
     expect(pin.getAttribute('aria-pressed')).toBe('false')
     expect(pin.classList.contains('find-icon-button')).toBe(true)
+    expect(pin.querySelector('.lucide-pin')).not.toBeNull()
     await act(async () => pin.click())
     await vi.waitFor(() => expect(host.querySelector('button[aria-label="取消固定"]')).toBeTruthy())
     const close = host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
+    expect(close.querySelector('.lucide-x')).not.toBeNull()
     await act(async () => close.click())
     expect(fake.client.hide).toHaveBeenCalledWith({ invocationId: 'inv-1', force: true })
+  })
+
+  it('uses the shared UiPilot theme and semantic surface tokens', () => {
+    expect(findViewSource).toContain("from './ui-theme'")
+    expect(findViewSource).toContain('uiThemeConfig(scheme)')
+    expect(findViewSource).not.toContain('@ant-design/icons')
+    expect(stylesSource).toMatch(
+      /\.find-surface\s*\{[^}]*color:\s*var\(--uipilot-ui-foreground\);[^}]*background:\s*var\(--uipilot-ui-background\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-icon-button\.is-selected\s*\{[^}]*color:\s*var\(--uipilot-ui-primary\);[^}]*background:\s*var\(--uipilot-ui-accent\);/s,
+    )
   })
 
   it('reuses the launcher file workspace visual language', async () => {

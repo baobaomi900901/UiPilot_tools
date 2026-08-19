@@ -154,6 +154,20 @@ describe('message center state', () => {
     expect(core.getSnapshot()).toMatchObject({ unreadCount: 0, summaryRevision: '0' })
   })
 
+  it('refreshes the persisted summary after a hidden-window event may have been missed', async () => {
+    const fake = fakeClient()
+    const core = createMessageCenterCore(fake.client)
+    await core.start()
+    vi.mocked(fake.client.getMessageSummary).mockResolvedValueOnce(summary('1', 1))
+
+    await core.refresh()
+
+    expect(fake.client.getMessageSummary).toHaveBeenCalledTimes(2)
+    expect(core.getSnapshot()).toMatchObject({
+      status: 'ready', unreadCount: 1, summaryRevision: '1',
+    })
+  })
+
   it('accepts a full snapshot at the same revision after the event arrives first', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.getMessageSummary).mockResolvedValueOnce(summary('9', 1))

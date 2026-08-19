@@ -28,6 +28,13 @@
         },
         "outputMode": {
           "$ref": "#/$defs/PublicOutputMode"
+        },
+        "summary": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

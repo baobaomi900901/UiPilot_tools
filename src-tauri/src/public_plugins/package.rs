@@ -11,6 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 use zip::{CompressionMethod, ZipArchive};
 
 use super::{
+    icon::{self, ICON_MIME, ICON_PATH, MAX_ICON_BYTES},
     manifest::{parse_manifest, PublicManifestV1},
     PreparedPublicPlugin, PublicPackageError, PublicPackageSource, PublicPluginHost,
     PublicResource,
@@ -38,7 +39,7 @@ pub(super) fn load_existing(
     let manifest_bytes = fs::read(package_root.join("plugin.json"))
         .map_err(|_| PublicPackageError::InvalidPackage)?;
     let manifest = parse_manifest(&manifest_bytes, host)?;
-    validate_manifest_entries(&manifest, &snapshot.resources)?;
+    validate_manifest_entries(package_root, &manifest, &snapshot.resources)?;
     validate_css_references(package_root, &snapshot.resources)?;
     Ok((manifest, snapshot.resources))
 }
@@ -73,7 +74,7 @@ pub(super) fn stage(
     let manifest_bytes = fs::read(package_root.join("plugin.json"))
         .map_err(|_| PublicPackageError::InvalidPackage)?;
     let manifest = parse_manifest(&manifest_bytes, host)?;
-    validate_manifest_entries(&manifest, &first.resources)?;
+    validate_manifest_entries(&package_root, &manifest, &first.resources)?;
     validate_css_references(&package_root, &first.resources)?;
     make_snapshot_read_only(&package_root, &first.resources)?;
 
@@ -420,6 +421,7 @@ fn scan_directory(
 }
 
 fn validate_manifest_entries(
+    root: &Path,
     manifest: &PublicManifestV1,
     resources: &BTreeMap<String, PublicResource>,
 ) -> Result<(), PublicPackageError> {
@@ -430,6 +432,24 @@ fn validate_manifest_entries(
             .is_some_and(|window| !resources.contains_key(&window.entry))
     {
         return Err(PublicPackageError::InvalidPackage);
+    }
+    let icons = resources
+        .iter()
+        .filter(|(_, resource)| resource.mime == ICON_MIME)
+        .collect::<Vec<_>>();
+    if icons.len() > 1 {
+        return Err(PublicPackageError::InvalidPackage);
+    }
+    if let Some((path, resource)) = icons.first() {
+        if path.as_str() != ICON_PATH || resource.length as usize > MAX_ICON_BYTES {
+            return Err(PublicPackageError::InvalidPackage);
+        }
+        let bytes =
+            fs::read(root.join(ICON_PATH)).map_err(|_| PublicPackageError::InvalidPackage)?;
+        if bytes.len() as u64 != resource.length {
+            return Err(PublicPackageError::InvalidPackage);
+        }
+        icon::validate_png(&bytes)?;
     }
     Ok(())
 }
@@ -682,6 +702,7 @@ fn validate_public_resource_path(path: &str) -> Result<&'static str, PublicPacka
         "html" => Ok("text/html"),
         "js" => Ok("text/javascript"),
         "css" => Ok("text/css"),
+        "png" => Ok(ICON_MIME),
         _ => Err(PublicPackageError::InvalidPackage),
     }
 }

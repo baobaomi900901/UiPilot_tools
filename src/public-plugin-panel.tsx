@@ -1,13 +1,8 @@
-import {
-  DeleteOutlined,
-  FolderOpenOutlined,
-  SaveOutlined,
-  UndoOutlined,
-  UploadOutlined,
-} from '@ant-design/icons'
 import { Button, Checkbox, Form, Input, InputNumber, Popconfirm, Select, Spin, Switch, Tooltip } from 'antd'
+import { FolderOpen, Save, Trash2, Undo2, Upload } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { PluginIcon } from './plugin-icon'
 import type {
   LauncherClient,
   PublicPermission,
@@ -128,14 +123,19 @@ function PublicPluginRow({
   return (
     <article className="plugin-item public-plugin-item">
       <div className="plugin-item-main">
-        <div className="plugin-title-line">
-          <h3>{plugin.name}</h3>
-          <code>/{plugin.effectiveName}</code>
-          <span>{plugin.version}</span>
-          <span>{plugin.enabled ? '已启用' : '已禁用'}</span>
-          {plugin.fault ? <span>运行故障</span> : null}
+        <div className="public-plugin-summary">
+          <PluginIcon iconUrl={plugin.iconUrl} size={36} />
+          <div className="public-plugin-summary-copy">
+            <div className="plugin-title-line">
+              <h3>{plugin.name}</h3>
+              <code>/{plugin.effectiveName}</code>
+              <span>{plugin.version}</span>
+              <span>{plugin.enabled ? '已启用' : '已禁用'}</span>
+              {plugin.fault ? <span>运行故障</span> : null}
+            </div>
+            <div className="plugin-version-list">{plugin.pluginId}</div>
+          </div>
         </div>
-        <div className="plugin-version-list">{plugin.pluginId}</div>
         {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
         <div className="public-permissions">
           {plugin.permissions.map((permission) => (
@@ -146,8 +146,8 @@ function PublicPluginRow({
           <Form.Item label="启动名称">
             <div className="public-name-control">
               <Input value={name} disabled={busy} onChange={(event) => setName(event.target.value)} />
-              <Tooltip title="保存名称"><Button icon={<SaveOutlined />} disabled={busy} onClick={() => void mutate(() => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride: name }))} /></Tooltip>
-              <Tooltip title="恢复默认"><Button icon={<UndoOutlined />} disabled={busy} onClick={() => void mutate(() => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride: null }))} /></Tooltip>
+              <Tooltip title="保存名称"><Button aria-label="保存名称" icon={<Save aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void mutate(() => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride: name }))} /></Tooltip>
+              <Tooltip title="恢复默认"><Button aria-label="恢复默认" icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void mutate(() => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride: null }))} /></Tooltip>
             </div>
           </Form.Item>
           {plugin.settings.map((setting) => (
@@ -155,7 +155,7 @@ function PublicPluginRow({
           ))}
           {plugin.settings.length ? (
             <Button
-              icon={<SaveOutlined />}
+              icon={<Save aria-hidden size={16} strokeWidth={1.8} />}
               loading={busy}
               onClick={() => void mutate(() => client.savePublicPluginSettings({
                 input: {
@@ -174,7 +174,7 @@ function PublicPluginRow({
       <div className="plugin-actions public-plugin-actions">
         <Switch checked={plugin.enabled} disabled={busy} onChange={(enabled) => void mutate(() => client.setPublicPluginEnabled({ pluginId: plugin.pluginId, enabled }))} />
         <Popconfirm title="卸载并删除数据？" okText="删除" cancelText="取消" onConfirm={() => void mutate(() => client.uninstallPublicPlugin({ pluginId: plugin.pluginId, retainData: false }))}>
-          <Tooltip title="卸载并删除数据"><Button danger icon={<DeleteOutlined />} disabled={busy} /></Tooltip>
+          <Tooltip title="卸载并删除数据"><Button aria-label="卸载并删除数据" danger icon={<Trash2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} /></Tooltip>
         </Popconfirm>
         <Popconfirm title="卸载但保留数据？" okText="保留" cancelText="取消" onConfirm={() => void mutate(() => client.uninstallPublicPlugin({ pluginId: plugin.pluginId, retainData: true }))}>
           <Button disabled={busy}>保留数据卸载</Button>
@@ -257,13 +257,14 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
       <div className="plugin-inventory-header">
         <h2 id="public-plugin-title">公开插件</h2>
         <div className="public-install-actions">
-          <Tooltip title="选择插件包"><Button icon={<UploadOutlined />} disabled={busy} onClick={() => void prepare('archive')} /></Tooltip>
-          <Tooltip title="选择开发目录"><Button icon={<FolderOpenOutlined />} disabled={busy} onClick={() => void prepare('developmentDirectory')} /></Tooltip>
+          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void prepare('archive')} /></Tooltip>
+          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void prepare('developmentDirectory')} /></Tooltip>
           <Button disabled={busy || loading} onClick={() => void reload()}>刷新</Button>
         </div>
       </div>
       {prepared ? (
         <div className="public-prepare" role="status">
+          <PluginIcon iconUrl={prepared.iconUrl} size={32} />
           <strong>{prepared.name}</strong><span>{prepared.version}</span>
           <span>{prepared.permissions.join('、') || '无额外权限'}</span>
           <Button type="primary" loading={busy} onClick={() => void commitPrepared()}>确认安装</Button>

@@ -37,4 +37,14 @@ describe('development server contract', () => {
     expect(packageJson.scripts['dev:vite']).toBe('vite')
     expect(startupScript).not.toMatch(/--(?:host|port|strictPort)/)
   })
+
+  it('disables native maximize only for the fixed-size main window', () => {
+    const windows = JSON.parse(tauriConfigSource).app.windows as Array<Record<string, unknown>>
+    const main = windows.find((window) => window.label === 'main')
+    const find = windows.find((window) => window.label === 'find')
+
+    expect(main).toMatchObject({ resizable: false, maximizable: false, fullscreen: false })
+    expect(find).toMatchObject({ resizable: true, fullscreen: false })
+    expect(find).not.toHaveProperty('maximizable')
+  })
 })

@@ -30,6 +30,7 @@
     "allow-save-settings",
     "allow-save-hotkey",
     "allow-set-theme-preference",
+    "allow-set-web-search-engine",
     "allow-hide-launcher",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

@@ -1,5 +1,7 @@
 [CmdletBinding()]
 param(
+    [ValidateSet('com.uipilot.demo-win', 'com.uipilot.demo-return')]
+    [string]$PluginId = 'com.uipilot.demo-win',
     [string]$OutputPath = ''
 )
 
@@ -7,10 +9,10 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $workspace = Split-Path -Parent $PSScriptRoot
-$exampleRoot = Join-Path $workspace 'examples/public-plugins/com.uipilot.demo'
+$exampleRoot = Join-Path $workspace "examples/public-plugins/$PluginId"
 $packageRoot = Join-Path $exampleRoot 'package'
 if (-not $OutputPath) {
-    $OutputPath = Join-Path $exampleRoot 'com.uipilot.demo.uipilot-plugin'
+    $OutputPath = Join-Path $exampleRoot "$PluginId.uipilot-plugin"
 }
 $output = [System.IO.Path]::GetFullPath($OutputPath)
 if ([System.IO.Path]::GetExtension($output) -ne '.uipilot-plugin') {

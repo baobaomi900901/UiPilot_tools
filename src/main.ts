@@ -17,6 +17,7 @@ import {
   parseMessageSummary,
   parsePluginInventorySnapshot,
   parsePublicPluginInventory,
+  parsePublicPluginWindowIdentity,
   parseFindPreviewPreferenceResult,
   parseFindReadyOutcome,
   type FindClient,
@@ -34,7 +35,6 @@ import {
 
 export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
-  searchApps: (input) => invoke<SearchResponse | null>('search_apps', input),
   listenMessageStateChanged: (handler) =>
     listen('message-center://state-changed', (event) => handler(event.payload)),
   getMessageSummary: async () => {
@@ -61,6 +61,7 @@ export const client: LauncherClient = {
     if (!snapshot) throw { code: 'MessageOperationFailed', storeStatus: 'ready' }
     return snapshot
   },
+  searchApps: (input) => invoke<SearchResponse | null>('search_apps', input),
   openFind: (input) => invoke('open_find_window', { input }),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   commitPluginWindowTransfer: (input) => invoke<void>('commit_plugin_window_transfer', input),
@@ -119,10 +120,21 @@ export const client: LauncherClient = {
       'set_theme_preference',
       Object.freeze({ preference: Object.freeze({ theme: input.preference.theme }) }),
     ),
+  setWebSearchEngine: (input) =>
+    invoke<void>(
+      'set_web_search_engine',
+      Object.freeze({ preference: Object.freeze({ engine: input.preference.engine }) }),
+    ),
   hideLauncher: () => invoke<void>('hide_launcher'),
 }
 
 export const pluginWindowClient: PluginWindowClient = {
+  getIdentity: async () => {
+    const value = await invoke<unknown>('get_public_plugin_window_identity')
+    const identity = parsePublicPluginWindowIdentity(value)
+    if (!identity) throw new Error('invalid public plugin window identity')
+    return identity
+  },
   setPinned: (input) => invoke('set_plugin_window_pinned', input),
   close: () => invoke<void>('close_plugin_window'),
 }
@@ -225,7 +237,9 @@ void (async () => {
     root.unmount()
   }
   window.addEventListener('pagehide', teardown)
-  root.render(createElement(PluginWindowView, { core }))} else if (label === 'find') {
+  root.render(createElement(PluginWindowView, { core }))
+  void core.start()
+} else if (label === 'find') {
   const core = createFindCore(findClient)
   const root = createRoot(host, {
     onUncaughtError: () => {

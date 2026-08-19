@@ -22,6 +22,12 @@ mod message_center;
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod calculator;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod web_search;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod apps;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -120,6 +126,9 @@ fn setup_production_lifecycle(
     let event_coordinator = Arc::clone(coordinator);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
+            event_app
+                .state::<Arc<message_center::MessageCenterService>>()
+                .observe_main_focus(*focused);
             let transfers =
                 event_app.state::<Arc<window_transfer::MainWindowTransferCoordinator>>();
             let expected_blur = !*focused && transfers.consume_expected_main_blur();
@@ -225,8 +234,6 @@ fn setup_production_lifecycle(
         .build(app)
         .map_err(|_| lifecycle_setup_error())?;
 
-    let reminder_icon =
-        tauri::image::Image::from_bytes(include_bytes!("../icons/tray-reminder.png"))?.to_owned();
     let notification_app = app.handle().clone();
     let notification_coordinator = Arc::clone(coordinator);
     let toast: Arc<dyn message_center::MessageToast> = Arc::new(
@@ -234,10 +241,8 @@ fn setup_production_lifecycle(
             let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
         })),
     );
-    let tray_reminder: Arc<dyn message_center::MessageTray> = Arc::new(
-        message_center::TauriTrayReminder::new(tray, icon, reminder_icon)
-            .map_err(|_| lifecycle_setup_error())?,
-    );
+    let tray_reminder: Arc<dyn message_center::MessageTray> =
+        Arc::new(message_center::TauriTrayReminder::new(tray, icon));
     message_center
         .install_native_effects(toast, tray_reminder)
         .map_err(|_| lifecycle_setup_error())?;
@@ -327,7 +332,11 @@ pub fn run() {
         .register_uri_scheme_protocol("uipilot-public-plugin", {
             let public_plugin_service = Arc::clone(&public_plugin_service);
             move |ctx, request| {
-                public_plugin_service.asset_response(ctx.webview_label(), request.uri().path())
+                public_plugin_service.asset_response(
+                    ctx.webview_label(),
+                    request.uri().path(),
+                    request.uri().query(),
+                )
             }
         })
         .manage(Arc::clone(&public_plugin_service))
@@ -363,12 +372,13 @@ pub fn run() {
             commands::plugin_window_content_ready,
             commands::plugin_window_content_ack,
             commands::commit_plugin_window_transfer,
+            commands::get_public_plugin_window_identity,
             commands::set_plugin_window_pinned,
+            commands::close_plugin_window,
             commands::get_message_summary,
             commands::open_message_center,
             commands::read_message_center,
             commands::clear_messages,
-            commands::close_plugin_window,
             commands::search_apps,
             commands::publish_plugin_results,
             commands::search_files,
@@ -382,6 +392,7 @@ pub fn run() {
             commands::save_hotkey,
             commands::set_file_preview_preference,
             commands::set_theme_preference,
+            commands::set_web_search_engine,
             commands::hide_launcher,
         ]);
 
@@ -598,7 +609,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 41);
+        assert_eq!(production.matches("commands::").count(), 43);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -621,6 +632,7 @@ mod tests {
             "plugin_window_content_ready",
             "plugin_window_content_ack",
             "commit_plugin_window_transfer",
+            "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
             "close_plugin_window",
             "get_message_summary",
@@ -640,6 +652,7 @@ mod tests {
             "save_hotkey",
             "set_file_preview_preference",
             "set_theme_preference",
+            "set_web_search_engine",
             "hide_launcher",
         ] {
             assert!(production.contains(&format!("commands::{command}")));
@@ -729,7 +742,11 @@ mod tests {
         assert!(!shell.contains("commit-plugin-window-transfer"));
         assert!(!content.contains("commit-plugin-window-transfer"));
         assert!(shell.contains("\"webviews\": [\"plugin-shell-*\"]"));
-        for command in ["set_plugin_window_pinned", "close_plugin_window"] {
+        for command in [
+            "get_public_plugin_window_identity",
+            "set_plugin_window_pinned",
+            "close_plugin_window",
+        ] {
             let permission = format!("allow-{}", command.replace('_', "-"));
             assert!(build.contains(&format!("\"{command}\",")));
             assert!(shell.contains(&permission));
@@ -855,6 +872,31 @@ mod tests {
             .find("_app.state::<Arc<message_center::MessageCenterService>>()")
             .expect("message center shutdown is missing");
         assert!(delayed_shutdown < native_shutdown);
+    }
+
+    #[test]
+    fn main_focus_reaches_tray_attention_before_expected_blur_can_return() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let focused_branch = production
+            .split("tauri::WindowEvent::Focused(focused) => {")
+            .nth(1)
+            .and_then(|tail| tail.split("tauri::WindowEvent::CloseRequested").next())
+            .expect("main focused branch is missing");
+        let observe = focused_branch
+            .find("observe_main_focus(*focused)")
+            .expect("tray attention focus observation is missing");
+        let consume = focused_branch
+            .find("consume_expected_main_blur()")
+            .expect("expected main blur handling is missing");
+        let early_return = focused_branch
+            .find("if expected_blur")
+            .expect("expected blur early return is missing");
+
+        assert!(observe < consume && consume < early_return);
     }
 
     #[test]
@@ -1164,23 +1206,24 @@ mod tests {
     }
 
     #[test]
-    fn host_source_has_no_builtin_math_plugin() {
-        for (name, source) in [
-            ("lib.rs", include_str!("lib.rs")),
-            ("plugins.rs", include_str!("plugins.rs")),
-        ] {
-            for forbidden in [
-                ["/", "math"].concat(),
-                ["internal", ".", "math"].concat(),
-                ["Expr", "ession"].concat(),
-                ["calculate", "("].concat(),
-            ] {
-                assert!(
-                    !source.contains(&forbidden),
-                    "host source contains {forbidden}: {name}"
-                );
-            }
+    fn host_uses_builtin_calculator_without_legacy_math_command() {
+        let lib_source = include_str!("lib.rs").replace("\r\n", "\n");
+        let product_lib = lib_source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(product_lib.contains("mod calculator;"));
+        let plugin_source = include_str!("plugins.rs");
+        assert!(plugin_source.contains("fn retired_plugin_id("));
+        let forbidden_command = ["/", "math"].concat();
+        for source in [product_lib, plugin_source] {
+            assert!(!source.contains(&forbidden_command));
         }
+
+        let legacy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples")
+            .join("plugins")
+            .join("internal.math");
+        assert!(!legacy.exists());
     }
 
     #[test]

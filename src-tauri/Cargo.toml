@@ -26,12 +26,14 @@ everything-ipc = { package = "everything-ipc-spike", path = "../spikes/everythin
 icu_casemap = { version = "=1.5.1", default-features = false, features = ["compiled_data"] }
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
 schemars = "=1.2.1"
+png = "=0.18.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "=0.10.9"
 tauri = { version = "2.11.3", features = ["image-png", "tray-icon", "unstable"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 unicode-normalization = { version = "=0.1.23", default-features = false, features = ["std"] }
+url = "=2.5.8"
 zip = { version = "=2.4.2", default-features = false, features = ["flate2", "deflate-flate2"] }
 windows = { version = "0.61.3", features = [
   "Data_Xml_Dom",
@@ -64,3 +66,6 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 webview2-com = "=0.38.2"
+
+[profile.dev]
+incremental = false

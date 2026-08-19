@@ -99,7 +99,8 @@ pub(crate) trait MessageToast: Send + Sync {
 }
 
 pub(crate) trait MessageTray: Send + Sync {
-    fn restart(&self) -> Result<(), NativeEffectError>;
+    fn message_arrived(&self) -> Result<(), NativeEffectError>;
+    fn main_focus_changed(&self, focused: bool) -> Result<(), NativeEffectError>;
     fn shutdown(&self);
 }
 
@@ -197,6 +198,16 @@ impl MessageCenterService {
             native_effects.tray.shutdown();
         }
     }
+
+    pub(crate) fn observe_main_focus(&self, focused: bool) {
+        if self
+            .native_effects
+            .get()
+            .is_some_and(|effects| effects.tray.main_focus_changed(focused).is_err())
+        {
+            eprintln!("[message-center] tray attention focus dispatch failed");
+        }
+    }
 }
 
 fn dispatch_native_effects(
@@ -207,8 +218,8 @@ fn dispatch_native_effects(
     if toast.is_some_and(|adapter| adapter.show_message(message).is_err()) {
         eprintln!("[message-center] Windows notification dispatch failed");
     }
-    if tray.is_some_and(|adapter| adapter.restart().is_err()) {
-        eprintln!("[message-center] tray reminder dispatch failed");
+    if tray.is_some_and(|adapter| adapter.message_arrived().is_err()) {
+        eprintln!("[message-center] tray attention dispatch failed");
     }
 }
 
@@ -374,8 +385,16 @@ mod tests {
     struct RecordingTray(Arc<Mutex<Vec<&'static str>>>);
 
     impl MessageTray for RecordingTray {
-        fn restart(&self) -> Result<(), NativeEffectError> {
+        fn message_arrived(&self) -> Result<(), NativeEffectError> {
             self.0.lock().unwrap().push("tray");
+            Ok(())
+        }
+
+        fn main_focus_changed(&self, focused: bool) -> Result<(), NativeEffectError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(if focused { "focus" } else { "blur" });
             Ok(())
         }
 

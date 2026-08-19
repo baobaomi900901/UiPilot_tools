@@ -7,7 +7,9 @@ use std::{
     },
 };
 
-use crate::{apps::ApplicationLaunchTarget, file_search::FileExecutionAction};
+use crate::{
+    apps::ApplicationLaunchTarget, file_search::FileExecutionAction, settings::WebSearchEngine,
+};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
     LaunchApplication {
@@ -15,6 +17,13 @@ pub(crate) enum ResultAction {
         target: ApplicationLaunchTarget,
     },
     OpenFile(FileExecutionAction),
+    CopyBuiltInText {
+        text: String,
+    },
+    OpenWebSearch {
+        engine: WebSearchEngine,
+        query: String,
+    },
     CopyText {
         plugin_id: String,
         generation: u64,
@@ -714,7 +723,10 @@ mod tests {
             title: title.to_owned(),
             subtitle: None,
             icon: None,
+            plugin_icon_url: None,
+            icon_kind: None,
             detail: None,
+            completion_text: None,
             has_default_action: true,
         }
     }
@@ -780,8 +792,10 @@ mod tests {
                         item
                     })
                     .collect(),
-
+                command_hint: None,
                 window_transfer_token: None,
+
+                replace_local_results: false,
             },
         )
     }

@@ -61,6 +61,8 @@ pub(crate) enum PublicOutputMode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicCommandV1 {
     pub(crate) default_name: String,
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) output_mode: PublicOutputMode,
     pub(crate) input_required: bool,
@@ -268,6 +270,11 @@ fn validate_manifest(
         || manifest.supported_platforms.is_empty()
         || has_duplicates(manifest.supported_platforms.iter().copied())
         || !valid_command_name(&manifest.command.default_name)
+        || !manifest
+            .command
+            .summary
+            .as_deref()
+            .is_none_or(valid_command_summary)
         || (manifest.command.input_required
             && !manifest
                 .command
@@ -420,6 +427,10 @@ fn nonempty_plain_text(value: &str) -> bool {
     !value.trim().is_empty() && plain_text(value)
 }
 
+fn valid_command_summary(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 512 && !value.chars().any(char::is_control)
+}
+
 fn plain_text(value: &str) -> bool {
     !value.chars().any(|character| {
         character == '\0' || (character.is_control() && !"\r\n\t".contains(character))
@@ -428,6 +439,38 @@ fn plain_text(value: &str) -> bool {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    fn manifest(summary: Option<Value>) -> Value {
+        let mut manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "pluginId": "com.uipilot.summary",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "minimumHostVersion": "0.2.0",
+            "name": "Summary Demo",
+            "supportedPlatforms": ["windows"],
+            "command": {
+                "defaultName": "summary",
+                "activationMode": "submit",
+                "outputMode": "mainResult",
+                "inputRequired": false
+            },
+            "runtime": { "entry": "dist/runtime.js" },
+            "permissions": [],
+            "settings": []
+        });
+        if let Some(summary) = summary {
+            manifest["command"]["summary"] = summary;
+        }
+        manifest
+    }
+
+    fn parse(value: &Value) -> Result<PublicManifestV1, PublicPackageError> {
+        parse_manifest(
+            &serde_json::to_vec(value).unwrap(),
+            &PublicPluginHost::current(PublicPlatform::Windows),
+        )
+    }
 
     #[test]
     fn generated_schema_covers_manifest_commands_settings_and_window_contracts() {
@@ -449,5 +492,29 @@ mod schema_tests {
             );
         }
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn command_summary_is_optional_bounded_single_line_plain_text() {
+        assert!(parse(&manifest(None)).is_ok());
+
+        let parsed = parse(&manifest(Some(serde_json::json!("Run the summary demo")))).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["command"]["summary"],
+            "Run the summary demo"
+        );
+
+        for invalid in [
+            String::new(),
+            "   ".into(),
+            "line\nbreak".into(),
+            "control\u{0007}".into(),
+            "x".repeat(513),
+        ] {
+            assert_eq!(
+                parse(&manifest(Some(Value::String(invalid)))),
+                Err(PublicPackageError::InvalidPackage)
+            );
+        }
     }
 }

@@ -1,5 +1,6 @@
 import {
   App,
+  Badge,
   Button,
   Checkbox,
   ConfigProvider,
@@ -11,10 +12,10 @@ import {
   Switch,
   Tabs,
   Tooltip,
-  theme,
   type InputProps,
   type InputRef,
 } from 'antd'
+import { ArrowLeft, Calculator, FolderSearch, PanelsTopLeft, Search, Settings } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -25,11 +26,23 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 
 import type { LauncherCore } from './launcher-core'
+import { MessageCenterPanel } from './message-center-panel'
 import { bindNativeTextInput } from './native-input'
+import { PluginIcon } from './plugin-icon'
 import { PublicPluginPanel } from './public-plugin-panel'
-import type { ControlKey, FileCategory, FileResultKind, ThemePreference } from './protocol'
+import type {
+  ControlKey,
+  FileCategory,
+  FileResultKind,
+  ResultIconKind,
+  SettingsTabKey,
+  ThemePreference,
+  WebSearchEngine,
+} from './protocol'
+import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
 import {
   formatHotkeyDisplay,
   reduceHotkeyRecorder,
@@ -76,6 +89,32 @@ function composing(event: ReactKeyboardEvent): boolean {
   return event.nativeEvent.isComposing
 }
 
+function BuiltInResultIcon({ kind }: { kind: ResultIconKind }) {
+  if (kind === 'calculator') {
+    return (
+      <span className="built-in-result-icon built-in-result-icon-calculator" data-result-icon-kind={kind}>
+        <Calculator aria-hidden size={27} strokeWidth={1.8} />
+      </span>
+    )
+  }
+  const isFind = kind === 'find'
+  return (
+    <span
+      className={`built-in-result-icon ${isFind ? 'built-in-result-icon-find' : 'built-in-result-icon-web-search'}`}
+      data-result-icon-kind={kind}
+    >
+      {isFind ? (
+        <FolderSearch aria-hidden size={26} strokeWidth={1.8} />
+      ) : (
+        <>
+          <PanelsTopLeft aria-hidden size={25} strokeWidth={1.8} />
+          <Search aria-hidden className="built-in-result-icon-badge" size={12} strokeWidth={2} />
+        </>
+      )}
+    </span>
+  )
+}
+
 
 const pluginMarkdownElements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'li', 'em', 'strong', 'code', 'pre']
 
@@ -84,6 +123,17 @@ const themeOptions = [
   { value: 'dark', label: 'Dark' },
   { value: 'light', label: 'Light' },
 ] satisfies { value: ThemePreference; label: string }[]
+
+const webSearchEngineOptions = [
+  { value: 'bing', label: 'Bing' },
+  { value: 'baidu', label: '百度' },
+  { value: 'google', label: 'Google' },
+] satisfies { value: WebSearchEngine; label: string }[]
+
+const settingsScrollbarOptions = {
+  overflow: { x: 'hidden', y: 'scroll' },
+  scrollbars: { theme: 'os-theme-uipilot', visibility: 'auto', autoHide: 'never' },
+} as const
 
 const fileCategoryOptions = [
   { value: 'all', label: '全部' },
@@ -97,28 +147,13 @@ const fileCategoryOptions = [
   { value: 'audio', label: '音频' },
   { value: 'archive', label: '压缩包' },
 ] satisfies readonly { value: FileCategory; label: string }[]
-type SettingsTabKey = 'general' | 'plugins'
-
-interface SettingsTabSelection {
-  viewEpoch: number
-  key: SettingsTabKey
-}
-
 function settingsTabKey(target: EventTarget): SettingsTabKey | null {
   if (!(target instanceof HTMLElement) || target.getAttribute('role') !== 'tab') return null
   const controlledPanel = target.getAttribute('aria-controls')
   if (controlledPanel?.endsWith('-panel-general')) return 'general'
+  if (controlledPanel?.endsWith('-panel-messages')) return 'messages'
   if (controlledPanel?.endsWith('-panel-plugins')) return 'plugins'
   return null
-}
-
-function resolveColorScheme(
-  preference: ThemePreference,
-  systemDark: boolean,
-): 'light' | 'dark' {
-  if (preference === 'dark') return 'dark'
-  if (preference === 'light') return 'light'
-  return systemDark ? 'dark' : 'light'
 }
 
 function fileSize(kind: FileResultKind, sizeBytes: string | null): string {
@@ -225,16 +260,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
-  const colorScheme = resolveColorScheme(snapshot.theme, systemDark)
+  const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
-  const [settingsTabSelection, setSettingsTabSelection] = useState<SettingsTabSelection>({
-    viewEpoch: -1,
-    key: 'general',
-  })
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
-  const activeSettingsTab: SettingsTabKey =
-    settingsTabSelection.viewEpoch === snapshot.viewEpoch ? settingsTabSelection.key : 'general'
+  const activeSettingsTab = snapshot.settingsTab
   const optionRefs = useRef(new Map<number, HTMLElement>())
   const fileOptionRefs = useRef(new Map<number, HTMLElement>())
   const ready = useRef(false)
@@ -304,6 +334,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           snapshot.results[snapshot.selectedIndex]?.subtitle ? `，${snapshot.results[snapshot.selectedIndex]!.subtitle}` : ''
         }`
       : '')
+  const messageBadgeCount = snapshot.messageCenter.status === 'unavailable'
+    ? '!'
+    : snapshot.messageCenter.status === 'ready'
+      ? snapshot.messageCenter.unreadCount ?? 0
+      : 0
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (
@@ -329,7 +364,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (event.key === 'Escape' && !isComposing) event.preventDefault()
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
   }
-  const settingsKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+  const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== 'Escape') return
     const isComposing = composing(event)
     if (!isComposing) event.preventDefault()
@@ -358,14 +393,40 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         aria-activedescendant={
           snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
         }
+        suffix={(
+          <Tooltip title="设置">
+            <span className="launcher-settings-control">
+              <Badge
+                className={`launcher-settings-badge${snapshot.messageCenter.status === 'unavailable' ? ' is-unavailable' : ''}`}
+                count={messageBadgeCount}
+                offset={[-2, 2]}
+                overflowCount={99}
+                size="small"
+              >
+                <Button
+                  aria-label="打开设置"
+                  className="launcher-settings-button"
+                  disabled={!snapshot.invocationId}
+                  icon={<Settings aria-hidden size={16} strokeWidth={1.8} />}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => core.navigate('settings')}
+                  size="small"
+                  type="text"
+                />
+              </Badge>
+            </span>
+          </Tooltip>
+        )}
         onKeyDown={queryKeyDown}
         onBound={reportQueryBound}
         onBindingFailed={reportFailed}
       />
 
       <Spin spinning={snapshot.searchPending} size="small">
-        <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
-          {snapshot.results.map((item, index) => (
+        <div className="launcher-result-surface">
+          {snapshot.commandHint ? <div className="command-hint">{snapshot.commandHint}</div> : null}
+          <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
+            {snapshot.results.map((item, index) => (
               <div
                 key={item.key}
                 id={`launcher-result-${item.key}`}
@@ -379,21 +440,29 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 }}
               >
                 <span className="result-icon" aria-hidden="true">
-                  <span className="app-mark" hidden={item.icon !== undefined} />
-                  {item.icon ? (
-                    <img
-                      className="result-icon-image"
-                      src={item.icon}
-                      alt=""
-                      aria-hidden="true"
-                      draggable={false}
-                      onError={(event) => {
-                        event.currentTarget.hidden = true
-                        const fallback = event.currentTarget.previousElementSibling
-                        if (fallback instanceof HTMLElement) fallback.hidden = false
-                      }}
-                    />
-                  ) : null}
+                  {item.iconKind ? (
+                    <BuiltInResultIcon kind={item.iconKind} />
+                  ) : item.pluginIconUrl ? (
+                    <PluginIcon iconUrl={item.pluginIconUrl} size={28} />
+                  ) : (
+                    <>
+                      <span className="app-mark" hidden={item.icon !== undefined} />
+                      {item.icon ? (
+                        <img
+                          className="result-icon-image"
+                          src={item.icon}
+                          alt=""
+                          aria-hidden="true"
+                          draggable={false}
+                          onError={(event) => {
+                            event.currentTarget.hidden = true
+                            const fallback = event.currentTarget.previousElementSibling
+                            if (fallback instanceof HTMLElement) fallback.hidden = false
+                          }}
+                        />
+                      ) : null}
+                    </>
+                  )}
                 </span>
                 <span className="result-copy">
                   <span className="result-title">{item.title}</span>
@@ -402,6 +471,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 </span>
               </div>
             ))}
+          </div>
         </div>
       </Spin>
     </section>
@@ -534,74 +604,87 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
   const settings = snapshot.settings
   const plugins = snapshot.plugins
+  const showLegacyPluginInventory =
+    plugins?.status === 'error' || (plugins?.items.length ?? 0) > 0
   const busy = settings?.operation !== undefined
   const locked = busy || settings?.readOnly === true
   const generalSettingsPanel = (
-    <div className="settings-tab-panel settings-general-panel">
-      {!settings ? (
-        <div className="settings-loading">
-          {snapshot.settingsLoadStatus === 'error' ? (
-            <Button onClick={() => void core.reloadSettings()}>重试</Button>
-          ) : (
-            <Spin size="small" />
-          )}
-        </div>
-      ) : (
-        <Form component="div" layout="vertical" className="settings-basic-form">
-          <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
-            <HotkeyRecorderInput
-              core={core}
-              value={settings.hotkey.value}
-              id={`settings-hotkey-${settings.hotkey.key}`}
-              name={`settings-hotkey-${settings.hotkey.key}`}
-              disabled={locked}
-            />
-          </Form.Item>
-          <Checkbox
-            checked={settings.autostart}
-            disabled={locked}
-            onChange={(event) => core.setAutostart(event.target.checked)}
-          >
-            开机启动
-          </Checkbox>
-          <Form.Item label="风格">
-            <Select
-              aria-label="风格"
-              value={settings.theme}
-              disabled={locked}
-              options={themeOptions}
-              onChange={(value: ThemePreference) => core.setThemePreference(value)}
-            />
-          </Form.Item>
-          <div className="settings-actions">
-            <Popconfirm
-              title="恢复初始化设置？"
-              description="快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。"
-              okText="恢复"
-              cancelText="取消"
-              onConfirm={() => void core.resetSettings()}
-              disabled={locked}
-            >
-              <Button danger disabled={locked} loading={settings.operation === 'save'}>
-                恢复初始化
-              </Button>
-            </Popconfirm>
-            {settings.loadStatus === 'error' ? (
-              <Button
-                disabled={busy}
-                loading={settings.operation === 'load'}
-                onClick={() => void core.reloadSettings()}
-              >
-                重试
-              </Button>
-            ) : null}
+    <OverlayScrollbarsComponent className="settings-tab-panel settings-general-panel" options={settingsScrollbarOptions}>
+      <div className="settings-scroll-content">
+        {!settings ? (
+          <div className="settings-loading">
+            {snapshot.settingsLoadStatus === 'error' ? (
+              <Button onClick={() => void core.reloadSettings()}>重试</Button>
+            ) : (
+              <Spin size="small" />
+            )}
           </div>
-        </Form>
-      )}
-    </div>
+        ) : (
+          <Form component="div" layout="vertical" className="settings-basic-form">
+            <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
+              <HotkeyRecorderInput
+                core={core}
+                value={settings.hotkey.value}
+                id={`settings-hotkey-${settings.hotkey.key}`}
+                name={`settings-hotkey-${settings.hotkey.key}`}
+                disabled={locked}
+              />
+            </Form.Item>
+            <Checkbox
+              checked={settings.autostart}
+              disabled={locked}
+              onChange={(event) => core.setAutostart(event.target.checked)}
+            >
+              开机启动
+            </Checkbox>
+            <Form.Item label="风格">
+              <Select
+                aria-label="风格"
+                value={settings.theme}
+                disabled={locked}
+                options={themeOptions}
+                onChange={(value: ThemePreference) => core.setThemePreference(value)}
+              />
+            </Form.Item>
+            <Form.Item label="搜索引擎">
+              <Select
+                aria-label="搜索引擎"
+                value={settings.webSearchEngine}
+                disabled={locked}
+                options={webSearchEngineOptions}
+                onChange={(value: WebSearchEngine) => core.setWebSearchEngine(value)}
+              />
+            </Form.Item>
+            <div className="settings-actions">
+              <Popconfirm
+                title="恢复初始化设置？"
+                description="快捷键将恢复为 Shift+Space，关闭开机启动，将风格恢复为跟随系统，并将搜索引擎恢复为 Bing。"
+                okText="恢复"
+                cancelText="取消"
+                onConfirm={() => void core.resetSettings()}
+                disabled={locked}
+              >
+                <Button danger disabled={locked} loading={settings.operation === 'save'}>
+                  恢复初始化
+                </Button>
+              </Popconfirm>
+              {settings.loadStatus === 'error' ? (
+                <Button
+                  disabled={busy}
+                  loading={settings.operation === 'load'}
+                  onClick={() => void core.reloadSettings()}
+                >
+                  重试
+                </Button>
+              ) : null}
+            </div>
+          </Form>
+        )}
+      </div>
+    </OverlayScrollbarsComponent>
   )
   const selectSettingsTab = (key: SettingsTabKey) => {
-    setSettingsTabSelection({ viewEpoch: snapshot.viewEpoch, key })
+    core.selectSettingsTab(key)
     if (key === 'plugins') {
       if (activatedPluginEpoch.current === snapshot.viewEpoch) return
       activatedPluginEpoch.current = snapshot.viewEpoch
@@ -612,9 +695,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     }
   }
   const pluginSettingsPanel = (
-    <div className="settings-tab-panel settings-plugin-panel">
-      <PublicPluginPanel client={core.client} />
-      <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
+    <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
+      <div className="settings-scroll-content">
+        <PublicPluginPanel client={core.client} />
+        {showLegacyPluginInventory ? (
+        <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
           <h2 id="plugin-inventory-title">插件</h2>
           <Button
@@ -729,16 +814,33 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             })}
           </div>
         )}
-      </section>
-    </div>
+        </section>
+        ) : null}
+      </div>
+    </OverlayScrollbarsComponent>
+  )
+  const messageSettingsPanel = (
+    <MessageCenterPanel
+      state={snapshot.messageCenter}
+      onClear={() => void core.clearMessages()}
+    />
   )
   const settingsView = (
-    <section className="settings-view" aria-label="设置">
+    <section className="settings-view" aria-label="设置" onKeyDown={settingsKeyDown}>
       <header className="settings-header">
-        <h1>设置</h1>
-        <Button aria-label="关闭" disabled={snapshot.hidePending} onClick={() => void core.requestHide()}>
-          关闭
-        </Button>
+        <div className="settings-title-group">
+          <Tooltip title="返回主界面">
+            <Button
+              aria-label="返回主界面"
+              disabled={snapshot.hidePending}
+              icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
+              onClick={() => core.navigate('launcher')}
+              size="small"
+              type="text"
+            />
+          </Tooltip>
+          <h1>设置</h1>
+        </div>
       </header>
       <div
         ref={settingsTabsRef}
@@ -754,11 +856,26 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           destroyOnHidden
           items={[
             { key: 'general', label: '通用', children: generalSettingsPanel },
+            {
+              key: 'messages',
+              label: (
+                <Badge
+                  className={`settings-message-tab-badge${snapshot.messageCenter.status === 'unavailable' ? ' is-unavailable' : ''}`}
+                  count={messageBadgeCount}
+                  offset={[-1, 1]}
+                  overflowCount={99}
+                  size="small"
+                >
+                  <span>消息</span>
+                </Badge>
+              ),
+              children: messageSettingsPanel,
+            },
             { key: 'plugins', label: '插件', children: pluginSettingsPanel },
           ]}
           tabPlacement="start"
           onChange={(key) => {
-            if (key !== 'general' && key !== 'plugins') return
+            if (key !== 'general' && key !== 'messages' && key !== 'plugins') return
             selectSettingsTab(key)
           }}
         />
@@ -767,7 +884,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   )
 
   return (
-    <ConfigProvider theme={{ algorithm: colorScheme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
+    <ConfigProvider theme={uiThemeConfig(colorScheme)}>
       <App>
         <main className="launcher-surface" data-color-scheme={colorScheme}>
           {snapshot.view === 'launcher' ? launcher : settingsView}

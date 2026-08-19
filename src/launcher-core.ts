@@ -20,15 +20,19 @@ import {
   type PluginListStatus,
   type PluginMutationKind,
   type ResultItem,
+  type ResultIconKind,
   type SearchResponse,
   type SettingsTabKey,
+  type ShowTarget,
   type SettingsLoadStatus,
   type SettingsView,
   type ThemePreference,
   type UserSettingsUpdate,
   type ViewResult,
+  type WebSearchEngine,
 } from './protocol'
 import { createMessageCenterCore } from './message-center-core'
+import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export interface LauncherCore {
   readonly client: LauncherClient
@@ -40,10 +44,13 @@ export interface LauncherCore {
   readonly text: (record: ClassifiedTextRecord) => void
   readonly retireControl: (control: ControlKey) => void
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
+  readonly navigate: (target: ShowTarget) => void
+  readonly selectSettingsTab: (key: SettingsTabKey) => void
   readonly requestHide: () => Promise<void>
   readonly activateResult: (index: number) => void
   readonly setAutostart: (checked: boolean) => void
   readonly setThemePreference: (theme: ThemePreference) => void
+  readonly setWebSearchEngine: (engine: WebSearchEngine) => void
   readonly setHotkeyCanonical: (value: string) => void
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly clearMessages: () => Promise<void>
@@ -65,6 +72,7 @@ export interface LauncherCore {
 interface PrivateApplicationResult extends ViewResult {
   kind: 'application'
   resultId: string
+  completionText?: string
 }
 
 interface PrivateFindResult extends ViewResult {
@@ -111,6 +119,7 @@ interface Model {
   executePending: boolean
   hidePending: boolean
   shownNotice?: string
+  commandHint?: string
   status: string
   settings?: PrivateSettings
   settingsOperation?: SettingsOperationKind
@@ -149,6 +158,7 @@ interface TextControl {
 interface PrivateSettings {
   hotkey: TextControl
   autostart: boolean
+  webSearchEngine: WebSearchEngine
 }
 
 interface FileSearchOwner {
@@ -166,7 +176,7 @@ interface PreviewPreferenceOwner {
   enabled: boolean
 }
 
-type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme'
+type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
 
 interface SettingsOperation {
   token: number
@@ -206,6 +216,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   searchUnavailable: '搜索暂不可用。',
   fileNotFound: '文件已不存在。',
   fileOpenFailed: '无法在资源管理器中打开。',
+  webSearchFailed: '操作不可用，请重试。',
   clipboardWriteFailed: '无法复制到剪贴板。',
   pluginPermissionDenied: '插件无权写入剪贴板。',
   pluginListFailed: '无法加载插件清单。',
@@ -222,6 +233,7 @@ const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
 const FALLBACK_ERROR = '操作不可用，请重试。'
 const FILE_PREVIEW_ERROR = '无法保存文件预览设置。'
 const THEME_PREFERENCE_ERROR = '无法保存风格设置。'
+const WEB_SEARCH_ENGINE_ERROR = '无法保存搜索引擎设置。'
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
 const ICON_PREFIX = 'data:image/png;base64,'
 const MAX_ICON_LENGTH = 65_536
@@ -238,11 +250,24 @@ export const FILE_CATEGORY_ORDER: readonly FileCategory[] = [
   'archive',
 ]
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+const PLUGIN_COMPLETION = /^\/[a-z][a-z0-9-]{0,31} $/
 
 function safeApplicationIcon(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length > MAX_ICON_LENGTH || !value.startsWith(ICON_PREFIX)) return undefined
   const payload = value.slice(ICON_PREFIX.length)
   return payload.length > 0 && BASE64.test(payload) ? value : undefined
+}
+
+function safeResultIconKind(value: unknown): ResultIconKind | undefined {
+  return value === 'find' || value === 'calculator' || value === 'webSearch' ? value : undefined
+}
+
+function safeCompletionText(value: unknown): string | undefined {
+  return typeof value === 'string' && PLUGIN_COMPLETION.test(value) ? value : undefined
+}
+
+function safeCommandHint(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function errorText(value: unknown): string {
@@ -253,12 +278,14 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon, detail, hasDefaultAction }) =>
+    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, hasDefaultAction }) =>
       Object.freeze({
         key,
         title,
         ...(subtitle === undefined ? {} : { subtitle }),
         ...(icon === undefined ? {} : { icon }),
+        ...(pluginIconUrl === undefined ? {} : { pluginIconUrl }),
+        ...(iconKind === undefined ? {} : { iconKind }),
         ...(detail === undefined ? {} : { detail }),
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
       }),
@@ -269,6 +296,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
         autostart: model.settings.autostart,
         theme: model.theme,
+        webSearchEngine: model.settings.webSearchEngine,
         loadStatus: model.settingsLoadStatus,
         readOnly:
           model.settingsUncertain || model.settingsLoadStatus !== 'ready' || model.settingsOperation !== undefined,
@@ -328,6 +356,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     executePending: model.executePending,
     hidePending: model.hidePending,
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
+    ...(model.commandHint === undefined ? {} : { commandHint: model.commandHint }),
     status:
       model.view === 'settings' && model.settingsUncertain
         ? NOTICE_TEXT.settingsFailed
@@ -375,6 +404,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let lastLoadedFilePreviewEnabled = true
   let themeDurableGeneration = 0
   let durableTheme: ThemePreference = 'system'
+  let durableWebSearchEngine: WebSearchEngine = 'bing'
   let token = 0
   let searchToken = 0
   let slashSearchTimer: ReturnType<typeof setTimeout> | undefined
@@ -418,10 +448,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       listeners.delete(listener)
     }
   }
-  unsubscribeMessages = messageCenter.subscribe(() => {
-    model.messageCenter = messageCenter.getSnapshot()
-    publish(true)
-  })
 
   function newTextControl(value: string): TextControl {
     return { key: controlKey++, value, draft: value }
@@ -443,6 +469,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       durableTheme = view.theme
       model.theme = view.theme
     }
+    durableWebSearchEngine = view.webSearchEngine
   }
 
   function replaceSettingsView(view: SettingsView): void {
@@ -452,6 +479,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.settings = {
       hotkey: newTextControl(view.hotkey),
       autostart: view.autostart,
+      webSearchEngine: view.webSearchEngine,
     }
   }
 
@@ -520,6 +548,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.requestId = undefined
     model.results = []
     model.selectedIndex = -1
+    model.commandHint = undefined
   }
 
 
@@ -545,6 +574,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       query,
       title: '/find',
       subtitle: `搜索文件：${query}`,
+      iconKind: 'find',
     }
   }
 
@@ -784,6 +814,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     clearTimeout(slashSearchTimer)
     slashSearchTimer = undefined
   }
+  unsubscribeMessages = messageCenter.subscribe(() => {
+    model.messageCenter = messageCenter.getSnapshot()
+    publish(true)
+  })
 
   function beginSearch(submit = false): void {
     const invocationId = model.invocationId
@@ -898,23 +932,33 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     if (response !== null) {
       model.requestId = response.requestId
-      const findResult = model.results.find((item): item is PrivateFindResult => item.kind === 'find')
-      const applications: PrivateApplicationResult[] = response.items.map((item: ResultItem) => {
+      model.commandHint = safeCommandHint(response.commandHint)
+      const findResult = response.replaceLocalResults
+        ? undefined
+        : model.results.find((item): item is PrivateFindResult => item.kind === 'find')
+      const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
+        const completionText = safeCompletionText(item.completionText)
+        if (item.completionText !== undefined && completionText === undefined) return []
         const icon = safeApplicationIcon(item.icon)
-        return {
+        const pluginIconUrl = safePublicPluginIconUrl(item.pluginIconUrl)
+        const iconKind = safeResultIconKind(item.iconKind)
+        return [{
           kind: 'application',
           key: resultKey++,
           resultId: item.resultId,
           title: item.title,
           ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
           ...(icon === undefined ? {} : { icon }),
+          ...(pluginIconUrl === undefined ? {} : { pluginIconUrl }),
+          ...(iconKind === undefined ? {} : { iconKind }),
           ...(item.detail === undefined ? {} : { detail: item.detail }),
           ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
-        }
+          ...(completionText === undefined ? {} : { completionText }),
+        }]
       })
       model.results = findResult ? [findResult, ...applications] : applications
       model.selectedIndex = model.results.length ? 0 : -1
-      model.status = model.results.length ? '' : '未找到应用'
+      model.status = model.results.length || model.commandHint ? '' : '未找到应用'
     }
     publish(true)
   }
@@ -1094,20 +1138,23 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     await mutatePlugin(pluginId, 'delete', () => client.deletePlugin({ pluginId }))
   }
 
-  function shown(payload: unknown): void {
-    if (destroyed) return
-    const event = parseLauncherShown(payload)
-    if (!event) return
-    const nextView = event.target === 'launcher' ? 'launcher' : 'settings'
+  function transitionView(
+    target: ShowTarget,
+    invocationId: string,
+    notice: import('./protocol').LifecycleNotice | null,
+  ): void {
+    const nextView = target === 'launcher' ? 'launcher' : 'settings'
+    const nextSettingsTab: SettingsTabKey =
+      target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
     messageCenter.leave()
-    if (event.notice === 'settingsFailed') model.settingsUncertain = true
+    if (notice === 'settingsFailed') model.settingsUncertain = true
     if (composition) restoreControl(composition.control)
     composition = undefined
     leaveFileMode()
     model.viewEpoch += 1
-    model.invocationId = event.invocationId
+    model.invocationId = invocationId
     model.view = nextView
-    model.settingsTab = event.target === 'messages' ? 'messages' : 'general'
+    model.settingsTab = nextSettingsTab
     pluginInventoryActive = false
     model.queryControlValue = model.query
     model.querySequence = 0
@@ -1120,14 +1167,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.hidePending = false
     model.status = ''
     clearResults()
-    model.shownNotice = event.notice === null ? undefined : NOTICE_TEXT[event.notice]
+    model.shownNotice = notice === null ? undefined : NOTICE_TEXT[notice]
     if (nextView === 'launcher') pendingSettingsLoadEpoch = undefined
     else queueSettingsLoad()
-    if (event.target === 'launcher' && event.notice === null && activationNoticePending) {
+    if (nextView === 'launcher' && notice === null && activationNoticePending) {
       activationNoticePending = false
       model.shownNotice = REFUSED_NOTICE
     }
-    if (event.target === 'launcher' && model.query !== '') {
+    if (nextView === 'launcher' && model.query !== '') {
       model.querySequence = 1
       scheduleSearch()
     }
@@ -1135,7 +1182,36 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (nextView === 'settings') {
       void drainSettingsLoad()
     }
-    if (event.target === 'messages') void messageCenter.enter()
+    if (target === 'messages') void messageCenter.enter()
+  }
+
+  function shown(payload: unknown): void {
+    if (destroyed) return
+    const event = parseLauncherShown(payload)
+    if (!event) return
+    transitionView(event.target, event.invocationId, event.notice)
+    void messageCenter.refresh()
+  }
+
+  function navigate(target: ShowTarget): void {
+    const nextView = target === 'launcher' ? 'launcher' : 'settings'
+    const nextTab = target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
+    if (
+      destroyed ||
+      model.invocationId === undefined ||
+      (model.view === nextView && (nextView === 'launcher' || model.settingsTab === nextTab))
+    ) {
+      return
+    }
+    transitionView(target, model.invocationId, null)
+  }
+
+  function selectSettingsTab(key: SettingsTabKey): void {
+    if (destroyed || model.view !== 'settings' || model.settingsTab === key) return
+    messageCenter.leave()
+    model.settingsTab = key
+    publish(true)
+    if (key === 'messages') void messageCenter.enter()
   }
 
   function text(record: ClassifiedTextRecord): void {
@@ -1238,6 +1314,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function setWebSearchEngine(engine: WebSearchEngine): void {
+    if (!settingsEditable() || model.settings?.webSearchEngine === engine) return
+    const operation = startSettingsOperation('webSearchEngine')
+    if (!operation) return
+    model.settings!.webSearchEngine = engine
+    model.status = ''
+    publish(true)
+
+    let pending: Promise<void>
+    try {
+      pending = client.setWebSearchEngine({ preference: { engine } })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      () => finishWebSearchEngineMutation(operation, engine, false),
+      () => finishWebSearchEngineMutation(operation, engine, true),
+    )
+  }
+
   function setHotkeyCanonical(value: string): void {
     if (!settingsEditable() || !model.settings) return
     const field = model.settings.hotkey
@@ -1288,6 +1384,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hotkey: settings.hotkey.value,
       autostart: settings.autostart,
       theme: model.theme,
+      webSearchEngine: settings.webSearchEngine,
     }
   }
 
@@ -1398,6 +1495,31 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     })
   }
 
+  function finishWebSearchEngineMutation(
+    operation: SettingsOperation,
+    engine: WebSearchEngine,
+    failed: boolean,
+  ): void {
+    if (!ownsSettingsOperation(operation)) return
+    if (model.settings) {
+      model.settings.webSearchEngine = failed ? durableWebSearchEngine : engine
+    }
+    if (!failed) durableWebSearchEngine = engine
+    releaseSettingsOperation(operation)
+    if (model.view !== 'settings') {
+      if (failed) model.status = WEB_SEARCH_ENGINE_ERROR
+      publish(true)
+      return
+    }
+    const reconciliation = requestSettingsLoad()
+    if (!failed) return
+    void reconciliation?.then(() => {
+      if (destroyed) return
+      model.status = WEB_SEARCH_ENGINE_ERROR
+      publish(true)
+    })
+  }
+
   async function persistSettings(operation: SettingsOperation, update: UserSettingsUpdate): Promise<void> {
     try {
       await client.saveSettings({ settings: update })
@@ -1415,6 +1537,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setControlDraft(model.settings.hotkey.key, 'Shift+Space')
     model.settings.hotkey.value = 'Shift+Space'
     model.settings.autostart = false
+    model.settings.webSearchEngine = 'bing'
     model.theme = 'system'
     model.shownNotice = undefined
     publish(true)
@@ -1422,6 +1545,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hotkey: 'Shift+Space',
       autostart: false,
       theme: 'system',
+      webSearchEngine: 'bing',
     })
   }
 
@@ -1450,6 +1574,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       if (!selected) return
       if (selected.kind === 'find') {
         submitFind(selected.query)
+        return
+      }
+      if (selected.completionText !== undefined) {
+        applyEdit(selected.completionText)
         return
       }
       if (selected.hasDefaultAction === false) return
@@ -1740,10 +1868,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     text,
     retireControl,
     keyDown,
+    navigate,
+    selectSettingsTab,
     requestHide,
     activateResult,
     setAutostart,
     setThemePreference,
+    setWebSearchEngine,
     setHotkeyCanonical,
     saveHotkeyCanonical,
     clearMessages,

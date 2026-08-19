@@ -861,14 +861,13 @@ impl LifecycleCoordinator {
     ) -> Result<(), LifecycleError> {
         let dispatcher = app.clone();
         let app_for_show = app.clone();
-        let result = self.request_show_with(target, move |coordinator, target| {
+        self.request_show_with(target, move |coordinator, target| {
             dispatcher
                 .run_on_main_thread(move || {
                     coordinator.handle_request_main(&app_for_show, target);
                 })
                 .map_err(|_| ())
-        });
-        result
+        })
     }
 
     pub(crate) fn mark_setup_ready(

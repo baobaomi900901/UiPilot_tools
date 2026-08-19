@@ -33,11 +33,11 @@ Composite icons use a stable 28 by 28 wrapper. The search badge is positioned in
 
 ## Data And Failure Behavior
 
-`iconKind` is presentation-only and never participates in result identity, authorization, execution, or persistence. Unknown wire values are rejected by the existing exact response parser. A missing kind preserves backward compatibility. PNG load failure retains the existing square fallback; semantic vector icons have no loading state.
+`iconKind` is presentation-only and never participates in result identity, authorization, execution, or persistence. Rust publishes only the closed enum values. A missing or unknown frontend value preserves backward compatibility by using the existing PNG or square fallback. PNG load failure retains the existing square fallback; semantic vector icons have no loading state.
 
 ## Testing
 
-- The protocol parser accepts the three exact values, accepts omission, and rejects unknown values.
+- The typed wire contract carries the three exact values; omission and an injected unknown value use the existing fallback.
 - Calculator and browser-search publications expose the correct semantic kind without exposing private actions.
 - The local `/find` result carries `find`.
 - The view renders each Ant Design icon and keeps ordinary PNG/fallback rendering unchanged.

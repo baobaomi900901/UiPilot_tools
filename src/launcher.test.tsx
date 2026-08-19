@@ -43,6 +43,7 @@ import {
 import protocolSource from './protocol.ts?raw'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
+const publicPluginPanelSource = readFileSync('src/public-plugin-panel.tsx', 'utf8')
 
 describe('retired validation settings contract', () => {
   it('contains no research, rescan, export, or validation-clear surface', () => {
@@ -115,6 +116,7 @@ describe('plugin protocol', () => {
       pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
       source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
       fault: null, generation: 1,
+      iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
       permissions: [{ permission: 'clipboard.write', supported: true, granted: true }],
       settings: [
         { definition: { type: 'text', key: 'prefix', label: 'Prefix', default: 'Hi' }, value: 'Hello' },
@@ -125,6 +127,8 @@ describe('plugin protocol', () => {
       ],
     }
     expect(parsePublicPluginInventory({ revision: '1', items: [item] })).toEqual({ revision: '1', items: [item] })
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, iconUrl: null }] })).not.toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, iconUrl: 'https://example.com/icon.png' }] })).toBeNull()
     expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, outputMode: 'mainResult' }] })).toBeNull()
     expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, settings: [{ definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true, value: 'leak' }] }] })).toBeNull()
   })
@@ -183,6 +187,7 @@ const emptySettings: SettingsView = {
   autostart: false,
   filePreviewEnabled: true,
   theme: 'system',
+  webSearchEngine: 'bing',
 }
 
 const settingsFixture: SettingsView = {
@@ -190,6 +195,7 @@ const settingsFixture: SettingsView = {
   autostart: false,
   filePreviewEnabled: true,
   theme: 'system',
+  webSearchEngine: 'bing',
 }
 
 type TestLauncherClient = LauncherClient & {
@@ -220,6 +226,7 @@ function fakeClient() {
     searchFiles: vi.fn(async () => null),
     setFilePreviewPreference: vi.fn(async () => undefined),
     setThemePreference: vi.fn(async () => undefined),
+    setWebSearchEngine: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
     selectPublicPluginArchive: vi.fn(async () => null),
@@ -295,6 +302,22 @@ function shown(invocationId: string, target: LauncherShown['target'] = 'launcher
   return { invocationId, target, notice }
 }
 
+function messageCenterSnapshot(revision: string, unreadCount: number, contents: string[] = []) {
+  return {
+    revision,
+    unreadCount,
+    messages: contents.map((content, index) => ({
+      id: String(index + 1),
+      pluginId: 'com.uipilot.demo-win',
+      pluginNameSnapshot: 'Demo Window',
+      pluginIconUrl: null,
+      createdAt: '2026-08-19T01:02:03.000Z',
+      content,
+      readAt: null,
+    })),
+  }
+}
+
 function installMatchMedia(initial: boolean) {
   let matches = initial
   let listener: ((event: MediaQueryListEvent) => void) | undefined
@@ -352,15 +375,17 @@ async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
   }
 }
 
-function settingsTab(host: HTMLElement, label: '通用' | '插件'): HTMLElement {
+function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): HTMLElement {
   const tab = [...host.querySelectorAll<HTMLElement>('[role="tab"]')].find(
-    (candidate) => candidate.textContent?.trim().endsWith(label),
+    (candidate) => label === '消息'
+      ? candidate.querySelector('.settings-message-tab-badge') !== null
+      : candidate.textContent?.trim().endsWith(label),
   )
   if (!tab) throw new Error(`settings tab missing: ${label}`)
   return tab
 }
 
-async function activateSettingsTab(host: HTMLElement, label: '通用' | '插件'): Promise<HTMLElement> {
+async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): Promise<HTMLElement> {
   const tab = settingsTab(host, label)
   await act(async () => {
     tab.focus()
@@ -556,7 +581,111 @@ describe('startup ownership', () => {
 })
 
 describe('shown and search ownership', () => {
-  it('routes the messages target to its settings tab and rereads later events without marking', async () => {
+  it('refreshes unread messages whenever native shown reopens the main window', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    vi.mocked(fake.client.getMessageSummary).mockResolvedValueOnce({ revision: '1', unreadCount: 1 })
+
+    fake.emit(shown('message-summary-recovery'))
+
+    await vi.waitFor(() => expect(core.getSnapshot().messageCenter).toMatchObject({
+      status: 'ready', unreadCount: 1, summaryRevision: '1',
+    }))
+    expect(fake.client.getMessageSummary).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops malformed plugin completion metadata without an execution fallback', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'malformed-plugin-completion',
+      items: [{
+        resultId: 'malformed',
+        title: '/demo win',
+        subtitle: 'invalid completion',
+        completionText: '/demo win ',
+        hasDefaultAction: false,
+      }],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('malformed-plugin-completion'))
+
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results).toEqual([])
+    core.keyDown('Enter', false)
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('navigates between launcher and settings without hiding while preserving and refreshing the query', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.searchApps).mockResolvedValue({
+      requestId: 'local-navigation-search',
+      items: [{ resultId: 'calculator', title: 'Calculator' }],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('local-navigation'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'calc',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    vi.mocked(fake.client.searchApps).mockClear()
+    vi.mocked(fake.client.loadSettings).mockClear()
+
+    const navigationCore = core as typeof core & {
+      navigate(target: 'launcher' | 'settings'): void
+    }
+    expect(navigationCore.navigate).toBeTypeOf('function')
+    const launcherEpoch = core.getSnapshot().viewEpoch
+    navigationCore.navigate('settings')
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      viewEpoch: launcherEpoch + 1,
+      invocationId: 'local-navigation',
+      query: 'calc',
+      queryControlValue: 'calc',
+      results: [],
+      selectedIndex: -1,
+    })
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
+    expect(fake.client.loadSettings).toHaveBeenCalledOnce()
+
+    navigationCore.navigate('launcher')
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      viewEpoch: launcherEpoch + 2,
+      invocationId: 'local-navigation',
+      query: 'calc',
+      queryControlValue: 'calc',
+      querySequence: 1,
+      searchPending: true,
+    })
+    expect(fake.client.searchApps).toHaveBeenCalledWith({
+      query: 'calc',
+      invocationId: 'local-navigation',
+      querySequence: 1,
+    })
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('routes the messages target to its settings tab and marks read once per entry', async () => {
     const fake = fakeClient()
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -569,10 +698,11 @@ describe('shown and search ownership', () => {
     })
     await vi.waitFor(() => expect(fake.client.openMessageCenter).toHaveBeenCalledOnce())
 
+    core.navigate('messages')
+    expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
     fake.emitMessageState({ status: 'ready', revision: '1', unreadCount: 1 })
     await vi.waitFor(() => expect(fake.client.readMessageCenter).toHaveBeenCalledOnce())
     expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
-    core.destroy()
   })
 
   it('uses the exact shown reset and preserved-query search rules', async () => {
@@ -644,6 +774,67 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 3, results: [], selectedIndex: -1, searchPending: false, status: '' })
   })
 
+  it('replaces the local find suggestion with an exclusive built-in result', async () => {
+    const { core, client, emit } = await startedCore()
+    const response = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
+    emit(shown('math'))
+
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '1+1', inputType: 'insertText' })
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find'])
+
+    response.resolve({
+      requestId: 'math-request',
+      items: [{ resultId: 'math-result', title: '2', subtitle: '复制结果', hasDefaultAction: true }],
+      replaceLocalResults: true,
+    })
+    await response.promise
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['2'])
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+  })
+
+  it('carries exact result icon kinds and falls back for injected unknown values', async () => {
+    const { core, client, emit } = await startedCore()
+    const response = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
+    emit(shown('result-icon-kinds'))
+
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
+    expect(core.getSnapshot().results[0]).toMatchObject({ title: '/find', iconKind: 'find' })
+
+    response.resolve({
+      requestId: 'icon-kinds',
+      items: [
+        { resultId: 'calculator', title: '2', iconKind: 'calculator' },
+        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch' },
+        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==' },
+        {
+          resultId: 'plugin',
+          title: '/demo-win',
+          pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
+        },
+        { resultId: 'forged-plugin', title: 'Forged', pluginIconUrl: 'https://example.com/icon.png' },
+        { resultId: 'unknown', title: 'Unknown', iconKind: 'unknown' },
+      ],
+    } as unknown as SearchResponse)
+    await response.promise
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map(({ title, iconKind, icon, pluginIconUrl }) => ({ title, iconKind, icon, pluginIconUrl }))).toEqual([
+      { title: '/find', iconKind: 'find', icon: undefined, pluginIconUrl: undefined },
+      { title: '2', iconKind: 'calculator', icon: undefined, pluginIconUrl: undefined },
+      { title: 'Bing 搜索', iconKind: 'webSearch', icon: undefined, pluginIconUrl: undefined },
+      { title: 'App', iconKind: undefined, icon: 'data:image/png;base64,AA==', pluginIconUrl: undefined },
+      {
+        title: '/demo-win', iconKind: undefined, icon: undefined,
+        pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
+      },
+      { title: 'Forged', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
+      { title: 'Unknown', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
+    ])
+  })
   it('releases a current null without inventing status and leaves stale null zero-effect', async () => {
     const { core, client, emit } = await startedCore()
     const stale = deferred<SearchResponse | null>()
@@ -1380,11 +1571,47 @@ describe('settings ownership', () => {
         hotkey: 'Alt+Space',
         autostart: true,
         theme: 'system',
+        webSearchEngine: 'bing',
       },
     })
     await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
   })
 
+  it('saves a search engine immediately and rolls back a failure without leaving settings', async () => {
+    const { core, client } = await settingsCore()
+    const setEngine = (core as typeof core & {
+      setWebSearchEngine(engine: 'bing' | 'baidu' | 'google'): void
+    }).setWebSearchEngine
+    expect(setEngine).toBeTypeOf('function')
+    vi.mocked(client.setWebSearchEngine).mockRejectedValueOnce({
+      code: 'settingsFailed',
+      message: 'private engine failure',
+    })
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+
+    setEngine.call(core, 'baidu')
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      settings: {
+        webSearchEngine: 'baidu',
+        operation: 'webSearchEngine',
+        readOnly: true,
+      },
+    })
+    expect(client.setWebSearchEngine).toHaveBeenCalledWith({ preference: { engine: 'baidu' } })
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      settings: {
+        webSearchEngine: 'bing',
+        needsReload: false,
+        readOnly: false,
+      },
+      status: '无法保存搜索引擎设置。',
+    })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private engine failure')
+  })
   it('publishes theme immediately and persists through the narrow command', async () => {
     const { core, client } = await settingsCore()
     const save = deferred<void>()
@@ -1452,7 +1679,7 @@ describe('settings ownership', () => {
 
     expect(client.saveSettings).toHaveBeenCalledOnce()
     expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: { hotkey: 'Alt+Space', autostart: true, theme: 'system' },
+      settings: { hotkey: 'Alt+Space', autostart: true, theme: 'system', webSearchEngine: 'bing' },
     })
     await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
   })
@@ -1531,7 +1758,12 @@ describe('settings ownership', () => {
     await core.resetSettings()
 
     expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system' },
+      settings: {
+        hotkey: 'Shift+Space',
+        autostart: false,
+        theme: 'system',
+        webSearchEngine: 'bing',
+      },
     })
     expect(client.saveSettings).toHaveBeenCalledOnce()
     expect(client.setThemePreference).not.toHaveBeenCalled()
@@ -1915,6 +2147,146 @@ describe('execute and hide continuation', () => {
 })
 
 describe('React view and accessibility', () => {
+  it('completes a plugin command and keeps an unselectable command usage hint until submit', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+      if (request.query === '/d') {
+        return {
+          requestId: 'plugin-completions',
+          items: [
+            {
+              resultId: 'demo-return-completion',
+              title: '/demo-return',
+              subtitle: '返回示例文本到主界面',
+              completionText: '/demo-return ',
+              hasDefaultAction: false,
+            },
+            {
+              resultId: 'demo-win-completion',
+              title: '/demo-win',
+              subtitle: '打开演示子窗口',
+              completionText: '/demo-win ',
+              hasDefaultAction: false,
+            },
+          ],
+        } as unknown as SearchResponse
+      }
+      if (request.query.startsWith('/demo-win ') && !request.submit) {
+        return {
+          requestId: `demo-win-hint-${request.querySequence}`,
+          items: [],
+          commandHint: '请输入信息回车',
+        } as unknown as SearchResponse
+      }
+      return null
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('plugin-command-completion')))
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/d',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    const initialOptions = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    expect(initialOptions.map((option) => option.textContent)).toEqual([
+      '/demo-return返回示例文本到主界面',
+      '/demo-win打开演示子窗口',
+    ])
+    expect(initialOptions[0]?.getAttribute('aria-selected')).toBe('true')
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(input.value).toBe('/demo-win '))
+    expect(document.activeElement).toBe(input)
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+
+    await vi.waitFor(() => expect(mounted.host.querySelector('.command-hint')?.textContent).toBe('请输入信息回车'))
+    const hint = mounted.host.querySelector<HTMLElement>('.command-hint')!
+    expect(hint.getAttribute('role')).toBeNull()
+    expect(hint.tabIndex).toBe(-1)
+    expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(0)
+    expect(input.getAttribute('aria-activedescendant')).toBeNull()
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo-win 123',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelector('.command-hint')?.textContent).toBe('请输入信息回车'))
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
+      query: '/demo-win 123',
+      submit: true,
+    })))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await mounted.unmount()
+  })
+
+  it('opens Settings from the query suffix and returns through the title back button', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.searchApps).mockResolvedValue({
+      requestId: 'view-navigation-search',
+      items: [{ resultId: 'calculator', title: 'Calculator' }],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('view-navigation')))
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'calc',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+
+    const settingsButton = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="打开设置"]')
+    expect(settingsButton).not.toBeNull()
+    expect(settingsButton?.closest('.ant-input-suffix')).not.toBeNull()
+    expect(settingsButton?.querySelector('.lucide-settings')).not.toBeNull()
+    await act(async () => settingsButton?.click())
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('settings'))
+
+    const backButton = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回主界面"]')
+    const titleGroup = mounted.host.querySelector('.settings-title-group')
+    expect(backButton).not.toBeNull()
+    expect(backButton?.querySelector('.lucide-arrow-left')).not.toBeNull()
+    expect(titleGroup?.firstElementChild).toBe(backButton)
+    expect(titleGroup?.querySelector('h1')?.textContent).toBe('设置')
+    expect(mounted.host.querySelector('button[aria-label="关闭"]')).toBeNull()
+
+    const settingsView = mounted.host.querySelector<HTMLElement>('.settings-view')
+    expect(settingsView).not.toBeNull()
+    await act(async () => {
+      settingsView?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    })
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+
+    await act(async () => backButton?.click())
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
+    const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')
+    await vi.waitFor(() => expect(document.activeElement).toBe(query))
+    expect(query?.value).toBe('calc')
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+    expect(stylesSource).toMatch(/\.launcher-settings-button\.ant-btn\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(/\.settings-title-group\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s)
+    await mounted.unmount()
+  })
+
   it('uses the exact AntD light/dark algorithms and removes the media listener', async () => {
     configCapture.values.length = 0
     const scheme = installMatchMedia(false)
@@ -2007,6 +2379,40 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('renders ordered search engine options and locks the select while saving', async () => {
+    installMatchMedia(false)
+    const { core, emit, client } = await startedCore(settingsFixture)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('settings-engine-select', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    const save = deferred<void>()
+    vi.mocked(client.setWebSearchEngine).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, webSearchEngine: 'google' })
+
+    const combobox = mounted.host.querySelector<HTMLElement>('[role="combobox"][aria-label="搜索引擎"]')
+    expect(combobox).toBeInstanceOf(HTMLElement)
+    await act(async () => {
+      combobox!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    })
+    const options = [...document.body.querySelectorAll<HTMLElement>('.ant-select-item-option')]
+    expect(options.map((option) => option.textContent)).toEqual(['Bing', '百度', 'Google'])
+    await act(async () => options[2]!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(client.setWebSearchEngine).toHaveBeenCalledWith({ preference: { engine: 'google' } })
+    expect(core.getSnapshot().view).toBe('settings')
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBe('webSearchEngine'))
+    expect(
+      mounted.host
+        .querySelector('[role="combobox"][aria-label="搜索引擎"]')
+        ?.closest('.ant-select')
+        ?.classList.contains('ant-select-disabled'),
+    ).toBe(true)
+
+    await act(async () => save.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    expect(core.getSnapshot().view).toBe('settings')
+    await mounted.unmount()
+  })
   it('uses native app regions without invoking Tauri mouse capture', () => {
     expect(launcherViewSource).not.toContain('data-tauri-drag-region')
     expect(stylesSource).toMatch(
@@ -2083,34 +2489,107 @@ describe('React view and accessibility', () => {
 
   it('lays out settings tabs with a fixed left nav and right scroller', () => {
     expect(stylesSource).toMatch(
+      /\.settings-view\s*\{[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
+    )
+    expect(stylesSource).toMatch(
       /\.settings-tabs\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*height:\s*100%;/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.settings-tabs > \.ant-tabs\s*\{[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
     )
     expect(stylesSource).toMatch(
       /\.settings-tabs \.ant-tabs-nav\s*\{[^}]*flex:\s*0 0 112px;[^}]*width:\s*112px;/s,
     )
     expect(stylesSource).toMatch(
-      /\.settings-tabs \.ant-tabs-content-holder\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;/s,
+      /\.settings-tabs \.ant-tabs-body-holder,\s*\.settings-tabs \.ant-tabs-body,\s*\.settings-tabs \.ant-tabs-content\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
     )
     expect(stylesSource).toMatch(
-      /\.settings-tab-panel\s*\{[^}]*height:\s*100%;[^}]*overflow-y:\s*auto;/s,
+      /\.settings-tab-panel\s*\{[^}]*height:\s*100%;[^}]*padding:\s*0;[^}]*overflow:\s*hidden;/s,
     )
+    expect(stylesSource).toMatch(/\.settings-scroll-content\s*\{[^}]*min-height:\s*100%;[^}]*padding:\s*10px 12px 4px;/s)
   })
 
-  it('keeps the slim result scrollbar visible without hover', () => {
-    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar,\s*\.settings-tab-panel::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track,\s*\.settings-tab-panel::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
+  it('uses the third-party overlay scrollbar for both settings panels', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce(pluginInventory())
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-overlay-scrollbar', 'settings')))
+    expect(mounted.host.querySelector('.settings-general-panel .settings-scroll-content')).toBeTruthy()
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.settings-plugin-panel .settings-scroll-content')).toBeTruthy())
+
+    expect(launcherViewSource).toContain("from 'overlayscrollbars-react'")
+    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(2)
+    expect(launcherViewSource).not.toContain('./overlay-scroll-area')
+    expect(stylesSource).toMatch(/\.os-theme-uipilot\s*\{[^}]*--os-size:\s*8px;[^}]*--os-handle-bg:\s*var\(--result-scrollbar-thumb\);/s)
+    expect(stylesSource).not.toContain('.overlay-scroll-')
+    await mounted.unmount()
+  })
+
+  it('keeps slim native results and third-party settings scrollbars visible without hover', () => {
+    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*var\(--uipilot-ui-scrollbar\);/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
     expect(stylesSource).toMatch(
-      /\.result-list::-webkit-scrollbar-thumb,\s*\.settings-tab-panel::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
+      /\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
-    expect(stylesSource).toMatch(
-      /\.launcher-surface\[data-color-scheme="dark"\][\s\S]*\.result-list,[\s\S]*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
-    )
+    expect(stylesSource).not.toMatch(/\.launcher-surface\[data-color-scheme="dark"\][\s\S]*--result-scrollbar-thumb:/s)
     expect(stylesSource).not.toContain('@media (prefers-color-scheme: dark)')
     expect(stylesSource).toMatch(
-      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-tab-panel::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
+      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
+    expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.os-theme-uipilot\s*\{[^}]*--os-handle-bg:\s*ButtonText;/s)
+  })
+
+  it('renders built-in, public plugin, application, and fallback result icons', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'built-in-icons',
+      items: [
+        { resultId: 'calculator', title: '2', iconKind: 'calculator' },
+        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch' },
+        {
+          resultId: 'plugin',
+          title: '/demo-win',
+          pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
+        },
+        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,iVBORw==' },
+        { resultId: 'fallback', title: 'Fallback' },
+      ],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('built-in-icons')))
+    await act(async () =>
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
+    )
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(6))
+
+    const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    const find = rows[0]!.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
+    const calculator = rows[1]!.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
+    const web = rows[2]!.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
+    expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
+    expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
+    expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
+    expect(web?.querySelector('.lucide-search')).toBeTruthy()
+    for (const icon of [find, calculator, web]) {
+      expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
+    }
+    expect(rows[3]!.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rows[4]!.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rows[5]!.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
+    expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
+    await mounted.unmount()
   })
 
   it('shows real icons, falls back on error, and resets the error for a new src', async () => {
@@ -2266,6 +2745,7 @@ describe('React view and accessibility', () => {
       autostart: false,
       filePreviewEnabled: true,
       theme: 'system',
+      webSearchEngine: 'bing',
       applications: [{ appId: 'legacy', displayName: 'LiveCaptions', aliases: ['caption'] }],
     } as SettingsView)
     const core = createLauncherCore(fake.client)
@@ -2279,7 +2759,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('renders exactly two settings tabs, focuses general, and keeps the title unfocusable', async () => {
+  it('renders ordered snapshot-owned settings tabs, keeps the title unfocusable, and hides on Escape', async () => {
     installMatchMedia(true)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -2291,8 +2771,13 @@ describe('React view and accessibility', () => {
     expect(heading.textContent).toBe('设置')
     expect(heading.hasAttribute('tabindex')).toBe(false)
     const tabs = [...mounted.host.querySelectorAll<HTMLElement>('[role="tab"]')]
-    expect(tabs).toEqual([settingsTab(mounted.host, '通用'), settingsTab(mounted.host, '插件')])
+    expect(tabs).toEqual([
+      settingsTab(mounted.host, '通用'),
+      settingsTab(mounted.host, '消息'),
+      settingsTab(mounted.host, '插件'),
+    ])
     expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true')
+    expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('false')
     expect(settingsTab(mounted.host, '插件').getAttribute('aria-selected')).toBe('false')
     expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
     expect(document.activeElement).not.toBe(heading)
@@ -2301,12 +2786,129 @@ describe('React view and accessibility', () => {
     expect(mounted.host.textContent).toContain('恢复初始化')
     expect(mounted.host.textContent).not.toContain('保存')
     expect(mounted.host.textContent).not.toContain('重新加载设置')
-    const close = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
-    expect(close.getAttribute('aria-label')).toBe('关闭')
-    await act(async () => close.click())
+    expect(mounted.host.querySelector('button[aria-label="关闭"]')).toBeNull()
+    await act(async () => {
+      settingsTab(mounted.host, '通用').dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+      )
+    })
     expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
     expect(core.getSnapshot().view).toBe('settings')
     await mounted.unmount()
+  })
+
+  it('opens notification targets on Messages and keeps settings visible across clear failure and success', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.openMessageCenter).mockResolvedValueOnce(messageCenterSnapshot('1', 0, ['first']))
+    vi.mocked(fake.client.clearMessages)
+      .mockRejectedValueOnce({ code: 'MessageOperationFailed', storeStatus: 'ready' })
+      .mockResolvedValueOnce(messageCenterSnapshot('2', 0))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+
+    await act(async () => fake.emit(shown('notification-target', 'messages')))
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('true'))
+    await vi.waitFor(() => expect(mounted.host.textContent).toContain('first'))
+    expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
+
+    const clear = () => [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('清空全部'))!
+    await act(async () => clear().click())
+    await vi.waitFor(() => expect(mounted.host.textContent).toContain('MessageOperationFailed'))
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(mounted.host.textContent).toContain('first')
+
+    await act(async () => clear().click())
+    await vi.waitFor(() => expect(mounted.host.textContent).toContain('暂无消息'))
+    expect(core.getSnapshot().view).toBe('settings')
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('renders a fixed settings badge for 0, 1, 99, 100, and terminal unavailable', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('message-badge')))
+    const badge = () => mounted.host.querySelector<HTMLElement>('.launcher-settings-badge .ant-badge-count')
+
+    expect(badge()).toBeNull()
+    for (const [revision, unreadCount, text] of [
+      ['1', 1, '1'],
+      ['2', 99, '99'],
+      ['3', 100, '99+'],
+    ] as const) {
+      await act(async () => fake.emitMessageState({ status: 'ready', revision, unreadCount }))
+      expect(badge()).not.toBeNull()
+      if (unreadCount === 100) expect(badge()?.textContent).toBe(text)
+      else expect(badge()?.getAttribute('title')).toBe(String(unreadCount))
+    }
+    await act(async () => fake.emitMessageState({ status: 'unavailable', error: 'MessageStoreUnavailable' }))
+    expect(badge()?.textContent).toBe('!')
+    await act(async () => fake.emitMessageState({ status: 'ready', revision: '4', unreadCount: 1 }))
+    expect(badge()?.textContent).toBe('!')
+    expect(mounted.host.querySelector('.launcher-settings-badge')).not.toBeNull()
+    expect(stylesSource).toMatch(/\.launcher-settings-control\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(
+      /\.launcher-settings-badge \.ant-badge-count,[\s\S]*?\.settings-message-tab-badge \.ant-badge-count\s*\{[^}]*color:\s*#fff;[^}]*background:\s*var\(--uipilot-ui-destructive\);/,
+    )
+    expect(stylesSource).not.toMatch(
+      /\.launcher-settings-badge \.ant-badge-count,[\s\S]*?\{[^}]*background:\s*var\(--uipilot-ui-primary\);/,
+    )
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('shares unread count with the Messages tab, clears on entry, and restores for later messages', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.openMessageCenter).mockResolvedValueOnce(
+      messageCenterSnapshot('2', 0, ['kept message']),
+    )
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('shared-message-badge')))
+    await act(async () => fake.emitMessageState({ status: 'ready', revision: '1', unreadCount: 3 }))
+    expect(
+      mounted.host.querySelector('.launcher-settings-badge .ant-badge-count')?.getAttribute('title'),
+    ).toBe('3')
+
+    await act(async () => {
+      mounted.host.querySelector<HTMLButtonElement>('button[aria-label="打开设置"]')?.click()
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('settings'))
+    expect(
+      settingsTab(mounted.host, '消息').querySelector('.settings-message-tab-badge .ant-badge-count')?.getAttribute('title'),
+    ).toBe('3')
+
+    await activateSettingsTab(mounted.host, '消息')
+    await vi.waitFor(() => expect(fake.client.openMessageCenter).toHaveBeenCalledOnce())
+    expect(mounted.host.textContent).toContain('kept message')
+    expect(settingsTab(mounted.host, '消息').querySelector('.ant-badge-count')).toBeNull()
+    expect(core.getSnapshot().messageCenter.unreadCount).toBe(0)
+
+    await act(async () => fake.emitMessageState({ status: 'ready', revision: '3', unreadCount: 1 }))
+    expect(
+      settingsTab(mounted.host, '消息').querySelector('.ant-badge-count')?.getAttribute('title'),
+    ).toBe('1')
+    expect(mounted.host.textContent).toContain('kept message')
+
+    await act(async () => {
+      mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回主界面"]')?.click()
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
+    expect(
+      mounted.host.querySelector('.launcher-settings-badge .ant-badge-count')?.getAttribute('title'),
+    ).toBe('1')
+    await mounted.unmount()
+    core.destroy()
   })
 
   it('switches settings panels without loading and resets to general for a new view epoch', async () => {
@@ -2324,7 +2926,8 @@ describe('React view and accessibility', () => {
     const pluginLoads = vi.mocked(fake.client.listPlugins).mock.calls.length
     const pluginTab = await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    expect(mounted.host.querySelector('.plugin-inventory')).toBeTruthy()
+    expect(mounted.host.querySelector('.plugin-inventory')).toBeNull()
+    expect(mounted.host.textContent).not.toContain('未发现插件')
     expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeNull()
     expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
     expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 1)
@@ -2339,11 +2942,24 @@ describe('React view and accessibility', () => {
         }),
       )
     })
-    await vi.waitFor(() => expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true'))
-    expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
-    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('true'))
+    expect(document.activeElement).toBe(settingsTab(mounted.host, '消息'))
+    expect(mounted.host.textContent).toContain('暂无消息')
     expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
     expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 1)
+
+    await act(async () => {
+      settingsTab(mounted.host, '消息').dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'ArrowUp',
+          code: 'ArrowUp',
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    })
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true'))
+    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
 
     await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 2))
@@ -2553,7 +3169,7 @@ describe('React view and accessibility', () => {
     expect(resetButton()).toBeTruthy()
     await act(async () => resetButton()!.click())
     expect(document.body.textContent).toContain(
-      '快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。',
+      '快捷键将恢复为 Shift+Space，关闭开机启动，将风格恢复为跟随系统，并将搜索引擎恢复为 Bing。',
     )
     await act(async () => portalButton('取消')!.click())
     expect(fake.client.saveSettings).not.toHaveBeenCalled()
@@ -2562,7 +3178,7 @@ describe('React view and accessibility', () => {
     await act(async () => portalButton('恢复')!.click())
     await vi.waitFor(() =>
       expect(fake.client.saveSettings).toHaveBeenCalledWith({
-        settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system' },
+        settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system', webSearchEngine: 'bing' },
       }),
     )
     await vi.waitFor(() =>
@@ -2676,7 +3292,6 @@ describe('React view and accessibility', () => {
     }
     for (const forbidden of [
       '@tauri-apps/api',
-      '@ant-design/icons',
       'AutoComplete',
       'Card',
       'Modal',
@@ -2685,6 +3300,12 @@ describe('React view and accessibility', () => {
     ]) {
       expect(launcherViewSource).not.toContain(forbidden)
     }
+    expect(launcherViewSource).toContain("from './ui-theme'")
+    expect(launcherViewSource).toContain('uiThemeConfig(colorScheme)')
+    expect(launcherViewSource).toContain("from 'lucide-react'")
+    expect(launcherViewSource).not.toContain('@ant-design/icons')
+    expect(publicPluginPanelSource).toContain("from 'lucide-react'")
+    expect(publicPluginPanelSource).not.toContain('@ant-design/icons')
   })
 
   it('submits generated public settings once without exposing an existing secret', async () => {
@@ -2696,7 +3317,9 @@ describe('React view and accessibility', () => {
       items: [{
         pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
         source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
-        fault: null, generation: 1, permissions: [],
+        fault: null, generation: 1,
+        iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
+        permissions: [],
         settings: [
           { definition: { type: 'text', key: 'prefix', label: 'Prefix' }, value: 'Hello' },
           { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 9 }, value: 3 },
@@ -2712,6 +3335,8 @@ describe('React view and accessibility', () => {
     await act(async () => fake.emit(shown('public-settings', 'settings')))
     await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+    expect(mounted.host.querySelector<HTMLImageElement>('.public-plugin-item .plugin-icon-image')?.getAttribute('src'))
+      .toBe('uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png')
 
     const prefix = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Prefix"]')!
     const secret = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Token"]')!
@@ -2734,6 +3359,35 @@ describe('React view and accessibility', () => {
       settings: { prefix: 'Welcome', limit: 3, loud: false, style: 'short' },
       secrets: { token: 'new-token' },
     } })
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('shows the prepared public plugin icon before installation', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.selectPublicPluginDirectory).mockResolvedValueOnce('D:\\demo-win')
+    vi.mocked(fake.client.preparePublicPlugin).mockResolvedValueOnce({
+      token: 'public-prepare-0000000000000001-0000000000000002',
+      pluginId: 'com.uipilot.demo-win',
+      name: 'Public Plugin Demo Window',
+      version: '1.0.2',
+      permissions: ['ui.window'],
+      isUpdate: false,
+      sourceVerified: false,
+      iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-prepare-icon', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    const chooseDirectory = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!
+    await act(async () => chooseDirectory.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-prepare')).not.toBeNull())
+    expect(mounted.host.querySelector<HTMLImageElement>('.public-prepare .plugin-icon-image')?.getAttribute('src'))
+      .toBe('uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png')
     await mounted.unmount()
     core.destroy()
   })
@@ -2842,7 +3496,7 @@ describe('real adapter and startup', () => {
       }
       return Promise.resolve(undefined)
     })
-    const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const }
+    const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const, webSearchEngine: 'bing' as const }
     await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()

@@ -60,7 +60,9 @@ where
         ResultAction::OpenFile(_) => {
             return Err(ApplicationActionError::ApplicationEntryUnavailable)
         }
-        ResultAction::CopyText { .. } => {
+        ResultAction::CopyBuiltInText { .. }
+        | ResultAction::OpenWebSearch { .. }
+        | ResultAction::CopyText { .. } => {
             return Err(ApplicationActionError::ApplicationEntryUnavailable)
         }
     };

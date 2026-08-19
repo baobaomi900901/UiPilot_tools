@@ -20,13 +20,13 @@ use crate::message_center::{
 
 use super::{
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
+    icon::{self, IconRequest, ICON_PATH},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
-    package, runtime_label, stage_public_package, EffectivePluginConfig, PluginApiRequest,
-    PluginApiExecution, PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext,
+    package, runtime_label, stage_public_package, EffectivePluginConfig, PluginApiExecution,
+    PluginApiRequest, PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext,
     PluginRequestScheduler, PluginRuntimeApi, PluginRuntimeError, PluginSecretStore,
-    PluginStateError, PluginStateStore,
-    PluginStorageStore, PreparedPublicPlugin, PublicManifestV1, PublicPackageError,
-    PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource,
+    PluginStateError, PluginStateStore, PluginStorageStore, PreparedPublicPlugin, PublicManifestV1,
+    PublicPackageError, PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource,
 };
 
 const PREPARE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -60,6 +60,7 @@ pub(crate) struct PublicPluginPrepareSummary {
     pub(crate) permissions: Vec<PublicPermission>,
     pub(crate) is_update: bool,
     pub(crate) source_verified: bool,
+    pub(crate) icon_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -93,6 +94,7 @@ pub(crate) struct PublicPluginInventoryItem {
     pub(crate) generation: u64,
     pub(crate) permissions: Vec<PublicPermissionView>,
     pub(crate) settings: Vec<PublicSettingView>,
+    pub(crate) icon_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -123,6 +125,22 @@ pub(crate) struct PublicPluginRoute {
     pub(crate) input_required: bool,
     pub(crate) input_placeholder: Option<String>,
     pub(crate) window_entry: Option<String>,
+    pub(crate) icon_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicCommandSuggestion {
+    pub(crate) effective_name: String,
+    pub(crate) display_name: String,
+    pub(crate) summary: Option<String>,
+    pub(crate) icon_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPluginWindowIdentity {
+    pub(crate) name: String,
+    pub(crate) icon_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,6 +265,12 @@ impl RuntimeSnapshot {
             runtime_entry: self.manifest.runtime.entry.clone(),
         }
     }
+
+    fn icon_url(&self) -> Option<String> {
+        self.resources
+            .contains_key(ICON_PATH)
+            .then(|| icon::installed_url(&self.manifest.plugin_id, self.generation))
+    }
 }
 
 #[derive(Default)]
@@ -274,10 +298,17 @@ pub(crate) struct PublicRuntimeAsset {
     pub(crate) bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicIconAsset {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) cache_control: &'static str,
+}
+
 struct PendingActivation {
     caller_label: String,
     expires_at: Instant,
     prepared: PreparedPublicPlugin,
+    icon: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -395,6 +426,14 @@ impl PublicPluginManager {
         self.cleanup_expired(now)?;
         let prepared =
             stage_public_package(source.into_package_source(), &self.staging_root, &self.host)?;
+        let icon = if prepared.resources.contains_key(ICON_PATH) {
+            Some(
+                fs::read(prepared.package_root.join(ICON_PATH))
+                    .map_err(|_| PublicPluginManagementError::InvalidPackage)?,
+            )
+        } else {
+            None
+        };
         let is_update = self
             .state
             .config(&prepared.manifest.plugin_id)?
@@ -417,6 +456,7 @@ impl PublicPluginManager {
             permissions: prepared.manifest.permissions.clone(),
             is_update,
             source_verified: false,
+            icon_url: icon.as_ref().map(|_| icon::prepared_url(&token)),
         };
         let expires_at = now
             .checked_add(PREPARE_TTL)
@@ -427,6 +467,7 @@ impl PublicPluginManager {
                 caller_label: caller_label.into(),
                 expires_at,
                 prepared,
+                icon,
             },
         );
         Ok(summary)
@@ -843,6 +884,7 @@ impl PublicPluginManager {
                     })
                     .collect(),
                 settings,
+                icon_url: snapshot.icon_url(),
             });
         }
         items.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
@@ -892,9 +934,45 @@ impl PublicPluginManager {
                     .window
                     .as_ref()
                     .map(|window| window.entry.clone()),
+                icon_url: snapshot.icon_url(),
             }));
         }
         Ok(None)
+    }
+
+    pub(crate) fn command_suggestions(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<PublicCommandSuggestion>, PublicPluginManagementError> {
+        let folded_prefix = prefix.to_lowercase();
+        let data = self.lock_data()?;
+        let mut suggestions = Vec::new();
+        for (plugin_id, snapshot) in &data.active_by_plugin {
+            let Some(config) = self.state.config(plugin_id)? else {
+                continue;
+            };
+            if !config.installed
+                || !config.enabled
+                || config.fault.is_some()
+                || config.active_generation != snapshot.generation
+                || (!config.effective_name.starts_with(prefix)
+                    && !snapshot
+                        .manifest
+                        .name
+                        .to_lowercase()
+                        .contains(&folded_prefix))
+            {
+                continue;
+            }
+            suggestions.push(PublicCommandSuggestion {
+                effective_name: config.effective_name,
+                display_name: snapshot.manifest.name.clone(),
+                summary: snapshot.manifest.command.summary.clone(),
+                icon_url: snapshot.icon_url(),
+            });
+        }
+        suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        Ok(suggestions)
     }
     pub(crate) fn runtime_candidates(
         &self,
@@ -969,6 +1047,104 @@ impl PublicPluginManager {
             bytes: resource.bytes.clone(),
         })
     }
+
+    pub(crate) fn icon_asset(
+        &self,
+        caller_label: &str,
+        request_path: &str,
+        now: Instant,
+    ) -> Option<PublicIconAsset> {
+        match icon::parse_request_path(request_path)? {
+            IconRequest::Prepared { token } => {
+                if caller_label != "main" {
+                    return None;
+                }
+                let data = self.data.lock().ok()?;
+                let pending = data.pending.get(&token)?;
+                if pending.caller_label != caller_label || pending.expires_at <= now {
+                    return None;
+                }
+                Some(PublicIconAsset {
+                    bytes: pending.icon.clone()?,
+                    cache_control: "no-store",
+                })
+            }
+            IconRequest::Installed {
+                plugin_id,
+                generation,
+            } => {
+                let snapshot = self
+                    .data
+                    .lock()
+                    .ok()?
+                    .active_by_plugin
+                    .get(&plugin_id)
+                    .cloned()?;
+                let config = self.state.config(&plugin_id).ok()??;
+                if !config.installed
+                    || config.active_generation != generation
+                    || snapshot.generation != generation
+                    || config.package_digest.as_deref() != Some(snapshot.digest.as_str())
+                {
+                    return None;
+                }
+                let main_allowed = caller_label == "main";
+                let shell_allowed = config.enabled
+                    && config.fault.is_none()
+                    && snapshot.manifest.command.output_mode == PublicOutputMode::Window
+                    && snapshot
+                        .manifest
+                        .permissions
+                        .contains(&PublicPermission::UiWindow)
+                    && crate::plugin_window::plugin_id_from_shell_label(caller_label).as_deref()
+                        == Some(plugin_id.as_str());
+                if !main_allowed && !shell_allowed {
+                    return None;
+                }
+                Some(PublicIconAsset {
+                    bytes: snapshot.resources.get(ICON_PATH)?.bytes.clone(),
+                    cache_control: "public, max-age=31536000, immutable",
+                })
+            }
+        }
+    }
+
+    pub(crate) fn window_identity(
+        &self,
+        plugin_id: &str,
+    ) -> Result<PublicPluginWindowIdentity, PublicPluginManagementError> {
+        let snapshot = self
+            .lock_data()?
+            .active_by_plugin
+            .get(plugin_id)
+            .cloned()
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let config = self
+            .state
+            .config(plugin_id)?
+            .filter(|config| {
+                config.installed
+                    && config.enabled
+                    && config.fault.is_none()
+                    && config.active_generation == snapshot.generation
+                    && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
+            })
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let _ = config;
+        if snapshot.manifest.command.output_mode != PublicOutputMode::Window
+            || !snapshot
+                .manifest
+                .permissions
+                .contains(&PublicPermission::UiWindow)
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        Ok(PublicPluginWindowIdentity {
+            name: snapshot.manifest.name.clone(),
+            icon_url: snapshot.icon_url(),
+        })
+    }
+
     pub(crate) fn message_icon_url(&self, plugin_id: &str) -> Option<String> {
         let snapshot = self
             .data
@@ -977,25 +1153,12 @@ impl PublicPluginManager {
             .active_by_plugin
             .get(plugin_id)
             .cloned()?;
-        self.state
-            .config(plugin_id)
-            .ok()?
-            .filter(|config| {
-                config.installed
-                    && config.active_generation == snapshot.generation
-                    && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
-            })?;
-        snapshot.resources.contains_key("icon.png").then(|| {
-            let origin = if cfg!(target_os = "windows") {
-                "http://uipilot-public-plugin.localhost"
-            } else {
-                "uipilot-public-plugin://localhost"
-            };
-            format!(
-                "{origin}/__uipilot_icon/installed/{plugin_id}/{}/icon.png",
-                snapshot.generation
-            )
-        })
+        self.state.config(plugin_id).ok()?.filter(|config| {
+            config.installed
+                && config.active_generation == snapshot.generation
+                && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
+        })?;
+        snapshot.icon_url()
     }
 
     pub(crate) fn can_copy_text(&self, plugin_id: &str, generation: u64) -> bool {
@@ -1658,6 +1821,52 @@ mod tests {
             .unwrap();
     }
 
+    fn write_discovery_package(
+        root: &Path,
+        plugin_id: &str,
+        name: &str,
+        default_name: &str,
+        summary: &str,
+    ) {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": plugin_id,
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "minimumHostVersion": "0.2.0",
+                "name": name,
+                "supportedPlatforms": ["windows"],
+                "command": {
+                    "defaultName": default_name,
+                    "summary": summary,
+                    "activationMode": "submit",
+                    "outputMode": "mainResult",
+                    "inputRequired": true,
+                    "inputPlaceholder": "请输入信息回车"
+                },
+                "runtime": { "entry": "dist/runtime.js" },
+                "permissions": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/runtime.js"),
+            "export async function onCommand() {}",
+        )
+        .unwrap();
+    }
+
+    fn install_discovery_package(manager: &PublicPluginManager, source: &Path, now: Instant) {
+        let prepared = manager.prepare("main", self::source(source), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+    }
+
     fn source(path: &Path) -> PublicPluginInstallSource {
         PublicPluginInstallSource::DevelopmentDirectory {
             path: path.to_path_buf(),
@@ -1952,6 +2161,7 @@ mod tests {
                 input_required: false,
                 input_placeholder: None,
                 window_entry: None,
+                icon_url: None,
             }
         );
         assert!(manager.route("/activationX nope").unwrap().is_none());
@@ -1959,6 +2169,179 @@ mod tests {
             .set_enabled_with_readiness("com.example.activation", false, |_| false)
             .unwrap();
         assert!(manager.route("/activation").unwrap().is_none());
+    }
+
+    #[test]
+    fn command_suggestions_filter_match_sort_and_follow_effective_state() {
+        let dir = TestDir::new("command-suggestions");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let demo_win = dir.path().join("source-demo-win");
+        let demo_return = dir.path().join("source-demo-return");
+        write_discovery_package(
+            &demo_win,
+            "com.example.demo-win",
+            "Public Plugin Demo Window",
+            "demo-win",
+            "打开演示子窗口",
+        );
+        write_discovery_package(
+            &demo_return,
+            "com.example.demo-return",
+            "Public Plugin Demo Return",
+            "demo-return",
+            "返回示例文本到主界面",
+        );
+        install_discovery_package(&manager, &demo_win, now);
+        install_discovery_package(&manager, &demo_return, now);
+
+        assert_eq!(
+            manager.command_suggestions("d").unwrap(),
+            vec![
+                PublicCommandSuggestion {
+                    effective_name: "demo-return".into(),
+                    display_name: "Public Plugin Demo Return".into(),
+                    summary: Some("返回示例文本到主界面".into()),
+                    icon_url: None,
+                },
+                PublicCommandSuggestion {
+                    effective_name: "demo-win".into(),
+                    display_name: "Public Plugin Demo Window".into(),
+                    summary: Some("打开演示子窗口".into()),
+                    icon_url: None,
+                },
+            ]
+        );
+        assert_eq!(
+            manager.command_suggestions("window").unwrap()[0].effective_name,
+            "demo-win"
+        );
+
+        manager
+            .rename("com.example.demo-win", Some("alpha-win"))
+            .unwrap();
+        assert_eq!(
+            manager.command_suggestions("a").unwrap()[0].effective_name,
+            "alpha-win"
+        );
+
+        let current = manager
+            .data
+            .lock()
+            .unwrap()
+            .active_by_plugin
+            .get("com.example.demo-win")
+            .unwrap()
+            .clone();
+        let mut stale = (*current).clone();
+        stale.generation += 1;
+        manager
+            .data
+            .lock()
+            .unwrap()
+            .active_by_plugin
+            .insert("com.example.demo-win".into(), Arc::new(stale));
+        assert!(manager.command_suggestions("a").unwrap().is_empty());
+        manager
+            .data
+            .lock()
+            .unwrap()
+            .active_by_plugin
+            .insert("com.example.demo-win".into(), current);
+
+        manager
+            .set_enabled_with_readiness("com.example.demo-return", false, |_| false)
+            .unwrap();
+        assert!(manager
+            .command_suggestions("demo-return")
+            .unwrap()
+            .is_empty());
+        manager
+            .state
+            .disable_for_fault(
+                "com.example.demo-win",
+                PublicPluginFault::ConsecutiveFailures,
+            )
+            .unwrap();
+        assert!(manager.command_suggestions("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_plugin_icon_urls_are_generation_and_caller_bound() {
+        let dir = TestDir::new("icon-ownership");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let source = workspace.join("examples/public-plugins/com.uipilot.demo-win/package");
+        let expected = fs::read(source.join(super::super::icon::ICON_PATH)).unwrap();
+
+        let prepared = manager.prepare("main", self::source(&source), now).unwrap();
+        let prepared_url = prepared.icon_url.clone().unwrap();
+        let prepared_path = tauri::Url::parse(&prepared_url).unwrap().path().to_owned();
+        let prepared_asset = manager.icon_asset("main", &prepared_path, now).unwrap();
+        assert_eq!(prepared_asset.bytes, expected);
+        assert_eq!(prepared_asset.cache_control, "no-store");
+        assert!(manager.icon_asset("find", &prepared_path, now).is_none());
+        assert!(manager
+            .icon_asset("plugin-runtime-forged", &prepared_path, now)
+            .is_none());
+
+        let commit = manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiWindow,
+                    PublicPermission::NotificationsPublish,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        assert!(manager.icon_asset("main", &prepared_path, now).is_none());
+
+        let inventory = manager.inventory().unwrap();
+        let installed_url = inventory.items[0].icon_url.clone().unwrap();
+        let installed_path = tauri::Url::parse(&installed_url).unwrap().path().to_owned();
+        let installed_asset = manager.icon_asset("main", &installed_path, now).unwrap();
+        assert_eq!(installed_asset.bytes, expected);
+        assert_eq!(
+            installed_asset.cache_control,
+            "public, max-age=31536000, immutable"
+        );
+
+        let shell = crate::plugin_window::plugin_shell_label(&commit.mutation.plugin_id).unwrap();
+        assert!(manager.icon_asset(&shell, &installed_path, now).is_some());
+        assert!(manager
+            .icon_asset(&commit.runtime.label, &installed_path, now)
+            .is_none());
+        assert!(manager
+            .icon_asset(
+                &crate::plugin_window::plugin_content_label(&commit.mutation.plugin_id).unwrap(),
+                &installed_path,
+                now,
+            )
+            .is_none());
+        assert!(manager.icon_asset("find", &installed_path, now).is_none());
+
+        let stale_url = super::super::icon::installed_url(
+            &commit.mutation.plugin_id,
+            commit.mutation.generation + 1,
+        );
+        let stale_path = tauri::Url::parse(&stale_url).unwrap().path().to_owned();
+        assert!(manager.icon_asset("main", &stale_path, now).is_none());
+
+        let identity = manager.window_identity(&commit.mutation.plugin_id).unwrap();
+        assert_eq!(identity.name, "Public Plugin Demo Window");
+        assert_eq!(identity.icon_url.as_deref(), Some(installed_url.as_str()));
+        assert_eq!(
+            manager.message_icon_url(&commit.mutation.plugin_id),
+            Some(installed_url.clone())
+        );
+        assert_eq!(
+            manager.command_suggestions("demo-win").unwrap()[0].icon_url,
+            Some(installed_url)
+        );
     }
 
     #[test]

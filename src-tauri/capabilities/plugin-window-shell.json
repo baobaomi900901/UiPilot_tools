@@ -4,6 +4,7 @@
   "description": "Host-owned controls for public plugin window shells",
   "webviews": ["plugin-shell-*"],
   "permissions": [
+    "allow-get-public-plugin-window-identity",
     "allow-set-plugin-window-pinned",
     "allow-close-plugin-window"
   ]

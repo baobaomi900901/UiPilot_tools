@@ -26,6 +26,7 @@ fn main() {
             "plugin_window_content_ready",
             "plugin_window_content_ack",
             "commit_plugin_window_transfer",
+            "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
             "close_plugin_window",
             "get_message_summary",
@@ -45,6 +46,7 @@ fn main() {
             "save_hotkey",
             "set_file_preview_preference",
             "set_theme_preference",
+            "set_web_search_engine",
             "hide_launcher",
         ]),
     ))

@@ -384,7 +384,10 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
                 .into(),
             ),
             icon: application.icon.clone(),
+            plugin_icon_url: None,
+            icon_kind: None,
             detail: None,
+            completion_text: None,
             has_default_action: true,
         },
         ResultAction::LaunchApplication {

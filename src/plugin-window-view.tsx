@@ -1,20 +1,30 @@
-import { CloseOutlined, PushpinFilled, PushpinOutlined } from '@ant-design/icons'
 import { Button, Tooltip } from 'antd'
+import { Pin, X } from 'lucide-react'
 import { useSyncExternalStore } from 'react'
+import { PluginIcon } from './plugin-icon'
 import type { PluginWindowCore } from './plugin-window-core'
 
 export function PluginWindowView({ core }: { core: PluginWindowCore }) {
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   return (
     <header className="plugin-window-shell" data-tauri-drag-region>
-      <strong data-tauri-drag-region>UiPilot</strong>
+      <PluginIcon className="plugin-window-icon" iconUrl={snapshot.iconUrl} size={20} />
+      <strong className="plugin-window-title" data-tauri-drag-region>{snapshot.name}</strong>
       <span className="plugin-window-shell-spacer" data-tauri-drag-region />
       <Tooltip title={snapshot.pinned ? '取消固定' : '固定窗口'}>
         <Button
           aria-label={snapshot.pinned ? '取消固定' : '固定窗口'}
+          aria-pressed={snapshot.pinned}
           className={snapshot.pinned ? 'is-selected' : undefined}
           disabled={snapshot.pending}
-          icon={snapshot.pinned ? <PushpinFilled /> : <PushpinOutlined />}
+          icon={(
+            <Pin
+              aria-hidden
+              fill={snapshot.pinned ? 'currentColor' : 'none'}
+              size={16}
+              strokeWidth={1.8}
+            />
+          )}
           onClick={() => void core.togglePinned()}
           size="small"
           type="text"
@@ -25,7 +35,7 @@ export function PluginWindowView({ core }: { core: PluginWindowCore }) {
           aria-label="关闭"
           danger
           disabled={snapshot.pending}
-          icon={<CloseOutlined />}
+          icon={<X aria-hidden size={16} strokeWidth={1.8} />}
           onClick={() => void core.close()}
           size="small"
           type="text"

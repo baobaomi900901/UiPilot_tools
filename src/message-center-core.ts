@@ -24,6 +24,7 @@ export interface MessageCenterCore {
   readonly getSnapshot: () => MessageCenterStateSnapshot
   readonly subscribe: (listener: () => void) => () => void
   readonly start: () => Promise<void>
+  readonly refresh: () => Promise<void>
   readonly enter: () => Promise<void>
   readonly leave: () => void
   readonly clear: () => Promise<void>
@@ -263,6 +264,11 @@ export function createMessageCenterCore(client: MessageCenterClient): MessageCen
     await initialOpen
   }
 
+  async function refresh(): Promise<void> {
+    if (destroyed || !listenerReady || model.status === 'unavailable') return
+    await loadSummary()
+  }
+
   async function openCurrent(): Promise<void> {
     try {
       const value = await client.openMessageCenter()
@@ -320,5 +326,5 @@ export function createMessageCenterCore(client: MessageCenterClient): MessageCen
     listeners.clear()
   }
 
-  return { getSnapshot, subscribe, start, enter, leave, clear, destroy }
+  return { getSnapshot, subscribe, start, refresh, enter, leave, clear, destroy }
 }

@@ -1,5 +1,6 @@
 mod activation;
 mod delayed_messages;
+mod icon;
 mod manifest;
 mod package;
 mod runtime;
@@ -31,9 +32,10 @@ use tauri::{
 use crate::message_center::MessageCenterService;
 
 pub(crate) use activation::{
-    parse_main_result_response, parse_window_response, PublicMainResult, PublicPluginInstallSource,
-    PublicPluginInventory, PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
-    PublicPluginPrepareSummary, PublicPluginRoute, PublicRuntimeCandidate, PublicWindowResponse,
+    parse_main_result_response, parse_window_response, PublicCommandSuggestion, PublicMainResult,
+    PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
+    PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginRoute,
+    PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse,
 };
 pub(crate) use manifest::{
     public_manifest_v1_schema, PublicActivationMode, PublicManifestV1, PublicOutputMode,
@@ -502,8 +504,31 @@ impl PublicPluginService {
             .lock()
             .map_err(|_| PublicPluginManagementError::Unavailable)
     }
-    pub(crate) fn asset_response(&self, label: &str, path: &str) -> Response<Vec<u8>> {
-        let Some(asset) = self.manager().ok().and_then(|manager| {
+    pub(crate) fn asset_response(
+        &self,
+        label: &str,
+        path: &str,
+        query: Option<&str>,
+    ) -> Response<Vec<u8>> {
+        if query.is_some() && icon::is_icon_request(path) {
+            return Response::builder().status(403).body(Vec::new()).unwrap();
+        }
+        let manager = self.manager().ok();
+        if let Some(asset) =
+            manager.and_then(|manager| manager.icon_asset(label, path, Instant::now()))
+        {
+            return Response::builder()
+                .status(200)
+                .header("content-type", icon::ICON_MIME)
+                .header("x-content-type-options", "nosniff")
+                .header("cache-control", asset.cache_control)
+                .body(asset.bytes)
+                .unwrap();
+        }
+        if icon::is_icon_request(path) {
+            return Response::builder().status(403).body(Vec::new()).unwrap();
+        }
+        let Some(asset) = manager.and_then(|manager| {
             manager.asset(label, path).or_else(|| {
                 crate::plugin_window::plugin_id_from_content_label(label)
                     .and_then(|plugin_id| manager.window_asset(&plugin_id, path))

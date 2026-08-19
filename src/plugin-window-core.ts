@@ -1,6 +1,9 @@
 import type { PluginWindowClient } from './protocol'
+import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export interface PluginWindowSnapshot {
+  name: string
+  iconUrl?: string
   pinned: boolean
   pending: boolean
   error?: string
@@ -9,13 +12,14 @@ export interface PluginWindowSnapshot {
 export interface PluginWindowCore {
   getSnapshot(): PluginWindowSnapshot
   subscribe(listener: () => void): () => void
+  start(): Promise<void>
   togglePinned(): Promise<void>
   close(): Promise<void>
   destroy(): void
 }
 
 export function createPluginWindowCore(client: PluginWindowClient): PluginWindowCore {
-  let snapshot: PluginWindowSnapshot = { pinned: false, pending: false }
+  let snapshot: PluginWindowSnapshot = { name: '插件', pinned: false, pending: false }
   let destroyed = false
   const listeners = new Set<() => void>()
   const publish = (next: PluginWindowSnapshot) => {
@@ -32,13 +36,28 @@ export function createPluginWindowCore(client: PluginWindowClient): PluginWindow
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
+    async start() {
+      if (destroyed) return
+      try {
+        const identity = await client.getIdentity()
+        if (destroyed) return
+        const iconUrl = safePublicPluginIconUrl(identity.iconUrl)
+        publish({
+          ...snapshot,
+          name: identity.name,
+          ...(iconUrl === undefined ? { iconUrl: undefined } : { iconUrl }),
+        })
+      } catch {
+        // Identity failure must not disable host-owned window controls.
+      }
+    },
     async togglePinned() {
       if (destroyed || snapshot.pending) return
       const expected = !snapshot.pinned
       publish({ ...snapshot, pending: true, error: undefined })
       try {
         const result = await client.setPinned({ pinned: expected })
-        publish({ pinned: result.pinned, pending: false })
+        publish({ ...snapshot, pinned: result.pinned, pending: false, error: undefined })
       } catch {
         publish({ ...snapshot, pending: false, error: errorText() })
       }
@@ -48,7 +67,7 @@ export function createPluginWindowCore(client: PluginWindowClient): PluginWindow
       publish({ ...snapshot, pending: true, error: undefined })
       try {
         await client.close()
-        publish({ pinned: false, pending: false })
+        publish({ ...snapshot, pinned: false, pending: false, error: undefined })
       } catch {
         publish({ ...snapshot, pending: false, error: errorText() })
       }

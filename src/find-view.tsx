@@ -1,17 +1,14 @@
-import { CloseOutlined, PushpinFilled, PushpinOutlined } from '@ant-design/icons'
-import { App, Button, ConfigProvider, Input, Spin, Switch, Tooltip, theme } from 'antd'
+import { App, Button, ConfigProvider, Input, Spin, Switch, Tooltip } from 'antd'
+import { Pin, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 
 import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
-import type { FileCategory, FileResultKind, ThemePreference } from './protocol'
+import type { FileCategory, FileResultKind } from './protocol'
+import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
 
 const CATEGORY_LABELS: Record<FileCategory, string> = {
   all: '全部', folder: '文件夹', excel: 'Excel', word: 'Word', ppt: 'PPT',
   pdf: 'PDF', image: '图片', video: '视频', audio: '音频', archive: '压缩包',
-}
-
-function colorScheme(preference: ThemePreference, systemDark: boolean): 'light' | 'dark' {
-  return preference === 'system' ? (systemDark ? 'dark' : 'light') : preference
 }
 
 function fileSize(kind: FileResultKind, sizeBytes: string | null): string {
@@ -35,6 +32,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   const optionRefs = useRef(new Map<number, HTMLElement>())
   const disabled = !snapshot.ready || snapshot.executePending
   const selected = snapshot.selectedIndex >= 0 ? snapshot.results[snapshot.selectedIndex] : undefined
+  const scheme = resolveUiColorScheme(snapshot.theme, systemDark)
 
   useEffect(() => {
     const changed = (event: MediaQueryListEvent) => setSystemDark(event.matches)
@@ -77,9 +75,9 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   }
 
   return (
-    <ConfigProvider theme={{ algorithm: colorScheme(snapshot.theme, systemDark) === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { motion: false } }}>
+    <ConfigProvider theme={uiThemeConfig(scheme)}>
       <App>
-        <main className="find-surface" data-color-scheme={colorScheme(snapshot.theme, systemDark)}>
+        <main className="find-surface" data-color-scheme={scheme}>
           <header className="find-header">
             <span className="find-drag-handle" aria-hidden="true" />
             <Input
@@ -101,7 +99,14 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               <Button
                 className={snapshot.pinned ? 'find-icon-button is-selected' : 'find-icon-button'}
                 type="text"
-                icon={snapshot.pinned ? <PushpinFilled /> : <PushpinOutlined />}
+                icon={(
+                  <Pin
+                    aria-hidden
+                    fill={snapshot.pinned ? 'currentColor' : 'none'}
+                    size={17}
+                    strokeWidth={1.8}
+                  />
+                )}
                 aria-label={snapshot.pinned ? '取消固定' : '固定窗口'}
                 aria-pressed={snapshot.pinned}
                 disabled={disabled || snapshot.pinPending || !snapshot.invocationId}
@@ -112,7 +117,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               <Button
                 className="find-icon-button"
                 type="text"
-                icon={<CloseOutlined />}
+                icon={<X aria-hidden size={17} strokeWidth={1.8} />}
                 aria-label="关闭"
                 disabled={disabled || snapshot.hidePending || !snapshot.invocationId}
                 onClick={() => void core.requestHide(true)}

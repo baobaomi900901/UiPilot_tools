@@ -4465,6 +4465,7 @@ version = "0.2.0"
 dependencies = [
  "everything-ipc-spike",
  "icu_casemap",
+ "png 0.18.1",
  "rusqlite",
  "schemars 1.2.1",
  "serde",
@@ -4479,6 +4480,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "time",
  "unicode-normalization",
+ "url",
  "webview2-com",
  "windows",
  "zip",

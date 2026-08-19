@@ -1,30 +1,42 @@
+import { safePublicPluginIconUrl } from './plugin-icon-url'
+
+export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
+
 export interface ResultItem {
   resultId: string
   title: string
   subtitle?: string
   icon?: string
+  pluginIconUrl?: string
+  iconKind?: ResultIconKind
   detail?: string
   hasDefaultAction?: boolean
+  completionText?: string
 }
 export interface SearchResponse {
   requestId: string
   items: ResultItem[]
   windowTransferToken?: string
+  replaceLocalResults?: boolean
+  commandHint?: string
 }
 
 export type ThemePreference = 'system' | 'dark' | 'light'
+export type WebSearchEngine = 'bing' | 'baidu' | 'google'
 
 export interface SettingsView {
   hotkey: string
   autostart: boolean
   filePreviewEnabled: boolean
   theme: ThemePreference
+  webSearchEngine: WebSearchEngine
 }
 
 export interface UserSettingsUpdate {
   hotkey: string
   autostart: boolean
   theme: ThemePreference
+  webSearchEngine: WebSearchEngine
 }
 
 export interface HotkeySettingsUpdate {
@@ -104,6 +116,7 @@ export interface PublicPluginInventoryItem {
   enabled: boolean
   fault: PublicPluginFault | null
   generation: number
+  iconUrl: string | null
   permissions: readonly PublicPermissionView[]
   settings: readonly PublicSettingView[]
 }
@@ -121,6 +134,12 @@ export interface PublicPluginPrepareSummary {
   permissions: readonly PublicPermission[]
   isUpdate: boolean
   sourceVerified: boolean
+  iconUrl: string | null
+}
+
+export interface PublicPluginWindowIdentity {
+  name: string
+  iconUrl: string | null
 }
 export interface PluginMutationOutcome {
   revision: string
@@ -152,6 +171,7 @@ export type CommandErrorCode =
   | 'pluginDeleteFailed'
   | 'fileNotFound'
   | 'fileOpenFailed'
+  | 'webSearchFailed'
 
 export interface CommandError {
   code: CommandErrorCode
@@ -231,10 +251,12 @@ export interface LauncherClient {
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
   setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
+  setWebSearchEngine(input: { preference: { engine: WebSearchEngine } }): Promise<void>
   hideLauncher(): Promise<void>
 }
 
 export interface PluginWindowClient {
+  getIdentity(): Promise<PublicPluginWindowIdentity>
   setPinned(input: { pinned: boolean }): Promise<{ pinned: boolean }>
   close(): Promise<void>
 }
@@ -280,6 +302,8 @@ export interface ViewResult {
   title: string
   subtitle?: string
   icon?: string
+  pluginIconUrl?: string
+  iconKind?: ResultIconKind
   detail?: string
   hasDefaultAction?: boolean
 }
@@ -294,9 +318,10 @@ export interface SettingsSnapshot {
   hotkey: TextControlView
   autostart: boolean
   theme: ThemePreference
+  webSearchEngine: WebSearchEngine
   loadStatus: SettingsLoadStatus
   readOnly: boolean
-  operation?: 'load' | 'save' | 'hotkey' | 'theme'
+  operation?: 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
   needsReload: boolean
 }
 
@@ -386,6 +411,7 @@ export interface LauncherSnapshot {
   executePending: boolean
   hidePending: boolean
   shownNotice?: string
+  commandHint?: string
   status: string
   settingsLoadStatus?: SettingsLoadStatus
   settings?: SettingsSnapshot
@@ -581,8 +607,8 @@ function parsePublicSettingView(value: unknown): PublicSettingView | null {
 
 function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null {
   const item = plainRecord(value)
-  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'name', 'permissions', 'pluginId', 'settings', 'source', 'version']
-  if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.defaultName !== 'string' || typeof item.effectiveName !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
+  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'permissions', 'pluginId', 'settings', 'source', 'version']
+  if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.defaultName !== 'string' || typeof item.effectiveName !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.iconUrl !== null && safePublicPluginIconUrl(item.iconUrl) === undefined) || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
   if (!Array.isArray(item.permissions) || !exactDenseArray(item.permissions) || !Array.isArray(item.settings) || !exactDenseArray(item.settings)) return null
   const permissions: PublicPermissionView[] = []
   for (const valuePermission of item.permissions) {
@@ -611,6 +637,13 @@ export function parsePublicPluginInventory(value: unknown): PublicPluginInventor
     items.push(item)
   }
   return { revision: inventory.revision, items }
+}
+
+export function parsePublicPluginWindowIdentity(value: unknown): PublicPluginWindowIdentity | null {
+  const identity = plainRecord(value)
+  if (!identity || !exactKeys(identity, ['iconUrl', 'name']) || typeof identity.name !== 'string' || identity.name.length === 0) return null
+  if (identity.iconUrl !== null && safePublicPluginIconUrl(identity.iconUrl) === undefined) return null
+  return identity as unknown as PublicPluginWindowIdentity
 }
 export function parsePluginMutationOutcome(value: unknown): PluginMutationOutcome | null {
   const outcome = plainRecord(value)

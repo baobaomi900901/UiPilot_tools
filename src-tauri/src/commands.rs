@@ -30,7 +30,7 @@ use crate::{
     message_center::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
-    model::SearchResponse,
+    model::{ResultIconKind, SearchResponse},
     plugin_window::{
         self, PluginWindowController, PluginWindowOwner, PluginWindowPinState, PluginWindowUpdate,
     },
@@ -42,14 +42,16 @@ use crate::{
         PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
         PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
         PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
-        PublicPluginManager,
-        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse,
-        PublicPluginService,
+        PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary,
+        PublicPluginResponse, PublicPluginService, PublicPluginWindowIdentity,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
     },
-    settings::{SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WindowPosition},
+    settings::{
+        SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine,
+        WindowPosition,
+    },
     window_transfer::MainWindowTransferCoordinator,
 };
 
@@ -62,6 +64,7 @@ pub(crate) struct SettingsView {
     autostart: bool,
     file_preview_enabled: bool,
     theme: ThemePreference,
+    web_search_engine: WebSearchEngine,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -70,6 +73,7 @@ pub(crate) struct UserSettingsUpdate {
     hotkey: String,
     autostart: bool,
     theme: ThemePreference,
+    web_search_engine: WebSearchEngine,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -94,6 +98,12 @@ pub(crate) struct FilePreviewPreferenceUpdate {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ThemePreferenceUpdate {
     theme: ThemePreference,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct WebSearchEngineUpdate {
+    engine: WebSearchEngine,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -364,6 +374,13 @@ impl CommandError {
             message: "indexed file could not be opened",
         }
     }
+
+    fn web_search_failed() -> Self {
+        Self {
+            code: "webSearchFailed",
+            message: "browser search could not be opened",
+        }
+    }
 }
 
 impl From<SettingsError> for CommandError {
@@ -488,9 +505,7 @@ pub(crate) fn read_message_center(
     public_plugins: State<'_, Arc<PublicPluginService>>,
 ) -> Result<MessageCenterSnapshotDto, MessageCommandError> {
     require_main_window(&window)?;
-    let snapshot = messages
-        .read_snapshot()
-        .map_err(message_command_error)?;
+    let snapshot = messages.read_snapshot().map_err(message_command_error)?;
     Ok(message_snapshot_dto(
         snapshot,
         public_plugins.manager().ok().map(Arc::as_ref),
@@ -1128,6 +1143,16 @@ pub(crate) async fn commit_plugin_window_transfer(
 }
 
 #[tauri::command]
+pub(crate) fn get_public_plugin_window_identity(
+    webview: tauri::Webview,
+    service: State<'_, Arc<PublicPluginService>>,
+) -> Result<PublicPluginWindowIdentity, CommandError> {
+    let plugin_id = plugin_window::plugin_id_from_shell_label(webview.label())
+        .ok_or(PublicPluginManagementError::InvalidCaller)?;
+    Ok(service.manager()?.window_identity(&plugin_id)?)
+}
+
+#[tauri::command]
 pub(crate) fn set_plugin_window_pinned(
     webview: tauri::Webview,
     app: AppHandle,
@@ -1167,19 +1192,26 @@ pub(crate) async fn search_apps(
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let public = app.state::<Arc<PublicPluginService>>();
+    if let Some(prefix) = plugin_discovery_prefix(&query) {
+        return Ok(publish_public_command_suggestions(
+            registry,
+            &invocation_id,
+            query_sequence,
+            public.manager()?.command_suggestions(prefix)?,
+        ));
+    }
     if let Some(route) = public.manager()?.route(&query)? {
-        if (route.activation_mode == PublicActivationMode::Submit && !submit)
-            || (route.activation_mode == PublicActivationMode::Live && submit)
-        {
-            return Ok(None);
-        }
-        if route.input_required && route.input.is_empty() {
-            return Ok(public_plugin_prompt(
-                registry,
-                &invocation_id,
-                query_sequence,
-                route.input_placeholder,
-            ));
+        match public_plugin_search_decision(&route, submit) {
+            PublicPluginSearchDecision::Ignore => return Ok(None),
+            PublicPluginSearchDecision::Hint(hint) => {
+                return Ok(public_plugin_prompt(
+                    registry,
+                    &invocation_id,
+                    query_sequence,
+                    Some(hint),
+                ))
+            }
+            PublicPluginSearchDecision::Dispatch => {}
         }
         let Some(registry_token) =
             registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
@@ -1255,7 +1287,9 @@ pub(crate) async fn search_apps(
                 Ok(Some(SearchResponse {
                     request_id: response.request_id,
                     items: Vec::new(),
+                    command_hint: None,
                     window_transfer_token: Some(prepared.transfer_token),
+                    replace_local_results: false,
                 }))
             }
         };
@@ -1280,7 +1314,44 @@ pub(crate) async fn search_apps(
         query_sequence,
         || cache.snapshot(),
         |applications| settings.decorate_applications(applications),
+        settings.snapshot().web_search_engine,
     ))
+}
+
+fn plugin_discovery_prefix(query: &str) -> Option<&str> {
+    let command = query.strip_prefix('/')?;
+    (!command.contains(' ')).then_some(command)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PublicPluginSearchDecision {
+    Ignore,
+    Hint(String),
+    Dispatch,
+}
+
+fn public_plugin_search_decision(
+    route: &crate::public_plugins::PublicPluginRoute,
+    submit: bool,
+) -> PublicPluginSearchDecision {
+    if route.input_required && route.input.is_empty() {
+        return PublicPluginSearchDecision::Hint(
+            route
+                .input_placeholder
+                .clone()
+                .unwrap_or_else(|| "请输入内容".into()),
+        );
+    }
+    match (route.activation_mode, submit) {
+        (PublicActivationMode::Submit, true) | (PublicActivationMode::Live, false) => {
+            PublicPluginSearchDecision::Dispatch
+        }
+        (PublicActivationMode::Submit, false) => route.input_placeholder.clone().map_or(
+            PublicPluginSearchDecision::Ignore,
+            PublicPluginSearchDecision::Hint,
+        ),
+        (PublicActivationMode::Live, true) => PublicPluginSearchDecision::Ignore,
+    }
 }
 
 pub(crate) fn invocation_theme(
@@ -1320,20 +1391,49 @@ fn public_plugin_prompt(
     placeholder: Option<String>,
 ) -> Option<SearchResponse> {
     let token = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)?;
-    let item = crate::model::ResultItem {
-        result_id: String::new(),
-        title: placeholder.unwrap_or_else(|| "请输入内容".into()),
-        subtitle: None,
-        icon: None,
-        detail: None,
-        has_default_action: false,
-    };
     registry.publish_if_latest(
         token,
-        vec![(item, None::<ResultAction>)],
+        Vec::<((), Option<ResultAction>)>::new(),
         || true,
-        search_response,
+        |request_id, _| SearchResponse {
+            request_id,
+            items: Vec::new(),
+            command_hint: Some(placeholder.unwrap_or_else(|| "请输入内容".into())),
+            window_transfer_token: None,
+            replace_local_results: false,
+        },
     )
+}
+
+fn publish_public_command_suggestions(
+    registry: &ResultRegistry,
+    invocation_id: &str,
+    query_sequence: u64,
+    suggestions: Vec<crate::public_plugins::PublicCommandSuggestion>,
+) -> Option<SearchResponse> {
+    let token = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)?;
+    let entries = suggestions
+        .into_iter()
+        .map(|suggestion| {
+            let title = format!("/{}", suggestion.effective_name);
+            let completion_text = format!("{title} ");
+            (
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    title,
+                    subtitle: Some(suggestion.summary.unwrap_or(suggestion.display_name)),
+                    icon: None,
+                    plugin_icon_url: suggestion.icon_url,
+                    icon_kind: None,
+                    detail: None,
+                    completion_text: Some(completion_text),
+                    has_default_action: false,
+                },
+                None::<ResultAction>,
+            )
+        })
+        .collect();
+    registry.publish_if_latest(token, entries, || true, search_response)
 }
 
 fn publish_public_main_results(
@@ -1356,7 +1456,10 @@ fn publish_public_main_results(
                     title: result.title,
                     subtitle: result.subtitle,
                     icon: None,
+                    plugin_icon_url: route.icon_url.clone(),
+                    icon_kind: None,
                     detail: result.detail,
+                    completion_text: None,
                     has_default_action: action.is_some(),
                 },
                 action,
@@ -1379,7 +1482,9 @@ fn search_response(
                 item
             })
             .collect(),
+        command_hint: None,
         window_transfer_token: None,
+        replace_local_results: false,
     }
 }
 #[tauri::command]
@@ -1410,18 +1515,73 @@ fn search_apps_with<S, D>(
     query_sequence: u64,
     snapshot: S,
     decorate: D,
+    web_search_engine: WebSearchEngine,
 ) -> Option<SearchResponse>
 where
     S: FnOnce() -> Vec<Application>,
     D: FnOnce(&mut [Application]),
 {
+    if let Some(result) = crate::calculator::evaluate(query) {
+        let token =
+            registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
+        let item = crate::model::ResultItem {
+            result_id: String::new(),
+            title: result.clone(),
+            subtitle: Some("复制结果".into()),
+            icon: None,
+            plugin_icon_url: None,
+            icon_kind: Some(ResultIconKind::Calculator),
+            detail: None,
+            completion_text: None,
+            has_default_action: true,
+        };
+        return registry.publish_if_latest(
+            token,
+            vec![(item, Some(ResultAction::CopyBuiltInText { text: result }))],
+            || true,
+            |request_id, items| SearchResponse {
+                request_id,
+                items: items
+                    .into_iter()
+                    .map(|(result_id, mut item)| {
+                        item.result_id = result_id;
+                        item
+                    })
+                    .collect(),
+                command_hint: None,
+                window_transfer_token: None,
+                replace_local_results: true,
+            },
+        );
+    }
     let token = registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
     let mut applications = snapshot();
     decorate(&mut applications);
-    let entries = apps::rank(&applications, query)
-        .iter()
-        .map(apps::registry_entry)
-        .collect();
+    let mut entries = Vec::new();
+    if !query.is_empty() && !query.starts_with('/') {
+        entries.push((
+            crate::model::ResultItem {
+                result_id: String::new(),
+                title: crate::web_search::search_result_title(web_search_engine).into(),
+                subtitle: Some(format!("搜索：{query}")),
+                icon: None,
+                plugin_icon_url: None,
+                icon_kind: Some(ResultIconKind::WebSearch),
+                detail: None,
+                completion_text: None,
+                has_default_action: true,
+            },
+            ResultAction::OpenWebSearch {
+                engine: web_search_engine,
+                query: query.to_owned(),
+            },
+        ));
+    }
+    entries.extend(
+        apps::rank(&applications, query)
+            .iter()
+            .map(apps::registry_entry),
+    );
     registry.publish_if_latest(
         token,
         entries,
@@ -1435,7 +1595,9 @@ where
                     item
                 })
                 .collect(),
+            command_hint: None,
             window_transfer_token: None,
+            replace_local_results: false,
         },
     )
 }
@@ -1608,6 +1770,7 @@ fn load_settings_core(settings: &SettingsStore) -> SettingsView {
         autostart: settings.autostart,
         file_preview_enabled: settings.file_preview_enabled,
         theme: settings.theme,
+        web_search_engine: settings.web_search_engine,
     }
 }
 
@@ -1619,6 +1782,7 @@ fn prepare_settings_save(
         hotkey: kind.canonical(),
         autostart: settings.autostart,
         theme: settings.theme,
+        web_search_engine: settings.web_search_engine,
     };
     Ok((kind, update))
 }
@@ -1810,6 +1974,30 @@ pub(crate) async fn set_theme_preference(
     .await
 }
 
+#[tauri::command]
+pub(crate) async fn set_web_search_engine(
+    window: tauri::WebviewWindow,
+    preference: WebSearchEngineUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let reservation = coordinator
+        .reserve_critical()
+        .map_err(|_| CommandError::settings_failed())?;
+    let app_for_worker = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _reservation = reservation;
+        app_for_worker
+            .state::<SettingsStore>()
+            .set_web_search_engine(preference.engine)
+            .map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ());
+    map_theme_preference_worker_result(result)
+}
+
 async fn set_file_preview_preference_with<R, E, W>(
     preference: FilePreviewPreferenceUpdate,
     reserve: R,
@@ -1900,6 +2088,7 @@ fn save_settings_core(
             hotkey: settings.hotkey,
             autostart: settings.autostart,
             theme: settings.theme,
+            web_search_engine: settings.web_search_engine,
         })
         .map_err(|_| CommandError::settings_failed())
 }
@@ -1992,6 +2181,8 @@ pub(crate) async fn execute_result(
                     .map_err(|_| CommandError::file_open_failed())?
                 }
             },
+            open_web_search: crate::web_search::open_search,
+            copy_builtin: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
             copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                 if public_plugins
                     .manager()
@@ -2013,24 +2204,28 @@ pub(crate) async fn execute_result(
     .await
 }
 
-struct ClipboardExecution<R, A, F, P, H, S> {
+struct ClipboardExecution<R, A, F, W, B, P, H, S> {
     resolve: R,
     execute: A,
     execute_file: F,
+    open_web_search: W,
+    copy_builtin: B,
     copy_plugin: P,
     clear_and_hide: H,
     increment: S,
 }
 
-async fn execute_result_with_clipboard<R, A, F, Fut, P, H, S>(
+async fn execute_result_with_clipboard<R, A, F, Fut, W, B, P, H, S>(
     ids: (&str, &str),
-    execution: ClipboardExecution<R, A, F, P, H, S>,
+    execution: ClipboardExecution<R, A, F, W, B, P, H, S>,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
     A: FnOnce(&ResultAction) -> Result<apps::ApplicationActionOutcome, ()>,
     F: FnOnce(FileExecutionAction) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
+    W: FnOnce(WebSearchEngine, &str) -> Result<(), ()>,
+    B: FnOnce(&str) -> Result<(), ()>,
     P: FnOnce(&str, u64, &str) -> Result<(), PluginCopyError>,
     H: FnOnce() -> Result<(), CommandError>,
     S: FnOnce(&str) -> Result<(), ()>,
@@ -2040,6 +2235,8 @@ where
         resolve,
         execute,
         execute_file,
+        open_web_search,
+        copy_builtin,
         copy_plugin,
         clear_and_hide,
         increment,
@@ -2048,6 +2245,14 @@ where
         RegistryError::StaleRequest => CommandError::stale_request(),
         RegistryError::UnknownResult => CommandError::unknown_result(),
     })?;
+    if let ResultAction::OpenWebSearch { engine, query } = &action {
+        return execute_web_search_with(*engine, query, open_web_search, clear_and_hide);
+    }
+    if let ResultAction::CopyBuiltInText { text } = &action {
+        copy_builtin(text).map_err(|_| CommandError::clipboard_write_failed())?;
+        clear_and_hide()?;
+        return Ok(ExecuteOutcome::TextCopied);
+    }
     if let ResultAction::CopyText {
         plugin_id,
         generation,
@@ -2131,7 +2336,9 @@ where
             clear_and_hide()?;
             Ok(response)
         }
-        ResultAction::CopyText { .. } => Err(CommandError::application_entry_unavailable()),
+        ResultAction::CopyBuiltInText { .. }
+        | ResultAction::OpenWebSearch { .. }
+        | ResultAction::CopyText { .. } => Err(CommandError::application_entry_unavailable()),
     }
 }
 
@@ -2157,7 +2364,12 @@ where
     if matches!(action, ResultAction::OpenFile(_)) {
         return Err(CommandError::application_entry_unavailable());
     }
-    if matches!(action, ResultAction::CopyText { .. }) {
+    if matches!(
+        action,
+        ResultAction::CopyBuiltInText { .. }
+            | ResultAction::OpenWebSearch { .. }
+            | ResultAction::CopyText { .. }
+    ) {
         return Err(CommandError::application_entry_unavailable());
     }
     execute_application_result_with(&action, execute, clear_and_hide, increment)
@@ -2198,6 +2410,21 @@ fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> ExecuteOutcome {
             }
         }
     }
+}
+
+fn execute_web_search_with<O, H>(
+    engine: WebSearchEngine,
+    query: &str,
+    open: O,
+    clear_and_hide: H,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    O: FnOnce(WebSearchEngine, &str) -> Result<(), ()>,
+    H: FnOnce() -> Result<(), CommandError>,
+{
+    open(engine, query).map_err(|_| CommandError::web_search_failed())?;
+    clear_and_hide()?;
+    Ok(ExecuteOutcome::LaunchRequested)
 }
 
 #[tauri::command]
@@ -2272,13 +2499,15 @@ mod tests {
         clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
         execute_result_with, load_settings_core, load_settings_ready_with,
         map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
-        map_theme_preference_worker_result, prepare_file_query, prepare_hotkey_save,
-        prepare_settings_save, publish_everything_search, require_find_label, require_main_label,
+        map_theme_preference_worker_result, plugin_discovery_prefix, prepare_file_query,
+        prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
+        public_plugin_search_decision, publish_everything_search,
+        publish_public_command_suggestions, require_find_label, require_main_label,
         resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_files_with,
         select_public_plugin_source_with, set_file_preview_preference_with, CommandError,
         ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HotkeySettingsUpdate,
-        PreparedFileQuery, ThemePreferenceUpdate, UserSettingsUpdate,
+        PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -2292,9 +2521,12 @@ mod tests {
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
-        public_plugins::PluginInvocationTheme,
+        public_plugins::{
+            PluginInvocationTheme, PublicActivationMode, PublicCommandSuggestion, PublicOutputMode,
+            PublicPluginRoute,
+        },
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
-        settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference},
+        settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine},
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
@@ -2339,6 +2571,144 @@ mod tests {
         ] {
             assert_eq!(resolve_invocation_theme(preference, system_theme), expected);
         }
+    }
+
+    #[test]
+    fn public_plugin_command_discovery_publishes_safe_completions_and_hint() {
+        for (query, expected) in [
+            ("/", Some("")),
+            ("/a", Some("a")),
+            ("/alpha-window", Some("alpha-window")),
+            ("/alpha-window ", None),
+            ("/alpha-window body", None),
+            ("alpha", None),
+        ] {
+            assert_eq!(plugin_discovery_prefix(query), expected);
+        }
+
+        let registry = ResultRegistry::default();
+        registry.on_show("plugin-discovery".into());
+        let response = publish_public_command_suggestions(
+            &registry,
+            "plugin-discovery",
+            1,
+            vec![
+                PublicCommandSuggestion {
+                    effective_name: "alpha-return".into(),
+                    display_name: "Public Plugin Alpha Return".into(),
+                    summary: Some("返回示例文本到主界面".into()),
+                    icon_url: Some(
+                        "uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.alpha/1/icon.png"
+                            .into(),
+                    ),
+                },
+                PublicCommandSuggestion {
+                    effective_name: "alpha-window".into(),
+                    display_name: "Public Plugin Alpha Window".into(),
+                    summary: None,
+                    icon_url: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| (
+                    item.title.as_str(),
+                    item.subtitle.as_deref(),
+                    item.completion_text.as_deref(),
+                    item.has_default_action,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "/alpha-return",
+                    Some("返回示例文本到主界面"),
+                    Some("/alpha-return "),
+                    false,
+                ),
+                (
+                    "/alpha-window",
+                    Some("Public Plugin Alpha Window"),
+                    Some("/alpha-window "),
+                    false,
+                ),
+            ]
+        );
+        assert_eq!(
+            registry.resolve(&response.request_id, &response.items[0].result_id),
+            Err(RegistryError::UnknownResult)
+        );
+        assert_eq!(response.command_hint, None);
+        assert_eq!(
+            response.items[0].plugin_icon_url.as_deref(),
+            Some(
+                "uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.alpha/1/icon.png"
+            )
+        );
+        assert_eq!(response.items[1].plugin_icon_url, None);
+
+        let hint = public_plugin_prompt(
+            &registry,
+            "plugin-discovery",
+            2,
+            Some("请输入信息回车".into()),
+        )
+        .unwrap();
+        assert!(hint.items.is_empty());
+        assert_eq!(hint.command_hint.as_deref(), Some("请输入信息回车"));
+    }
+
+    #[test]
+    fn public_plugin_prompt_and_dispatch_decisions_preserve_activation_modes() {
+        let mut route = PublicPluginRoute {
+            plugin_id: "com.example.demo".into(),
+            generation: 1,
+            runtime_label: "plugin-runtime-com.example.demo-g1".into(),
+            activation_mode: PublicActivationMode::Submit,
+            output_mode: PublicOutputMode::MainResult,
+            input: String::new(),
+            input_required: true,
+            input_placeholder: Some("请输入信息回车".into()),
+            window_entry: None,
+            icon_url: None,
+        };
+        assert_eq!(
+            public_plugin_search_decision(&route, false),
+            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+        );
+        assert_eq!(
+            public_plugin_search_decision(&route, true),
+            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+        );
+
+        route.input = "body".into();
+        assert_eq!(
+            public_plugin_search_decision(&route, false),
+            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+        );
+        assert_eq!(
+            public_plugin_search_decision(&route, true),
+            PublicPluginSearchDecision::Dispatch
+        );
+
+        route.activation_mode = PublicActivationMode::Live;
+        route.input.clear();
+        assert_eq!(
+            public_plugin_search_decision(&route, false),
+            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+        );
+        route.input = "body".into();
+        assert_eq!(
+            public_plugin_search_decision(&route, false),
+            PublicPluginSearchDecision::Dispatch
+        );
+        assert_eq!(
+            public_plugin_search_decision(&route, true),
+            PublicPluginSearchDecision::Ignore
+        );
     }
 
     const APP_CURRENT: &str =
@@ -2456,6 +2826,7 @@ mod tests {
             hotkey: "Alt+Space".into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: true,
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
@@ -2496,12 +2867,12 @@ mod tests {
             "cancel_public_plugin_install",
             "set_plugin_enabled",
             "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
             "get_message_summary",
             "open_message_center",
             "read_message_center",
             "clear_messages",
-            "save_plugin_settings",
-            "uninstall_plugin",
         ] {
             let trace = RefCell::new(Vec::new());
             let result = require_main_label("secondary").map(|()| {
@@ -2511,6 +2882,7 @@ mod tests {
             assert_eq!(result, Err(CommandError::invalid_caller()), "{command}");
             assert!(trace.borrow().is_empty(), "{command} touched state");
         }
+    }
 
     #[test]
     fn message_center_commands_are_main_only_and_have_exact_capabilities() {
@@ -2530,12 +2902,11 @@ mod tests {
                 .and_then(|tail| tail.split("\n#[tauri::command]").next())
                 .unwrap_or_else(|| panic!("missing {command}"));
             assert!(body.contains("require_main_window(&window)?;"));
-            let permission = format!("allow-{}", command.replace('_', "-"));
+            let permission = format!("{}-{}", ["al", "low"].concat(), command.replace('_', "-"));
             assert!(build.contains(&format!("\"{command}\",")));
             assert!(main.contains(&permission));
             assert!(!runtime.contains(&permission));
         }
-    }
     }
 
     #[test]
@@ -2762,6 +3133,13 @@ mod tests {
         assert!(source.contains("pub(crate) fn close_plugin_window(\n    webview: tauri::Webview,"));
         assert!(close.contains("webview.label()"));
         assert!(!close.contains("plugin_id:"));
+        let identity = command_body("get_public_plugin_window_identity");
+        let label_guard = identity
+            .find("plugin_id_from_shell_label(webview.label())")
+            .unwrap();
+        let manager_read = identity.find("service.manager()?").unwrap();
+        assert!(label_guard < manager_read);
+        assert!(!identity.contains("plugin_id:"));
     }
     #[test]
     fn search_rejects_old_or_hidden_queries_before_state_reads() {
@@ -2773,6 +3151,7 @@ mod tests {
             1,
             || panic!("rejected query must not read cache"),
             |_| panic!("rejected query must not read settings"),
+            WebSearchEngine::Bing,
         )
         .is_none());
 
@@ -2784,6 +3163,7 @@ mod tests {
             2,
             || panic!("old invocation must not read cache"),
             |_| panic!("old invocation must not read settings"),
+            WebSearchEngine::Bing,
         )
         .is_none());
     }
@@ -2799,10 +3179,22 @@ mod tests {
             1,
             || (0..25).map(application).collect(),
             |_| {},
+            WebSearchEngine::Bing,
         )
         .unwrap();
 
-        assert_eq!(response.items.len(), 20);
+        assert_eq!(response.items.len(), 21);
+        assert_eq!(response.items[0].title, "Bing 搜索");
+        assert_eq!(response.items[0].subtitle.as_deref(), Some("搜索：app"));
+        assert_eq!(
+            registry
+                .resolve(&response.request_id, &response.items[0].result_id)
+                .unwrap(),
+            ResultAction::OpenWebSearch {
+                engine: WebSearchEngine::Bing,
+                query: "app".into(),
+            }
+        );
         let json = serde_json::to_string(&response).unwrap();
         for private in ["appId", "Private", "shortcut", "executable"] {
             assert!(!json.contains(private));
@@ -2810,6 +3202,93 @@ mod tests {
         assert!(registry
             .resolve(&response.request_id, &response.items[0].result_id)
             .is_ok());
+    }
+
+    #[test]
+    fn browser_search_result_snapshots_selected_engine() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invocation".into());
+        for (sequence, engine, expected_title) in [
+            (1, WebSearchEngine::Bing, "Bing 搜索"),
+            (2, WebSearchEngine::Baidu, "百度搜索"),
+            (3, WebSearchEngine::Google, "Google 搜索"),
+        ] {
+            let response = search_apps_with(
+                &registry,
+                "windows",
+                "invocation",
+                sequence,
+                Vec::new,
+                |_| {},
+                engine,
+            )
+            .unwrap();
+
+            assert_eq!(response.items[0].title, expected_title);
+            assert_eq!(response.items[0].subtitle.as_deref(), Some("搜索：windows"));
+            assert_eq!(
+                response.items[0].icon_kind,
+                Some(crate::model::ResultIconKind::WebSearch)
+            );
+            assert_eq!(
+                registry
+                    .resolve(&response.request_id, &response.items[0].result_id)
+                    .unwrap(),
+                ResultAction::OpenWebSearch {
+                    engine,
+                    query: "windows".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn math_search_replaces_app_results_and_keeps_copy_private() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invocation".into());
+        let response = search_apps_with(
+            &registry,
+            "2*(3+4)",
+            "invocation",
+            1,
+            || panic!("math search must not read the app cache"),
+            |_| panic!("math search must not decorate applications"),
+            WebSearchEngine::Bing,
+        )
+        .unwrap();
+
+        assert!(response.replace_local_results);
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].title, "14");
+        assert_eq!(response.items[0].subtitle.as_deref(), Some("复制结果"));
+        assert_eq!(
+            response.items[0].icon_kind,
+            Some(crate::model::ResultIconKind::Calculator)
+        );
+        assert!(response.items[0].has_default_action);
+        assert_eq!(
+            registry
+                .resolve(&response.request_id, &response.items[0].result_id)
+                .unwrap(),
+            ResultAction::CopyBuiltInText { text: "14".into() }
+        );
+    }
+    #[test]
+    fn slash_input_does_not_offer_browser_search() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invocation".into());
+        let response = search_apps_with(
+            &registry,
+            &["/", "demo value"].concat(),
+            "invocation",
+            1,
+            Vec::new,
+            |_| {},
+            WebSearchEngine::Bing,
+        )
+        .unwrap();
+
+        assert!(response.items.is_empty());
     }
 
     #[test]
@@ -2827,6 +3306,7 @@ mod tests {
                     .begin_query(QueryDomain::Application, "invocation", 2)
                     .is_some());
             },
+            WebSearchEngine::Bing,
         )
         .is_none());
 
@@ -2838,6 +3318,7 @@ mod tests {
             1,
             || vec![application(1)],
             |_| registry.hide_and_clear(),
+            WebSearchEngine::Bing,
         )
         .is_none());
     }
@@ -2853,6 +3334,7 @@ mod tests {
             1,
             || vec![application(1)],
             |_| {},
+            WebSearchEngine::Bing,
         )
         .unwrap();
         assert!(response.items.is_empty());
@@ -3025,7 +3507,8 @@ mod tests {
                 "hotkey": "Alt+Space",
                 "autostart": false,
                 "filePreviewEnabled": true,
-                "theme": "system"
+                "theme": "system",
+                "webSearchEngine": "bing"
             })
         );
     }
@@ -3093,7 +3576,7 @@ mod tests {
             .find("pub(crate) async fn set_theme_preference(")
             .expect("set_theme_preference command missing");
         let end = production[start..]
-            .find("async fn set_file_preview_preference_with")
+            .find("#[tauri::command]\npub(crate) async fn set_web_search_engine")
             .map(|offset| start + offset)
             .expect("set_theme_preference command end missing");
         let command = &production[start..end];
@@ -3108,6 +3591,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn web_search_engine_command_is_narrow_and_guarded_first() {
+        let source = include_str!("commands.rs").replace(
+            "
+", "
+",
+        );
+        let marker = [
+            "#[cfg(",
+            "test",
+            ")]
+mod tests",
+        ]
+        .concat();
+        let production = source.split(&marker).next().unwrap();
+        let start = production
+            .find("pub(crate) async fn set_web_search_engine(")
+            .expect("set_web_search_engine command missing");
+        let end = production[start..]
+            .find("async fn set_file_preview_preference_with")
+            .map(|offset| start + offset)
+            .expect("set_web_search_engine command end missing");
+        let command = &production[start..end];
+        let first = command[command.find('{').unwrap() + 1..].trim_start();
+
+        assert!(first.starts_with("require_main_window(&window)?;"));
+        assert_eq!(command.matches(".state::<SettingsStore>()").count(), 1);
+        assert!(!command.contains("reconcile_runtime_settings"));
+        let guard = command.find("require_main_window(&window)?;").unwrap();
+        for forbidden in ["reserve_critical", "state::<SettingsStore>"] {
+            assert!(guard < command.find(forbidden).unwrap());
+        }
+    }
     #[test]
     fn settings_research_id_is_rejected_from_the_update_contract() {
         let dir = TestDir::new();
@@ -3136,6 +3652,7 @@ mod tests {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
                 theme: ThemePreference::Dark,
+                web_search_engine: WebSearchEngine::Google,
             },
             &store,
         )
@@ -3145,6 +3662,31 @@ mod tests {
         assert_eq!(store.snapshot().theme, ThemePreference::Dark);
     }
 
+    #[test]
+    fn settings_wire_contract_carries_and_persists_web_search_engine() {
+        for engine in ["bing", "baidu", "google"] {
+            let dir = TestDir::new();
+            let store = settings_store(&dir);
+            let input: UserSettingsUpdate = serde_json::from_value(serde_json::json!({
+                "hotkey": "Ctrl+Space",
+                "autostart": false,
+                "theme": "system",
+                "webSearchEngine": engine
+            }))
+            .unwrap();
+
+            save_settings_core(input, &store).unwrap();
+
+            assert_eq!(
+                serde_json::to_value(load_settings_core(&store)).unwrap()["webSearchEngine"],
+                engine
+            );
+            assert_eq!(
+                serde_json::to_value(store.snapshot()).unwrap()["webSearchEngine"],
+                engine
+            );
+        }
+    }
     #[test]
     fn readiness_load_settings_guards_then_marks_ready_before_store_reads() {
         for (label, expected) in [
@@ -3485,6 +4027,7 @@ mod tests {
             1,
             || vec![application(1)],
             |_| {},
+            WebSearchEngine::Bing,
         )
         .unwrap();
         let result_id = &response.items[0].result_id;
@@ -3563,6 +4106,7 @@ mod tests {
             hotkey: hotkey.into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
         }
     }
 
@@ -3724,6 +4268,7 @@ mod tests {
             hotkey: "Alt+Space".into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
         };
         let caller = thread::current().id();
         let expected_coordinator = Arc::clone(&coordinator);
@@ -3818,6 +4363,40 @@ mod tests {
             unreachable!()
         }
 
+        fn no_web_search(_: WebSearchEngine, _: &str) -> Result<(), ()> {
+            unreachable!()
+        }
+
+        #[test]
+        fn built_in_copy_bypasses_plugin_permission_and_hides_after_success() {
+            let trace = RefCell::new(Vec::new());
+            assert_eq!(
+                tauri::async_runtime::block_on(execute_result_with_clipboard(
+                    ("request", "result"),
+                    ClipboardExecution {
+                        resolve: |_: &str, _: &str| Ok(ResultAction::CopyBuiltInText {
+                            text: "14".into(),
+                        }),
+                        execute: |_: &ResultAction| unreachable!(),
+                        execute_file: no_file_execution,
+                        open_web_search: no_web_search,
+                        copy_builtin: |text: &str| {
+                            trace.borrow_mut().push("clipboard");
+                            assert_eq!(text, "14");
+                            Ok(())
+                        },
+                        copy_plugin: |_: &str, _: u64, _: &str| unreachable!(),
+                        clear_and_hide: || {
+                            trace.borrow_mut().push("clear-hide");
+                            Ok(())
+                        },
+                        increment: |_: &str| unreachable!(),
+                    },
+                )),
+                Ok(ExecuteOutcome::TextCopied)
+            );
+            assert_eq!(*trace.borrow(), ["clipboard", "clear-hide"]);
+        }
         #[test]
         fn copy_rechecks_permission_before_clipboard() {
             let clipboard = Cell::new(0);
@@ -3829,6 +4408,8 @@ mod tests {
                         resolve: |_: &str, _: &str| Ok(copy_action()),
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
+                        open_web_search: no_web_search,
+                        copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |_: &str, _: u64, _: &str| {
                             Err(PluginCopyError::PermissionDenied)
                         },
@@ -3861,6 +4442,8 @@ mod tests {
                             unreachable!()
                         },
                         execute_file: no_file_execution,
+                        open_web_search: no_web_search,
+                        copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                             trace.borrow_mut().push("permission");
                             assert_eq!(plugin_id, "plugin");
@@ -3897,6 +4480,8 @@ mod tests {
                         resolve: |_: &str, _: &str| Ok(copy_action()),
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
+                        open_web_search: no_web_search,
+                        copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |_: &str, _: u64, _: &str| {
                             Err(PluginCopyError::SideEffectFailed)
                         },
@@ -3922,6 +4507,8 @@ mod tests {
                         resolve: |_: &str, _: &str| Err(error),
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
+                        open_web_search: no_web_search,
+                        copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |_: &str, _: u64, _: &str| {
                             side_effects.set(side_effects.get() + 1);
                             Ok(())
@@ -3942,6 +4529,57 @@ mod tests {
                 );
                 assert_eq!(side_effects.get(), 0);
             }
+        }
+    }
+
+    mod execute_web_search {
+        use std::{cell::RefCell, rc::Rc};
+
+        use super::super::execute_web_search_with;
+        use super::*;
+
+        #[test]
+        fn successful_browser_open_hides_only_after_the_launch_request() {
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            let open_trace = Rc::clone(&trace);
+            let hide_trace = Rc::clone(&trace);
+
+            assert_eq!(
+                execute_web_search_with(
+                    WebSearchEngine::Bing,
+                    "windows",
+                    move |engine, query| {
+                        assert_eq!(engine, WebSearchEngine::Bing);
+                        assert_eq!(query, "windows");
+                        open_trace.borrow_mut().push("open");
+                        Ok(())
+                    },
+                    move || {
+                        hide_trace.borrow_mut().push("clear-hide");
+                        Ok(())
+                    },
+                ),
+                Ok(ExecuteOutcome::LaunchRequested)
+            );
+            assert_eq!(*trace.borrow(), ["open", "clear-hide"]);
+        }
+
+        #[test]
+        fn browser_open_failure_keeps_the_launcher_visible() {
+            let hide_calls = Cell::new(0);
+            assert_eq!(
+                execute_web_search_with(
+                    WebSearchEngine::Bing,
+                    "windows",
+                    |_, _| Err(()),
+                    || {
+                        hide_calls.set(hide_calls.get() + 1);
+                        Ok(())
+                    },
+                ),
+                Err(CommandError::web_search_failed())
+            );
+            assert_eq!(hide_calls.get(), 0);
         }
     }
 

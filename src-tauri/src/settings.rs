@@ -30,6 +30,15 @@ pub(crate) enum ThemePreference {
     Light,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WebSearchEngine {
+    #[default]
+    Bing,
+    Baidu,
+    Google,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
@@ -37,6 +46,8 @@ pub(crate) struct Settings {
     pub(crate) autostart: bool,
     #[serde(default)]
     pub(crate) theme: ThemePreference,
+    #[serde(default)]
+    pub(crate) web_search_engine: WebSearchEngine,
     #[serde(default = "default_file_preview_enabled")]
     pub(crate) file_preview_enabled: bool,
     #[serde(default)]
@@ -53,6 +64,7 @@ pub(crate) struct SettingsUpdate {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
     pub(crate) theme: ThemePreference,
+    pub(crate) web_search_engine: WebSearchEngine,
 }
 
 struct SettingsState {
@@ -89,6 +101,7 @@ impl Default for Settings {
             hotkey: "Shift+Space".into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: default_file_preview_enabled(),
             use_counts: BTreeMap::new(),
             window_position: None,
@@ -179,6 +192,7 @@ impl SettingsStore {
         candidate.hotkey = update.hotkey;
         candidate.autostart = update.autostart;
         candidate.theme = update.theme;
+        candidate.web_search_engine = update.web_search_engine;
         self.persist(&mut state, candidate)
     }
 
@@ -202,6 +216,16 @@ impl SettingsStore {
         let mut candidate = state.value.clone();
         let count = candidate.use_counts.entry(app_id.into()).or_default();
         *count = count.checked_add(1).ok_or(SettingsError::CountOverflow)?;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_web_search_engine(
+        &self,
+        engine: WebSearchEngine,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.web_search_engine = engine;
         self.persist(&mut state, candidate)
     }
 
@@ -463,6 +487,7 @@ mod tests {
             hotkey: "Alt+Space".into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
         }
     }
 
@@ -479,6 +504,57 @@ mod tests {
         assert_eq!(Settings::default().hotkey, "Shift+Space");
     }
 
+    #[test]
+    fn web_search_engine_defaults_and_round_trips_strict_values() {
+        let legacy: Settings = serde_json::from_value(serde_json::json!({
+            "hotkey": "Shift+Space",
+            "autostart": false
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap()["webSearchEngine"],
+            "bing"
+        );
+
+        for engine in ["bing", "baidu", "google"] {
+            let value: Settings = serde_json::from_value(serde_json::json!({
+                "hotkey": "Shift+Space",
+                "autostart": false,
+                "webSearchEngine": engine
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(value).unwrap()["webSearchEngine"],
+                engine
+            );
+        }
+        assert!(serde_json::from_value::<Settings>(serde_json::json!({
+            "hotkey": "Shift+Space",
+            "autostart": false,
+            "webSearchEngine": "unknown"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn invalid_web_search_engine_uses_existing_backup_recovery() {
+        let dir = TestDir::new("invalid-web-search-engine");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Ctrl+Space","autostart":false,"webSearchEngine":"unknown"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.backup(),
+            br#"{"hotkey":"Alt+Space","autostart":false,"webSearchEngine":"bing"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(dir.path()).unwrap();
+
+        assert_eq!(store.snapshot().hotkey, "Alt+Space");
+        assert!(!dir.current().exists());
+    }
     #[test]
     fn theme_defaults_system_and_round_trips_all_values() {
         let dir = TestDir::new("theme-legacy");
@@ -690,6 +766,7 @@ mod tests {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
                 theme: ThemePreference::Dark,
+                web_search_engine: WebSearchEngine::Google,
             })
             .unwrap();
 
@@ -698,6 +775,7 @@ mod tests {
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
         assert_eq!(value.theme, ThemePreference::Dark);
+        assert_eq!(value.web_search_engine, WebSearchEngine::Google);
     }
 
     #[test]
@@ -995,6 +1073,7 @@ mod tests {
             hotkey: "Ctrl+Space".into(),
             autostart: true,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             window_position: None,
