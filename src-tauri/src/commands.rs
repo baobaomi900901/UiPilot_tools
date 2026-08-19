@@ -396,6 +396,8 @@ impl From<PluginRuntimeError> for CommandError {
             PluginRuntimeError::InvalidOperation => "invalidOperation",
             PluginRuntimeError::PermissionDenied => "permissionDenied",
             PluginRuntimeError::InvalidNotification => "invalidNotification",
+            PluginRuntimeError::InvalidDelay => "invalidDelay",
+            PluginRuntimeError::ScheduleLimitExceeded => "scheduleLimitExceeded",
             PluginRuntimeError::AlreadyPublished => "alreadyPublished",
             PluginRuntimeError::MessageStoreUnavailable => "messageStoreUnavailable",
             PluginRuntimeError::Storage => "storageFailed",

@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +8,9 @@ use crate::message_center::{
 };
 
 use super::{
+    delayed_messages::{
+        DelayedMessageRegistration, DelayedMessageScheduleError, DelayedMessageScheduler,
+    },
     scheduler::{PluginContextAccessError, PluginCurrentRequest, PluginRequestScheduler},
     PluginDataScope, PluginRequestContext, PluginSecretStore, PluginStateStore, PluginStorageStore,
     PublicManifestV1, PublicPermission,
@@ -67,6 +70,12 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
               : input;
             return operation('notificationPublish', undefined, undefined, snapshot);
           },
+          schedule: (input) => {
+            const snapshot = input && typeof input === 'object' && !Array.isArray(input)
+              ? deepFreeze({ ...input })
+              : input;
+            return operation('notificationSchedule', undefined, undefined, snapshot);
+          },
         },
       });
       try {
@@ -113,12 +122,22 @@ pub(crate) enum PluginApiOperation {
     SettingGet,
     SecretConfigured,
     NotificationPublish,
+    NotificationSchedule,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PluginNotificationPublishInput {
     content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginNotificationScheduleInput {
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    delay_ms: Option<Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +148,8 @@ pub(crate) enum PluginRuntimeError {
     InvalidOperation,
     PermissionDenied,
     InvalidNotification,
+    InvalidDelay,
+    ScheduleLimitExceeded,
     AlreadyPublished,
     MessageStoreUnavailable,
     Storage,
@@ -144,6 +165,8 @@ impl fmt::Display for PluginRuntimeError {
             Self::InvalidOperation => "InvalidOperation",
             Self::PermissionDenied => "PermissionDenied",
             Self::InvalidNotification => "InvalidNotification",
+            Self::InvalidDelay => "InvalidDelay",
+            Self::ScheduleLimitExceeded => "ScheduleLimitExceeded",
             Self::AlreadyPublished => "AlreadyPublished",
             Self::MessageStoreUnavailable => "MessageStoreUnavailable",
             Self::Storage => "StorageError",
@@ -159,6 +182,7 @@ pub(crate) struct PluginRuntimeApi {
     state: Arc<PluginStateStore>,
     storage: Arc<PluginStorageStore>,
     secrets: Arc<PluginSecretStore>,
+    delayed_messages: Arc<DelayedMessageScheduler>,
     messages: Arc<dyn MessagePublisher>,
 }
 
@@ -193,6 +217,7 @@ impl PluginRuntimeApi {
         state: Arc<PluginStateStore>,
         storage: Arc<PluginStorageStore>,
         secrets: Arc<PluginSecretStore>,
+        delayed_messages: Arc<DelayedMessageScheduler>,
         messages: Arc<dyn MessagePublisher>,
     ) -> Self {
         Self {
@@ -200,6 +225,7 @@ impl PluginRuntimeApi {
             state,
             storage,
             secrets,
+            delayed_messages,
             messages,
         }
     }
@@ -240,6 +266,9 @@ impl PluginRuntimeApi {
     ) -> PluginApiExecution {
         if request.operation == PluginApiOperation::NotificationPublish {
             return self.publish_notification(request, manifest, current);
+        }
+        if request.operation == PluginApiOperation::NotificationSchedule {
+            return self.schedule_notification(request, manifest, current);
         }
         if request.notification.is_some() {
             return PluginApiExecution::failed(PluginRuntimeError::InvalidOperation);
@@ -317,7 +346,9 @@ impl PluginRuntimeApi {
             | PluginApiOperation::StorageRemove
             | PluginApiOperation::SettingGet
             | PluginApiOperation::SecretConfigured => Err(PluginRuntimeError::InvalidOperation),
-            PluginApiOperation::NotificationPublish => unreachable!("handled before data APIs"),
+            PluginApiOperation::NotificationPublish | PluginApiOperation::NotificationSchedule => {
+                unreachable!("handled before data APIs")
+            }
         }
     }
 
@@ -382,6 +413,85 @@ impl PluginRuntimeApi {
             ),
             MessagePublishOutcome::OperationFailed | MessagePublishOutcome::Unavailable => {
                 PluginApiExecution::failed(PluginRuntimeError::MessageStoreUnavailable)
+            }
+        }
+    }
+
+    fn schedule_notification(
+        &self,
+        request: PluginApiRequest,
+        manifest: &PublicManifestV1,
+        current: &mut PluginCurrentRequest<'_>,
+    ) -> PluginApiExecution {
+        let plugin_id = &request.context.plugin_id;
+        let permitted = manifest
+            .permissions
+            .contains(&PublicPermission::NotificationsPublish)
+            && self
+                .state
+                .config(plugin_id)
+                .ok()
+                .flatten()
+                .is_some_and(|config| {
+                    config.installed
+                        && config.enabled
+                        && config.fault.is_none()
+                        && config.active_generation == request.context.plugin_generation
+                        && config
+                            .permission_grants
+                            .contains(&PublicPermission::NotificationsPublish)
+                });
+        if !permitted {
+            return PluginApiExecution::failed(PluginRuntimeError::PermissionDenied);
+        }
+        if request.key.is_some() || request.value.is_some() {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        }
+        let Some(value) = request.notification else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        };
+        let Ok(input) = serde_json::from_value::<PluginNotificationScheduleInput>(value) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        };
+        let Some(content) = input.content.as_ref().and_then(Value::as_str) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        };
+        if !valid_notification_content(content) {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidNotification);
+        }
+        let Some(delay_ms) = input.delay_ms.as_ref().and_then(Value::as_u64) else {
+            return PluginApiExecution::failed(PluginRuntimeError::InvalidDelay);
+        };
+        if current.notification_published() {
+            return PluginApiExecution::failed(PluginRuntimeError::AlreadyPublished);
+        }
+        if !self.messages.is_available() {
+            return PluginApiExecution::failed(PluginRuntimeError::MessageStoreUnavailable);
+        }
+        let registration = DelayedMessageRegistration {
+            plugin_id: plugin_id.clone(),
+            plugin_generation: request.context.plugin_generation,
+            plugin_name_snapshot: manifest.name.clone(),
+            request_id: request.context.request_id,
+            content: content.into(),
+            delay_ms,
+        };
+        match self.delayed_messages.schedule(registration, Instant::now()) {
+            Ok(_) => {
+                current.mark_notification_published();
+                PluginApiExecution::complete(Ok(Value::Null), None)
+            }
+            Err(DelayedMessageScheduleError::InvalidDelay) => {
+                PluginApiExecution::failed(PluginRuntimeError::InvalidDelay)
+            }
+            Err(DelayedMessageScheduleError::LimitExceeded) => {
+                PluginApiExecution::failed(PluginRuntimeError::ScheduleLimitExceeded)
+            }
+            Err(DelayedMessageScheduleError::InvalidRegistration) => {
+                PluginApiExecution::failed(PluginRuntimeError::InvalidContext)
+            }
+            Err(DelayedMessageScheduleError::Unavailable) => {
+                PluginApiExecution::failed(PluginRuntimeError::Unavailable)
             }
         }
     }
@@ -506,10 +616,10 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Mutex,
         },
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     use serde_json::json;
@@ -520,6 +630,7 @@ mod tests {
         MessagePublished, MessagePublisher,
     };
     use crate::public_plugins::{
+        delayed_messages::{DelayedMessageRegistration, DelayedMessageScheduler},
         scheduler::{PluginRequestCandidate, PluginScheduleOutcome, PluginSubmissionOwner},
         PublicActivationMode, PublicPermission, ScheduledPluginRequest,
     };
@@ -606,6 +717,19 @@ mod tests {
         }
     }
 
+    fn scheduled_notification_request(
+        context: PluginRequestContext,
+        notification: Option<Value>,
+    ) -> PluginApiRequest {
+        PluginApiRequest {
+            context,
+            operation: PluginApiOperation::NotificationSchedule,
+            key: None,
+            value: None,
+            notification,
+        }
+    }
+
     fn runtime_fixture(
         dir: &TestDir,
         persisted_manifest: &PublicManifestV1,
@@ -614,6 +738,7 @@ mod tests {
     ) -> (
         PluginRuntimeApi,
         Arc<PluginRequestScheduler>,
+        Arc<DelayedMessageScheduler>,
         ScheduledPluginRequest,
         String,
     ) {
@@ -626,7 +751,15 @@ mod tests {
             .unwrap();
         let storage = Arc::new(PluginStorageStore::load(&dir.path().join("storage")).unwrap());
         let secrets = Arc::new(PluginSecretStore::load(&dir.path().join("secrets")).unwrap());
-        let api = PluginRuntimeApi::new(Arc::clone(&scheduler), state, storage, secrets, publisher);
+        let delayed_messages = Arc::new(DelayedMessageScheduler::default());
+        let api = PluginRuntimeApi::new(
+            Arc::clone(&scheduler),
+            state,
+            storage,
+            secrets,
+            Arc::clone(&delayed_messages),
+            publisher,
+        );
         let scheduled = match scheduler
             .enqueue(
                 PluginRequestCandidate {
@@ -648,7 +781,7 @@ mod tests {
             PluginScheduleOutcome::Waiting { .. } => panic!("first request must dispatch"),
         };
         let label = runtime_label(&persisted_manifest.plugin_id, 1).unwrap();
-        (api, scheduler, scheduled, label)
+        (api, scheduler, delayed_messages, scheduled, label)
     }
 
     #[derive(Clone, Copy)]
@@ -658,6 +791,7 @@ mod tests {
     }
 
     struct FakePublisher {
+        available: AtomicBool,
         outcomes: Mutex<VecDeque<FakePublishOutcome>>,
         calls: Mutex<Vec<MessagePublishRequest>>,
     }
@@ -665,7 +799,16 @@ mod tests {
     impl FakePublisher {
         fn new(outcomes: impl IntoIterator<Item = FakePublishOutcome>) -> Self {
             Self {
+                available: AtomicBool::new(true),
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                available: AtomicBool::new(false),
+                outcomes: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -673,9 +816,17 @@ mod tests {
         fn calls(&self) -> Vec<MessagePublishRequest> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn set_available(&self, available: bool) {
+            self.available.store(available, Ordering::Release);
+        }
     }
 
     impl MessagePublisher for FakePublisher {
+        fn is_available(&self) -> bool {
+            self.available.load(Ordering::Acquire)
+        }
+
         fn commit_publish(&self, request: MessagePublishRequest) -> MessagePublishOutcome {
             let mut calls = self.calls.lock().unwrap();
             calls.push(request.clone());
@@ -710,7 +861,14 @@ mod tests {
         let storage = Arc::new(PluginStorageStore::load(&dir.path().join("storage")).unwrap());
         let secrets = Arc::new(PluginSecretStore::load(&dir.path().join("secrets")).unwrap());
         let publisher = Arc::new(FakePublisher::new([]));
-        let api = PluginRuntimeApi::new(Arc::clone(&scheduler), state, storage, secrets, publisher);
+        let api = PluginRuntimeApi::new(
+            Arc::clone(&scheduler),
+            state,
+            storage,
+            secrets,
+            Arc::new(DelayedMessageScheduler::default()),
+            publisher,
+        );
         let manifest = manifest();
         let scheduled = match scheduler
             .enqueue(
@@ -811,7 +969,7 @@ mod tests {
         let persisted = manifest();
         let declared = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, _, scheduled, label) =
+        let (api, _, _, scheduled, label) =
             runtime_fixture(&dir, &persisted, BTreeSet::new(), publisher.clone());
         let input = Some(json!({ "content": "message" }));
 
@@ -841,7 +999,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -888,7 +1046,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -916,7 +1074,7 @@ mod tests {
             FakePublishOutcome::OperationFailed,
             FakePublishOutcome::Succeed,
         ]));
-        let (api, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -942,7 +1100,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let message_center = Arc::new(MessageCenterService::load(dir.path()));
-        let (api, scheduler, scheduled, label) = runtime_fixture(
+        let (api, scheduler, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1005,7 +1163,7 @@ mod tests {
         .unwrap();
         let manifest = notification_manifest();
         let message_center = Arc::new(MessageCenterService::load(dir.path()));
-        let (api, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1029,5 +1187,252 @@ mod tests {
             Err(PluginRuntimeError::MessageStoreUnavailable)
         );
         assert_eq!(second.post_guard_effect, None);
+    }
+
+    #[test]
+    fn accepted_schedule_survives_request_supersession_with_immutable_identity() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([]));
+        let (api, scheduler, delayed_messages, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher,
+        );
+        let before = Instant::now();
+
+        let execution = api.execute(
+            &label,
+            scheduled_notification_request(
+                scheduled.context.clone(),
+                Some(json!({ "content": "later", "delayMs": 10_000 })),
+            ),
+            &manifest,
+        );
+        scheduler
+            .enqueue(
+                PluginRequestCandidate {
+                    plugin_id: manifest.plugin_id.clone(),
+                    plugin_generation: 1,
+                    activation_mode: PublicActivationMode::Submit,
+                    input: "new".into(),
+                    owner: PluginSubmissionOwner {
+                        ui_intent_epoch: 2,
+                        control_value: "/runtime new".into(),
+                        submission_token: "submission-new".into(),
+                    },
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(execution.result, Ok(Value::Null));
+        assert_eq!(execution.post_guard_effect, None);
+        assert_eq!(
+            scheduler.context_status(&scheduled.context),
+            crate::public_plugins::PluginContextStatus::Expired
+        );
+        let message = delayed_messages
+            .claim_due(before + Duration::from_secs(11))
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.plugin_id, manifest.plugin_id);
+        assert_eq!(message.plugin_generation, 1);
+        assert_eq!(message.plugin_name_snapshot, manifest.name);
+        assert_eq!(message.request_id, scheduled.context.request_id);
+        assert_eq!(message.content, "later");
+    }
+
+    #[test]
+    fn unavailable_store_rejects_schedule_without_consuming_notification_allowance() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::unavailable());
+        let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher.clone(),
+        );
+
+        let schedule = scheduled_notification_request(
+            scheduled.context.clone(),
+            Some(json!({ "content": "later", "delayMs": 10_000 })),
+        );
+        assert_eq!(
+            api.execute(&label, schedule, &manifest).result,
+            Err(PluginRuntimeError::MessageStoreUnavailable)
+        );
+        assert_eq!(
+            delayed_messages.claim_due(Instant::now() + Duration::from_secs(11)),
+            Ok(None)
+        );
+        publisher.set_available(true);
+        assert_eq!(
+            api.execute(
+                &label,
+                notification_request(scheduled.context, Some(json!({ "content": "immediate" })),),
+                &manifest,
+            )
+            .result,
+            Ok(Value::Null)
+        );
+        assert_eq!(publisher.calls().len(), 1);
+    }
+
+    #[test]
+    fn schedule_validation_distinguishes_content_and_delay_without_consuming_allowance() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([]));
+        let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher,
+        );
+
+        for (notification, expected) in [
+            (
+                json!({ "content": "   ", "delayMs": 10_000 }),
+                PluginRuntimeError::InvalidNotification,
+            ),
+            (
+                json!({ "content": "later" }),
+                PluginRuntimeError::InvalidDelay,
+            ),
+            (
+                json!({ "content": "later", "delayMs": -1 }),
+                PluginRuntimeError::InvalidDelay,
+            ),
+            (
+                json!({ "content": "later", "delayMs": 1.5 }),
+                PluginRuntimeError::InvalidDelay,
+            ),
+            (
+                json!({ "content": "later", "delayMs": 999 }),
+                PluginRuntimeError::InvalidDelay,
+            ),
+            (
+                json!({ "content": "later", "delayMs": 86_400_001 }),
+                PluginRuntimeError::InvalidDelay,
+            ),
+            (
+                json!({ "content": "later", "delayMs": 10_000, "unknown": true }),
+                PluginRuntimeError::InvalidNotification,
+            ),
+        ] {
+            assert_eq!(
+                api.execute(
+                    &label,
+                    scheduled_notification_request(scheduled.context.clone(), Some(notification),),
+                    &manifest,
+                )
+                .result,
+                Err(expected)
+            );
+        }
+
+        assert_eq!(
+            api.execute(
+                &label,
+                scheduled_notification_request(
+                    scheduled.context,
+                    Some(json!({ "content": "valid", "delayMs": 10_000 })),
+                ),
+                &manifest,
+            )
+            .result,
+            Ok(Value::Null)
+        );
+        assert!(delayed_messages
+            .claim_due(Instant::now() + Duration::from_secs(11))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn immediate_and_delayed_notifications_share_one_request_allowance() {
+        for schedule_first in [true, false] {
+            let dir = TestDir::new();
+            let manifest = notification_manifest();
+            let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
+            let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+                &dir,
+                &manifest,
+                BTreeSet::from([PublicPermission::NotificationsPublish]),
+                publisher.clone(),
+            );
+            let schedule = scheduled_notification_request(
+                scheduled.context.clone(),
+                Some(json!({ "content": "later", "delayMs": 10_000 })),
+            );
+            let publish =
+                notification_request(scheduled.context, Some(json!({ "content": "immediate" })));
+            let (first, second) = if schedule_first {
+                (schedule, publish)
+            } else {
+                (publish, schedule)
+            };
+
+            assert_eq!(
+                api.execute(&label, first, &manifest).result,
+                Ok(Value::Null)
+            );
+            assert_eq!(
+                api.execute(&label, second, &manifest).result,
+                Err(PluginRuntimeError::AlreadyPublished),
+                "schedule_first={schedule_first}"
+            );
+            let queued = delayed_messages
+                .claim_due(Instant::now() + Duration::from_secs(11))
+                .unwrap();
+            assert_eq!(queued.is_some(), schedule_first);
+            assert_eq!(publisher.calls().len(), usize::from(!schedule_first));
+        }
+    }
+
+    #[test]
+    fn schedule_limit_error_does_not_consume_request_allowance() {
+        let dir = TestDir::new();
+        let manifest = notification_manifest();
+        let publisher = Arc::new(FakePublisher::new([]));
+        let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+            &dir,
+            &manifest,
+            BTreeSet::from([PublicPermission::NotificationsPublish]),
+            publisher,
+        );
+        let now = Instant::now();
+        for index in 0..32 {
+            delayed_messages
+                .schedule(
+                    DelayedMessageRegistration {
+                        plugin_id: manifest.plugin_id.clone(),
+                        plugin_generation: 1,
+                        plugin_name_snapshot: manifest.name.clone(),
+                        request_id: format!("prefill-{index}"),
+                        content: "prefill".into(),
+                        delay_ms: 10_000,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        let request = scheduled_notification_request(
+            scheduled.context,
+            Some(json!({ "content": "later", "delayMs": 10_000 })),
+        );
+
+        assert_eq!(
+            api.execute(&label, request.clone(), &manifest).result,
+            Err(PluginRuntimeError::ScheduleLimitExceeded)
+        );
+        assert_eq!(delayed_messages.cancel_plugin(&manifest.plugin_id), Ok(32));
+        assert_eq!(
+            api.execute(&label, request, &manifest).result,
+            Ok(Value::Null)
+        );
     }
 }

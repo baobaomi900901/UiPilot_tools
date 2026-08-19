@@ -86,6 +86,7 @@ pub(crate) enum MessageCenterError {
 }
 
 pub(crate) trait MessagePublisher: Send + Sync {
+    fn is_available(&self) -> bool;
     fn commit_publish(&self, request: MessagePublishRequest) -> MessagePublishOutcome;
 }
 
@@ -212,6 +213,10 @@ fn dispatch_native_effects(
 }
 
 impl MessagePublisher for MessageCenterService {
+    fn is_available(&self) -> bool {
+        self.summary().is_ok()
+    }
+
     fn commit_publish(&self, request: MessagePublishRequest) -> MessagePublishOutcome {
         match self.store.publish(PublishInput {
             plugin_id: request.plugin_id,

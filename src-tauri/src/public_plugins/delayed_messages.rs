@@ -150,6 +150,7 @@ impl DelayedMessageScheduler {
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_due(
         &self,
         now: Instant,

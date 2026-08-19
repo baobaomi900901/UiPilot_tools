@@ -11,10 +11,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tauri::AppHandle;
 
-use crate::message_center::MessageCenterService;
+use crate::message_center::{
+    MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest,
+    MessagePublisher,
+};
 
 use super::{
+    delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
     package, runtime_label, stage_public_package, EffectivePluginConfig, PluginApiRequest,
     PluginApiExecution, PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext,
@@ -290,6 +295,7 @@ pub(crate) struct PublicPluginManager {
     storage: Arc<PluginStorageStore>,
     secrets: Arc<PluginSecretStore>,
     scheduler: Arc<PluginRequestScheduler>,
+    delayed_messages: Arc<DelayedMessageScheduler>,
     message_center: Arc<MessageCenterService>,
     api: PluginRuntimeApi,
     mutation: Mutex<()>,
@@ -320,11 +326,13 @@ impl PublicPluginManager {
                 .map_err(|_| PublicPluginManagementError::Unavailable)?,
         );
         let scheduler = Arc::new(PluginRequestScheduler::default());
+        let delayed_messages = Arc::new(DelayedMessageScheduler::default());
         let api = PluginRuntimeApi::new(
             Arc::clone(&scheduler),
             Arc::clone(&state),
             Arc::clone(&storage),
             Arc::clone(&secrets),
+            Arc::clone(&delayed_messages),
             message_center.clone(),
         );
         let mut active_by_plugin = HashMap::new();
@@ -361,6 +369,7 @@ impl PublicPluginManager {
             storage,
             secrets,
             scheduler,
+            delayed_messages,
             message_center,
             api,
             mutation: Mutex::new(()),
@@ -551,6 +560,7 @@ impl PublicPluginManager {
         self.scheduler
             .invalidate_plugin(&runtime.plugin_id, Some(runtime.generation))
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.cancel_delayed_messages(&runtime.plugin_id);
         {
             let mut data = self.lock_data()?;
             let staged = data
@@ -603,6 +613,7 @@ impl PublicPluginManager {
                 self.scheduler
                     .invalidate_plugin(plugin_id, None)
                     .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                self.cancel_delayed_messages(plugin_id);
                 return Ok(PublicEnabledCommit {
                     mutation: mutation_from_config(&config),
                     runtime: None,
@@ -672,6 +683,7 @@ impl PublicPluginManager {
             .ok_or(PublicPluginManagementError::Unavailable)?;
         data.active_by_plugin.insert(plugin_id.into(), staged);
         drop(data);
+        self.cancel_delayed_messages(plugin_id);
         self.clear_runtime_faults(plugin_id)?;
         Ok(PublicEnabledCommit {
             mutation: mutation_from_config(&config),
@@ -746,6 +758,7 @@ impl PublicPluginManager {
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.cancel_delayed_messages(plugin_id);
         let runtime_label = self
             .lock_data()?
             .active_by_plugin
@@ -1020,6 +1033,76 @@ impl PublicPluginManager {
         &self.message_center
     }
 
+    pub(crate) fn start_delayed_messages(
+        self: &Arc<Self>,
+        app: &AppHandle,
+    ) -> Result<(), PublicPluginManagementError> {
+        let manager = Arc::downgrade(self);
+        let app = app.clone();
+        self.delayed_messages
+            .start(move |message| {
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                let effect = manager.commit_scheduled_message(message);
+                manager.message_center.dispatch_post_guard(&app, effect);
+            })
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn shutdown_delayed_messages(&self) {
+        self.delayed_messages.shutdown();
+    }
+
+    pub(crate) fn commit_scheduled_message(
+        &self,
+        message: ScheduledPluginMessage,
+    ) -> Option<MessagePostGuardEffect> {
+        let mutation = self.lock_mutation().ok()?;
+        let eligible = self
+            .state
+            .config(&message.plugin_id)
+            .ok()
+            .flatten()
+            .is_some_and(|config| {
+                config.installed
+                    && config.enabled
+                    && config.fault.is_none()
+                    && config.active_generation == message.plugin_generation
+                    && config
+                        .permission_grants
+                        .contains(&PublicPermission::NotificationsPublish)
+            })
+            && self
+                .lock_data()
+                .ok()
+                .and_then(|data| data.active_by_plugin.get(&message.plugin_id).cloned())
+                .is_some_and(|snapshot| {
+                    snapshot.generation == message.plugin_generation
+                        && snapshot
+                            .manifest
+                            .permissions
+                            .contains(&PublicPermission::NotificationsPublish)
+                });
+        drop(mutation);
+        if !eligible {
+            return None;
+        }
+        match self.message_center.commit_publish(MessagePublishRequest {
+            plugin_id: message.plugin_id,
+            plugin_name_snapshot: message.plugin_name_snapshot,
+            content: message.content,
+        }) {
+            MessagePublishOutcome::Published(published) => {
+                Some(MessagePostGuardEffect::Published(published))
+            }
+            MessagePublishOutcome::BecameUnavailable => {
+                Some(MessagePostGuardEffect::BecameUnavailable)
+            }
+            MessagePublishOutcome::OperationFailed | MessagePublishOutcome::Unavailable => None,
+        }
+    }
+
     pub(crate) fn complete(
         &self,
         caller_label: &str,
@@ -1087,6 +1170,7 @@ impl PublicPluginManager {
             new_generation,
             Some(replacement.digest.clone()),
         )?;
+        self.cancel_delayed_messages(plugin_id);
         let replacement = Arc::new(replacement);
         let candidate = replacement.candidate();
         data.active_by_plugin.insert(plugin_id.into(), replacement);
@@ -1121,6 +1205,7 @@ impl PublicPluginManager {
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.cancel_delayed_messages(plugin_id);
         Ok(true)
     }
 
@@ -1141,7 +1226,12 @@ impl PublicPluginManager {
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.cancel_delayed_messages(plugin_id);
         Ok(())
+    }
+
+    fn cancel_delayed_messages(&self, plugin_id: &str) {
+        let _ = self.delayed_messages.cancel_plugin(plugin_id);
     }
 
     fn active_manifest(
@@ -1435,7 +1525,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::public_plugins::PublicPlatform;
+    use crate::message_center::MessagePostGuardEffect;
+    use crate::public_plugins::{
+        delayed_messages::{DelayedMessageRegistration, ScheduledPluginMessage},
+        PublicPlatform,
+    };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -1509,6 +1603,59 @@ mod tests {
             format!("export async function onCommand() {{ return {{ marker: '{marker}' }}; }}"),
         )
         .unwrap();
+    }
+
+    fn write_notification_package(root: &Path, version: &str) {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "com.example.activation",
+                "version": version,
+                "apiVersion": 1,
+                "minimumHostVersion": "0.2.0",
+                "name": "Activation",
+                "supportedPlatforms": ["windows"],
+                "command": {
+                    "defaultName": "activation",
+                    "activationMode": "submit",
+                    "outputMode": "mainResult",
+                    "inputRequired": false
+                },
+                "runtime": { "entry": "dist/runtime.js" },
+                "permissions": ["notifications.publish"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/runtime.js"),
+            "export async function onCommand() { return { results: [] }; }",
+        )
+        .unwrap();
+    }
+
+    fn schedule_test_message(
+        manager: &PublicPluginManager,
+        generation: u64,
+        request_id: &str,
+        now: Instant,
+    ) {
+        manager
+            .delayed_messages
+            .schedule(
+                DelayedMessageRegistration {
+                    plugin_id: "com.example.activation".into(),
+                    plugin_generation: generation,
+                    plugin_name_snapshot: "Activation".into(),
+                    request_id: request_id.into(),
+                    content: request_id.into(),
+                    delay_ms: 1_000,
+                },
+                now,
+            )
+            .unwrap();
     }
 
     fn source(path: &Path) -> PublicPluginInstallSource {
@@ -1670,6 +1817,94 @@ mod tests {
                 .enabled
         );
         assert!(runtime_staging_is_empty(&manager));
+    }
+
+    #[test]
+    fn disable_update_and_uninstall_cancel_pending_delayed_messages() {
+        let dir = TestDir::new("delayed-lifecycle");
+        write_notification_package(&dir.source(), "1.0.0");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let grants = BTreeSet::from([PublicPermission::NotificationsPublish]);
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let installed = manager
+            .commit_with_readiness("main", &prepared.token, grants.clone(), now, |_| true)
+            .unwrap();
+
+        schedule_test_message(&manager, installed.runtime.generation, "disabled", now);
+        manager
+            .set_enabled_with_readiness("com.example.activation", false, |_| false)
+            .unwrap();
+        assert_eq!(
+            manager
+                .delayed_messages
+                .claim_due(now + Duration::from_secs(2)),
+            Ok(None)
+        );
+
+        let enabled = manager
+            .set_enabled_with_readiness("com.example.activation", true, |_| true)
+            .unwrap()
+            .runtime
+            .unwrap();
+        schedule_test_message(&manager, enabled.generation, "updated", now);
+        write_notification_package(&dir.source(), "1.1.0");
+        let update = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let updated = manager
+            .commit_with_readiness("main", &update.token, grants, now, |_| true)
+            .unwrap();
+        assert_eq!(
+            manager
+                .delayed_messages
+                .claim_due(now + Duration::from_secs(2)),
+            Ok(None)
+        );
+
+        schedule_test_message(&manager, updated.runtime.generation, "uninstalled", now);
+        manager.uninstall("com.example.activation", true).unwrap();
+        assert_eq!(
+            manager
+                .delayed_messages
+                .claim_due(now + Duration::from_secs(2)),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn delayed_delivery_commits_only_for_the_current_authorized_generation() {
+        let dir = TestDir::new("delayed-delivery");
+        write_notification_package(&dir.source(), "1.0.0");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let grants = BTreeSet::from([PublicPermission::NotificationsPublish]);
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let installed = manager
+            .commit_with_readiness("main", &prepared.token, grants, now, |_| true)
+            .unwrap();
+        let message = |generation, request_id: &str| ScheduledPluginMessage {
+            schedule_id: generation,
+            plugin_id: "com.example.activation".into(),
+            plugin_generation: generation,
+            plugin_name_snapshot: "Activation".into(),
+            request_id: request_id.into(),
+            content: request_id.into(),
+            due_at: now,
+        };
+
+        let effect =
+            manager.commit_scheduled_message(message(installed.runtime.generation, "current"));
+        assert!(matches!(
+            effect,
+            Some(MessagePostGuardEffect::Published(ref published))
+                if published.content == "current"
+        ));
+        assert_eq!(manager.message_center.summary().unwrap().unread_count, 1);
+
+        assert_eq!(
+            manager.commit_scheduled_message(message(installed.runtime.generation + 1, "stale",)),
+            None
+        );
+        assert_eq!(manager.message_center.summary().unwrap().unread_count, 1);
     }
 
     #[test]

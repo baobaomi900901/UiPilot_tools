@@ -91,6 +91,7 @@ pub(crate) struct PublicSubmission {
 impl PublicPluginService {
     pub(crate) fn initialize(
         &self,
+        app: &AppHandle,
         app_data_dir: &Path,
         reserved_names: impl IntoIterator<Item = String>,
         message_center: Arc<MessageCenterService>,
@@ -101,9 +102,11 @@ impl PublicPluginService {
             reserved_names,
             message_center,
         )?);
-        self.manager
-            .set(Arc::clone(&manager))
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        manager.start_delayed_messages(app)?;
+        if self.manager.set(Arc::clone(&manager)).is_err() {
+            manager.shutdown_delayed_messages();
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         Ok(manager)
     }
 
@@ -111,6 +114,12 @@ impl PublicPluginService {
         self.manager
             .get()
             .ok_or(PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if let Some(manager) = self.manager.get() {
+            manager.shutdown_delayed_messages();
+        }
     }
 
     pub(crate) fn start_enabled_runtimes(

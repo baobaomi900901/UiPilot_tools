@@ -101,6 +101,7 @@ fn setup_production_lifecycle(
         return Err(lifecycle_setup_error().into());
     }
     public_plugin_service.initialize(
+        app.handle(),
         &app_data_dir,
         ["find".into(), "math".into()],
         Arc::clone(&message_center),
@@ -396,6 +397,9 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let run_find_controller = Arc::clone(&find_controller);
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let run_public_plugin_service = Arc::clone(&public_plugin_service);
+
     let app = builder
         .setup(move |_app| {
             #[cfg(all(not(test), feature = "test-instrumentation"))]
@@ -421,6 +425,7 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                run_public_plugin_service.shutdown();
                 _app.state::<Arc<message_center::MessageCenterService>>()
                     .shutdown();
                 run_find_controller.shutdown();
@@ -824,6 +829,32 @@ mod tests {
         assert!(production.contains("Some(lifecycle::TrayAction::Show(target))"));
         assert!(production.contains("tray_coordinator.request_show(app, target)"));
         assert!(production.contains("lifecycle::TRAY_OPEN_SETTINGS"));
+    }
+
+    #[test]
+    fn delayed_plugin_messages_start_with_app_and_stop_before_native_effects() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        assert!(production.contains(
+            "public_plugin_service.initialize(\n        app.handle(),\n        &app_data_dir,"
+        ));
+        assert!(production
+            .contains("let run_public_plugin_service = Arc::clone(&public_plugin_service);"));
+        let run_exit = production
+            .split("tauri::RunEvent::Exit => {")
+            .nth(1)
+            .and_then(|tail| tail.split("_ => {}").next())
+            .expect("run exit branch is missing");
+        let delayed_shutdown = run_exit
+            .find("run_public_plugin_service.shutdown();")
+            .expect("delayed scheduler shutdown is missing");
+        let native_shutdown = run_exit
+            .find("_app.state::<Arc<message_center::MessageCenterService>>()")
+            .expect("message center shutdown is missing");
+        assert!(delayed_shutdown < native_shutdown);
     }
 
     #[test]
