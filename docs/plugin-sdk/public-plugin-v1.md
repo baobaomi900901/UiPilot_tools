@@ -1,5 +1,7 @@
 # UiPilot Public Plugin API v1
 
+New to public plugin development? Start with the [third-party plugin developer tutorial](./public-plugin-developer-guide.md), then use this document as the complete contract reference.
+
 Public plugins are static packages loaded by UiPilot. A plugin owns one slash command, one hidden Runtime, and optionally one singleton content window. Removing or disabling the package removes its command; the host does not provide command-specific fallbacks.
 
 ## Package Layout
@@ -8,6 +10,7 @@ The package root is strict:
 
 ```text
 plugin.json
+icon.png                  # optional, fixed 128x128 plugin identity icon
 dist/
   runtime.js
   optional-window.html
@@ -15,7 +18,7 @@ dist/
   optional-window.css
 ```
 
-Only `plugin.json`, `.html`, `.js`, and `.css` files are accepted. Basenames have exactly one extension. Paths are relative, normalized, at most eight components deep, and cannot contain traversal, symlinks, reparse points, remote URLs, `data:` resources, unknown MIME types, or unlisted files. Runtime and window entries must name package JavaScript and HTML files respectively.
+Only `plugin.json`, `.html`, `.js`, `.css`, and the optional package-root `icon.png` are accepted. The icon must be a completely decodable, static 128x128 PNG no larger than 128 KiB; other PNG paths and additional PNG files are rejected. Basenames have exactly one extension. Paths are relative, normalized, at most eight components deep, and cannot contain traversal, symlinks, reparse points, remote URLs, `data:` resources, unknown MIME types, or unlisted files. Runtime and window entries must name package JavaScript and HTML files respectively.
 
 Use [uipilot-plugin-v1.schema.json](./uipilot-plugin-v1.schema.json) to validate `plugin.json`. The schema is generated from the Rust DTOs by:
 
@@ -30,6 +33,8 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `version` and `minimumHostVersion` are canonical `major.minor.patch` numbers.
 - `supportedPlatforms` contains `windows` and/or `macos` without duplicates.
 - `command.defaultName` is the initial slash command name. Users may rename it, but reserved and conflicting names fail closed.
+- `command.summary` is an optional one-line discovery hint. It is limited to 512 Unicode scalar values; when omitted, the launcher uses `name`.
+- `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
 - `activationMode` is `live` or `submit`; `window` output requires `submit`.
 - `outputMode` is static. `window` requires a window entry and `ui.window`; `mainResult` forbids both.
 
@@ -37,9 +42,9 @@ Installation and reload use staging. Static validation and Runtime readiness mus
 
 ## Runtime Contract
 
-The Runtime entry is an ES module exporting `onCommand` with the `PluginHandler` type from [uipilot-plugin-api-v1.d.ts](./uipilot-plugin-api-v1.d.ts). Each invocation and API object is new, deeply frozen, and bound to an immutable plugin ID, generation, and request ID.
+The Runtime entry is an ES module exporting `onCommand` with the `PluginHandler` type from [uipilot-plugin-api-v1.d.ts](./uipilot-plugin-api-v1.d.ts). Each invocation and API object is new, deeply frozen, and bound to an immutable plugin ID, generation, and request ID. On Windows, a plugin that declares and receives `notifications.publish` may call `api.notifications.publish({ content })` once during that request.
 
-`invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage and reads of declared non-secret settings; Runtime code cannot access Tauri, Shell, files, network, native input, another plugin, or secret plaintext.
+`invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage, reads of declared non-secret settings, and the request-bound Windows message operation when granted; Runtime code cannot access Tauri, Shell, files, network, native input, another plugin, or secret plaintext.
 
 Context errors are stable:
 
@@ -48,8 +53,13 @@ Context errors are stable:
 - `InvalidOperation`: unsupported operation, key, value, or response.
 - `StorageError`: an atomic storage operation failed.
 - `RuntimeUnavailable`: the isolated Runtime is unavailable.
+- `InvalidNotification`: notification content is not one non-empty, trimmed, single-line plain-text value of at most 500 Unicode scalar values.
+- `AlreadyPublished`: the current request already committed its one allowed message.
+- `MessageStoreUnavailable`: the host could not atomically persist the message.
 
 Late responses from expired requests are discarded and cannot mutate newer UI or data.
+
+`notifications.publish` is request-bound. Its Promise resolves at the atomic message-file commit; later Windows toast or tray failures do not reject it or remove the saved message. Expired requests cannot publish. The API does not register background work, timers, actions, links, markup, or arbitrary notification payloads.
 
 ## Responses
 
@@ -76,6 +86,7 @@ API v1 implements only:
 
 - `ui.window`: create the host-owned singleton window.
 - `clipboard.write`: expose a host-owned `copyText` default action.
+- `notifications.publish`: on Windows only, atomically save one request-bound message and ask the host to show its own notification and tray reminder.
 
 Other parsed permission names are reserved and installation fails until the host implements them. Permission changes during reload require normal confirmation; no development-package bypass exists.
 
@@ -83,4 +94,9 @@ Other parsed permission names are reserved and installation fails until the host
 
 Background execution, timers, scheduling, multiple commands, multiple windows, streaming, pagination, large responses, network, arbitrary files, clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP.
 
-The reference package is under `examples/public-plugins/com.uipilot.demo`. Its README describes both static output modes and the user-operated acceptance flow.
+The fixed-output reference packages are:
+
+- `examples/public-plugins/com.uipilot.demo-win`: Windows-only `submit + window` with `ui.window` and `notifications.publish`.
+- `examples/public-plugins/com.uipilot.demo-return`: `submit + mainResult` with `clipboard.write`.
+
+Each README documents its development-directory installation, focused verification, packaging command, and user-operated acceptance flow.

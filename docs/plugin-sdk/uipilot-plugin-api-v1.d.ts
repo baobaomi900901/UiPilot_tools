@@ -22,6 +22,13 @@ export interface UiPilotPluginApiV1 {
     get(key: string): Promise<JsonValue | null>
     isSecretConfigured(key: string): Promise<boolean>
   }
+  readonly notifications: {
+    publish(input: Readonly<PluginNotificationPublishInput>): Promise<void>
+  }
+}
+
+export interface PluginNotificationPublishInput {
+  readonly content: string
 }
 
 export interface CopyTextDefaultAction {

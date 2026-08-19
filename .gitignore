@@ -11,6 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+!/examples/public-plugins/com.uipilot.demo-win/package/dist/
+!/examples/public-plugins/com.uipilot.demo-win/package/dist/**
 downloads/
 eggs/
 .eggs/
