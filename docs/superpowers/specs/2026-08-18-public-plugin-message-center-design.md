@@ -32,8 +32,10 @@ UiPilot 负责持久化消息、维护未读状态、显示 Windows 通知、短
 - `notifications.publish` 在 Windows 宿主上从“已知但不可用”变为可安装、可授权和可调用；
 - 新增宿主管理的消息中心、未读徽标、Windows 通知和托盘短时闪烁。
 
-`background.schedule`、常驻 Runtime、定时任务和请求结束后的主动推送仍然不可用。其他既有权限、
-请求所有权、generation、安装原子性、窗口交接和 UI 焦点合同不变。
+除后续[宿主延迟消息设计](./2026-08-19-public-plugin-delayed-message-design.md)窄化开放的宿主持有
+`notifications.schedule()` 单次纯文本消息外，`background.schedule`、常驻 Runtime、通用定时任务和
+请求结束后的插件主动推送仍然不可用；插件代码不能在请求结束后运行。其他既有权限、请求所有权、
+generation、安装原子性、窗口交接和 UI 焦点合同不变。
 
 ## 4. 用户合同
 
@@ -663,7 +665,9 @@ SDK 与 Demo 覆盖：
 
 ## 18. 非目标
 
-- 后台 Runtime、定时器、番茄时钟、`background.schedule` 或请求完成后的发布；
+- 除[宿主延迟消息设计](./2026-08-19-public-plugin-delayed-message-design.md)定义的
+  `notifications.schedule()` 外，后台 Runtime、定时器、番茄时钟、`background.schedule` 或请求完成后的
+  插件发布；
 - 远程推送、云同步、跨设备通知或插件间消息；
 - Markdown、HTML、图片、附件、链接、按钮、自定义动作或声音选择；
 - 一次请求发布多条消息、批量发布、消息更新或撤回；
