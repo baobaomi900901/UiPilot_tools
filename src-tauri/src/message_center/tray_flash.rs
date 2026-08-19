@@ -51,7 +51,7 @@ impl TrayFlashState {
         let elapsed = now - self.next_toggle;
         let intervals = elapsed.as_millis() / FLASH_INTERVAL.as_millis() + 1;
         self.next_toggle += FLASH_INTERVAL * u32::try_from(intervals).unwrap_or(u32::MAX);
-        if intervals % 2 == 0 {
+        if intervals.is_multiple_of(2) {
             return None;
         }
         let visual = match self.visual {
