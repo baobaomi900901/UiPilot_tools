@@ -58,6 +58,7 @@ pub(crate) use state::{
     EffectivePluginConfig, PluginStateError, PluginStateStore, PublicPluginFault,
 };
 pub(crate) use storage::PluginStorageStore;
+pub(crate) use timers::{PluginTimerStartInput, PluginTimerState, TimerError, TimerKey};
 const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]

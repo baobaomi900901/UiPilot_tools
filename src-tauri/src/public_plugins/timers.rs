@@ -86,6 +86,9 @@ pub(crate) struct PluginTimerState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TimerError {
+    InvalidCaller,
+    PermissionDenied,
+    ExpiredWindowSessionError,
     InvalidTimerInput,
     TimerInputRequired,
     TimerInputNotAllowed,
@@ -96,6 +99,9 @@ pub(crate) enum TimerError {
 impl TimerError {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::InvalidCaller => "InvalidCaller",
+            Self::PermissionDenied => "PermissionDenied",
+            Self::ExpiredWindowSessionError => "ExpiredWindowSessionError",
             Self::InvalidTimerInput => "InvalidTimerInput",
             Self::TimerInputRequired => "TimerInputRequired",
             Self::TimerInputNotAllowed => "TimerInputNotAllowed",
@@ -135,12 +141,6 @@ pub(crate) struct AudioTicket {
     pub(super) round_id: u64,
     pub(super) audio_id: u64,
     pub(super) fired_revision: u64,
-}
-
-impl AudioTicket {
-    pub(crate) fn key(&self) -> &TimerKey {
-        &self.key
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

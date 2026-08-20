@@ -40,10 +40,11 @@ use crate::{
     },
     public_plugins::{
         PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
-        PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
-        PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
-        PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary,
-        PublicPluginResponse, PublicPluginService, PublicPluginWindowIdentity,
+        PluginTimerStartInput, PluginTimerState, PublicActivationMode, PublicMainResult,
+        PublicOutputMode, PublicPermission, PublicPluginInstallSource, PublicPluginInventory,
+        PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
+        PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginService,
+        PublicPluginWindowIdentity, TimerError,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -425,6 +426,28 @@ impl From<PluginRuntimeError> for CommandError {
             message: "public plugin runtime operation failed",
         }
     }
+}
+
+impl From<TimerError> for CommandError {
+    fn from(error: TimerError) -> Self {
+        Self {
+            code: error.code(),
+            message: "public plugin timer operation failed",
+        }
+    }
+}
+
+fn parse_timer_session_generation(value: &str) -> Result<u64, TimerError> {
+    if value == "0"
+        || value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(TimerError::ExpiredWindowSessionError);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| TimerError::ExpiredWindowSessionError)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1015,20 +1038,26 @@ pub(crate) async fn set_plugin_enabled(
 #[tauri::command]
 pub(crate) fn set_plugin_effective_name(
     window: WebviewWindow,
+    app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
     name_override: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
-    Ok(service
+    let mutation = service
         .manager()?
-        .rename(&plugin_id, name_override.as_deref())?)
+        .rename(&plugin_id, name_override.as_deref())?;
+    plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
+    Ok(mutation)
 }
 
 #[tauri::command]
 pub(crate) fn save_plugin_settings(
     window: WebviewWindow,
+    app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    window_controller: State<'_, Arc<PluginWindowController>>,
     input: SavePublicPluginSettingsInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
@@ -1036,7 +1065,9 @@ pub(crate) fn save_plugin_settings(
     for (key, value) in &input.secrets {
         manager.save_secret(&input.plugin_id, key, value.as_deref())?;
     }
-    Ok(manager.save_settings(&input.plugin_id, &input.settings)?)
+    let mutation = manager.save_settings(&input.plugin_id, &input.settings)?;
+    plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &input.plugin_id);
+    Ok(mutation)
 }
 
 #[tauri::command]
@@ -1116,6 +1147,112 @@ pub(crate) fn plugin_window_content_ack(
     plugin_window::content_ack(controller.inner().as_ref(), webview.label(), &request_id)
         .then_some(())
         .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_timer_get_state(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+) -> Result<PluginTimerState, CommandError> {
+    let session_generation = parse_timer_session_generation(&session_generation)?;
+    let lease = controller
+        .inner()
+        .begin_timer_call(webview.label(), session_generation, false)?;
+    let owner = lease.owner().clone();
+    let state = service
+        .manager()?
+        .window_timer_get_state(&owner.plugin_id, owner.plugin_generation)?;
+    drop(lease);
+    plugin_window::publish_timer_state(
+        &app,
+        controller.inner().as_ref(),
+        &crate::public_plugins::TimerKey::new(&owner.plugin_id, owner.plugin_generation)
+            .ok_or(TimerError::TimerUnavailable)?,
+        &state,
+    );
+    Ok(state)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_timer_start(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+    input: Option<PluginTimerStartInput>,
+) -> Result<PluginTimerState, CommandError> {
+    plugin_window_timer_mutation(
+        webview.label(),
+        &app,
+        controller.inner(),
+        service.inner(),
+        &session_generation,
+        |manager, owner| {
+            manager.window_timer_start(&owner.plugin_id, owner.plugin_generation, input)
+        },
+    )
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_timer_stop(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+) -> Result<PluginTimerState, CommandError> {
+    plugin_window_timer_mutation(
+        webview.label(),
+        &app,
+        controller.inner(),
+        service.inner(),
+        &session_generation,
+        |manager, owner| manager.window_timer_stop(&owner.plugin_id, owner.plugin_generation),
+    )
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_timer_reset(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+) -> Result<PluginTimerState, CommandError> {
+    plugin_window_timer_mutation(
+        webview.label(),
+        &app,
+        controller.inner(),
+        service.inner(),
+        &session_generation,
+        |manager, owner| manager.window_timer_reset(&owner.plugin_id, owner.plugin_generation),
+    )
+}
+
+fn plugin_window_timer_mutation(
+    caller_label: &str,
+    app: &AppHandle,
+    controller: &Arc<PluginWindowController>,
+    service: &Arc<PublicPluginService>,
+    session_generation: &str,
+    operation: impl FnOnce(
+        &PublicPluginManager,
+        &PluginWindowOwner,
+    ) -> Result<PluginTimerState, TimerError>,
+) -> Result<PluginTimerState, CommandError> {
+    let session_generation = parse_timer_session_generation(session_generation)?;
+    let lease = controller.begin_timer_call(caller_label, session_generation, true)?;
+    let owner = lease.owner().clone();
+    let state = operation(service.manager()?.as_ref(), &owner)?;
+    drop(lease);
+    let key = crate::public_plugins::TimerKey::new(&owner.plugin_id, owner.plugin_generation)
+        .ok_or(TimerError::TimerUnavailable)?;
+    plugin_window::publish_timer_state(app, controller.as_ref(), &key, &state);
+    Ok(state)
 }
 
 #[tauri::command]
@@ -2499,9 +2636,9 @@ mod tests {
         clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
         execute_result_with, load_settings_core, load_settings_ready_with,
         map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
-        map_theme_preference_worker_result, plugin_discovery_prefix, prepare_file_query,
-        prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
-        public_plugin_search_decision, publish_everything_search,
+        map_theme_preference_worker_result, parse_timer_session_generation,
+        plugin_discovery_prefix, prepare_file_query, prepare_hotkey_save, prepare_settings_save,
+        public_plugin_prompt, public_plugin_search_decision, publish_everything_search,
         publish_public_command_suggestions, require_find_label, require_main_label,
         resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_files_with,
@@ -2523,7 +2660,7 @@ mod tests {
         lifecycle::LifecycleCoordinator,
         public_plugins::{
             PluginInvocationTheme, PublicActivationMode, PublicCommandSuggestion, PublicOutputMode,
-            PublicPluginRoute,
+            PublicPluginRoute, TimerError,
         },
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine},
@@ -3140,6 +3277,48 @@ mod tests {
         let manager_read = identity.find("service.manager()?").unwrap();
         assert!(label_guard < manager_read);
         assert!(!identity.contains("plugin_id:"));
+    }
+
+    #[test]
+    fn plugin_window_timer_commands_are_content_only_and_session_bound() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        for command in [
+            "plugin_window_timer_get_state",
+            "plugin_window_timer_start",
+            "plugin_window_timer_stop",
+            "plugin_window_timer_reset",
+        ] {
+            let body = source
+                .split(&format!("pub(crate) fn {command}("))
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .unwrap_or_else(|| panic!("missing timer command {command}"));
+            assert!(body.contains("webview: tauri::Webview"));
+            assert!(body.contains("session_generation: String"));
+            assert!(!body.contains("plugin_id: String"));
+        }
+        let capability = include_str!("../capabilities/plugin-window-content.json");
+        for permission in [
+            "allow-plugin-window-timer-get-state",
+            "allow-plugin-window-timer-start",
+            "allow-plugin-window-timer-stop",
+            "allow-plugin-window-timer-reset",
+        ] {
+            assert!(capability.contains(permission));
+        }
+    }
+
+    #[test]
+    fn timer_session_generation_is_canonical_nonzero_u64() {
+        for value in ["1", "9", "10", "18446744073709551615"] {
+            assert!(parse_timer_session_generation(value).is_ok());
+        }
+        for value in ["", "0", "00", "01", "-1", "+1", "18446744073709551616"] {
+            assert_eq!(
+                parse_timer_session_generation(value),
+                Err(TimerError::ExpiredWindowSessionError)
+            );
+        }
     }
     #[test]
     fn search_rejects_old_or_hidden_queries_before_state_reads() {

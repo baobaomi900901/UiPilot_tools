@@ -371,6 +371,10 @@ pub fn run() {
             commands::complete_plugin_command,
             commands::plugin_window_content_ready,
             commands::plugin_window_content_ack,
+            commands::plugin_window_timer_get_state,
+            commands::plugin_window_timer_start,
+            commands::plugin_window_timer_stop,
+            commands::plugin_window_timer_reset,
             commands::commit_plugin_window_transfer,
             commands::get_public_plugin_window_identity,
             commands::set_plugin_window_pinned,
@@ -609,7 +613,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 43);
+        assert_eq!(production.matches("commands::").count(), 47);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -631,6 +635,10 @@ mod tests {
             "complete_plugin_command",
             "plugin_window_content_ready",
             "plugin_window_content_ack",
+            "plugin_window_timer_get_state",
+            "plugin_window_timer_start",
+            "plugin_window_timer_stop",
+            "plugin_window_timer_reset",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
@@ -755,7 +763,14 @@ mod tests {
             assert!(!content.contains(&permission));
         }
         assert!(content.contains("\"webviews\": [\"plugin-content-*\"]"));
-        for command in ["plugin_window_content_ready", "plugin_window_content_ack"] {
+        for command in [
+            "plugin_window_content_ready",
+            "plugin_window_content_ack",
+            "plugin_window_timer_get_state",
+            "plugin_window_timer_start",
+            "plugin_window_timer_stop",
+            "plugin_window_timer_reset",
+        ] {
             let permission = format!("allow-{}", command.replace('_', "-"));
             assert!(build.contains(&format!("\"{command}\",")));
             assert!(content.contains(&permission));

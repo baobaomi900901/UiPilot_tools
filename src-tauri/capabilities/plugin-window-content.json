@@ -5,6 +5,10 @@
   "webviews": ["plugin-content-*"],
   "permissions": [
     "allow-plugin-window-content-ready",
-    "allow-plugin-window-content-ack"
+    "allow-plugin-window-content-ack",
+    "allow-plugin-window-timer-get-state",
+    "allow-plugin-window-timer-start",
+    "allow-plugin-window-timer-stop",
+    "allow-plugin-window-timer-reset"
   ]
 }

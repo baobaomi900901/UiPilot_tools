@@ -11,7 +11,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::message_center::{
     MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest,
@@ -24,7 +24,10 @@ use super::{
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
     package, runtime_label, stage_public_package,
     timer_alarm::TimerAlarm,
-    timers::{ClaimTicket, Clock, PluginTimerService, SystemClock, TimerKey},
+    timers::{
+        ClaimTicket, Clock, PluginTimerService, PluginTimerStartInput, PluginTimerState,
+        SystemClock, TimerError, TimerKey,
+    },
     EffectivePluginConfig, PluginApiExecution, PluginApiRequest, PluginCommandCompletion,
     PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler, PluginRuntimeApi,
     PluginRuntimeError, PluginSecretStore, PluginStateError, PluginStateStore, PluginStorageStore,
@@ -1250,8 +1253,106 @@ impl PublicPluginManager {
         &self.message_center
     }
 
-    pub(crate) fn timer_service(&self) -> &Arc<PluginTimerService> {
-        &self.timers
+    pub(crate) fn window_timer_get_state(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Result<PluginTimerState, TimerError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| TimerError::TimerUnavailable)?;
+        let (key, _) = self.authorize_window_timer(plugin_id, generation)?;
+        self.timers.get_state(&key)
+    }
+
+    pub(crate) fn window_timer_start(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        input: Option<PluginTimerStartInput>,
+    ) -> Result<PluginTimerState, TimerError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| TimerError::TimerUnavailable)?;
+        let (key, plugin_name) = self.authorize_window_timer(plugin_id, generation)?;
+        let mutation = self.timers.start(
+            &key,
+            &plugin_name,
+            input,
+            self.timer_publisher.is_available(),
+        )?;
+        drop(_mutation);
+        self.stop_timer_audio(mutation.audio_to_stop);
+        Ok(mutation.state)
+    }
+
+    pub(crate) fn window_timer_stop(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Result<PluginTimerState, TimerError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| TimerError::TimerUnavailable)?;
+        let (key, _) = self.authorize_window_timer(plugin_id, generation)?;
+        let mutation = self.timers.stop(&key)?;
+        drop(_mutation);
+        self.stop_timer_audio(mutation.audio_to_stop);
+        Ok(mutation.state)
+    }
+
+    pub(crate) fn window_timer_reset(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Result<PluginTimerState, TimerError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| TimerError::TimerUnavailable)?;
+        let (key, _) = self.authorize_window_timer(plugin_id, generation)?;
+        let mutation = self.timers.reset(&key)?;
+        drop(_mutation);
+        self.stop_timer_audio(mutation.audio_to_stop);
+        Ok(mutation.state)
+    }
+
+    fn authorize_window_timer(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Result<(TimerKey, String), TimerError> {
+        let config = self
+            .state
+            .config(plugin_id)
+            .map_err(|_| TimerError::TimerUnavailable)?
+            .filter(|config| {
+                config.installed
+                    && config.enabled
+                    && config.fault.is_none()
+                    && config.active_generation == generation
+            })
+            .ok_or(TimerError::ExpiredWindowSessionError)?;
+        let snapshot = self
+            .lock_data()
+            .map_err(|_| TimerError::TimerUnavailable)?
+            .active_by_plugin
+            .get(plugin_id)
+            .cloned()
+            .filter(|snapshot| snapshot.generation == generation)
+            .ok_or(TimerError::ExpiredWindowSessionError)?;
+        let required = [
+            PublicPermission::UiWindow,
+            PublicPermission::NotificationsPublish,
+            PublicPermission::TimerControl,
+        ];
+        if !required.iter().all(|permission| {
+            config.permission_grants.contains(permission)
+                && snapshot.manifest.permissions.contains(permission)
+        }) {
+            return Err(TimerError::PermissionDenied);
+        }
+        let key = TimerKey::new(plugin_id, generation).ok_or(TimerError::TimerUnavailable)?;
+        Ok((key, config.effective_name))
     }
 
     pub(crate) fn start_timers(
@@ -1265,8 +1366,19 @@ impl PublicPluginManager {
                 let Some(manager) = manager.upgrade() else {
                     return;
                 };
+                let key = ticket.key().clone();
                 let effect = manager.commit_timer_claim(ticket);
                 manager.message_center.dispatch_post_guard(&app, effect);
+                if let Ok(state) = manager.timers.get_state(&key) {
+                    let controller =
+                        app.state::<Arc<crate::plugin_window::PluginWindowController>>();
+                    crate::plugin_window::publish_timer_state(
+                        &app,
+                        controller.inner().as_ref(),
+                        &key,
+                        &state,
+                    );
+                }
             }))
             .map_err(|_| PublicPluginManagementError::Unavailable)
     }
@@ -2508,6 +2620,52 @@ mod tests {
         assert_eq!(
             manager.timers.get_state(&key).unwrap().phase,
             PluginTimerPhase::Fired
+        );
+    }
+
+    #[test]
+    fn window_timer_calls_revalidate_the_current_enabled_generation() {
+        let dir = TestDir::new("timer-window-authorization");
+        write_timer_package(&dir.source(), "1.0.0");
+        let manager = timer_manager(
+            &dir,
+            Arc::new(TestClock::default()),
+            Arc::new(TestPublisher::successful()),
+            Arc::new(TestAlarm::default()),
+        );
+        let generation = install_timer(&manager, &dir.source());
+
+        assert_eq!(
+            manager
+                .window_timer_get_state("com.example.timer", generation)
+                .unwrap()
+                .phase,
+            PluginTimerPhase::Idle
+        );
+        assert_eq!(
+            manager
+                .window_timer_start(
+                    "com.example.timer",
+                    generation,
+                    Some(PluginTimerStartInput {
+                        duration_ms: 1_000,
+                        completion_message: "done".into(),
+                    }),
+                )
+                .unwrap()
+                .phase,
+            PluginTimerPhase::Running
+        );
+        assert_eq!(
+            manager.window_timer_get_state("com.example.timer", generation + 1),
+            Err(TimerError::ExpiredWindowSessionError)
+        );
+        manager
+            .set_enabled_with_readiness("com.example.timer", false, |_| false)
+            .unwrap();
+        assert_eq!(
+            manager.window_timer_get_state("com.example.timer", generation),
+            Err(TimerError::ExpiredWindowSessionError)
         );
     }
 

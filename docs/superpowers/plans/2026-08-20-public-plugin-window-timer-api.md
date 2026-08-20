@@ -34,11 +34,11 @@ Approved source of truth: [2026-08-20-public-plugin-window-timer-api-design.md](
 
 **Dependencies:** Design sections 6-8, 15, 19, and 20.1-20.2.
 
-- [ ] Add `PublicPermission::TimerControl` with the exact `timer.control` wire value and enforce the Windows, dependency-permission, output-mode, activation-mode, and window-entry combination rules.
-- [ ] Preserve the existing exact permission-grant equality rule for install and update; add focused coverage proving a missing grant cannot commit or replace the current generation.
-- [ ] Add the exact timer DTOs and window API types from design section 7, including non-optional `timer`, canonical `U64Decimal`, nullable first-idle fields, and fixed error names.
-- [ ] Reuse the existing decimal-u64 parser/comparator in frontend protocol code and cover `9 -> 10`, `99 -> 100`, values above `Number.MAX_SAFE_INTEGER`, `u64::MAX`, and malformed values.
-- [ ] Regenerate the Rust-owned JSON Schema and update the public v1 contract summary without touching validation CLI outputs.
+- [x] Add `PublicPermission::TimerControl` with the exact `timer.control` wire value and enforce the Windows, dependency-permission, output-mode, activation-mode, and window-entry combination rules.
+- [x] Preserve the existing exact permission-grant equality rule for install and update; add focused coverage proving a missing grant cannot commit or replace the current generation.
+- [x] Add the exact timer DTOs and window API types from design section 7, including non-optional `timer`, canonical `U64Decimal`, nullable first-idle fields, and fixed error names.
+- [x] Reuse the existing decimal-u64 parser/comparator in frontend protocol code and cover `9 -> 10`, `99 -> 100`, values above `Number.MAX_SAFE_INTEGER`, `u64::MAX`, and malformed values.
+- [x] Regenerate the Rust-owned JSON Schema and update the public v1 contract summary without touching validation CLI outputs.
 
 **Distinct test coverage:** legal three-permission Windows manifest; missing dependency; wrong mode; macOS; unknown permission; exact grants; timer input boundary and unknown-field DTO parsing; decimal revision ordering and rejection.
 
@@ -50,11 +50,11 @@ Approved source of truth: [2026-08-20-public-plugin-window-timer-api-design.md](
 
 **Dependencies:** Task 1; design sections 7.2-12.1, 14-15, 18.2, and 20.2-20.3/20.6.
 
-- [ ] Implement the replaceable clock abstraction, production Windows elapsed-time clock using `GetTickCount64`, deterministic test clock, one shared due-time worker, and one timer record per `pluginId + pluginGeneration`.
-- [ ] Implement `idle | running | paused | claiming | fired`, frozen round data, canonical revision projection, checked internal identities, and failure-closed `TimerUnavailable`.
-- [ ] Implement Start/Stop/Reset/get-state semantics, including nullable first idle, Reset display duration, pause/resume, idempotency, claiming projection, one queue owner, and no public claiming phase.
-- [ ] Implement ClaimTicket creation and validation entirely inside the timer service, but leave lifecycle admission, message persistence, and audio effects behind explicit callbacks owned by Task 3.
-- [ ] Make shutdown terminal, clear queued work, revoke tickets, and expose pure in-memory lifecycle hooks for generation cancellation and session consumers.
+- [x] Implement the replaceable clock abstraction, production Windows elapsed-time clock using `GetTickCount64`, deterministic test clock, one shared due-time worker, and one timer record per `pluginId + pluginGeneration`.
+- [x] Implement `idle | running | paused | claiming | fired`, frozen round data, canonical revision projection, checked internal identities, and failure-closed `TimerUnavailable`.
+- [x] Implement Start/Stop/Reset/get-state semantics, including nullable first idle, Reset display duration, pause/resume, idempotency, claiming projection, one queue owner, and no public claiming phase.
+- [x] Implement ClaimTicket creation and validation entirely inside the timer service, but leave lifecycle admission, message persistence, and audio effects behind explicit callbacks owned by Task 3.
+- [x] Make shutdown terminal, clear queued work, revoke tickets, and expose pure in-memory lifecycle hooks for generation cancellation and session consumers.
 
 **Distinct test coverage:** every transition in design table 11.1; Stop-before-claim and claim-before-Stop barriers; exactly-once claim per round; sleep-style clock advance; wall-clock independence; stale queue entries; revision/identity exhaustion; process shutdown.
 
@@ -66,11 +66,11 @@ Approved source of truth: [2026-08-20-public-plugin-window-timer-api-design.md](
 
 **Dependencies:** Task 2; design sections 11.3, 12-14, 18.2-18.3, and 20.5-20.6; existing `MessagePublisher` / `MessageCenterService` contract.
 
-- [ ] Wire the timer worker to delivery admission using the fixed `plugin mutation guard -> timer record` order; failed eligibility must skip message persistence and return a still-current claim to idle.
-- [ ] Persist admitted completion through `MessagePublisher::commit_publish` outside all plugin, timer, session, and message locks; dispatch existing post-guard message effects independently.
-- [ ] Add an injectable alarm trait and Windows production adapter using `PlaySoundW` with the bundled finite WAV, `SND_FILENAME | SND_ASYNC | SND_NODEFAULT`, and `PlaySoundW(NULL, NULL, 0)` for best-effort stop. Add only the required `Win32_Media_Audio` Windows crate feature, validate AudioTicket immediately before start, and never roll back `fired` or a saved message for playback failure.
-- [ ] On committed disable, fault-disable, uninstall, generation replacement, successful upgrade, and shutdown, revoke sessions and cancel the matching timer/tickets/audio before releasing the mutation boundary. Failed upgrade must leave the current generation unchanged.
-- [ ] Keep rename/settings changes limited to session revocation; retain the timer, frozen name/message data, and any admitted claiming work as specified.
+- [x] Wire the timer worker to delivery admission using the fixed `plugin mutation guard -> timer record` order; failed eligibility must skip message persistence and return a still-current claim to idle.
+- [x] Persist admitted completion through `MessagePublisher::commit_publish` outside all plugin, timer, session, and message locks; dispatch existing post-guard message effects independently.
+- [x] Add an injectable alarm trait and Windows production adapter using `PlaySoundW` with the bundled finite WAV, `SND_FILENAME | SND_ASYNC | SND_NODEFAULT`, and `PlaySoundW(NULL, NULL, 0)` for best-effort stop. Add only the required `Win32_Media_Audio` Windows crate feature, validate AudioTicket immediately before start, and never roll back `fired` or a saved message for playback failure.
+- [x] On committed disable, fault-disable, uninstall, generation replacement, successful upgrade, and shutdown, revoke sessions and cancel the matching timer/tickets/audio before releasing the mutation boundary. Failed upgrade must leave the current generation unchanged.
+- [x] Keep rename/settings changes limited to session revocation; retain the timer, frozen name/message data, and any admitted claiming work as specified.
 
 **Distinct test coverage:** lifecycle-before-admission skips the publisher; eligibility failure with a valid ticket returns idle; admission-before-lifecycle may save but cannot fire or sound; Reset-before-admission skips persistence; Reset during persistence preserves a saved message but blocks fired/audio; Reset before/after audio start; failure upgrade preservation; message failure returns idle and never sounds.
 
@@ -82,12 +82,12 @@ Approved source of truth: [2026-08-20-public-plugin-window-timer-api-design.md](
 
 **Dependencies:** Tasks 1-3; design sections 7.6-9, 14-17, 18.1, and 20.4/20.7.
 
-- [ ] Add checked session generations and the `prepared | active | closing | revoked` lifecycle to each plugin content window owner without exposing generation or identity fields to JavaScript.
-- [ ] Permit only `getState()` and one `onStateChanged()` registration during prepared; activate control only after update ack plus successful native show/focus commit; push one full activation snapshot.
-- [ ] Add the four narrow Tauri commands and exact content-label, current plugin generation, health, permission, owner, and session guards. Shell, Runtime, main, find, and forged labels must fail before timer state access.
-- [ ] Inject and deep-freeze the non-optional timer facade in the private bootstrap, keep Tauri internals unavailable, and deliver full private state snapshots only to the current content session.
-- [ ] Implement frontend session-local revision convergence, equal-revision running-anchor refresh for the latest `getState()` token only, single-handler enforcement, idempotent unsubscribe, and handler exception isolation.
-- [ ] On hide/close/auto-hide/new invocation/reload/lifecycle change, make the session closing before native work. A failed hide must issue a new session or destroy the window, never revive the old session object.
+- [x] Add checked session generations and the `prepared | active | closing | revoked` lifecycle to each plugin content window owner without exposing generation or identity fields to JavaScript.
+- [x] Permit only `getState()` and one `onStateChanged()` registration during prepared; activate control only after update ack plus successful native show/focus commit; push one full activation snapshot.
+- [x] Add the four narrow Tauri commands and exact content-label, current plugin generation, health, permission, owner, and session guards. Shell, Runtime, main, find, and forged labels must fail before timer state access.
+- [x] Inject and deep-freeze the non-optional timer facade in the private bootstrap, keep Tauri internals unavailable, and deliver full private state snapshots only to the current content session.
+- [x] Implement frontend session-local revision convergence, equal-revision running-anchor refresh for the latest `getState()` token only, single-handler enforcement, idempotent unsubscribe, and handler exception isolation.
+- [x] On hide/close/auto-hide/new invocation/reload/lifecycle change, make the session closing before native work. A failed hide must issue a new session or destroy the window, never revive the old session object.
 
 **Distinct test coverage:** prepare/ack/focus failure never activates; prepared mutation rejection; activation snapshot closes the subscribe/read race; API-call versus hide barrier in both orders; stale Promise/event cannot affect a new session; same-revision restrictions; timer field present but unauthorized; exact capability and command caller matrix.
 
