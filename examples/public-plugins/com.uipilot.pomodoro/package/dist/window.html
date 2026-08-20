@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pomodoro Timer</title>
+    <link rel="stylesheet" href="./window.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">番茄钟</p>
+      <output id="time" aria-live="off">00:10</output>
+      <p id="status" class="status">准备</p>
+      <div class="controls">
+        <button id="start" type="button">开始</button>
+        <button id="pause" type="button" disabled>暂停</button>
+        <button id="reset" type="button" class="secondary">重置</button>
+      </div>
+      <p id="error" class="error" role="status"></p>
+    </main>
+    <script type="module" src="./window.js"></script>
+  </body>
+</html>

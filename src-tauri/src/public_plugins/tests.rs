@@ -111,6 +111,30 @@ fn accepts_archive_and_directory_packages() {
 }
 
 #[test]
+fn pomodoro_reference_package_is_installable() {
+    let root = TestRoot::new("pomodoro-reference");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/public-plugins/com.uipilot.pomodoro/package");
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.pomodoro");
+    assert_eq!(
+        prepared.manifest.permissions,
+        vec![
+            PublicPermission::UiWindow,
+            PublicPermission::NotificationsPublish,
+            PublicPermission::TimerControl,
+        ]
+    );
+    assert_eq!(prepared.revalidate(), Ok(()));
+}
+
+#[test]
 fn rejects_resource_and_archive_path_variants() {
     for path in ["dist/icon.png", "dist/runtime.min.js", "dist/data.json"] {
         let root = TestRoot::new(path.replace(['/', '.'], "-").as_str());

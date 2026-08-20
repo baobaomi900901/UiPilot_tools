@@ -99,11 +99,11 @@ Approved source of truth: [2026-08-20-public-plugin-window-timer-api-design.md](
 
 **Dependencies:** Tasks 1-4; design sections 17 and 21-22.
 
-- [ ] Build a separate Windows `submit + window` example declaring all three permissions; leave both demo plugins and request-scoped delayed notification semantics unchanged.
-- [ ] Have Runtime return the initial `10_000` ms and completion message as window data. Render `00:10` locally before the host owns a round; Enter must not auto-start.
-- [ ] Register the timer subscription before the first state read, merge snapshots by canonical revision, interpolate running display with `performance.now()`, and expose Start/Pause/Resume/Reset controls against the frozen host API.
-- [ ] Document the permission bundle, session lifetime, Start/Stop/Reset contract, hidden-window continuation, completion ordering, error handling, revision merge rules, process-exit behavior, and install/test commands.
-- [ ] Add SDK contract and behavior tests covering initial display, explicit start, prepared/active interaction expectations, pause/resume/reset projection, fired display, and existing Demo compatibility.
+- [x] Build a separate Windows `submit + window` example declaring all three permissions; leave both demo plugins and request-scoped delayed notification semantics unchanged.
+- [x] Have Runtime return the initial `10_000` ms and completion message as window data. Render `00:10` locally before the host owns a round; Enter must not auto-start.
+- [x] Register the timer subscription before the first state read, merge snapshots by canonical revision, interpolate running display with `performance.now()`, and expose Start/Pause/Resume/Reset controls against the frozen host API.
+- [x] Document the permission bundle, session lifetime, Start/Stop/Reset contract, hidden-window continuation, completion ordering, error handling, revision merge rules, process-exit behavior, and install/test commands.
+- [x] Add SDK contract and behavior tests covering initial display, explicit start, prepared/active interaction expectations, pause/resume/reset projection, fired display, and existing Demo compatibility.
 
 **Distinct test coverage:** valid example manifest and package paths; Runtime output; TypeScript SDK consumption; no local background authority; initial host idle remains null while UI displays `00:10`; existing `demo-win` and `demo-return` tests remain unchanged and pass.
 

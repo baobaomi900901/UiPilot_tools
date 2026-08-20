@@ -9,6 +9,7 @@
 
 - [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：主界面结果与复制。
 - [`com.uipilot.demo-win`](../../examples/public-plugins/com.uipilot.demo-win)：单例子窗口。
+- [`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)：窗口隐藏后仍由宿主计时的番茄钟。
 
 完整字段、上限和安全合同见 [`Public Plugin API v1`](./public-plugin-v1.md)、[`plugin.json` Schema](./uipilot-plugin-v1.schema.json) 和 [TypeScript API 类型](./uipilot-plugin-api-v1.d.ts)。
 
@@ -18,6 +19,7 @@
 | --- | --- | --- | --- | --- |
 | 按 Enter 后在主界面显示结果 | `submit` | `mainResult` | 复制时使用 `clipboard.write` | `demo-return` |
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
+| 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
 MVP 中每个插件只能注册一个启动名称。用户可以在 UiPilot 设置中修改该名称，所以 Runtime 不应硬编码 `/命令名`。
@@ -78,7 +80,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - `command.defaultName` 不包含 `/`，只能有一个。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`，以及仅 Windows 可用的 `notifications.publish`。
+- 当前真正可用的权限只有 `clipboard.write`、`ui.window`，以及仅 Windows 可用的 `notifications.publish` 和 `timer.control`。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -349,6 +351,61 @@ p {
 
 图钉、关闭、拖拽、焦点交接、窗口位置和主题切换均由 UiPilot 外层窗口管理。插件页面不要实现自己的标题栏，也不能调用 Tauri 命令控制窗口。
 
+### 6.4 使用宿主持有的窗口计时器（仅 Windows）
+
+需要窗口隐藏后继续计时时，Manifest 必须同时声明 `ui.window`、`notifications.publish` 和
+`timer.control`，并使用 `submit + window`。三项权限必须在安装时全部确认；`timer.control` 不能用于
+Runtime，也不能脱离插件窗口调用。完整参考实现见
+[`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)。
+
+每个 active plugin generation 最多有一个宿主持有的计时器。窗口每次收到 `onUpdate` 时都会获得新的
+控制会话，因此应先订阅，再读取基准状态：
+
+```js
+let unsubscribe = null
+
+window.uipilotPluginWindow.onUpdate(async (update) => {
+  unsubscribe?.()
+  const timer = window.uipilotPluginWindow.timer
+  unsubscribe = timer.onStateChanged(renderTimerState)
+  renderTimerState(await timer.getState())
+})
+```
+
+窗口准备期间只允许 `getState()` 和 `onStateChanged()`；Start、Stop、Reset 只有在宿主完成原生显示与
+焦点交接后才可调用。窗口隐藏、关闭、新 invocation、插件改名或保存设置会撤销当前控制会话，旧 API
+引用随后返回 `ExpiredWindowSessionError`。隐藏窗口不会取消已经运行或暂停的宿主计时器；重新打开窗口
+后必须重新订阅和读取。
+
+```js
+await timer.start({
+  durationMs: 10_000,
+  completionMessage: '番茄钟完成',
+})
+await timer.stop()  // running -> paused；再次调用幂等
+await timer.start() // paused -> running；恢复时不能再传 input
+await timer.reset() // 回到 idle，保留显示时长但不自动开始
+```
+
+`durationMs` 是 `1_000..=86_400_000` 的 JavaScript 安全整数。`completionMessage` 是 1 到 500 个
+Unicode 标量值的纯文本。首次 `idle` 的 `durationMs / remainingMs` 都是 `null`；示例页面自己显示
+`00:10`，用户点击 Start 后宿主才冻结输入。`running` 时再次无参 Start、以及 idle/paused/fired 的幂等
+操作都返回当前权威状态；需要 input 时省略会得到 `TimerInputRequired`，不允许 input 时传入会得到
+`TimerInputNotAllowed`。
+
+状态的 `timerRevision` 是规范十进制 `u64` 字符串，不能转成 JavaScript `number`，也不能直接按字符串
+比较。应先比较长度，再在长度相等时按字典序比较。较低 revision 必须丢弃；相同 revision 通常丢弃，
+只有当前会话最新一次 `getState()` 返回的 running 状态，且 phase 和 duration 都相同，才可刷新本地
+remaining 锚点。页面可以用 `performance.now()` 插值显示数字，但本地 interval/animation frame 不能拥有
+到期、消息或后台副作用。
+
+到期时宿主先把完成消息原子保存到消息中心，成功后才进入 `fired` 并尝试播放一次有限音效。消息保存
+失败会回到 `idle`，不响铃、不重试；系统通知或音频失败不删除已保存消息。禁用、卸载、故障停用或成功
+升级会取消当前 generation 的计时器。退出 UiPilot 会丢弃所有计时器且下次启动不恢复、不补发。
+
+常见错误包括 `PermissionDenied`、`ExpiredWindowSessionError`、`InvalidTimerInput`、
+`TimerInputRequired`、`TimerInputNotAllowed`、`MessageStoreUnavailable` 和 `TimerUnavailable`。
+
 ## 7. 添加插件图标
 
 图标是可选的固定文件，不写入 `plugin.json`：
@@ -447,6 +504,7 @@ node --test .\tests\runtime.test.js
 ```powershell
 node --test examples/public-plugins/com.uipilot.demo-return/tests/runtime.test.js
 node --test examples/public-plugins/com.uipilot.demo-win/tests/runtime.test.js
+node --test examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js
 ```
 
 ## 9. 使用开发目录安装
@@ -502,7 +560,7 @@ $output
 
 把输出文件名改成自己的 `pluginId`。在发布前，用 UiPilot 的“选择插件包”重新安装该文件做最终验证。
 
-仓库内两个 Demo 可使用现有脚本打包：
+仓库内固定输出 Demo 可使用现有脚本打包；番茄钟示例可直接选择其 `package` 开发目录安装：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plugin.ps1 -PluginId com.uipilot.demo-return
@@ -563,7 +621,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 当前不支持：
 
 - 一个插件注册多个命令或多个窗口。
-- 插件代码长期后台运行、插件自建定时器、番茄钟产品功能或任意后台回调；延迟纯文本消息只能交给宿主的 `notifications.schedule()`。
+- 插件代码长期后台运行、插件自建计时器或任意后台回调；单轮窗口计时必须交给宿主的 `timer.control`，延迟纯文本消息交给 `notifications.schedule()`。
 - 网络、任意文件、原生二进制和 Shell。
 - 输入模拟或控制鼠标键盘。
 - 多动作结果、自定义动作回调、HTML/Markdown 结果。
@@ -579,6 +637,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `outputMode`、权限和 `window` 入口组合正确。
 - [ ] Runtime 始终原样返回 `requestId`。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
+- [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。
 - [ ] 内部空格不会被插件意外压缩。
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
 - [ ] `icon.png` 满足固定规则。

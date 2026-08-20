@@ -99,11 +99,12 @@ Other parsed permission names are reserved and installation fails until the host
 
 ## Unsupported In v1
 
-Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, network, arbitrary files, clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. The only delayed operation is the host-owned, process-local `notifications.schedule()` message described above.
+Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, network, arbitrary files, clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
 
 The fixed-output reference packages are:
 
 - `examples/public-plugins/com.uipilot.demo-win`: Windows-only `submit + window` with `ui.window` and a 10-second host-owned delayed message.
 - `examples/public-plugins/com.uipilot.demo-return`: `submit + mainResult` with `clipboard.write`.
+- `examples/public-plugins/com.uipilot.pomodoro`: Windows-only `submit + window` with the three-permission host timer, pause/resume/reset, message-center completion, and a finite host alarm.
 
 Each README documents its development-directory installation, focused verification, packaging command, and user-operated acceptance flow.
