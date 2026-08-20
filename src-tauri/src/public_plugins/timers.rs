@@ -656,8 +656,7 @@ impl PluginTimerService {
                 .0
                 .due_at_ms
                 .saturating_sub(self.clock.now_ms())
-                .min(SLEEP_RECHECK_MS)
-                .max(1);
+                .clamp(1, SLEEP_RECHECK_MS);
             if self
                 .wake
                 .wait_timeout(state, Duration::from_millis(wait_ms))

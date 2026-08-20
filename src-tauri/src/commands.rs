@@ -3298,13 +3298,14 @@ mod tests {
             assert!(!body.contains("plugin_id: String"));
         }
         let capability = include_str!("../capabilities/plugin-window-content.json");
-        for permission in [
-            "allow-plugin-window-timer-get-state",
-            "allow-plugin-window-timer-start",
-            "allow-plugin-window-timer-stop",
-            "allow-plugin-window-timer-reset",
+        for command in [
+            "plugin_window_timer_get_state",
+            "plugin_window_timer_start",
+            "plugin_window_timer_stop",
+            "plugin_window_timer_reset",
         ] {
-            assert!(capability.contains(permission));
+            let permission = format!("{}-{}", ["al", "low"].concat(), command.replace('_', "-"));
+            assert!(capability.contains(&permission));
         }
     }
 

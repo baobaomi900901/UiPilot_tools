@@ -434,10 +434,10 @@ impl PluginWindowController {
         let Ok(mut core) = self.core.lock() else {
             return false;
         };
-        if !core
+        if core
             .windows
             .get(plugin_id)
-            .is_some_and(|window| window.generation == generation)
+            .is_none_or(|window| window.generation != generation)
         {
             return false;
         }
