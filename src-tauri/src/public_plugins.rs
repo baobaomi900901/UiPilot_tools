@@ -8,6 +8,7 @@ mod scheduler;
 mod secrets;
 mod state;
 mod storage;
+mod timer_alarm;
 mod timers;
 
 #[cfg(test)]
@@ -99,15 +100,29 @@ impl PublicPluginService {
         reserved_names: impl IntoIterator<Item = String>,
         message_center: Arc<MessageCenterService>,
     ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
+        let alarm_path = app
+            .path()
+            .resolve(
+                "sounds/timer-complete.wav",
+                tauri::path::BaseDirectory::Resource,
+            )
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let timer_alarm = timer_alarm::windows_alarm(alarm_path);
         let manager = Arc::new(PublicPluginManager::load(
             app_data_dir,
             PublicPluginHost::current(PublicPlatform::Windows),
             reserved_names,
             message_center,
+            timer_alarm,
         )?);
         manager.start_delayed_messages(app)?;
+        if let Err(error) = manager.start_timers(app) {
+            manager.shutdown_delayed_messages();
+            return Err(error);
+        }
         if self.manager.set(Arc::clone(&manager)).is_err() {
             manager.shutdown_delayed_messages();
+            manager.shutdown_timers();
             return Err(PublicPluginManagementError::Unavailable);
         }
         Ok(manager)
@@ -122,6 +137,7 @@ impl PublicPluginService {
     pub(crate) fn shutdown(&self) {
         if let Some(manager) = self.manager.get() {
             manager.shutdown_delayed_messages();
+            manager.shutdown_timers();
         }
     }
 

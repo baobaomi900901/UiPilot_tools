@@ -22,11 +22,14 @@ use super::{
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
-    package, runtime_label, stage_public_package, EffectivePluginConfig, PluginApiExecution,
-    PluginApiRequest, PluginCommandCompletion, PluginCompletionOutcome, PluginRequestContext,
-    PluginRequestScheduler, PluginRuntimeApi, PluginRuntimeError, PluginSecretStore,
-    PluginStateError, PluginStateStore, PluginStorageStore, PreparedPublicPlugin, PublicManifestV1,
-    PublicPackageError, PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource,
+    package, runtime_label, stage_public_package,
+    timer_alarm::TimerAlarm,
+    timers::{ClaimTicket, Clock, PluginTimerService, SystemClock, TimerKey},
+    EffectivePluginConfig, PluginApiExecution, PluginApiRequest, PluginCommandCompletion,
+    PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler, PluginRuntimeApi,
+    PluginRuntimeError, PluginSecretStore, PluginStateError, PluginStateStore, PluginStorageStore,
+    PreparedPublicPlugin, PublicManifestV1, PublicPackageError, PublicPackageSource,
+    PublicPluginFault, PublicPluginHost, PublicResource,
 };
 
 const PREPARE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -328,6 +331,9 @@ pub(crate) struct PublicPluginManager {
     scheduler: Arc<PluginRequestScheduler>,
     delayed_messages: Arc<DelayedMessageScheduler>,
     message_center: Arc<MessageCenterService>,
+    timer_publisher: Arc<dyn MessagePublisher>,
+    timer_alarm: Arc<dyn TimerAlarm>,
+    timers: Arc<PluginTimerService>,
     api: PluginRuntimeApi,
     mutation: Mutex<()>,
     data: Mutex<ActivationData>,
@@ -341,6 +347,28 @@ impl PublicPluginManager {
         host: PublicPluginHost,
         reserved_names: impl IntoIterator<Item = String>,
         message_center: Arc<MessageCenterService>,
+        timer_alarm: Arc<dyn TimerAlarm>,
+    ) -> Result<Self, PublicPluginManagementError> {
+        let timer_publisher: Arc<dyn MessagePublisher> = message_center.clone();
+        Self::load_with_timer_dependencies(
+            app_data_dir,
+            host,
+            reserved_names,
+            message_center,
+            Arc::new(SystemClock),
+            timer_publisher,
+            timer_alarm,
+        )
+    }
+
+    fn load_with_timer_dependencies(
+        app_data_dir: &Path,
+        host: PublicPluginHost,
+        reserved_names: impl IntoIterator<Item = String>,
+        message_center: Arc<MessageCenterService>,
+        timer_clock: Arc<dyn Clock>,
+        timer_publisher: Arc<dyn MessagePublisher>,
+        timer_alarm: Arc<dyn TimerAlarm>,
     ) -> Result<Self, PublicPluginManagementError> {
         let root = app_data_dir.join("public-plugins");
         let staging_root = root.join("staging");
@@ -358,6 +386,7 @@ impl PublicPluginManager {
         );
         let scheduler = Arc::new(PluginRequestScheduler::default());
         let delayed_messages = Arc::new(DelayedMessageScheduler::default());
+        let timers = Arc::new(PluginTimerService::new(timer_clock));
         let api = PluginRuntimeApi::new(
             Arc::clone(&scheduler),
             Arc::clone(&state),
@@ -402,6 +431,9 @@ impl PublicPluginManager {
             scheduler,
             delayed_messages,
             message_center,
+            timer_publisher,
+            timer_alarm,
+            timers,
             api,
             mutation: Mutex::new(()),
             data: Mutex::new(ActivationData {
@@ -602,6 +634,9 @@ impl PublicPluginManager {
             .invalidate_plugin(&runtime.plugin_id, Some(runtime.generation))
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(&runtime.plugin_id);
+        let timer_audio = previous_config.as_ref().and_then(|config| {
+            self.cancel_timer_generation(&runtime.plugin_id, config.active_generation)
+        });
         {
             let mut data = self.lock_data()?;
             let staged = data
@@ -613,11 +648,14 @@ impl PublicPluginManager {
                 .insert(runtime.plugin_id.clone(), staged);
         }
         self.clear_runtime_faults(&runtime.plugin_id)?;
-        Ok(PublicActivationCommit {
+        let commit = PublicActivationCommit {
             mutation: mutation_from_config(&config),
             runtime,
             previous_runtime_label,
-        })
+        };
+        drop(_mutation);
+        self.stop_timer_audio(timer_audio);
+        Ok(commit)
     }
     pub(crate) fn set_enabled_with_readiness<F>(
         &self,
@@ -655,11 +693,15 @@ impl PublicPluginManager {
                     .invalidate_plugin(plugin_id, None)
                     .map_err(|_| PublicPluginManagementError::Unavailable)?;
                 self.cancel_delayed_messages(plugin_id);
-                return Ok(PublicEnabledCommit {
+                let audio = self.cancel_timer_generation(plugin_id, before.active_generation);
+                let commit = PublicEnabledCommit {
                     mutation: mutation_from_config(&config),
                     runtime: None,
                     closed_runtime_label: Some(current_runtime.label),
-                });
+                };
+                drop(_mutation);
+                self.stop_timer_audio(audio);
+                return Ok(commit);
             }
             let generation = before
                 .active_generation
@@ -687,7 +729,7 @@ impl PublicPluginManager {
         }
 
         let _mutation = self.lock_mutation()?;
-        if self.state.config(plugin_id)? != Some(before) {
+        if self.state.config(plugin_id)? != Some(before.clone()) {
             self.unstage(&runtime.label);
             return Err(PublicPluginManagementError::Unavailable);
         }
@@ -725,12 +767,16 @@ impl PublicPluginManager {
         data.active_by_plugin.insert(plugin_id.into(), staged);
         drop(data);
         self.cancel_delayed_messages(plugin_id);
+        let timer_audio = self.cancel_timer_generation(plugin_id, before.active_generation);
         self.clear_runtime_faults(plugin_id)?;
-        Ok(PublicEnabledCommit {
+        let commit = PublicEnabledCommit {
             mutation: mutation_from_config(&config),
             runtime: Some(runtime),
             closed_runtime_label: previous_runtime_label,
-        })
+        };
+        drop(_mutation);
+        self.stop_timer_audio(timer_audio);
+        Ok(commit)
     }
     pub(crate) fn rename(
         &self,
@@ -794,12 +840,18 @@ impl PublicPluginManager {
         retain_data: bool,
     ) -> Result<Option<String>, PublicPluginManagementError> {
         let _mutation = self.lock_mutation()?;
+        let previous_generation = self
+            .state
+            .config(plugin_id)?
+            .map(|config| config.active_generation);
         self.clear_runtime_faults(plugin_id)?;
         self.state.uninstall(plugin_id, retain_data)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
+        let timer_audio = previous_generation
+            .and_then(|generation| self.cancel_timer_generation(plugin_id, generation));
         let runtime_label = self
             .lock_data()?
             .active_by_plugin
@@ -817,6 +869,8 @@ impl PublicPluginManager {
         if packages.exists() {
             package::remove_package_tree(packages);
         }
+        drop(_mutation);
+        self.stop_timer_audio(timer_audio);
         Ok(runtime_label)
     }
 
@@ -1196,6 +1250,114 @@ impl PublicPluginManager {
         &self.message_center
     }
 
+    pub(crate) fn timer_service(&self) -> &Arc<PluginTimerService> {
+        &self.timers
+    }
+
+    pub(crate) fn start_timers(
+        self: &Arc<Self>,
+        app: &AppHandle,
+    ) -> Result<(), PublicPluginManagementError> {
+        let manager = Arc::downgrade(self);
+        let app = app.clone();
+        self.timers
+            .start_worker(Arc::new(move |ticket| {
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                let effect = manager.commit_timer_claim(ticket);
+                manager.message_center.dispatch_post_guard(&app, effect);
+            }))
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn shutdown_timers(&self) {
+        if let Ok(tickets) = self.timers.shutdown() {
+            for ticket in tickets {
+                let _ = self.timer_alarm.stop(&ticket);
+            }
+        }
+        self.timer_alarm.shutdown();
+    }
+
+    fn commit_timer_claim(&self, ticket: ClaimTicket) -> Option<MessagePostGuardEffect> {
+        let admitted = {
+            let mutation = self.lock_mutation().ok()?;
+            let key = ticket.key();
+            let eligible = self
+                .state
+                .config(&key.plugin_id)
+                .ok()
+                .flatten()
+                .is_some_and(|config| {
+                    config.installed
+                        && config.enabled
+                        && config.fault.is_none()
+                        && config.active_generation == key.plugin_generation
+                        && [
+                            PublicPermission::UiWindow,
+                            PublicPermission::NotificationsPublish,
+                            PublicPermission::TimerControl,
+                        ]
+                        .into_iter()
+                        .all(|permission| config.permission_grants.contains(&permission))
+                })
+                && self
+                    .lock_data()
+                    .ok()
+                    .and_then(|data| data.active_by_plugin.get(&key.plugin_id).cloned())
+                    .is_some_and(|snapshot| {
+                        snapshot.generation == key.plugin_generation
+                            && [
+                                PublicPermission::UiWindow,
+                                PublicPermission::NotificationsPublish,
+                                PublicPermission::TimerControl,
+                            ]
+                            .into_iter()
+                            .all(|permission| snapshot.manifest.permissions.contains(&permission))
+                    });
+            if !eligible {
+                drop(mutation);
+                let _ = self.timers.complete_claim(&ticket, false);
+                return None;
+            }
+            let admitted = self.timers.admit_claim(&ticket).ok()?;
+            drop(mutation);
+            admitted
+        };
+        if !admitted {
+            return None;
+        }
+
+        let outcome = self.timer_publisher.commit_publish(MessagePublishRequest {
+            plugin_id: ticket.frozen_completion.plugin_id.clone(),
+            plugin_name_snapshot: ticket.frozen_completion.plugin_name_snapshot.clone(),
+            content: ticket.frozen_completion.completion_message.clone(),
+        });
+        let (persisted, effect) = match outcome {
+            MessagePublishOutcome::Published(published) => {
+                (true, Some(MessagePostGuardEffect::Published(published)))
+            }
+            MessagePublishOutcome::BecameUnavailable => {
+                (false, Some(MessagePostGuardEffect::BecameUnavailable))
+            }
+            MessagePublishOutcome::OperationFailed | MessagePublishOutcome::Unavailable => {
+                (false, None)
+            }
+        };
+        let completion = self
+            .timers
+            .complete_claim(&ticket, persisted)
+            .ok()
+            .flatten();
+        if let Some(audio) = completion.and_then(|completion| completion.audio_ticket) {
+            if self.timers.is_audio_ticket_current(&audio).unwrap_or(false) {
+                let _ = self.timer_alarm.play(&audio);
+            }
+        }
+        effect
+    }
+
     pub(crate) fn start_delayed_messages(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1334,9 +1496,13 @@ impl PublicPluginManager {
             Some(replacement.digest.clone()),
         )?;
         self.cancel_delayed_messages(plugin_id);
+        let timer_audio = self.cancel_timer_generation(plugin_id, previous_generation);
         let replacement = Arc::new(replacement);
         let candidate = replacement.candidate();
         data.active_by_plugin.insert(plugin_id.into(), replacement);
+        drop(data);
+        drop(_mutation);
+        self.stop_timer_audio(timer_audio);
         Ok(candidate)
     }
 
@@ -1363,12 +1529,20 @@ impl PublicPluginManager {
             return Ok(false);
         }
         let _mutation = self.lock_mutation()?;
+        let generation = self
+            .state
+            .config(plugin_id)?
+            .map(|config| config.active_generation);
         self.state
             .disable_for_fault(plugin_id, PublicPluginFault::RuntimeUnavailable)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
+        let timer_audio =
+            generation.and_then(|generation| self.cancel_timer_generation(plugin_id, generation));
+        drop(_mutation);
+        self.stop_timer_audio(timer_audio);
         Ok(true)
     }
 
@@ -1384,17 +1558,40 @@ impl PublicPluginManager {
         plugin_id: &str,
     ) -> Result<(), PublicPluginManagementError> {
         let _mutation = self.lock_mutation()?;
+        let generation = self
+            .state
+            .config(plugin_id)?
+            .map(|config| config.active_generation);
         self.state
             .disable_for_fault(plugin_id, PublicPluginFault::RuntimeUnavailable)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
+        let timer_audio =
+            generation.and_then(|generation| self.cancel_timer_generation(plugin_id, generation));
+        drop(_mutation);
+        self.stop_timer_audio(timer_audio);
         Ok(())
     }
 
     fn cancel_delayed_messages(&self, plugin_id: &str) {
         let _ = self.delayed_messages.cancel_plugin(plugin_id);
+    }
+
+    fn cancel_timer_generation(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Option<super::timers::AudioTicket> {
+        TimerKey::new(plugin_id, generation)
+            .and_then(|key| self.timers.cancel_generation(&key).ok().flatten())
+    }
+
+    fn stop_timer_audio(&self, audio: Option<super::timers::AudioTicket>) {
+        if let Some(audio) = audio {
+            let _ = self.timer_alarm.stop(&audio);
+        }
     }
 
     fn active_manifest(
@@ -1691,10 +1888,89 @@ mod tests {
     use crate::message_center::MessagePostGuardEffect;
     use crate::public_plugins::{
         delayed_messages::{DelayedMessageRegistration, ScheduledPluginMessage},
+        timer_alarm::{TimerAlarm, TimerAlarmError},
+        timers::{Clock, PluginTimerPhase, PluginTimerStartInput, TimerKey},
         PublicPlatform,
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct TestClock(AtomicU64);
+
+    impl TestClock {
+        fn advance(&self, millis: u64) {
+            self.0.fetch_add(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Default)]
+    struct TestAlarm(Mutex<Vec<&'static str>>);
+
+    impl TimerAlarm for TestAlarm {
+        fn play(
+            &self,
+            _ticket: &super::super::timers::AudioTicket,
+        ) -> Result<bool, TimerAlarmError> {
+            self.0.lock().unwrap().push("play");
+            Ok(true)
+        }
+
+        fn stop(&self, _ticket: &super::super::timers::AudioTicket) -> Result<(), TimerAlarmError> {
+            self.0.lock().unwrap().push("stop");
+            Ok(())
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    struct TestPublisher {
+        outcome: MessagePublishOutcome,
+        calls: Mutex<Vec<MessagePublishRequest>>,
+    }
+
+    impl TestPublisher {
+        fn successful() -> Self {
+            Self {
+                outcome: MessagePublishOutcome::Published(
+                    crate::message_center::MessagePublished {
+                        id: "1".into(),
+                        plugin_id: "com.example.timer".into(),
+                        plugin_name_snapshot: "Timer".into(),
+                        created_at: "2026-08-20T00:00:00Z".into(),
+                        content: "finished".into(),
+                        revision: "1".into(),
+                        unread_count: 1,
+                    },
+                ),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                outcome: MessagePublishOutcome::OperationFailed,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MessagePublisher for TestPublisher {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn commit_publish(&self, request: MessagePublishRequest) -> MessagePublishOutcome {
+            self.calls.lock().unwrap().push(request);
+            self.outcome.clone()
+        }
+    }
 
     struct TestDir(PathBuf);
 
@@ -1728,11 +2004,32 @@ mod tests {
 
     fn manager(dir: &TestDir) -> PublicPluginManager {
         let message_center = Arc::new(MessageCenterService::load(dir.path()));
-        PublicPluginManager::load(
+        PublicPluginManager::load_with_timer_dependencies(
             dir.path(),
             PublicPluginHost::current(PublicPlatform::Windows),
             ["find".into(), "math".into()],
             message_center,
+            Arc::new(TestClock::default()),
+            Arc::new(TestPublisher::successful()),
+            Arc::new(TestAlarm::default()),
+        )
+        .unwrap()
+    }
+
+    fn timer_manager(
+        dir: &TestDir,
+        clock: Arc<TestClock>,
+        publisher: Arc<TestPublisher>,
+        alarm: Arc<TestAlarm>,
+    ) -> PublicPluginManager {
+        PublicPluginManager::load_with_timer_dependencies(
+            dir.path(),
+            PublicPluginHost::current(PublicPlatform::Windows),
+            ["find".into(), "math".into()],
+            Arc::new(MessageCenterService::load(dir.path())),
+            clock,
+            publisher,
+            alarm,
         )
         .unwrap()
     }
@@ -1797,6 +2094,82 @@ mod tests {
             "export async function onCommand() { return { results: [] }; }",
         )
         .unwrap();
+    }
+
+    fn write_timer_package(root: &Path, version: &str) {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "com.example.timer",
+                "version": version,
+                "apiVersion": 1,
+                "minimumHostVersion": "0.2.0",
+                "name": "Timer",
+                "supportedPlatforms": ["windows"],
+                "command": {
+                    "defaultName": "timer",
+                    "activationMode": "submit",
+                    "outputMode": "window",
+                    "inputRequired": false
+                },
+                "runtime": { "entry": "dist/runtime.js" },
+                "window": { "entry": "dist/window.html" },
+                "permissions": ["ui.window", "notifications.publish", "timer.control"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/runtime.js"),
+            "export async function onCommand() { return { data: {} }; }",
+        )
+        .unwrap();
+        fs::write(root.join("dist/window.html"), "<!doctype html>").unwrap();
+    }
+
+    fn install_timer(manager: &PublicPluginManager, source_path: &Path) -> u64 {
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(source_path), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiWindow,
+                    PublicPermission::NotificationsPublish,
+                    PublicPermission::TimerControl,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap()
+            .runtime
+            .generation
+    }
+
+    fn start_due_timer(
+        manager: &PublicPluginManager,
+        clock: &TestClock,
+        generation: u64,
+    ) -> (TimerKey, super::super::timers::ClaimTicket) {
+        let key = TimerKey::new("com.example.timer", generation).unwrap();
+        manager
+            .timers
+            .start(
+                &key,
+                "Timer",
+                Some(PluginTimerStartInput {
+                    duration_ms: 1_000,
+                    completion_message: "finished".into(),
+                }),
+                true,
+            )
+            .unwrap();
+        clock.advance(1_000);
+        let ticket = manager.timers.claim_next_due().unwrap().unwrap();
+        (key, ticket)
     }
 
     fn schedule_test_message(
@@ -2114,6 +2487,196 @@ mod tests {
             None
         );
         assert_eq!(manager.message_center.summary().unwrap().unread_count, 1);
+    }
+
+    #[test]
+    fn timer_delivery_persists_for_the_current_generation_before_audio() {
+        let dir = TestDir::new("timer-delivery");
+        write_timer_package(&dir.source(), "1.0.0");
+        let clock = Arc::new(TestClock::default());
+        let publisher = Arc::new(TestPublisher::successful());
+        let alarm = Arc::new(TestAlarm::default());
+        let manager = timer_manager(&dir, clock.clone(), publisher.clone(), alarm.clone());
+        let generation = install_timer(&manager, &dir.source());
+        let (key, ticket) = start_due_timer(&manager, &clock, generation);
+
+        let effect = manager.commit_timer_claim(ticket);
+
+        assert!(matches!(effect, Some(MessagePostGuardEffect::Published(_))));
+        assert_eq!(publisher.calls.lock().unwrap().len(), 1);
+        assert_eq!(*alarm.0.lock().unwrap(), ["play"]);
+        assert_eq!(
+            manager.timers.get_state(&key).unwrap().phase,
+            PluginTimerPhase::Fired
+        );
+    }
+
+    #[test]
+    fn lifecycle_before_timer_admission_skips_message_and_audio() {
+        let dir = TestDir::new("timer-lifecycle-first");
+        write_timer_package(&dir.source(), "1.0.0");
+        let clock = Arc::new(TestClock::default());
+        let publisher = Arc::new(TestPublisher::successful());
+        let alarm = Arc::new(TestAlarm::default());
+        let manager = timer_manager(&dir, clock.clone(), publisher.clone(), alarm.clone());
+        let generation = install_timer(&manager, &dir.source());
+        let (_key, ticket) = start_due_timer(&manager, &clock, generation);
+        manager
+            .set_enabled_with_readiness("com.example.timer", false, |_| false)
+            .unwrap();
+
+        assert_eq!(manager.commit_timer_claim(ticket), None);
+        assert!(publisher.calls.lock().unwrap().is_empty());
+        assert!(alarm.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn timer_message_failure_returns_idle_without_audio() {
+        let dir = TestDir::new("timer-message-failure");
+        write_timer_package(&dir.source(), "1.0.0");
+        let clock = Arc::new(TestClock::default());
+        let publisher = Arc::new(TestPublisher::failing());
+        let alarm = Arc::new(TestAlarm::default());
+        let manager = timer_manager(&dir, clock.clone(), publisher.clone(), alarm.clone());
+        let generation = install_timer(&manager, &dir.source());
+        let (key, ticket) = start_due_timer(&manager, &clock, generation);
+
+        assert_eq!(manager.commit_timer_claim(ticket), None);
+        assert_eq!(publisher.calls.lock().unwrap().len(), 1);
+        assert!(alarm.0.lock().unwrap().is_empty());
+        let state = manager.timers.get_state(&key).unwrap();
+        assert_eq!(state.phase, PluginTimerPhase::Idle);
+        assert_eq!(state.remaining_ms, Some(1_000));
+    }
+
+    #[test]
+    fn failed_timer_upgrade_preserves_the_current_generation_timer() {
+        let dir = TestDir::new("timer-failed-upgrade");
+        write_timer_package(&dir.source(), "1.0.0");
+        let clock = Arc::new(TestClock::default());
+        let manager = timer_manager(
+            &dir,
+            clock,
+            Arc::new(TestPublisher::successful()),
+            Arc::new(TestAlarm::default()),
+        );
+        let generation = install_timer(&manager, &dir.source());
+        let key = TimerKey::new("com.example.timer", generation).unwrap();
+        manager
+            .timers
+            .start(
+                &key,
+                "Timer",
+                Some(PluginTimerStartInput {
+                    duration_ms: 10_000,
+                    completion_message: "finished".into(),
+                }),
+                true,
+            )
+            .unwrap();
+
+        write_timer_package(&dir.source(), "1.1.0");
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert_eq!(
+            manager.commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiWindow,
+                    PublicPermission::NotificationsPublish,
+                    PublicPermission::TimerControl,
+                ]),
+                now,
+                |_| false,
+            ),
+            Err(PublicPluginManagementError::RuntimeNotReady)
+        );
+        assert_eq!(
+            manager.timers.get_state(&key).unwrap().phase,
+            PluginTimerPhase::Running
+        );
+    }
+
+    #[test]
+    fn committed_generation_lifecycle_changes_cancel_timers() {
+        let dir = TestDir::new("timer-generation-lifecycle");
+        write_timer_package(&dir.source(), "1.0.0");
+        let clock = Arc::new(TestClock::default());
+        let manager = timer_manager(
+            &dir,
+            clock,
+            Arc::new(TestPublisher::successful()),
+            Arc::new(TestAlarm::default()),
+        );
+        let start = |manager: &PublicPluginManager, generation| {
+            let key = TimerKey::new("com.example.timer", generation).unwrap();
+            manager
+                .timers
+                .start(
+                    &key,
+                    "Timer",
+                    Some(PluginTimerStartInput {
+                        duration_ms: 10_000,
+                        completion_message: "finished".into(),
+                    }),
+                    true,
+                )
+                .unwrap();
+            key
+        };
+
+        let first_generation = install_timer(&manager, &dir.source());
+        let first_key = start(&manager, first_generation);
+        write_timer_package(&dir.source(), "1.1.0");
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let updated = manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiWindow,
+                    PublicPermission::NotificationsPublish,
+                    PublicPermission::TimerControl,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.timers.get_state(&first_key).unwrap().timer_revision,
+            "0"
+        );
+
+        let updated_key = start(&manager, updated.runtime.generation);
+        manager
+            .mark_runtime_unavailable("com.example.timer")
+            .unwrap();
+        assert_eq!(
+            manager
+                .timers
+                .get_state(&updated_key)
+                .unwrap()
+                .timer_revision,
+            "0"
+        );
+
+        let enabled = manager
+            .set_enabled_with_readiness("com.example.timer", true, |_| true)
+            .unwrap()
+            .runtime
+            .unwrap();
+        let enabled_key = start(&manager, enabled.generation);
+        manager.uninstall("com.example.timer", true).unwrap();
+        assert_eq!(
+            manager
+                .timers
+                .get_state(&enabled_key)
+                .unwrap()
+                .timer_revision,
+            "0"
+        );
     }
 
     #[test]

@@ -46,7 +46,8 @@
     "resources": [
       "resources/everything/Everything.exe",
       "resources/everything/LICENSE.txt",
-      "resources/everything/everything.lock.json"
+      "resources/everything/everything.lock.json",
+      "resources/sounds/timer-complete.wav"
     ],
     "targets": "all",
     "icon": [

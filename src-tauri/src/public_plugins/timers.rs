@@ -129,12 +129,12 @@ impl ClaimTicket {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AudioTicket {
-    key: TimerKey,
-    round_id: u64,
-    audio_id: u64,
-    fired_revision: u64,
+    pub(super) key: TimerKey,
+    pub(super) round_id: u64,
+    pub(super) audio_id: u64,
+    pub(super) fired_revision: u64,
 }
 
 impl AudioTicket {
@@ -580,7 +580,7 @@ impl PluginTimerService {
         Ok(audio)
     }
 
-    fn claim_next_due(&self) -> Result<Option<ClaimTicket>, TimerError> {
+    pub(super) fn claim_next_due(&self) -> Result<Option<ClaimTicket>, TimerError> {
         let now = self.clock.now_ms();
         let mut state = self.lock_state()?;
         if state.terminal {
