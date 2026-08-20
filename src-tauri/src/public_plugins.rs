@@ -8,6 +8,7 @@ mod scheduler;
 mod secrets;
 mod state;
 mod storage;
+mod timers;
 
 #[cfg(test)]
 mod tests;
