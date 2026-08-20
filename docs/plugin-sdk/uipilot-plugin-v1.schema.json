@@ -61,6 +61,7 @@
         "files.userSelected",
         "files.index.readAll",
         "notifications.publish",
+        "timer.control",
         "background.schedule"
       ],
       "type": "string"

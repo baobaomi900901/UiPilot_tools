@@ -32,6 +32,8 @@ pub(crate) enum PublicPermission {
     FilesIndexReadAll,
     #[serde(rename = "notifications.publish")]
     NotificationsPublish,
+    #[serde(rename = "timer.control")]
+    TimerControl,
     #[serde(rename = "background.schedule")]
     BackgroundSchedule,
 }
@@ -39,7 +41,8 @@ pub(crate) enum PublicPermission {
 impl PublicPermission {
     pub(super) fn is_available(self, platform: PublicPlatform) -> bool {
         matches!(self, Self::UiWindow | Self::ClipboardWrite)
-            || (self == Self::NotificationsPublish && platform == PublicPlatform::Windows)
+            || (matches!(self, Self::NotificationsPublish | Self::TimerControl)
+                && platform == PublicPlatform::Windows)
     }
 }
 
@@ -315,6 +318,20 @@ fn validate_manifest(
         _ => {}
     }
 
+    if manifest
+        .permissions
+        .contains(&PublicPermission::TimerControl)
+        && (manifest.command.activation_mode != PublicActivationMode::Submit
+            || manifest.command.output_mode != PublicOutputMode::Window
+            || manifest.window.is_none()
+            || !manifest.permissions.contains(&PublicPermission::UiWindow)
+            || !manifest
+                .permissions
+                .contains(&PublicPermission::NotificationsPublish))
+    {
+        return Err(PublicPackageError::InvalidPackage);
+    }
+
     if !manifest.supported_platforms.contains(&host.platform) {
         return Err(PublicPackageError::IncompatiblePlatform);
     }
@@ -485,6 +502,7 @@ mod schema_tests {
             "additionalProperties",
             "ui.window",
             "clipboard.write",
+            "timer.control",
         ] {
             assert!(
                 serialized.contains(required),
@@ -516,5 +534,66 @@ mod schema_tests {
                 Err(PublicPackageError::InvalidPackage)
             );
         }
+    }
+
+    #[test]
+    fn timer_control_requires_the_exact_windows_window_permission_bundle() {
+        let mut valid = manifest(None);
+        valid["supportedPlatforms"] = serde_json::json!(["windows"]);
+        valid["command"] = serde_json::json!({
+            "defaultName": "timer",
+            "activationMode": "submit",
+            "outputMode": "window",
+            "inputRequired": false
+        });
+        valid["window"] = serde_json::json!({ "entry": "dist/window.html" });
+        valid["permissions"] =
+            serde_json::json!(["ui.window", "notifications.publish", "timer.control"]);
+        assert!(parse(&valid).is_ok());
+
+        for (label, candidate) in [
+            ("missing-window-permission", {
+                let mut candidate = valid.clone();
+                candidate["permissions"] =
+                    serde_json::json!(["notifications.publish", "timer.control"]);
+                candidate
+            }),
+            ("missing-notification-permission", {
+                let mut candidate = valid.clone();
+                candidate["permissions"] = serde_json::json!(["ui.window", "timer.control"]);
+                candidate
+            }),
+            ("wrong-output-mode", {
+                let mut candidate = valid.clone();
+                candidate["command"]["outputMode"] = serde_json::json!("mainResult");
+                candidate
+            }),
+            ("wrong-activation-mode", {
+                let mut candidate = valid.clone();
+                candidate["command"]["activationMode"] = serde_json::json!("live");
+                candidate
+            }),
+            ("missing-window-entry", {
+                let mut candidate = valid.clone();
+                candidate.as_object_mut().unwrap().remove("window");
+                candidate
+            }),
+        ] {
+            assert_eq!(
+                parse(&candidate),
+                Err(PublicPackageError::InvalidPackage),
+                "{label}"
+            );
+        }
+
+        let mut macos = valid;
+        macos["supportedPlatforms"] = serde_json::json!(["macos"]);
+        assert_eq!(
+            parse_manifest(
+                &serde_json::to_vec(&macos).unwrap(),
+                &PublicPluginHost::current(PublicPlatform::Macos),
+            ),
+            Err(PublicPackageError::UnsupportedPermission)
+        );
     }
 }

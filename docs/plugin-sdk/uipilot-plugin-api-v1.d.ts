@@ -81,10 +81,48 @@ export interface PluginWindowUpdate {
   data: JsonValue
 }
 
+export type U64Decimal = string
+
+export type PluginTimerPhase = 'idle' | 'running' | 'paused' | 'fired'
+
+export interface PluginTimerStartInput {
+  readonly durationMs: number
+  readonly completionMessage: string
+}
+
+export type PluginTimerState =
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'idle'
+      durationMs: number | null
+      remainingMs: number | null
+    }>
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'running' | 'paused'
+      durationMs: number
+      remainingMs: number
+    }>
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'fired'
+      durationMs: number
+      remainingMs: 0
+    }>
+
+export interface UiPilotPluginWindowTimerApiV1 {
+  getState(): Promise<PluginTimerState>
+  start(input?: Readonly<PluginTimerStartInput>): Promise<PluginTimerState>
+  stop(): Promise<PluginTimerState>
+  reset(): Promise<PluginTimerState>
+  onStateChanged(handler: (state: Readonly<PluginTimerState>) => void): () => void
+}
+
 export interface UiPilotPluginWindowApiV1 {
   onUpdate(
     handler: (update: Readonly<PluginWindowUpdate>) => void | Promise<void>,
   ): () => void
+  readonly timer: Readonly<UiPilotPluginWindowTimerApiV1>
 }
 
 declare global {

@@ -84,6 +84,7 @@ export type PublicPermission =
   | 'files.userSelected'
   | 'files.index.readAll'
   | 'notifications.publish'
+  | 'timer.control'
   | 'background.schedule'
 
 export interface PublicPermissionView {
@@ -261,6 +262,39 @@ export interface PluginWindowClient {
   close(): Promise<void>
 }
 export type U64Decimal = string & { readonly __u64Decimal: unique symbol }
+export type PluginTimerPhase = 'idle' | 'running' | 'paused' | 'fired'
+export interface PluginTimerStartInput {
+  readonly durationMs: number
+  readonly completionMessage: string
+}
+export type PluginTimerState =
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'idle'
+      durationMs: number | null
+      remainingMs: number | null
+    }>
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'running' | 'paused'
+      durationMs: number
+      remainingMs: number
+    }>
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'fired'
+      durationMs: number
+      remainingMs: 0
+    }>
+export type PluginTimerErrorName =
+  | 'InvalidCaller'
+  | 'PermissionDenied'
+  | 'ExpiredWindowSessionError'
+  | 'InvalidTimerInput'
+  | 'TimerInputRequired'
+  | 'TimerInputNotAllowed'
+  | 'MessageStoreUnavailable'
+  | 'TimerUnavailable'
 export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string }
 export type OpenFindOutcome = { status: 'forwarded' } | { status: 'superseded' }
 export interface OpenFindInput { query: string; invocationId: string; querySequence: number }
@@ -559,7 +593,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 
 const publicPermissions = new Set<PublicPermission>([
   'ui.window', 'clipboard.write', 'clipboard.read', 'network.https',
-  'files.userSelected', 'files.index.readAll', 'notifications.publish', 'background.schedule',
+  'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])
 
@@ -663,6 +697,66 @@ export const compareDecimalRevision = compareU64Decimal
 export function parseU64Decimal(value: unknown): U64Decimal | null {
   if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return null
   return BigInt(value) <= U64_MAX ? value as U64Decimal : null
+}
+
+function validTimerDuration(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1_000 && value <= 86_400_000
+}
+
+function validTimerMessage(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim().length === 0) return false
+  let scalars = 0
+  for (const character of value) {
+    const point = character.codePointAt(0)
+    if (point === undefined || (point >= 0xd800 && point <= 0xdfff) || point <= 0x1f || (point >= 0x7f && point <= 0x9f)) {
+      return false
+    }
+    scalars += 1
+    if (scalars > 500) return false
+  }
+  return true
+}
+
+export function parsePluginTimerStartInput(value: unknown): PluginTimerStartInput | null {
+  const input = plainRecord(value)
+  if (
+    !input ||
+    !exactKeys(input, ['completionMessage', 'durationMs']) ||
+    !validTimerDuration(input.durationMs) ||
+    !validTimerMessage(input.completionMessage)
+  ) {
+    return null
+  }
+  return { durationMs: input.durationMs, completionMessage: input.completionMessage }
+}
+
+export function parsePluginTimerState(value: unknown): PluginTimerState | null {
+  const state = plainRecord(value)
+  if (!state || !exactKeys(state, ['durationMs', 'phase', 'remainingMs', 'timerRevision'])) return null
+  const timerRevision = parseU64Decimal(state.timerRevision)
+  if (!timerRevision || !['idle', 'running', 'paused', 'fired'].includes(String(state.phase))) return null
+
+  if (state.phase === 'idle') {
+    if (state.durationMs === null && state.remainingMs === null) {
+      return { timerRevision, phase: 'idle', durationMs: null, remainingMs: null }
+    }
+    if (!validTimerDuration(state.durationMs) || state.remainingMs !== state.durationMs) return null
+    return { timerRevision, phase: 'idle', durationMs: state.durationMs, remainingMs: state.remainingMs }
+  }
+
+  if (!validTimerDuration(state.durationMs) || !Number.isSafeInteger(state.remainingMs)) return null
+  if (typeof state.remainingMs !== 'number' || state.remainingMs < 0 || state.remainingMs > state.durationMs) return null
+  if (state.phase === 'fired') {
+    return state.remainingMs === 0
+      ? { timerRevision, phase: 'fired', durationMs: state.durationMs, remainingMs: 0 }
+      : null
+  }
+  return {
+    timerRevision,
+    phase: state.phase as 'running' | 'paused',
+    durationMs: state.durationMs,
+    remainingMs: state.remainingMs,
+  }
 }
 
 function canonicalU64(value: unknown): value is string {

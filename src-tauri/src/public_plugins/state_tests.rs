@@ -63,6 +63,29 @@ fn install(store: &PluginStateStore, manifest: &PublicManifestV1) -> EffectivePl
     store.install_or_upgrade(manifest, BTreeSet::new()).unwrap()
 }
 
+fn timer_manifest(version: &str) -> PublicManifestV1 {
+    serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "pluginId": "com.example.timer",
+        "version": version,
+        "apiVersion": 1,
+        "minimumHostVersion": "0.2.0",
+        "name": "Timer",
+        "supportedPlatforms": ["windows"],
+        "command": {
+            "defaultName": "timer",
+            "activationMode": "submit",
+            "outputMode": "window",
+            "inputRequired": false
+        },
+        "runtime": { "entry": "runtime.js" },
+        "window": { "entry": "window.html" },
+        "permissions": ["ui.window", "notifications.publish", "timer.control"],
+        "settings": []
+    }))
+    .unwrap()
+}
+
 fn definitions() -> Value {
     json!([
         {
@@ -141,6 +164,25 @@ fn effective_names_are_global_and_failed_rename_is_atomic() {
             .effective_name,
         "beta"
     );
+}
+
+#[test]
+fn timer_upgrade_requires_every_declared_grant_and_preserves_current_generation() {
+    let dir = TestDir::new("timer-grants");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let installed_manifest = timer_manifest("1.0.0");
+    let all_grants = installed_manifest.permissions.iter().copied().collect();
+    let installed = store
+        .install_or_upgrade(&installed_manifest, all_grants)
+        .unwrap();
+
+    let upgrade = timer_manifest("1.1.0");
+    let missing_timer_grant = upgrade.permissions.iter().copied().take(2).collect();
+    assert_eq!(
+        store.install_or_upgrade(&upgrade, missing_timer_grant),
+        Err(PluginStateError::InvalidPermissions)
+    );
+    assert_eq!(store.config(&upgrade.plugin_id).unwrap(), Some(installed));
 }
 
 #[test]
