@@ -111,9 +111,9 @@ Approved source of truth: [2026-08-20-public-plugin-window-timer-api-design.md](
 
 ## Final Verification and User Gate
 
-- [ ] Run `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`.
-- [ ] Run `cargo test --manifest-path src-tauri/Cargo.toml`.
-- [ ] Run `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --no-default-features -- -D warnings`.
-- [ ] Run `npm.cmd test` and `npm.cmd run build`.
-- [ ] Confirm the generated Schema and SDK baseline are stable, then hand their exact changes to the validation CLI task; do not let the CLI regenerate from an intermediate Timer contract.
+- [x] Run `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`.
+- [x] Run `cargo test --manifest-path src-tauri/Cargo.toml`.
+- [x] Run `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --no-default-features -- -D warnings`.
+- [x] Run `npm.cmd test` and `npm.cmd run build`.
+- [x] Confirm the generated Schema and SDK baseline are stable, then hand their exact changes to the validation CLI task; do not let the CLI regenerate from an intermediate Timer contract.
 - [ ] Stop and ask the user before the design section 21 manual acceptance. The user operates all real windows, focus, mouse, keyboard, and audible-alarm checks.
