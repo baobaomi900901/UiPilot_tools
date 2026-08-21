@@ -146,7 +146,17 @@ pub(crate) struct AudioTicket {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TimerMutation {
     pub(crate) state: PluginTimerState,
-    pub(crate) audio_to_stop: Option<AudioTicket>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TimerPostLockEffect {
+    AudioCancelled(AudioTicket),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TimerOperation<T> {
+    pub(crate) result: Result<T, TimerError>,
+    pub(crate) post_lock_effects: Vec<TimerPostLockEffect>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +181,13 @@ struct StoredClaim {
 }
 
 #[derive(Clone, Debug)]
+enum TimerAudioState {
+    Issued(AudioTicket),
+    Admitted(AudioTicket),
+    Confirmed(AudioTicket),
+}
+
+#[derive(Clone, Debug)]
 struct TimerRecord {
     phase: InternalPhase,
     revision: u64,
@@ -182,7 +199,7 @@ struct TimerRecord {
     due_at_ms: Option<u64>,
     frozen_completion: Option<FrozenCompletion>,
     claim: Option<StoredClaim>,
-    audio: Option<AudioTicket>,
+    audio: Option<TimerAudioState>,
     unavailable: bool,
 }
 
@@ -226,6 +243,18 @@ pub(crate) struct PluginTimerService {
     state: Mutex<ServiceState>,
     wake: Condvar,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(crate) struct TimerAudioFocusAuthority<'a> {
+    state: &'a mut ServiceState,
+}
+
+impl TimerAudioFocusAuthority<'_> {
+    pub(crate) fn confirm_all_current(&mut self) {
+        for record in self.state.records.values_mut() {
+            confirm_current_audio(record);
+        }
+    }
 }
 
 impl PluginTimerService {
@@ -284,6 +313,28 @@ impl PluginTimerService {
         plugin_name_snapshot: &str,
         input: Option<PluginTimerStartInput>,
         message_store_available: bool,
+    ) -> TimerOperation<TimerMutation> {
+        let mut post_lock_effects = Vec::new();
+        let result = self.start_result(
+            key,
+            plugin_name_snapshot,
+            input,
+            message_store_available,
+            &mut post_lock_effects,
+        );
+        TimerOperation {
+            result,
+            post_lock_effects,
+        }
+    }
+
+    fn start_result(
+        &self,
+        key: &TimerKey,
+        plugin_name_snapshot: &str,
+        input: Option<PluginTimerStartInput>,
+        message_store_available: bool,
+        post_lock_effects: &mut Vec<TimerPostLockEffect>,
     ) -> Result<TimerMutation, TimerError> {
         let now = self.clock.now_ms();
         let mut state = self.lock_state()?;
@@ -303,7 +354,7 @@ impl PluginTimerService {
                 remove_queued(&mut state, key);
                 let (queue_item, result) = {
                     let record = state.records.entry(key.clone()).or_default();
-                    let audio_to_stop = record.audio.take();
+                    take_audio_for_operation(record, post_lock_effects);
                     let due_at_ms = now
                         .checked_add(input.duration_ms)
                         .ok_or_else(|| make_unavailable(record))?;
@@ -333,7 +384,6 @@ impl PluginTimerService {
                         },
                         TimerMutation {
                             state: project(record, now),
-                            audio_to_stop,
                         },
                     )
                 };
@@ -367,7 +417,6 @@ impl PluginTimerService {
                         },
                         TimerMutation {
                             state: project(record, now),
-                            audio_to_stop: None,
                         },
                     )
                 };
@@ -382,13 +431,19 @@ impl PluginTimerService {
                 let record = state.records.get(key).expect("running record missing");
                 Ok(TimerMutation {
                     state: project(record, now),
-                    audio_to_stop: None,
                 })
             }
         }
     }
 
-    pub(crate) fn stop(&self, key: &TimerKey) -> Result<TimerMutation, TimerError> {
+    pub(crate) fn stop(&self, key: &TimerKey) -> TimerOperation<TimerMutation> {
+        TimerOperation {
+            result: self.stop_result(key),
+            post_lock_effects: Vec::new(),
+        }
+    }
+
+    fn stop_result(&self, key: &TimerKey) -> Result<TimerMutation, TimerError> {
         let now = self.clock.now_ms();
         let mut state = self.lock_state()?;
         ensure_available(&state, key)?;
@@ -413,13 +468,23 @@ impl PluginTimerService {
             .records
             .get(key)
             .map_or_else(initial_state, |record| project(record, now));
-        Ok(TimerMutation {
-            state: state_view,
-            audio_to_stop: None,
-        })
+        Ok(TimerMutation { state: state_view })
     }
 
-    pub(crate) fn reset(&self, key: &TimerKey) -> Result<TimerMutation, TimerError> {
+    pub(crate) fn reset(&self, key: &TimerKey) -> TimerOperation<TimerMutation> {
+        let mut post_lock_effects = Vec::new();
+        let result = self.reset_result(key, &mut post_lock_effects);
+        TimerOperation {
+            result,
+            post_lock_effects,
+        }
+    }
+
+    fn reset_result(
+        &self,
+        key: &TimerKey,
+        post_lock_effects: &mut Vec<TimerPostLockEffect>,
+    ) -> Result<TimerMutation, TimerError> {
         let now = self.clock.now_ms();
         let mut state = self.lock_state()?;
         ensure_available(&state, key)?;
@@ -432,14 +497,11 @@ impl PluginTimerService {
                 .records
                 .get(key)
                 .map_or_else(initial_state, |record| project(record, now));
-            return Ok(TimerMutation {
-                state: state_view,
-                audio_to_stop: None,
-            });
+            return Ok(TimerMutation { state: state_view });
         }
         remove_queued(&mut state, key);
         let record = state.records.get_mut(key).expect("timer record missing");
-        let audio_to_stop = record.audio.take();
+        take_audio_for_operation(record, post_lock_effects);
         advance_revision(record)?;
         record.phase = InternalPhase::Idle;
         record.remaining_ms = record.duration_ms;
@@ -448,7 +510,6 @@ impl PluginTimerService {
         record.claim = None;
         Ok(TimerMutation {
             state: project(record, now),
-            audio_to_stop,
         })
     }
 
@@ -511,7 +572,7 @@ impl PluginTimerService {
                 audio_id: record.audio_id,
                 fired_revision: record.revision,
             };
-            record.audio = Some(audio_ticket.clone());
+            record.audio = Some(TimerAudioState::Issued(audio_ticket.clone()));
             Ok(Some(ClaimCompletion {
                 state: project(record, now),
                 audio_ticket: Some(audio_ticket),
@@ -528,56 +589,129 @@ impl PluginTimerService {
         }
     }
 
-    pub(crate) fn is_audio_ticket_current(&self, ticket: &AudioTicket) -> Result<bool, TimerError> {
-        let state = self.lock_state()?;
-        if state.terminal {
-            return Err(TimerError::TimerUnavailable);
-        }
-        Ok(state
-            .records
-            .get(&ticket.key)
-            .is_some_and(|record| !record.unavailable && record.audio.as_ref() == Some(ticket)))
-    }
-
-    pub(crate) fn cancel_generation(
-        &self,
-        key: &TimerKey,
-    ) -> Result<Option<AudioTicket>, TimerError> {
+    pub(crate) fn admit_audio_start(&self, ticket: &AudioTicket) -> Result<bool, TimerError> {
         let mut state = self.lock_state()?;
         if state.terminal {
             return Err(TimerError::TimerUnavailable);
         }
-        remove_queued(&mut state, key);
-        let audio = state.records.remove(key).and_then(|record| record.audio);
-        self.wake.notify_all();
-        Ok(audio)
+        let Some(record) = state.records.get_mut(&ticket.key) else {
+            return Ok(false);
+        };
+        if !matches!(record.audio.as_ref(), Some(TimerAudioState::Issued(current)) if current == ticket)
+        {
+            return Ok(false);
+        }
+        record.audio = Some(TimerAudioState::Admitted(ticket.clone()));
+        Ok(true)
     }
 
-    pub(crate) fn shutdown(&self) -> Result<Vec<AudioTicket>, TimerError> {
-        let audio = {
+    pub(crate) fn confirm_audio_after_play_failure(
+        &self,
+        ticket: &AudioTicket,
+    ) -> Result<bool, TimerError> {
+        let mut state = self.lock_state()?;
+        if state.terminal {
+            return Err(TimerError::TimerUnavailable);
+        }
+        let Some(record) = state.records.get_mut(&ticket.key) else {
+            return Ok(false);
+        };
+        if !matches!(record.audio.as_ref(), Some(TimerAudioState::Admitted(current)) if current == ticket)
+        {
+            return Ok(false);
+        }
+        record.audio = Some(TimerAudioState::Confirmed(ticket.clone()));
+        Ok(true)
+    }
+
+    pub(crate) fn confirm_audio_without_start(
+        &self,
+        ticket: &AudioTicket,
+    ) -> Result<bool, TimerError> {
+        let mut state = self.lock_state()?;
+        if state.terminal {
+            return Err(TimerError::TimerUnavailable);
+        }
+        let Some(record) = state.records.get_mut(&ticket.key) else {
+            return Ok(false);
+        };
+        if !matches!(record.audio.as_ref(), Some(TimerAudioState::Issued(current)) if current == ticket)
+        {
+            return Ok(false);
+        }
+        record.audio = Some(TimerAudioState::Confirmed(ticket.clone()));
+        Ok(true)
+    }
+
+    pub(crate) fn with_audio_focus_authority<T>(
+        &self,
+        action: impl FnOnce(&mut TimerAudioFocusAuthority<'_>) -> T,
+    ) -> Result<T, TimerError> {
+        let mut state = self.lock_state()?;
+        if state.terminal {
+            return Err(TimerError::TimerUnavailable);
+        }
+        Ok(action(&mut TimerAudioFocusAuthority { state: &mut state }))
+    }
+
+    pub(crate) fn terminate_all_audio(&self) -> Result<(), TimerError> {
+        let mut state = self.lock_state()?;
+        for record in state.records.values_mut() {
+            confirm_current_audio(record);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_generation(&self, key: &TimerKey) -> TimerOperation<()> {
+        let mut post_lock_effects = Vec::new();
+        let result = (|| {
             let mut state = self.lock_state()?;
             if state.terminal {
-                Vec::new()
-            } else {
+                return Err(TimerError::TimerUnavailable);
+            }
+            remove_queued(&mut state, key);
+            if let Some(mut record) = state.records.remove(key) {
+                take_audio_for_operation(&mut record, &mut post_lock_effects);
+            }
+            self.wake.notify_all();
+            Ok(())
+        })();
+        TimerOperation {
+            result,
+            post_lock_effects,
+        }
+    }
+
+    pub(crate) fn shutdown(&self) -> TimerOperation<()> {
+        let mut post_lock_effects = Vec::new();
+        let mut result = (|| {
+            let mut state = self.lock_state()?;
+            if !state.terminal {
                 state.terminal = true;
                 state.queue.clear();
-                state
-                    .records
-                    .values_mut()
-                    .filter_map(|record| record.audio.take())
-                    .collect()
+                for record in state.records.values_mut() {
+                    take_audio_for_operation(record, &mut post_lock_effects);
+                }
             }
-        };
+            Ok(())
+        })();
         self.wake.notify_all();
-        if let Some(worker) = self
-            .worker
-            .lock()
-            .map_err(|_| TimerError::TimerUnavailable)?
-            .take()
-        {
-            let _ = worker.join();
+        if result.is_ok() {
+            match self.worker.lock() {
+                Ok(mut worker) => {
+                    if let Some(worker) = worker.take() {
+                        let _ = worker.join();
+                    }
+                }
+                Err(_) => {
+                    result = Err(TimerError::TimerUnavailable);
+                }
+            }
         }
-        Ok(audio)
+        TimerOperation {
+            result,
+            post_lock_effects,
+        }
     }
 
     pub(super) fn claim_next_due(&self) -> Result<Option<ClaimTicket>, TimerError> {
@@ -753,6 +887,31 @@ fn initial_state() -> PluginTimerState {
     }
 }
 
+fn take_audio_for_operation(
+    record: &mut TimerRecord,
+    post_lock_effects: &mut Vec<TimerPostLockEffect>,
+) {
+    match record.audio.take() {
+        Some(TimerAudioState::Admitted(ticket)) => {
+            post_lock_effects.push(TimerPostLockEffect::AudioCancelled(ticket));
+        }
+        Some(TimerAudioState::Issued(_ticket) | TimerAudioState::Confirmed(_ticket)) => {}
+        None => {}
+    }
+}
+
+fn confirm_current_audio(record: &mut TimerRecord) {
+    let ticket = match record.audio.as_ref() {
+        Some(TimerAudioState::Issued(ticket) | TimerAudioState::Admitted(ticket)) => {
+            Some(ticket.clone())
+        }
+        Some(TimerAudioState::Confirmed(_)) | None => None,
+    };
+    if let Some(ticket) = ticket {
+        record.audio = Some(TimerAudioState::Confirmed(ticket));
+    }
+}
+
 fn project(record: &TimerRecord, now_ms: u64) -> PluginTimerState {
     let phase = match record.phase {
         InternalPhase::Idle => PluginTimerPhase::Idle,
@@ -788,6 +947,7 @@ mod tests {
 
     use super::{
         Clock, PluginTimerPhase, PluginTimerService, PluginTimerStartInput, TimerError, TimerKey,
+        TimerOperation, TimerPostLockEffect,
     };
 
     #[derive(Default)]
@@ -819,6 +979,151 @@ mod tests {
         }
     }
 
+    trait TimerOperationTestExt<T> {
+        fn unwrap(self) -> T;
+    }
+
+    impl<T> TimerOperationTestExt<T> for TimerOperation<T> {
+        fn unwrap(self) -> T {
+            self.result.unwrap()
+        }
+    }
+
+    fn complete_fired_round(
+        service: &PluginTimerService,
+        clock: &TestClock,
+        key: &TimerKey,
+    ) -> super::AudioTicket {
+        service
+            .start(key, "Timer", Some(input(1_000)), true)
+            .unwrap();
+        clock.advance(1_000);
+        let claim = service.claim_next_due().unwrap().unwrap();
+        assert!(service.admit_claim(&claim).unwrap());
+        service
+            .complete_claim(&claim, true)
+            .unwrap()
+            .unwrap()
+            .audio_ticket
+            .unwrap()
+    }
+
+    #[test]
+    fn audio_authority_transitions_keep_the_fired_revision() {
+        let (service, clock, key) = fixture();
+        let ticket = complete_fired_round(&service, &clock, &key);
+        let fired_revision = service.get_state(&key).unwrap().timer_revision;
+
+        assert!(service.admit_audio_start(&ticket).unwrap());
+        assert_eq!(
+            service.get_state(&key).unwrap().timer_revision,
+            fired_revision
+        );
+        assert!(service.confirm_audio_after_play_failure(&ticket).unwrap());
+        assert_eq!(
+            service.get_state(&key).unwrap().timer_revision,
+            fired_revision
+        );
+        assert!(!service.admit_audio_start(&ticket).unwrap());
+    }
+
+    #[test]
+    fn reset_returns_admitted_audio_as_a_post_lock_cancellation() {
+        let (service, clock, key) = fixture();
+        let ticket = complete_fired_round(&service, &clock, &key);
+        assert!(service.admit_audio_start(&ticket).unwrap());
+
+        let operation = service.reset(&key);
+
+        assert_eq!(
+            operation.post_lock_effects,
+            [TimerPostLockEffect::AudioCancelled(ticket)]
+        );
+        assert_eq!(
+            operation.result.unwrap().state.phase,
+            PluginTimerPhase::Idle
+        );
+    }
+
+    #[test]
+    fn new_round_exhaustion_still_returns_admitted_audio_cancellation() {
+        let (service, clock, key) = fixture();
+        let ticket = complete_fired_round(&service, &clock, &key);
+        assert!(service.admit_audio_start(&ticket).unwrap());
+        service
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&key)
+            .unwrap()
+            .round_id = u64::MAX;
+
+        let operation = service.start(&key, "Timer", Some(input(1_000)), true);
+
+        assert_eq!(operation.result, Err(TimerError::TimerUnavailable));
+        assert_eq!(
+            operation.post_lock_effects,
+            [TimerPostLockEffect::AudioCancelled(ticket)]
+        );
+    }
+
+    #[test]
+    fn focus_authority_confirms_only_current_audio_without_revision_changes() {
+        let (service, clock, first_key) = fixture();
+        let first = complete_fired_round(&service, &clock, &first_key);
+        assert!(service.admit_audio_start(&first).unwrap());
+        let second_key = TimerKey::new("com.example.second", 1).unwrap();
+        let second = complete_fired_round(&service, &clock, &second_key);
+        let first_revision = service.get_state(&first_key).unwrap().timer_revision;
+        let second_revision = service.get_state(&second_key).unwrap().timer_revision;
+
+        service
+            .with_audio_focus_authority(|authority| authority.confirm_all_current())
+            .unwrap();
+
+        assert!(!service.admit_audio_start(&first).unwrap());
+        assert!(!service.admit_audio_start(&second).unwrap());
+        assert_eq!(
+            service.get_state(&first_key).unwrap().timer_revision,
+            first_revision
+        );
+        assert_eq!(
+            service.get_state(&second_key).unwrap().timer_revision,
+            second_revision
+        );
+    }
+
+    #[test]
+    fn terminal_audio_cleanup_absorbs_issued_and_admitted_tickets() {
+        let (service, clock, first_key) = fixture();
+        let first = complete_fired_round(&service, &clock, &first_key);
+        assert!(service.admit_audio_start(&first).unwrap());
+        let second_key = TimerKey::new("com.example.second", 1).unwrap();
+        let second = complete_fired_round(&service, &clock, &second_key);
+
+        service.terminate_all_audio().unwrap();
+
+        assert!(!service.admit_audio_start(&first).unwrap());
+        assert!(!service.admit_audio_start(&second).unwrap());
+    }
+
+    #[test]
+    fn focused_no_start_confirmation_absorbs_an_issued_ticket() {
+        let (service, clock, key) = fixture();
+        let ticket = complete_fired_round(&service, &clock, &key);
+        let fired_revision = service.get_state(&key).unwrap().timer_revision;
+
+        assert!(service.confirm_audio_without_start(&ticket).unwrap());
+
+        assert!(!service.confirm_audio_without_start(&ticket).unwrap());
+        assert!(!service.admit_audio_start(&ticket).unwrap());
+        assert_eq!(
+            service.get_state(&key).unwrap().timer_revision,
+            fired_revision
+        );
+    }
+
     #[test]
     fn state_machine_starts_pauses_resumes_resets_and_fires() {
         let (service, clock, key) = fixture();
@@ -828,7 +1133,7 @@ mod tests {
         assert_eq!(initial.timer_revision, "0");
 
         assert_eq!(
-            service.start(&key, "Timer", None, true),
+            service.start(&key, "Timer", None, true).result,
             Err(TimerError::TimerInputRequired)
         );
         let running = service
@@ -858,15 +1163,16 @@ mod tests {
         assert_eq!(fired.state.timer_revision, "5");
         assert!(fired.audio_ticket.is_some());
 
-        let reset = service.reset(&key).unwrap();
+        let reset_operation = service.reset(&key);
+        assert!(reset_operation.post_lock_effects.is_empty());
+        let reset = reset_operation.unwrap();
         assert_eq!(reset.state.phase, PluginTimerPhase::Idle);
         assert_eq!(
             (reset.state.duration_ms, reset.state.remaining_ms),
             (Some(10_000), Some(10_000))
         );
-        assert!(reset.audio_to_stop.is_some());
         assert_eq!(
-            service.start(&key, "Timer", None, true),
+            service.start(&key, "Timer", None, true).result,
             Err(TimerError::TimerInputRequired)
         );
     }
@@ -927,11 +1233,14 @@ mod tests {
             .unwrap()
             .audio_ticket
             .unwrap();
-        assert!(service.is_audio_ticket_current(&audio).unwrap());
-        service
-            .start(&key, "Timer", Some(input(2_000)), true)
-            .unwrap();
-        assert!(!service.is_audio_ticket_current(&audio).unwrap());
+        assert!(service.admit_audio_start(&audio).unwrap());
+        let next = service.start(&key, "Timer", Some(input(2_000)), true);
+        assert_eq!(
+            next.post_lock_effects,
+            [TimerPostLockEffect::AudioCancelled(audio.clone())]
+        );
+        next.unwrap();
+        assert!(!service.admit_audio_start(&audio).unwrap());
     }
 
     #[test]
@@ -960,12 +1269,14 @@ mod tests {
             },
         ] {
             assert_eq!(
-                service.start(&key, "Timer", Some(candidate), true),
+                service.start(&key, "Timer", Some(candidate), true).result,
                 Err(TimerError::InvalidTimerInput)
             );
         }
         assert_eq!(
-            service.start(&key, "Timer", Some(input(1_000)), false),
+            service
+                .start(&key, "Timer", Some(input(1_000)), false)
+                .result,
             Err(TimerError::MessageStoreUnavailable)
         );
         assert_eq!(service.get_state(&key).unwrap().timer_revision, "0");
@@ -978,28 +1289,32 @@ mod tests {
             .start(&key, "Timer", Some(input(10_000)), true)
             .unwrap();
         assert_eq!(
-            service.start(
-                &key,
-                "Timer",
-                Some(PluginTimerStartInput {
-                    duration_ms: 1,
-                    completion_message: String::new(),
-                }),
-                true,
-            ),
+            service
+                .start(
+                    &key,
+                    "Timer",
+                    Some(PluginTimerStartInput {
+                        duration_ms: 1,
+                        completion_message: String::new(),
+                    }),
+                    true,
+                )
+                .result,
             Err(TimerError::TimerInputNotAllowed)
         );
         service.stop(&key).unwrap();
         assert_eq!(
-            service.start(
-                &key,
-                "Timer",
-                Some(PluginTimerStartInput {
-                    duration_ms: 1,
-                    completion_message: String::new(),
-                }),
-                true,
-            ),
+            service
+                .start(
+                    &key,
+                    "Timer",
+                    Some(PluginTimerStartInput {
+                        duration_ms: 1,
+                        completion_message: String::new(),
+                    }),
+                    true,
+                )
+                .result,
             Err(TimerError::TimerInputNotAllowed)
         );
     }
@@ -1024,7 +1339,9 @@ mod tests {
         service.shutdown().unwrap();
         assert_eq!(service.get_state(&key), Err(TimerError::TimerUnavailable));
         assert_eq!(
-            service.start(&key, "Timer", Some(input(1_000)), true),
+            service
+                .start(&key, "Timer", Some(input(1_000)), true)
+                .result,
             Err(TimerError::TimerUnavailable)
         );
     }
@@ -1069,7 +1386,7 @@ mod tests {
             .unwrap()
             .revision = u64::MAX;
 
-        assert_eq!(service.stop(&key), Err(TimerError::TimerUnavailable));
+        assert_eq!(service.stop(&key).result, Err(TimerError::TimerUnavailable));
         assert_eq!(service.get_state(&key), Err(TimerError::TimerUnavailable));
 
         let other = TimerKey::new("com.example.other", 1).unwrap();

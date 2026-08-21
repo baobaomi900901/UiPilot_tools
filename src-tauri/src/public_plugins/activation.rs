@@ -26,7 +26,7 @@ use super::{
     timer_alarm::TimerAlarm,
     timers::{
         ClaimTicket, Clock, PluginTimerService, PluginTimerStartInput, PluginTimerState,
-        SystemClock, TimerError, TimerKey,
+        SystemClock, TimerError, TimerKey, TimerPostLockEffect,
     },
     EffectivePluginConfig, PluginApiExecution, PluginApiRequest, PluginCommandCompletion,
     PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler, PluginRuntimeApi,
@@ -637,9 +637,12 @@ impl PublicPluginManager {
             .invalidate_plugin(&runtime.plugin_id, Some(runtime.generation))
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(&runtime.plugin_id);
-        let timer_audio = previous_config.as_ref().and_then(|config| {
-            self.cancel_timer_generation(&runtime.plugin_id, config.active_generation)
-        });
+        let timer_effects = previous_config
+            .as_ref()
+            .map(|config| {
+                self.cancel_timer_generation(&runtime.plugin_id, config.active_generation)
+            })
+            .unwrap_or_default();
         {
             let mut data = self.lock_data()?;
             let staged = data
@@ -657,7 +660,7 @@ impl PublicPluginManager {
             previous_runtime_label,
         };
         drop(_mutation);
-        self.stop_timer_audio(timer_audio);
+        self.apply_timer_post_lock_effects(timer_effects);
         Ok(commit)
     }
     pub(crate) fn set_enabled_with_readiness<F>(
@@ -696,14 +699,15 @@ impl PublicPluginManager {
                     .invalidate_plugin(plugin_id, None)
                     .map_err(|_| PublicPluginManagementError::Unavailable)?;
                 self.cancel_delayed_messages(plugin_id);
-                let audio = self.cancel_timer_generation(plugin_id, before.active_generation);
+                let timer_effects =
+                    self.cancel_timer_generation(plugin_id, before.active_generation);
                 let commit = PublicEnabledCommit {
                     mutation: mutation_from_config(&config),
                     runtime: None,
                     closed_runtime_label: Some(current_runtime.label),
                 };
                 drop(_mutation);
-                self.stop_timer_audio(audio);
+                self.apply_timer_post_lock_effects(timer_effects);
                 return Ok(commit);
             }
             let generation = before
@@ -770,7 +774,7 @@ impl PublicPluginManager {
         data.active_by_plugin.insert(plugin_id.into(), staged);
         drop(data);
         self.cancel_delayed_messages(plugin_id);
-        let timer_audio = self.cancel_timer_generation(plugin_id, before.active_generation);
+        let timer_effects = self.cancel_timer_generation(plugin_id, before.active_generation);
         self.clear_runtime_faults(plugin_id)?;
         let commit = PublicEnabledCommit {
             mutation: mutation_from_config(&config),
@@ -778,7 +782,7 @@ impl PublicPluginManager {
             closed_runtime_label: previous_runtime_label,
         };
         drop(_mutation);
-        self.stop_timer_audio(timer_audio);
+        self.apply_timer_post_lock_effects(timer_effects);
         Ok(commit)
     }
     pub(crate) fn rename(
@@ -853,8 +857,9 @@ impl PublicPluginManager {
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
-        let timer_audio = previous_generation
-            .and_then(|generation| self.cancel_timer_generation(plugin_id, generation));
+        let timer_effects = previous_generation
+            .map(|generation| self.cancel_timer_generation(plugin_id, generation))
+            .unwrap_or_default();
         let runtime_label = self
             .lock_data()?
             .active_by_plugin
@@ -873,7 +878,7 @@ impl PublicPluginManager {
             package::remove_package_tree(packages);
         }
         drop(_mutation);
-        self.stop_timer_audio(timer_audio);
+        self.apply_timer_post_lock_effects(timer_effects);
         Ok(runtime_label)
     }
 
@@ -1275,15 +1280,15 @@ impl PublicPluginManager {
             .lock_mutation()
             .map_err(|_| TimerError::TimerUnavailable)?;
         let (key, plugin_name) = self.authorize_window_timer(plugin_id, generation)?;
-        let mutation = self.timers.start(
+        let operation = self.timers.start(
             &key,
             &plugin_name,
             input,
             self.timer_publisher.is_available(),
-        )?;
+        );
         drop(_mutation);
-        self.stop_timer_audio(mutation.audio_to_stop);
-        Ok(mutation.state)
+        self.apply_timer_post_lock_effects(operation.post_lock_effects);
+        Ok(operation.result?.state)
     }
 
     pub(crate) fn window_timer_stop(
@@ -1295,10 +1300,10 @@ impl PublicPluginManager {
             .lock_mutation()
             .map_err(|_| TimerError::TimerUnavailable)?;
         let (key, _) = self.authorize_window_timer(plugin_id, generation)?;
-        let mutation = self.timers.stop(&key)?;
+        let operation = self.timers.stop(&key);
         drop(_mutation);
-        self.stop_timer_audio(mutation.audio_to_stop);
-        Ok(mutation.state)
+        self.apply_timer_post_lock_effects(operation.post_lock_effects);
+        Ok(operation.result?.state)
     }
 
     pub(crate) fn window_timer_reset(
@@ -1310,10 +1315,10 @@ impl PublicPluginManager {
             .lock_mutation()
             .map_err(|_| TimerError::TimerUnavailable)?;
         let (key, _) = self.authorize_window_timer(plugin_id, generation)?;
-        let mutation = self.timers.reset(&key)?;
+        let operation = self.timers.reset(&key);
         drop(_mutation);
-        self.stop_timer_audio(mutation.audio_to_stop);
-        Ok(mutation.state)
+        self.apply_timer_post_lock_effects(operation.post_lock_effects);
+        Ok(operation.result?.state)
     }
 
     fn authorize_window_timer(
@@ -1384,11 +1389,8 @@ impl PublicPluginManager {
     }
 
     pub(crate) fn shutdown_timers(&self) {
-        if let Ok(tickets) = self.timers.shutdown() {
-            for ticket in tickets {
-                let _ = self.timer_alarm.stop(&ticket);
-            }
-        }
+        let operation = self.timers.shutdown();
+        self.apply_timer_post_lock_effects(operation.post_lock_effects);
         self.timer_alarm.shutdown();
     }
 
@@ -1463,8 +1465,10 @@ impl PublicPluginManager {
             .ok()
             .flatten();
         if let Some(audio) = completion.and_then(|completion| completion.audio_ticket) {
-            if self.timers.is_audio_ticket_current(&audio).unwrap_or(false) {
-                let _ = self.timer_alarm.play(&audio);
+            if self.timers.admit_audio_start(&audio).unwrap_or(false)
+                && self.timer_alarm.play(&audio).is_err()
+            {
+                let _ = self.timers.confirm_audio_after_play_failure(&audio);
             }
         }
         effect
@@ -1608,13 +1612,13 @@ impl PublicPluginManager {
             Some(replacement.digest.clone()),
         )?;
         self.cancel_delayed_messages(plugin_id);
-        let timer_audio = self.cancel_timer_generation(plugin_id, previous_generation);
+        let timer_effects = self.cancel_timer_generation(plugin_id, previous_generation);
         let replacement = Arc::new(replacement);
         let candidate = replacement.candidate();
         data.active_by_plugin.insert(plugin_id.into(), replacement);
         drop(data);
         drop(_mutation);
-        self.stop_timer_audio(timer_audio);
+        self.apply_timer_post_lock_effects(timer_effects);
         Ok(candidate)
     }
 
@@ -1651,10 +1655,11 @@ impl PublicPluginManager {
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
-        let timer_audio =
-            generation.and_then(|generation| self.cancel_timer_generation(plugin_id, generation));
+        let timer_effects = generation
+            .map(|generation| self.cancel_timer_generation(plugin_id, generation))
+            .unwrap_or_default();
         drop(_mutation);
-        self.stop_timer_audio(timer_audio);
+        self.apply_timer_post_lock_effects(timer_effects);
         Ok(true)
     }
 
@@ -1680,10 +1685,11 @@ impl PublicPluginManager {
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
-        let timer_audio =
-            generation.and_then(|generation| self.cancel_timer_generation(plugin_id, generation));
+        let timer_effects = generation
+            .map(|generation| self.cancel_timer_generation(plugin_id, generation))
+            .unwrap_or_default();
         drop(_mutation);
-        self.stop_timer_audio(timer_audio);
+        self.apply_timer_post_lock_effects(timer_effects);
         Ok(())
     }
 
@@ -1695,14 +1701,20 @@ impl PublicPluginManager {
         &self,
         plugin_id: &str,
         generation: u64,
-    ) -> Option<super::timers::AudioTicket> {
-        TimerKey::new(plugin_id, generation)
-            .and_then(|key| self.timers.cancel_generation(&key).ok().flatten())
+    ) -> Vec<TimerPostLockEffect> {
+        let Some(key) = TimerKey::new(plugin_id, generation) else {
+            return Vec::new();
+        };
+        self.timers.cancel_generation(&key).post_lock_effects
     }
 
-    fn stop_timer_audio(&self, audio: Option<super::timers::AudioTicket>) {
-        if let Some(audio) = audio {
-            let _ = self.timer_alarm.stop(&audio);
+    fn apply_timer_post_lock_effects(&self, effects: Vec<TimerPostLockEffect>) {
+        for effect in effects {
+            match effect {
+                TimerPostLockEffect::AudioCancelled(audio) => {
+                    let _ = self.timer_alarm.stop(&audio);
+                }
+            }
         }
     }
 
@@ -2278,6 +2290,7 @@ mod tests {
                 }),
                 true,
             )
+            .result
             .unwrap();
         clock.advance(1_000);
         let ticket = manager.timers.claim_next_due().unwrap().unwrap();
@@ -2731,6 +2744,7 @@ mod tests {
                 }),
                 true,
             )
+            .result
             .unwrap();
 
         write_timer_package(&dir.source(), "1.1.0");
@@ -2780,6 +2794,7 @@ mod tests {
                     }),
                     true,
                 )
+                .result
                 .unwrap();
             key
         };
