@@ -1,5 +1,10 @@
 # 公开插件窗口计时 API 设计
 
+> **增量覆盖通知（2026-08-21）：** 本文关于 AudioTicket 的播放 admission、单次/循环音频、每票独立
+> 播放或停止、多 Timer 声音合并、主窗口焦点确认和原生音频失败处理的合同，已由
+> [Windows 原生提醒协调器设计](./2026-08-21-windows-native-attention-design.md) 覆盖。公开 Timer API、
+> Timer 状态机、ClaimTicket、消息持久化、窗口会话、权限与 revision 合同继续有效。
+
 ## 1. 文档信息
 
 - 日期：2026-08-20
