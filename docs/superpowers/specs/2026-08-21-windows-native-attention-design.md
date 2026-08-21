@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-21
-- 状态：Draft，第三轮独立审核修订完成，等待复审
+- 状态：Draft，第四轮独立审核修订完成，等待复审
 - 范围：Windows Toast、托盘提醒、普通消息提示音、计时器持续闹铃
 - 公开 API：不变
 
@@ -138,16 +138,10 @@ enum AttentionOrigin {
     TimerCompletion { audio_ticket: Option<AudioTicket> },
 }
 
-struct MainFocusChanged {
-    focused: bool,
-    // Focused(false) 固定为空；Focused(true) 最多 64 张。
-    confirmed_admitted_tickets: Vec<AudioTicket>,
-}
-
 enum NativeAttentionEvent {
     Published(PublishedAttention),
     TimerAudioCancelled(AudioTicket),
-    MainFocusChanged(MainFocusChanged),
+    MainFocusChanged(bool),
     ToastCallback {
         notification_id: NativeNotificationId,
         kind: ToastCallbackKind,
@@ -257,17 +251,21 @@ sequence 更早的消息：worker 先处理旧消息的 Toast、托盘和普通�
 
 主窗口请求 `show()` 或 `focus()` 不算确认；只有随后实际收到的 `Focused(true)` 才确认。
 
-`Focused(true)` 的 admission 使用固定锁顺序 `attention admission -> Timer`：在邮箱短临界区内先分配焦点
-sequence 并更新最新焦点快照，再获取 Timer 服务锁，把该线性化点已经存在的全部 `issued/admitted` audio
-槽位提交为 `confirmed`，同时收集当时准确的 admitted AudioTicket 列表；列表受活动票证上限约束，最多 64
-张。随后释放 Timer 锁、把该列表附到焦点事件、释放邮箱锁并唤醒 worker。所有 Timer 完成、Reset 和生命周期
-路径都必须先释放 Timer/plugin mutation 锁才进入 attention admission，禁止 `Timer -> attention admission`
-反向锁序。
+`Focused(true)` 的 admission 是唯一允许同时持有 Timer 与邮箱锁的路径，固定锁顺序为
+`Timer -> attention admission`：先取得 Timer 服务锁，再取得邮箱短临界区；两把锁都取得后才分配焦点
+sequence、更新最新焦点快照，并把该线性化点已经存在的全部 `issued/admitted` audio 槽位提交为
+`confirmed`。随后把 `MainFocusChanged(true)` 写入焦点 FIFO，释放邮箱与 Timer 锁并唤醒 worker。
 
-worker 处理该 `Focused(true)` 时只从 `activeTimerTickets` 移除事件携带的准确列表，并停止当前普通声音、
-循环声音和托盘提醒；不得再次调用无 sequence 截止点的 `confirm_all_current_audio()`。该焦点线性化点之后才
-签发的票证不在列表中，因此 `Focused(false)` 后产生的新 Timer 可以正常 admission。已经在焦点前排队、但
-尚处于 issued 的票证已被同步确认，其旧 `Published` 仍可按 sequence 显示 Toast/托盘，但不得迟到启动循环。
+所有 Timer 完成、Reset 和生命周期路径都必须先释放 Timer/plugin mutation 锁才进入 attention admission；
+它们不得在持有 Timer 锁时派发事件。worker 从邮箱取出事件后也必须先释放邮箱锁，才调用任何 Timer 方法或
+原生端口。因此不存在 `attention admission -> Timer` 的嵌套路径，焦点与票证签发的先后由两把锁共同确定。
+`Focused(false)` 只取得 attention admission 锁。
+
+worker 处理 `Focused(true)` 时直接清空整个 `activeTimerTickets`，并停止当前普通声音、循环声音和托盘提醒；
+不得依赖 TimerRecord 扫描结果决定清理范围。由于 worker 单线程按 sequence 处理，焦点之后的 Timer 事件此时
+尚未进入活动集合，不会被误清。焦点前排队但尚处于 issued 的票证已被同步确认，其旧 `Published` 仍可按
+sequence 显示 Toast/托盘，但不得迟到启动循环。已经从 TimerRecord 清除但取消事件尚未入邮箱的旧活动票，
+也会在焦点 sequence 被清除；其迟到取消随后幂等吸收。
 
 ### 5.3 Timer 票证竞态
 
@@ -284,9 +282,9 @@ Reset、禁用、故障停用、卸载和版本替换使用同一 Timer 状态�
 - `PlaySoundW` 循环启动失败：从活动集合移除该票，并在 Timer 锁内执行匹配的 `admitted -> confirmed`；
   本票不重试，后续新 round 或其他 Timer 票证仍可独立尝试；
 - 主窗口已经聚焦：协调器调用 `confirm_audio_without_start(ticket)`，只允许当前 `issued -> confirmed`；
-- 每个 `MainFocusChanged(true)` 都携带第 5.2 节 admission 临界区同步确认后得到的准确 admitted 列表；worker
-  只移除这些票证并停止声音，不重新扫描 TimerRecord；尚未到期、没有 audio 槽位以及焦点线性化点之后才
-  签发的 Timer 不受影响；
+- 每个 `MainFocusChanged(true)` 都在第 5.2 节的双锁临界区同步确认当时的全部 issued/admitted；worker 在该
+  sequence 清空整个 `activeTimerTickets` 并停止声音，不重新扫描 TimerRecord；焦点之后才签发的 Timer 事件
+  尚未进入活动集合，因而不受影响；
 - 重复或迟到提交：当前状态不是匹配的 `issued`，admission 拒绝；
 - 新 round、Reset 或生命周期取消后，旧票证不再匹配当前槽位。
 
@@ -419,6 +417,8 @@ Timer 循环到达时可以替换正在播放的普通声音。Timer 待确认�
 - Timer worker、Reset 和生命周期路径必须先提交 Timer 内存转换并释放 Timer/plugin mutation 锁，再发送
   原生提醒事件。协调器调用 audio admission/confirm 时只获取 Timer 服务锁，Timer 服务在该锁内绝不反向
   调用协调器。
+- 唯一嵌套例外是 `Focused(true)` admission，锁顺序固定为 `Timer -> attention admission`。邮箱 worker 取出
+  事件后先释放邮箱锁再获取 Timer 锁；其他生产者不得同时持有 Timer 与 attention admission 锁。
 - `NativeAttentionCoordinator` 的邮箱所有权必须在消息发布和 Timer worker 启动前建立。
 - 普通消息配额只限制新建原生效果；Focused、Timer 完成、Timer 取消、Toast 回调清理和 Shutdown 使用
   第 4.4 节各自的有界控制槽位。控制槽位 admission 失败必须进入 terminal emergency-stop，不能静默丢弃、
@@ -464,8 +464,8 @@ Timer 循环到达时可以替换正在播放的普通声音。Timer 待确认�
 2. `PublishedAttention` 恰好派发一次；`TimerCompletion(None)` 有 Toast/托盘/徽标但绝不退化成普通声音。
 3. barrier 测试：Timer 事件已排队，Reset 在 `admit_audio_start` 前提交，admission 拒绝且没有播放调用。
 4. barrier 测试：admission 先提交，Reset 随后执行，只允许一次开始意图并必须处理取消停止。
-5. Timer 在主窗口已聚焦时到期只执行 `issued -> confirmed`；`Focused(true)` admission 同步确认当时准确的
-   issued/admitted 集合，worker 只移除事件携带的 admitted 列表，之后失焦、迟到或重复事件都不补响。
+5. Timer 在主窗口已聚焦时到期只执行 `issued -> confirmed`；`Focused(true)` 在取得 Timer 与 attention
+   admission 两把锁后才分配 sequence 并同步确认当时的 issued/admitted，之后失焦、迟到或重复事件不补响。
 6. 焦点确认后再 Reset 不创建墓碑；同票证重复派发被吸收，新 round 仍可正常 admission。
 7. 第一张 Timer 票证启动循环，后续票证不重启；逐张取消，集合非空继续、变空停止。
 8. 主窗口焦点把全部 admitted 票证提交 confirmed、停止当前声音、恢复托盘，但不修改未读。
@@ -485,14 +485,17 @@ Timer 循环到达时可以替换正在播放的普通声音。Timer 待确认�
     回调被吸收，Activated 只路由 Messages，Failed/Dismissed 不修改已读。
 18. 有界邮箱压力测试覆盖 ordinary=64、TimerKey=64、Toast=64、focus FIFO=128、同 key 合并、满额新 key、
     sequence 耗尽和 Shutdown 独立唤醒；不存在无界备用队列。
-19. 焦点顺序测试覆盖 `message -> true`、`true -> message`、`true -> false -> Timer` 和 worker 阻塞期间多次
-    切换；旧消息先产生效果再由焦点停止，Toast 不撤回，失焦后签发的 Timer 票证不被旧焦点确认误伤。
-20. `fired -> start(new round)`、Reset、生命周期撤销、revision/round/audio identity 耗尽都验证 admitted 票证
+19. 焦点顺序与 barrier 测试覆盖 `message -> true`、`true -> message`、`true -> false -> Timer`、Timer 持锁
+    尚未签票时焦点等待，以及焦点持锁后 Timer 等待；旧消息先产生效果再由焦点停止，Toast 不撤回，焦点
+    sequence 之后签发的票证不被误确认。
+20. `Reset -> 延迟取消 -> Focused(true) -> Focused(false) -> ordinary -> 旧取消` 清空协调器活动集合；普通
+    消息不因残留旧票而被错误静音，迟到取消幂等吸收。
+21. `fired -> start(new round)`、Reset、生命周期撤销、revision/round/audio identity 耗尽都验证 admitted 票证
     产生锁后取消；即使公开操作返回 `TimerUnavailable` 也必须停止最后一票。
-21. audio `issued -> admitted -> confirmed`、播放失败、焦点确认和取消都保持同一 fired revision；Reset 或
+22. audio `issued -> admitted -> confirmed`、播放失败、焦点确认和取消都保持同一 fired revision；Reset 或
     新 Start 只因公开 Timer 转换递增一次，AudioTicket 的 firedRevision 不变。
-22. 打包产物中的 WAV 必须解析为 RIFF/WAVE，大小和 SHA-256 与第 7.1 节一致，Tauri 资源路径可解析。
-23. 现有消息中心、Demo、Pomodoro、Timer 状态机和完整 Rust/前端回归继续通过。
+23. 打包产物中的 WAV 必须解析为 RIFF/WAVE，大小和 SHA-256 与第 7.1 节一致，Tauri 资源路径可解析。
+24. 现有消息中心、Demo、Pomodoro、Timer 状态机和完整 Rust/前端回归继续通过。
 
 自动化不得调用真实 Toast、改变真实前台焦点或播放真实声音。
 
