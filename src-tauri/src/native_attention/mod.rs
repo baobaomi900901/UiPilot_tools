@@ -6,13 +6,19 @@ use std::{
         Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use crate::{
-    message_center::{MessagePublished, MessageToast, MessageTray, NativeEffectError},
-    public_plugins::{AudioTicket, PluginTimerService, TimerAlarm, TimerError, TimerKey},
+    message_center::{MessagePublished, MessageToast, NativeEffectError},
+    public_plugins::{AudioTicket, PluginTimerService, TimerError, TimerKey},
 };
 
+use tray::TrayAnimation;
+pub(crate) use tray::{TrayAttentionPort, TrayVisual};
+
+mod tray;
+mod windows_audio;
 mod windows_identity;
 mod windows_toast;
 
@@ -22,6 +28,17 @@ pub(crate) fn prepare_process_identity() {
 
 pub(crate) fn windows_toast() -> Arc<dyn MessageToast> {
     Arc::new(windows_toast::WindowsToastPort::new())
+}
+
+pub(crate) fn tauri_tray<R: tauri::Runtime>(
+    tray: tauri::tray::TrayIcon<R>,
+    normal: tauri::image::Image<'static>,
+) -> Arc<dyn TrayAttentionPort> {
+    tray::tauri_tray_port(tray, normal)
+}
+
+pub(crate) fn windows_audio(path: std::path::PathBuf) -> Arc<dyn AttentionAudioPort> {
+    windows_audio::windows_audio(path)
 }
 
 const ORDINARY_CAPACITY: usize = 64;
@@ -117,36 +134,6 @@ impl TimerAttentionPort for PluginTimerAttentionPort {
     fn terminate_all_audio(&self) -> Result<(), TimerError> {
         self.timers.terminate_all_audio()
     }
-}
-
-struct LegacyAttentionAudio {
-    alarm: Arc<dyn TimerAlarm>,
-}
-
-impl AttentionAudioPort for LegacyAttentionAudio {
-    fn play_ordinary(&self) -> Result<(), NativeEffectError> {
-        Ok(())
-    }
-
-    fn stop_ordinary(&self) -> Result<(), NativeEffectError> {
-        Ok(())
-    }
-
-    fn start_timer_loop(&self, ticket: &AudioTicket) -> Result<bool, NativeEffectError> {
-        self.alarm.play(ticket).map_err(|_| NativeEffectError)
-    }
-
-    fn stop_timer_loop(&self, ticket: &AudioTicket) -> Result<(), NativeEffectError> {
-        self.alarm.stop(ticket).map_err(|_| NativeEffectError)
-    }
-
-    fn shutdown(&self) {
-        self.alarm.shutdown();
-    }
-}
-
-pub(crate) fn legacy_attention_audio(alarm: Arc<dyn TimerAlarm>) -> Arc<dyn AttentionAudioPort> {
-    Arc::new(LegacyAttentionAudio { alarm })
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +263,7 @@ enum WorkerEvent {
         notification_id: NativeNotificationId,
         kind: ToastCallbackKind,
     },
+    TrayTick,
 }
 
 struct Mailbox {
@@ -296,7 +284,7 @@ impl Default for Mailbox {
 
 struct Ports {
     toast: Arc<dyn MessageToast>,
-    tray: Arc<dyn MessageTray>,
+    tray: Arc<dyn TrayAttentionPort>,
     audio: Arc<dyn AttentionAudioPort>,
     route: Arc<dyn AttentionRoutePort>,
     timers: Arc<dyn TimerAttentionPort>,
@@ -304,7 +292,7 @@ struct Ports {
 
 #[derive(Default)]
 struct WorkerState {
-    main_focused: bool,
+    tray: TrayAnimation,
     ordinary_playing: bool,
     active_timer_tickets: BTreeSet<AudioTicket>,
     timer_loop_owner: Option<AudioTicket>,
@@ -323,7 +311,7 @@ impl NativeAttentionCoordinator {
     pub(crate) fn start(
         timers: Arc<PluginTimerService>,
         toast: Arc<dyn MessageToast>,
-        tray: Arc<dyn MessageTray>,
+        tray: Arc<dyn TrayAttentionPort>,
         audio: Arc<dyn AttentionAudioPort>,
         route: Arc<dyn AttentionRoutePort>,
     ) -> Arc<Self> {
@@ -339,7 +327,7 @@ impl NativeAttentionCoordinator {
     fn start_with_timer_port(
         timers: Arc<dyn TimerAttentionPort>,
         toast: Arc<dyn MessageToast>,
-        tray: Arc<dyn MessageTray>,
+        tray: Arc<dyn TrayAttentionPort>,
         audio: Arc<dyn AttentionAudioPort>,
         route: Arc<dyn AttentionRoutePort>,
     ) -> Arc<Self> {
@@ -685,19 +673,28 @@ fn worker_loop(mailbox: Arc<Mailbox>, ports: Arc<Ports>) {
     loop {
         let event = {
             let mut mailbox_state = mailbox.state.lock().expect("attention mailbox poisoned");
-            while !mailbox.shutdown.load(Ordering::Acquire)
-                && !mailbox_state.terminal
-                && !mailbox_state.has_events()
-            {
-                mailbox_state = mailbox
-                    .wake
-                    .wait(mailbox_state)
-                    .expect("attention mailbox poisoned");
-            }
-            if mailbox.shutdown.load(Ordering::Acquire) || mailbox_state.terminal {
-                None
-            } else {
-                mailbox_state.next_event()
+            loop {
+                if mailbox.shutdown.load(Ordering::Acquire) || mailbox_state.terminal {
+                    break None;
+                }
+                if let Some(event) = mailbox_state.next_event() {
+                    break Some(event);
+                }
+                if let Some(wait) = state.tray.wait_duration(Instant::now()) {
+                    let result = mailbox
+                        .wake
+                        .wait_timeout(mailbox_state, wait)
+                        .expect("attention mailbox poisoned");
+                    mailbox_state = result.0;
+                    if result.1.timed_out() && !mailbox_state.has_events() {
+                        break Some(WorkerEvent::TrayTick);
+                    }
+                } else {
+                    mailbox_state = mailbox
+                        .wake
+                        .wait(mailbox_state)
+                        .expect("attention mailbox poisoned");
+                }
             }
         };
         let Some(event) = event else {
@@ -718,8 +715,8 @@ fn process_event(mailbox: &Mailbox, ports: &Ports, state: &mut WorkerState, even
             }
         }
         WorkerEvent::MainFocusChanged(focused) => {
-            state.main_focused = focused;
-            let _ = ports.tray.main_focus_changed(focused);
+            let tray_action = state.tray.focus(focused);
+            apply_tray_transition(ports.tray.as_ref(), &mut state.tray, tray_action);
             if focused {
                 if state.ordinary_playing {
                     let _ = ports.audio.stop_ordinary();
@@ -730,6 +727,10 @@ fn process_event(mailbox: &Mailbox, ports: &Ports, state: &mut WorkerState, even
                     let _ = ports.audio.stop_timer_loop(&owner);
                 }
             }
+        }
+        WorkerEvent::TrayTick => {
+            let tray_action = state.tray.advance(Instant::now());
+            apply_tray_transition(ports.tray.as_ref(), &mut state.tray, tray_action);
         }
         WorkerEvent::ToastCallback {
             notification_id,
@@ -768,7 +769,8 @@ fn process_published(
             }
         }
     }
-    let _ = ports.tray.message_arrived();
+    let tray_action = state.tray.activate(Instant::now());
+    apply_tray_transition(ports.tray.as_ref(), &mut state.tray, tray_action);
 
     match event.attention.origin {
         AttentionOrigin::Ordinary => {
@@ -795,7 +797,10 @@ fn process_published(
             state.active_timer_tickets.insert(ticket.clone());
             if starts_loop {
                 match ports.audio.start_timer_loop(&ticket) {
-                    Ok(true) => state.timer_loop_owner = Some(ticket),
+                    Ok(true) => {
+                        state.ordinary_playing = false;
+                        state.timer_loop_owner = Some(ticket);
+                    }
                     Ok(false) | Err(_) => {
                         state.active_timer_tickets.remove(&ticket);
                         let _ = ports.timers.confirm_audio_after_play_failure(&ticket);
@@ -804,6 +809,19 @@ fn process_published(
             }
         }
         AttentionOrigin::TimerCompletion { audio_ticket: None } => {}
+    }
+}
+
+fn apply_tray_transition(
+    port: &dyn TrayAttentionPort,
+    animation: &mut TrayAnimation,
+    action: Option<TrayVisual>,
+) {
+    if action.is_some_and(|visual| port.set_visual(visual).is_err()) {
+        eprintln!("[native-attention] tray update failed");
+        if let Some(restore) = animation.degrade() {
+            let _ = port.set_visual(restore);
+        }
     }
 }
 
@@ -855,7 +873,7 @@ impl Drop for CleanupGuard {
 
 fn emergency_stop(ports: &Ports) {
     ports.audio.shutdown();
-    let _ = ports.tray.main_focus_changed(true);
+    let _ = ports.tray.set_visual(TrayVisual::Normal);
     let _ = ports.timers.terminate_all_audio();
 }
 
@@ -905,14 +923,12 @@ mod tests {
 
     struct FakeTray(Arc<Calls>);
 
-    impl MessageTray for FakeTray {
-        fn message_arrived(&self) -> Result<(), NativeEffectError> {
-            self.0.push("tray");
-            Ok(())
-        }
-
-        fn main_focus_changed(&self, focused: bool) -> Result<(), NativeEffectError> {
-            self.0.push(if focused { "focus" } else { "blur" });
+    impl TrayAttentionPort for FakeTray {
+        fn set_visual(&self, visual: TrayVisual) -> Result<(), NativeEffectError> {
+            self.0.push(match visual {
+                TrayVisual::Normal => "focus",
+                TrayVisual::Transparent => "tray",
+            });
             Ok(())
         }
 
@@ -1114,7 +1130,8 @@ mod tests {
         assert_eq!(calls.wait_for(1), ["focus"]);
         coordinator.publish(ordinary("1"));
         coordinator.observe_main_focus(false);
-        assert_eq!(calls.wait_for(2), ["focus", "blur"]);
+        coordinator.publish(ordinary("2"));
+        assert_eq!(calls.wait_for(4), ["focus", "toast", "tray", "ordinary"]);
         coordinator.shutdown();
     }
 
@@ -1127,30 +1144,17 @@ mod tests {
 
         coordinator.publish(timer("1", first.clone()));
         coordinator.publish(timer("2", second.clone()));
-        assert_eq!(
-            calls.wait_for(5),
-            ["toast", "tray", "timer-start", "toast", "tray"]
-        );
+        assert_eq!(calls.wait_for(4), ["toast", "tray", "timer-start", "toast"]);
 
         coordinator.publish(ordinary("3"));
         assert_eq!(
-            calls.wait_for(7),
-            [
-                "toast",
-                "tray",
-                "timer-start",
-                "toast",
-                "tray",
-                "toast",
-                "tray",
-            ]
+            calls.wait_for(5),
+            ["toast", "tray", "timer-start", "toast", "toast"]
         );
 
         coordinator.cancel_timer_audio(first);
-        coordinator.observe_main_focus(false);
-        assert_eq!(calls.wait_for(8).last(), Some(&"blur"));
         coordinator.cancel_timer_audio(second);
-        assert_eq!(calls.wait_for(9).last(), Some(&"timer-stop"));
+        assert_eq!(calls.wait_for(6).last(), Some(&"timer-stop"));
         coordinator.shutdown();
     }
 
@@ -1161,12 +1165,9 @@ mod tests {
 
         coordinator.observe_main_focus(true);
         coordinator.observe_main_focus(false);
-        assert_eq!(calls.wait_for(2), ["focus", "blur"]);
+        assert_eq!(calls.wait_for(1), ["focus"]);
         coordinator.publish(timer("1", ticket("com.example.timer.after-focus", 1)));
-        assert_eq!(
-            calls.wait_for(5),
-            ["focus", "blur", "toast", "tray", "timer-start"]
-        );
+        assert_eq!(calls.wait_for(4), ["focus", "toast", "tray", "timer-start"]);
         coordinator.shutdown();
     }
 
@@ -1181,11 +1182,9 @@ mod tests {
         assert_eq!(calls.wait_for(4).last(), Some(&"route"));
         coordinator.toast_callback(1, ToastCallbackKind::Failed);
         coordinator.toast_callback(1, ToastCallbackKind::Dismissed);
-        coordinator.observe_main_focus(false);
-        assert_eq!(calls.wait_for(5).last(), Some(&"blur"));
         assert_eq!(
             calls
-                .wait_for(5)
+                .wait_for(4)
                 .iter()
                 .filter(|call| **call == "route")
                 .count(),
@@ -1223,9 +1222,8 @@ mod tests {
         let coordinator = coordinator(Arc::clone(&calls));
 
         coordinator.publish(timer_without_audio("1"));
-        coordinator.observe_main_focus(false);
 
-        assert_eq!(calls.wait_for(3), ["toast", "tray", "blur"]);
+        assert_eq!(calls.wait_for(2), ["toast", "tray"]);
         coordinator.shutdown();
     }
 }

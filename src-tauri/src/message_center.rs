@@ -1,7 +1,4 @@
 mod store;
-mod tray_flash;
-
-pub(crate) use tray_flash::TauriTrayReminder;
 
 use std::{
     path::Path,
@@ -13,10 +10,10 @@ use tauri::{AppHandle, Emitter};
 
 use crate::{
     native_attention::{
-        legacy_attention_audio, AttentionOrigin, AttentionRoutePort, NativeAttentionCoordinator,
-        PublishedAttention,
+        AttentionAudioPort, AttentionOrigin, AttentionRoutePort, NativeAttentionCoordinator,
+        PublishedAttention, TrayAttentionPort,
     },
-    public_plugins::{AudioTicket, PluginTimerService, TimerAlarm},
+    public_plugins::{AudioTicket, PluginTimerService},
 };
 
 use store::{MessageStore, MessageStoreError, PublishInput};
@@ -114,15 +111,10 @@ pub(crate) trait MessageToast: Send + Sync {
     fn shutdown(&self);
 }
 
-pub(crate) trait MessageTray: Send + Sync {
-    fn message_arrived(&self) -> Result<(), NativeEffectError>;
-    fn main_focus_changed(&self, focused: bool) -> Result<(), NativeEffectError>;
-    fn shutdown(&self);
-}
-
 struct NativeEffects {
     toast: Arc<dyn MessageToast>,
-    tray: Arc<dyn MessageTray>,
+    tray: Arc<dyn TrayAttentionPort>,
+    audio: Arc<dyn AttentionAudioPort>,
 }
 
 pub(crate) struct MessageCenterService {
@@ -143,17 +135,17 @@ impl MessageCenterService {
     pub(crate) fn install_native_effects(
         &self,
         toast: Arc<dyn MessageToast>,
-        tray: Arc<dyn MessageTray>,
+        tray: Arc<dyn TrayAttentionPort>,
+        audio: Arc<dyn AttentionAudioPort>,
     ) -> Result<(), NativeEffectError> {
         self.native_effects
-            .set(NativeEffects { toast, tray })
+            .set(NativeEffects { toast, tray, audio })
             .map_err(|_| NativeEffectError)
     }
 
     pub(crate) fn start_native_attention(
         &self,
         timers: Arc<PluginTimerService>,
-        timer_alarm: Arc<dyn TimerAlarm>,
         route: Arc<dyn AttentionRoutePort>,
     ) -> Result<(), NativeEffectError> {
         let effects = self.native_effects.get().ok_or(NativeEffectError)?;
@@ -161,7 +153,7 @@ impl MessageCenterService {
             timers,
             Arc::clone(&effects.toast),
             Arc::clone(&effects.tray),
-            legacy_attention_audio(timer_alarm),
+            Arc::clone(&effects.audio),
             route,
         );
         self.native_attention
@@ -265,6 +257,7 @@ impl MessageCenterService {
         } else if let Some(effects) = self.native_effects.get() {
             effects.toast.shutdown();
             effects.tray.shutdown();
+            effects.audio.shutdown();
         }
     }
 
@@ -272,6 +265,12 @@ impl MessageCenterService {
         if let Some(coordinator) = self.native_attention.get() {
             coordinator.observe_main_focus(focused);
         }
+    }
+}
+
+impl Drop for MessageCenterService {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

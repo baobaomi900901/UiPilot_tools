@@ -8,7 +8,6 @@ mod scheduler;
 mod secrets;
 mod state;
 mod storage;
-mod timer_alarm;
 mod timers;
 
 #[cfg(test)]
@@ -59,7 +58,6 @@ pub(crate) use state::{
     EffectivePluginConfig, PluginStateError, PluginStateStore, PublicPluginFault,
 };
 pub(crate) use storage::PluginStorageStore;
-pub(crate) use timer_alarm::TimerAlarm;
 pub(crate) use timers::{
     AudioTicket, PluginTimerService, PluginTimerStartInput, PluginTimerState, TimerError, TimerKey,
 };
@@ -106,27 +104,14 @@ impl PublicPluginService {
         message_center: Arc<MessageCenterService>,
         attention_route: Arc<dyn AttentionRoutePort>,
     ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
-        let alarm_path = app
-            .path()
-            .resolve(
-                "sounds/timer-complete.wav",
-                tauri::path::BaseDirectory::Resource,
-            )
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let timer_alarm = timer_alarm::windows_alarm(alarm_path);
         let manager = Arc::new(PublicPluginManager::load(
             app_data_dir,
             PublicPluginHost::current(PublicPlatform::Windows),
             reserved_names,
             Arc::clone(&message_center),
-            timer_alarm,
         )?);
         message_center
-            .start_native_attention(
-                manager.timer_service(),
-                manager.timer_alarm(),
-                attention_route,
-            )
+            .start_native_attention(manager.timer_service(), attention_route)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         manager.start_delayed_messages(app)?;
         if let Err(error) = manager.start_timers(app) {

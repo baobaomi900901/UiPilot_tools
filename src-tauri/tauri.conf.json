@@ -47,7 +47,7 @@
       "resources/everything/Everything.exe",
       "resources/everything/LICENSE.txt",
       "resources/everything/everything.lock.json",
-      "resources/sounds/timer-complete.wav"
+      "resources/sounds/attention-alarm.wav"
     ],
     "targets": "all",
     "icon": [

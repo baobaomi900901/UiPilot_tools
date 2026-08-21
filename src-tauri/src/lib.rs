@@ -237,10 +237,17 @@ fn setup_production_lifecycle(
         let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
     });
     let toast = native_attention::windows_toast();
-    let tray_reminder: Arc<dyn message_center::MessageTray> =
-        Arc::new(message_center::TauriTrayReminder::new(tray, icon));
+    let tray_attention = native_attention::tauri_tray(tray, icon);
+    let attention_sound = app
+        .path()
+        .resolve(
+            "sounds/attention-alarm.wav",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|_| lifecycle_setup_error())?;
+    let attention_audio = native_attention::windows_audio(attention_sound);
     message_center
-        .install_native_effects(toast, tray_reminder)
+        .install_native_effects(toast, tray_attention, attention_audio)
         .map_err(|_| lifecycle_setup_error())?;
     public_plugin_service.initialize(
         app.handle(),

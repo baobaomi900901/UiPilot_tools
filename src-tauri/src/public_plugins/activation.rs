@@ -23,7 +23,6 @@ use super::{
     icon::{self, IconRequest, ICON_PATH},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
     package, runtime_label, stage_public_package,
-    timer_alarm::TimerAlarm,
     timers::{
         AudioTicket, ClaimTicket, Clock, PluginTimerService, PluginTimerStartInput,
         PluginTimerState, SystemClock, TimerError, TimerKey, TimerPostLockEffect,
@@ -341,7 +340,6 @@ pub(crate) struct PublicPluginManager {
     delayed_messages: Arc<DelayedMessageScheduler>,
     message_center: Arc<MessageCenterService>,
     timer_publisher: Arc<dyn MessagePublisher>,
-    timer_alarm: Arc<dyn TimerAlarm>,
     timers: Arc<PluginTimerService>,
     api: PluginRuntimeApi,
     mutation: Mutex<()>,
@@ -356,7 +354,6 @@ impl PublicPluginManager {
         host: PublicPluginHost,
         reserved_names: impl IntoIterator<Item = String>,
         message_center: Arc<MessageCenterService>,
-        timer_alarm: Arc<dyn TimerAlarm>,
     ) -> Result<Self, PublicPluginManagementError> {
         let timer_publisher: Arc<dyn MessagePublisher> = message_center.clone();
         Self::load_with_timer_dependencies(
@@ -366,7 +363,6 @@ impl PublicPluginManager {
             message_center,
             Arc::new(SystemClock),
             timer_publisher,
-            timer_alarm,
         )
     }
 
@@ -377,7 +373,6 @@ impl PublicPluginManager {
         message_center: Arc<MessageCenterService>,
         timer_clock: Arc<dyn Clock>,
         timer_publisher: Arc<dyn MessagePublisher>,
-        timer_alarm: Arc<dyn TimerAlarm>,
     ) -> Result<Self, PublicPluginManagementError> {
         let root = app_data_dir.join("public-plugins");
         let staging_root = root.join("staging");
@@ -441,7 +436,6 @@ impl PublicPluginManager {
             delayed_messages,
             message_center,
             timer_publisher,
-            timer_alarm,
             timers,
             api,
             mutation: Mutex::new(()),
@@ -1268,10 +1262,6 @@ impl PublicPluginManager {
         Arc::clone(&self.timers)
     }
 
-    pub(crate) fn timer_alarm(&self) -> Arc<dyn TimerAlarm> {
-        Arc::clone(&self.timer_alarm)
-    }
-
     pub(crate) fn window_timer_get_state(
         &self,
         plugin_id: &str,
@@ -2036,7 +2026,6 @@ mod tests {
     use crate::message_center::MessagePostGuardEffect;
     use crate::public_plugins::{
         delayed_messages::{DelayedMessageRegistration, ScheduledPluginMessage},
-        timer_alarm::{TimerAlarm, TimerAlarmError},
         timers::{Clock, PluginTimerPhase, PluginTimerStartInput, TimerKey},
         PublicPlatform,
     };
@@ -2056,26 +2045,6 @@ mod tests {
         fn now_ms(&self) -> u64 {
             self.0.load(Ordering::SeqCst)
         }
-    }
-
-    #[derive(Default)]
-    struct TestAlarm(Mutex<Vec<&'static str>>);
-
-    impl TimerAlarm for TestAlarm {
-        fn play(
-            &self,
-            _ticket: &super::super::timers::AudioTicket,
-        ) -> Result<bool, TimerAlarmError> {
-            self.0.lock().unwrap().push("play");
-            Ok(true)
-        }
-
-        fn stop(&self, _ticket: &super::super::timers::AudioTicket) -> Result<(), TimerAlarmError> {
-            self.0.lock().unwrap().push("stop");
-            Ok(())
-        }
-
-        fn shutdown(&self) {}
     }
 
     struct TestPublisher {
@@ -2159,7 +2128,6 @@ mod tests {
             message_center,
             Arc::new(TestClock::default()),
             Arc::new(TestPublisher::successful()),
-            Arc::new(TestAlarm::default()),
         )
         .unwrap()
     }
@@ -2168,7 +2136,6 @@ mod tests {
         dir: &TestDir,
         clock: Arc<TestClock>,
         publisher: Arc<TestPublisher>,
-        alarm: Arc<TestAlarm>,
     ) -> PublicPluginManager {
         PublicPluginManager::load_with_timer_dependencies(
             dir.path(),
@@ -2177,7 +2144,6 @@ mod tests {
             Arc::new(MessageCenterService::load(dir.path())),
             clock,
             publisher,
-            alarm,
         )
         .unwrap()
     }
@@ -2644,8 +2610,7 @@ mod tests {
         write_timer_package(&dir.source(), "1.0.0");
         let clock = Arc::new(TestClock::default());
         let publisher = Arc::new(TestPublisher::successful());
-        let alarm = Arc::new(TestAlarm::default());
-        let manager = timer_manager(&dir, clock.clone(), publisher.clone(), alarm.clone());
+        let manager = timer_manager(&dir, clock.clone(), publisher.clone());
         let generation = install_timer(&manager, &dir.source());
         let (key, ticket) = start_due_timer(&manager, &clock, generation);
 
@@ -2657,7 +2622,6 @@ mod tests {
         ));
         assert!(effect.audio_ticket.is_some());
         assert_eq!(publisher.calls.lock().unwrap().len(), 1);
-        assert!(alarm.0.lock().unwrap().is_empty());
         assert_eq!(
             manager.timers.get_state(&key).unwrap().phase,
             PluginTimerPhase::Fired
@@ -2672,7 +2636,6 @@ mod tests {
             &dir,
             Arc::new(TestClock::default()),
             Arc::new(TestPublisher::successful()),
-            Arc::new(TestAlarm::default()),
         );
         let generation = install_timer(&manager, &dir.source());
 
@@ -2716,8 +2679,7 @@ mod tests {
         write_timer_package(&dir.source(), "1.0.0");
         let clock = Arc::new(TestClock::default());
         let publisher = Arc::new(TestPublisher::successful());
-        let alarm = Arc::new(TestAlarm::default());
-        let manager = timer_manager(&dir, clock.clone(), publisher.clone(), alarm.clone());
+        let manager = timer_manager(&dir, clock.clone(), publisher.clone());
         let generation = install_timer(&manager, &dir.source());
         let (_key, ticket) = start_due_timer(&manager, &clock, generation);
         manager
@@ -2732,7 +2694,6 @@ mod tests {
             }
         );
         assert!(publisher.calls.lock().unwrap().is_empty());
-        assert!(alarm.0.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2741,8 +2702,7 @@ mod tests {
         write_timer_package(&dir.source(), "1.0.0");
         let clock = Arc::new(TestClock::default());
         let publisher = Arc::new(TestPublisher::failing());
-        let alarm = Arc::new(TestAlarm::default());
-        let manager = timer_manager(&dir, clock.clone(), publisher.clone(), alarm.clone());
+        let manager = timer_manager(&dir, clock.clone(), publisher.clone());
         let generation = install_timer(&manager, &dir.source());
         let (key, ticket) = start_due_timer(&manager, &clock, generation);
 
@@ -2754,7 +2714,6 @@ mod tests {
             }
         );
         assert_eq!(publisher.calls.lock().unwrap().len(), 1);
-        assert!(alarm.0.lock().unwrap().is_empty());
         let state = manager.timers.get_state(&key).unwrap();
         assert_eq!(state.phase, PluginTimerPhase::Idle);
         assert_eq!(state.remaining_ms, Some(1_000));
@@ -2765,12 +2724,7 @@ mod tests {
         let dir = TestDir::new("timer-failed-upgrade");
         write_timer_package(&dir.source(), "1.0.0");
         let clock = Arc::new(TestClock::default());
-        let manager = timer_manager(
-            &dir,
-            clock,
-            Arc::new(TestPublisher::successful()),
-            Arc::new(TestAlarm::default()),
-        );
+        let manager = timer_manager(&dir, clock, Arc::new(TestPublisher::successful()));
         let generation = install_timer(&manager, &dir.source());
         let key = TimerKey::new("com.example.timer", generation).unwrap();
         manager
@@ -2815,12 +2769,7 @@ mod tests {
         let dir = TestDir::new("timer-generation-lifecycle");
         write_timer_package(&dir.source(), "1.0.0");
         let clock = Arc::new(TestClock::default());
-        let manager = timer_manager(
-            &dir,
-            clock,
-            Arc::new(TestPublisher::successful()),
-            Arc::new(TestAlarm::default()),
-        );
+        let manager = timer_manager(&dir, clock, Arc::new(TestPublisher::successful()));
         let start = |manager: &PublicPluginManager, generation| {
             let key = TimerKey::new("com.example.timer", generation).unwrap();
             manager
