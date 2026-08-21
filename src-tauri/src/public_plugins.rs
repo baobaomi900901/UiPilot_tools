@@ -32,6 +32,7 @@ use tauri::{
 };
 
 use crate::message_center::MessageCenterService;
+use crate::native_attention::AttentionRoutePort;
 
 pub(crate) use activation::{
     parse_main_result_response, parse_window_response, PublicCommandSuggestion, PublicMainResult,
@@ -58,7 +59,10 @@ pub(crate) use state::{
     EffectivePluginConfig, PluginStateError, PluginStateStore, PublicPluginFault,
 };
 pub(crate) use storage::PluginStorageStore;
-pub(crate) use timers::{PluginTimerStartInput, PluginTimerState, TimerError, TimerKey};
+pub(crate) use timer_alarm::TimerAlarm;
+pub(crate) use timers::{
+    AudioTicket, PluginTimerService, PluginTimerStartInput, PluginTimerState, TimerError, TimerKey,
+};
 const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +104,7 @@ impl PublicPluginService {
         app_data_dir: &Path,
         reserved_names: impl IntoIterator<Item = String>,
         message_center: Arc<MessageCenterService>,
+        attention_route: Arc<dyn AttentionRoutePort>,
     ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
         let alarm_path = app
             .path()
@@ -113,9 +118,16 @@ impl PublicPluginService {
             app_data_dir,
             PublicPluginHost::current(PublicPlatform::Windows),
             reserved_names,
-            message_center,
+            Arc::clone(&message_center),
             timer_alarm,
         )?);
+        message_center
+            .start_native_attention(
+                manager.timer_service(),
+                manager.timer_alarm(),
+                attention_route,
+            )
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         manager.start_delayed_messages(app)?;
         if let Err(error) = manager.start_timers(app) {
             manager.shutdown_delayed_messages();

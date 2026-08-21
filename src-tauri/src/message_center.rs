@@ -13,6 +13,14 @@ use std::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
+use crate::{
+    native_attention::{
+        legacy_attention_audio, AttentionOrigin, AttentionRoutePort, NativeAttentionCoordinator,
+        PublishedAttention,
+    },
+    public_plugins::{AudioTicket, PluginTimerService, TimerAlarm},
+};
+
 use store::{MessageStore, MessageStoreError, PublishInput};
 
 pub(crate) const MESSAGE_STATE_CHANGED_EVENT: &str = "message-center://state-changed";
@@ -112,6 +120,7 @@ struct NativeEffects {
 pub(crate) struct MessageCenterService {
     store: MessageStore,
     native_effects: OnceLock<NativeEffects>,
+    native_attention: OnceLock<Arc<NativeAttentionCoordinator>>,
 }
 
 impl MessageCenterService {
@@ -119,6 +128,7 @@ impl MessageCenterService {
         Self {
             store: MessageStore::load(&app_data_dir.join("message-center")),
             native_effects: OnceLock::new(),
+            native_attention: OnceLock::new(),
         }
     }
 
@@ -129,6 +139,25 @@ impl MessageCenterService {
     ) -> Result<(), NativeEffectError> {
         self.native_effects
             .set(NativeEffects { toast, tray })
+            .map_err(|_| NativeEffectError)
+    }
+
+    pub(crate) fn start_native_attention(
+        &self,
+        timers: Arc<PluginTimerService>,
+        timer_alarm: Arc<dyn TimerAlarm>,
+        route: Arc<dyn AttentionRoutePort>,
+    ) -> Result<(), NativeEffectError> {
+        let effects = self.native_effects.get().ok_or(NativeEffectError)?;
+        let coordinator = NativeAttentionCoordinator::start(
+            timers,
+            Arc::clone(&effects.toast),
+            Arc::clone(&effects.tray),
+            legacy_attention_audio(timer_alarm),
+            route,
+        );
+        self.native_attention
+            .set(coordinator)
             .map_err(|_| NativeEffectError)
     }
 
@@ -162,7 +191,34 @@ impl MessageCenterService {
         app: &AppHandle,
         effect: Option<MessagePostGuardEffect>,
     ) {
-        let event = match effect.as_ref() {
+        let published = match effect.as_ref() {
+            Some(MessagePostGuardEffect::Published(message)) => Some(message.clone()),
+            _ => None,
+        };
+        self.dispatch_post_guard_event(app, effect.as_ref());
+        if let Some(message) = published {
+            self.dispatch_published(message, AttentionOrigin::Ordinary);
+        }
+    }
+
+    pub(crate) fn dispatch_timer_post_guard(
+        &self,
+        app: &AppHandle,
+        effect: Option<MessagePostGuardEffect>,
+        audio_ticket: Option<AudioTicket>,
+    ) {
+        let published = match effect.as_ref() {
+            Some(MessagePostGuardEffect::Published(message)) => Some(message.clone()),
+            _ => None,
+        };
+        self.dispatch_post_guard_event(app, effect.as_ref());
+        if let Some(message) = published {
+            self.dispatch_published(message, AttentionOrigin::TimerCompletion { audio_ticket });
+        }
+    }
+
+    fn dispatch_post_guard_event(&self, app: &AppHandle, effect: Option<&MessagePostGuardEffect>) {
+        let event = match effect {
             Some(MessagePostGuardEffect::Published(message)) => {
                 MessageHostStateChangedEvent::Ready {
                     revision: message.revision.clone(),
@@ -181,45 +237,33 @@ impl MessageCenterService {
             None => return,
         };
         let _ = app.emit_to("main", MESSAGE_STATE_CHANGED_EVENT, event);
-        if let (Some(MessagePostGuardEffect::Published(message)), Some(native_effects)) =
-            (effect.as_ref(), self.native_effects.get())
-        {
-            dispatch_native_effects(
-                Some(&native_effects.toast),
-                Some(&native_effects.tray),
-                message,
-            );
+    }
+
+    fn dispatch_published(&self, message: MessagePublished, origin: AttentionOrigin) {
+        if let Some(coordinator) = self.native_attention.get() {
+            coordinator.publish(PublishedAttention { message, origin });
+        }
+    }
+
+    pub(crate) fn cancel_timer_audio(&self, ticket: AudioTicket) {
+        if let Some(coordinator) = self.native_attention.get() {
+            coordinator.cancel_timer_audio(ticket);
         }
     }
 
     pub(crate) fn shutdown(&self) {
-        if let Some(native_effects) = self.native_effects.get() {
-            native_effects.toast.shutdown();
-            native_effects.tray.shutdown();
+        if let Some(coordinator) = self.native_attention.get() {
+            coordinator.shutdown();
+        } else if let Some(effects) = self.native_effects.get() {
+            effects.toast.shutdown();
+            effects.tray.shutdown();
         }
     }
 
     pub(crate) fn observe_main_focus(&self, focused: bool) {
-        if self
-            .native_effects
-            .get()
-            .is_some_and(|effects| effects.tray.main_focus_changed(focused).is_err())
-        {
-            eprintln!("[message-center] tray attention focus dispatch failed");
+        if let Some(coordinator) = self.native_attention.get() {
+            coordinator.observe_main_focus(focused);
         }
-    }
-}
-
-fn dispatch_native_effects(
-    toast: Option<&Arc<dyn MessageToast>>,
-    tray: Option<&Arc<dyn MessageTray>>,
-    message: &MessagePublished,
-) {
-    if toast.is_some_and(|adapter| adapter.show_message(message).is_err()) {
-        eprintln!("[message-center] Windows notification dispatch failed");
-    }
-    if tray.is_some_and(|adapter| adapter.message_arrived().is_err()) {
-        eprintln!("[message-center] tray attention dispatch failed");
     }
 }
 
@@ -327,10 +371,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc, Mutex,
-        },
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
@@ -369,56 +410,6 @@ mod tests {
             plugin_name_snapshot: "Messages".into(),
             content: "hello".into(),
         })
-    }
-
-    struct FailingToast(Arc<Mutex<Vec<&'static str>>>);
-
-    impl MessageToast for FailingToast {
-        fn show_message(&self, _message: &MessagePublished) -> Result<(), NativeEffectError> {
-            self.0.lock().unwrap().push("toast");
-            Err(NativeEffectError)
-        }
-
-        fn shutdown(&self) {}
-    }
-
-    struct RecordingTray(Arc<Mutex<Vec<&'static str>>>);
-
-    impl MessageTray for RecordingTray {
-        fn message_arrived(&self) -> Result<(), NativeEffectError> {
-            self.0.lock().unwrap().push("tray");
-            Ok(())
-        }
-
-        fn main_focus_changed(&self, focused: bool) -> Result<(), NativeEffectError> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(if focused { "focus" } else { "blur" });
-            Ok(())
-        }
-
-        fn shutdown(&self) {}
-    }
-
-    #[test]
-    fn native_publish_effects_are_ordered_and_independent() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let toast: Arc<dyn MessageToast> = Arc::new(FailingToast(Arc::clone(&calls)));
-        let tray: Arc<dyn MessageTray> = Arc::new(RecordingTray(Arc::clone(&calls)));
-        let message = MessagePublished {
-            id: "1".into(),
-            plugin_id: "com.example.messages".into(),
-            plugin_name_snapshot: "Messages".into(),
-            created_at: "2026-08-19T00:00:00Z".into(),
-            content: "private content".into(),
-            revision: "1".into(),
-            unread_count: 1,
-        };
-
-        dispatch_native_effects(Some(&toast), Some(&tray), &message);
-
-        assert_eq!(*calls.lock().unwrap(), ["toast", "tray"]);
     }
 
     #[test]

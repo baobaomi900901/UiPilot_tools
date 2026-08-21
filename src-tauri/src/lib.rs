@@ -19,6 +19,9 @@ mod atomic_file;
 mod message_center;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod native_attention;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -106,12 +109,6 @@ fn setup_production_lifecycle(
     if !app.manage(Arc::clone(&message_center)) {
         return Err(lifecycle_setup_error().into());
     }
-    public_plugin_service.initialize(
-        app.handle(),
-        &app_data_dir,
-        ["find".into(), "math".into()],
-        Arc::clone(&message_center),
-    )?;
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -236,16 +233,24 @@ fn setup_production_lifecycle(
 
     let notification_app = app.handle().clone();
     let notification_coordinator = Arc::clone(coordinator);
+    let route_messages: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
+    });
     let toast: Arc<dyn message_center::MessageToast> = Arc::new(
-        message_center::WindowsNotificationAdapter::new(Arc::new(move || {
-            let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
-        })),
+        message_center::WindowsNotificationAdapter::new(Arc::clone(&route_messages)),
     );
     let tray_reminder: Arc<dyn message_center::MessageTray> =
         Arc::new(message_center::TauriTrayReminder::new(tray, icon));
     message_center
         .install_native_effects(toast, tray_reminder)
         .map_err(|_| lifecycle_setup_error())?;
+    public_plugin_service.initialize(
+        app.handle(),
+        &app_data_dir,
+        ["find".into(), "math".into()],
+        Arc::clone(&message_center),
+        native_attention::attention_route(route_messages),
+    )?;
 
     lifecycle::install_session_end_hook(app.handle(), &window)
         .map_err(|_| lifecycle_setup_error())?;

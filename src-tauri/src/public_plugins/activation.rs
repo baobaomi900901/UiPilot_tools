@@ -25,8 +25,8 @@ use super::{
     package, runtime_label, stage_public_package,
     timer_alarm::TimerAlarm,
     timers::{
-        ClaimTicket, Clock, PluginTimerService, PluginTimerStartInput, PluginTimerState,
-        SystemClock, TimerError, TimerKey, TimerPostLockEffect,
+        AudioTicket, ClaimTicket, Clock, PluginTimerService, PluginTimerStartInput,
+        PluginTimerState, SystemClock, TimerError, TimerKey, TimerPostLockEffect,
     },
     EffectivePluginConfig, PluginApiExecution, PluginApiRequest, PluginCommandCompletion,
     PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler, PluginRuntimeApi,
@@ -322,6 +322,12 @@ struct ActivationData {
     pending: HashMap<String, PendingActivation>,
     active_by_plugin: HashMap<String, Arc<RuntimeSnapshot>>,
     staged_by_label: HashMap<String, Arc<RuntimeSnapshot>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TimerClaimDispatch {
+    effect: Option<MessagePostGuardEffect>,
+    audio_ticket: Option<AudioTicket>,
 }
 
 pub(crate) struct PublicPluginManager {
@@ -1258,6 +1264,14 @@ impl PublicPluginManager {
         &self.message_center
     }
 
+    pub(crate) fn timer_service(&self) -> Arc<PluginTimerService> {
+        Arc::clone(&self.timers)
+    }
+
+    pub(crate) fn timer_alarm(&self) -> Arc<dyn TimerAlarm> {
+        Arc::clone(&self.timer_alarm)
+    }
+
     pub(crate) fn window_timer_get_state(
         &self,
         plugin_id: &str,
@@ -1372,8 +1386,12 @@ impl PublicPluginManager {
                     return;
                 };
                 let key = ticket.key().clone();
-                let effect = manager.commit_timer_claim(ticket);
-                manager.message_center.dispatch_post_guard(&app, effect);
+                let dispatch = manager.commit_timer_claim(ticket);
+                manager.message_center.dispatch_timer_post_guard(
+                    &app,
+                    dispatch.effect,
+                    dispatch.audio_ticket,
+                );
                 if let Ok(state) = manager.timers.get_state(&key) {
                     let controller =
                         app.state::<Arc<crate::plugin_window::PluginWindowController>>();
@@ -1391,12 +1409,16 @@ impl PublicPluginManager {
     pub(crate) fn shutdown_timers(&self) {
         let operation = self.timers.shutdown();
         self.apply_timer_post_lock_effects(operation.post_lock_effects);
-        self.timer_alarm.shutdown();
     }
 
-    fn commit_timer_claim(&self, ticket: ClaimTicket) -> Option<MessagePostGuardEffect> {
+    fn commit_timer_claim(&self, ticket: ClaimTicket) -> TimerClaimDispatch {
         let admitted = {
-            let mutation = self.lock_mutation().ok()?;
+            let Ok(mutation) = self.lock_mutation() else {
+                return TimerClaimDispatch {
+                    effect: None,
+                    audio_ticket: None,
+                };
+            };
             let key = ticket.key();
             let eligible = self
                 .state
@@ -1433,14 +1455,20 @@ impl PublicPluginManager {
             if !eligible {
                 drop(mutation);
                 let _ = self.timers.complete_claim(&ticket, false);
-                return None;
+                return TimerClaimDispatch {
+                    effect: None,
+                    audio_ticket: None,
+                };
             }
-            let admitted = self.timers.admit_claim(&ticket).ok()?;
+            let admitted = self.timers.admit_claim(&ticket).unwrap_or(false);
             drop(mutation);
             admitted
         };
         if !admitted {
-            return None;
+            return TimerClaimDispatch {
+                effect: None,
+                audio_ticket: None,
+            };
         }
 
         let outcome = self.timer_publisher.commit_publish(MessagePublishRequest {
@@ -1464,14 +1492,10 @@ impl PublicPluginManager {
             .complete_claim(&ticket, persisted)
             .ok()
             .flatten();
-        if let Some(audio) = completion.and_then(|completion| completion.audio_ticket) {
-            if self.timers.admit_audio_start(&audio).unwrap_or(false)
-                && self.timer_alarm.play(&audio).is_err()
-            {
-                let _ = self.timers.confirm_audio_after_play_failure(&audio);
-            }
+        TimerClaimDispatch {
+            effect,
+            audio_ticket: completion.and_then(|completion| completion.audio_ticket),
         }
-        effect
     }
 
     pub(crate) fn start_delayed_messages(
@@ -1712,7 +1736,7 @@ impl PublicPluginManager {
         for effect in effects {
             match effect {
                 TimerPostLockEffect::AudioCancelled(audio) => {
-                    let _ = self.timer_alarm.stop(&audio);
+                    self.message_center.cancel_timer_audio(audio);
                 }
             }
         }
@@ -2615,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn timer_delivery_persists_for_the_current_generation_before_audio() {
+    fn timer_delivery_persists_then_returns_audio_for_coordinator_admission() {
         let dir = TestDir::new("timer-delivery");
         write_timer_package(&dir.source(), "1.0.0");
         let clock = Arc::new(TestClock::default());
@@ -2627,9 +2651,13 @@ mod tests {
 
         let effect = manager.commit_timer_claim(ticket);
 
-        assert!(matches!(effect, Some(MessagePostGuardEffect::Published(_))));
+        assert!(matches!(
+            effect.effect,
+            Some(MessagePostGuardEffect::Published(_))
+        ));
+        assert!(effect.audio_ticket.is_some());
         assert_eq!(publisher.calls.lock().unwrap().len(), 1);
-        assert_eq!(*alarm.0.lock().unwrap(), ["play"]);
+        assert!(alarm.0.lock().unwrap().is_empty());
         assert_eq!(
             manager.timers.get_state(&key).unwrap().phase,
             PluginTimerPhase::Fired
@@ -2696,7 +2724,13 @@ mod tests {
             .set_enabled_with_readiness("com.example.timer", false, |_| false)
             .unwrap();
 
-        assert_eq!(manager.commit_timer_claim(ticket), None);
+        assert_eq!(
+            manager.commit_timer_claim(ticket),
+            TimerClaimDispatch {
+                effect: None,
+                audio_ticket: None,
+            }
+        );
         assert!(publisher.calls.lock().unwrap().is_empty());
         assert!(alarm.0.lock().unwrap().is_empty());
     }
@@ -2712,7 +2746,13 @@ mod tests {
         let generation = install_timer(&manager, &dir.source());
         let (key, ticket) = start_due_timer(&manager, &clock, generation);
 
-        assert_eq!(manager.commit_timer_claim(ticket), None);
+        assert_eq!(
+            manager.commit_timer_claim(ticket),
+            TimerClaimDispatch {
+                effect: None,
+                audio_ticket: None,
+            }
+        );
         assert_eq!(publisher.calls.lock().unwrap().len(), 1);
         assert!(alarm.0.lock().unwrap().is_empty());
         let state = manager.timers.get_state(&key).unwrap();

@@ -137,10 +137,16 @@ impl ClaimTicket {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AudioTicket {
-    pub(super) key: TimerKey,
-    pub(super) round_id: u64,
-    pub(super) audio_id: u64,
-    pub(super) fired_revision: u64,
+    pub(crate) key: TimerKey,
+    pub(crate) round_id: u64,
+    pub(crate) audio_id: u64,
+    pub(crate) fired_revision: u64,
+}
+
+impl AudioTicket {
+    pub(crate) fn key(&self) -> &TimerKey {
+        &self.key
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
