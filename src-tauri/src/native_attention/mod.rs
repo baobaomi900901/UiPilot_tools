@@ -13,6 +13,17 @@ use crate::{
     public_plugins::{AudioTicket, PluginTimerService, TimerAlarm, TimerError, TimerKey},
 };
 
+mod windows_identity;
+mod windows_toast;
+
+pub(crate) fn prepare_process_identity() {
+    let _ = windows_identity::prepare_process_identity();
+}
+
+pub(crate) fn windows_toast() -> Arc<dyn MessageToast> {
+    Arc::new(windows_toast::WindowsToastPort::new())
+}
+
 const ORDINARY_CAPACITY: usize = 64;
 const TIMER_KEY_CAPACITY: usize = 64;
 const FOCUS_CAPACITY: usize = 128;
@@ -21,6 +32,8 @@ const ACTIVE_TIMER_CAPACITY: usize = 64;
 const ACTIVE_TOAST_CAPACITY: usize = 64;
 
 pub(crate) type NativeNotificationId = u64;
+pub(crate) type ToastCallbackSink =
+    Arc<dyn Fn(NativeNotificationId, ToastCallbackKind) + Send + Sync>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublishedAttention {
@@ -163,6 +176,7 @@ struct MailboxState {
     timers: BTreeMap<TimerKey, TimerSlots>,
     focus: VecDeque<Sequenced<bool>>,
     callbacks: BTreeMap<NativeNotificationId, Sequenced<ToastCallbackKind>>,
+    toast_ids: BTreeSet<NativeNotificationId>,
 }
 
 impl MailboxState {
@@ -345,6 +359,14 @@ impl NativeAttentionCoordinator {
             worker_alive: Arc::clone(&worker_alive),
             emergency_started: AtomicBool::new(false),
         });
+        let weak = Arc::downgrade(&coordinator);
+        let _ = coordinator.ports.toast.install_callback_sink(Arc::new(
+            move |notification_id, kind| {
+                if let Some(coordinator) = weak.upgrade() {
+                    coordinator.toast_callback(notification_id, kind);
+                }
+            },
+        ));
         let worker = thread::Builder::new()
             .name("uipilot-native-attention".into())
             .spawn(move || {
@@ -588,7 +610,10 @@ impl NativeAttentionCoordinator {
                 self.enter_terminal();
                 return;
             };
-            if state.terminal || state.callbacks.contains_key(&notification_id) {
+            if state.terminal
+                || state.callbacks.contains_key(&notification_id)
+                || !state.toast_ids.contains(&notification_id)
+            {
                 false
             } else if state.callbacks.len() >= TOAST_CALLBACK_CAPACITY {
                 state.terminal = true;
@@ -655,6 +680,7 @@ fn worker_loop(mailbox: Arc<Mailbox>, ports: Arc<Ports>) {
     let _cleanup = CleanupGuard {
         ports: Arc::clone(&ports),
     };
+    let _ = ports.toast.initialize_worker();
     let mut state = WorkerState::default();
     loop {
         let event = {
@@ -677,13 +703,13 @@ fn worker_loop(mailbox: Arc<Mailbox>, ports: Arc<Ports>) {
         let Some(event) = event else {
             break;
         };
-        process_event(&ports, &mut state, event);
+        process_event(&mailbox, &ports, &mut state, event);
     }
 }
 
-fn process_event(ports: &Ports, state: &mut WorkerState, event: WorkerEvent) {
+fn process_event(mailbox: &Mailbox, ports: &Ports, state: &mut WorkerState, event: WorkerEvent) {
     match event {
-        WorkerEvent::Published(event) => process_published(ports, state, event),
+        WorkerEvent::Published(event) => process_published(mailbox, ports, state, event),
         WorkerEvent::TimerAudioCancelled(ticket) => {
             if state.active_timer_tickets.remove(&ticket) && state.active_timer_tickets.is_empty() {
                 if let Some(owner) = state.timer_loop_owner.take() {
@@ -709,15 +735,23 @@ fn process_event(ports: &Ports, state: &mut WorkerState, event: WorkerEvent) {
             notification_id,
             kind,
         } => {
-            if state.active_toasts.remove(&notification_id) && kind == ToastCallbackKind::Activated
-            {
-                ports.route.show_messages();
+            if state.active_toasts.remove(&notification_id) {
+                ports.toast.finish_notification(notification_id);
+                release_toast_id(mailbox, notification_id);
+                if kind == ToastCallbackKind::Activated {
+                    ports.route.show_messages();
+                }
             }
         }
     }
 }
 
-fn process_published(ports: &Ports, state: &mut WorkerState, event: SequencedPublished) {
+fn process_published(
+    mailbox: &Mailbox,
+    ports: &Ports,
+    state: &mut WorkerState,
+    event: SequencedPublished,
+) {
     if event.focused_at_admission {
         if let Some(ticket) = timer_ticket(&event.attention) {
             let _ = ports.timers.confirm_audio_without_start(ticket);
@@ -725,11 +759,13 @@ fn process_published(ports: &Ports, state: &mut WorkerState, event: SequencedPub
         return;
     }
 
-    if state.active_toasts.len() < ACTIVE_TOAST_CAPACITY
-        && ports.toast.show_message(&event.attention.message).is_ok()
-    {
-        if let Ok(id) = event.attention.message.id.parse::<u64>() {
-            state.active_toasts.insert(id);
+    if let Ok(id) = event.attention.message.id.parse::<u64>() {
+        if reserve_toast_id(mailbox, id) {
+            if ports.toast.show_message(&event.attention.message).is_ok() {
+                state.active_toasts.insert(id);
+            } else {
+                release_toast_id(mailbox, id);
+            }
         }
     }
     let _ = ports.tray.message_arrived();
@@ -768,6 +804,25 @@ fn process_published(ports: &Ports, state: &mut WorkerState, event: SequencedPub
             }
         }
         AttentionOrigin::TimerCompletion { audio_ticket: None } => {}
+    }
+}
+
+fn reserve_toast_id(mailbox: &Mailbox, notification_id: NativeNotificationId) -> bool {
+    let Ok(mut state) = mailbox.state.lock() else {
+        return false;
+    };
+    if state.terminal
+        || state.toast_ids.len() >= ACTIVE_TOAST_CAPACITY
+        || !state.toast_ids.insert(notification_id)
+    {
+        return false;
+    }
+    true
+}
+
+fn release_toast_id(mailbox: &Mailbox, notification_id: NativeNotificationId) {
+    if let Ok(mut state) = mailbox.state.lock() {
+        state.toast_ids.remove(&notification_id);
     }
 }
 

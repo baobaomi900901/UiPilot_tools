@@ -2,5 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    uipilot_lib::prepare_windows_identity();
     uipilot_lib::run();
 }

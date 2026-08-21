@@ -236,9 +236,7 @@ fn setup_production_lifecycle(
     let route_messages: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
     });
-    let toast: Arc<dyn message_center::MessageToast> = Arc::new(
-        message_center::WindowsNotificationAdapter::new(Arc::clone(&route_messages)),
-    );
+    let toast = native_attention::windows_toast();
     let tray_reminder: Arc<dyn message_center::MessageTray> =
         Arc::new(message_center::TauriTrayReminder::new(tray, icon));
     message_center
@@ -266,6 +264,11 @@ fn setup_production_lifecycle(
         .mark_setup_ready(app.handle())
         .map_err(|_| lifecycle_setup_error())?;
     Ok(())
+}
+
+pub fn prepare_windows_identity() {
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    native_attention::prepare_process_identity();
 }
 
 pub fn run() {
@@ -866,6 +869,27 @@ mod tests {
         assert!(production.contains("Some(lifecycle::TrayAction::Show(target))"));
         assert!(production.contains("tray_coordinator.request_show(app, target)"));
         assert!(production.contains("lifecycle::TRAY_OPEN_SETTINGS"));
+    }
+
+    #[test]
+    fn process_identity_is_prepared_before_tauri_builder() {
+        let main = include_str!("main.rs");
+        let prepare = main
+            .find("uipilot_lib::prepare_windows_identity()")
+            .expect("process identity preparation is missing");
+        let run = main
+            .find("uipilot_lib::run()")
+            .expect("application run call is missing");
+        assert!(prepare < run);
+
+        let library = include_str!("lib.rs");
+        let identity = library
+            .find("native_attention::prepare_process_identity()")
+            .expect("native identity call is missing");
+        let builder = library
+            .find("let builder = tauri::Builder::default();")
+            .expect("Tauri builder is missing");
+        assert!(identity < builder);
     }
 
     #[test]

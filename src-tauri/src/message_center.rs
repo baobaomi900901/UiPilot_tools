@@ -1,9 +1,7 @@
 mod store;
 mod tray_flash;
-mod windows_notification;
 
 pub(crate) use tray_flash::TauriTrayReminder;
-pub(crate) use windows_notification::WindowsNotificationAdapter;
 
 use std::{
     path::Path,
@@ -102,7 +100,17 @@ pub(crate) trait MessagePublisher: Send + Sync {
 pub(crate) struct NativeEffectError;
 
 pub(crate) trait MessageToast: Send + Sync {
+    fn initialize_worker(&self) -> Result<(), NativeEffectError> {
+        Ok(())
+    }
     fn show_message(&self, message: &MessagePublished) -> Result<(), NativeEffectError>;
+    fn install_callback_sink(
+        &self,
+        _sink: crate::native_attention::ToastCallbackSink,
+    ) -> Result<(), NativeEffectError> {
+        Ok(())
+    }
+    fn finish_notification(&self, _notification_id: u64) {}
     fn shutdown(&self);
 }
 
