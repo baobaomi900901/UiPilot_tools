@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-21
-- 状态：Draft，第一轮独立审核修订完成，等待复审
+- 状态：Draft，第二轮独立审核修订完成，等待复审
 - 范围：Windows Toast、托盘提醒、普通消息提示音、计时器持续闹铃
 - 公开 API：不变
 
@@ -105,19 +105,20 @@ Timer 持续闹铃具有最高声音优先级。只要待确认集合非空，�
 
 ### 4.1 统一协调器
 
-新增一个进程级 `NativeAttentionCoordinator`。它拥有唯一事件队列和工作线程，并通过窄端口调用：
+新增一个进程级 `NativeAttentionCoordinator`。它拥有唯一有界合并邮箱和工作线程，并通过窄端口调用：
 
 - `MessageToastPort`：Toast 身份、显示、点击、失败与清理；
 - `TrayAttentionPort`：正常图标与透明帧切换；
 - `AttentionAudioPort`：单次播放、循环播放和停止。
 
 消息中心在持久化成功并释放消息存储锁后构造唯一分类派发对象。Timer 完成消息无论最终是否取得可播放
-AudioTicket，都恰好构造一次 Timer 分类。主窗口的既有 `WindowEvent::Focused(bool)` 钩子向同一队列派发
+AudioTicket，都恰好构造一次 Timer 分类。主窗口的既有 `WindowEvent::Focused(bool)` 钩子向同一邮箱提交
 焦点事件。
 
-队列使用非阻塞发送的先进先出通道。普通消息原生效果最多允许 64 个待处理配额，超额时只丢弃该消息的
-Toast、托盘和一次声音。Timer 完成、`MainFocusChanged`、`TimerAudioCancelled` 和 `Shutdown` 是控制或
-持续声音事件，不受普通效果配额限制，也不得使用可能因容量而失败的 `try_send`。
+邮箱 admission 在一个短临界区内分配严格单调的内部 `attentionSequence`，并按第 4.4 节的固定槽位与合并
+规则保存事件。普通消息原生效果最多允许 64 个待处理配额，超额时只丢弃该消息的 Toast、托盘和一次声音。
+Timer、焦点、取消、Toast 回调和 Shutdown 不与普通消息争用这 64 个配额；它们使用各自有界槽位，达到
+边界时按第 4.4、8、9 节 fail-closed，绝不进入无界备用队列。
 
 不增加第二套焦点查询，也不由前端上报焦点。生产初始焦点固定为 `false`，之后只接受原生焦点事件。
 
@@ -140,7 +141,17 @@ enum NativeAttentionEvent {
     Published(PublishedAttention),
     TimerAudioCancelled(AudioTicket),
     MainFocusChanged(bool),
+    ToastCallback {
+        notification_id: NativeNotificationId,
+        kind: ToastCallbackKind,
+    },
     Shutdown,
+}
+
+enum ToastCallbackKind {
+    Activated,
+    Failed,
+    Dismissed,
 }
 ```
 
@@ -148,7 +159,7 @@ enum NativeAttentionEvent {
 不能播放声音。该消息仍可显示 Toast、更新徽标和触发托盘，但绝不退化成 `Ordinary` 或普通一次提示音。
 
 `PublishedAttention` 只存在于宿主内存，不进入持久化 DTO 或公开插件协议。成功保存的消息恰好构造一个该
-对象；一个统一 post-guard dispatcher 先发送前端 ready 事件，再发送 `Published` 原生事件。
+对象；一个统一 post-guard dispatcher 先发送前端 ready 事件，再向有界邮箱提交 `Published` 原生事件。
 
 ### 4.3 状态
 
@@ -175,6 +186,39 @@ audio: none | issued(AudioTicket) | admitted(AudioTicket) | confirmed(AudioTicke
 新 round 替换旧槽位；Reset 或生命周期取消清空槽位。协调器不保存取消墓碑，也不根据历史事件自行恢复
 票证。重复或迟到事件必须先匹配 TimerRecord 当前的 `issued` 状态，因而不会补响或随历史轮次增长内存。
 `confirmed` 表示该票证不会再启动声音，原因可以是主窗口焦点确认或原生播放终态失败；不等同于消息已读。
+协调器的 `activeTimerTickets` 同样硬限制为 64 张。集合已满时不执行 `issued -> admitted`，而是执行匹配的
+`issued -> confirmed` 并只保留该消息的 Toast/托盘效果，避免第 65 张活动票扩大常驻内存。
+
+audio 槽位是宿主原生副作用的权威状态，但不是公开 Timer 状态。`issued -> admitted -> confirmed`、清空
+audio 槽位以及派发 `TimerAudioCancelled` 都不得递增公开 `timerRevision`、发送 Timer 状态事件或改变
+`getState()` 投影。`issued` 在既有 `claiming -> fired` 权威转换中一并创建，并共享该次 `fired` revision；
+`AudioTicket.firedRevision` 此后保持不变。Reset、新 Start 等公开 Timer 转换仍各自只递增一次 revision，
+附带的 audio 取消不再额外递增。
+
+### 4.4 有界合并邮箱
+
+邮箱没有通用无界 FIFO，固定由以下存储组成：
+
+- `ordinaryPublished`：最多 64 条，保持 FIFO；满时丢弃新消息的原生效果，消息、徽标和前端事件不回滚；
+- `timerEffects`：最多 64 个 `TimerKey`；每个 key 最多一个待处理 `Published` 和一个待处理取消。旧 pending
+  `Published` 被同 key 新轮次替换时，必须先终结旧 `issued` AudioTicket；已 admitted 的旧票通过对应取消
+  槽位保留，不能被新 `Published` 覆盖；
+- `focusState`：保存最新原生焦点布尔值、最后一次 `Focused(true)` 的 sequence 高水位，以及最多一个待处理
+  焦点确认。后续 `Focused(false)` 只能更新最新状态，不能擦除尚未处理的焦点确认；
+- `toastCallbacks`：最多 64 个活动通知 ID，每个 ID 最多保留第一个终态回调；活动 Toast 句柄也最多 64 个；
+- `shutdown`：独立原子 terminal 标记与唤醒信号，不依赖任何数据槽位容量。
+
+Timer 第 65 个 key 无法 admission 时，本条 Timer 消息仍保持成功并更新徽标，但跳过全部原生效果；若携带
+`issued` 票证，必须在返回前调用 Timer 权威终止方法把它提交为不可迟到播放的终态。活动 Toast 已达 64
+时只跳过新 Toast，托盘和声音仍可继续。
+
+每个已保存条目携带 admission 时分配的 sequence，worker 总是选择最小 sequence。普通 `Published` 还捕获
+`focusedAtAdmission`；worker 在执行前同时检查该快照和 `lastFocusedTrueSequence` 高水位。消息 admission 时
+已经聚焦，或后来存在 sequence 更高的 `Focused(true)`，都必须抑制该消息的原生效果。这样快速的
+`true -> false` 不会让旧消息补响，而失焦后新 admission 的消息仍可正常提醒。
+
+邮箱唤醒、sequence 或固定槽位出现不可恢复的耗尽/不一致时，协调器进入本次进程 terminal：拒绝新原生
+效果、执行幂等 emergency-stop，并终结所有 `issued/admitted` audio 票证。计数器不得回绕；消息和徽标仍可用。
 
 ## 5. 事件顺序与线性化
 
@@ -195,11 +239,14 @@ audio: none | issued(AudioTicket) | admitted(AudioTicket) | confirmed(AudioTicke
 
 ### 5.2 焦点与消息竞态
 
-消息与 `MainFocusChanged` 共用一个先进先出事件队列。入队顺序是注意效果的线性化顺序：
+消息与 `MainFocusChanged` 共用一个有界邮箱 admission 临界区。`attentionSequence` 是注意效果的线性化顺序：
 
 - 焦点事件先处理：后到消息读取 `mainFocused = true`，不产生原生注意效果；
 - 消息先处理：允许开始原生效果；随后焦点事件会停止声音和托盘；
 - `MainFocusChanged(false)` 不会重新播放或重新闪烁已经确认的旧事件。
+
+焦点事件被合并时仍按第 4.4 节的焦点高水位规则产生与上述顺序等价的结果；不能因为只保存最新焦点布尔值
+而丢失中间发生过的 `Focused(true)` 确认。
 
 主窗口请求 `show()` 或 `focus()` 不算确认；只有随后实际收到的 `Focused(true)` 才确认。
 
@@ -226,6 +273,25 @@ Reset、禁用、故障停用、卸载和版本替换使用同一 Timer 状态�
 
 Timer 锁只跨越上述内存状态转换，不跨事件发送、Toast、托盘或 `PlaySoundW`。取消、焦点确认和重复事件均
 幂等。任何票证最多使共享循环从空集合启动一次，绝不保存第二条完成消息。
+
+所有可能删除或替换 `admitted(ticket)` 的 Timer 操作统一返回锁后效果，不允许只靠成功返回路径派发取消：
+
+```rust
+struct TimerOperation<T> {
+    result: Result<T, TimerError>,
+    post_lock_effects: Vec<TimerPostLockEffect>,
+}
+
+enum TimerPostLockEffect {
+    AudioCancelled(AudioTicket),
+}
+```
+
+Reset、`fired -> start(new round)`、禁用、故障停用、卸载、成功版本替换，以及 revision/round/audio identity
+耗尽导致的 `TimerUnavailable`，只要移除或替换的是 `admitted`，都必须恰好产生一个 `AudioCancelled`。调用方
+先释放 Timer/plugin mutation 锁，再派发全部 `post_lock_effects`，最后才向公开命令返回 `result`；因此即使
+结果是错误，也不能漏发取消。清除尚未 admission 的 `issued` 只需让后续 admission 失败；清除 `confirmed`
+不产生取消。取消事件发送失败按 terminal emergency-stop 处理，不能让协调器中的活动票继续循环。
 
 ## 6. Windows Toast 身份
 
@@ -278,9 +344,13 @@ Debug 快捷方式与 Release 快捷方式隔离。所有实际发布的安装�
 `CreateToastNotifierWithId(current_aumid)`；`ToastNotifier`、`ToastNotification` 和活动句柄只在该线程
 创建、显示、隐藏、移除处理器和释放。worker 退出时平衡 `RoUninitialize`。
 
-`Activated`、`Failed` 和 `Dismissed` 处理器可以由 WinRT 在回调线程执行，但回调只发送携带宿主管理通知
-ID 和固定事件类型的内部事件。回调线程不得持活动句柄锁调用生命周期、窗口或原生适配器。worker 收到
-Activated 后先清理对应 Toast，再请求固定 `ShowTarget::Messages`；Shutdown 后的迟到回调幂等吸收。
+`Activated`、`Failed` 和 `Dismissed` 处理器可以由 WinRT 在回调线程执行，但回调只向第 4.4 节的固定槽位
+提交 `ToastCallback { notification_id, kind }`。回调线程不得持活动句柄锁调用生命周期、窗口或原生适配器。
+每个活动通知只接受第一个终态回调；重复 ID、未知 ID 和 Shutdown 后的迟到回调直接忽略。
+
+worker 处理 `Activated` 时先移除处理器并清理对应 Toast，再请求固定 `ShowTarget::Messages`；窗口路由失败
+只记录诊断。`Failed` 记录稳定错误并清理，`Dismissed` 只清理；后二者不打开窗口，三者都不修改消息已读。
+回调 admission 只使用活动通知 ID，不接受插件数据或任意 launch 参数。
 
 worker 或回调不依赖任何调用线程已经初始化 COM/WinRT。STA 快捷方式线程、MTA Toast worker 和 Tauri
 线程之间不传递 apartment-bound COM 对象。
@@ -330,9 +400,10 @@ Timer 循环到达时可以替换正在播放的普通声音。Timer 待确认�
 - Timer worker、Reset 和生命周期路径必须先提交 Timer 内存转换并释放 Timer/plugin mutation 锁，再发送
   原生提醒事件。协调器调用 audio admission/confirm 时只获取 Timer 服务锁，Timer 服务在该锁内绝不反向
   调用协调器。
-- `NativeAttentionCoordinator` 的队列所有权必须在消息发布和 Timer worker 启动前建立。
-- 普通消息配额只限制新建原生效果；Focused、Timer 完成、Timer 取消、Toast 回调清理和 Shutdown 不受该
-  配额限制。控制事件不允许用满时丢弃的发送方式。
+- `NativeAttentionCoordinator` 的邮箱所有权必须在消息发布和 Timer worker 启动前建立。
+- 普通消息配额只限制新建原生效果；Focused、Timer 完成、Timer 取消、Toast 回调清理和 Shutdown 使用
+  第 4.4 节各自的有界控制槽位。控制槽位 admission 失败必须进入 terminal emergency-stop，不能静默丢弃、
+  阻塞调用线程或退化到无界通道。
 - 控制器或工作线程构造失败时安装本次进程固定 terminal 的 no-op 原生提醒端口；UiPilot 继续启动，消息和
   徽标仍可用。
 - worker 外层必须使用 `catch_unwind` 和拥有音频/托盘/Toast 端口的 `CleanupGuard`。正常 Shutdown、receiver
@@ -355,6 +426,8 @@ Timer 循环到达时可以替换正在播放的普通声音。Timer 待确认�
 | 单次声音失败 | 消息保持成功 | Toast、托盘、徽标继续 |
 | Timer 循环声音失败 | 消息与 `fired` 保持成功 | 票证仍按焦点/取消合同确认；不影响其他效果 |
 | 普通消息效果配额耗尽或发送失败 | 消息保持成功 | 只丢弃本条 Toast、托盘和一次声音，不重试 |
+| Timer key、Toast 句柄或控制槽位达到硬边界 | 消息与 Timer 权威状态保持 | 按第 4.4 节跳过对应效果；携票 Timer 必须终结票证，控制槽位异常则 terminal cleanup |
+| attention sequence 耗尽或邮箱不一致 | 消息与 Timer 业务结果保持 | 协调器进入 terminal，停止声音/托盘、清理 Toast、终结 issued/admitted 票证，不回绕 |
 | Timer 完成事件发送时 receiver 已断开 | 消息与 `fired` 保持成功 | 调用 Timer 权威终止方法吸收 `issued` 票证；不播放 |
 | Focused、取消或 Shutdown 发送时 receiver 已断开 | 消息/Timer 状态保持 | 协调器进入 terminal，调用幂等 emergency-stop，不允许静默丢弃 |
 | worker panic 或 receiver 断开 | 消息/Timer 状态保持 | CleanupGuard 停止声音、恢复托盘、清理 Toast 并终止 admitted 票证 |
@@ -387,8 +460,18 @@ Timer 循环到达时可以替换正在播放的普通声音。Timer 待确认�
 15. Debug/Release AUMID、快捷方式缺失创建、当前目标无 AUMID 的安全接管、已知旧 AUMID/旧目标修复、
     未知同名文件拒绝覆盖，以及安装/升级后的属性检查。
 16. Toast XML 纯文本、系统关闭、同步失败、异步失败和退出清理。
-17. 打包产物中的 WAV 必须解析为 RIFF/WAVE，大小和 SHA-256 与第 7.1 节一致，Tauri 资源路径可解析。
-18. 现有消息中心、Demo、Pomodoro、Timer 状态机和完整 Rust/前端回归继续通过。
+17. Toast `Activated/Failed/Dismissed` 使用固定 `ToastCallback` DTO；同 ID 第一个终态胜出，重复/未知/迟到
+    回调被吸收，Activated 只路由 Messages，Failed/Dismissed 不修改已读。
+18. 有界邮箱压力测试覆盖 ordinary=64、TimerKey=64、Toast=64、同 key 合并、满额新 key、sequence 耗尽和
+    Shutdown 独立唤醒；不存在无界备用队列。
+19. 焦点合并测试覆盖 `true -> false`、`false -> message -> true`、`true -> false -> message` 和 worker 阻塞
+    期间多次切换，确认中间 `Focused(true)` 不丢失且旧消息不补响。
+20. `fired -> start(new round)`、Reset、生命周期撤销、revision/round/audio identity 耗尽都验证 admitted 票证
+    产生锁后取消；即使公开操作返回 `TimerUnavailable` 也必须停止最后一票。
+21. audio `issued -> admitted -> confirmed`、播放失败、焦点确认和取消都保持同一 fired revision；Reset 或
+    新 Start 只因公开 Timer 转换递增一次，AudioTicket 的 firedRevision 不变。
+22. 打包产物中的 WAV 必须解析为 RIFF/WAVE，大小和 SHA-256 与第 7.1 节一致，Tauri 资源路径可解析。
+23. 现有消息中心、Demo、Pomodoro、Timer 状态机和完整 Rust/前端回归继续通过。
 
 自动化不得调用真实 Toast、改变真实前台焦点或播放真实声音。
 
@@ -422,16 +505,16 @@ Agent 必须在人工验收前通知用户并等待确认，绝不代替操作�
 4. 每个 TimerRecord 只保留一个有界 audio 状态；重复、旧轮次和已 confirmed 票证不补响，也不积累墓碑。
 5. 多张 Timer 票证只共享一条声音；取消最后一张或主窗口聚焦才停止。
 6. 主窗口聚焦确认注意效果但不标记消息已读；进入 Messages Tab 才清除徽标。
-7. 普通消息效果允许限额降级，但 Focused、Timer 完成、取消和 Shutdown 不因配额丢失；worker 失败有
-   fail-closed 清理路径。
+7. 普通消息和所有控制路径都有明确硬边界；Focused(true) 不被后续失焦合并掉，Timer 票证在满额、耗尽、
+   错误返回或 worker 失败时都有 fail-closed 终结路径，不存在无界备用队列。
 8. 系统通知、托盘或音频任一失败不回滚消息、未读或 `fired`，也不阻止其他效果。
 9. Debug/Release 在正确 COM/WinRT apartment 和 AUMID 下创建快捷方式/notifier；未知同名文件不被覆盖。
 10. 插件不能控制 Toast、音频、AUMID、托盘、焦点确认或注意优先级。
-11. 所有原生效果发生在消息提交和相关锁释放之后，事件顺序、票证 admission、控制事件失败和 shutdown
-    均有确定性测试。
+11. 所有原生效果发生在消息提交和相关锁释放之后；事件顺序、票证 admission/取消、audio revision 边界、
+    Toast 终态回调、控制槽位耗尽和 shutdown 均有确定性测试。
 
 ## 12. 结论
 
 本设计不扩充插件 API，而是修复和统一宿主原生提醒层。消息中心继续负责持久化与未读，Timer 服务继续负责
-权威计时和票证，新的协调器只负责进程内注意效果。统一事件队列让主窗口焦点、托盘和单一 Windows 声音
-通道具有明确顺序；独立 Toast 身份让普通权限 `dev` 与正式安装包使用各自稳定的 AUMID。
+权威计时和票证，新的协调器只负责进程内注意效果。有界合并邮箱让主窗口焦点、托盘和单一 Windows 声音
+通道具有明确顺序且不会无限积压；独立 Toast 身份让普通权限 `dev` 与正式安装包使用各自稳定的 AUMID。
