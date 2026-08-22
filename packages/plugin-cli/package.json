@@ -21,7 +21,6 @@
     "build": "node scripts/build.mjs",
     "verify": "npm run check && npm test && npm run build && node scripts/smoke.mjs"
   },
-  "dependencies": {},
   "devDependencies": {
     "@types/node": "24.10.1",
     "typescript": "7.0.2",
