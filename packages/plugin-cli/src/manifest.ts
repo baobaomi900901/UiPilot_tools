@@ -74,7 +74,7 @@ export interface ManifestValidationIssue {
 
 export type ManifestValidationResult =
   | { ok: true; manifest: PublicManifestV1; issues: [] }
-  | { ok: false; issues: ManifestValidationIssue[] }
+  | { ok: false; manifest?: PublicManifestV1; issues: ManifestValidationIssue[] }
 
 function plainText(value: string): boolean {
   return ![...value].some(
@@ -279,5 +279,5 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (manifest.permissions.some((permission) => !permissionAvailable(permission, platform))) {
     issues.push({ code: 'PERMISSION_UNSUPPORTED', message: `Plugin declares a permission unavailable on ${platform}.` })
   }
-  return issues.length > 0 ? { ok: false, issues } : { ok: true, manifest, issues: [] }
+  return issues.length > 0 ? { ok: false, manifest, issues } : { ok: true, manifest, issues: [] }
 }
