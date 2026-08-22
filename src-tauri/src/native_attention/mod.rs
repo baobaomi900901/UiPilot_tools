@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     message_center::{MessagePublished, MessageToast, NativeEffectError},
-    public_plugins::{AudioTicket, PluginTimerService, TimerError, TimerKey},
+    public_plugins::{AudioTicket, PluginTimerService, TimerAudioCompletion, TimerError, TimerKey},
 };
 
 use tray::TrayAnimation;
@@ -61,7 +61,9 @@ pub(crate) struct PublishedAttention {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AttentionOrigin {
     Ordinary,
-    TimerCompletion { audio_ticket: Option<AudioTicket> },
+    TimerCompletion {
+        audio: Option<Box<TimerAudioCompletion>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,10 +432,10 @@ impl NativeAttentionCoordinator {
 
     fn publish_timer(&self, attention: PublishedAttention) {
         let key = match &attention.origin {
-            AttentionOrigin::TimerCompletion {
-                audio_ticket: Some(ticket),
-            } => Some(ticket.key().clone()),
-            AttentionOrigin::TimerCompletion { audio_ticket: None } => None,
+            AttentionOrigin::TimerCompletion { audio: Some(audio) } => {
+                Some(audio.ticket.key().clone())
+            }
+            AttentionOrigin::TimerCompletion { audio: None } => None,
             AttentionOrigin::Ordinary => return,
         };
         let mut replaced_ticket = None;
@@ -778,9 +780,8 @@ fn process_published(
                 state.ordinary_playing = true;
             }
         }
-        AttentionOrigin::TimerCompletion {
-            audio_ticket: Some(ticket),
-        } => {
+        AttentionOrigin::TimerCompletion { audio: Some(audio) } => {
+            let ticket = audio.ticket;
             if state.active_timer_tickets.len() >= ACTIVE_TIMER_CAPACITY
                 || state
                     .active_timer_tickets
@@ -808,7 +809,7 @@ fn process_published(
                 }
             }
         }
-        AttentionOrigin::TimerCompletion { audio_ticket: None } => {}
+        AttentionOrigin::TimerCompletion { audio: None } => {}
     }
 }
 
@@ -846,7 +847,7 @@ fn release_toast_id(mailbox: &Mailbox, notification_id: NativeNotificationId) {
 
 fn timer_ticket(attention: &PublishedAttention) -> Option<&AudioTicket> {
     match &attention.origin {
-        AttentionOrigin::TimerCompletion { audio_ticket } => audio_ticket.as_ref(),
+        AttentionOrigin::TimerCompletion { audio } => audio.as_ref().map(|audio| &audio.ticket),
         AttentionOrigin::Ordinary => None,
     }
 }
@@ -855,6 +856,7 @@ fn timerless_key(attention: &PublishedAttention) -> TimerKey {
     TimerKey {
         plugin_id: attention.message.plugin_id.clone(),
         plugin_generation: attention.message.id.parse().unwrap_or(1),
+        activation_id: attention.message.id.parse().unwrap_or(1),
     }
 }
 
@@ -882,6 +884,7 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::*;
+    use crate::public_plugins::{AlarmAssetIdentity, ValidatedAlarmAsset};
 
     #[derive(Default)]
     struct Calls {
@@ -1085,7 +1088,7 @@ mod tests {
 
     fn ticket(plugin_id: &str, audio_id: u64) -> AudioTicket {
         AudioTicket {
-            key: TimerKey::new(plugin_id, 1).unwrap(),
+            key: TimerKey::new(plugin_id, 1, 1).unwrap(),
             round_id: 1,
             audio_id,
             fired_revision: audio_id,
@@ -1094,15 +1097,26 @@ mod tests {
 
     fn timer(id: &str, ticket: AudioTicket) -> PublishedAttention {
         let mut attention = ordinary(id);
+        let alarm = ValidatedAlarmAsset {
+            identity: AlarmAssetIdentity {
+                plugin_id: ticket.key().plugin_id.clone(),
+                plugin_generation: ticket.key().plugin_generation,
+                activation_id: ticket.key().activation_id,
+                package_digest: "package".into(),
+                resource_sha256: "resource".into(),
+                fixed_relative_path: "assets/sounds/timer-alarm.wav",
+            },
+            bytes: Arc::from([1_u8]),
+        };
         attention.origin = AttentionOrigin::TimerCompletion {
-            audio_ticket: Some(ticket),
+            audio: Some(Box::new(TimerAudioCompletion { ticket, alarm })),
         };
         attention
     }
 
     fn timer_without_audio(id: &str) -> PublishedAttention {
         let mut attention = ordinary(id);
-        attention.origin = AttentionOrigin::TimerCompletion { audio_ticket: None };
+        attention.origin = AttentionOrigin::TimerCompletion { audio: None };
         attention
     }
 

@@ -1162,15 +1162,21 @@ pub(crate) fn plugin_window_timer_get_state(
         .inner()
         .begin_timer_call(webview.label(), session_generation, false)?;
     let owner = lease.owner().clone();
-    let state = service
-        .manager()?
-        .window_timer_get_state(&owner.plugin_id, owner.plugin_generation)?;
+    let state = service.manager()?.window_timer_get_state(
+        &owner.plugin_id,
+        owner.plugin_generation,
+        owner.activation_id,
+    )?;
     drop(lease);
     plugin_window::publish_timer_state(
         &app,
         controller.inner().as_ref(),
-        &crate::public_plugins::TimerKey::new(&owner.plugin_id, owner.plugin_generation)
-            .ok_or(TimerError::TimerUnavailable)?,
+        &crate::public_plugins::TimerKey::new(
+            &owner.plugin_id,
+            owner.plugin_generation,
+            owner.activation_id,
+        )
+        .ok_or(TimerError::TimerUnavailable)?,
         &state,
     );
     Ok(state)
@@ -1192,7 +1198,12 @@ pub(crate) fn plugin_window_timer_start(
         service.inner(),
         &session_generation,
         |manager, owner| {
-            manager.window_timer_start(&owner.plugin_id, owner.plugin_generation, input)
+            manager.window_timer_start(
+                &owner.plugin_id,
+                owner.plugin_generation,
+                owner.activation_id,
+                input,
+            )
         },
     )
 }
@@ -1211,7 +1222,13 @@ pub(crate) fn plugin_window_timer_stop(
         controller.inner(),
         service.inner(),
         &session_generation,
-        |manager, owner| manager.window_timer_stop(&owner.plugin_id, owner.plugin_generation),
+        |manager, owner| {
+            manager.window_timer_stop(
+                &owner.plugin_id,
+                owner.plugin_generation,
+                owner.activation_id,
+            )
+        },
     )
 }
 
@@ -1229,7 +1246,13 @@ pub(crate) fn plugin_window_timer_reset(
         controller.inner(),
         service.inner(),
         &session_generation,
-        |manager, owner| manager.window_timer_reset(&owner.plugin_id, owner.plugin_generation),
+        |manager, owner| {
+            manager.window_timer_reset(
+                &owner.plugin_id,
+                owner.plugin_generation,
+                owner.activation_id,
+            )
+        },
     )
 }
 
@@ -1249,8 +1272,12 @@ fn plugin_window_timer_mutation(
     let owner = lease.owner().clone();
     let state = operation(service.manager()?.as_ref(), &owner)?;
     drop(lease);
-    let key = crate::public_plugins::TimerKey::new(&owner.plugin_id, owner.plugin_generation)
-        .ok_or(TimerError::TimerUnavailable)?;
+    let key = crate::public_plugins::TimerKey::new(
+        &owner.plugin_id,
+        owner.plugin_generation,
+        owner.activation_id,
+    )
+    .ok_or(TimerError::TimerUnavailable)?;
     plugin_window::publish_timer_state(app, controller.as_ref(), &key, &state);
     Ok(state)
 }
@@ -1399,6 +1426,7 @@ pub(crate) async fn search_apps(
                     submission_token,
                     plugin_id: route.plugin_id.clone(),
                     plugin_generation: route.generation,
+                    activation_id: route.activation_id,
                     request_id: response.request_id.clone(),
                     control_value: query.clone(),
                 };

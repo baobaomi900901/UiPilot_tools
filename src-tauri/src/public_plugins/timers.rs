@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::alarm_asset::ValidatedAlarmAsset;
+
 const MIN_DURATION_MS: u64 = 1_000;
 const MAX_DURATION_MS: u64 = 86_400_000;
 const SLEEP_RECHECK_MS: u64 = 100;
@@ -48,14 +50,17 @@ impl Clock for SystemClock {
 pub(crate) struct TimerKey {
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
+    pub(crate) activation_id: u64,
 }
 
 impl TimerKey {
-    pub(crate) fn new(plugin_id: &str, plugin_generation: u64) -> Option<Self> {
-        (plugin_generation > 0 && super::manifest::valid_plugin_id(plugin_id)).then(|| Self {
-            plugin_id: plugin_id.to_owned(),
-            plugin_generation,
-        })
+    pub(crate) fn new(plugin_id: &str, plugin_generation: u64, activation_id: u64) -> Option<Self> {
+        (plugin_generation > 0 && activation_id > 0 && super::manifest::valid_plugin_id(plugin_id))
+            .then(|| Self {
+                plugin_id: plugin_id.to_owned(),
+                plugin_generation,
+                activation_id,
+            })
     }
 }
 
@@ -118,6 +123,7 @@ pub(crate) struct FrozenCompletion {
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
     pub(crate) duration_ms: u64,
+    pub(crate) alarm: ValidatedAlarmAsset,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,7 +174,13 @@ pub(crate) struct TimerOperation<T> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimCompletion {
     pub(crate) state: PluginTimerState,
-    pub(crate) audio_ticket: Option<AudioTicket>,
+    pub(crate) audio: Option<TimerAudioCompletion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TimerAudioCompletion {
+    pub(crate) ticket: AudioTicket,
+    pub(crate) alarm: ValidatedAlarmAsset,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,6 +331,7 @@ impl PluginTimerService {
         plugin_name_snapshot: &str,
         input: Option<PluginTimerStartInput>,
         message_store_available: bool,
+        alarm: &ValidatedAlarmAsset,
     ) -> TimerOperation<TimerMutation> {
         let mut post_lock_effects = Vec::new();
         let result = self.start_result(
@@ -326,6 +339,7 @@ impl PluginTimerService {
             plugin_name_snapshot,
             input,
             message_store_available,
+            alarm,
             &mut post_lock_effects,
         );
         TimerOperation {
@@ -340,6 +354,7 @@ impl PluginTimerService {
         plugin_name_snapshot: &str,
         input: Option<PluginTimerStartInput>,
         message_store_available: bool,
+        alarm: &ValidatedAlarmAsset,
         post_lock_effects: &mut Vec<TimerPostLockEffect>,
     ) -> Result<TimerMutation, TimerError> {
         let now = self.clock.now_ms();
@@ -356,6 +371,12 @@ impl PluginTimerService {
                 validate_input(&input)?;
                 if !message_store_available {
                     return Err(TimerError::MessageStoreUnavailable);
+                }
+                if alarm.identity.plugin_id != key.plugin_id
+                    || alarm.identity.plugin_generation != key.plugin_generation
+                    || alarm.identity.activation_id != key.activation_id
+                {
+                    return Err(TimerError::TimerUnavailable);
                 }
                 remove_queued(&mut state, key);
                 let (queue_item, result) = {
@@ -380,6 +401,7 @@ impl PluginTimerService {
                         plugin_id: key.plugin_id.clone(),
                         plugin_generation: key.plugin_generation,
                         duration_ms: input.duration_ms,
+                        alarm: alarm.clone(),
                     });
                     (
                         QueueItem {
@@ -581,7 +603,10 @@ impl PluginTimerService {
             record.audio = Some(TimerAudioState::Issued(audio_ticket.clone()));
             Ok(Some(ClaimCompletion {
                 state: project(record, now),
-                audio_ticket: Some(audio_ticket),
+                audio: Some(TimerAudioCompletion {
+                    ticket: audio_ticket,
+                    alarm: ticket.frozen_completion.alarm.clone(),
+                }),
             }))
         } else {
             advance_revision(record)?;
@@ -590,7 +615,7 @@ impl PluginTimerService {
             record.due_at_ms = None;
             Ok(Some(ClaimCompletion {
                 state: project(record, now),
-                audio_ticket: None,
+                audio: None,
             }))
         }
     }
@@ -951,6 +976,7 @@ mod tests {
         time::Duration,
     };
 
+    use super::super::alarm_asset::{AlarmAssetIdentity, ValidatedAlarmAsset};
     use super::{
         Clock, PluginTimerPhase, PluginTimerService, PluginTimerStartInput, TimerError, TimerKey,
         TimerOperation, TimerPostLockEffect,
@@ -974,8 +1000,22 @@ mod tests {
     fn fixture() -> (Arc<PluginTimerService>, Arc<TestClock>, TimerKey) {
         let clock = Arc::new(TestClock::default());
         let service = Arc::new(PluginTimerService::new(clock.clone()));
-        let key = TimerKey::new("com.example.timer", 7).unwrap();
+        let key = TimerKey::new("com.example.timer", 7, 19).unwrap();
         (service, clock, key)
+    }
+
+    fn alarm(key: &TimerKey, marker: u8) -> ValidatedAlarmAsset {
+        ValidatedAlarmAsset {
+            identity: AlarmAssetIdentity {
+                plugin_id: key.plugin_id.clone(),
+                plugin_generation: key.plugin_generation,
+                activation_id: key.activation_id,
+                package_digest: format!("package-{marker}"),
+                resource_sha256: format!("resource-{marker}"),
+                fixed_relative_path: super::super::alarm_asset::ALARM_PATH,
+            },
+            bytes: Arc::from([marker]),
+        }
     }
 
     fn input(duration_ms: u64) -> PluginTimerStartInput {
@@ -1001,7 +1041,7 @@ mod tests {
         key: &TimerKey,
     ) -> super::AudioTicket {
         service
-            .start(key, "Timer", Some(input(1_000)), true)
+            .start(key, "Timer", Some(input(1_000)), true, &alarm(key, 1))
             .unwrap();
         clock.advance(1_000);
         let claim = service.claim_next_due().unwrap().unwrap();
@@ -1010,8 +1050,35 @@ mod tests {
             .complete_claim(&claim, true)
             .unwrap()
             .unwrap()
-            .audio_ticket
+            .audio
             .unwrap()
+            .ticket
+    }
+
+    #[test]
+    fn reinstalled_same_generation_has_a_distinct_timer_authority() {
+        let first = TimerKey::new("com.example.timer", 1, 41).unwrap();
+        let reinstalled = TimerKey::new("com.example.timer", 1, 42).unwrap();
+
+        assert_ne!(first, reinstalled);
+    }
+
+    #[test]
+    fn fired_completion_keeps_the_alarm_frozen_when_the_round_started() {
+        let (service, clock, key) = fixture();
+        let old_alarm = alarm(&key, 7);
+        service
+            .start(&key, "Timer", Some(input(1_000)), true, &old_alarm)
+            .unwrap();
+        clock.advance(1_000);
+        let claim = service.claim_next_due().unwrap().unwrap();
+        assert!(service.admit_claim(&claim).unwrap());
+
+        let completion = service.complete_claim(&claim, true).unwrap().unwrap();
+        let audio = completion.audio.expect("fired round should issue audio");
+
+        assert_eq!(audio.alarm.identity, old_alarm.identity);
+        assert!(Arc::ptr_eq(&audio.alarm.bytes, &old_alarm.bytes));
     }
 
     #[test]
@@ -1065,7 +1132,7 @@ mod tests {
             .unwrap()
             .round_id = u64::MAX;
 
-        let operation = service.start(&key, "Timer", Some(input(1_000)), true);
+        let operation = service.start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1));
 
         assert_eq!(operation.result, Err(TimerError::TimerUnavailable));
         assert_eq!(
@@ -1079,7 +1146,7 @@ mod tests {
         let (service, clock, first_key) = fixture();
         let first = complete_fired_round(&service, &clock, &first_key);
         assert!(service.admit_audio_start(&first).unwrap());
-        let second_key = TimerKey::new("com.example.second", 1).unwrap();
+        let second_key = TimerKey::new("com.example.second", 1, 1).unwrap();
         let second = complete_fired_round(&service, &clock, &second_key);
         let first_revision = service.get_state(&first_key).unwrap().timer_revision;
         let second_revision = service.get_state(&second_key).unwrap().timer_revision;
@@ -1105,7 +1172,7 @@ mod tests {
         let (service, clock, first_key) = fixture();
         let first = complete_fired_round(&service, &clock, &first_key);
         assert!(service.admit_audio_start(&first).unwrap());
-        let second_key = TimerKey::new("com.example.second", 1).unwrap();
+        let second_key = TimerKey::new("com.example.second", 1, 1).unwrap();
         let second = complete_fired_round(&service, &clock, &second_key);
 
         service.terminate_all_audio().unwrap();
@@ -1139,11 +1206,13 @@ mod tests {
         assert_eq!(initial.timer_revision, "0");
 
         assert_eq!(
-            service.start(&key, "Timer", None, true).result,
+            service
+                .start(&key, "Timer", None, true, &alarm(&key, 1))
+                .result,
             Err(TimerError::TimerInputRequired)
         );
         let running = service
-            .start(&key, "Timer", Some(input(10_000)), true)
+            .start(&key, "Timer", Some(input(10_000)), true, &alarm(&key, 1))
             .unwrap();
         assert_eq!(running.state.phase, PluginTimerPhase::Running);
         assert_eq!(running.state.remaining_ms, Some(10_000));
@@ -1157,7 +1226,9 @@ mod tests {
         clock.advance(20_000);
         assert!(service.claim_next_due().unwrap().is_none());
 
-        let resumed = service.start(&key, "ignored", None, true).unwrap();
+        let resumed = service
+            .start(&key, "ignored", None, true, &alarm(&key, 2))
+            .unwrap();
         assert_eq!(resumed.state.phase, PluginTimerPhase::Running);
         assert_eq!(resumed.state.timer_revision, "3");
         clock.advance(7_500);
@@ -1167,7 +1238,7 @@ mod tests {
         let fired = service.complete_claim(&ticket, true).unwrap().unwrap();
         assert_eq!(fired.state.phase, PluginTimerPhase::Fired);
         assert_eq!(fired.state.timer_revision, "5");
-        assert!(fired.audio_ticket.is_some());
+        assert!(fired.audio.is_some());
 
         let reset_operation = service.reset(&key);
         assert!(reset_operation.post_lock_effects.is_empty());
@@ -1178,7 +1249,9 @@ mod tests {
             (Some(10_000), Some(10_000))
         );
         assert_eq!(
-            service.start(&key, "Timer", None, true).result,
+            service
+                .start(&key, "Timer", None, true, &alarm(&key, 1))
+                .result,
             Err(TimerError::TimerInputRequired)
         );
     }
@@ -1187,7 +1260,7 @@ mod tests {
     fn stop_and_claim_share_one_linearization_order() {
         let (service, clock, key) = fixture();
         service
-            .start(&key, "Timer", Some(input(1_000)), true)
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
             .unwrap();
         clock.advance(1_000);
         let paused = service.stop(&key).unwrap();
@@ -1196,7 +1269,7 @@ mod tests {
 
         service.reset(&key).unwrap();
         service
-            .start(&key, "Timer", Some(input(1_000)), true)
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
             .unwrap();
         clock.advance(1_000);
         let ticket = service.claim_next_due().unwrap().unwrap();
@@ -1219,7 +1292,7 @@ mod tests {
     fn reset_and_new_round_reject_stale_claim_and_audio_tickets() {
         let (service, clock, key) = fixture();
         service
-            .start(&key, "Timer", Some(input(1_000)), true)
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
             .unwrap();
         clock.advance(1_000);
         let old_claim = service.claim_next_due().unwrap().unwrap();
@@ -1228,7 +1301,7 @@ mod tests {
         assert!(service.complete_claim(&old_claim, true).unwrap().is_none());
 
         service
-            .start(&key, "Timer", Some(input(1_000)), true)
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 2))
             .unwrap();
         clock.advance(1_000);
         let claim = service.claim_next_due().unwrap().unwrap();
@@ -1237,10 +1310,11 @@ mod tests {
             .complete_claim(&claim, true)
             .unwrap()
             .unwrap()
-            .audio_ticket
-            .unwrap();
+            .audio
+            .unwrap()
+            .ticket;
         assert!(service.admit_audio_start(&audio).unwrap());
-        let next = service.start(&key, "Timer", Some(input(2_000)), true);
+        let next = service.start(&key, "Timer", Some(input(2_000)), true, &alarm(&key, 3));
         assert_eq!(
             next.post_lock_effects,
             [TimerPostLockEffect::AudioCancelled(audio.clone())]
@@ -1275,13 +1349,15 @@ mod tests {
             },
         ] {
             assert_eq!(
-                service.start(&key, "Timer", Some(candidate), true).result,
+                service
+                    .start(&key, "Timer", Some(candidate), true, &alarm(&key, 1))
+                    .result,
                 Err(TimerError::InvalidTimerInput)
             );
         }
         assert_eq!(
             service
-                .start(&key, "Timer", Some(input(1_000)), false)
+                .start(&key, "Timer", Some(input(1_000)), false, &alarm(&key, 1),)
                 .result,
             Err(TimerError::MessageStoreUnavailable)
         );
@@ -1292,7 +1368,7 @@ mod tests {
     fn disallowed_input_takes_precedence_over_input_content_validation() {
         let (service, _, key) = fixture();
         service
-            .start(&key, "Timer", Some(input(10_000)), true)
+            .start(&key, "Timer", Some(input(10_000)), true, &alarm(&key, 1))
             .unwrap();
         assert_eq!(
             service
@@ -1304,6 +1380,7 @@ mod tests {
                         completion_message: String::new(),
                     }),
                     true,
+                    &alarm(&key, 1),
                 )
                 .result,
             Err(TimerError::TimerInputNotAllowed)
@@ -1319,6 +1396,7 @@ mod tests {
                         completion_message: String::new(),
                     }),
                     true,
+                    &alarm(&key, 1),
                 )
                 .result,
             Err(TimerError::TimerInputNotAllowed)
@@ -1329,7 +1407,7 @@ mod tests {
     fn message_failure_returns_idle_and_shutdown_is_terminal() {
         let (service, clock, key) = fixture();
         service
-            .start(&key, "Timer", Some(input(1_000)), true)
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
             .unwrap();
         clock.advance(1_000);
         let ticket = service.claim_next_due().unwrap().unwrap();
@@ -1340,13 +1418,13 @@ mod tests {
             (failed.state.duration_ms, failed.state.remaining_ms),
             (Some(1_000), Some(1_000))
         );
-        assert!(failed.audio_ticket.is_none());
+        assert!(failed.audio.is_none());
 
         service.shutdown().unwrap();
         assert_eq!(service.get_state(&key), Err(TimerError::TimerUnavailable));
         assert_eq!(
             service
-                .start(&key, "Timer", Some(input(1_000)), true)
+                .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1),)
                 .result,
             Err(TimerError::TimerUnavailable)
         );
@@ -1362,7 +1440,7 @@ mod tests {
             }))
             .unwrap();
         service
-            .start(&key, "Timer", Some(input(1_000)), true)
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
             .unwrap();
         clock.advance(1_000);
         service.wake.notify_all();
@@ -1381,7 +1459,7 @@ mod tests {
     fn revision_exhaustion_is_failure_closed_for_only_that_timer() {
         let (service, _, key) = fixture();
         service
-            .start(&key, "Timer", Some(input(10_000)), true)
+            .start(&key, "Timer", Some(input(10_000)), true, &alarm(&key, 1))
             .unwrap();
         service
             .state
@@ -1395,7 +1473,51 @@ mod tests {
         assert_eq!(service.stop(&key).result, Err(TimerError::TimerUnavailable));
         assert_eq!(service.get_state(&key), Err(TimerError::TimerUnavailable));
 
-        let other = TimerKey::new("com.example.other", 1).unwrap();
+        let other = TimerKey::new("com.example.other", 1, 1).unwrap();
         assert_eq!(service.get_state(&other).unwrap().timer_revision, "0");
+    }
+
+    #[test]
+    fn claim_and_audio_identifiers_never_wrap() {
+        let (service, clock, key) = fixture();
+        service
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
+            .unwrap();
+        service
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&key)
+            .unwrap()
+            .claim_id = u64::MAX;
+        clock.advance(1_000);
+        assert_eq!(service.claim_next_due(), Err(TimerError::TimerUnavailable));
+
+        let (service, clock, key) = fixture();
+        service
+            .start(&key, "Timer", Some(input(1_000)), true, &alarm(&key, 1))
+            .unwrap();
+        clock.advance(1_000);
+        let claim = service.claim_next_due().unwrap().unwrap();
+        assert!(service.admit_claim(&claim).unwrap());
+        service
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&key)
+            .unwrap()
+            .audio_id = u64::MAX;
+        assert_eq!(
+            service.complete_claim(&claim, true),
+            Err(TimerError::TimerUnavailable)
+        );
+    }
+
+    #[test]
+    fn timer_identity_rejects_zero_components() {
+        assert!(TimerKey::new("com.example.timer", 0, 1).is_none());
+        assert!(TimerKey::new("com.example.timer", 1, 0).is_none());
     }
 }

@@ -114,7 +114,7 @@ mod tests {
 
     fn ticket() -> AudioTicket {
         AudioTicket {
-            key: TimerKey::new("com.example.audio", 1).unwrap(),
+            key: TimerKey::new("com.example.audio", 1, 1).unwrap(),
             round_id: 1,
             audio_id: 1,
             fired_revision: 1,

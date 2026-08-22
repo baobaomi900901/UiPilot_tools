@@ -36,6 +36,7 @@ pub(crate) struct PluginWindowOwner {
     pub(crate) submission_token: String,
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
+    pub(crate) activation_id: u64,
     pub(crate) request_id: String,
     pub(crate) control_value: String,
 }
@@ -173,6 +174,7 @@ impl PluginWindowController {
         let core = self.core.lock().ok()?;
         let window = core.windows.get(&key.plugin_id)?;
         (window.owner.plugin_generation == key.plugin_generation
+            && window.owner.activation_id == key.activation_id
             && window.phase == PluginWindowPhase::Visible
             && window.timer_session.phase == TimerSessionPhase::Active)
             .then(|| {
@@ -1257,10 +1259,17 @@ pub(crate) fn commit(
         return Err(PublicPluginManagementError::Unavailable);
     }
     if let Ok(manager) = app.state::<Arc<PublicPluginService>>().manager() {
-        if let Ok(state) = manager.window_timer_get_state(&owner.plugin_id, owner.plugin_generation)
-        {
-            let key = TimerKey::new(&owner.plugin_id, owner.plugin_generation)
-                .ok_or(PublicPluginManagementError::Unavailable)?;
+        if let Ok(state) = manager.window_timer_get_state(
+            &owner.plugin_id,
+            owner.plugin_generation,
+            owner.activation_id,
+        ) {
+            let key = TimerKey::new(
+                &owner.plugin_id,
+                owner.plugin_generation,
+                owner.activation_id,
+            )
+            .ok_or(PublicPluginManagementError::Unavailable)?;
             publish_timer_state(app, controller, &key, &state);
         }
     }
@@ -1399,6 +1408,7 @@ mod tests {
             submission_token: token.into(),
             plugin_id: "com.example.demo".into(),
             plugin_generation: generation,
+            activation_id: generation,
             request_id: request.into(),
             control_value: format!("/demo {token}"),
         }
@@ -1478,6 +1488,15 @@ mod tests {
             assert!(controller.advance(&first, expected, next));
         }
         assert!(controller.activate_timer_session(&first));
+        let stale_reinstall_key = TimerKey::new(
+            &first.plugin_id,
+            first.plugin_generation,
+            first.activation_id + 1,
+        )
+        .unwrap();
+        assert!(controller
+            .active_timer_session(&stale_reinstall_key)
+            .is_none());
         drop(
             controller
                 .begin_timer_call(

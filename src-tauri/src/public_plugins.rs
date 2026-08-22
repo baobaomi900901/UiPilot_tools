@@ -42,6 +42,8 @@ pub(crate) use activation::{
     PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginRoute,
     PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse,
 };
+#[cfg(test)]
+pub(crate) use alarm_asset::AlarmAssetIdentity;
 pub(crate) use alarm_asset::{PreparedAlarmAsset, ValidatedAlarmAsset};
 pub(crate) use manifest::{
     public_manifest_v1_schema, PublicActivationMode, PublicManifestV1, PublicOutputMode,
@@ -63,7 +65,8 @@ pub(crate) use state::{
 };
 pub(crate) use storage::PluginStorageStore;
 pub(crate) use timers::{
-    AudioTicket, PluginTimerService, PluginTimerStartInput, PluginTimerState, TimerError, TimerKey,
+    AudioTicket, PluginTimerService, PluginTimerStartInput, PluginTimerState, TimerAudioCompletion,
+    TimerError, TimerKey,
 };
 pub(crate) use webview_audio_guard::{
     inert_url, prepare_windows_webview, verify_windows_webview_muted, WebViewGuardAuthority,

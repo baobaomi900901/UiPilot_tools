@@ -13,7 +13,7 @@ use crate::{
         AttentionAudioPort, AttentionOrigin, AttentionRoutePort, NativeAttentionCoordinator,
         PublishedAttention, TrayAttentionPort,
     },
-    public_plugins::{AudioTicket, PluginTimerService},
+    public_plugins::{AudioTicket, PluginTimerService, TimerAudioCompletion},
 };
 
 use store::{MessageStore, MessageStoreError, PublishInput};
@@ -205,7 +205,7 @@ impl MessageCenterService {
         &self,
         app: &AppHandle,
         effect: Option<MessagePostGuardEffect>,
-        audio_ticket: Option<AudioTicket>,
+        audio: Option<TimerAudioCompletion>,
     ) {
         let published = match effect.as_ref() {
             Some(MessagePostGuardEffect::Published(message)) => Some(message.clone()),
@@ -213,7 +213,12 @@ impl MessageCenterService {
         };
         self.dispatch_post_guard_event(app, effect.as_ref());
         if let Some(message) = published {
-            self.dispatch_published(message, AttentionOrigin::TimerCompletion { audio_ticket });
+            self.dispatch_published(
+                message,
+                AttentionOrigin::TimerCompletion {
+                    audio: audio.map(Box::new),
+                },
+            );
         }
     }
 
