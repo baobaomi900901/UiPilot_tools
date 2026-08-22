@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第一轮独立审核修订完成，等待复审
+- 状态：Draft，第二轮独立审核修订完成，等待复审
 - 范围：公开插件窗口私有存储 API、Pomodoro 计时长度选择、持久化与下一轮计时语义
 - 公开 JavaScript API：扩展 `UiPilotPluginWindowApiV1`
 - Manifest 字段：不变
@@ -52,9 +52,10 @@ Pomodoro 内容区右上角显示一个下拉选择器，固定选项及值为�
 首次使用、键不存在或持久值非法时显示 10 分钟。读取期间选择器显示 10 分钟并禁用。读取成功后显示保存
 值；读取失败时保留 10 分钟、恢复可操作状态，并显示“无法读取计时长度”。
 
-选择新值时立即开始原子保存，并在完成前禁用选择器。成功后该值成为下一轮时长；失败时恢复上一个已保存
-值并显示“无法保存计时长度”。当前 `running` 或 `paused` 轮次不被重置、不改变剩余时间。暂停后的“继续”
-恢复同一轮；从 `idle` 或 `fired` 点击“开始/重新开始”时才把最新保存值传给 `timer.start()`。
+选择新值时立即开始原子保存，并在完成前禁用选择器以及 `idle` 的“开始”/`fired` 的“重新开始”。成功后该值
+成为下一轮时长；失败时恢复上一个已保存值或默认 10，并显示“无法保存计时长度”。当前 `running` 或 `paused`
+轮次不被重置、不改变剩余时间；暂停后的“继续”在保存期间仍可用并恢复同一轮。从 `idle` 或 `fired` 点击
+“开始/重新开始”时才把当前 effective 值传给 `timer.start()`。
 
 窗口恢复时，如果宿主已有运行轮次，倒计时显示当前轮剩余时间，选择器显示下一轮保存时长。打开、选择、
 保存或失败不得改变 `timerRevision`。
@@ -98,7 +99,10 @@ document 按既有无效文档隔离规则处理；本预发布版本不增加�
 - 空、非规范、溢出、非当前或阶段不允许的 session：`ExpiredWindowSessionError`；
 - 非法 key 或 JSON value：`InvalidOperation`；
 - 配额、序列化、磁盘或原子提交失败：`StorageError`；
-- lease 成功后出现不可能的后端 plugin scope/ActivationBundle 身份不一致：`InvalidContext`，零存储访问。
+- 合法调用在 Window lease 后因 generation、activationId、admission epoch 或 ActivationBundle 已被生命周期替换：
+  `ExpiredWindowSessionError`，零存储访问；
+- `InvalidContext` 只用于后端不变量损坏或合法调用不可能产生的伪造 plugin scope/ActivationBundle 身份，
+  零存储访问。
 
 Runtime storage 同步采用 `InvalidOperation` 与 `StorageError` 的相同分类，不再把所有 `PluginStorageError` 无差别
 映射为 `StorageError`。错误消息不包含插件数据、key、路径、generation、activationId 或 session generation。
@@ -147,9 +151,16 @@ PluginDataCallLease，前者约束窗口 session，后者建立卸载排空边�
    `PluginStorageStore`；
 5. 返回固定成功值或稳定错误，最后释放 data lease 与 Window call lease。
 
-存储 I/O 不取得 Timer 锁，不发布 Timer 状态事件，也不修改 inventory revision。Window call lease 成功签发是
-该调用的授权线性化点：进入 Closing 后不签发新 lease；此前签发的调用可以完成，关闭方必须等待其释放。前端仍
-必须用会话 epoch 丢弃迟到 UI 完成。
+存储 I/O 不取得 Timer 锁，不发布 Timer 状态事件，也不修改 inventory revision。两个 lease 的线性化含义不得
+混淆：
+
+- Window call lease 只线性化窗口 session/phase 准入；普通 hide/close 进入 Closing 后不再签发，并等待已签发
+  Window lease 释放；
+- 当前 ActivationBundle 复核与 `PluginDataCallLease` 的原子签发才是存储访问的最终授权线性化点；
+- 卸载可以拒绝只持有 Window lease、尚未取得 data lease 的调用；data lease 一旦签发，卸载必须等待其完整
+  存储 I/O 完成。
+
+前端仍必须用会话 epoch 丢弃迟到 UI 完成。
 
 ### 6.1 完全卸载顺序
 
@@ -161,15 +172,22 @@ PluginDataCallLease，前者约束窗口 session，后者建立卸载排空边�
    并等待同一 in-flight 计数归零；等待期间不持有 manager、storage 或 Timer 锁；
 3. 等待 `PluginDataCallGate` 的既有 Runtime/Window data lease 归零；等待期间同样不持有 manager、Window
    controller 或 storage 锁；已取得 Window call lease 但尚未取得 data lease 的调用会被关闭的 gate 拒绝；
-4. 卸载事务重新取得 mutation gate 并验证仍为当前 owner，失效旧 generation/ActivationBundle；
-5. 只有上述两个 drain 都完成后才调用 `PluginStorageStore::uninstall(pluginId, false)` 删除内存记录和目录；
-6. 最后销毁 Runtime 与插件窗口，删除窗口位置并提交卸载结果。
+4. 卸载事务重新取得 mutation gate 并验证仍为当前 owner；持久化提交“已卸载 + data cleanup pending”
+   tombstone，发布无 ActivationBundle 状态，然后释放 mutation gate；该提交是不可回滚的卸载线性化点；
+5. 销毁 Runtime 与插件窗口并删除窗口位置；旧 generation/ActivationBundle、facade、request 和 lease 永久失效；
+6. 调用 `PluginStorageStore::uninstall(pluginId, false)` 删除内存记录和目录；只有删除全部成功并持久化移除
+   tombstone 后，命令才报告彻底卸载完成。
 
-选择保留数据时仍执行准入关闭和两个 drain，但跳过 storage 删除。若 drain 或卸载提交失败，事务关闭状态不得
-留下一扇可继续调用的旧窗口或 Runtime：销毁当前实例，并只为重新验证后的当前 ActivationBundle 以新 admission
-epoch 恢复准入；插件记录保持已安装，用户下次调用时建立新 Runtime/window session。旧 facade、旧 request 和旧
-lease 不能进入新 epoch。任何路径都不得同时持有 plugin mutation gate、Window controller mutex、data gate mutex
-或 storage mutex 等待另一个锁。
+选择保留数据时仍执行准入关闭和两个 drain，但卸载提交不写 cleanup tombstone，并跳过 storage 删除。若 drain
+或持久卸载提交在线性化点前失败，事务关闭状态不得留下一扇可继续调用的旧窗口或 Runtime：销毁当前实例，并只为
+重新验证后的当前 ActivationBundle 以新 admission epoch 恢复准入；插件记录保持已安装，用户下次调用时建立新
+Runtime/window session。旧 facade、旧 request 和旧 lease 不能进入新 epoch。
+
+若完全卸载已提交而 storage 删除或 tombstone 清除失败，不得恢复旧插件；命令返回稳定的
+`DataCleanupPending`，UI 表示“插件已卸载，数据清理将在下次启动时重试”。启动时必须先重试 tombstone 清理；
+同一 `pluginId` 的安装、更新和激活在 tombstone 清除前被拒绝。重复清理必须幂等，目录不存在视为删除成功，且
+不得加载残留数据。任何路径都不得同时持有 plugin mutation gate、Window controller mutex、data gate mutex 或
+storage mutex 等待另一个锁。
 
 ## 7. Pomodoro 窗口状态
 
@@ -193,6 +211,9 @@ running、paused 和 fired 的 `durationMs/remainingMs` 始终来自宿主 Timer
 是 effective 下一轮值。新一轮从 idle 或 fired 启动时，把 `effectiveDurationMinutes * 60000` 与当前完成消息
 一起传给 `timer.start()`。继续 paused 轮次仍调用无参数 `timer.start()`。
 
+`pendingDurationMinutes` 非空时禁用 idle 的“开始”和 fired 的“重新开始”，直到保存成功或失败完成，避免用旧
+effective 值启动新一轮；paused 的“继续”保持可用，因为它恢复当前轮且不读取下一轮时长。
+
 ## 8. 失败行为
 
 - `get` 存储失败：effective 保持 10、persisted 为 `null`，显示读取错误；用户仍可选择，后续 `set` 独立尝试。
@@ -203,6 +224,7 @@ running、paused 和 fired 的 `durationMs/remainingMs` 始终来自宿主 Timer
 - 配额、序列化或原子文件失败：返回既有存储错误，旧值保持不变，不停用插件。
 - 已提交写入后的迟到 UI 完成：数据继续有效，但旧 epoch 不得更新新窗口 UI。
 - 完全卸载与已签发写 lease 竞态：卸载等待写入完成后再删除，最终目录与内存记录均不存在。
+- 完全卸载提交后的清理失败：插件保持已卸载，返回 `DataCleanupPending`；启动重试成功前同 ID 不能安装或激活。
 
 任何存储失败都不停止、重置、完成或取消 Timer，也不影响消息、Toast、托盘和闹铃。
 
@@ -216,8 +238,9 @@ running、paused 和 fired 的 `durationMs/remainingMs` 始终来自宿主 Timer
 - 窗口与 Runtime 读取同一插件存储；不同插件相同 key 互不影响。
 - 升级后值保留；保留数据卸载再安装后值恢复；彻底卸载后为空。
 - 分别暂停已签发的 Window write 与 Runtime write，再并发彻底卸载；两组测试都证明卸载等待 data lease 后
-  删除，旧调用不能重建目录；已取得 Window lease 但未取得 data lease 的调用被拒绝；卸载 drain/commit 失败
-  销毁旧实例并以新 admission epoch 允许以后建立新 session。
+  提交并删除，旧调用不能重建目录；已取得 Window lease 但未取得 data lease 的调用被拒绝。
+- drain/持久提交在线性化点前失败时销毁旧实例并以新 admission epoch 恢复已安装插件；持久卸载提交后 storage
+  删除失败时不恢复插件，保留 tombstone，重启幂等重试并阻止同 ID 安装/激活；清理成功后 tombstone 消失。
 - Runtime 与 Window 共同拒绝不匹配统一正则或 `__proto__`/`prototype`/`constructor` 的 key；非法 key/value 映射
   `InvalidOperation`，5 MiB 配额和原子提交失败映射 `StorageError` 且保持旧值。
 - 存储调用不改变 timer revision，不持有窗口/Timer 锁跨文件 I/O。
@@ -236,6 +259,8 @@ running、paused 和 fired 的 `durationMs/remainingMs` 始终来自宿主 Timer
 - 保存期间禁用；成功同时更新 effective/persisted；失败恢复 persisted 或默认 10 并显示固定错误。
 - running/paused 中选择不改变当前状态、remaining 或 revision；下一轮使用新毫秒数。
 - idle 大号时间显示 effective 下一轮值；running/paused/fired 显示宿主当前轮权威值。
+- 选择 25 后保存未完成时 idle/fired 不能启动新轮；保存成功后启动 25 分钟；保存失败后按恢复值启动。
+- paused 在保存未完成时仍可继续当前轮，且不读取 pending/effective 下一轮时长。
 - paused 的继续无输入；idle/fired 的新轮使用持久时长。
 - 新 `onUpdate` 后旧读写完成不改变 DOM；当前 Timer 恢复与选择器持久值可同时正确显示。
 
@@ -258,4 +283,5 @@ running、paused 和 fired 的 `durationMs/remainingMs` 始终来自宿主 Timer
 3. 公开窗口存储 API 与现有插件存储共享作用域和原子/配额合同，但受窗口会话额外约束。
 4. 当前 Timer 状态、revision、消息和闹铃不被偏好读写改变。
 5. 失败回退、乱序完成和旧会话全部有自动化覆盖。
-6. SDK 合同、公开插件测试、Rust 构建及 Pomodoro 示例测试通过。
+6. 完全卸载的准入关闭、双 drain、持久提交、数据清理与启动重试形成可恢复的单向事务。
+7. SDK 合同、公开插件测试、Rust 构建及 Pomodoro 示例测试通过。
