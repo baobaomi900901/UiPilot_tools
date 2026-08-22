@@ -11,6 +11,9 @@ The package root is strict:
 ```text
 plugin.json
 icon.png                  # optional, fixed 128x128 plugin identity icon
+assets/
+  sounds/
+    timer-alarm.wav       # required only for timer.control
 dist/
   runtime.js
   optional-window.html
@@ -18,7 +21,7 @@ dist/
   optional-window.css
 ```
 
-Only `plugin.json`, `.html`, `.js`, `.css`, and the optional package-root `icon.png` are accepted. The icon must be a completely decodable, static 128x128 PNG no larger than 128 KiB; other PNG paths and additional PNG files are rejected. Basenames have exactly one extension. Paths are relative, normalized, at most eight components deep, and cannot contain traversal, symlinks, reparse points, remote URLs, `data:` resources, unknown MIME types, or unlisted files. Runtime and window entries must name package JavaScript and HTML files respectively.
+Only `plugin.json`, `.html`, `.js`, `.css`, the optional package-root `icon.png`, and the permission-bound fixed alarm path are accepted. The icon must be a completely decodable, static 128x128 PNG no larger than 128 KiB; other PNG paths and additional PNG files are rejected. A plugin declaring `timer.control` must contain exactly one WAV at `assets/sounds/timer-alarm.wav`; a package without that permission must not contain the WAV, and all other WAV paths are rejected. Basenames have exactly one extension. Paths are relative, normalized, at most eight components deep, and cannot contain traversal, symlinks, reparse points, remote URLs, `data:` resources, unknown MIME types, or unlisted files. Runtime and window entries must name package JavaScript and HTML files respectively.
 
 Use [uipilot-plugin-v1.schema.json](./uipilot-plugin-v1.schema.json) to validate `plugin.json`. The schema is generated from the Rust DTOs by:
 
@@ -71,7 +74,9 @@ Both notification methods are request-bound. `publish()` resolves at the atomic 
 
 `window` returns `{ requestId, data }`. The host creates or reuses one window for that plugin and sends a `PluginWindowUpdate` through `window.uipilotPluginWindow.onUpdate`. Content receives input, platform, theme, invocation time, singleton instance `1`, and plugin data. It cannot invoke commands or own pin, close, drag, focus, theme, or position behavior.
 
-Every plugin content window also sees the frozen `window.uipilotPluginWindow.timer` facade. Calls require the Windows-only `timer.control` permission together with `ui.window` and `notifications.publish`; unpermitted callers receive `PermissionDenied`. The host owns one process-local timer per active plugin generation, continues it while the window is hidden, and discards it on process exit. Full session, revision, pause/reset, completion-message, and alarm behavior is documented in the developer guide.
+Every plugin content window also sees the frozen `window.uipilotPluginWindow.timer` facade. Calls require the Windows-only `timer.control` permission together with `ui.window` and `notifications.publish`; unpermitted callers receive `PermissionDenied`. The host owns one process-local timer per active plugin generation, continues it while the window is hidden, and discards it on process exit.
+
+A `timer.control` package supplies its own fixed `assets/sounds/timer-alarm.wav`, while the host exclusively validates, freezes, and plays it. The WAV must be little-endian PCM with one or two channels, a 44.1 or 48 kHz sample rate, and 16- or 24-bit samples; it must not exceed 2 MiB or 15 seconds. Unknown or duplicate chunks, trailing bytes, additional WAV files, and Runtime/content access to the alarm are rejected. Timer completion loops the alarm frozen at round start until the main window opens. Ordinary plugin messages use the host's shared one-shot notification sound instead. Full session, revision, pause/reset, completion-message, and alarm behavior is documented in the developer guide.
 
 The complete serialized response budget is 64 KiB. Unknown fields, duplicate keys, non-finite numbers, prototype keys, invalid actions, and over-budget responses reject the entire response.
 
@@ -105,6 +110,6 @@ The fixed-output reference packages are:
 
 - `examples/public-plugins/com.uipilot.demo-win`: Windows-only `submit + window` with `ui.window` and a 10-second host-owned delayed message.
 - `examples/public-plugins/com.uipilot.demo-return`: `submit + mainResult` with `clipboard.write`.
-- `examples/public-plugins/com.uipilot.pomodoro`: Windows-only `submit + window` with the three-permission host timer, pause/resume/reset, message-center completion, and a finite host alarm.
+- `examples/public-plugins/com.uipilot.pomodoro`: Windows-only `submit + window` with the three-permission host timer, pause/resume/reset, message-center completion, and a plugin-supplied finite alarm validated and played by the host.
 
 Each README documents its development-directory installation, focused verification, packaging command, and user-operated acceptance flow.

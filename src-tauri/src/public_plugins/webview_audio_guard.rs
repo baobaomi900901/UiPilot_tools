@@ -279,6 +279,7 @@ pub(crate) fn prepare_windows_webview(
     on_unmuted: UnmutedCallback,
     timeout: Duration,
 ) -> Result<WebViewGuardHandle, WebViewGuardError> {
+    let target_url = windows_navigation_target(target_url)?;
     let guard = authority.issue(owner)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     let setup_authority = Arc::clone(&authority);
@@ -412,6 +413,26 @@ fn schedule_windows_bootstrap(
         core.AddScriptToExecuteOnDocumentCreated(*script.as_ref().as_pcwstr(), &completion)
             .map_err(|_| WebViewGuardError::Native)
     }
+}
+
+#[cfg(windows)]
+fn windows_navigation_target(target: tauri::Url) -> Result<tauri::Url, WebViewGuardError> {
+    if target.scheme() == "uipilot-public-plugin"
+        && target.host_str() == Some("localhost")
+        && target.port().is_none()
+    {
+        let mut mapped = format!("http://uipilot-public-plugin.localhost{}", target.path());
+        if let Some(query) = target.query() {
+            mapped.push('?');
+            mapped.push_str(query);
+        }
+        if let Some(fragment) = target.fragment() {
+            mapped.push('#');
+            mapped.push_str(fragment);
+        }
+        return tauri::Url::parse(&mapped).map_err(|_| WebViewGuardError::Native);
+    }
+    Ok(target)
 }
 
 #[cfg(windows)]
@@ -554,6 +575,21 @@ mod tests {
         assert_eq!(
             boundary.calls,
             ["cast", "set-muted", "listener", "readback"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_navigation_uses_the_windows_custom_protocol_origin() {
+        let custom =
+            tauri::Url::parse("uipilot-public-plugin://localhost/dist/runtime.js?generation=3")
+                .unwrap();
+
+        let mapped = windows_navigation_target(custom).unwrap();
+
+        assert_eq!(
+            mapped.as_str(),
+            "http://uipilot-public-plugin.localhost/dist/runtime.js?generation=3"
         );
     }
 

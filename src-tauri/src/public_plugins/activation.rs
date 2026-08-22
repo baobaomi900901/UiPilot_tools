@@ -749,13 +749,17 @@ impl PublicPluginManager {
         }
         self.clear_runtime_faults(&runtime.plugin_id)?;
         let config = self.state.publish_prepared(prepared_state)?;
-        reservation.publish(Some(candidate.bundle(config.clone())))?;
+        let runtime_active = config.enabled && config.fault.is_none();
+        reservation.publish(runtime_active.then(|| candidate.bundle(config.clone())))?;
         let staged = data
             .staged_by_label
             .remove(&runtime.label)
             .ok_or(PublicPluginManagementError::Unavailable)?;
-        data.active_by_plugin
-            .insert(runtime.plugin_id.clone(), Arc::clone(&staged.runtime));
+        data.active_by_plugin.remove(&runtime.plugin_id);
+        if runtime_active {
+            data.active_by_plugin
+                .insert(runtime.plugin_id.clone(), Arc::clone(&staged.runtime));
+        }
         drop(data);
         let commit = PublicActivationCommit {
             mutation: mutation_from_config(&config),
@@ -2854,6 +2858,58 @@ mod tests {
             .asset(&upgraded.runtime.label, "/dist/runtime.js")
             .is_some_and(|asset| String::from_utf8(asset.bytes).unwrap().contains("two")));
         assert!(staging_is_empty(&manager));
+    }
+
+    #[test]
+    fn fault_disabled_upgrade_discards_the_probe_runtime_and_can_be_enabled() {
+        let dir = TestDir::new("fault-disabled-upgrade");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        manager
+            .disable_plugin_for_fault(
+                "com.example.activation",
+                PublicPluginFault::RuntimeUnavailable,
+            )
+            .unwrap();
+
+        write_package(&dir.source(), "1.1.0", "two");
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let upgraded = manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+
+        assert!(!upgraded.mutation.enabled);
+        assert!(manager
+            .bundles
+            .bundle("com.example.activation")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .data
+            .lock()
+            .unwrap()
+            .active_by_plugin
+            .get("com.example.activation")
+            .is_none());
+        assert!(manager
+            .asset(&upgraded.runtime.label, "/dist/runtime.js")
+            .is_none());
+
+        let enabled = manager
+            .set_enabled_with_readiness("com.example.activation", true, |_| true)
+            .unwrap();
+        assert!(enabled.mutation.enabled);
+        assert!(enabled.runtime.is_some());
+        assert!(manager
+            .bundles
+            .bundle("com.example.activation")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

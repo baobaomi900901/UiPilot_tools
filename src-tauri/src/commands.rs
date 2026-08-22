@@ -978,6 +978,9 @@ pub(crate) async fn commit_public_plugin_install(
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.previous_runtime_label.as_deref());
+            if !commit.mutation.enabled {
+                PublicPluginService::destroy_runtime(&app, Some(&commit.runtime.label));
+            }
             plugin_window::teardown_current(
                 &app,
                 window_controller.inner().as_ref(),
