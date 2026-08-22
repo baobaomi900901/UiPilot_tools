@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第三轮独立审核修订完成，等待复审
+- 状态：Approved，四轮独立审核通过，可进入实施计划
 - 范围：公开插件窗口私有存储 API、Pomodoro 计时长度选择、持久化与下一轮计时语义
 - 公开 JavaScript API：扩展 `UiPilotPluginWindowApiV1`
 - Manifest 字段：不变
