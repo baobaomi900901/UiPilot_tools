@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第二轮独立审核 findings 已处理，等待复审
+- 状态：Draft，第三轮独立审核 findings 已处理，等待复审
 - 范围：公开插件计时闹铃的私有包资源、安装校验、激活身份、原生播放与声音仲裁
 - 公开 JavaScript API：不变
 - Manifest 字段：不变
@@ -65,8 +65,9 @@ admission 和窗口会话合同。
 - **alarmEpoch**：原生提醒邮箱内划分闹铃 owner 竞争批次的单调 `u64`。
 - **timerAudioOwner**：协调器中的当前唯一逻辑播放所有者，阶段为 `reserved` 或 `playing`；不最终拥有 PCM 字节。
 - **PlayingMemory**：Windows audio adapter 内部持有的 `Arc<[u8]> + AudioTicket + alarmEpoch + asset identity`。
-- **ProcessAudioQuarantine**：应用根状态持有、只在原生进程真正退出时释放的失败停止缓冲区集合。
-- **activation reservation**：一次插件 mutation 的 `Reserved -> Durable -> Published` 提交状态。
+- **ProcessAudioQuarantine**：process-static、无 Rust 析构的失败停止缓冲区集合；内容只由 Windows 在
+  `ExitProcess` 后随整个地址空间回收。
+- **activation reservation**：一次插件 mutation 的 `Reserved -> Committing -> Durable -> Published` 提交状态。
 
 `pluginGeneration`、`activationId`、`packageDigest`、`roundId`、`audioId`、`firedRevision`、`alarmEpoch` 和
 `attentionSequence` 含义不同，不能互换。
@@ -375,7 +376,7 @@ AudioTicket 和当前闹铃。已经运行的 Timer 继续使用 start 时冻结
 所有插件 mutation 路径必须识别每插件 activation reservation：
 
 ```text
-Reserved -> Durable -> Published
+Reserved -> Committing -> Durable -> Published
 ```
 
 提交顺序固定为：
@@ -383,28 +384,34 @@ Reserved -> Durable -> Published
 1. 短暂取得 plugin mutation guard，CAS 验证准备时捕获的旧 activationId、generation 和 packageDigest；
 2. 为该 pluginId 安装唯一 `Reserved`，释放 guard；其他 mutation 在 reservation 清除前失败或等待，读取方
    继续看到完整旧 Bundle；
-3. 在所有运行时锁之外执行持久状态临时文件的原子替换；失败则重新取得 guard、清除 reservation、删除候选，
-   旧 Bundle 和旧 Timer 完全不变；持久 helper 成功时必须在返回调用方前把 RAII guard 转换成持有
-   `DurableCommit` token 的状态；
-4. `DurableCommit` 表示 reservation 已进入 `Durable`；从此不能回到旧 Bundle，也不能清除后继续运行旧状态；
-5. 重新取得 plugin mutation guard，验证同一 reservation，再按固定顺序取得 window session、Timer 与
+3. 在执行持久替换前，预先构造 `DurableCommit` token 及成功路径需要的全部内存，并把 RAII guard 原子设置为
+   `Committing`；
+4. 在所有运行时锁之外执行持久状态临时文件的原子替换；
+5. 替换成功返回后，立即用不可失败、无分配、无取锁的原子写入把 guard 设置为 `Durable`；从原生替换调用
+   返回到该原子写入之间不得执行其他代码；
+6. 替换返回失败时，只有宿主重新验证并证明 durable 文件仍是准备前的旧 digest，才允许把 reservation 回到
+   `Reserved`、清除并删除候选；若 durable 文件是新 digest 或结果无法确定，公开插件服务进入 terminal；
+7. 重新取得 plugin mutation guard，验证同一 reservation，再按固定顺序取得 window session、Timer 与
    ActivationBundle 内存锁；
-6. 在不执行 I/O 的临界区内，以不可失败的内存交换发布新 Bundle，并按第 8.4 节 mutation 分类撤销权威：
+8. 在不执行 I/O 的临界区内，以不可失败的内存交换发布新 Bundle，并按第 8.4 节 mutation 分类撤销权威：
    新激活/移除操作撤销旧窗口 session、Timer、ClaimTicket、AudioTicket 和 owner；config-only mutation 只撤销
    旧请求和窗口 session，保留 Timer 与音频；随后把 reservation 提交为 `Published`；
-7. 清除已发布 reservation 并释放所有锁；
-8. 锁外派发取消效果、销毁旧窗口并清理旧包。
+9. 清除已发布 reservation 并释放所有锁；
+10. 锁外派发取消效果、销毁旧窗口并清理旧包。
 
-第 6 步的可见 Bundle 交换是运行时激活线性化点。持久状态已在第 3 步提交，但 reservation 阻止进程内观察到
-半提交状态；若进程在 durable helper 成功与第 6 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧
+第 8 步的可见 Bundle 交换是运行时激活线性化点。持久状态已在第 4-5 步提交，但 reservation 阻止进程内观察
+到半提交状态；若进程在 durable helper 成功与第 8 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧
 内存 Timer 已随进程消失。
 
 线性化点后的窗口销毁或旧包清理失败只记录并延后重试，不能回滚新 Bundle。更新失败时旧 generation、旧
 内存闹铃、旧 Runtime 和旧 Timer 均继续有效。
 
 `Reserved` 阶段由 RAII guard 负责异常清理；线程 panic 或提前返回会清除 reservation 并保留旧 Bundle。
-进入 `Durable` 后，guard 的异常路径不得清除 reservation。若执行线程 panic、锁中毒、CAS 不一致或任何原因
-无法完成 `Published`，整个公开插件服务立即进入本进程 terminal：
+`Committing` 与 `Durable` 的 guard 异常路径不得清除 reservation。若这两个阶段发生 panic、SEH、锁中毒、
+CAS 不一致或任何原因无法完成 `Published`，整个公开插件服务立即进入本进程 terminal。原子替换返回错误不
+等于“未替换”；必须先按步骤 6 验证旧 digest 才能安全回滚。
+
+terminal 行为固定为：
 
 - 拒绝新的公开插件调用、窗口打开和管理 mutation；
 - 先设置进程级 public-plugin terminal 原子标记，使所有入口立即失败，旧 Runtime 不再获得宿主调用资格；
@@ -543,8 +550,8 @@ WindowsAudioAdapter 是异步 PCM 字节的最终所有者，并且是进程中�
 3. adapter 在自身串行状态中匹配 PlayingMemory；身份不匹配为幂等 no-op，不能停止后来 owner；
 4. 匹配时调用 `PlaySoundW(NULL, ..., 0)` 或等价停止；
 5. 停止成功后才释放 PlayingMemory；
-6. 停止失败时把 Arc 移入应用根状态的 ProcessAudioQuarantine，保持地址有效直到原生进程真正退出，并把整个
-   原生音频 adapter 设为 terminal，避免异步 WinMM 继续读取已释放内存；此后普通提示音和 Timer 闹铃均失败关闭。
+6. 停止失败时把 Arc 移入 ProcessAudioQuarantine，并把整个原生音频 adapter 设为 terminal，避免异步 WinMM
+   继续读取已释放内存；此后普通提示音和 Timer 闹铃均失败关闭。
 
 NativeAttentionCoordinator Worker panic、receiver 断开和 emergency-stop 均不得先释放 PlayingMemory：
 
@@ -554,11 +561,17 @@ NativeAttentionCoordinator Worker panic、receiver 断开和 emergency-stop 均�
 - adapter shutdown/Drop 必须先执行串行 stop，成功后释放，失败则把 Arc 移交 ProcessAudioQuarantine；
 - adapter 自身状态不能在 stop/shutdown 前因锁中毒或 channel 断开丢弃字节。
 
-ProcessAudioQuarantine 的生命周期不得绑定 public-plugin service、attention coordinator 或 audio adapter；这些
-对象在主进程中提前 shutdown/drop 时，quarantine 仍然保留字节，直到进程 teardown。
+ProcessAudioQuarantine 的内容永远不得由 Rust Drop。实现必须使用 process-static `ManuallyDrop`、有意 leak 或
+等价无析构存储；它不能作为 Tauri managed state、public-plugin service、attention coordinator 或 audio
+adapter 的普通字段。上述对象在主进程中提前 shutdown/drop 时，quarantine 仍保留字节，最终只由 Windows 在
+`ExitProcess` 后回收进程地址空间。
+
+quarantine 交接若遇锁中毒或其他异常，必须恢复并写入无析构存储，或对该 Arc 执行 `mem::forget`；任何错误
+分支都不能回退为正常 drop。第一次 stop 失败后整个 adapter 已 terminal，不再接受新声音，因此单进程
+quarantine 最多新增一份 Timer PCM，内存占用受第 6 节 `2 MiB` 上限约束。
 
 启动失败后同一 epoch 的旧后续票证仍不能候补。清除并推进到新 epoch 后，新到期轮次可以再次尝试，除非
-Timer 音频通道已因不安全的停止失败进入 terminal。
+整个原生音频 adapter 已因不安全的停止失败进入 terminal。
 
 Windows 音频后端仍是一个进程级声音通道。普通提示音、Timer start/stop、shutdown 和 emergency-stop 全部
 经过同一个 adapter 串行执行。Timer owner 开始前停止当前普通提示音；只要 adapter 持有 PlayingMemory，
@@ -587,7 +600,7 @@ Toast、托盘和徽标继续可用。
 - `PlaySoundW` 启动失败：保持已保存消息与 `fired`，终结当前票证，不重试本轮，不停用插件；
 - 停止失败：按第 12 节 quarantine 字节并使整个原生音频 adapter terminal，不停用插件；
 - 宿主按错误类型限频记录不包含敏感路径的稳定诊断；
-- 后续新 Timer round 可以重新尝试启动，除非 Timer 音频通道已 terminal；
+- 后续新 Timer round 可以重新尝试启动，除非整个原生音频 adapter 已 terminal；
 - 普通消息公共提示音失败同样不改变消息来源插件状态。
 
 资产内容问题只能在构造 ValidatedAlarmAsset 前出现并拒绝候选。激活后使用不可变内存，不存在“磁盘文件后来
@@ -658,7 +671,9 @@ Toast、托盘和徽标继续可用。
 
 - 候选准备、Runtime ready、包持久化、状态替换和 Bundle 发布逐步故障注入；
 - reservation 阻止并发 enable/disable/update/uninstall 观察或制造半提交状态；
-- `Reserved` panic 自动回滚；`Durable` 后 panic、锁中毒或 CAS 异常使公开插件服务 terminal；
+- `Reserved` panic 自动回滚；`Committing` 或 `Durable` 的 panic、SEH、锁中毒、CAS 异常或 durable 结果不确定
+  均使公开插件服务 terminal；
+- 故障注入精确覆盖原子替换调用前、调用中、成功返回到 Durable 原子写入之间及 Durable 写入后；
 - 持久替换失败旧 Bundle 完整保留；
 - 新激活线性化点同时发布 config/runtime/asset 并撤销旧 Timer 权威；config-only Bundle 交换复用
   activationId 并保留 Timer/owner；
@@ -679,6 +694,8 @@ Toast、托盘和徽标继续可用。
 - adapter 持有 PlayingMemory 时，即使上层误发 ordinary 请求也不会播放公共提示音；
 - worker panic、receiver 断开和 emergency-stop 时 adapter 保持 Arc，shutdown 先 stop 再释放，失败移交
   ProcessAudioQuarantine；
+- 根状态先 drop/adapter 后 drop 与 adapter 先 drop/根状态 teardown 两种顺序都不释放 quarantine；交接锁中毒
+  路径使用无析构 fallback；
 - 普通、Timer 和 cleanup 的所有 `PlaySoundW` 调用在 adapter 内串行，迟到旧 stop 不能停止新 owner；
 - 所有外部 I/O、WebView 和原生音频调用都发生在相关运行时锁外。
 
@@ -704,7 +721,8 @@ Toast、托盘和徽标继续可用。
 9. 安装期无默认回退；运行期原生音频失败不回滚消息，也不错误停用插件。
 10. 更新失败保留完整旧 Bundle；成功更新原子发布新 Bundle 并只让新计时使用新闹铃；config-only 修改保留
     activationId 和运行中 Timer。
-11. `Reserved` 可回滚，`Durable` 后无法发布会使公开插件服务 terminal，不能继续运行旧 Bundle。
+11. `Reserved` 可回滚；`Committing`/`Durable` 的异常或不确定结果会使公开插件服务 terminal，不能继续运行
+    旧 Bundle。
 12. PCM 字节由 Windows audio adapter 最终持有；worker panic、迟到 start/stop 和 emergency-stop 均不会释放
     正在被 WinMM 使用的内存或停止后来 owner。
 13. 音频解析、Web 隔离、激活身份、内存生命周期、原子提交、alarmEpoch 和票证乱序均有确定性测试。
