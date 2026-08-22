@@ -360,15 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_attention_waves_have_the_approved_identity_and_resource_paths() {
-        let alarm = include_bytes!("../../resources/sounds/attention-alarm.wav");
-        assert_eq!(alarm.len(), 1_724_844);
-        assert_eq!(&alarm[..4], b"RIFF");
-        assert_eq!(&alarm[8..12], b"WAVE");
-        assert_eq!(
-            format!("{:X}", Sha256::digest(alarm)),
-            "9F66E473EEEE7AAF75AB2761423DAD1D04FA3F019744899DD154350F4117A8F3"
-        );
+    fn host_bundles_only_the_approved_ordinary_message_sound() {
         let message = include_bytes!("../../resources/sounds/message-notification.wav");
         assert_eq!(message.len(), 684_044);
         assert_eq!(&message[..4], b"RIFF");
@@ -378,8 +370,8 @@ mod tests {
             "B29D9BF3E4942C5372159A641203A20F124E4D58DCBEE8B272957423701D7766"
         );
         let config = include_str!("../../tauri.conf.json");
-        assert!(config.contains("resources/sounds/attention-alarm.wav"));
         assert!(config.contains("resources/sounds/message-notification.wav"));
+        assert!(!config.contains("resources/sounds/attention-alarm.wav"));
         assert!(!config.contains("resources/sounds/timer-complete.wav"));
         let bootstrap = include_str!("../lib.rs");
         assert!(!bootstrap.contains("\"resources/sounds/attention-alarm.wav\""));

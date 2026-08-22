@@ -314,23 +314,40 @@ fn pomodoro_reference_package_is_installable() {
     let root = TestRoot::new("pomodoro-reference");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../examples/public-plugins/com.uipilot.pomodoro/package");
-    let prepared = stage_public_package(
-        PublicPackageSource::DevelopmentDirectory(source),
+    let directory = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source.clone()),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+    let archive_path = root.0.join("pomodoro.uipilot-plugin");
+    archive_directory(&source, &archive_path);
+    let archive = stage_public_package(
+        PublicPackageSource::Archive(archive_path),
         &root.staging(),
         &host(),
     )
     .unwrap();
 
-    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.pomodoro");
+    assert_eq!(directory.manifest.plugin_id, "com.uipilot.pomodoro");
     assert_eq!(
-        prepared.manifest.permissions,
+        directory.manifest.permissions,
         vec![
             PublicPermission::UiWindow,
             PublicPermission::NotificationsPublish,
             PublicPermission::TimerControl,
         ]
     );
-    assert_eq!(prepared.revalidate(), Ok(()));
+    let directory_alarm = directory.alarm.as_ref().unwrap();
+    let archive_alarm = archive.alarm.as_ref().unwrap();
+    assert_eq!(directory.digest, archive.digest);
+    assert_eq!(
+        directory_alarm.resource_sha256,
+        archive_alarm.resource_sha256
+    );
+    assert_eq!(directory_alarm.bytes, archive_alarm.bytes);
+    assert_eq!(directory.revalidate(), Ok(()));
+    assert_eq!(archive.revalidate(), Ok(()));
 }
 
 #[test]

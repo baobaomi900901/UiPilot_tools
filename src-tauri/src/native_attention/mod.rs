@@ -1621,8 +1621,10 @@ mod tests {
 
     #[test]
     fn alarm_epoch_exhaustion_fails_only_timer_audio_admission_closed() {
-        let mut mailbox = MailboxState::default();
-        mailbox.alarm_epoch = u64::MAX;
+        let mut mailbox = MailboxState {
+            alarm_epoch: u64::MAX,
+            ..MailboxState::default()
+        };
 
         mailbox.advance_alarm_epoch();
 

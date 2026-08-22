@@ -7,6 +7,7 @@ const packageRoot = new URL('../package/', import.meta.url)
 test('manifest declares the host-owned Pomodoro contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('plugin.json', packageRoot), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.pomodoro')
+  assert.equal(manifest.version, '1.1.0')
   assert.equal(manifest.command.defaultName, 'pomodoro')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'window')
@@ -20,13 +21,21 @@ test('manifest declares the host-owned Pomodoro contract', async () => {
 })
 
 test('package contains only the declared Pomodoro assets', async () => {
-  assert.deepEqual((await readdir(packageRoot)).sort(), ['dist', 'icon.png', 'plugin.json'])
+  assert.deepEqual((await readdir(packageRoot)).sort(), ['assets', 'dist', 'icon.png', 'plugin.json'])
+  assert.deepEqual((await readdir(new URL('assets/', packageRoot))).sort(), ['sounds'])
+  assert.deepEqual((await readdir(new URL('assets/sounds/', packageRoot))).sort(), [
+    'timer-alarm.wav',
+  ])
   assert.deepEqual((await readdir(new URL('dist/', packageRoot))).sort(), [
     'runtime.js',
     'window.css',
     'window.html',
     'window.js',
   ])
+  const alarm = await readFile(new URL('assets/sounds/timer-alarm.wav', packageRoot))
+  assert.equal(alarm.subarray(0, 4).toString('ascii'), 'RIFF')
+  assert.equal(alarm.subarray(8, 12).toString('ascii'), 'WAVE')
+  assert.equal(alarm.readUInt32LE(4) + 8, alarm.length)
 })
 
 test('runtime supplies ten seconds and a completion message without starting a timer', async () => {

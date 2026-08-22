@@ -358,6 +358,21 @@ p {
 Runtime，也不能脱离插件窗口调用。完整参考实现见
 [`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)。
 
+计时插件必须在包内提供唯一的固定闹铃，路径和大小写必须完全一致：
+
+```text
+package/assets/sounds/timer-alarm.wav
+```
+
+该文件属于宿主私有资源，不写入 Manifest 路径字段，也不能由 Runtime 或窗口读取。UiPilot 在安装时完整解析
+WAV，只接受 1/2 声道、44.1/48 kHz、16/24-bit little-endian PCM，文件最多 2 MiB、有效时长最多 15 秒；
+未知或重复 chunk、尾随字节及包内其他 WAV 都会导致安装失败。声明 `timer.control` 却缺少此文件，或未声明
+权限却携带此文件，同样拒绝安装。修改闹铃后必须重新打包并重新安装插件。
+
+普通插件消息始终使用 UiPilot 自带的公共提示音播放一次，插件不能替换。只有有效 Timer 到期后，宿主才会
+从内存循环播放该轮开始时冻结的插件闹铃；打开主窗口会停止声音，但不会自动清除未读消息。插件没有任意
+音频 API，也不要在 WebView 中使用 `<audio>` 或 WebAudio。
+
 每个 active plugin generation 最多有一个宿主持有的计时器。窗口每次收到 `onUpdate` 时都会获得新的
 控制会话，因此应先订阅，再读取基准状态：
 
@@ -399,7 +414,7 @@ Unicode 标量值的纯文本。首次 `idle` 的 `durationMs / remainingMs` 都
 remaining 锚点。页面可以用 `performance.now()` 插值显示数字，但本地 interval/animation frame 不能拥有
 到期、消息或后台副作用。
 
-到期时宿主先把完成消息原子保存到消息中心，成功后才进入 `fired` 并尝试播放一次有限音效。消息保存
+到期时宿主先把完成消息原子保存到消息中心，成功后才进入 `fired` 并尝试循环播放该轮冻结的插件闹铃。消息保存
 失败会回到 `idle`，不响铃、不重试；系统通知或音频失败不删除已保存消息。禁用、卸载、故障停用或成功
 升级会取消当前 generation 的计时器。退出 UiPilot 会丢弃所有计时器且下次启动不恢复、不补发。
 
@@ -638,6 +653,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] Runtime 始终原样返回 `requestId`。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。
+- [ ] `timer.control` 包只包含唯一的 `assets/sounds/timer-alarm.wav`，且 WAV 满足固定 PCM、大小与时长限制。
 - [ ] 内部空格不会被插件意外压缩。
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
 - [ ] `icon.png` 满足固定规则。
