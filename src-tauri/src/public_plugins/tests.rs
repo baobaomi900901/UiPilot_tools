@@ -10,8 +10,9 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{
     manifest::{PublicOutputMode, PublicPermission},
-    package, stage_public_package, PublicPackageError, PublicPackageSource, PublicPlatform,
-    PublicPluginHost, PublicPluginService,
+    package, stage_public_package,
+    webview_audio_guard::{INERT_DOCUMENT, INERT_PATH},
+    PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost, PublicPluginService,
 };
 use crate::plugins::{PluginCatalog, Version};
 
@@ -39,6 +40,25 @@ fn public_plugin_alarm_protocol_is_always_forbidden() {
         assert_eq!(response.status(), 403);
         assert!(response.body().is_empty());
     }
+}
+
+#[test]
+fn inert_webview_document_is_host_owned_and_denies_media() {
+    let service = PublicPluginService::default();
+    let response = service.asset_response("untrusted-label", &format!("/{INERT_PATH}"), None);
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.body(), INERT_DOCUMENT.as_bytes());
+    assert_eq!(
+        response.headers()["content-security-policy"],
+        "default-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'"
+    );
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+}
+
+#[test]
+fn public_plugin_protocol_csp_denies_media() {
+    assert!(super::PUBLIC_PLUGIN_CSP.contains("media-src 'none'"));
 }
 
 struct TestRoot(PathBuf);

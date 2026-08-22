@@ -14,8 +14,9 @@ use tauri::{
 use crate::{
     lifecycle,
     public_plugins::{
-        PluginInvocationTheme, PluginTimerState, PublicPluginManagementError, PublicPluginService,
-        TimerKey,
+        inert_url, prepare_windows_webview, verify_windows_webview_muted, PluginInvocationTheme,
+        PluginTimerState, PublicPluginManagementError, PublicPluginService, TimerKey,
+        WebViewGuardOwner,
     },
     settings::SettingsStore,
     window_transfer::{MainWindowSnapshot, MainWindowTransferCoordinator, TransferTarget},
@@ -273,6 +274,22 @@ impl PluginWindowController {
         if hidden {
             window.focused = false;
         }
+        self.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn revoke_timer_session(&self, plugin_id: &str, session_generation: u64) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(window) = core.windows.get_mut(plugin_id) else {
+            return false;
+        };
+        if window.timer_session.generation != session_generation {
+            return false;
+        }
+        window.timer_session.phase = TimerSessionPhase::Revoked;
+        window.focused = false;
         self.changed.notify_all();
         true
     }
@@ -799,6 +816,26 @@ pub(crate) fn prepare(
             created.is_ok()
         );
         created?;
+    } else {
+        let content = app
+            .get_webview(&transaction.content_label)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        if verify_windows_webview_muted(&content, CONTENT_READY_TIMEOUT).is_err() {
+            let _ = controller
+                .revoke_timer_session(&owner.plugin_id, transaction.timer_session_generation);
+            if let Some(shell) = app.get_window(&transaction.shell_label) {
+                let _ = shell.destroy();
+            }
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        app.state::<Arc<PublicPluginService>>()
+            .webview_guards()
+            .rebind_current(WebViewGuardOwner::Content {
+                label: transaction.content_label.clone(),
+                plugin_id: owner.plugin_id.clone(),
+                session_generation: transaction.timer_session_generation,
+            })
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
     }
 
     let awaiting_ready = controller.is_current(&owner, PluginWindowPhase::AwaitingReady);
@@ -936,11 +973,11 @@ fn create_window(
         window_entry.trim_start_matches('/')
     ))
     .map_err(|_| PublicPluginManagementError::Unavailable)?;
+    let inert_url = inert_url().map_err(|_| PublicPluginManagementError::Unavailable)?;
     let content = WebviewBuilder::new(
         transaction.content_label.clone(),
-        WebviewUrl::CustomProtocol(content_url),
+        WebviewUrl::CustomProtocol(inert_url),
     )
-    .initialization_script(PUBLIC_CONTENT_BOOTSTRAP)
     .on_navigation(|url| {
         matches!(url.scheme(), "uipilot-public-plugin" | "http")
             && url.host_str().is_some_and(|host| {
@@ -954,7 +991,7 @@ fn create_window(
     let native = app
         .get_window(&transaction.shell_label)
         .ok_or(PublicPluginManagementError::Unavailable)?;
-    native
+    let content = native
         .add_child(
             content,
             LogicalPosition::new(0.0, PLUGIN_SHELL_HEIGHT),
@@ -964,6 +1001,43 @@ fn create_window(
             ),
         )
         .map_err(|_| PublicPluginManagementError::Unavailable)?;
+    let guard_controller = Arc::clone(&controller);
+    let guard_shell = shell.clone();
+    let on_unmuted = Arc::new(move |owner| {
+        let WebViewGuardOwner::Content {
+            plugin_id,
+            session_generation,
+            ..
+        } = owner
+        else {
+            return;
+        };
+        if guard_controller.revoke_timer_session(&plugin_id, session_generation) {
+            let _ = guard_shell.destroy();
+        }
+    });
+    if prepare_windows_webview(
+        &content,
+        app.state::<Arc<PublicPluginService>>().webview_guards(),
+        WebViewGuardOwner::Content {
+            label: transaction.content_label.clone(),
+            plugin_id: transaction.owner.plugin_id.clone(),
+            session_generation: transaction.timer_session_generation,
+        },
+        PUBLIC_CONTENT_BOOTSTRAP,
+        content_url,
+        on_unmuted,
+        CONTENT_READY_TIMEOUT,
+    )
+    .is_err()
+    {
+        let _ = controller.revoke_timer_session(
+            &transaction.owner.plugin_id,
+            transaction.timer_session_generation,
+        );
+        let _ = shell.destroy();
+        return Err(PublicPluginManagementError::RuntimeNotReady);
+    }
 
     let plugin_id = transaction.owner.plugin_id.clone();
     let event_controller = Arc::clone(&controller);
@@ -1486,6 +1560,32 @@ mod tests {
     }
 
     #[test]
+    fn mute_guard_revokes_only_the_exact_content_session() {
+        let controller = PluginWindowController::default();
+        let first = owner("mute-guard-first", 2, "request-first");
+        let first_transaction = controller.submit(first.clone()).unwrap();
+        assert!(controller.advance(
+            &first,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::AwaitingAck
+        ));
+        assert!(controller
+            .revoke_timer_session(&first.plugin_id, first_transaction.timer_session_generation));
+
+        let second = owner("mute-guard-second", 2, "request-second");
+        let second_transaction = controller.submit(second.clone()).unwrap();
+        assert!(!controller.revoke_timer_session(
+            &second.plugin_id,
+            first_transaction.timer_session_generation
+        ));
+        assert!(controller.is_current(&second, PluginWindowPhase::AwaitingAck));
+        assert!(controller.revoke_timer_session(
+            &second.plugin_id,
+            second_transaction.timer_session_generation
+        ));
+    }
+
+    #[test]
     fn bootstrap_owns_a_session_bound_timer_facade_without_general_events() {
         for fragment in [
             "get timer()",
@@ -1707,6 +1807,11 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn commit(").next())
             .expect("plugin window production source markers are missing");
+        let preparation = source
+            .split("pub(crate) fn prepare(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn commit(").next())
+            .expect("plugin window preparation source markers are missing");
         for required in [
             "WebviewWindowBuilder::new(",
             "WebviewUrl::App(\"index.html\".into())",
@@ -1714,8 +1819,9 @@ mod tests {
             ".decorations(false)",
             ".always_on_top(false)",
             "WebviewBuilder::new(",
-            "WebviewUrl::CustomProtocol(content_url)",
-            ".initialization_script(PUBLIC_CONTENT_BOOTSTRAP)",
+            "WebviewUrl::CustomProtocol(inert_url)",
+            "prepare_windows_webview(",
+            "PUBLIC_CONTENT_BOOTSTRAP",
             ".on_navigation(",
             ".on_new_window(|_, _| NewWindowResponse::Deny)",
             ".on_download(|_, _| false)",
@@ -1726,10 +1832,12 @@ mod tests {
                 "missing isolation fragment: {required}"
             );
         }
+        assert!(preparation.contains("verify_windows_webview_muted("));
         for forbidden in [
             "NewWindowResponse::Allow",
             "WebviewUrl::External",
             "file://",
+            ".initialization_script(PUBLIC_CONTENT_BOOTSTRAP)",
             ".always_on_top(true)",
             "Command::new",
         ] {

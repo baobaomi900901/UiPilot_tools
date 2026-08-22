@@ -11,6 +11,7 @@ mod secrets;
 mod state;
 mod storage;
 mod timers;
+mod webview_audio_guard;
 
 #[cfg(test)]
 mod tests;
@@ -64,7 +65,12 @@ pub(crate) use storage::PluginStorageStore;
 pub(crate) use timers::{
     AudioTicket, PluginTimerService, PluginTimerStartInput, PluginTimerState, TimerError, TimerKey,
 };
+pub(crate) use webview_audio_guard::{
+    inert_url, prepare_windows_webview, verify_windows_webview_muted, WebViewGuardAuthority,
+    WebViewGuardOwner,
+};
 const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLIC_PLUGIN_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicPluginResponse {
@@ -91,6 +97,7 @@ pub(crate) struct PublicPluginService {
     submissions: Mutex<PublicSubmissionState>,
     next_submission: AtomicU64,
     startup_runtimes_started: AtomicBool,
+    webview_guards: Arc<WebViewGuardAuthority>,
 }
 
 pub(crate) struct PublicSubmission {
@@ -560,6 +567,18 @@ impl PublicPluginService {
         path: &str,
         query: Option<&str>,
     ) -> Response<Vec<u8>> {
+        if path.trim_start_matches('/') == webview_audio_guard::INERT_PATH {
+            return Response::builder()
+                .status(200)
+                .header("content-type", "text/html; charset=utf-8")
+                .header("x-content-type-options", "nosniff")
+                .header(
+                    "content-security-policy",
+                    "default-src 'none'; media-src 'none'; base-uri 'none'; form-action 'none'",
+                )
+                .body(webview_audio_guard::INERT_DOCUMENT.as_bytes().to_vec())
+                .unwrap();
+        }
         if path.trim_start_matches('/') == alarm_asset::ALARM_PATH {
             return Response::builder().status(403).body(Vec::new()).unwrap();
         }
@@ -593,10 +612,7 @@ impl PublicPluginService {
             .status(200)
             .header("content-type", asset.mime)
             .header("x-content-type-options", "nosniff")
-            .header(
-                "content-security-policy",
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'",
-            )
+            .header("content-security-policy", PUBLIC_PLUGIN_CSP)
             .body(asset.bytes)
             .unwrap()
     }
@@ -606,20 +622,21 @@ impl PublicPluginService {
         app: &AppHandle,
         candidate: &PublicRuntimeCandidate,
     ) -> Result<WebviewWindow, PublicPluginManagementError> {
-        let url = tauri::Url::parse("uipilot-public-plugin://localhost/__uipilot_runtime.html")
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let target_url =
+            tauri::Url::parse("uipilot-public-plugin://localhost/__uipilot_runtime.html")
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let inert_url = inert_url().map_err(|_| PublicPluginManagementError::RuntimeNotReady)?;
         let ready = Arc::new((Mutex::new(None), Condvar::new()));
         let title_ready = Arc::clone(&ready);
         let window = WebviewWindowBuilder::new(
             app,
             candidate.label.clone(),
-            WebviewUrl::CustomProtocol(url),
+            WebviewUrl::CustomProtocol(inert_url),
         )
         .visible(false)
         .focusable(false)
         .skip_taskbar(true)
         .incognito(true)
-        .initialization_script(PUBLIC_RUNTIME_BOOTSTRAP)
         .on_navigation(public_runtime_navigation_allowed)
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .on_download(|_, _| false)
@@ -638,6 +655,44 @@ impl PublicPluginService {
         })
         .build()
         .map_err(|_| PublicPluginManagementError::RuntimeNotReady)?;
+        let unmute_app = app.clone();
+        let on_unmuted = Arc::new(move |owner| {
+            let WebViewGuardOwner::Runtime {
+                label,
+                plugin_id,
+                generation,
+                activation_id,
+            } = owner
+            else {
+                return;
+            };
+            if let Some(service) = unmute_app.try_state::<Arc<PublicPluginService>>() {
+                if let Ok(manager) = service.manager() {
+                    let _ = manager.mark_runtime_unavailable(&plugin_id, generation, activation_id);
+                }
+                service.settle_plugin_submissions(&plugin_id);
+            }
+            PublicPluginService::destroy_runtime(&unmute_app, Some(&label));
+        });
+        if prepare_windows_webview(
+            window.as_ref(),
+            Arc::clone(&self.webview_guards),
+            WebViewGuardOwner::Runtime {
+                label: candidate.label.clone(),
+                plugin_id: candidate.plugin_id.clone(),
+                generation: candidate.generation,
+                activation_id: candidate.activation_id,
+            },
+            PUBLIC_RUNTIME_BOOTSTRAP,
+            target_url,
+            on_unmuted,
+            PUBLIC_RUNTIME_READY_TIMEOUT,
+        )
+        .is_err()
+        {
+            let _ = window.destroy();
+            return Err(PublicPluginManagementError::RuntimeNotReady);
+        }
         let settled = ready
             .1
             .wait_timeout_while(
@@ -662,6 +717,10 @@ impl PublicPluginService {
         if let Some(window) = label.and_then(|label| app.get_webview_window(label)) {
             let _ = window.destroy();
         }
+    }
+
+    pub(crate) fn webview_guards(&self) -> Arc<WebViewGuardAuthority> {
+        Arc::clone(&self.webview_guards)
     }
 }
 

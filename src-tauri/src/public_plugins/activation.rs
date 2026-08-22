@@ -2148,7 +2148,7 @@ fn package_destination(root: &Path, plugin_id: &str, digest: &str) -> PathBuf {
 
 fn runtime_host_document(entry: &str) -> String {
     format!(
-        "<!doctype html><html data-runtime-entry=\"/{entry}\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'\"></head><body></body></html>"
+        "<!doctype html><html data-runtime-entry=\"/{entry}\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'self'; connect-src ipc: http://ipc.localhost; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'\"></head><body></body></html>"
     )
 }
 
@@ -3528,6 +3528,11 @@ mod tests {
             json!({ "requestId": "public-request-1", "data": "x".repeat(65_536) })
         )
         .is_err());
+    }
+
+    #[test]
+    fn runtime_host_document_denies_media() {
+        assert!(runtime_host_document("dist/runtime.js").contains("media-src 'none'"));
     }
 
     #[test]
