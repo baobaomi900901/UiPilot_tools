@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第二轮独立审核修订完成，等待复审
+- 状态：Draft，第三轮独立审核修订完成，等待复审
 - 范围：公开插件窗口私有存储 API、Pomodoro 计时长度选择、持久化与下一轮计时语义
 - 公开 JavaScript API：扩展 `UiPilotPluginWindowApiV1`
 - Manifest 字段：不变
@@ -140,6 +140,11 @@ Active 阶段获准，使 `onUpdate` handler 能在 ACK 前读取基准值；`st
 存储 I/O，并在完成后释放。它不替代 Window call lease：Window storage 调用同时持有 Window call lease 与
 PluginDataCallLease，前者约束窗口 session，后者建立卸载排空边界。
 
+每个 ActivationBundle 内部拥有单调 `admissionEpoch`；它由 manager 分配，不暴露给插件。`PluginWindowOwner`
+与 `ScheduledPluginRequest` 在建立时捕获当前 epoch。Data gate 只接受完全匹配的
+`pluginId + pluginGeneration + activationId + admissionEpoch`，关闭后拒绝新 lease；失败恢复准入必须分配新
+epoch，旧窗口 owner 和旧 Runtime request 因此不能跨 epoch。
+
 每条 Window storage 命令遵循：
 
 1. 解析并验证 session generation；
@@ -150,6 +155,11 @@ PluginDataCallLease，前者约束窗口 session，后者建立卸载排空边�
 4. 不持有 controller、manager mutation gate、ActivationBundle、Timer 或消息中心锁地调用现有
    `PluginStorageStore`；
 5. 返回固定成功值或稳定错误，最后释放 data lease 与 Window call lease。
+
+Runtime storage 不取得 mutation gate。它在 `scheduler.with_current()` 持有当前请求守卫期间，从
+`ScheduledPluginRequest` 读取 activationId 与 admissionEpoch，直接调用只取得 data gate 自身 mutex 的
+`try_acquire(pluginId, generation, activationId, admissionEpoch)`；gate 在自身临界区原子校验 tuple、open 状态并
+签发 lease。Runtime 不得先退出 `with_current` 再取 data lease，也不得在 scheduler mutex 内获取 mutation gate。
 
 存储 I/O 不取得 Timer 锁，不发布 Timer 状态事件，也不修改 inventory revision。两个 lease 的线性化含义不得
 混淆：
@@ -166,28 +176,40 @@ PluginDataCallLease，前者约束窗口 session，后者建立卸载排空边�
 
 彻底卸载必须保证数据删除晚于所有旧窗口写入，不得沿用当前“先删除数据、后 teardown 窗口”的顺序：
 
-1. `PublicPluginManager` 在 plugin mutation gate 内签发唯一卸载事务，关闭该插件的新命令、窗口 transfer、
-   Runtime dispatch 和 `PluginDataCallGate` 新 lease 准入，然后释放 mutation gate；
+1. `PublicPluginManager` 在 plugin mutation gate 内签发唯一卸载事务并关闭 manager 新命令/窗口 transfer 准入；
+   随后在同一 mutation 临界区依次取得 scheduler mutex，淘汰/阻止该插件 Runtime request，再取得 data gate
+   mutex 关闭新 data lease 准入，最后按逆序释放。唯一锁顺序是 `mutation -> scheduler -> data gate`；Runtime
+   只走 `scheduler -> data gate`，Window 只走 `mutation -> data gate`；任何路径禁止反向获取；
 2. `PluginWindowController` 把现有 session 转为 Closing，拒绝新的 Window `get/set/remove` 与 Timer 调用，
    并等待同一 in-flight 计数归零；等待期间不持有 manager、storage 或 Timer 锁；
 3. 等待 `PluginDataCallGate` 的既有 Runtime/Window data lease 归零；等待期间同样不持有 manager、Window
    controller 或 storage 锁；已取得 Window call lease 但尚未取得 data lease 的调用会被关闭的 gate 拒绝；
-4. 卸载事务重新取得 mutation gate 并验证仍为当前 owner；持久化提交“已卸载 + data cleanup pending”
-   tombstone，发布无 ActivationBundle 状态，然后释放 mutation gate；该提交是不可回滚的卸载线性化点；
-5. 销毁 Runtime 与插件窗口并删除窗口位置；旧 generation/ActivationBundle、facade、request 和 lease 永久失效；
-6. 调用 `PluginStorageStore::uninstall(pluginId, false)` 删除内存记录和目录；只有删除全部成功并持久化移除
-   tombstone 后，命令才报告彻底卸载完成。
+4. 卸载事务重新取得 mutation gate 并验证仍为当前 owner；持久化提交“已卸载 + plugin owner cleanup pending”
+   `PluginOwnerCleanupReceipt`，发布无 ActivationBundle 状态，然后释放 mutation gate；该提交是不可回滚的
+   卸载线性化点；
+5. 销毁 Runtime 与插件窗口；旧 generation/ActivationBundle、facade、request 和 lease 永久失效；
+6. 执行 receipt 的完整 owner cleanup：普通 storage 内存记录与目录、secret owner、卸载后的 state owner、已安装
+   package tree 和窗口位置；只有每个必需目标都幂等删除成功并持久化移除 receipt 后，命令才报告彻底卸载完成。
 
-选择保留数据时仍执行准入关闭和两个 drain，但卸载提交不写 cleanup tombstone，并跳过 storage 删除。若 drain
-或持久卸载提交在线性化点前失败，事务关闭状态不得留下一扇可继续调用的旧窗口或 Runtime：销毁当前实例，并只为
-重新验证后的当前 ActivationBundle 以新 admission epoch 恢复准入；插件记录保持已安装，用户下次调用时建立新
-Runtime/window session。旧 facade、旧 request 和旧 lease 不能进入新 epoch。
+receipt 持久化在所有待清理 owner root 之外，只保存 manager 已验证的 pluginId、卸载事务 ID、
+generation/activation 身份和固定 root 下可重建的目标标识，不接受调用者路径。每次重试可重复执行全部目标；目标
+不存在视为成功。任一目标失败时 receipt 整体保留，不得仅因 storage 已删除而解除同 ID 阻塞。Timer、延迟消息
+和 Runtime fault 等仅存内存的 generation 资源在卸载提交时撤销，不属于磁盘 cleanup receipt。
 
-若完全卸载已提交而 storage 删除或 tombstone 清除失败，不得恢复旧插件；命令返回稳定的
-`DataCleanupPending`，UI 表示“插件已卸载，数据清理将在下次启动时重试”。启动时必须先重试 tombstone 清理；
-同一 `pluginId` 的安装、更新和激活在 tombstone 清除前被拒绝。重复清理必须幂等，目录不存在视为删除成功，且
-不得加载残留数据。任何路径都不得同时持有 plugin mutation gate、Window controller mutex、data gate mutex 或
-storage mutex 等待另一个锁。
+选择保留数据时仍执行准入关闭和两个 drain，但不写 `PluginOwnerCleanupReceipt`；只保留普通 storage、secret 和
+既有保留数据合同要求的 state 配置，package tree、Runtime/window 与窗口位置仍按既有保留数据卸载流程清理。
+若 drain 或持久卸载提交在线性化点前失败，事务关闭状态不得留下一扇可继续调用的旧窗口或 Runtime：销毁当前
+实例，并只为重新验证后的当前 ActivationBundle 以新 admission epoch 恢复准入；插件记录保持已安装，用户下次
+调用时建立新 Runtime/window session。旧 facade、旧 request 和旧 lease 不能进入新 epoch。
+
+若完全卸载已提交而任一 owner cleanup 或 receipt 清除失败，不得恢复旧插件。内部管理错误变体为
+`PublicPluginManagementError::DataCleanupPending`，Tauri `CommandError.code` 固定序列化为
+`dataCleanupPending`；卸载命令以该错误结束而不是返回成功。设置页必须结束 loading、刷新 inventory（插件已从
+列表消失），并在页面级显示“插件已卸载，数据清理将在下次启动时重试”，不得映射为“操作不可用”。启动时必须
+先重试 receipt 清理；同一 `pluginId` 的安装、更新和激活在 receipt 清除前被拒绝。WebView 重载不算启动重试。
+
+任何路径都不得同时持有 plugin mutation gate、Window controller mutex、data gate mutex 或 storage mutex 等待
+另一个锁；尤其不得持有 mutation/scheduler/data gate mutex 等待 Window 或 data lease 归零。
 
 ## 7. Pomodoro 窗口状态
 
@@ -224,7 +246,8 @@ effective 值启动新一轮；paused 的“继续”保持可用，因为它恢
 - 配额、序列化或原子文件失败：返回既有存储错误，旧值保持不变，不停用插件。
 - 已提交写入后的迟到 UI 完成：数据继续有效，但旧 epoch 不得更新新窗口 UI。
 - 完全卸载与已签发写 lease 竞态：卸载等待写入完成后再删除，最终目录与内存记录均不存在。
-- 完全卸载提交后的清理失败：插件保持已卸载，返回 `DataCleanupPending`；启动重试成功前同 ID 不能安装或激活。
+- 完全卸载提交后的任一 owner 清理失败：插件保持已卸载，返回 `dataCleanupPending`；启动重试成功前同 ID 不能
+  安装或激活，设置页结束 loading、刷新 inventory 并显示固定页面级提示。
 
 任何存储失败都不停止、重置、完成或取消 Timer，也不影响消息、Toast、托盘和闹铃。
 
@@ -239,8 +262,11 @@ effective 值启动新一轮；paused 的“继续”保持可用，因为它恢
 - 升级后值保留；保留数据卸载再安装后值恢复；彻底卸载后为空。
 - 分别暂停已签发的 Window write 与 Runtime write，再并发彻底卸载；两组测试都证明卸载等待 data lease 后
   提交并删除，旧调用不能重建目录；已取得 Window lease 但未取得 data lease 的调用被拒绝。
-- drain/持久提交在线性化点前失败时销毁旧实例并以新 admission epoch 恢复已安装插件；持久卸载提交后 storage
-  删除失败时不恢复插件，保留 tombstone，重启幂等重试并阻止同 ID 安装/激活；清理成功后 tombstone 消失。
+- Runtime 持 current guard 并进入 data gate 时与卸载并发，证明固定锁顺序无死锁；旧 Runtime request 不能跨
+  admission epoch 获取 lease，卸载不得持 data gate 或 scheduler mutex 等待 data lease。
+- drain/持久提交在线性化点前失败时销毁旧实例并以新 admission epoch 恢复已安装插件；持久卸载提交后分别模拟
+  storage 成功但 secret、state owner、package tree 或窗口位置清理失败，证明插件不恢复、receipt 保留且同 ID
+  安装/激活被阻止；重启幂等重试全部目标成功后 receipt 消失。
 - Runtime 与 Window 共同拒绝不匹配统一正则或 `__proto__`/`prototype`/`constructor` 的 key；非法 key/value 映射
   `InvalidOperation`，5 MiB 配额和原子提交失败映射 `StorageError` 且保持旧值。
 - 存储调用不改变 timer revision，不持有窗口/Timer 锁跨文件 I/O。
@@ -263,6 +289,11 @@ effective 值启动新一轮；paused 的“继续”保持可用，因为它恢
 - paused 在保存未完成时仍可继续当前轮，且不读取 pending/effective 下一轮时长。
 - paused 的继续无输入；idle/fired 的新轮使用持久时长。
 - 新 `onUpdate` 后旧读写完成不改变 DOM；当前 Timer 恢复与选择器持久值可同时正确显示。
+
+### 9.4 管理界面
+
+- 卸载返回 `dataCleanupPending` 时设置页结束 loading、刷新 inventory、移除插件行并显示固定页面级提示；不显示
+  “操作不可用”。
 
 ## 10. 人工验收
 
