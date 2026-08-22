@@ -56,7 +56,7 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 **Distinct test coverage:** table-driven valid directory/archive packages; missing/wrong-case/extra/non-timer WAV rejection; exact RIFF chunk order, padding, length arithmetic, PCM equations, duration and size boundaries; source hardlink becomes a single-link staging file; private alarm affects digest/revalidation but is absent from public resource enumeration and always returns `403`.
 
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::alarm_asset::tests && cargo test --manifest-path src-tauri/Cargo.toml public_plugins::tests`
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::alarm_asset::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::tests`
 
 ### Task 2: Publish Atomic Activation Bundles and Non-Reusable Identities
 
@@ -72,7 +72,7 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 **Distinct test coverage:** uninstall then reinstall can reuse generation `1` but never activationId; old cancel/publish/fault results cannot affect the new Bundle; reservation blocks concurrent mutations while readers retain the complete old Bundle; failure injection before durable replace, inside each helper outcome, between `Committed` and `Durable`, and after `Durable`; config-only rename/settings preserve an active Timer and owner; cleanup failure after publication does not roll back the new Bundle.
 
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::activation_bundle::tests && cargo test --manifest-path src-tauri/Cargo.toml public_plugins::activation::tests && cargo test --manifest-path src-tauri/Cargo.toml public_plugins::state_tests`
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::activation_bundle::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::activation::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::state_tests`
 
 ### Task 3: Enforce Pre-Navigation Native WebView Muting
 
@@ -87,7 +87,7 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 **Distinct test coverage:** ordered inert-create -> cast -> set -> readback -> listener -> navigate sequence; every preparation step and timeout fails before plugin navigation; the first plugin script observes a muted controller; runtime/content reloads remain muted; a later unmute event destroys only the exact current activation/session; CSP and fixed-path denial block media as defense in depth.
 
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::webview_audio_guard::tests && cargo test --manifest-path src-tauri/Cargo.toml plugin_window::tests && cargo test --manifest-path src-tauri/Cargo.toml public_plugins::tests`
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::webview_audio_guard::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib plugin_window::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::tests`
 
 ### Task 4: Freeze Activation and Alarm Authority into Timer Tickets
 
@@ -102,7 +102,7 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 **Distinct test coverage:** an update before a new round gives only the new round the new asset; an already running round retains old frozen bytes through package deletion; old generation-1 tickets fail after uninstall/reinstall generation-1 because activationId differs; Reset/update/focus/cancel races reject stale completion and audio effects; identity/round/audio/revision exhaustion never wraps.
 
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml public_plugins::timers::tests && cargo test --manifest-path src-tauri/Cargo.toml public_plugins::activation::tests && cargo test --manifest-path src-tauri/Cargo.toml message_center::tests`
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::timers::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::activation::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib message_center::tests`
 
 ### Task 5: Add Epoch Ownership and a Memory-Safe Windows Audio Adapter
 
@@ -118,7 +118,7 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 **Distinct test coverage:** first valid owner and invalid-first admission; concurrent start barriers with later tickets; cancel/focus/reset/update before call, during call, and after return; ordinary audio suppressed only while Timer audio actually plays and never replayed; all WinMM calls serialized; start failure ends only that round; stop failure quarantines one bounded buffer and makes subsequent ordinary/Timer audio fail closed; both coordinator/adapter drop orders and poison fallback retain quarantined memory.
 
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml native_attention::tests && cargo test --manifest-path src-tauri/Cargo.toml native_attention::windows_audio::tests`
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib native_attention::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib native_attention::windows_audio::tests`
 
 ### Task 6: Migrate Pomodoro Assets, Update SDK Guidance, and Integrate
 
