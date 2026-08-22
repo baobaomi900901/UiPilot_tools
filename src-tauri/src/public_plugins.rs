@@ -1,4 +1,5 @@
 mod activation;
+mod alarm_asset;
 mod delayed_messages;
 mod icon;
 mod manifest;
@@ -39,6 +40,7 @@ pub(crate) use activation::{
     PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginRoute,
     PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse,
 };
+pub(crate) use alarm_asset::PreparedAlarmAsset;
 pub(crate) use manifest::{
     public_manifest_v1_schema, PublicActivationMode, PublicManifestV1, PublicOutputMode,
     PublicPermission, PublicPlatform,
@@ -525,6 +527,9 @@ impl PublicPluginService {
         path: &str,
         query: Option<&str>,
     ) -> Response<Vec<u8>> {
+        if path.trim_start_matches('/') == alarm_asset::ALARM_PATH {
+            return Response::builder().status(403).body(Vec::new()).unwrap();
+        }
         if query.is_some() && icon::is_icon_request(path) {
             return Response::builder().status(403).body(Vec::new()).unwrap();
         }
@@ -720,6 +725,8 @@ pub(crate) struct PreparedPublicPlugin {
     pub(crate) manifest: PublicManifestV1,
     pub(crate) digest: String,
     pub(crate) resources: BTreeMap<String, PublicResource>,
+    package_resources: BTreeMap<String, PublicResource>,
+    pub(crate) alarm: Option<PreparedAlarmAsset>,
 }
 
 impl PreparedPublicPlugin {
@@ -729,6 +736,8 @@ impl PreparedPublicPlugin {
         manifest: PublicManifestV1,
         digest: String,
         resources: BTreeMap<String, PublicResource>,
+        package_resources: BTreeMap<String, PublicResource>,
+        alarm: Option<PreparedAlarmAsset>,
     ) -> Self {
         Self {
             transaction_root: Some(transaction_root),
@@ -736,6 +745,8 @@ impl PreparedPublicPlugin {
             manifest,
             digest,
             resources,
+            package_resources,
+            alarm,
         }
     }
 
@@ -747,13 +758,20 @@ impl PreparedPublicPlugin {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), PublicPackageError> {
-        package::revalidate_snapshot(&self.package_root, &self.digest, &self.resources)
+        package::revalidate_snapshot(&self.package_root, &self.digest, &self.package_resources)?;
+        if let Some(alarm) = &self.alarm {
+            alarm.revalidate_at(&self.package_root)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn persist(mut self, destination: &Path) -> Result<bool, PublicPackageError> {
         self.revalidate()?;
         if destination.exists() {
-            package::revalidate_snapshot(destination, &self.digest, &self.resources)?;
+            package::revalidate_snapshot(destination, &self.digest, &self.package_resources)?;
+            if let Some(alarm) = &self.alarm {
+                alarm.revalidate_at(destination)?;
+            }
             return Ok(false);
         }
         let parent = destination

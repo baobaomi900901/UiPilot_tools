@@ -28,6 +28,19 @@ fn public_plugin_icon_protocol_rejects_query_parameters() {
     assert_eq!(response.status(), 403);
 }
 
+#[test]
+fn public_plugin_alarm_protocol_is_always_forbidden() {
+    let service = PublicPluginService::default();
+    for label in [
+        "public-runtime-com.example.timer-g1",
+        "public-plugin-content-com.example.timer",
+    ] {
+        let response = service.asset_response(label, "/assets/sounds/timer-alarm.wav", None);
+        assert_eq!(response.status(), 403);
+        assert!(response.body().is_empty());
+    }
+}
+
 struct TestRoot(PathBuf);
 
 impl TestRoot {
@@ -108,6 +121,172 @@ fn accepts_archive_and_directory_packages() {
         drop(prepared);
         assert!(!transaction.exists());
     }
+}
+
+#[test]
+fn accepts_timer_alarm_in_directory_and_archive_without_exposing_it_publicly() {
+    for (name, archive) in [("timer-directory", false), ("timer-archive", true)] {
+        let root = TestRoot::new(name);
+        let source = root.package();
+        write_package(&source, &timer_manifest());
+        let alarm = source.join("assets/sounds/timer-alarm.wav");
+        fs::create_dir_all(alarm.parent().unwrap()).unwrap();
+        fs::write(&alarm, valid_alarm_wav()).unwrap();
+        let source = if archive {
+            let path = root.0.join("candidate.uipilot-plugin");
+            archive_directory(&source, &path);
+            PublicPackageSource::Archive(path)
+        } else {
+            PublicPackageSource::DevelopmentDirectory(source)
+        };
+
+        let prepared = stage_public_package(source, &root.staging(), &host()).unwrap();
+
+        assert_eq!(prepared.revalidate(), Ok(()));
+        assert!(!prepared
+            .resources
+            .contains_key("assets/sounds/timer-alarm.wav"));
+    }
+}
+
+#[test]
+fn accepts_supported_alarm_pcm_boundaries() {
+    for (name, wav) in [
+        ("mono-24-padding", alarm_wav(1, 1, 44_100, 24)),
+        ("stereo-48k-24", alarm_wav(100, 2, 48_000, 24)),
+        (
+            "max-duration-mono-24",
+            alarm_wav(44_100 * 15, 1, 44_100, 24),
+        ),
+    ] {
+        let root = TestRoot::new(name);
+        let source = root.package();
+        write_package(&source, &timer_manifest());
+        write_alarm(&source, &wav);
+        let prepared = stage_public_package(
+            PublicPackageSource::DevelopmentDirectory(source),
+            &root.staging(),
+            &host(),
+        )
+        .unwrap();
+        assert!(prepared.alarm.is_some());
+        assert_eq!(prepared.revalidate(), Ok(()));
+    }
+}
+
+#[test]
+fn timer_permission_and_fixed_alarm_must_be_declared_together() {
+    let missing = TestRoot::new("timer-alarm-missing");
+    let source = missing.package();
+    write_package(&source, &timer_manifest());
+    assert_rejected(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &missing,
+        PublicPackageError::InvalidPackage,
+    );
+
+    let unexpected = TestRoot::new("timer-alarm-unexpected");
+    let source = unexpected.package();
+    write_package(&source, &manifest("window"));
+    write_alarm(&source, &valid_alarm_wav());
+    assert_rejected(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &unexpected,
+        PublicPackageError::InvalidPackage,
+    );
+}
+
+#[test]
+fn rejects_malformed_or_unsupported_timer_alarm_wav() {
+    let mut bad_riff = valid_alarm_wav();
+    bad_riff[0] = b'X';
+    let mut trailing = valid_alarm_wav();
+    trailing.push(0);
+    let mut non_pcm = valid_alarm_wav();
+    non_pcm[20..22].copy_from_slice(&3_u16.to_le_bytes());
+    let mut channels = valid_alarm_wav();
+    channels[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    let mut sample_rate = valid_alarm_wav();
+    sample_rate[24..28].copy_from_slice(&22_050_u32.to_le_bytes());
+    let mut byte_rate = valid_alarm_wav();
+    byte_rate[28..32].copy_from_slice(&1_u32.to_le_bytes());
+    let mut block_align = valid_alarm_wav();
+    block_align[32..34].copy_from_slice(&1_u16.to_le_bytes());
+    let mut bits = valid_alarm_wav();
+    bits[34..36].copy_from_slice(&8_u16.to_le_bytes());
+    let mut unknown_chunk = valid_alarm_wav();
+    unknown_chunk[36..40].copy_from_slice(b"JUNK");
+    let mut extended_fmt = valid_alarm_wav();
+    extended_fmt[16..20].copy_from_slice(&18_u32.to_le_bytes());
+    let mut mismatched_data_length = valid_alarm_wav();
+    mismatched_data_length[40..44].copy_from_slice(&199_u32.to_le_bytes());
+    let mut even_padding = valid_alarm_wav();
+    even_padding.push(0);
+    let riff_size = u32::try_from(even_padding.len() - 8).unwrap();
+    even_padding[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    let mut bad_padding = alarm_wav(1, 1, 44_100, 24);
+    *bad_padding.last_mut().unwrap() = 1;
+    let mut missing_padding = alarm_wav(1, 1, 44_100, 24);
+    missing_padding.pop();
+    let zero_frames = alarm_wav(0, 1, 44_100, 16);
+    let too_long = alarm_wav(44_100 * 15 + 1, 1, 44_100, 16);
+
+    for (name, wav) in [
+        ("bad-riff", bad_riff),
+        ("trailing", trailing),
+        ("non-pcm", non_pcm),
+        ("channels", channels),
+        ("sample-rate", sample_rate),
+        ("byte-rate", byte_rate),
+        ("block-align", block_align),
+        ("bits", bits),
+        ("unknown-chunk", unknown_chunk),
+        ("extended-fmt", extended_fmt),
+        ("mismatched-data-length", mismatched_data_length),
+        ("even-padding", even_padding),
+        ("bad-padding", bad_padding),
+        ("missing-padding", missing_padding),
+        ("zero-frames", zero_frames),
+        ("too-long", too_long),
+    ] {
+        let root = TestRoot::new(name);
+        let source = root.package();
+        write_package(&source, &timer_manifest());
+        write_alarm(&source, &wav);
+        assert_rejected(
+            PublicPackageSource::DevelopmentDirectory(source),
+            &root,
+            PublicPackageError::InvalidPackage,
+        );
+    }
+}
+
+#[test]
+fn source_alarm_hardlink_is_copied_but_staged_multilink_is_rejected() {
+    let root = TestRoot::new("timer-alarm-hardlink");
+    let source = root.package();
+    write_package(&source, &timer_manifest());
+    let original = root.0.join("original.wav");
+    fs::write(&original, valid_alarm_wav()).unwrap();
+    let alarm = source.join("assets/sounds/timer-alarm.wav");
+    fs::create_dir_all(alarm.parent().unwrap()).unwrap();
+    fs::hard_link(&original, &alarm).unwrap();
+
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+    fs::write(&original, alarm_wav(101, 1, 44_100, 16)).unwrap();
+    assert_eq!(prepared.revalidate(), Ok(()));
+
+    let staged_alarm = prepared.package_root.join("assets/sounds/timer-alarm.wav");
+    fs::hard_link(staged_alarm, root.0.join("staged-alarm-link.wav")).unwrap();
+    assert_eq!(
+        prepared.revalidate(),
+        Err(PublicPackageError::InvalidPackage)
+    );
 }
 
 #[test]
@@ -299,6 +478,48 @@ fn manifest(mode: &str) -> Value {
         value["window"] = json!({"entry":"dist/window.html"});
     }
     value
+}
+
+fn timer_manifest() -> Value {
+    let mut value = manifest("window");
+    value["permissions"] = json!(["ui.window", "notifications.publish", "timer.control"]);
+    value
+}
+
+fn valid_alarm_wav() -> Vec<u8> {
+    alarm_wav(100, 1, 44_100, 16)
+}
+
+fn alarm_wav(frames: u32, channels: u16, sample_rate: u32, bits_per_sample: u16) -> Vec<u8> {
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+    let data = vec![0_u8; usize::from(block_align) * usize::try_from(frames).unwrap()];
+    let padding = data.len() % 2;
+    let riff_size = 36_u32 + u32::try_from(data.len() + padding).unwrap();
+    let mut wav = Vec::with_capacity(44 + data.len() + padding);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    wav.extend_from_slice(&data);
+    if padding == 1 {
+        wav.push(0);
+    }
+    wav
+}
+
+fn write_alarm(root: &Path, bytes: &[u8]) {
+    let alarm = root.join("assets/sounds/timer-alarm.wav");
+    fs::create_dir_all(alarm.parent().unwrap()).unwrap();
+    fs::write(alarm, bytes).unwrap();
 }
 
 fn write_package(root: &Path, manifest: &Value) {

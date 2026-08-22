@@ -11,8 +11,9 @@ use unicode_normalization::UnicodeNormalization;
 use zip::{CompressionMethod, ZipArchive};
 
 use super::{
+    alarm_asset::{self, PreparedAlarmAsset, ALARM_MIME, ALARM_PATH},
     icon::{self, ICON_MIME, ICON_PATH, MAX_ICON_BYTES},
-    manifest::{parse_manifest, PublicManifestV1},
+    manifest::{parse_manifest, PublicManifestV1, PublicPermission},
     PreparedPublicPlugin, PublicPackageError, PublicPackageSource, PublicPluginHost,
     PublicResource,
 };
@@ -41,7 +42,8 @@ pub(super) fn load_existing(
     let manifest = parse_manifest(&manifest_bytes, host)?;
     validate_manifest_entries(package_root, &manifest, &snapshot.resources)?;
     validate_css_references(package_root, &snapshot.resources)?;
-    Ok((manifest, snapshot.resources))
+    let (resources, _) = split_resources(package_root, &snapshot.resources)?;
+    Ok((manifest, resources))
 }
 
 pub(super) fn remove_package_tree(path: PathBuf) {
@@ -82,13 +84,16 @@ pub(super) fn stage(
     if first.digest != second.digest || first.resources != second.resources {
         return Err(PublicPackageError::InvalidPackage);
     }
+    let (resources, alarm) = split_resources(&package_root, &second.resources)?;
 
     Ok(PreparedPublicPlugin::new(
         guard.into_path(),
         package_root,
         manifest,
         second.digest,
+        resources,
         second.resources,
+        alarm,
     ))
 }
 
@@ -181,7 +186,7 @@ fn extract_archive(archive_path: &Path, package_root: &Path) -> Result<(), Publi
             fs::create_dir_all(&destination).map_err(|_| PublicPackageError::InvalidPackage)?;
             continue;
         }
-        validate_public_resource_path(&canonical)?;
+        validate_package_resource_path(&canonical)?;
         files = files
             .checked_add(1)
             .filter(|value| *value <= MAX_FILES)
@@ -266,7 +271,7 @@ fn copy_directory(
             fs::create_dir(&destination).map_err(|_| PublicPackageError::InvalidPackage)?;
             copy_directory(root, &source_path, destination_root, context)?;
         } else if metadata.is_file() {
-            validate_public_resource_path(&canonical)?;
+            validate_package_resource_path(&canonical)?;
             context.files = context
                 .files
                 .checked_add(1)
@@ -390,7 +395,7 @@ fn scan_directory(
         if !metadata.is_file() {
             return Err(PublicPackageError::InvalidPackage);
         }
-        let mime = validate_public_resource_path(&canonical)?;
+        let mime = validate_package_resource_path(&canonical)?;
         context.files = context
             .files
             .checked_add(1)
@@ -425,6 +430,12 @@ fn validate_manifest_entries(
     manifest: &PublicManifestV1,
     resources: &BTreeMap<String, PublicResource>,
 ) -> Result<(), PublicPackageError> {
+    let declares_timer = manifest
+        .permissions
+        .contains(&PublicPermission::TimerControl);
+    if declares_timer != resources.contains_key(ALARM_PATH) {
+        return Err(PublicPackageError::InvalidPackage);
+    }
     if !resources.contains_key(&manifest.runtime.entry)
         || manifest
             .window
@@ -452,6 +463,18 @@ fn validate_manifest_entries(
         icon::validate_png(&bytes)?;
     }
     Ok(())
+}
+
+fn split_resources(
+    root: &Path,
+    package_resources: &BTreeMap<String, PublicResource>,
+) -> Result<(BTreeMap<String, PublicResource>, Option<PreparedAlarmAsset>), PublicPackageError> {
+    let mut public_resources = package_resources.clone();
+    let alarm = public_resources
+        .remove(ALARM_PATH)
+        .map(|resource| alarm_asset::prepare(root, &resource))
+        .transpose()?;
+    Ok((public_resources, alarm))
 }
 
 fn validate_css_references(
@@ -686,7 +709,10 @@ fn register_directory(
     }
     Ok(())
 }
-fn validate_public_resource_path(path: &str) -> Result<&'static str, PublicPackageError> {
+fn validate_package_resource_path(path: &str) -> Result<&'static str, PublicPackageError> {
+    if path == ALARM_PATH {
+        return Ok(ALARM_MIME);
+    }
     if path == "plugin.json" {
         return Ok("application/json");
     }

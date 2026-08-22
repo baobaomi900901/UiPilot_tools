@@ -2212,6 +2212,7 @@ mod tests {
 
     fn write_timer_package(root: &Path, version: &str) {
         fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join("assets/sounds")).unwrap();
         fs::write(
             root.join("plugin.json"),
             serde_json::to_vec(&json!({
@@ -2241,6 +2242,32 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("dist/window.html"), "<!doctype html>").unwrap();
+        fs::write(root.join("assets/sounds/timer-alarm.wav"), test_alarm_wav()).unwrap();
+    }
+
+    fn test_alarm_wav() -> Vec<u8> {
+        let channels = 1_u16;
+        let sample_rate = 44_100_u32;
+        let bits_per_sample = 16_u16;
+        let block_align = channels * (bits_per_sample / 8);
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data = vec![0_u8; usize::from(block_align) * 100];
+        let riff_size = 36_u32 + u32::try_from(data.len()).unwrap();
+        let mut wav = Vec::with_capacity(44 + data.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+        wav.extend_from_slice(&data);
+        wav
     }
 
     fn install_timer(manager: &PublicPluginManager, source_path: &Path) -> u64 {
