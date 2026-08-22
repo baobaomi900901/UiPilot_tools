@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第五轮独立审核 finding 已处理，等待复审
+- 状态：Draft，第六轮独立审核 finding 已处理，等待复审
 - 范围：公开插件计时闹铃的私有包资源、安装校验、激活身份、原生播放与声音仲裁
 - 公开 JavaScript API：不变
 - Manifest 字段：不变
@@ -407,7 +407,8 @@ Reserved -> Committing -> Durable -> Published
 
 线性化点后的窗口销毁或旧包清理失败只记录并延后重试，不能回滚新 Bundle。只有进入 `Committing` 前失败，
 或 helper 返回 `NotCommitted` 且旧 digest 复核成功时，旧 generation、旧内存闹铃、旧 Runtime 和旧 Timer
-才继续有效；其他持久结果按本节 terminal 合同处理。
+才继续有效。`Committed` 按步骤 5-11 进入 `Durable -> Published`；`Unknown`、旧 digest 复核失败的
+`NotCommitted`，以及 `Committing`/`Durable` 异常按本节 terminal 合同处理。
 
 `Reserved` 阶段由 RAII guard 负责异常清理；线程 panic 或提前返回会清除 reservation 并保留旧 Bundle。
 `Committing` 与 `Durable` 的 guard 在 Rust panic/unwind、提前返回、锁中毒或 CAS 不一致时，不得清除
