@@ -29,10 +29,11 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 - `AlarmAssetIdentity` binds `pluginId + pluginGeneration + activationId + packageDigest + resourceSha256 + fixedRelativePath`.
 - `ValidatedAlarmAsset` is that identity plus immutable `Arc<[u8]>` bytes.
 - `ActivationBundle` atomically exposes config, public Runtime snapshot, optional private alarm, generation, and activationId.
+- `WebViewGuardToken` is a checked, non-reusable, exact-instance ownership token for the Windows mute handshake; cancellation is terminal and every asynchronous callback must CAS it before navigation or teardown.
 - Activation reservation follows `Reserved -> Committing -> Durable -> Published`; the durable helper returns only `NotCommitted | Committed | Unknown`.
 - `TimerKey` includes `pluginId + activationId`; completion carries its full `AudioTicket`, frozen alarm identity, and frozen bytes.
 - `timerAudioOwner` follows `reserved -> playing` within a monotonic `alarmEpoch`. The first valid ticket owns the epoch; later tickets do not mix, switch, retry, or become fallback owners.
-- `WindowsAudioAdapter` owns `PlayingMemory`. A failed stop moves the buffer to process-static `ProcessAudioQuarantine` and makes the whole native audio adapter terminal.
+- `AlarmPlaybackKey` is the only playback identity crossing the audio adapter seam; `WindowsAudioAdapter` owns `PlayingMemory { key, bytes }` and does not interpret Timer or plugin identities. A failed stop moves the buffer to process-static `ProcessAudioQuarantine` and makes the whole native audio adapter terminal.
 
 ## Global Execution Rules
 
@@ -80,12 +81,12 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 **Dependencies:** Task 2; design sections 7.2, 9.1 item 6, 13.2, 16.2.
 
-- [ ] Create public-plugin Runtime and content WebViews on an inert host-owned URL with no plugin initialization script or controllable resource loaded.
-- [ ] Behind a fakeable Windows boundary, obtain `ICoreWebView2_8`, call `SetIsMuted(true)`, read back true, register `IsMutedChanged`, and complete a bounded readiness handshake before native navigation to the plugin URL.
-- [ ] On cast/set/read/listener/timeout failure, destroy the candidate WebView and fail closed. On a later false mute observation, destroy the affected WebView and revoke the matching Runtime or content session.
+- [ ] On Windows, create public-plugin Runtime and content WebViews on an inert host-owned URL with no plugin initialization script or controllable resource loaded; keep the existing macOS `timer.control` rejection and do not assume WebView2 outside Windows.
+- [ ] Sign a checked non-reusable `WebViewGuardToken` for the exact native WebView plus Runtime activation/generation or content session generation. Behind a fakeable Windows seam, obtain `ICoreWebView2_8`, call `SetIsMuted(true)`, register `IsMutedChanged`, perform the final true readback, register bootstrap completion, CAS the token, and only then navigate to the plugin URL.
+- [ ] On cast/set/listener/readback/bootstrap/token/timeout failure, terminally revoke the token, destroy the candidate WebView, and fail closed. Every late callback must become a no-op; a later false mute observation may destroy only the exact WebView and matching Runtime activation or content session held by the current token.
 - [ ] Keep mute enforcement across reload and session reuse, deny plugin navigation/mute commands, and add `media-src 'none'` to both Runtime host and protocol response CSP.
 
-**Distinct test coverage:** ordered inert-create -> cast -> set -> readback -> listener -> navigate sequence; every preparation step and timeout fails before plugin navigation; the first plugin script observes a muted controller; runtime/content reloads remain muted; a later unmute event destroys only the exact current activation/session; CSP and fixed-path denial block media as defense in depth.
+**Distinct test coverage:** ordered inert-create -> token -> cast -> set -> listener -> final-readback -> bootstrap-completion -> token-CAS -> navigate sequence; every preparation step and timeout fails before plugin navigation; timeout/destroy followed by a late bootstrap callback never navigates; an old unmute callback cannot destroy a new same-label Runtime/content WebView or session; the first plugin script observes a muted controller; runtime/content reloads remain muted; token exhaustion fails closed without reuse; CSP and fixed-path denial block media as defense in depth.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::webview_audio_guard::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib plugin_window::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::tests`
 
@@ -111,12 +112,12 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 **Dependencies:** Task 4; design sections 4.3, 11-12, 13.2, 16.5.
 
 - [ ] Replace the shared active-ticket set with one logical `timerAudioOwner { reserved | playing }` and checked alarmEpoch stamping at mailbox admission. The first valid ticket owns the epoch; same-epoch tickets never start, switch, mix, or become fallback.
-- [ ] Revalidate epoch, full ticket, and asset identity around asynchronous start. A late success may stop only its matching adapter state and cannot stop a newer owner.
-- [ ] Make `WindowsAudioAdapter` the sole serial point for all WinMM calls: ordinary sound remains filename-backed one-shot host audio, while Timer uses `PlaySoundW(SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT)` with adapter-owned `PlayingMemory`.
+- [ ] Revalidate epoch, full ticket, asset identity, and opaque `AlarmPlaybackKey` around asynchronous start. A late success may stop only the adapter state with the same key and cannot stop a newer owner.
+- [ ] Keep full Timer/plugin/asset qualification in the coordinator and expose only `start(AlarmPlaybackKey, Arc<[u8]>)`, `stop(AlarmPlaybackKey)`, and `shutdown()` at the audio adapter seam. Make `WindowsAudioAdapter` the sole serial point for all WinMM calls: ordinary sound remains filename-backed one-shot host audio, while Timer uses `PlaySoundW(SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT)` with adapter-owned `PlayingMemory { key, bytes }`.
 - [ ] Keep the alarm `Arc<[u8]>` alive until a successful matching stop. On stop failure, move it to process-static non-dropping `ProcessAudioQuarantine`, make the whole native audio adapter terminal, and keep Toast/tray/badge/message paths operational.
 - [ ] Ensure focus, cancellation, shutdown, worker panic/disconnect, root/adapter drop-order variants, and lock-poison fallback cannot release bytes still used by WinMM or let an old stop affect a new owner.
 
-**Distinct test coverage:** first valid owner and invalid-first admission; concurrent start barriers with later tickets; cancel/focus/reset/update before call, during call, and after return; ordinary audio suppressed only while Timer audio actually plays and never replayed; all WinMM calls serialized; start failure ends only that round; stop failure quarantines one bounded buffer and makes subsequent ordinary/Timer audio fail closed; both coordinator/adapter drop orders and poison fallback retain quarantined memory.
+**Distinct test coverage:** first valid owner and invalid-first admission; concurrent start barriers with later tickets; cancel/focus/reset/update before call, during call, and after return; late start/stop can affect only the same `AlarmPlaybackKey`; adapter fakes require no AudioTicket, plugin, activation, epoch, or asset-domain comparison; ordinary audio is suppressed only while Timer audio actually plays and never replayed; all WinMM calls are serialized; start failure ends only that round; stop failure quarantines one bounded buffer and makes subsequent ordinary/Timer audio fail closed; both coordinator/adapter drop orders and poison fallback retain quarantined memory.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib native_attention::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib native_attention::windows_audio::tests`
 
