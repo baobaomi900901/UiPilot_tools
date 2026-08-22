@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第三轮独立审核 findings 已处理，等待复审
+- 状态：Draft，第四轮独立审核 findings 已处理，等待复审
 - 范围：公开插件计时闹铃的私有包资源、安装校验、激活身份、原生播放与声音仲裁
 - 公开 JavaScript API：不变
 - Manifest 字段：不变
@@ -386,30 +386,33 @@ Reserved -> Committing -> Durable -> Published
    继续看到完整旧 Bundle；
 3. 在执行持久替换前，预先构造 `DurableCommit` token 及成功路径需要的全部内存，并把 RAII guard 原子设置为
    `Committing`；
-4. 在所有运行时锁之外执行持久状态临时文件的原子替换；
-5. 替换成功返回后，立即用不可失败、无分配、无取锁的原子写入把 guard 设置为 `Durable`；从原生替换调用
+4. 在所有运行时锁之外调用持久状态原子替换 helper；helper 的公开结果固定为
+   `NotCommitted | Committed | Unknown`；
+5. `Committed` 返回后，立即用不可失败、无分配、无取锁的原子写入把 guard 设置为 `Durable`；从 helper
    返回到该原子写入之间不得执行其他代码；
-6. 替换返回失败时，只有宿主重新验证并证明 durable 文件仍是准备前的旧 digest，才允许把 reservation 回到
-   `Reserved`、清除并删除候选；若 durable 文件是新 digest 或结果无法确定，公开插件服务进入 terminal；
-7. 重新取得 plugin mutation guard，验证同一 reservation，再按固定顺序取得 window session、Timer 与
+6. `NotCommitted` 仍必须重新读取并证明 durable 文件是准备前的旧 digest，才允许把 reservation 回到
+   `Reserved`、清除并删除候选；若文件是新 digest、未知 digest、缺失或无法验证，公开插件服务进入 terminal；
+7. `Unknown` 立即使公开插件服务进入 terminal，不尝试回滚；
+8. 重新取得 plugin mutation guard，验证同一 reservation，再按固定顺序取得 window session、Timer 与
    ActivationBundle 内存锁；
-8. 在不执行 I/O 的临界区内，以不可失败的内存交换发布新 Bundle，并按第 8.4 节 mutation 分类撤销权威：
+9. 在不执行 I/O 的临界区内，以不可失败的内存交换发布新 Bundle，并按第 8.4 节 mutation 分类撤销权威：
    新激活/移除操作撤销旧窗口 session、Timer、ClaimTicket、AudioTicket 和 owner；config-only mutation 只撤销
    旧请求和窗口 session，保留 Timer 与音频；随后把 reservation 提交为 `Published`；
-9. 清除已发布 reservation 并释放所有锁；
-10. 锁外派发取消效果、销毁旧窗口并清理旧包。
+10. 清除已发布 reservation 并释放所有锁；
+11. 锁外派发取消效果、销毁旧窗口并清理旧包。
 
-第 8 步的可见 Bundle 交换是运行时激活线性化点。持久状态已在第 4-5 步提交，但 reservation 阻止进程内观察
-到半提交状态；若进程在 durable helper 成功与第 8 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧
+第 9 步的可见 Bundle 交换是运行时激活线性化点。持久状态已在第 4-5 步提交，但 reservation 阻止进程内观察
+到半提交状态；若进程在 durable helper 成功与第 9 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧
 内存 Timer 已随进程消失。
 
 线性化点后的窗口销毁或旧包清理失败只记录并延后重试，不能回滚新 Bundle。更新失败时旧 generation、旧
 内存闹铃、旧 Runtime 和旧 Timer 均继续有效。
 
 `Reserved` 阶段由 RAII guard 负责异常清理；线程 panic 或提前返回会清除 reservation 并保留旧 Bundle。
-`Committing` 与 `Durable` 的 guard 异常路径不得清除 reservation。若这两个阶段发生 panic、SEH、锁中毒、
-CAS 不一致或任何原因无法完成 `Published`，整个公开插件服务立即进入本进程 terminal。原子替换返回错误不
-等于“未替换”；必须先按步骤 6 验证旧 digest 才能安全回滚。
+`Committing` 与 `Durable` 的 guard 在 Rust panic/unwind、提前返回、锁中毒或 CAS 不一致时，不得清除
+reservation，并必须通过不可失败的原子写把公开插件服务设为 terminal。helper 内部可恢复的原生异常必须转换
+为 `Unknown`。访问违规、栈溢出、abort 等致命 SEH 允许直接终止进程，不承诺运行 Rust Drop；新进程按 durable
+文件 digest 重建完整 Bundle。原生 helper 的任意错误也不自动等于“未替换”；只有步骤 6 的双重验证允许回滚。
 
 terminal 行为固定为：
 
@@ -608,9 +611,12 @@ Toast、托盘和徽标继续可用。
 
 ### 13.3 原子提交失败
 
-- reservation 前失败：旧 Bundle 完整保留；
-- `Reserved` 后持久替换失败：RAII 清除 reservation，删除候选，旧 Bundle 和旧 Timer 完整保留；
-- `Durable` 后同进程无法发布：公开插件服务进入 terminal，不允许继续服务旧 Bundle；
+- 进入 `Committing` 前失败：RAII 清除 reservation，旧 Bundle 完整保留；
+- `Committing` 中 helper 返回 `NotCommitted`，且重新验证仍为旧 digest：清除 reservation、删除候选，旧
+  Bundle 和旧 Timer 完整保留；
+- helper 返回 `Committed`：进入 `Durable`，不得回滚；
+- helper 返回 `Unknown`，或 `NotCommitted` 后发现新/未知/缺失/不可验证 digest：公开插件服务进入 terminal；
+- `Committing`/`Durable` 的 Rust unwind 或同进程无法发布：公开插件服务进入 terminal，不允许继续服务旧 Bundle；
 - `Durable` 后进程退出：新进程从新状态重建，旧内存副作用随进程结束；
 - Bundle 线性化后清理失败：新 Bundle 保持成功，旧清理延后重试，不回滚。
 
@@ -671,10 +677,12 @@ Toast、托盘和徽标继续可用。
 
 - 候选准备、Runtime ready、包持久化、状态替换和 Bundle 发布逐步故障注入；
 - reservation 阻止并发 enable/disable/update/uninstall 观察或制造半提交状态；
-- `Reserved` panic 自动回滚；`Committing` 或 `Durable` 的 panic、SEH、锁中毒、CAS 异常或 durable 结果不确定
-  均使公开插件服务 terminal；
+- `Reserved` panic 自动回滚；`Committing` 或 `Durable` 的 Rust panic/unwind、锁中毒、CAS 异常或 durable
+  结果不确定均使公开插件服务 terminal；
+- helper 三态 `NotCommitted | Committed | Unknown` 均有确定性测试；`NotCommitted` 仅在旧 digest 复核通过
+  后回滚；
 - 故障注入精确覆盖原子替换调用前、调用中、成功返回到 Durable 原子写入之间及 Durable 写入后；
-- 持久替换失败旧 Bundle 完整保留；
+- 可恢复原生异常模拟为 `Unknown`；不在自动化中制造访问违规、栈溢出或 abort；
 - 新激活线性化点同时发布 config/runtime/asset 并撤销旧 Timer 权威；config-only Bundle 交换复用
   activationId 并保留 Timer/owner；
 - 锁序固定为 `plugin mutation -> window session -> timer -> ActivationBundle`，锁内不进入 attention；
@@ -719,8 +727,9 @@ Toast、托盘和徽标继续可用。
 7. 主窗口聚焦、owner 生命周期撤销、Reset、新轮次或退出按完整身份停止闹铃。
 8. 闹铃期间普通消息仍完整送达，但其公共提示音被抑制且不补播。
 9. 安装期无默认回退；运行期原生音频失败不回滚消息，也不错误停用插件。
-10. 更新失败保留完整旧 Bundle；成功更新原子发布新 Bundle 并只让新计时使用新闹铃；config-only 修改保留
-    activationId 和运行中 Timer。
+10. 更新在进入 `Committing` 前失败，或 helper 返回 `NotCommitted` 且旧 digest 复核通过时，保留完整旧
+    Bundle；成功更新原子发布新 Bundle 并只让新计时使用新闹铃；config-only 修改保留 activationId 和运行中
+    Timer。
 11. `Reserved` 可回滚；`Committing`/`Durable` 的异常或不确定结果会使公开插件服务 terminal，不能继续运行
     旧 Bundle。
 12. PCM 字节由 Windows audio adapter 最终持有；worker panic、迟到 start/stop 和 emergency-stop 均不会释放
