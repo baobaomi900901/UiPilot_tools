@@ -41,55 +41,55 @@ Use the exact identities, error mapping, transaction order, and UI state from de
 - The approved design is authoritative for authorization, linearization, lock order, rollback, failure behavior, and acceptance. This plan assigns implementation ownership without weakening those contracts.
 - Run Rust commands from the repository root with `--manifest-path src-tauri/Cargo.toml`. Run frontend and example commands from the repository root.
 
-### Task 1: Add Shared Storage Admission and Runtime Integration
+### Task 1: Establish Recoverable Uninstall and Startup Recovery
+
+**Files:** create `src-tauri/src/public_plugins/owner_cleanup.rs`; modify `src-tauri/src/public_plugins/activation_bundle.rs`, `src-tauri/src/public_plugins/activation.rs`, `src-tauri/src/public_plugins/scheduler.rs`, `src-tauri/src/public_plugins/state.rs`, `src-tauri/src/public_plugins/storage.rs`, `src-tauri/src/public_plugins/secrets.rs`, `src-tauri/src/public_plugins.rs`, `src-tauri/src/plugin_window.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/settings.rs`, `src/protocol.ts`, `src/main.ts`, `src/public-plugin-panel.tsx`, `src/launcher.test.tsx`
+
+**Dependencies:** Design sections 6.1, 8, 9.1, 9.4, and acceptance item 11.6. This task must leave the existing Runtime storage path safe before any Window storage command is introduced.
+
+- [ ] Add the checked process-local `admissionEpoch` allocator. Capture the epoch in ActivationBundle and ScheduledPluginRequest, preserve it for config-only replacement, and allocate a new epoch for activation replacement or failed-uninstall recovery.
+- [ ] Split the current uninstall into explicit `begin`, `commit`, `finish_cleanup`, and `abort_before_commit` transaction phases. `begin` closes manager/window-transfer admission and invalidates the Runtime scheduler while holding only the approved lock order; because current Runtime storage executes inside `scheduler.with_current`, scheduler invalidation must wait for an already-running storage closure before proceeding.
+- [ ] Make the command-side online order exact: begin and drain the current Window/Timer session; durably commit `PluginOwnerCleanupReceipt` and publish no Bundle; destroy the Runtime and plugin window; only then delete storage, secrets, uninstalled state owner, package tree, and window position; clear the receipt last. A late `Moved` callback from the destroyed window must not recreate a position after receipt clear.
+- [ ] Persist receipts outside all target roots using only validated backend identities and fixed-root target keys. Missing targets are success; any target or receipt-clear failure leaves the receipt and same-ID install/update/activation block intact.
+- [ ] On a failure before durable commit, destroy the old Runtime/window and reopen only a newly validated epoch for the still-installed plugin. After durable commit, never restore the plugin; return `PublicPluginManagementError::DataCleanupPending` / `CommandError.code = dataCleanupPending`.
+- [ ] Freeze startup recovery in `PublicPluginService::initialize`: after `SettingsStore` is loaded and available, but before `PublicPluginManager::load` reads state or constructs any ActivationBundle, load and retry receipts. Any uncleared receipt ID enters the blocked set; even a crash snapshot whose state owner still says `installed=true` must not create a Bundle.
+- [ ] Preserve retain-data behavior: retain storage, secrets, and retained state config while removing package, Runtime/window, and position. Make normal restart and successful upgrade preserve data, and make complete uninstall followed by same-ID reinstall start empty.
+- [ ] In the settings UI, treat `dataCleanupPending` as committed uninstall: end loading, refresh inventory, remove the row, and show “插件已卸载，数据清理将在下次启动时重试” at page level instead of “操作不可用”.
+
+**Distinct test coverage:** pause existing Runtime storage inside `scheduler.with_current`, begin uninstall, prove durable commit waits for the closure, then prove no deleted root is recreated; exact online order proves Runtime/window destruction precedes position cleanup and a late move cannot rewrite it; pre-commit abort creates a new epoch and rejects old requests; receipt with state still marked installed is processed before bundle construction; storage succeeds while secret/state/package/position cleanup individually fail, keeping the block; receipt-clear failure remains blocked until a later native startup clears it; ordinary restart and successful upgrade preserve a stored value; retain-data reinstall restores it; complete uninstall cleanup plus same-ID reinstall reads no value; frontend pending-cleanup behavior ends busy state and reloads inventory.
+
+**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::owner_cleanup::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::activation::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib commands::tests && npm.cmd test -- src/launcher.test.tsx`
+
+### Task 2: Add Shared Data Admission and Runtime Storage Contract
 
 **Files:** create `src-tauri/src/public_plugins/data_call_gate.rs`; modify `src-tauri/src/public_plugins/activation_bundle.rs`, `src-tauri/src/public_plugins/activation.rs`, `src-tauri/src/public_plugins/scheduler.rs`, `src-tauri/src/public_plugins/runtime.rs`, `src-tauri/src/public_plugins/manifest.rs`, `src-tauri/src/public_plugins/storage.rs`, `src-tauri/src/public_plugins/storage_tests.rs`, `src-tauri/src/public_plugins.rs`
 
-**Dependencies:** Design sections 4, 6, 6.1, and 9.1.
+**Dependencies:** Task 1; design sections 4, 6, 6.1, and 9.1. Gate integration and uninstall close/drain are one atomic task so no commit can expose a lease that uninstall ignores.
 
-- [ ] Add a checked admission-epoch allocator and per-plugin `PluginDataCallGate`/RAII lease. Bind each published ActivationBundle, scheduled Runtime request, and later Window owner to the exact `pluginId + generation + activationId + admissionEpoch` tuple.
-- [ ] Make config-only bundle replacement preserve the epoch; activation replacement, failure recovery, disable/uninstall, and a reopened failed transaction must close or replace it exactly as specified.
-- [ ] Extend `scheduler.with_current()` access so Runtime storage reads the captured activationId/epoch while holding the current-request guard and directly calls `data_gate.try_acquire` without acquiring the mutation gate.
-- [ ] Hold the data lease through the complete Runtime storage operation, map invalid key/value to `InvalidOperation`, map quota/serialization/storage failures to `StorageError`, and leave notification/settings behavior unchanged.
-- [ ] Replace the prototype-only key check with the one shared Runtime/Window validator. Quarantine loaded documents containing any newly invalid key instead of adding legacy compatibility.
+- [ ] Add the per-plugin `PluginDataCallGate` and RAII lease keyed by `pluginId + generation + activationId + admissionEpoch`. Config-only replacement preserves the gate; replacement/disable/recovery changes or closes it.
+- [ ] In `scheduler.with_current`, read activationId/epoch from the guarded request and call `data_gate.try_acquire` directly without mutation. Hold the lease through complete Runtime storage I/O; never leave the current guard and then acquire a lease.
+- [ ] Extend Task 1's uninstall `begin` phase to acquire `mutation -> scheduler -> data gate`, close new data admission, release all mutexes, then drain existing leases before durable commit. Never hold scheduler/data-gate mutex while waiting for a lease.
+- [ ] Replace the prototype-only key check with the shared regex-plus-prototype validator. Quarantine loaded invalid documents; map key/value failures to `InvalidOperation` and quota/serialization/filesystem failures to `StorageError`.
 
-**Distinct test coverage:** checked epoch exhaustion; config-only preservation versus new-activation replacement; Runtime current guard concurrently racing gate close with no deadlock; an old request cannot acquire a new epoch; data lease remains counted through storage I/O; `9 -> 10`-style identity progression never wraps; table-driven Runtime/storage rejection of regex failures and all three prototype keys with exact error classes.
+**Distinct test coverage:** checked epoch exhaustion; config-only gate preservation versus activation replacement; Runtime current guard racing gate close with no deadlock; data lease covers full storage I/O; old requests cannot cross epoch; uninstall waits an already-signed lease but rejects a request that has not signed one; table-driven key/value/quota errors have exact classes and preserve the old document.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::data_call_gate::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::scheduler::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::runtime::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::storage_tests`
 
-### Task 2: Expose Session-Bound Window Storage
+### Task 3: Expose Session-Bound Window Storage
 
-**Files:** modify `src-tauri/src/plugin_window.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src-tauri/capabilities/plugin-window-content.json`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`, `docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/public-plugin-developer-guide.md`; generate `src-tauri/permissions/autogenerated/plugin_window_storage_get.toml`, `src-tauri/permissions/autogenerated/plugin_window_storage_set.toml`, `src-tauri/permissions/autogenerated/plugin_window_storage_remove.toml`
+**Files:** modify `src-tauri/src/plugin_window.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src-tauri/capabilities/plugin-window-content.json`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`, `docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/public-plugin-developer-guide.md`, `examples/public-plugins/com.uipilot.pomodoro/tests/sdk-contract.ts`; generate `src-tauri/permissions/autogenerated/plugin_window_storage_get.toml`, `src-tauri/permissions/autogenerated/plugin_window_storage_set.toml`, `src-tauri/permissions/autogenerated/plugin_window_storage_remove.toml`
 
-**Dependencies:** Task 1; design sections 4-6, 8, 9.1-9.2.
+**Dependencies:** Tasks 1-2; design sections 4-6, 8, 9.1-9.2. The safe uninstall/data-gate boundary is complete before this task exposes mutable Window storage.
 
-- [ ] Generalize `TimerCallLease` and the Timer session in-flight counter into the shared Window session/call lease without creating a second session state machine. Preserve all existing Timer behavior and event projection.
-- [ ] Capture admissionEpoch in `PluginWindowOwner`. Permit read leases in Prepared/Active and mutable leases only in Active; Closing/Revoked and stale decimal session generations fail before manager or storage access.
-- [ ] Add the three narrow Tauri commands. After the Window lease, atomically validate the current ActivationBundle and sign a data lease under the mutation/data-gate order, release all manager/controller locks, then call `PluginStorageStore`.
-- [ ] Add the command allowlist, content capability, generated permissions, exact caller/error mapping, and focused guard tests for content versus shell/main/find/Runtime/other-plugin/forged labels.
-- [ ] Extend `PUBLIC_CONTENT_BOOTSTRAP` with a deeply frozen non-optional storage facade whose methods capture the current session generation. Do not expose Tauri internals, plugin identity, epoch, activation, or paths.
-- [ ] Publish the exact TypeScript API and update the public v1/developer guide with Prepared-read/Active-write, lifecycle expiry, shared namespace, key/value/quota, and uninstall semantics.
+- [ ] Generalize `TimerCallLease` and its in-flight counter into the shared Window session/call lease without creating a second state machine or changing Timer projection.
+- [ ] Capture admissionEpoch in `PluginWindowOwner`. Allow read leases in Prepared/Active and mutable leases only in Active; Closing/Revoked and stale decimal session generations fail before manager or storage access.
+- [ ] Add the three narrow commands. After Window admission, atomically validate the current Bundle and sign a data lease, release manager/controller mutexes, then perform storage I/O with both lease handles alive.
+- [ ] Add invoke allowlists, capability, generated permissions, exact caller/error mapping, and the deeply frozen bootstrap storage facade whose methods capture the current session generation without caller-supplied scope.
+- [ ] Publish the exact TypeScript API and documentation. Extend the Pomodoro SDK contract to type-check `storage.get`, `storage.set`, `storage.remove`, `JsonValue`, and the readonly Window storage facade; keep both Demo SDK contracts passing.
 
-**Distinct test coverage:** Prepared `get` succeeds while Prepared `set/remove` fail; Active permits all three; a Window lease paused before data admission is rejected by a concurrent gate close; an admitted write finishes while hide/close waits; a stale facade cannot cross session or epoch; malformed session and each caller class produce the exact stable error with zero storage access; bootstrap objects/methods are frozen and capture no caller-supplied scope.
+**Distinct test coverage:** Prepared get succeeds while writes fail; Active permits all three; a Window call holding only its first lease is rejected by concurrent gate close; an admitted write finishes while hide/close and uninstall wait; stale facade/session/epoch and every invalid caller produce the exact error with zero access; bootstrap objects are frozen; the SDK contract actually calls all three storage methods and checks the nullable read type.
 
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib plugin_window::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib commands::tests && npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.pomodoro/tests/sdk-contract.ts`
-
-### Task 3: Make Complete Uninstall Recoverable
-
-**Files:** create `src-tauri/src/public_plugins/owner_cleanup.rs`; modify `src-tauri/src/public_plugins/activation.rs`, `src-tauri/src/public_plugins/state.rs`, `src-tauri/src/public_plugins/storage.rs`, `src-tauri/src/public_plugins/secrets.rs`, `src-tauri/src/public_plugins.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/settings.rs`, `src/protocol.ts`, `src/main.ts`, `src/public-plugin-panel.tsx`, `src/launcher.test.tsx`
-
-**Dependencies:** Tasks 1-2; design sections 6.1, 8, 9.1, 9.4, and acceptance item 11.6.
-
-- [ ] Split the current uninstall path into close-admission, Window/data drain, durable publish, owner cleanup, and receipt-clear phases. Implement the unique `mutation -> scheduler -> data gate` acquisition order and never wait for leases while holding those locks.
-- [ ] Persist `PluginOwnerCleanupReceipt` outside every target owner root before publishing the no-Bundle state. Store only validated backend identities and fixed-root target keys, never caller paths.
-- [ ] Make complete cleanup idempotently remove ordinary storage state/directory, secret owner, uninstalled state owner, installed package tree, and saved window position. Clear the receipt and report success only after every target succeeds; missing targets count as success.
-- [ ] On pre-commit failure, destroy the old Runtime/window and reopen only a newly validated admission epoch for the still-installed plugin. On post-commit cleanup failure, never restore the plugin; retain the receipt, block the same plugin ID, and retry during native process startup.
-- [ ] Preserve the existing retain-data contract: retain storage, secrets, and retained state configuration while removing package, Runtime/window, and saved position through the existing retained-uninstall lifecycle.
-- [ ] Add `PublicPluginManagementError::DataCleanupPending`, serialize `CommandError.code` as `dataCleanupPending`, and make the settings page finish loading, refresh inventory, remove the plugin row, and show the fixed page-level cleanup message rather than “操作不可用”.
-
-**Distinct test coverage:** paused Window and Runtime writes both complete before durable uninstall and cannot recreate deleted roots; a Window call with only the first lease is rejected; pre-commit drain/durable failures reopen a new epoch without reviving old requests; storage succeeds while each of secret/state/package/position cleanup fails, leaving the receipt and same-ID block; restart retries all targets idempotently and clears the block only at full success; retain-data reinstall recovers the duration value; frontend `dataCleanupPending` ends busy state, reloads inventory, removes the row, and renders the fixed page-level notice.
-
-**Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::owner_cleanup::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::activation::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib commands::tests && npm.cmd test -- src/launcher.test.tsx`
 
 ### Task 4: Persist and Apply the Pomodoro Duration Selector
 
@@ -99,13 +99,13 @@ Use the exact identities, error mapping, transaction order, and UI state from de
 
 - [ ] Bump the reference plugin version and render the fixed 10/15/25/30/45-minute selector in the content area's top-right without changing Manifest settings or permissions.
 - [ ] Stop treating Runtime's development-only 10-second value as the next-round duration. Keep only the invocation-derived completion message in window data; initialize effective duration to 10 minutes in content.
-- [ ] On each `onUpdate`, create a new view epoch, subscribe to Timer state first, then read Timer baseline and `pomodoro.duration-minutes` in parallel. Only the current epoch may update DOM/error state.
+- [ ] On each `onUpdate`, create a new view epoch and set `durationReadPending=true`; show 10 minutes and disable the selector while the initial storage read owns the view. Subscribe to Timer first, then read Timer baseline and `pomodoro.duration-minutes` in parallel. Only the current epoch may settle the read or update DOM/error state.
 - [ ] Keep effective, persisted, pending, and host Timer state separate. Missing/invalid/read-failed storage projects 10 without writing it; successful selection atomically persists the exact allowed integer; failed save restores persisted or 10.
 - [ ] Show effective duration while idle and the host's current-round duration/remaining while running, paused, or fired. A new idle/fired round uses effective minutes; paused resume remains argument-free.
 - [ ] Disable the selector plus idle Start/fired Restart while a save is pending; allow paused Resume. A duration change during running/paused never changes the current round or timer revision.
 - [ ] Update example tests, SDK contract, and README for persistence, next-round semantics, failure recovery, and the required reinstall after the example version changes.
 
-**Distinct test coverage:** exact options/order/labels and default 10 minutes; legal saved values restore while missing/invalid values remain unpersisted 10; save pending blocks idle/fired start but not paused resume; save success starts 25 minutes and failure starts the restored value; running/paused selection leaves current state/revision untouched; stale read/save/Timer completions cannot mutate a new view epoch; a reconstructed content model reads the mocked persisted value after close/reopen. Rust coverage in Task 3 owns process restart, upgrade, retain-data reinstall, and full-uninstall reinstall.
+**Distinct test coverage:** exact options/order/labels and default 10 minutes; during initial read the selector displays 10 and is disabled; legal values restore while missing/invalid values remain unpersisted 10; a read from an old view epoch cannot overwrite a newer update or selection; save pending blocks idle/fired start but not paused resume; save success starts 25 minutes and failure starts the restored value; running/paused selection leaves current state/revision untouched; a reconstructed content model reads mocked persisted state after close/reopen. Rust coverage in Task 1 owns process restart, upgrade, retain-data reinstall, and full-uninstall reinstall.
 
 **Verify:** `node --test examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js && npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.pomodoro/tests/sdk-contract.ts`
 
