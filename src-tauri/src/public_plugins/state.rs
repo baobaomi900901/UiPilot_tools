@@ -8,7 +8,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::atomic_file::{commit_with_backup, quarantine_invalid, read_optional, AtomicPaths};
+use crate::atomic_file::{
+    commit_with_backup, quarantine_invalid, read_optional, AtomicFileError, AtomicPaths,
+};
 
 use super::{
     authorize_plugin_scope,
@@ -112,9 +114,25 @@ impl PluginStateDocument {
     }
 }
 
+#[derive(Clone)]
 struct StoredState {
     document: PluginStateDocument,
     raw: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableStateOutcome {
+    NotCommitted,
+    Committed,
+    Unknown,
+}
+
+pub(crate) struct PreparedStateCommit {
+    plugin_id: String,
+    base_revision: u64,
+    previous: Option<StoredState>,
+    candidate: StoredState,
+    remove_after_publish: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -191,6 +209,7 @@ impl PluginStateStore {
         self.activate(manifest, permission_grants, generation, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn activate(
         &self,
         manifest: &PublicManifestV1,
@@ -198,6 +217,21 @@ impl PluginStateStore {
         generation: u64,
         package_digest: Option<String>,
     ) -> Result<EffectivePluginConfig, PluginStateError> {
+        let prepared =
+            self.prepare_activation(manifest, permission_grants, generation, package_digest)?;
+        if self.persist_prepared(&prepared) != DurableStateOutcome::Committed {
+            return Err(PluginStateError::Storage);
+        }
+        self.publish_prepared(prepared)
+    }
+
+    pub(crate) fn prepare_activation(
+        &self,
+        manifest: &PublicManifestV1,
+        permission_grants: BTreeSet<PublicPermission>,
+        generation: u64,
+        package_digest: Option<String>,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
         if generation == 0
             || package_digest.as_deref().is_some_and(|digest| {
                 digest.len() != 64
@@ -216,7 +250,7 @@ impl PluginStateStore {
         if declared != permission_grants {
             return Err(PluginStateError::InvalidPermissions);
         }
-        let mut state = self.lock()?;
+        let state = self.lock()?;
         let previous = state.by_plugin.get(&manifest.plugin_id);
         if previous.is_some_and(|stored| generation <= stored.document.active_generation) {
             return Err(PluginStateError::InvalidPlugin);
@@ -251,14 +285,17 @@ impl PluginStateStore {
             package_digest,
             settings,
         };
-        self.persist_revision(revision)?;
-        let stored = self.persist(&document, previous)?;
-        let view = document.view();
-        state.revision = revision;
-        state.by_plugin.insert(manifest.plugin_id.clone(), stored);
-        Ok(view)
+        let raw = serde_json::to_vec(&document).map_err(|_| PluginStateError::Storage)?;
+        Ok(PreparedStateCommit {
+            plugin_id: manifest.plugin_id.clone(),
+            base_revision: state.revision,
+            previous: previous.cloned(),
+            candidate: StoredState { document, raw },
+            remove_after_publish: false,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn rename(
         &self,
         plugin_id: &str,
@@ -289,6 +326,31 @@ impl PluginStateStore {
         Ok(view)
     }
 
+    pub(crate) fn prepare_rename(
+        &self,
+        plugin_id: &str,
+        name_override: Option<&str>,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        if name_override.is_some_and(|name| !valid_command_name(name)) {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let target = name_override.unwrap_or(&previous.document.default_name);
+        self.ensure_name_available(&state, plugin_id, target)?;
+        let mut document = previous.document.clone();
+        document.name_override = name_override.map(str::to_owned);
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
+    }
+
+    #[cfg(test)]
     pub(crate) fn save_settings(
         &self,
         plugin_id: &str,
@@ -327,6 +389,38 @@ impl PluginStateStore {
         Ok(view)
     }
 
+    pub(crate) fn prepare_save_settings(
+        &self,
+        plugin_id: &str,
+        definitions: &[PublicSettingV1],
+        updates: &BTreeMap<String, Value>,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        for (key, value) in updates {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.key() == key)
+                .ok_or(PluginStateError::InvalidSetting)?;
+            if definition.is_secret() || !definition.accepts_value(value) {
+                return Err(PluginStateError::InvalidSetting);
+            }
+        }
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut document = previous.document.clone();
+        document.settings = reconcile_settings(Some(&document.settings), definitions);
+        for (key, value) in updates {
+            document.settings.insert(key.clone(), value.clone());
+        }
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
+    }
+
     pub(crate) fn setting(
         &self,
         scope: &PluginDataScope,
@@ -355,6 +449,7 @@ impl PluginStateStore {
             .or_else(|| definition.default_value()))
     }
 
+    #[cfg(test)]
     pub(crate) fn set_enabled(
         &self,
         plugin_id: &str,
@@ -368,15 +463,37 @@ impl PluginStateStore {
         })
     }
 
-    pub(crate) fn enable_with_generation(
+    pub(crate) fn prepare_set_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut document = previous.document.clone();
+        document.enabled = enabled;
+        if enabled {
+            document.fault = None;
+        }
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
+    }
+
+    pub(crate) fn prepare_enable_with_generation(
         &self,
         plugin_id: &str,
         generation: u64,
-    ) -> Result<EffectivePluginConfig, PluginStateError> {
+    ) -> Result<PreparedStateCommit, PluginStateError> {
         if generation == 0 {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let mut state = self.lock()?;
+        let state = self.lock()?;
         let previous = state
             .by_plugin
             .get(plugin_id)
@@ -384,18 +501,12 @@ impl PluginStateStore {
         if !previous.document.installed || generation <= previous.document.active_generation {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let revision = next_revision(state.revision)?;
         let mut document = previous.document.clone();
         document.enabled = true;
         document.fault = None;
         document.active_generation = generation;
-        document.inventory_revision = revision;
-        self.persist_revision(revision)?;
-        let stored = self.persist(&document, Some(previous))?;
-        let view = document.view();
-        state.revision = revision;
-        state.by_plugin.insert(plugin_id.into(), stored);
-        Ok(view)
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
     }
 
     pub(crate) fn disable_for_fault(
@@ -407,6 +518,26 @@ impl PluginStateStore {
             document.enabled = false;
             document.fault = Some(fault);
         })
+    }
+
+    pub(crate) fn prepare_disable_for_fault(
+        &self,
+        plugin_id: &str,
+        fault: PublicPluginFault,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut document = previous.document.clone();
+        document.enabled = false;
+        document.fault = Some(fault);
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
     }
 
     pub(crate) fn configs(&self) -> Result<Vec<EffectivePluginConfig>, PluginStateError> {
@@ -429,6 +560,25 @@ impl PluginStateStore {
             .map(|stored| stored.document.view()))
     }
 
+    fn prepare_document(
+        &self,
+        state: &StateData,
+        plugin_id: &str,
+        document: PluginStateDocument,
+        remove_after_publish: bool,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        let previous = state.by_plugin.get(plugin_id).cloned();
+        let raw = serde_json::to_vec(&document).map_err(|_| PluginStateError::Storage)?;
+        Ok(PreparedStateCommit {
+            plugin_id: plugin_id.to_owned(),
+            base_revision: state.revision,
+            previous,
+            candidate: StoredState { document, raw },
+            remove_after_publish,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn uninstall(
         &self,
         plugin_id: &str,
@@ -458,6 +608,30 @@ impl PluginStateStore {
             state.revision = revision;
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare_uninstall(
+        &self,
+        plugin_id: &str,
+        retain_data: bool,
+    ) -> Result<Option<PreparedStateCommit>, PluginStateError> {
+        let state = self.lock()?;
+        let Some(previous) = state.by_plugin.get(plugin_id) else {
+            return Ok(None);
+        };
+        let mut document = previous.document.clone();
+        document.installed = false;
+        document.enabled = false;
+        document.fault = None;
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, !retain_data)
+            .map(Some)
+    }
+
+    pub(crate) fn cleanup_uninstalled_owner(&self, plugin_id: &str) {
+        if let Ok(owner) = owner_root(&self.root, plugin_id) {
+            let _ = fs::remove_dir_all(owner);
+        }
     }
 
     fn update_lifecycle(
@@ -541,6 +715,69 @@ impl PluginStateStore {
         })
     }
 
+    pub(crate) fn persist_prepared(&self, prepared: &PreparedStateCommit) -> DurableStateOutcome {
+        let owner = match owner_root(&self.root, &prepared.plugin_id) {
+            Ok(owner) => owner,
+            Err(_) => return DurableStateOutcome::NotCommitted,
+        };
+        if fs::create_dir_all(&owner).is_err() || !ordinary_directory(&owner) {
+            return DurableStateOutcome::NotCommitted;
+        }
+        let paths = AtomicPaths::new(&owner, "state.json");
+        let outcome = classify_durable_result(commit_with_backup(
+            &paths,
+            prepared
+                .previous
+                .as_ref()
+                .map(|previous| previous.raw.as_slice()),
+            &prepared.candidate.raw,
+        ));
+        if outcome == DurableStateOutcome::Committed {
+            let _ = self.persist_revision(prepared.candidate.document.inventory_revision);
+        }
+        outcome
+    }
+
+    pub(crate) fn revalidate_previous(&self, prepared: &PreparedStateCommit) -> bool {
+        let Ok(owner) = owner_root(&self.root, &prepared.plugin_id) else {
+            return false;
+        };
+        let paths = AtomicPaths::new(&owner, "state.json");
+        match (read_optional(paths.current()), prepared.previous.as_ref()) {
+            (Ok(None), None) => true,
+            (Ok(Some(actual)), Some(previous)) => actual == previous.raw,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn publish_prepared(
+        &self,
+        prepared: PreparedStateCommit,
+    ) -> Result<EffectivePluginConfig, PluginStateError> {
+        let mut state = self.lock()?;
+        let previous_matches = match (
+            state.by_plugin.get(&prepared.plugin_id),
+            prepared.previous.as_ref(),
+        ) {
+            (None, None) => true,
+            (Some(current), Some(previous)) => current.raw == previous.raw,
+            _ => false,
+        };
+        if state.revision != prepared.base_revision || !previous_matches {
+            return Err(PluginStateError::Storage);
+        }
+        let view = prepared.candidate.document.view();
+        state.revision = prepared.candidate.document.inventory_revision;
+        if prepared.remove_after_publish {
+            state.by_plugin.remove(&prepared.plugin_id);
+        } else {
+            state
+                .by_plugin
+                .insert(prepared.plugin_id, prepared.candidate);
+        }
+        Ok(view)
+    }
+
     fn persist_revision(&self, revision: u64) -> Result<(), PluginStateError> {
         let bytes = serde_json::to_vec(&InventoryRevisionDocument {
             schema: 1,
@@ -555,6 +792,54 @@ impl PluginStateStore {
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, StateData>, PluginStateError> {
         self.state.lock().map_err(|_| PluginStateError::Storage)
+    }
+}
+
+fn classify_durable_result(result: Result<(), AtomicFileError>) -> DurableStateOutcome {
+    match result {
+        Ok(()) => DurableStateOutcome::Committed,
+        Err(
+            AtomicFileError::CandidateWrite
+            | AtomicFileError::BackupWrite
+            | AtomicFileError::BackupReplace,
+        ) => DurableStateOutcome::NotCommitted,
+        Err(
+            AtomicFileError::Read
+            | AtomicFileError::CurrentReplace
+            | AtomicFileError::InvalidQuarantine,
+        ) => DurableStateOutcome::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod durable_outcome_tests {
+    use super::{classify_durable_result, AtomicFileError, DurableStateOutcome};
+
+    #[test]
+    fn durable_helper_exposes_only_the_three_frozen_outcomes() {
+        let cases = [
+            (Ok(()), DurableStateOutcome::Committed),
+            (
+                Err(AtomicFileError::CandidateWrite),
+                DurableStateOutcome::NotCommitted,
+            ),
+            (
+                Err(AtomicFileError::BackupWrite),
+                DurableStateOutcome::NotCommitted,
+            ),
+            (
+                Err(AtomicFileError::BackupReplace),
+                DurableStateOutcome::NotCommitted,
+            ),
+            (
+                Err(AtomicFileError::CurrentReplace),
+                DurableStateOutcome::Unknown,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(classify_durable_result(input), expected);
+        }
     }
 }
 

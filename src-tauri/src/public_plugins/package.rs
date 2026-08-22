@@ -18,6 +18,12 @@ use super::{
     PublicResource,
 };
 
+type LoadedPublicPackage = (
+    PublicManifestV1,
+    BTreeMap<String, PublicResource>,
+    Option<PreparedAlarmAsset>,
+);
+
 const MAX_DIRECTORIES: usize = 64;
 const MAX_FILES: usize = 256;
 const MAX_DEPTH: usize = 8;
@@ -32,7 +38,7 @@ pub(super) fn load_existing(
     package_root: &Path,
     host: &PublicPluginHost,
     expected_digest: &str,
-) -> Result<(PublicManifestV1, BTreeMap<String, PublicResource>), PublicPackageError> {
+) -> Result<LoadedPublicPackage, PublicPackageError> {
     let snapshot = scan_snapshot(package_root)?;
     if snapshot.digest != expected_digest {
         return Err(PublicPackageError::InvalidPackage);
@@ -42,8 +48,8 @@ pub(super) fn load_existing(
     let manifest = parse_manifest(&manifest_bytes, host)?;
     validate_manifest_entries(package_root, &manifest, &snapshot.resources)?;
     validate_css_references(package_root, &snapshot.resources)?;
-    let (resources, _) = split_resources(package_root, &snapshot.resources)?;
-    Ok((manifest, resources))
+    let (resources, alarm) = split_resources(package_root, &snapshot.resources)?;
+    Ok((manifest, resources, alarm))
 }
 
 pub(super) fn remove_package_tree(path: PathBuf) {

@@ -471,6 +471,7 @@ impl PluginRuntimeApi {
         let registration = DelayedMessageRegistration {
             plugin_id: plugin_id.clone(),
             plugin_generation: request.context.plugin_generation,
+            activation_id: current.activation_id(),
             plugin_name_snapshot: manifest.name.clone(),
             request_id: request.context.request_id,
             content: content.into(),
@@ -765,6 +766,7 @@ mod tests {
                 PluginRequestCandidate {
                     plugin_id: persisted_manifest.plugin_id.clone(),
                     plugin_generation: 1,
+                    activation_id: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "input".into(),
                     owner: PluginSubmissionOwner {
@@ -875,6 +877,7 @@ mod tests {
                 PluginRequestCandidate {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
+                    activation_id: 1,
                     activation_mode: PublicActivationMode::Live,
                     input: "input".into(),
                     owner: PluginSubmissionOwner {
@@ -907,6 +910,7 @@ mod tests {
                 PluginRequestCandidate {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
+                    activation_id: 1,
                     activation_mode: PublicActivationMode::Live,
                     input: "new".into(),
                     owner: PluginSubmissionOwner {
@@ -1120,6 +1124,7 @@ mod tests {
                 PluginRequestCandidate {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
+                    activation_id: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "new".into(),
                     owner: PluginSubmissionOwner {
@@ -1215,6 +1220,7 @@ mod tests {
                 PluginRequestCandidate {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
+                    activation_id: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "new".into(),
                     owner: PluginSubmissionOwner {
@@ -1411,6 +1417,7 @@ mod tests {
                     DelayedMessageRegistration {
                         plugin_id: manifest.plugin_id.clone(),
                         plugin_generation: 1,
+                        activation_id: 1,
                         plugin_name_snapshot: manifest.name.clone(),
                         request_id: format!("prefill-{index}"),
                         content: "prefill".into(),

@@ -2803,6 +2803,7 @@ mod tests {
         let mut route = PublicPluginRoute {
             plugin_id: "com.example.demo".into(),
             generation: 1,
+            activation_id: 1,
             runtime_label: "plugin-runtime-com.example.demo-g1".into(),
             activation_mode: PublicActivationMode::Submit,
             output_mode: PublicOutputMode::MainResult,

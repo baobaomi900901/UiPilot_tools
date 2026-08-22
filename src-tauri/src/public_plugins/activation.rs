@@ -19,10 +19,15 @@ use crate::message_center::{
 };
 
 use super::{
+    activation_bundle::{
+        ActivationCandidate, ActivationIdAllocator, ActivationReservation,
+        ActivationReservationBook, ReservationError,
+    },
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
     package, runtime_label, stage_public_package,
+    state::{DurableStateOutcome, PreparedStateCommit},
     timers::{
         AudioTicket, ClaimTicket, Clock, PluginTimerService, PluginTimerStartInput,
         PluginTimerState, SystemClock, TimerError, TimerKey, TimerPostLockEffect,
@@ -123,6 +128,7 @@ pub(crate) struct PublicSettingView {
 pub(crate) struct PublicPluginRoute {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
+    pub(crate) activation_id: u64,
     pub(crate) runtime_label: String,
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) output_mode: PublicOutputMode,
@@ -166,6 +172,7 @@ pub(crate) struct PublicWindowResponse {
 pub(crate) struct PublicRuntimeCandidate {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
+    pub(crate) activation_id: u64,
     pub(crate) label: String,
     pub(crate) runtime_entry: String,
 }
@@ -247,25 +254,26 @@ impl From<PluginStateError> for PublicPluginManagementError {
 }
 
 #[derive(Clone)]
-struct RuntimeResource {
-    mime: &'static str,
-    bytes: Vec<u8>,
+pub(super) struct RuntimeResource {
+    pub(super) mime: &'static str,
+    pub(super) bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
-struct RuntimeSnapshot {
-    manifest: PublicManifestV1,
-    digest: String,
-    generation: u64,
-    label: String,
-    resources: BTreeMap<String, RuntimeResource>,
+pub(super) struct RuntimeSnapshot {
+    pub(super) manifest: PublicManifestV1,
+    pub(super) digest: String,
+    pub(super) generation: u64,
+    pub(super) label: String,
+    pub(super) resources: BTreeMap<String, RuntimeResource>,
 }
 
 impl RuntimeSnapshot {
-    fn candidate(&self) -> PublicRuntimeCandidate {
+    fn candidate(&self, activation_id: u64) -> PublicRuntimeCandidate {
         PublicRuntimeCandidate {
             plugin_id: self.manifest.plugin_id.clone(),
             generation: self.generation,
+            activation_id,
             label: self.label.clone(),
             runtime_entry: self.manifest.runtime.entry.clone(),
         }
@@ -320,7 +328,7 @@ struct PendingActivation {
 struct ActivationData {
     pending: HashMap<String, PendingActivation>,
     active_by_plugin: HashMap<String, Arc<RuntimeSnapshot>>,
-    staged_by_label: HashMap<String, Arc<RuntimeSnapshot>>,
+    staged_by_label: HashMap<String, Arc<ActivationCandidate>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -342,9 +350,11 @@ pub(crate) struct PublicPluginManager {
     timer_publisher: Arc<dyn MessagePublisher>,
     timers: Arc<PluginTimerService>,
     api: PluginRuntimeApi,
+    activation_ids: ActivationIdAllocator,
+    bundles: Arc<ActivationReservationBook>,
     mutation: Mutex<()>,
     data: Mutex<ActivationData>,
-    runtime_faults: Mutex<HashMap<String, RuntimeFaultWindow>>,
+    runtime_faults: Mutex<HashMap<(String, u64), RuntimeFaultWindow>>,
     next_token: AtomicU64,
 }
 
@@ -399,6 +409,8 @@ impl PublicPluginManager {
             Arc::clone(&delayed_messages),
             message_center.clone(),
         );
+        let activation_ids = ActivationIdAllocator::default();
+        let bundles = Arc::new(ActivationReservationBook::default());
         let mut active_by_plugin = HashMap::new();
         for config in state.configs()? {
             if !config.installed || config.active_generation == 0 {
@@ -409,13 +421,40 @@ impl PublicPluginManager {
             };
             let package_root = package_destination(&packages_root, &config.plugin_id, digest);
             match load_runtime_snapshot(&package_root, &host, digest, config.active_generation) {
-                Ok(snapshot)
+                Ok((snapshot, alarm))
                     if snapshot.manifest.plugin_id == config.plugin_id
                         && snapshot.manifest.version == config.version =>
                 {
-                    let _ = scheduler
-                        .invalidate_plugin(&config.plugin_id, Some(config.active_generation));
-                    active_by_plugin.insert(config.plugin_id, Arc::new(snapshot));
+                    let runtime = Arc::new(snapshot);
+                    if config.enabled && config.fault.is_none() {
+                        let Some(activation_id) = activation_ids.allocate() else {
+                            let _ = state.disable_for_fault(
+                                &config.plugin_id,
+                                PublicPluginFault::RuntimeUnavailable,
+                            );
+                            continue;
+                        };
+                        let candidate = ActivationCandidate::new(
+                            Arc::clone(&runtime),
+                            alarm.as_ref(),
+                            activation_id,
+                        );
+                        if bundles
+                            .install_initial(&config.plugin_id, candidate.bundle(config.clone()))
+                            .is_err()
+                        {
+                            let _ = state.disable_for_fault(
+                                &config.plugin_id,
+                                PublicPluginFault::RuntimeUnavailable,
+                            );
+                            continue;
+                        }
+                        let _ = scheduler.invalidate_plugin(
+                            &config.plugin_id,
+                            Some((config.active_generation, activation_id)),
+                        );
+                    }
+                    active_by_plugin.insert(config.plugin_id, runtime);
                 }
                 _ => {
                     let _ = state.disable_for_fault(
@@ -438,6 +477,8 @@ impl PublicPluginManager {
             timer_publisher,
             timers,
             api,
+            activation_ids,
+            bundles,
             mutation: Mutex::new(()),
             data: Mutex::new(ActivationData {
                 active_by_plugin,
@@ -456,6 +497,9 @@ impl PublicPluginManager {
     ) -> Result<PublicPluginPrepareSummary, PublicPluginManagementError> {
         if caller_label.is_empty() {
             return Err(PublicPluginManagementError::InvalidCaller);
+        }
+        if self.bundles.is_terminal() {
+            return Err(PublicPluginManagementError::Unavailable);
         }
         let _mutation = self.lock_mutation()?;
         self.cleanup_expired(now)?;
@@ -542,7 +586,14 @@ impl PublicPluginManager {
     where
         F: FnOnce(&PublicRuntimeCandidate) -> bool,
     {
-        let (pending, previous_config, candidate, runtime, previous_runtime_label) = {
+        let (
+            pending,
+            previous_config,
+            candidate,
+            runtime,
+            previous_runtime_label,
+            previous_activation_id,
+        ) = {
             let _mutation = self.lock_mutation()?;
             let pending = {
                 let mut data = self.lock_data()?;
@@ -576,13 +627,26 @@ impl PublicPluginManager {
                 .as_ref()
                 .map_or(Some(1), |config| config.active_generation.checked_add(1))
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let candidate = Arc::new(snapshot_from_prepared(&pending.prepared, generation)?);
-            let runtime = candidate.candidate();
-            let previous_runtime_label = self
-                .lock_data()?
-                .active_by_plugin
-                .get(&runtime.plugin_id)
-                .map(|snapshot| snapshot.label.clone());
+            let runtime_snapshot = Arc::new(snapshot_from_prepared(&pending.prepared, generation)?);
+            let activation_id = self
+                .activation_ids
+                .allocate()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let candidate = Arc::new(ActivationCandidate::new(
+                runtime_snapshot,
+                pending.prepared.alarm.as_ref(),
+                activation_id,
+            ));
+            let runtime = candidate.runtime.candidate(candidate.activation_id);
+            let previous_bundle = self
+                .bundles
+                .bundle(&runtime.plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let previous_runtime_label = previous_bundle
+                .as_ref()
+                .map(|bundle| bundle.runtime.label.clone());
+            let previous_activation_id =
+                previous_bundle.as_ref().map(|bundle| bundle.activation_id);
             let replaced = self
                 .lock_data()?
                 .staged_by_label
@@ -596,6 +660,7 @@ impl PublicPluginManager {
                 candidate,
                 runtime,
                 previous_runtime_label,
+                previous_activation_id,
             )
         };
 
@@ -604,13 +669,33 @@ impl PublicPluginManager {
             return Err(PublicPluginManagementError::RuntimeNotReady);
         }
 
-        let _mutation = self.lock_mutation()?;
-        if self.state.config(&runtime.plugin_id)? != previous_config {
-            self.unstage(&runtime.label);
-            return Err(PublicPluginManagementError::Unavailable);
-        }
-        let destination =
-            package_destination(&self.packages_root, &runtime.plugin_id, &candidate.digest);
+        let (reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            if self.state.config(&runtime.plugin_id)? != previous_config
+                || self
+                    .bundles
+                    .bundle(&runtime.plugin_id)?
+                    .as_ref()
+                    .map(|bundle| bundle.activation_id)
+                    != previous_activation_id
+            {
+                self.unstage(&runtime.label);
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let reservation = self.bundles.reserve(&runtime.plugin_id)?;
+            let prepared_state = self.state.prepare_activation(
+                &candidate.runtime.manifest,
+                permission_grants,
+                runtime.generation,
+                Some(candidate.runtime.digest.clone()),
+            )?;
+            (reservation, prepared_state)
+        };
+        let destination = package_destination(
+            &self.packages_root,
+            &runtime.plugin_id,
+            &candidate.runtime.digest,
+        );
         let created = match pending.prepared.persist(&destination) {
             Ok(created) => created,
             Err(error) => {
@@ -618,23 +703,29 @@ impl PublicPluginManager {
                 return Err(error.into());
             }
         };
-        let config = match self.state.activate(
-            &candidate.manifest,
-            permission_grants,
-            runtime.generation,
-            Some(candidate.digest.clone()),
-        ) {
-            Ok(config) => config,
-            Err(error) => {
+        reservation.begin_committing()?;
+        match self.state.persist_prepared(&prepared_state) {
+            DurableStateOutcome::Committed => reservation.mark_durable()?,
+            DurableStateOutcome::NotCommitted => {
+                if !self.state.revalidate_previous(&prepared_state) {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                reservation.rollback_not_committed()?;
                 if created {
                     package::remove_package_tree(destination);
                 }
                 self.unstage(&runtime.label);
-                return Err(error.into());
+                return Err(PublicPluginManagementError::Unavailable);
             }
-        };
+            DurableStateOutcome::Unknown => return Err(PublicPluginManagementError::Unavailable),
+        }
+
+        let _mutation = self.lock_mutation()?;
         self.scheduler
-            .invalidate_plugin(&runtime.plugin_id, Some(runtime.generation))
+            .invalidate_plugin(
+                &runtime.plugin_id,
+                Some((runtime.generation, runtime.activation_id)),
+            )
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(&runtime.plugin_id);
         let timer_effects = previous_config
@@ -643,17 +734,24 @@ impl PublicPluginManager {
                 self.cancel_timer_generation(&runtime.plugin_id, config.active_generation)
             })
             .unwrap_or_default();
-        {
-            let mut data = self.lock_data()?;
-            let staged = data
-                .staged_by_label
-                .remove(&runtime.label)
-                .filter(|staged| Arc::ptr_eq(staged, &candidate))
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            data.active_by_plugin
-                .insert(runtime.plugin_id.clone(), staged);
+        let mut data = self.lock_data()?;
+        let staged_matches = data
+            .staged_by_label
+            .get(&runtime.label)
+            .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
+        if !staged_matches {
+            return Err(PublicPluginManagementError::Unavailable);
         }
         self.clear_runtime_faults(&runtime.plugin_id)?;
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(Some(candidate.bundle(config.clone())))?;
+        let staged = data
+            .staged_by_label
+            .remove(&runtime.label)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        data.active_by_plugin
+            .insert(runtime.plugin_id.clone(), Arc::clone(&staged.runtime));
+        drop(data);
         let commit = PublicActivationCommit {
             mutation: mutation_from_config(&config),
             runtime,
@@ -661,6 +759,17 @@ impl PublicPluginManager {
         };
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
+        if let Some(previous_digest) = previous_config
+            .as_ref()
+            .and_then(|config| config.package_digest.as_deref())
+            .filter(|digest| *digest != candidate.runtime.digest)
+        {
+            package::remove_package_tree(package_destination(
+                &self.packages_root,
+                &candidate.runtime.manifest.plugin_id,
+                previous_digest,
+            ));
+        }
         Ok(commit)
     }
     pub(crate) fn set_enabled_with_readiness<F>(
@@ -672,62 +781,67 @@ impl PublicPluginManager {
     where
         F: FnOnce(&PublicRuntimeCandidate) -> bool,
     {
-        let (before, snapshot, runtime, previous_runtime_label) = {
+        if !enabled {
+            return self.disable_plugin(plugin_id);
+        }
+        let (before, candidate, runtime, previous_runtime_label) = {
             let _mutation = self.lock_mutation()?;
             let before = self
                 .state
                 .config(plugin_id)?
                 .filter(|config| config.installed)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let current_snapshot = self
-                .lock_data()?
-                .active_by_plugin
-                .get(plugin_id)
-                .cloned()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let current_runtime = current_snapshot.candidate();
+            let current_bundle = self
+                .bundles
+                .bundle(plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
             if before.enabled == enabled {
                 return Ok(PublicEnabledCommit {
                     mutation: mutation_from_config(&before),
-                    runtime: enabled.then_some(current_runtime),
+                    runtime: current_bundle
+                        .map(|bundle| bundle.runtime.candidate(bundle.activation_id)),
                     closed_runtime_label: None,
                 });
-            }
-            if !enabled {
-                let config = self.state.set_enabled(plugin_id, false)?;
-                self.scheduler
-                    .invalidate_plugin(plugin_id, None)
-                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
-                self.cancel_delayed_messages(plugin_id);
-                let timer_effects =
-                    self.cancel_timer_generation(plugin_id, before.active_generation);
-                let commit = PublicEnabledCommit {
-                    mutation: mutation_from_config(&config),
-                    runtime: None,
-                    closed_runtime_label: Some(current_runtime.label),
-                };
-                drop(_mutation);
-                self.apply_timer_post_lock_effects(timer_effects);
-                return Ok(commit);
             }
             let generation = before
                 .active_generation
                 .checked_add(1)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let mut next_snapshot = (*current_snapshot).clone();
-            next_snapshot.generation = generation;
-            next_snapshot.label = runtime_label(plugin_id, generation)
+            let digest = before
+                .package_digest
+                .as_deref()
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let snapshot = Arc::new(next_snapshot);
-            let runtime = snapshot.candidate();
+            let package_root = package_destination(&self.packages_root, plugin_id, digest);
+            let (snapshot, alarm) =
+                load_runtime_snapshot(&package_root, &self.host, digest, generation)?;
+            if snapshot.manifest.plugin_id != plugin_id
+                || snapshot.manifest.version != before.version
+            {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let activation_id = self
+                .activation_ids
+                .allocate()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let candidate = Arc::new(ActivationCandidate::new(
+                Arc::new(snapshot),
+                alarm.as_ref(),
+                activation_id,
+            ));
+            let runtime = candidate.runtime.candidate(candidate.activation_id);
             let replaced = self
                 .lock_data()?
                 .staged_by_label
-                .insert(runtime.label.clone(), Arc::clone(&snapshot));
+                .insert(runtime.label.clone(), Arc::clone(&candidate));
             if replaced.is_some() {
                 return Err(PublicPluginManagementError::Unavailable);
             }
-            (before, snapshot, runtime, Some(current_runtime.label))
+            let previous_runtime_label = self
+                .lock_data()?
+                .active_by_plugin
+                .get(plugin_id)
+                .map(|snapshot| snapshot.label.clone());
+            (before, candidate, runtime, previous_runtime_label)
         };
 
         if !readiness(&runtime) {
@@ -735,47 +849,60 @@ impl PublicPluginManager {
             return Err(PublicPluginManagementError::RuntimeNotReady);
         }
 
+        let (reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            if self.state.config(plugin_id)? != Some(before.clone())
+                || self.bundles.bundle(plugin_id)?.is_some()
+            {
+                self.unstage(&runtime.label);
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let staged_matches = self
+                .lock_data()?
+                .staged_by_label
+                .get(&runtime.label)
+                .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
+            if !staged_matches {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self
+                .state
+                .prepare_enable_with_generation(plugin_id, runtime.generation)?;
+            (reservation, prepared_state)
+        };
+
+        self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
-        if self.state.config(plugin_id)? != Some(before.clone()) {
-            self.unstage(&runtime.label);
-            return Err(PublicPluginManagementError::Unavailable);
-        }
         let mut data = self.lock_data()?;
         let staged_matches = data
             .staged_by_label
             .get(&runtime.label)
-            .is_some_and(|staged| Arc::ptr_eq(staged, &snapshot));
+            .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
         if !staged_matches {
             return Err(PublicPluginManagementError::Unavailable);
         }
         if self
             .scheduler
-            .invalidate_plugin(plugin_id, Some(runtime.generation))
+            .invalidate_plugin(plugin_id, Some((runtime.generation, runtime.activation_id)))
             .is_err()
         {
             data.staged_by_label.remove(&runtime.label);
             return Err(PublicPluginManagementError::Unavailable);
         }
-        let config = match self
-            .state
-            .enable_with_generation(plugin_id, runtime.generation)
-        {
-            Ok(config) => config,
-            Err(error) => {
-                data.staged_by_label.remove(&runtime.label);
-                return Err(error.into());
-            }
-        };
-        let staged = data
-            .staged_by_label
-            .remove(&runtime.label)
-            .filter(|staged| Arc::ptr_eq(staged, &snapshot))
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        data.active_by_plugin.insert(plugin_id.into(), staged);
-        drop(data);
         self.cancel_delayed_messages(plugin_id);
         let timer_effects = self.cancel_timer_generation(plugin_id, before.active_generation);
         self.clear_runtime_faults(plugin_id)?;
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(Some(candidate.bundle(config.clone())))?;
+        let staged = data
+            .staged_by_label
+            .remove(&runtime.label)
+            .filter(|staged| Arc::ptr_eq(staged, &candidate))
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        data.active_by_plugin
+            .insert(plugin_id.into(), Arc::clone(&staged.runtime));
+        drop(data);
         let commit = PublicEnabledCommit {
             mutation: mutation_from_config(&config),
             runtime: Some(runtime),
@@ -785,16 +912,76 @@ impl PublicPluginManager {
         self.apply_timer_post_lock_effects(timer_effects);
         Ok(commit)
     }
+
+    fn disable_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Result<PublicEnabledCommit, PublicPluginManagementError> {
+        let (before, runtime, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let before = self
+                .state
+                .config(plugin_id)?
+                .filter(|config| config.installed)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            if !before.enabled {
+                return Ok(PublicEnabledCommit {
+                    mutation: mutation_from_config(&before),
+                    runtime: None,
+                    closed_runtime_label: None,
+                });
+            }
+            let bundle = self
+                .bundles
+                .bundle(plugin_id)?
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let runtime = bundle.runtime.candidate(bundle.activation_id);
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self.state.prepare_set_enabled(plugin_id, false)?;
+            (before, runtime, reservation, prepared_state)
+        };
+
+        self.make_state_durable(&reservation, &prepared_state)?;
+        let _mutation = self.lock_mutation()?;
+        self.scheduler
+            .invalidate_plugin(plugin_id, None)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.cancel_delayed_messages(plugin_id);
+        let timer_effects = self.cancel_timer_generation(plugin_id, before.active_generation);
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(None)?;
+        let commit = PublicEnabledCommit {
+            mutation: mutation_from_config(&config),
+            runtime: None,
+            closed_runtime_label: Some(runtime.label),
+        };
+        drop(_mutation);
+        self.apply_timer_post_lock_effects(timer_effects);
+        Ok(commit)
+    }
+
     pub(crate) fn rename(
         &self,
         plugin_id: &str,
         name_override: Option<&str>,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let (bundle, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let bundle = self
+                .bundles
+                .bundle(plugin_id)?
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self.state.prepare_rename(plugin_id, name_override)?;
+            (bundle, reservation, prepared_state)
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
-        let config = self.state.rename(plugin_id, name_override)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(Some(bundle.with_config(config.clone())))?;
         Ok(mutation_from_config(&config))
     }
 
@@ -803,14 +990,27 @@ impl PublicPluginManager {
         plugin_id: &str,
         updates: &BTreeMap<String, Value>,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let (bundle, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let bundle = self
+                .bundles
+                .bundle(plugin_id)?
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self.state.prepare_save_settings(
+                plugin_id,
+                &bundle.runtime.manifest.settings,
+                updates,
+            )?;
+            (bundle, reservation, prepared_state)
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
-        let manifest = self.active_manifest(plugin_id)?;
-        let config = self
-            .state
-            .save_settings(plugin_id, &manifest.settings, updates)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(Some(bundle.with_config(config.clone())))?;
         Ok(mutation_from_config(&config))
     }
 
@@ -846,44 +1046,64 @@ impl PublicPluginManager {
         plugin_id: &str,
         retain_data: bool,
     ) -> Result<Option<String>, PublicPluginManagementError> {
+        let (previous_generation, runtime_label, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let Some(config) = self.state.config(plugin_id)? else {
+                return Ok(None);
+            };
+            let bundle = self.bundles.bundle(plugin_id)?;
+            let runtime_label = bundle.as_ref().map(|bundle| bundle.runtime.label.clone());
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self
+                .state
+                .prepare_uninstall(plugin_id, retain_data)?
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            (
+                config.active_generation,
+                runtime_label,
+                reservation,
+                prepared_state,
+            )
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
-        let previous_generation = self
-            .state
-            .config(plugin_id)?
-            .map(|config| config.active_generation);
         self.clear_runtime_faults(plugin_id)?;
-        self.state.uninstall(plugin_id, retain_data)?;
-        self.scheduler
-            .invalidate_plugin(plugin_id, None)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        if retain_data {
+            self.scheduler
+                .invalidate_plugin(plugin_id, None)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        } else {
+            self.scheduler
+                .forget_plugin(plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        }
         self.cancel_delayed_messages(plugin_id);
-        let timer_effects = previous_generation
-            .map(|generation| self.cancel_timer_generation(plugin_id, generation))
-            .unwrap_or_default();
-        let runtime_label = self
-            .lock_data()?
-            .active_by_plugin
-            .remove(plugin_id)
-            .map(|snapshot| snapshot.label.clone());
+        let timer_effects = self.cancel_timer_generation(plugin_id, previous_generation);
+        self.state.publish_prepared(prepared_state)?;
+        reservation.publish(None)?;
+        self.lock_data()?.active_by_plugin.remove(plugin_id);
+        drop(_mutation);
+        self.apply_timer_post_lock_effects(timer_effects);
         if !retain_data {
-            self.storage
-                .uninstall(plugin_id, false)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            self.secrets
-                .uninstall(plugin_id, false)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let _ = self.storage.uninstall(plugin_id, false);
+            let _ = self.secrets.uninstall(plugin_id, false);
+            self.state.cleanup_uninstalled_owner(plugin_id);
         }
         let packages = self.packages_root.join(plugin_id);
         if packages.exists() {
             package::remove_package_tree(packages);
         }
-        drop(_mutation);
-        self.apply_timer_post_lock_effects(timer_effects);
         Ok(runtime_label)
     }
 
     pub(crate) fn inventory(&self) -> Result<PublicPluginInventory, PublicPluginManagementError> {
         let configs = self.state.configs()?;
+        let active = self
+            .bundles
+            .bundles()?
+            .into_iter()
+            .map(|bundle| (bundle.config.plugin_id.clone(), bundle))
+            .collect::<HashMap<_, _>>();
         let data = self.lock_data()?;
         let revision = configs
             .iter()
@@ -891,8 +1111,19 @@ impl PublicPluginManager {
             .max()
             .unwrap_or(0);
         let mut items = Vec::new();
-        for config in configs.into_iter().filter(|config| config.installed) {
-            let Some(snapshot) = data.active_by_plugin.get(&config.plugin_id) else {
+        for stored_config in configs.into_iter().filter(|config| config.installed) {
+            let active_bundle = active.get(&stored_config.plugin_id);
+            let config = active_bundle
+                .map(|bundle| bundle.config.clone())
+                .unwrap_or(stored_config);
+            let snapshot = active_bundle
+                .map(|bundle| bundle.runtime.as_ref())
+                .or_else(|| {
+                    data.active_by_plugin
+                        .get(&config.plugin_id)
+                        .map(Arc::as_ref)
+                });
+            let Some(snapshot) = snapshot else {
                 continue;
             };
             let scope = super::PluginDataScope::new(&config.plugin_id)
@@ -968,11 +1199,9 @@ impl PublicPluginManager {
         if effective_name.is_empty() {
             return Ok(None);
         }
-        let data = self.lock_data()?;
-        for (plugin_id, snapshot) in &data.active_by_plugin {
-            let Some(config) = self.state.config(plugin_id)? else {
-                continue;
-            };
+        for bundle in self.bundles.bundles()? {
+            let config = &bundle.config;
+            let snapshot = &bundle.runtime;
             if !config.installed
                 || !config.enabled
                 || config.fault.is_some()
@@ -983,8 +1212,9 @@ impl PublicPluginManager {
             }
             let command = &snapshot.manifest.command;
             return Ok(Some(PublicPluginRoute {
-                plugin_id: plugin_id.clone(),
+                plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
+                activation_id: bundle.activation_id,
                 runtime_label: snapshot.label.clone(),
                 activation_mode: command.activation_mode,
                 output_mode: command.output_mode,
@@ -1007,12 +1237,10 @@ impl PublicPluginManager {
         prefix: &str,
     ) -> Result<Vec<PublicCommandSuggestion>, PublicPluginManagementError> {
         let folded_prefix = prefix.to_lowercase();
-        let data = self.lock_data()?;
         let mut suggestions = Vec::new();
-        for (plugin_id, snapshot) in &data.active_by_plugin {
-            let Some(config) = self.state.config(plugin_id)? else {
-                continue;
-            };
+        for bundle in self.bundles.bundles()? {
+            let config = &bundle.config;
+            let snapshot = &bundle.runtime;
             if !config.installed
                 || !config.enabled
                 || config.fault.is_some()
@@ -1027,7 +1255,7 @@ impl PublicPluginManager {
                 continue;
             }
             suggestions.push(PublicCommandSuggestion {
-                effective_name: config.effective_name,
+                effective_name: config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
@@ -1039,30 +1267,30 @@ impl PublicPluginManager {
     pub(crate) fn runtime_candidates(
         &self,
     ) -> Result<Vec<PublicRuntimeCandidate>, PublicPluginManagementError> {
-        let data = self.lock_data()?;
-        let mut candidates = Vec::new();
-        for (plugin_id, snapshot) in &data.active_by_plugin {
-            if self
-                .state
-                .config(plugin_id)?
-                .is_some_and(|config| config.installed && config.enabled)
-            {
-                candidates.push(snapshot.candidate());
-            }
-        }
-        Ok(candidates)
+        Ok(self
+            .bundles
+            .bundles()?
+            .into_iter()
+            .filter(|bundle| bundle.config.installed && bundle.config.enabled)
+            .map(|bundle| bundle.runtime.candidate(bundle.activation_id))
+            .collect())
     }
 
     pub(crate) fn asset(&self, label: &str, request_path: &str) -> Option<PublicRuntimeAsset> {
-        let snapshot = {
+        let staged = {
             let data = self.data.lock().ok()?;
-            data.staged_by_label.get(label).cloned().or_else(|| {
-                data.active_by_plugin
-                    .values()
-                    .find(|snapshot| snapshot.label == label)
-                    .cloned()
-            })?
+            data.staged_by_label
+                .get(label)
+                .map(|candidate| Arc::clone(&candidate.runtime))
         };
+        let snapshot = staged.or_else(|| {
+            self.bundles
+                .bundles()
+                .ok()?
+                .into_iter()
+                .find(|bundle| bundle.runtime.label == label)
+                .map(|bundle| Arc::clone(&bundle.runtime))
+        })?;
         if request_path == "/" || request_path == format!("/{RUNTIME_HOST_PATH}") {
             return Some(PublicRuntimeAsset {
                 mime: "text/html",
@@ -1082,14 +1310,9 @@ impl PublicPluginManager {
         plugin_id: &str,
         request_path: &str,
     ) -> Option<PublicRuntimeAsset> {
-        let snapshot = self
-            .data
-            .lock()
-            .ok()?
-            .active_by_plugin
-            .get(plugin_id)
-            .cloned()?;
-        let config = self.state.config(plugin_id).ok()??;
+        let bundle = self.bundles.bundle(plugin_id).ok()??;
+        let snapshot = &bundle.runtime;
+        let config = &bundle.config;
         if !config.installed
             || !config.enabled
             || config.fault.is_some()
@@ -1135,14 +1358,19 @@ impl PublicPluginManager {
                 plugin_id,
                 generation,
             } => {
-                let snapshot = self
-                    .data
-                    .lock()
-                    .ok()?
-                    .active_by_plugin
-                    .get(&plugin_id)
-                    .cloned()?;
                 let config = self.state.config(&plugin_id).ok()??;
+                let active_bundle = self.bundles.bundle(&plugin_id).ok()?;
+                let snapshot = active_bundle
+                    .as_ref()
+                    .map(|bundle| Arc::clone(&bundle.runtime))
+                    .or_else(|| {
+                        self.data
+                            .lock()
+                            .ok()?
+                            .active_by_plugin
+                            .get(&plugin_id)
+                            .cloned()
+                    })?;
                 if !config.installed
                     || config.active_generation != generation
                     || snapshot.generation != generation
@@ -1151,7 +1379,8 @@ impl PublicPluginManager {
                     return None;
                 }
                 let main_allowed = caller_label == "main";
-                let shell_allowed = config.enabled
+                let shell_allowed = active_bundle.is_some()
+                    && config.enabled
                     && config.fault.is_none()
                     && snapshot.manifest.command.output_mode == PublicOutputMode::Window
                     && snapshot
@@ -1175,24 +1404,20 @@ impl PublicPluginManager {
         &self,
         plugin_id: &str,
     ) -> Result<PublicPluginWindowIdentity, PublicPluginManagementError> {
-        let snapshot = self
-            .lock_data()?
-            .active_by_plugin
-            .get(plugin_id)
-            .cloned()
+        let bundle = self
+            .bundles
+            .bundle(plugin_id)?
             .ok_or(PublicPluginManagementError::Unavailable)?;
-        let config = self
-            .state
-            .config(plugin_id)?
-            .filter(|config| {
-                config.installed
-                    && config.enabled
-                    && config.fault.is_none()
-                    && config.active_generation == snapshot.generation
-                    && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
-            })
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        let _ = config;
+        let snapshot = &bundle.runtime;
+        let config = &bundle.config;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || config.active_generation != snapshot.generation
+            || config.package_digest.as_deref() != Some(snapshot.digest.as_str())
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         if snapshot.manifest.command.output_mode != PublicOutputMode::Window
             || !snapshot
                 .manifest
@@ -1208,40 +1433,26 @@ impl PublicPluginManager {
     }
 
     pub(crate) fn message_icon_url(&self, plugin_id: &str) -> Option<String> {
-        let snapshot = self
-            .data
-            .lock()
-            .ok()?
-            .active_by_plugin
-            .get(plugin_id)
-            .cloned()?;
-        self.state.config(plugin_id).ok()?.filter(|config| {
-            config.installed
-                && config.active_generation == snapshot.generation
-                && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
-        })?;
-        snapshot.icon_url()
+        let bundle = self.bundles.bundle(plugin_id).ok()??;
+        bundle.runtime.icon_url()
     }
 
     pub(crate) fn can_copy_text(&self, plugin_id: &str, generation: u64) -> bool {
-        self.state
-            .config(plugin_id)
+        self.bundles
+            .bundle(plugin_id)
             .ok()
             .flatten()
-            .is_some_and(|config| {
+            .is_some_and(|bundle| {
+                let config = &bundle.config;
                 config.installed
                     && config.enabled
                     && config.fault.is_none()
                     && config.active_generation == generation
+                    && bundle.runtime.generation == generation
                     && config
                         .permission_grants
                         .contains(&PublicPermission::ClipboardWrite)
             })
-            && self
-                .lock_data()
-                .ok()
-                .and_then(|data| data.active_by_plugin.get(plugin_id).cloned())
-                .is_some_and(|snapshot| snapshot.generation == generation)
     }
     pub(crate) fn execute_api(
         &self,
@@ -1330,25 +1541,21 @@ impl PublicPluginManager {
         plugin_id: &str,
         generation: u64,
     ) -> Result<(TimerKey, String), TimerError> {
-        let config = self
-            .state
-            .config(plugin_id)
+        let bundle = self
+            .bundles
+            .bundle(plugin_id)
             .map_err(|_| TimerError::TimerUnavailable)?
-            .filter(|config| {
-                config.installed
-                    && config.enabled
-                    && config.fault.is_none()
-                    && config.active_generation == generation
-            })
             .ok_or(TimerError::ExpiredWindowSessionError)?;
-        let snapshot = self
-            .lock_data()
-            .map_err(|_| TimerError::TimerUnavailable)?
-            .active_by_plugin
-            .get(plugin_id)
-            .cloned()
-            .filter(|snapshot| snapshot.generation == generation)
-            .ok_or(TimerError::ExpiredWindowSessionError)?;
+        let config = &bundle.config;
+        let snapshot = &bundle.runtime;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || config.active_generation != generation
+            || snapshot.generation != generation
+        {
+            return Err(TimerError::ExpiredWindowSessionError);
+        }
         let required = [
             PublicPermission::UiWindow,
             PublicPermission::NotificationsPublish,
@@ -1361,7 +1568,7 @@ impl PublicPluginManager {
             return Err(TimerError::PermissionDenied);
         }
         let key = TimerKey::new(plugin_id, generation).ok_or(TimerError::TimerUnavailable)?;
-        Ok((key, config.effective_name))
+        Ok((key, config.effective_name.clone()))
     }
 
     pub(crate) fn start_timers(
@@ -1411,37 +1618,29 @@ impl PublicPluginManager {
             };
             let key = ticket.key();
             let eligible = self
-                .state
-                .config(&key.plugin_id)
+                .bundles
+                .bundle(&key.plugin_id)
                 .ok()
                 .flatten()
-                .is_some_and(|config| {
+                .is_some_and(|bundle| {
+                    let config = &bundle.config;
+                    let snapshot = &bundle.runtime;
                     config.installed
                         && config.enabled
                         && config.fault.is_none()
                         && config.active_generation == key.plugin_generation
+                        && snapshot.generation == key.plugin_generation
                         && [
                             PublicPermission::UiWindow,
                             PublicPermission::NotificationsPublish,
                             PublicPermission::TimerControl,
                         ]
                         .into_iter()
-                        .all(|permission| config.permission_grants.contains(&permission))
-                })
-                && self
-                    .lock_data()
-                    .ok()
-                    .and_then(|data| data.active_by_plugin.get(&key.plugin_id).cloned())
-                    .is_some_and(|snapshot| {
-                        snapshot.generation == key.plugin_generation
-                            && [
-                                PublicPermission::UiWindow,
-                                PublicPermission::NotificationsPublish,
-                                PublicPermission::TimerControl,
-                            ]
-                            .into_iter()
-                            .all(|permission| snapshot.manifest.permissions.contains(&permission))
-                    });
+                        .all(|permission| {
+                            config.permission_grants.contains(&permission)
+                                && snapshot.manifest.permissions.contains(&permission)
+                        })
+                });
             if !eligible {
                 drop(mutation);
                 let _ = self.timers.complete_claim(&ticket, false);
@@ -1515,30 +1714,27 @@ impl PublicPluginManager {
     ) -> Option<MessagePostGuardEffect> {
         let mutation = self.lock_mutation().ok()?;
         let eligible = self
-            .state
-            .config(&message.plugin_id)
+            .bundles
+            .bundle(&message.plugin_id)
             .ok()
             .flatten()
-            .is_some_and(|config| {
+            .is_some_and(|bundle| {
+                let config = &bundle.config;
+                let snapshot = &bundle.runtime;
                 config.installed
                     && config.enabled
                     && config.fault.is_none()
+                    && bundle.activation_id == message.activation_id
                     && config.active_generation == message.plugin_generation
+                    && snapshot.generation == message.plugin_generation
                     && config
                         .permission_grants
                         .contains(&PublicPermission::NotificationsPublish)
-            })
-            && self
-                .lock_data()
-                .ok()
-                .and_then(|data| data.active_by_plugin.get(&message.plugin_id).cloned())
-                .is_some_and(|snapshot| {
-                    snapshot.generation == message.plugin_generation
-                        && snapshot
-                            .manifest
-                            .permissions
-                            .contains(&PublicPermission::NotificationsPublish)
-                });
+                    && snapshot
+                        .manifest
+                        .permissions
+                        .contains(&PublicPermission::NotificationsPublish)
+            });
         drop(mutation);
         if !eligible {
             return None;
@@ -1591,63 +1787,90 @@ impl PublicPluginManager {
         &self.state
     }
 
+    #[cfg(test)]
+    fn activation_id(&self, plugin_id: &str) -> Option<u64> {
+        self.bundles
+            .bundle(plugin_id)
+            .ok()
+            .flatten()
+            .map(|bundle| bundle.activation_id)
+    }
+
     pub(crate) fn replace_runtime_generation(
         &self,
         plugin_id: &str,
         previous_generation: u64,
         new_generation: u64,
     ) -> Result<PublicRuntimeCandidate, PublicPluginManagementError> {
+        let (candidate, runtime, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let current = self
+                .bundles
+                .bundle(plugin_id)?
+                .filter(|bundle| {
+                    bundle.config.installed
+                        && bundle.config.enabled
+                        && bundle.config.fault.is_none()
+                        && bundle.config.active_generation == previous_generation
+                        && bundle.runtime.generation == previous_generation
+                })
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let mut replacement = (*current.runtime).clone();
+            replacement.generation = new_generation;
+            replacement.label = runtime_label(plugin_id, new_generation)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let activation_id = self
+                .activation_ids
+                .allocate()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let candidate = Arc::new(ActivationCandidate::reactivate(
+                Arc::new(replacement),
+                current.alarm.as_ref(),
+                activation_id,
+            ));
+            let runtime = candidate.runtime.candidate(candidate.activation_id);
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self.state.prepare_activation(
+                &candidate.runtime.manifest,
+                current.config.permission_grants.clone(),
+                new_generation,
+                Some(candidate.runtime.digest.clone()),
+            )?;
+            (candidate, runtime, reservation, prepared_state)
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
-        let config = self
-            .state
-            .config(plugin_id)?
-            .filter(|config| {
-                config.installed
-                    && config.enabled
-                    && config.fault.is_none()
-                    && config.active_generation == previous_generation
-            })
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        let mut data = self.lock_data()?;
-        let current = data
-            .active_by_plugin
-            .get(plugin_id)
-            .filter(|snapshot| snapshot.generation == previous_generation)
-            .cloned()
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        let mut replacement = (*current).clone();
-        replacement.generation = new_generation;
-        replacement.label = runtime_label(plugin_id, new_generation)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        self.state.activate(
-            &replacement.manifest,
-            config.permission_grants,
-            new_generation,
-            Some(replacement.digest.clone()),
-        )?;
         self.cancel_delayed_messages(plugin_id);
         let timer_effects = self.cancel_timer_generation(plugin_id, previous_generation);
-        let replacement = Arc::new(replacement);
-        let candidate = replacement.candidate();
-        data.active_by_plugin.insert(plugin_id.into(), replacement);
-        drop(data);
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(Some(candidate.bundle(config)))?;
+        self.lock_data()?
+            .active_by_plugin
+            .insert(plugin_id.into(), Arc::clone(&candidate.runtime));
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
-        Ok(candidate)
+        Ok(runtime)
     }
 
     pub(crate) fn record_runtime_result(
         &self,
         plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
         success: bool,
         now: Instant,
     ) -> Result<bool, PublicPluginManagementError> {
+        if !self.bundles.bundle(plugin_id)?.is_some_and(|bundle| {
+            bundle.activation_id == activation_id && bundle.runtime.generation == generation
+        }) {
+            return Ok(false);
+        }
         let disable = {
             let mut faults = self
                 .runtime_faults
                 .lock()
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            let window = faults.entry(plugin_id.into()).or_default();
+            let window = faults.entry((plugin_id.into(), activation_id)).or_default();
             if success {
                 window.clear();
                 false
@@ -1658,53 +1881,91 @@ impl PublicPluginManager {
         if !disable {
             return Ok(false);
         }
-        let _mutation = self.lock_mutation()?;
-        let generation = self
-            .state
-            .config(plugin_id)?
-            .map(|config| config.active_generation);
-        self.state
-            .disable_for_fault(plugin_id, PublicPluginFault::RuntimeUnavailable)?;
-        self.scheduler
-            .invalidate_plugin(plugin_id, None)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        self.cancel_delayed_messages(plugin_id);
-        let timer_effects = generation
-            .map(|generation| self.cancel_timer_generation(plugin_id, generation))
-            .unwrap_or_default();
-        drop(_mutation);
-        self.apply_timer_post_lock_effects(timer_effects);
-        Ok(true)
+        self.disable_plugin_for_fault_if_current(
+            plugin_id,
+            generation,
+            activation_id,
+            PublicPluginFault::RuntimeUnavailable,
+        )
     }
 
     fn clear_runtime_faults(&self, plugin_id: &str) -> Result<(), PublicPluginManagementError> {
         self.runtime_faults
             .lock()
             .map_err(|_| PublicPluginManagementError::Unavailable)?
-            .remove(plugin_id);
+            .retain(|(owner, _), _| owner != plugin_id);
         Ok(())
     }
     pub(crate) fn mark_runtime_unavailable(
         &self,
         plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
     ) -> Result<(), PublicPluginManagementError> {
+        self.disable_plugin_for_fault_if_current(
+            plugin_id,
+            generation,
+            activation_id,
+            PublicPluginFault::RuntimeUnavailable,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn disable_plugin_for_fault(
+        &self,
+        plugin_id: &str,
+        fault: PublicPluginFault,
+    ) -> Result<(), PublicPluginManagementError> {
+        let Some(bundle) = self.bundles.bundle(plugin_id)? else {
+            return Ok(());
+        };
+        self.disable_plugin_for_fault_if_current(
+            plugin_id,
+            bundle.runtime.generation,
+            bundle.activation_id,
+            fault,
+        )?;
+        Ok(())
+    }
+
+    fn disable_plugin_for_fault_if_current(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        fault: PublicPluginFault,
+    ) -> Result<bool, PublicPluginManagementError> {
+        let (generation, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let config = self
+                .state
+                .config(plugin_id)?
+                .filter(|config| config.installed && config.enabled)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let bundle = self
+                .bundles
+                .bundle(plugin_id)?
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            if bundle.activation_id != activation_id || bundle.runtime.generation != generation {
+                return Ok(false);
+            }
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self.state.prepare_disable_for_fault(plugin_id, fault)?;
+            (config.active_generation, reservation, prepared_state)
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
-        let generation = self
-            .state
-            .config(plugin_id)?
-            .map(|config| config.active_generation);
-        self.state
-            .disable_for_fault(plugin_id, PublicPluginFault::RuntimeUnavailable)?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(plugin_id);
-        let timer_effects = generation
-            .map(|generation| self.cancel_timer_generation(plugin_id, generation))
-            .unwrap_or_default();
+        let timer_effects = self.cancel_timer_generation(plugin_id, generation);
+        self.state.publish_prepared(prepared_state)?;
+        reservation.publish(None)?;
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
-        Ok(())
+        Ok(true)
     }
 
     fn cancel_delayed_messages(&self, plugin_id: &str) {
@@ -1736,30 +1997,27 @@ impl PublicPluginManager {
         &self,
         plugin_id: &str,
     ) -> Result<PublicManifestV1, PublicPluginManagementError> {
-        self.lock_data()?
-            .active_by_plugin
-            .get(plugin_id)
-            .map(|snapshot| snapshot.manifest.clone())
+        self.bundles
+            .bundle(plugin_id)?
+            .map(|bundle| bundle.runtime.manifest.clone())
             .ok_or(PublicPluginManagementError::Unavailable)
     }
 
     fn manifest_for_label(&self, label: &str) -> Option<PublicManifestV1> {
-        let data = self.data.lock().ok()?;
-        let snapshot = data
-            .active_by_plugin
-            .values()
-            .find(|snapshot| snapshot.label == label)?;
-        self.state
-            .config(&snapshot.manifest.plugin_id)
-            .ok()
-            .flatten()
-            .filter(|config| {
-                config.installed
-                    && config.enabled
-                    && config.active_generation == snapshot.generation
-                    && config.package_digest.as_deref() == Some(snapshot.digest.as_str())
-            })?;
-        Some(snapshot.manifest.clone())
+        let bundle = self
+            .bundles
+            .bundles()
+            .ok()?
+            .into_iter()
+            .find(|bundle| bundle.runtime.label == label)?;
+        let snapshot = &bundle.runtime;
+        let config = &bundle.config;
+        (config.installed
+            && config.enabled
+            && config.fault.is_none()
+            && config.active_generation == snapshot.generation
+            && config.package_digest.as_deref() == Some(snapshot.digest.as_str()))
+        .then(|| snapshot.manifest.clone())
     }
 
     fn cleanup_expired(&self, now: Instant) -> Result<(), PublicPluginManagementError> {
@@ -1772,6 +2030,25 @@ impl PublicPluginManager {
     fn unstage(&self, label: &str) {
         if let Ok(mut data) = self.data.lock() {
             data.staged_by_label.remove(label);
+        }
+    }
+
+    fn make_state_durable(
+        &self,
+        reservation: &ActivationReservation,
+        prepared: &PreparedStateCommit,
+    ) -> Result<(), PublicPluginManagementError> {
+        reservation.begin_committing()?;
+        match self.state.persist_prepared(prepared) {
+            DurableStateOutcome::Committed => reservation.mark_durable().map_err(Into::into),
+            DurableStateOutcome::NotCommitted => {
+                if !self.state.revalidate_previous(prepared) {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                reservation.rollback_not_committed()?;
+                Err(PublicPluginManagementError::Unavailable)
+            }
+            DurableStateOutcome::Unknown => Err(PublicPluginManagementError::Unavailable),
         }
     }
 
@@ -1818,9 +2095,18 @@ fn load_runtime_snapshot(
     host: &PublicPluginHost,
     digest: &str,
     generation: u64,
-) -> Result<RuntimeSnapshot, PublicPluginManagementError> {
-    let (manifest, resources) = package::load_existing(package_root, host, digest)?;
-    snapshot_from_parts(package_root, manifest, digest.into(), resources, generation)
+) -> Result<(RuntimeSnapshot, Option<super::PreparedAlarmAsset>), PublicPluginManagementError> {
+    let (manifest, resources, alarm) = package::load_existing(package_root, host, digest)?;
+    Ok((
+        snapshot_from_parts(package_root, manifest, digest.into(), resources, generation)?,
+        alarm,
+    ))
+}
+
+impl From<ReservationError> for PublicPluginManagementError {
+    fn from(_: ReservationError) -> Self {
+        Self::Unavailable
+    }
 }
 
 fn snapshot_from_parts(
@@ -2167,7 +2453,13 @@ mod tests {
                     "inputRequired": false
                 },
                 "runtime": { "entry": "dist/runtime.js" },
-                "permissions": []
+                "permissions": [],
+                "settings": [{
+                    "type": "boolean",
+                    "key": "compact",
+                    "label": "Compact",
+                    "default": false
+                }]
             }))
             .unwrap(),
         )
@@ -2326,6 +2618,7 @@ mod tests {
                 DelayedMessageRegistration {
                     plugin_id: "com.example.activation".into(),
                     plugin_generation: generation,
+                    activation_id: manager.activation_id("com.example.activation").unwrap(),
                     plugin_name_snapshot: "Activation".into(),
                     request_id: request_id.into(),
                     content: request_id.into(),
@@ -2605,18 +2898,22 @@ mod tests {
         let installed = manager
             .commit_with_readiness("main", &prepared.token, grants, now, |_| true)
             .unwrap();
-        let message = |generation, request_id: &str| ScheduledPluginMessage {
+        let message = |generation, activation_id, request_id: &str| ScheduledPluginMessage {
             schedule_id: generation,
             plugin_id: "com.example.activation".into(),
             plugin_generation: generation,
+            activation_id,
             plugin_name_snapshot: "Activation".into(),
             request_id: request_id.into(),
             content: request_id.into(),
             due_at: now,
         };
 
-        let effect =
-            manager.commit_scheduled_message(message(installed.runtime.generation, "current"));
+        let effect = manager.commit_scheduled_message(message(
+            installed.runtime.generation,
+            installed.runtime.activation_id,
+            "current",
+        ));
         assert!(matches!(
             effect,
             Some(MessagePostGuardEffect::Published(ref published))
@@ -2625,10 +2922,49 @@ mod tests {
         assert_eq!(manager.message_center.summary().unwrap().unread_count, 1);
 
         assert_eq!(
-            manager.commit_scheduled_message(message(installed.runtime.generation + 1, "stale",)),
+            manager.commit_scheduled_message(message(
+                installed.runtime.generation + 1,
+                installed.runtime.activation_id,
+                "stale",
+            )),
             None
         );
         assert_eq!(manager.message_center.summary().unwrap().unread_count, 1);
+
+        manager.uninstall("com.example.activation", false).unwrap();
+        let later = now + Duration::from_secs(1);
+        let prepared = manager
+            .prepare("main", source(&dir.source()), later)
+            .unwrap();
+        let reinstalled = manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NotificationsPublish]),
+                later,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(reinstalled.runtime.generation, installed.runtime.generation);
+        assert_ne!(
+            reinstalled.runtime.activation_id,
+            installed.runtime.activation_id
+        );
+        assert_eq!(
+            manager.commit_scheduled_message(message(
+                reinstalled.runtime.generation,
+                installed.runtime.activation_id,
+                "old-activation",
+            )),
+            None
+        );
+        assert!(manager
+            .commit_scheduled_message(message(
+                reinstalled.runtime.generation,
+                reinstalled.runtime.activation_id,
+                "new-activation",
+            ))
+            .is_some());
     }
 
     #[test]
@@ -2840,7 +3176,11 @@ mod tests {
 
         let updated_key = start(&manager, updated.runtime.generation);
         manager
-            .mark_runtime_unavailable("com.example.timer")
+            .mark_runtime_unavailable(
+                "com.example.timer",
+                updated.runtime.generation,
+                updated.runtime.activation_id,
+            )
             .unwrap();
         assert_eq!(
             manager
@@ -2857,6 +3197,18 @@ mod tests {
             .runtime
             .unwrap();
         let enabled_key = start(&manager, enabled.generation);
+        let activation_id = manager.activation_id("com.example.timer").unwrap();
+        manager
+            .rename("com.example.timer", Some("timer-renamed"))
+            .unwrap();
+        assert_eq!(
+            manager.activation_id("com.example.timer"),
+            Some(activation_id)
+        );
+        assert_eq!(
+            manager.timers.get_state(&enabled_key).unwrap().phase,
+            PluginTimerPhase::Running
+        );
         manager.uninstall("com.example.timer", true).unwrap();
         assert_eq!(
             manager
@@ -2906,6 +3258,7 @@ mod tests {
             PublicPluginRoute {
                 plugin_id: "com.example.activation".into(),
                 generation: 1,
+                activation_id: manager.activation_id("com.example.activation").unwrap(),
                 runtime_label: runtime_label("com.example.activation", 1).unwrap(),
                 activation_mode: PublicActivationMode::Live,
                 output_mode: PublicOutputMode::MainResult,
@@ -2993,7 +3346,10 @@ mod tests {
             .unwrap()
             .active_by_plugin
             .insert("com.example.demo-win".into(), Arc::new(stale));
-        assert!(manager.command_suggestions("a").unwrap().is_empty());
+        assert_eq!(
+            manager.command_suggestions("a").unwrap()[0].effective_name,
+            "alpha-win"
+        );
         manager
             .data
             .lock()
@@ -3009,8 +3365,7 @@ mod tests {
             .unwrap()
             .is_empty());
         manager
-            .state
-            .disable_for_fault(
+            .disable_plugin_for_fault(
                 "com.example.demo-win",
                 PublicPluginFault::ConsecutiveFailures,
             )
@@ -3216,11 +3571,19 @@ mod tests {
         );
 
         assert!(!manager
-            .record_runtime_result("com.example.activation", false, now)
+            .record_runtime_result(
+                "com.example.activation",
+                replacement.generation,
+                replacement.activation_id,
+                false,
+                now,
+            )
             .unwrap());
         assert!(!manager
             .record_runtime_result(
                 "com.example.activation",
+                replacement.generation,
+                replacement.activation_id,
                 false,
                 now + Duration::from_secs(10),
             )
@@ -3228,6 +3591,8 @@ mod tests {
         assert!(manager
             .record_runtime_result(
                 "com.example.activation",
+                replacement.generation,
+                replacement.activation_id,
                 false,
                 now + Duration::from_secs(20),
             )
@@ -3272,9 +3637,82 @@ mod tests {
         assert!(!manager
             .record_runtime_result(
                 "com.example.activation",
+                reenabled_commit.runtime.as_ref().unwrap().generation,
+                reenabled_commit.runtime.as_ref().unwrap().activation_id,
                 false,
                 now + Duration::from_secs(30),
             )
             .unwrap());
+    }
+
+    #[test]
+    fn activation_identity_survives_config_only_changes_and_is_never_reused() {
+        let dir = TestDir::new("activation-identity");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let first_id = manager.activation_id("com.example.activation").unwrap();
+
+        manager
+            .rename("com.example.activation", Some("renamed"))
+            .unwrap();
+        assert_eq!(
+            manager.activation_id("com.example.activation"),
+            Some(first_id)
+        );
+        manager
+            .save_settings(
+                "com.example.activation",
+                &BTreeMap::from([("compact".into(), json!(true))]),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.activation_id("com.example.activation"),
+            Some(first_id)
+        );
+
+        let reservation = manager.bundles.reserve("com.example.activation").unwrap();
+        assert_eq!(manager.route("/renamed").unwrap().unwrap().generation, 1);
+        assert_eq!(
+            manager.rename("com.example.activation", Some("blocked")),
+            Err(PublicPluginManagementError::Unavailable)
+        );
+        drop(reservation);
+
+        manager.uninstall("com.example.activation", false).unwrap();
+        assert_eq!(manager.activation_id("com.example.activation"), None);
+        let later = now + Duration::from_secs(1);
+        let prepared = manager
+            .prepare("main", source(&dir.source()), later)
+            .unwrap();
+        let commit = manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), later, |_| true)
+            .unwrap();
+        assert_eq!(commit.runtime.generation, 1);
+        let second_id = manager.activation_id("com.example.activation").unwrap();
+        assert_ne!(second_id, first_id);
+        for offset in 0..3 {
+            assert!(!manager
+                .record_runtime_result(
+                    "com.example.activation",
+                    1,
+                    first_id,
+                    false,
+                    later + Duration::from_secs(offset),
+                )
+                .unwrap());
+        }
+        assert!(
+            manager
+                .state()
+                .config("com.example.activation")
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
     }
 }

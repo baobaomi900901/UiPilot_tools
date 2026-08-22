@@ -13,6 +13,7 @@ pub(crate) const MAX_PENDING_PER_PLUGIN: usize = 32;
 pub(crate) struct DelayedMessageRegistration {
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
+    pub(crate) activation_id: u64,
     pub(crate) plugin_name_snapshot: String,
     pub(crate) request_id: String,
     pub(crate) content: String,
@@ -24,6 +25,7 @@ pub(crate) struct ScheduledPluginMessage {
     pub(crate) schedule_id: u64,
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
+    pub(crate) activation_id: u64,
     pub(crate) plugin_name_snapshot: String,
     pub(crate) request_id: String,
     pub(crate) content: String,
@@ -110,6 +112,7 @@ impl DelayedMessageScheduler {
             schedule_id,
             plugin_id: registration.plugin_id,
             plugin_generation: registration.plugin_generation,
+            activation_id: registration.activation_id,
             plugin_name_snapshot: registration.plugin_name_snapshot,
             request_id: registration.request_id,
             content: registration.content,
@@ -210,6 +213,7 @@ impl DelayedMessageScheduler {
 fn valid_registration(registration: &DelayedMessageRegistration) -> bool {
     !registration.plugin_id.is_empty()
         && registration.plugin_generation != 0
+        && registration.activation_id != 0
         && !registration.plugin_name_snapshot.is_empty()
         && !registration.request_id.is_empty()
         && !registration.content.is_empty()
@@ -284,6 +288,7 @@ mod tests {
         DelayedMessageRegistration {
             plugin_id: plugin_id.into(),
             plugin_generation: 7,
+            activation_id: 11,
             plugin_name_snapshot: format!("{plugin_id} name"),
             request_id: request_id.into(),
             content: format!("message {request_id}"),

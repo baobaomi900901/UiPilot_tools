@@ -306,3 +306,47 @@ fn uninstall_retention_and_corrupt_owner_isolation_are_durable() {
         .to_string_lossy()
         .starts_with("state.json.invalid-")));
 }
+
+#[test]
+fn prepared_activation_is_invisible_until_durable_state_is_published() {
+    let dir = TestDir::new("prepared-activation");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let plugin = manifest("com.example.prepared", "prepared", json!([]));
+    let prepared = store
+        .prepare_activation(&plugin, BTreeSet::new(), 1, Some("a".repeat(64)))
+        .unwrap();
+
+    assert_eq!(store.config(&plugin.plugin_id).unwrap(), None);
+    assert_eq!(
+        store.persist_prepared(&prepared),
+        DurableStateOutcome::Committed
+    );
+    assert_eq!(store.config(&plugin.plugin_id).unwrap(), None);
+
+    let published = store.publish_prepared(prepared).unwrap();
+    assert_eq!(published.active_generation, 1);
+    assert_eq!(published.package_digest, Some("a".repeat(64)));
+    assert_eq!(store.config(&plugin.plugin_id).unwrap(), Some(published));
+}
+
+#[test]
+fn not_committed_rollback_requires_the_exact_previous_owner_bytes() {
+    let dir = TestDir::new("prepared-revalidation");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let mut plugin = manifest("com.example.prepared", "prepared", json!([]));
+    store
+        .activate(&plugin, BTreeSet::new(), 1, Some("a".repeat(64)))
+        .unwrap();
+    plugin.version = "1.1.0".into();
+    let prepared = store
+        .prepare_activation(&plugin, BTreeSet::new(), 2, Some("b".repeat(64)))
+        .unwrap();
+
+    assert!(store.revalidate_previous(&prepared));
+    fs::write(
+        dir.path().join(&plugin.plugin_id).join("state.json"),
+        b"ambiguous-owner",
+    )
+    .unwrap();
+    assert!(!store.revalidate_previous(&prepared));
+}

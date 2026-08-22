@@ -1,4 +1,5 @@
 mod activation;
+mod activation_bundle;
 mod alarm_asset;
 mod delayed_messages;
 mod icon;
@@ -40,7 +41,7 @@ pub(crate) use activation::{
     PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginRoute,
     PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse,
 };
-pub(crate) use alarm_asset::PreparedAlarmAsset;
+pub(crate) use alarm_asset::{PreparedAlarmAsset, ValidatedAlarmAsset};
 pub(crate) use manifest::{
     public_manifest_v1_schema, PublicActivationMode, PublicManifestV1, PublicOutputMode,
     PublicPermission, PublicPlatform,
@@ -160,7 +161,11 @@ impl PublicPluginService {
             for candidate in candidates {
                 let ready = service.create_runtime(&app, &candidate).is_ok();
                 if !ready {
-                    let _ = manager.mark_runtime_unavailable(&candidate.plugin_id);
+                    let _ = manager.mark_runtime_unavailable(
+                        &candidate.plugin_id,
+                        candidate.generation,
+                        candidate.activation_id,
+                    );
                 }
             }
         });
@@ -196,6 +201,7 @@ impl PublicPluginService {
                 PluginRequestCandidate {
                     plugin_id: route.plugin_id.clone(),
                     plugin_generation: route.generation,
+                    activation_id: route.activation_id,
                     activation_mode: route.activation_mode,
                     input: route.input.clone(),
                     owner: PluginSubmissionOwner {
@@ -328,15 +334,27 @@ impl PublicPluginService {
                     };
                     Some(result)
                 };
-                runtime_success = result.as_ref().map(Result::is_ok);
+                runtime_success = result.as_ref().map(|result| {
+                    (
+                        result.is_ok(),
+                        pending.route.generation,
+                        pending.route.activation_id,
+                    )
+                });
                 let _ = pending.sender.send(result);
             }
         }
-        if let Some(success) = runtime_success {
+        if let Some((success, generation, activation_id)) = runtime_success {
             let disabled = self
                 .manager()
                 .map_err(|_| PluginRuntimeError::Unavailable)?
-                .record_runtime_result(&completion.context.plugin_id, success, now)
+                .record_runtime_result(
+                    &completion.context.plugin_id,
+                    generation,
+                    activation_id,
+                    success,
+                    now,
+                )
                 .map_err(|_| PluginRuntimeError::Unavailable)?;
             if disabled {
                 if let Some(next) = outcome.next.as_ref() {
@@ -398,9 +416,13 @@ impl PublicPluginService {
                 );
             }
             if replacement.counts_as_fault
-                && self
-                    .manager()?
-                    .record_runtime_result(&replacement.plugin_id, false, now)?
+                && self.manager()?.record_runtime_result(
+                    &replacement.plugin_id,
+                    replacement.previous_generation,
+                    replacement.previous_activation_id,
+                    false,
+                    now,
+                )?
             {
                 self.settle_plugin_submissions(&replacement.plugin_id);
                 continue;
@@ -412,24 +434,33 @@ impl PublicPluginService {
             ) {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    let _ = self
-                        .manager()?
-                        .mark_runtime_unavailable(&replacement.plugin_id);
+                    let _ = self.manager()?.mark_runtime_unavailable(
+                        &replacement.plugin_id,
+                        replacement.previous_generation,
+                        replacement.previous_activation_id,
+                    );
                     self.settle_plugin_submissions(&replacement.plugin_id);
                     return Err(error);
                 }
             };
             if let Err(error) = self.create_runtime(app, &candidate) {
-                let _ = self
-                    .manager()?
-                    .mark_runtime_unavailable(&replacement.plugin_id);
+                let _ = self.manager()?.mark_runtime_unavailable(
+                    &replacement.plugin_id,
+                    candidate.generation,
+                    candidate.activation_id,
+                );
                 self.settle_plugin_submissions(&replacement.plugin_id);
                 return Err(error);
             }
             let next = self
                 .manager()?
                 .scheduler()
-                .runtime_replaced(&replacement.plugin_id, replacement.new_generation, now)
+                .runtime_replaced(
+                    &replacement.plugin_id,
+                    replacement.new_generation,
+                    candidate.activation_id,
+                    now,
+                )
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
             if let Some(next) = next {
                 self.bind_request(&next.candidate.owner.submission_token, &next.context)?;
@@ -438,9 +469,11 @@ impl PublicPluginService {
                 let invoked_at = crate::commands::invoked_at_rfc3339();
                 if let Err(error) = self.dispatch(app, &next, theme, invoked_at) {
                     self.fail_submission(&next.candidate.owner.submission_token);
-                    let _ = self
-                        .manager()?
-                        .mark_runtime_unavailable(&replacement.plugin_id);
+                    let _ = self.manager()?.mark_runtime_unavailable(
+                        &replacement.plugin_id,
+                        candidate.generation,
+                        candidate.activation_id,
+                    );
                     return Err(error);
                 }
             }

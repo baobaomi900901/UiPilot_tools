@@ -15,6 +15,38 @@ pub(crate) struct PreparedAlarmAsset {
     pub(crate) bytes: Arc<[u8]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AlarmAssetIdentity {
+    pub(crate) plugin_id: String,
+    pub(crate) plugin_generation: u64,
+    pub(crate) activation_id: u64,
+    pub(crate) package_digest: String,
+    pub(crate) resource_sha256: String,
+    pub(crate) fixed_relative_path: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedAlarmAsset {
+    pub(crate) identity: AlarmAssetIdentity,
+    pub(crate) bytes: Arc<[u8]>,
+}
+
+impl ValidatedAlarmAsset {
+    pub(super) fn reactivate(
+        &self,
+        plugin_generation: u64,
+        activation_id: u64,
+    ) -> ValidatedAlarmAsset {
+        let mut identity = self.identity.clone();
+        identity.plugin_generation = plugin_generation;
+        identity.activation_id = activation_id;
+        ValidatedAlarmAsset {
+            identity,
+            bytes: Arc::clone(&self.bytes),
+        }
+    }
+}
+
 pub(super) fn prepare(
     root: &Path,
     resource: &PublicResource,
@@ -38,6 +70,26 @@ pub(super) fn prepare(
 }
 
 impl PreparedAlarmAsset {
+    pub(super) fn activate(
+        &self,
+        plugin_id: &str,
+        plugin_generation: u64,
+        activation_id: u64,
+        package_digest: &str,
+    ) -> ValidatedAlarmAsset {
+        ValidatedAlarmAsset {
+            identity: AlarmAssetIdentity {
+                plugin_id: plugin_id.to_owned(),
+                plugin_generation,
+                activation_id,
+                package_digest: package_digest.to_owned(),
+                resource_sha256: self.resource_sha256.clone(),
+                fixed_relative_path: ALARM_PATH,
+            },
+            bytes: Arc::clone(&self.bytes),
+        }
+    }
+
     pub(super) fn revalidate_at(&self, root: &Path) -> Result<(), PublicPackageError> {
         let path = root.join(ALARM_PATH);
         if !single_link_file(&path) {
@@ -179,7 +231,9 @@ fn lower_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_wav;
+    use std::sync::Arc;
+
+    use super::{validate_wav, PreparedAlarmAsset, ALARM_PATH};
 
     fn wav(frames: u32, channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
         let block_align = channels * (bits / 8);
@@ -245,5 +299,24 @@ mod tests {
         for bytes in cases {
             assert!(validate_wav(&bytes).is_err());
         }
+    }
+
+    #[test]
+    fn activation_identity_freezes_the_exact_prepared_bytes() {
+        let bytes: Arc<[u8]> = Arc::from(wav(100, 1, 44_100, 16));
+        let prepared = PreparedAlarmAsset {
+            resource_sha256: "a".repeat(64),
+            bytes: Arc::clone(&bytes),
+        };
+
+        let active = prepared.activate("com.example.timer", 7, 19, &"b".repeat(64));
+
+        assert_eq!(active.identity.plugin_id, "com.example.timer");
+        assert_eq!(active.identity.plugin_generation, 7);
+        assert_eq!(active.identity.activation_id, 19);
+        assert_eq!(active.identity.package_digest, "b".repeat(64));
+        assert_eq!(active.identity.resource_sha256, "a".repeat(64));
+        assert_eq!(active.identity.fixed_relative_path, ALARM_PATH);
+        assert!(Arc::ptr_eq(&active.bytes, &bytes));
     }
 }
