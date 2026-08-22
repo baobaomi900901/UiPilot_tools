@@ -44,11 +44,12 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 ### Task 1: Validate and Separate the Host-Private Alarm Asset
 
-**Files:** create `src-tauri/src/public_plugins/alarm_asset.rs`; modify `src-tauri/src/public_plugins/package.rs`, `src-tauri/src/public_plugins.rs`, `src-tauri/src/public_plugins/tests.rs`
+**Files:** create `src-tauri/src/public_plugins/alarm_asset.rs`, create `examples/public-plugins/com.uipilot.pomodoro/package/assets/sounds/timer-alarm.wav`; modify `src-tauri/src/public_plugins/package.rs`, `src-tauri/src/public_plugins.rs`, `src-tauri/src/public_plugins/tests.rs`
 
 **Dependencies:** Design sections 5-7, 13.1, 16.1-16.2.
 
 - [ ] Add fixed alarm path and identity/asset preparation types, and implement the exact checked RIFF/WAVE PCM parser from sections 6.1-6.2.
+- [ ] Copy the approved host alarm into the Pomodoro package at the fixed private path before enforcing the new package rule, so the reference package and intermediate development state remain installable.
 - [ ] Make directory and archive staging enforce the `timer.control` presence/absence rule, reject every other WAV, and include the private alarm in file/count/size/digest/revalidation checks.
 - [ ] Copy development hardlinks into an ordinary staging file with link count one; continue to reject symlinks, reparse points, non-files, and staged multi-link files.
 - [ ] Split the prepared snapshot into public resources and the validated private alarm so `asset()` and `window_asset()` can never return the alarm; return `403` for its fixed path without revealing load state.
@@ -121,11 +122,11 @@ Use the exact identities and state machines from design sections 3 and 8-12:
 
 ### Task 6: Migrate Pomodoro Assets, Update SDK Guidance, and Integrate
 
-**Files:** create `examples/public-plugins/com.uipilot.pomodoro/package/assets/sounds/timer-alarm.wav`; modify `examples/public-plugins/com.uipilot.pomodoro/package/plugin.json`, `examples/public-plugins/com.uipilot.pomodoro/README.md`, `examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js`, `docs/plugin-sdk/public-plugin-developer-guide.md`, `src-tauri/tauri.conf.json`, `src-tauri/src/lib.rs`, `src-tauri/src/public_plugins/tests.rs`; remove `src-tauri/resources/sounds/attention-alarm.wav`
+**Files:** modify `examples/public-plugins/com.uipilot.pomodoro/package/plugin.json`, `examples/public-plugins/com.uipilot.pomodoro/README.md`, `examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js`, `docs/plugin-sdk/public-plugin-developer-guide.md`, `src-tauri/tauri.conf.json`, `src-tauri/src/lib.rs`, `src-tauri/src/public_plugins/tests.rs`; remove `src-tauri/resources/sounds/attention-alarm.wav`
 
 **Dependencies:** Tasks 1-5; design sections 14-17.
 
-- [ ] Move the approved Timer WAV into the Pomodoro package at the fixed private path, increase the example version, and keep only `message-notification.wav` in host packaging and startup resolution.
+- [ ] Increase the migrated Pomodoro example version and keep only `message-notification.wav` in host packaging and startup resolution; the package-owned WAV was introduced in Task 1 to keep intermediate builds valid.
 - [ ] Update the Pomodoro README/tests and the third-party guide with the fixed resource contract, strict WAV limits, host/private ownership boundary, reinstall requirement, and the unchanged JavaScript/Manifest interfaces.
 - [ ] Assert the host package contains only ordinary message audio, the Pomodoro directory/archive package contains exactly one valid private alarm, and the schema still has no configurable audio path.
 - [ ] Run the complete automated gate and inspect staged changes so no pre-existing user files or unrelated native-attention edits are absorbed accidentally.
