@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Approved，七轮独立审核通过，无 findings，并获用户最终确认
+- 状态：Draft，重新评估修订后等待用户书面确认
 - 范围：公开插件计时闹铃的私有包资源、安装校验、激活身份、原生播放与声音仲裁
 - 公开 JavaScript API：不变
 - Manifest 字段：不变
@@ -62,9 +62,13 @@ admission 和窗口会话合同。
 - **AlarmAssetRegistry**：ActivationBundle 管理器内部按 activationId 索引 ValidatedAlarmAsset 的宿主私有映射；
   它与 Bundle 在同一线性化点发布或移除，不是独立持久化事实源。
 - **ActivationBundle**：一次激活原子发布的 config、RuntimeSnapshot、私有闹铃、generation 和 activationId。
+- **WebViewGuardToken**：Windows 原生静音握手的一次性、进程内不可复用所有权票证；绑定精确的原生
+  WebView 实例与 Runtime activation 或内容窗口 session，超时、销毁或替换后不可恢复。
 - **alarmEpoch**：原生提醒邮箱内划分闹铃 owner 竞争批次的单调 `u64`。
 - **timerAudioOwner**：协调器中的当前唯一逻辑播放所有者，阶段为 `reserved` 或 `playing`；不最终拥有 PCM 字节。
-- **PlayingMemory**：Windows audio adapter 内部持有的 `Arc<[u8]> + AudioTicket + alarmEpoch + asset identity`。
+- **AlarmPlaybackKey**：协调器从当前 alarmEpoch 派生并交给 Windows audio adapter 的不透明播放身份；adapter
+  只能比较相等性，不能解释 Timer、插件或资产语义。
+- **PlayingMemory**：Windows audio adapter 内部持有的 `Arc<[u8]> + AlarmPlaybackKey`。
 - **ProcessAudioQuarantine**：process-static、无 Rust 析构的失败停止缓冲区集合；内容只由 Windows 在
   `ExitProcess` 后随整个地址空间回收。
 - **activation reservation**：一次插件 mutation 的 `Reserved -> Committing -> Durable -> Published` 提交状态。
@@ -254,22 +258,33 @@ AlarmAssetRegistry 是 ActivationBundle 内存索引的一部分。读取方必�
 
 ### 7.2 WebView 音频隔离
 
-所有公开插件 Runtime WebView 和插件内容 WebView 必须使用固定的 pre-navigation mute handshake：
+Windows 上所有公开插件 Runtime WebView 和插件内容 WebView 必须使用固定的 pre-navigation mute
+handshake。`timer.control` 继续不支持 macOS；未来若在 macOS 开放等价能力，必须先定义并实现独立的原生
+静音 adapter，不能复用或假定 WebView2 合同：
 
 1. 先以只包含宿主静态空白内容的 inert URL 创建 WebView，不能直接加载 Runtime host document、插件窗口
    HTML、插件初始化脚本或任何插件可控资源；
-2. WebView2 controller 建立后，在独立原生准备步骤中取得 `ICoreWebView2_8`；
-3. 调用 `SetIsMuted(true)`，随后回读 `IsMuted` 并确认值为 true；
-4. 注册 `IsMutedChanged` 监听并建立失败关闭处理；
-5. cast、设置、回读、监听注册和有界等待全部成功后，才允许原生层导航至插件 URL；
-6. Runtime ready、窗口 content ready 和任何插件 session 激活都不得早于该握手完成；
-7. 任一步失败或超时都立即销毁 WebView，不能以未确认静音状态继续。
+2. 为精确的原生 WebView 实例签发一次性 `WebViewGuardToken`。Runtime token 同时绑定 activationId 与
+   Runtime generation；内容 token 同时绑定窗口 session generation。token 使用检查递增身份且不得在进程内
+   回绕或复用；耗尽时本次 WebView 创建失败关闭；
+3. WebView2 controller 建立后，在独立原生准备步骤中取得 `ICoreWebView2_8`；
+4. 调用 `SetIsMuted(true)`；
+5. 注册绑定同一 token 的 `IsMutedChanged` 监听与失败关闭处理；
+6. 监听注册成功后执行最终 `IsMuted` 回读并确认值为 true，避免“先回读、后监听”留下未观察的解除静音窗口；
+7. 注册插件 bootstrap/navigation 准备回调。异步回调完成后必须先 CAS 验证同一 token 仍是当前 WebView 的
+   active guard，随后才能导航至插件 URL；
+8. cast、设置、监听、最终回读、bootstrap 注册、有界等待和 token CAS 全部成功后，才允许原生层导航；
+9. Runtime ready、窗口 content ready 和任何插件 session 激活都不得早于该握手完成；
+10. 任一步失败、超时、WebView 销毁、Runtime 替换或 session 撤销都把 token 置为吸收终态并销毁候选
+    WebView。迟到的 bootstrap、导航或静音事件回调必须观察 token 已失效并成为 no-op，不能继续导航，也不能
+    按可复用 label 查找或销毁后来创建的 WebView。
 
 运行期间：
 
 - reload、窗口隐藏/显示、重新建立 session 和内容重载不得清除静音；
-- `IsMutedChanged` 观察到 false 时立即销毁对应 WebView；Runtime WebView 随即使该插件本次运行不可用，内容
-  WebView 则撤销 session 并销毁窗口；
+- `IsMutedChanged` 观察到 false 时，只有仍持有当前 token 的回调可以销毁对应 WebView；Runtime WebView 随即
+  使该精确 activation 本次运行不可用，内容 WebView 则撤销精确 session 并销毁窗口；旧 token 不能影响同
+  label 的新实例；
 - 插件 JavaScript 不获得导航、静音或解除静音的桥接命令；
 - 主窗口 WebView 不受影响；普通消息音和 Timer 闹铃由宿主原生音频通道播放。
 
@@ -491,15 +506,16 @@ Worker 对每个 TimerCompletion 执行：
 2. 否则先通过 Timer 权威 admission 验证完整 AudioTicket；无效票证不 claim epoch，下一张有效票仍可竞争；
 3. admission 成功后，短暂取得邮箱锁，CAS 验证事件仍属于当前未 claim epoch；
 4. CAS 成功即在任何原生播放 I/O 前原子设置 `epochClaimed = true`，并建立
-   `timerAudioOwner = reserved(ticket, asset, epoch)`；
-5. 把完整资产交给 Windows audio adapter，等待该 adapter 的单一串行 start 调用返回；同一时刻最多一个
-   outstanding Timer start，在该结果完成前不得向 adapter 提交新 owner start；
+   `timerAudioOwner = reserved(ticket, asset, epoch, playbackKey)`；`AlarmPlaybackKey` 从该不可复用 epoch 派生，
+   但作为不透明值跨越 audio adapter seam；
+5. 只把 `AlarmPlaybackKey + Arc<[u8]>` 交给 Windows audio adapter，等待该 adapter 的单一串行 start 调用
+   返回；同一时刻最多一个 outstanding Timer start，在该结果完成前不得向 adapter 提交新 owner start；
 6. start 返回后重新进入 attention admission，以
-   `alarmEpoch + AudioTicket + AlarmAssetIdentity + reserved phase` 执行结果 CAS，并检查是否已有 sequence 更早的
-   Focused(true) 或匹配取消事件等待处理；
+   `alarmEpoch + AudioTicket + AlarmAssetIdentity + AlarmPlaybackKey + reserved phase` 执行结果 CAS，并检查是否
+   已有 sequence 更早的 Focused(true) 或匹配取消事件等待处理；
 7. start 成功且 CAS 仍匹配时，提交 `reserved -> playing`；
-8. start 成功但 CAS 不匹配时，立即要求 adapter 停止同一 PlayingMemory，成功后释放、失败则 quarantine；不得
-   恢复旧 owner，也不得推进或清除后来建立的新 epoch；
+8. start 成功但 CAS 不匹配时，立即要求 adapter 按同一 AlarmPlaybackKey 停止对应 PlayingMemory，成功后释放、
+   失败则 quarantine；不得恢复旧 owner，也不得推进或清除后来建立的新 epoch；
 9. start 失败时只清除完全匹配的旧 reservation；同样不能修改新 epoch 或后来 owner；
 10. 同一 epoch 内其他票证永久失去竞争资格，即使 owner 启动失败、取消或焦点随后到达也不能候补；
 11. owner 清除时 alarmEpoch 检查递增，并重新开放新 epoch；只有新 epoch 开始后 admission 的新事件可以竞争。
@@ -538,11 +554,13 @@ PlaySoundW(memoryPointer, ..., SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT
 
 WindowsAudioAdapter 是异步 PCM 字节的最终所有者，并且是进程中所有 `PlaySoundW` 调用的唯一串行点。可以
 使用适配器内部专用线程或等价串行执行器，但不能依赖 NativeAttentionCoordinator WorkerState 保存最后一份
-强引用。
+强引用。其外部 interface 固定为等价的 `start(AlarmPlaybackKey, Arc<[u8]>)`、
+`stop(AlarmPlaybackKey)` 与 `shutdown()`；adapter 不接收或解释 AudioTicket、pluginId、activationId、
+alarmEpoch 或 AlarmAssetIdentity。完整领域资格只由协调器持有和验证。
 
 启动顺序固定为：
 
-1. adapter 接收完整 `Arc<[u8]> + AudioTicket + alarmEpoch + AlarmAssetIdentity`；
+1. adapter 接收 `AlarmPlaybackKey + Arc<[u8]>`；
 2. 在调用 `PlaySoundW` 前，adapter 先把强引用安装为内部 `PlayingMemory`；
 3. adapter 在其串行执行上下文调用 Timer `SND_MEMORY` start；
 4. start 成功时继续持有 PlayingMemory，直到匹配 stop 成功；
@@ -551,7 +569,7 @@ WindowsAudioAdapter 是异步 PCM 字节的最终所有者，并且是进程中�
 停止顺序固定为：
 
 1. 协调器先从权威状态撤销逻辑 owner，禁止新事件复活它；
-2. 向 adapter 提交包含完整 ticket、epoch 和 asset identity 的 stop；
+2. 向 adapter 提交该 owner 的不透明 AlarmPlaybackKey；
 3. adapter 在自身串行状态中匹配 PlayingMemory；身份不匹配为幂等 no-op，不能停止后来 owner；
 4. 匹配时调用 `PlaySoundW(NULL, ..., 0)` 或等价停止；
 5. 停止成功后才释放 PlayingMemory；
@@ -661,10 +679,13 @@ Toast、托盘和徽标继续可用。
 - Runtime 与窗口请求固定闹铃均得到 `403`，其他合法公开资源仍可读取；
 - RuntimeSnapshot 资源枚举不包含闹铃，AlarmAssetRegistry 包含匹配 activationId 的私有内存资产；
 - CSP 包含 `media-src 'none'`；
-- Runtime 与插件内容 WebView 先创建 inert URL，完成 `ICoreWebView2_8` cast、set、readback 和 changed-listener
-  后才导航至插件 URL；
+- Windows Runtime 与插件内容 WebView 按 inert create、guard token、`ICoreWebView2_8` cast、set、
+  changed-listener、最终 readback、bootstrap completion、token CAS、navigation 的固定顺序执行；
 - 首个插件脚本执行前已原生静音，reload/重建仍静音；
 - cast、set、readback、listener、超时或运行中 unmute 任一失败时窗口/Runtime 创建或运行失败关闭；
+- 超时或销毁后的迟到 bootstrap completion 不得导航；旧 token 的 unmute callback 不得销毁同 label 的新
+  Runtime、内容 WebView 或 session；
+- WebViewGuardToken 耗尽不得回绕，当前候选创建失败关闭；
 - 插件无法通过 `<audio>`、data URL 或 WebAudio oscillator 产生可听声音。
 
 ### 16.3 身份与卸载重装
@@ -697,7 +718,8 @@ Toast、托盘和徽标继续可用。
 - 第一张无效票证不 claim epoch，下一张有效票可竞争；
 - start 进行中并发到期事件 stamp 旧 epoch，start 失败后不能候补；
 - owner 取消、焦点、Reset、更新和 shutdown 与 start 使用 barrier 覆盖调用前、调用中和返回后的顺序；
-- start 迟到成功必须重新 CAS ticket/asset/epoch/reserved；失配后 adapter 只停止同一 PlayingMemory；
+- start 迟到成功必须重新 CAS ticket/asset/epoch/playbackKey/reserved；失配后 adapter 只按同一
+  AlarmPlaybackKey 停止对应 PlayingMemory；
 - owner 清除后 admission 的新 epoch 票证可以成为新 owner；
 - 闹铃实际播放期间普通消息不播放公共提示音，停止后的新普通消息可以播放；
 - 启动失败不禁用插件；停止失败保留内存 quarantine 并使整个原生音频 adapter terminal；
@@ -707,6 +729,8 @@ Toast、托盘和徽标继续可用。
 - 根状态先 drop/adapter 后 drop 与 adapter 先 drop/根状态 teardown 两种顺序都不释放 quarantine；交接锁中毒
   路径使用无析构 fallback；
 - 普通、Timer 和 cleanup 的所有 `PlaySoundW` 调用在 adapter 内串行，迟到旧 stop 不能停止新 owner；
+- adapter interface 测试只使用 AlarmPlaybackKey 与字节，不依赖或复制 AudioTicket、pluginId、activationId、
+  alarmEpoch 和 AlarmAssetIdentity 的领域比较；
 - 所有外部 I/O、WebView 和原生音频调用都发生在相关运行时锁外。
 
 ### 16.6 资源与人工验收
@@ -722,7 +746,8 @@ Toast、托盘和徽标继续可用。
 
 1. 普通消息始终使用主程序公共提示音播放一次，插件不能替换。
 2. 每个 `timer.control` 插件必须携带合法的固定路径闹铃，否则安装或更新失败。
-3. 闹铃是宿主私有内存资源；Runtime/窗口协议返回 `403`，插件 WebView 通过 inert 导航握手永久原生静音。
+3. 闹铃是宿主私有内存资源；Runtime/窗口协议返回 `403`，Windows 插件 WebView 通过绑定精确实例的
+   WebViewGuardToken 完成 inert 导航握手并永久原生静音，迟到回调不能导航或影响替换实例。
 4. 插件没有任意音频 API；宿主只在有效 Timer 到期后循环播放签票时冻结的闹铃。
 5. activationId 防止完全卸载重装后的旧票证、事件或结果操作新插件实例。
 6. 第一张有效票证独占当前 alarmEpoch；后续票证不混音、不切换、不候补。
@@ -734,8 +759,8 @@ Toast、托盘和徽标继续可用。
     Timer。
 11. `Reserved` 可回滚；`Committing`/`Durable` 的异常或不确定结果会使公开插件服务 terminal，不能继续运行
     旧 Bundle。
-12. PCM 字节由 Windows audio adapter 最终持有；worker panic、迟到 start/stop 和 emergency-stop 均不会释放
-    正在被 WinMM 使用的内存或停止后来 owner。
+12. PCM 字节由 Windows audio adapter 最终持有，adapter interface 只暴露不透明 AlarmPlaybackKey；worker
+    panic、迟到 start/stop 和 emergency-stop 均不会释放正在被 WinMM 使用的内存或停止后来 owner。
 13. 音频解析、Web 隔离、激活身份、内存生命周期、原子提交、alarmEpoch 和票证乱序均有确定性测试。
 14. 当前番茄时钟示例重新安装后，关闭插件窗口仍可在到期时播放其包内闹铃，打开主界面即停止。
 
@@ -744,4 +769,6 @@ Toast、托盘和徽标继续可用。
 UiPilot 的普通消息提示音属于主程序公共能力；计时闹铃属于声明 `timer.control` 的插件包能力。插件只提供一份
 固定、受限、安装期验证的 PCM WAV；该文件进入宿主私有内存资产，不进入 Web 资源协议。不可复用 activationId、
 完整 AudioTicket、原子 ActivationBundle 和 alarmEpoch 共同封闭卸载重装、更新、迟到副作用与多 Timer 竞争。
-宿主继续拥有计时、消息、焦点、播放和失败关闭，插件 WebView 永久静音，因此不会扩大为任意音频或后台执行接口。
+WebViewGuardToken 封闭静音握手的迟到导航和同 label 替换竞态；AlarmPlaybackKey 把 Timer 领域资格留在协调器
+内部。宿主继续拥有计时、消息、焦点、播放和失败关闭，Windows 插件 WebView 永久静音，因此不会扩大为任意
+音频或后台执行接口。
