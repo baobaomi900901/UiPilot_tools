@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第四轮独立审核 findings 已处理，等待复审
+- 状态：Draft，第五轮独立审核 finding 已处理，等待复审
 - 范围：公开插件计时闹铃的私有包资源、安装校验、激活身份、原生播放与声音仲裁
 - 公开 JavaScript API：不变
 - Manifest 字段：不变
@@ -405,8 +405,9 @@ Reserved -> Committing -> Durable -> Published
 到半提交状态；若进程在 durable helper 成功与第 9 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧
 内存 Timer 已随进程消失。
 
-线性化点后的窗口销毁或旧包清理失败只记录并延后重试，不能回滚新 Bundle。更新失败时旧 generation、旧
-内存闹铃、旧 Runtime 和旧 Timer 均继续有效。
+线性化点后的窗口销毁或旧包清理失败只记录并延后重试，不能回滚新 Bundle。只有进入 `Committing` 前失败，
+或 helper 返回 `NotCommitted` 且旧 digest 复核成功时，旧 generation、旧内存闹铃、旧 Runtime 和旧 Timer
+才继续有效；其他持久结果按本节 terminal 合同处理。
 
 `Reserved` 阶段由 RAII guard 负责异常清理；线程 panic 或提前返回会清除 reservation 并保留旧 Bundle。
 `Committing` 与 `Durable` 的 guard 在 Rust panic/unwind、提前返回、锁中毒或 CAS 不一致时，不得清除
@@ -652,7 +653,7 @@ Toast、托盘和徽标继续可用。
 - 精确覆盖 RIFF size、唯一 `fmt`/`data`、固定顺序、未知/重复 chunk、奇数 padding、尾随字节和检查算术；
 - 表驱动覆盖错误编码、声道、采样率、位深、blockAlign、byteRate、零帧、超时长和超大小；
 - 源硬链接被复制为 staging 单链接文件；符号链接、重解析点和 staging 多链接拒绝；
-- 更新失败保留旧 Bundle、旧 Timer 和旧闹铃。
+- 包/WAV 候选校验失败发生在进入 `Committing` 前，必须保留旧 Bundle、旧 Timer 和旧闹铃。
 
 ### 16.2 Web 隔离
 
