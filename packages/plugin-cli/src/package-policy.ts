@@ -56,7 +56,7 @@ function validateResource(path: string): void {
   }
 }
 
-export function canonicalRelativePath(value: string): string {
+function canonicalPath(value: string, requireResource: boolean): string {
   if (
     value.length === 0 ||
     value.startsWith('/') ||
@@ -87,8 +87,12 @@ export function canonicalRelativePath(value: string): string {
     }
   }
   const canonical = components.join('/')
-  validateResource(canonical)
+  if (requireResource) validateResource(canonical)
   return canonical
+}
+
+export function canonicalRelativePath(value: string): string {
+  return canonicalPath(value, true)
 }
 
 export class SnapshotBuilder {
@@ -102,7 +106,7 @@ export class SnapshotBuilder {
   addDirectory(rawPath: string): void {
     const path = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath
     if (!path) return
-    const canonical = canonicalRelativePath(`${path}/placeholder.js`).slice(0, -'/placeholder.js'.length)
+    const canonical = canonicalPath(path, false)
     this.#registerDirectory(canonical)
   }
 

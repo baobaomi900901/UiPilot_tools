@@ -31,12 +31,14 @@ function compareUtf8(left: string, right: string): number {
 }
 
 function compareStored(left: StoredIssue, right: StoredIssue): number {
-  for (const index of [0, 2, 3, 4] as const) {
-    const difference = (left.key[index] as number) - (right.key[index] as number)
-    if (difference !== 0) return difference
-  }
+  const phaseOrder = left.key[0] - right.key[0]
+  if (phaseOrder !== 0) return phaseOrder
   const pathOrder = compareUtf8(left.key[1], right.key[1])
   if (pathOrder !== 0) return pathOrder
+  for (const index of [2, 3, 4] as const) {
+    const difference = left.key[index] - right.key[index]
+    if (difference !== 0) return difference
+  }
   return compareUtf8(left.key[5], right.key[5])
 }
 

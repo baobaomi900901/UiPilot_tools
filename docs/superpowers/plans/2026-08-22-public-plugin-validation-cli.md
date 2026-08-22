@@ -31,9 +31,9 @@
 
 **Dependencies:** Design sections `Distribution And Compatibility`, `Command Contract`, `JSON Output`, `Stable Issue Codes`, and `Failure Behavior`.
 
-- [ ] Add the npm workspace, Node 20 engine, `uipilot-plugin` bin, build/test/check scripts, and publish allowlist.
-- [ ] Implement argument parsing, platform defaulting, exit-code mapping, human output, exact JSON DTO output, total issue ordering, deduplication, cap, and `truncated` behavior.
-- [ ] Keep usage/internal errors separate from validation reports and suppress progress output in JSON mode.
+- [x] Add the npm workspace, Node 20 engine, `uipilot-plugin` bin, build/test/check scripts, and publish allowlist.
+- [x] Implement argument parsing, platform defaulting, exit-code mapping, human output, exact JSON DTO output, total issue ordering, deduplication, cap, and `truncated` behavior.
+- [x] Keep usage/internal errors separate from validation reports and suppress progress output in JSON mode.
 
 **Distinct test coverage:** valid/invalid syntax; unsupported host default; source failures remain exit 1; deterministic top-100 ordering and truncation; JSON mode emits exactly one DTO.
 
@@ -45,9 +45,9 @@
 
 **Dependencies:** Task 1; design sections `Source Readers`, `Package Policy`, `Package Validation Rules`, and `Data Flow`.
 
-- [ ] Implement Unicode 15.1 NFC/full-fold/NFC identity, canonical path/resource rules, bounds, reserved names, collision checks, and immutable snapshots.
-- [ ] Implement no-follow directory traversal and the fail-closed Windows attribute adapter with fixed absolute PowerShell, bounded UTF-8 protocol, pre/post checks, and no source-controlled process lookup.
-- [ ] Implement bounded raw ZIP central/local parsing for Stored/Deflate, creator/external type checks, streaming size/CRC verification, duplicate/collision checks, and no extraction.
+- [x] Implement Unicode 15.1 NFC/full-fold/NFC identity, canonical path/resource rules, bounds, reserved names, collision checks, and immutable snapshots.
+- [x] Implement no-follow directory traversal and the fail-closed Windows attribute adapter with fixed absolute PowerShell, bounded UTF-8 protocol, pre/post checks, and no source-controlled process lookup.
+- [x] Implement bounded raw ZIP central/local parsing for Stored/Deflate, creator/external type checks, streaming size/CRC verification, duplicate/collision checks, and no extraction.
 
 **Distinct test coverage:** Unicode recomposition/Hangul/full-fold collisions; traversal and limits; fake local PowerShell cannot run; Windows protocol CJK/non-BMP; archive links/devices, bad CRC for both methods, malformed headers, encryption, unsupported compression, and decompression bounds.
 
@@ -59,10 +59,10 @@
 
 **Dependencies:** Task 2; design sections `Manifest Validation` and `Package Validation Rules`; current `docs/plugin-sdk/uipilot-plugin-v1.schema.json` and `docs/plugin-sdk/public-plugin-v1.md`.
 
-- [ ] Fatal-decode UTF-8 and parse strict JSON with duplicate-key, scalar-surrogate, finite-number, and depth enforcement before Schema validation.
-- [ ] Generate and check an Ajv strict standalone ESM validator with inline `uint32` and `double` formats and no runtime Ajv compiler.
-- [ ] Enforce canonical identities/versions/settings/entries, selected platform, API/host compatibility, and current permission/output relationships.
-- [ ] Accept `timer.control` only for the complete Windows `submit + window + window entry + ui.window + notifications.publish` combination and reject it for macOS or incomplete combinations.
+- [x] Fatal-decode UTF-8 and parse strict JSON with duplicate-key, scalar-surrogate, finite-number, and depth enforcement before Schema validation.
+- [x] Generate and check an Ajv strict standalone ESM validator with inline `uint32` and `double` formats and no runtime Ajv compiler.
+- [x] Enforce canonical identities/versions/settings/entries, selected platform, API/host compatibility, and current permission/output relationships.
+- [x] Accept `timer.control` only for the complete Windows `submit + window + window entry + ui.window + notifications.publish` combination and reject it for macOS or incomplete combinations.
 
 **Distinct test coverage:** invalid UTF-8, duplicate nested keys, isolated/reversed surrogates, Schema diagnostics, setting boundaries, version/API/platform failures, and a table of every valid/invalid `timer.control` combination.
 
@@ -74,10 +74,10 @@
 
 **Dependencies:** Task 3; design sections `Specialized Validators` and `Data Flow`; current host `alarm_asset.rs` behavior recorded in the SDK contract.
 
-- [ ] Validate raw PNG chunk framing/CRC/IEND/APNG rules before complete pngjs decoding and exact icon size limits.
-- [ ] Reproduce the host's strict UTF-8 ASCII-insensitive CSS scanner and package-local reference resolution.
-- [ ] Enforce the fixed timer alarm path/permission bijection, reject every other WAV, and implement the exact canonical PCM parser and bounds.
-- [ ] Compose validator phases with the frozen skip/continue behavior and stable report production.
+- [x] Validate raw PNG chunk framing/CRC/IEND/APNG rules before complete pngjs decoding and exact icon size limits.
+- [x] Reproduce the host's strict UTF-8 ASCII-insensitive CSS scanner and package-local reference resolution.
+- [x] Enforce the fixed timer alarm path/permission bijection, reject every other WAV, and implement the exact canonical PCM parser and bounds.
+- [x] Compose validator phases with the frozen skip/continue behavior and stable report production.
 
 **Distinct test coverage:** PNG CRC/order/trailing/APNG/dimensions; CSS comments/strings/whitespace/media/nesting compatibility; WAV channel/rate/bit-depth/byte-rate/block-align/duration/size/padding/chunk/order/trailing failures; missing/extra/undeclared alarm resources; pomodoro passes on Windows and fails on macOS.
 
@@ -89,9 +89,9 @@
 
 **Dependencies:** Task 4; design sections `Artifact Smoke Test`, `Documentation`, and `Acceptance Criteria`.
 
-- [ ] Bundle the executable, generated validator, and Unicode data; audit allowed built-ins, the sole Windows child-process callsite, absence of network/compiler/dynamic-code capabilities, and npm tarball contents.
-- [ ] Install only the `.tgz` offline in a repository-external temporary project with empty cache and run directory/archive validation using filesystem restrictions and network API traps.
-- [ ] Document local/CI validation commands, platform behavior, human/JSON reports, exit codes, Timer/WAV failures, and the no-install/no-execution boundary.
+- [x] Bundle the executable, generated validator, and Unicode data; audit allowed built-ins, the sole Windows child-process callsite, absence of network/compiler/dynamic-code capabilities, and npm tarball contents.
+- [x] Install only the `.tgz` offline in a repository-external temporary project with empty cache and run directory/archive validation using filesystem restrictions and network API traps.
+- [x] Document local/CI validation commands, platform behavior, human/JSON reports, exit codes, Timer/WAV failures, and the no-install/no-execution boundary.
 
 **Distinct test coverage:** bin mapping, valid demos including pomodoro, invalid Timer/WAV fixture, no parent dependency/Schema lookup, one valid and invalid standalone Schema call without Ajv, and exact tarball allowlist.
 
@@ -99,8 +99,8 @@
 
 ## Final Checklist
 
-- [ ] Focused tests and full workspace tests pass.
-- [ ] TypeScript check, bundle audit, packed-artifact smoke, and root build pass.
-- [ ] Current `demo-return`, `demo-win`, and Windows pomodoro directories validate; pomodoro is rejected for macOS.
-- [ ] The source packages remain unchanged and no GUI/input operation occurred.
-- [ ] Only CLI/plan/developer-guide files are included in task commits; existing user changes remain untouched.
+- [x] Focused tests and full workspace tests pass.
+- [x] TypeScript check, bundle audit, packed-artifact smoke, and root build pass.
+- [x] Current `demo-return`, `demo-win`, and Windows pomodoro directories validate; pomodoro is rejected for macOS.
+- [x] The source packages remain unchanged and no GUI/input operation occurred.
+- [x] Only CLI/plan/developer-guide files are included in task commits; existing user changes remain untouched.

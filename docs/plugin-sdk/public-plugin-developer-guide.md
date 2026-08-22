@@ -522,7 +522,38 @@ node --test examples/public-plugins/com.uipilot.demo-win/tests/runtime.test.js
 node --test examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js
 ```
 
-## 9. 使用开发目录安装
+## 9. 使用独立 CLI 验证
+
+UiPilot 提供纯 TypeScript 的 `@uipilot/plugin-cli`。第三方开发者只需要 Node.js 20 或更高版本和已提供的 npm `.tgz`，不需要安装 Rust、UiPilot 或下载 UiPilot 源码。CLI 只读取并验证包，不安装插件、不运行 Runtime/窗口代码、不联网，也不修改源目录。
+
+当前包尚未发布到 npm Registry。取得 `.tgz` 后，可在本机或 CI 工作目录安装：
+
+```powershell
+npm install --global .\uipilot-plugin-cli-0.1.0.tgz
+```
+
+验证开发目录或最终归档：
+
+```powershell
+uipilot-plugin validate .\package --platform windows
+uipilot-plugin validate .\com.example.hello-return.uipilot-plugin --platform windows
+```
+
+`--platform` 可选 `windows` 或 `macos`；省略时使用当前受支持的系统。CI 可增加 `--json`，标准输出将只包含稳定的 `PluginValidationReportV1`：
+
+```powershell
+uipilot-plugin validate .\package --platform windows --json
+```
+
+退出码含义：
+
+- `0`：包对所选平台有效。
+- `1`：包结构、Manifest、兼容性或资源无效；JSON 模式仍返回验证报告。
+- `2`：命令用法错误或 CLI 自身发生意外故障。
+
+使用 `timer.control` 时，CLI 会检查完整的 Windows `submit + window` 权限组合，以及唯一固定文件 `assets/sounds/timer-alarm.wav`。缺少/多带 WAV、使用其他 WAV 路径、非规范 RIFF/WAVE、错误声道/采样率/位深、超过 2 MiB 或 15 秒都会返回 `RESOURCE_INVALID`。CLI 通过后仍应在目标平台用 UiPilot 做最终安装和交互验收。
+
+## 10. 使用开发目录安装
 
 1. 启动 UiPilot。
 2. 打开 **设置 > 插件 > 公开插件**。
@@ -542,7 +573,7 @@ node --test examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js
 
 更新会在 Runtime 通过 ready 校验后原子生效。更新失败时，当前已安装版本保持可用。
 
-## 10. 打包 `.uipilot-plugin`
+## 11. 打包 `.uipilot-plugin`
 
 `.uipilot-plugin` 是 ZIP 内容，归档根目录必须直接包含 `plugin.json`，不能再包一层 `package/`。
 
@@ -582,7 +613,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plu
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plugin.ps1 -PluginId com.uipilot.demo-win
 ```
 
-## 11. 可选：插件私有状态与设置
+## 12. 可选：插件私有状态与设置
 
 Runtime API 还提供请求期内的插件隔离存储和设置读取：
 
@@ -597,7 +628,7 @@ const hasToken = await api.settings.isSecretConfigured('token')
 
 存储只能保存 JSON。插件不能读取 secret 明文。设置字段定义、类型和限制见完整 API 文档与 Schema。
 
-## 12. 常见问题
+## 13. 常见问题
 
 ### 准备安装时失败
 
@@ -631,7 +662,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 确认窗口脚本尽早注册了 `window.uipilotPluginWindow.onUpdate`，并且回调能在五秒内完成。不要在内容页调用 Tauri、Shell、网络或其他宿主能力。
 
-## 13. MVP 边界
+## 14. MVP 边界
 
 当前不支持：
 
@@ -644,7 +675,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 遇到未覆盖的需求时，不要通过 WebView 或 Tauri 私有对象绕过限制；应等待宿主公开相应版本化 API。
 
-## 14. 发布前检查清单
+## 15. 发布前检查清单
 
 - [ ] `pluginId` 使用自己的稳定命名空间。
 - [ ] `version` 已提高，`minimumHostVersion` 合理。
@@ -658,4 +689,5 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
 - [ ] `icon.png` 满足固定规则。
 - [ ] Runtime 测试通过。
+- [ ] 开发目录和最终 `.uipilot-plugin` 均通过 `uipilot-plugin validate`。
 - [ ] 开发目录和最终 `.uipilot-plugin` 都完成安装验收。

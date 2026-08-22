@@ -51,4 +51,13 @@ describe('package path policy', () => {
       expect.objectContaining({ code: 'PATH_COLLISION' }),
     )
   })
+
+  it('accepts an empty directory at the maximum package depth', () => {
+    const snapshot = new SnapshotBuilder('directory')
+    const path = 'a/b/c/d/e/f/g/h'
+
+    snapshot.addDirectory(path)
+
+    expect(snapshot.finish().directories).toContain(path)
+  })
 })

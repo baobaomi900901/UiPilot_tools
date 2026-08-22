@@ -47,4 +47,12 @@ describe('IssueCollector', () => {
 
     expect(issues.finish().issues.map((issue) => issue.message)).toEqual(['pointer', 'byte', 'name'])
   })
+
+  it('orders canonical paths before issue and rule ranks within a phase', () => {
+    const issues = new IssueCollector()
+    issues.add({ phaseRank: 50, ruleRank: 1, code: 'PLATFORM_INCOMPATIBLE', path: 'z.js', message: 'z' })
+    issues.add({ phaseRank: 50, ruleRank: 99, code: 'API_INCOMPATIBLE', path: 'a.js', message: 'a' })
+
+    expect(issues.finish().issues.map((issue) => issue.path)).toEqual(['a.js', 'z.js'])
+  })
 })

@@ -14,6 +14,7 @@ const MAX_PROTOCOL_PATHS = 321
 const REPARSE_POINT = 0x400
 
 const SCRIPT = String.raw`
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
 [Console]::InputEncoding = $utf8
