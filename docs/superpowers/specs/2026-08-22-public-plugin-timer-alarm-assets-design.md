@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 日期：2026-08-22
-- 状态：Draft，第一轮独立审核 findings 已处理，等待复审
+- 状态：Draft，第二轮独立审核 findings 已处理，等待复审
 - 范围：公开插件计时闹铃的私有包资源、安装校验、激活身份、原生播放与声音仲裁
 - 公开 JavaScript API：不变
 - Manifest 字段：不变
@@ -23,12 +23,13 @@ AudioTicket、窗口会话、焦点确认、邮箱边界、锁顺序和失败关
 |---|---|---|
 | Timer 3.1 第 3 项、3.2“插件自定义音频”、4“闹铃”、6.1 权限说明、12.3 资源与播放、18.3、19、20.5 音频分支、21 第 6 项、22 第 4-5 项、23 音频结论 | Timer 使用固定宿主闹铃，插件不携带音频 | `timer.control` 插件必须携带固定私有闹铃；插件仍不能通过 JavaScript 控制播放 |
 | 原生提醒 2.1 第 3 项、2.2“插件指定音频”、3.2 Timer 声音、7.1 固定资源、7.2 文件播放 | 普通消息与 Timer 使用宿主资源路径 | 普通消息使用宿主公共提示音；Timer 使用签票时冻结的插件私有内存闹铃 |
-| 原生提醒 3.3、4.3 的 `activeTimerTickets`/共享声音字段、5.3 多票共享分支、8 中相应音频生命周期、10.1 第 6-9 项的共享集合断言、11 第 5 项 | 多张票共享一条声音，最后一票撤销才停止 | 单一 `timerAudioOwner + alarmEpoch`；后续票证不叠加、不切换、不候补 |
+| 原生提醒 3.3、4.3 的 `activeTimerTickets`/共享声音字段、5.2 中清空 active set 的音频句、5.3 多票共享分支、8 中 Worker 音频资源所有权、10.1 第 6-9、13、20-22 项的共享集合/失败/cleanup 音频断言、11 第 5 项 | 多张票共享一条声音，最后一票撤销才停止；Worker state 最终拥有音频资源 | 单一 `timerAudioOwner + alarmEpoch`；后续票证不叠加、不切换、不候补；Windows audio adapter 最终拥有 PCM 字节 |
 | Timer 18.3 与原生提醒 9 的音频失败条款 | 固定资源或设备失败只记录诊断，或无法区分地归入单一音频失败 | 安装期资产错误拒绝包；运行期原生播放失败属于宿主音频降级，不停用插件 |
 
-以下合同明确不被覆盖：原生提醒 4.4 邮箱硬边界、5.1 消息提交、5.2 焦点 sequence 与双锁线性化、6 Toast
-身份、8 中非音频锁顺序与 shutdown、9 中 Toast/托盘失败、10 中非音频测试，以及 Timer 的公开状态、
-revision、ClaimTicket、消息 delivery admission 和窗口会话合同。
+以下合同明确不被覆盖：原生提醒 4.4 邮箱硬边界、5.1 消息提交、5.2 除 active-set 清理句之外的焦点
+sequence 与双锁线性化、6 Toast 身份、8 中邮箱 terminal、shutdown、Toast/托盘与非音频 emergency-stop、
+9 中 Toast/托盘失败、10 中非音频测试，以及 Timer 的公开状态、revision、ClaimTicket、消息 delivery
+admission 和窗口会话合同。
 
 ## 2. 目标与非目标
 
@@ -62,7 +63,10 @@ revision、ClaimTicket、消息 delivery admission 和窗口会话合同。
   它与 Bundle 在同一线性化点发布或移除，不是独立持久化事实源。
 - **ActivationBundle**：一次激活原子发布的 config、RuntimeSnapshot、私有闹铃、generation 和 activationId。
 - **alarmEpoch**：原生提醒邮箱内划分闹铃 owner 竞争批次的单调 `u64`。
-- **timerAudioOwner**：当前唯一获准循环播放的 AudioTicket 与 ValidatedAlarmAsset。
+- **timerAudioOwner**：协调器中的当前唯一逻辑播放所有者，阶段为 `reserved` 或 `playing`；不最终拥有 PCM 字节。
+- **PlayingMemory**：Windows audio adapter 内部持有的 `Arc<[u8]> + AudioTicket + alarmEpoch + asset identity`。
+- **ProcessAudioQuarantine**：应用根状态持有、只在原生进程真正退出时释放的失败停止缓冲区集合。
+- **activation reservation**：一次插件 mutation 的 `Reserved -> Durable -> Published` 提交状态。
 
 `pluginGeneration`、`activationId`、`packageDigest`、`roundId`、`audioId`、`firedRevision`、`alarmEpoch` 和
 `attentionSequence` 含义不同，不能互换。
@@ -249,12 +253,23 @@ AlarmAssetRegistry 是 ActivationBundle 内存索引的一部分。读取方必�
 
 ### 7.2 WebView 音频隔离
 
-所有公开插件 Runtime WebView 和插件内容 WebView 必须在原生层永久静音：
+所有公开插件 Runtime WebView 和插件内容 WebView 必须使用固定的 pre-navigation mute handshake：
 
-- Windows WebView2 在第一次导航和执行插件脚本前设置 `IsMuted = true` 或等价原生能力；
-- reload、窗口隐藏/显示、重新建立 session 和内容重载后仍保持静音；
-- 插件 JavaScript 不获得解除静音的桥接命令；
-- 原生静音失败时，相关 Runtime 或插件窗口创建失败关闭，不能以未静音状态继续；
+1. 先以只包含宿主静态空白内容的 inert URL 创建 WebView，不能直接加载 Runtime host document、插件窗口
+   HTML、插件初始化脚本或任何插件可控资源；
+2. WebView2 controller 建立后，在独立原生准备步骤中取得 `ICoreWebView2_8`；
+3. 调用 `SetIsMuted(true)`，随后回读 `IsMuted` 并确认值为 true；
+4. 注册 `IsMutedChanged` 监听并建立失败关闭处理；
+5. cast、设置、回读、监听注册和有界等待全部成功后，才允许原生层导航至插件 URL；
+6. Runtime ready、窗口 content ready 和任何插件 session 激活都不得早于该握手完成；
+7. 任一步失败或超时都立即销毁 WebView，不能以未确认静音状态继续。
+
+运行期间：
+
+- reload、窗口隐藏/显示、重新建立 session 和内容重载不得清除静音；
+- `IsMutedChanged` 观察到 false 时立即销毁对应 WebView；Runtime WebView 随即使该插件本次运行不可用，内容
+  WebView 则撤销 session 并销毁窗口；
+- 插件 JavaScript 不获得导航、静音或解除静音的桥接命令；
 - 主窗口 WebView 不受影响；普通消息音和 Timer 闹铃由宿主原生音频通道播放。
 
 插件协议响应的 CSP 还必须包含：
@@ -286,9 +301,9 @@ ActivationBundle {
 
 ### 8.2 activationId
 
-原生进程维护一个所有公开插件共用的检查递增 `u64` 分配器。每个候选 Bundle 在建立内部身份时取得新的
-activationId；准备失败产生的空洞不复用。完全卸载、保留数据卸载、故障恢复、同版本重装和更新都不能在
-同一进程复用旧 activationId。
+原生进程维护一个所有公开插件共用的检查递增 `u64` 分配器。每个会建立新运行实例的候选 Bundle 在建立内部
+身份时取得新的 activationId；准备失败产生的空洞不复用。完全卸载、保留数据卸载、故障恢复、同版本重装和
+更新都不能在同一进程复用旧 activationId。仅配置 mutation 按第 8.4 节复用当前 activationId。
 
 activationId 不持久化也不跨 JavaScript 边界。原生进程重启会清除所有 Timer、票证、邮箱事件和 owner，
 因此新进程可以重新开始分配。分配器不得回绕；耗尽时本进程拒绝继续准备或激活公开插件，已有插件保持当前
@@ -317,6 +332,27 @@ AudioTicket + AlarmAssetIdentity + Arc<[u8]>
 原生协调器不能根据“当前 pluginId + generation”重新查询或替换声音。即使旧包随后删除，已冻结内存也保持
 有效；票证失效仍会阻止它播放。
 
+### 8.4 Mutation 分类
+
+以下操作建立新的运行实例、分配新 activationId，并取消旧 Timer、票证和 owner：
+
+- 首次安装；
+- 重新安装或版本更新；
+- 被禁用后重新启用；
+- 故障恢复后重新激活；
+- Runtime generation replacement。
+
+以下操作移除当前 activationId，并取消 Timer、票证和 owner：
+
+- 禁用；
+- 卸载；
+- 故障停用。
+
+修改启动名称或保存插件设置属于 config-only mutation。它们以新的 ActivationBundle config 快照原子替换旧
+config，但必须复用同一 activationId、pluginGeneration、packageDigest、RuntimeSnapshot 和
+ValidatedAlarmAsset。config-only mutation 撤销旧请求和窗口 session，但保留 Timer、ClaimTicket、
+AudioTicket 和当前闹铃。已经运行的 Timer 继续使用 start 时冻结的完成消息、插件名称与闹铃资产。
+
 ## 9. 原子安装、更新与卸载
 
 ### 9.1 候选准备
@@ -336,31 +372,64 @@ AudioTicket + AlarmAssetIdentity + Arc<[u8]>
 
 ### 9.2 提交协议
 
-所有插件 mutation 路径必须识别每插件 commit reservation。提交顺序固定为：
+所有插件 mutation 路径必须识别每插件 activation reservation：
+
+```text
+Reserved -> Durable -> Published
+```
+
+提交顺序固定为：
 
 1. 短暂取得 plugin mutation guard，CAS 验证准备时捕获的旧 activationId、generation 和 packageDigest；
-2. 为该 pluginId 安装唯一 commit reservation，释放 guard；其他 mutation 在 reservation 清除前失败或等待，
-   读取方继续看到完整旧 Bundle；
+2. 为该 pluginId 安装唯一 `Reserved`，释放 guard；其他 mutation 在 reservation 清除前失败或等待，读取方
+   继续看到完整旧 Bundle；
 3. 在所有运行时锁之外执行持久状态临时文件的原子替换；失败则重新取得 guard、清除 reservation、删除候选，
-   旧 Bundle 和旧 Timer 完全不变；
-4. 持久提交成功后重新取得 plugin mutation guard，验证同一 reservation，再按固定顺序取得 Timer 与
+   旧 Bundle 和旧 Timer 完全不变；持久 helper 成功时必须在返回调用方前把 RAII guard 转换成持有
+   `DurableCommit` token 的状态；
+4. `DurableCommit` 表示 reservation 已进入 `Durable`；从此不能回到旧 Bundle，也不能清除后继续运行旧状态；
+5. 重新取得 plugin mutation guard，验证同一 reservation，再按固定顺序取得 window session、Timer 与
    ActivationBundle 内存锁；
-5. 在不执行 I/O 的临界区内，以不可失败的内存交换发布新 Bundle，同时撤销旧 Timer、ClaimTicket、
-   AudioTicket、窗口 session 和 owner 权威；
-6. 清除 reservation 并释放所有锁；
-7. 锁外派发取消效果、销毁旧窗口并清理旧包。
+6. 在不执行 I/O 的临界区内，以不可失败的内存交换发布新 Bundle，并按第 8.4 节 mutation 分类撤销权威：
+   新激活/移除操作撤销旧窗口 session、Timer、ClaimTicket、AudioTicket 和 owner；config-only mutation 只撤销
+   旧请求和窗口 session，保留 Timer 与音频；随后把 reservation 提交为 `Published`；
+7. 清除已发布 reservation 并释放所有锁；
+8. 锁外派发取消效果、销毁旧窗口并清理旧包。
 
-第 5 步的可见 Bundle 交换是运行时激活线性化点。持久状态已在第 3 步提交，但 reservation 阻止进程内观察到
-半提交状态；若进程在第 3 与第 5 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧内存 Timer 已随
-进程消失。
+第 6 步的可见 Bundle 交换是运行时激活线性化点。持久状态已在第 3 步提交，但 reservation 阻止进程内观察到
+半提交状态；若进程在 durable helper 成功与第 6 步之间退出，新进程从已提交状态和新包重建完整 Bundle，旧
+内存 Timer 已随进程消失。
 
 线性化点后的窗口销毁或旧包清理失败只记录并延后重试，不能回滚新 Bundle。更新失败时旧 generation、旧
 内存闹铃、旧 Runtime 和旧 Timer 均继续有效。
 
+`Reserved` 阶段由 RAII guard 负责异常清理；线程 panic 或提前返回会清除 reservation 并保留旧 Bundle。
+进入 `Durable` 后，guard 的异常路径不得清除 reservation。若执行线程 panic、锁中毒、CAS 不一致或任何原因
+无法完成 `Published`，整个公开插件服务立即进入本进程 terminal：
+
+- 拒绝新的公开插件调用、窗口打开和管理 mutation；
+- 先设置进程级 public-plugin terminal 原子标记，使所有入口立即失败，旧 Runtime 不再获得宿主调用资格；
+- 随后最佳努力撤销公开插件请求、session、Timer 与原生音频权威，并在锁外销毁 WebView、停止插件闹铃；
+- 主界面、`/find` 和内置功能继续可用；
+- 设置页显示“插件服务不可用，请重启 UiPilot”；
+- WebView reload 或重新打开设置不能恢复，只有原生进程重启后从 durable 状态重建。
+
 ### 9.3 卸载与生命周期
 
-禁用、故障停用、卸载或成功更新必须先在 `plugin mutation -> timer -> activation bundle` 固定锁顺序下撤销
-对应 activationId，再在锁外停止 owner、销毁窗口和删除包。不得先删除闹铃文件或注册项再派发取消。
+所有同时涉及这些状态的路径使用唯一锁顺序：
+
+```text
+plugin mutation -> window session -> timer -> ActivationBundle
+```
+
+禁用、故障停用、卸载或成功更新必须在该顺序下撤销对应 activationId。临界区内不得进入 attention mailbox、
+调用 WebView、访问文件系统或调用 `PlaySoundW`。撤销返回包含完整 activationId、AudioTicket 和
+AlarmAssetIdentity 的锁后效果；释放全部锁后才向 attention mailbox 派发，由 mailbox 推进 alarmEpoch 并由
+音频适配器物理停止。
+
+`Focused(true)` 继续是既有唯一的 `Timer -> attention admission` 双锁例外，不引入 window session 或 Bundle
+锁。attention worker 和 audio adapter 永远不得反向获取 plugin mutation、window session、Timer 或 Bundle 锁。
+
+完成内存撤销后才可在锁外停止 owner、销毁窗口和删除包。不得先删除闹铃文件或注册项再派发取消。
 
 卸载持久化使用相同 reservation 协议。完全卸载可以删除公开 generation 状态，但不影响进程内 activationId
 分配器；立即重装仍取得不同 activationId。
@@ -409,9 +478,19 @@ Worker 对每个 TimerCompletion 执行：
 1. 若事件 epoch 不是当前 epoch，或当前 epoch 已被 claim，凭票证提交为不播放终态；
 2. 否则先通过 Timer 权威 admission 验证完整 AudioTicket；无效票证不 claim epoch，下一张有效票仍可竞争；
 3. admission 成功后，短暂取得邮箱锁，CAS 验证事件仍属于当前未 claim epoch；
-4. CAS 成功即在任何原生播放 I/O 前原子设置 `epochClaimed = true` 并建立 timerAudioOwner reservation；
-5. 同一 epoch 内其他票证永久失去竞争资格，即使 owner 启动失败、取消或焦点随后到达也不能候补；
-6. owner 清除时 alarmEpoch 检查递增，并重新开放新 epoch；只有新 epoch 开始后 admission 的新事件可以竞争。
+4. CAS 成功即在任何原生播放 I/O 前原子设置 `epochClaimed = true`，并建立
+   `timerAudioOwner = reserved(ticket, asset, epoch)`；
+5. 把完整资产交给 Windows audio adapter，等待该 adapter 的单一串行 start 调用返回；同一时刻最多一个
+   outstanding Timer start，在该结果完成前不得向 adapter 提交新 owner start；
+6. start 返回后重新进入 attention admission，以
+   `alarmEpoch + AudioTicket + AlarmAssetIdentity + reserved phase` 执行结果 CAS，并检查是否已有 sequence 更早的
+   Focused(true) 或匹配取消事件等待处理；
+7. start 成功且 CAS 仍匹配时，提交 `reserved -> playing`；
+8. start 成功但 CAS 不匹配时，立即要求 adapter 停止同一 PlayingMemory，成功后释放、失败则 quarantine；不得
+   恢复旧 owner，也不得推进或清除后来建立的新 epoch；
+9. start 失败时只清除完全匹配的旧 reservation；同样不能修改新 epoch 或后来 owner；
+10. 同一 epoch 内其他票证永久失去竞争资格，即使 owner 启动失败、取消或焦点随后到达也不能候补；
+11. owner 清除时 alarmEpoch 检查递增，并重新开放新 epoch；只有新 epoch 开始后 admission 的新事件可以竞争。
 
 如果步骤 2 已把票证转为 admitted，但步骤 3 的 CAS 失败，必须把同一票证提交为 confirmed，不得留下活动
 audio 状态。
@@ -427,8 +506,10 @@ audio 状态。
 - 进程 shutdown。
 
 清除 owner 与递增 alarmEpoch 是同一邮箱临界区内的线性化动作。已 stamp 旧 epoch 但尚未处理的事件不能在
-清除后成为候补。焦点 admission 继续使用既有 `Timer -> attention admission` 双锁规则：同步确认当时当前的
-Timer audio 权威并推进 alarmEpoch；worker 随后按 attentionSequence 停止真实声音。
+清除后成为候补。若 owner 正处于 `reserved` 且 adapter start 尚未返回，清除只撤销逻辑资格并推进 epoch；
+start 返回后的步骤 8 负责安全停止其 PlayingMemory。焦点 admission 继续使用既有
+`Timer -> attention admission` 双锁规则：同步确认当时当前的 Timer audio 权威并推进 alarmEpoch；worker
+随后按 attentionSequence 停止真实声音或等待 outstanding start 返回后立即停止。
 
 alarmEpoch 不得回绕。耗尽时 Timer 闹铃 admission 进入进程内失败关闭，终结 pending owner/票证并停止声音；
 消息、Toast、托盘、徽标和普通消息公共提示音继续按各自合同运行，重启后恢复 Timer 闹铃 admission。
@@ -443,19 +524,46 @@ PlaySoundW(memoryPointer, ..., SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT
 
 不得为 Timer 使用 `SND_FILENAME`，也不得在播放阶段重新打开插件文件。
 
-timerAudioOwner 必须持有完整 `Arc<[u8]>`，直到宿主成功调用全局停止并确认返回后才能释放。停止顺序固定为：
+WindowsAudioAdapter 是异步 PCM 字节的最终所有者，并且是进程中所有 `PlaySoundW` 调用的唯一串行点。可以
+使用适配器内部专用线程或等价串行执行器，但不能依赖 NativeAttentionCoordinator WorkerState 保存最后一份
+强引用。
 
-1. 先从权威状态撤销 owner，禁止新事件复活它；
-2. 调用 `PlaySoundW(NULL, ..., 0)` 或等价停止；
-3. 停止成功后释放 owner 字节；
-4. 停止失败时把该 Arc 移入进程生命周期 quarantine，保持地址有效直到进程退出，并把 Timer 音频通道设为
-   terminal，避免异步 WinMM 继续读取已释放内存。
+启动顺序固定为：
 
-启动返回失败时 Windows 未接受异步播放，当前票证终结且不保留 owner 字节；同一 epoch 的旧后续票证仍不能
-候补。清除并推进到新 epoch 后，新到期轮次可以再次尝试，除非音频通道已因不安全的停止失败进入 terminal。
+1. adapter 接收完整 `Arc<[u8]> + AudioTicket + alarmEpoch + AlarmAssetIdentity`；
+2. 在调用 `PlaySoundW` 前，adapter 先把强引用安装为内部 `PlayingMemory`；
+3. adapter 在其串行执行上下文调用 Timer `SND_MEMORY` start；
+4. start 成功时继续持有 PlayingMemory，直到匹配 stop 成功；
+5. start 返回失败表示 Windows 未接受异步播放，adapter 才可释放该 PlayingMemory，并把失败返回协调器。
 
-Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停止当前普通提示音；Timer 实际循环期间抑制
-后续普通提示音。
+停止顺序固定为：
+
+1. 协调器先从权威状态撤销逻辑 owner，禁止新事件复活它；
+2. 向 adapter 提交包含完整 ticket、epoch 和 asset identity 的 stop；
+3. adapter 在自身串行状态中匹配 PlayingMemory；身份不匹配为幂等 no-op，不能停止后来 owner；
+4. 匹配时调用 `PlaySoundW(NULL, ..., 0)` 或等价停止；
+5. 停止成功后才释放 PlayingMemory；
+6. 停止失败时把 Arc 移入应用根状态的 ProcessAudioQuarantine，保持地址有效直到原生进程真正退出，并把整个
+   原生音频 adapter 设为 terminal，避免异步 WinMM 继续读取已释放内存；此后普通提示音和 Timer 闹铃均失败关闭。
+
+NativeAttentionCoordinator Worker panic、receiver 断开和 emergency-stop 均不得先释放 PlayingMemory：
+
+- worker 的 timerAudioOwner 只保存逻辑身份；
+- adapter 独立持有 PlayingMemory，生命周期长于 worker state；
+- CleanupGuard 调用 adapter shutdown；
+- adapter shutdown/Drop 必须先执行串行 stop，成功后释放，失败则把 Arc 移交 ProcessAudioQuarantine；
+- adapter 自身状态不能在 stop/shutdown 前因锁中毒或 channel 断开丢弃字节。
+
+ProcessAudioQuarantine 的生命周期不得绑定 public-plugin service、attention coordinator 或 audio adapter；这些
+对象在主进程中提前 shutdown/drop 时，quarantine 仍然保留字节，直到进程 teardown。
+
+启动失败后同一 epoch 的旧后续票证仍不能候补。清除并推进到新 epoch 后，新到期轮次可以再次尝试，除非
+Timer 音频通道已因不安全的停止失败进入 terminal。
+
+Windows 音频后端仍是一个进程级声音通道。普通提示音、Timer start/stop、shutdown 和 emergency-stop 全部
+经过同一个 adapter 串行执行。Timer owner 开始前停止当前普通提示音；只要 adapter 持有 PlayingMemory，
+adapter 自身也必须拒绝普通声音，不能只依赖协调器抑制。adapter terminal 后所有声音调用均失败关闭，消息、
+Toast、托盘和徽标继续可用。
 
 ## 13. 失败行为
 
@@ -477,7 +585,7 @@ Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停
 
 - activationId、票证或资产身份不匹配：视为迟到/已撤销事件，静默拒绝，不停用当前插件；
 - `PlaySoundW` 启动失败：保持已保存消息与 `fired`，终结当前票证，不重试本轮，不停用插件；
-- 停止失败：按第 12 节 quarantine 字节并使 Timer 音频通道 terminal，不停用插件；
+- 停止失败：按第 12 节 quarantine 字节并使整个原生音频 adapter terminal，不停用插件；
 - 宿主按错误类型限频记录不包含敏感路径的稳定诊断；
 - 后续新 Timer round 可以重新尝试启动，除非 Timer 音频通道已 terminal；
 - 普通消息公共提示音失败同样不改变消息来源插件状态。
@@ -488,8 +596,9 @@ Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停
 ### 13.3 原子提交失败
 
 - reservation 前失败：旧 Bundle 完整保留；
-- reservation 后持久替换失败：清除 reservation，删除候选，旧 Bundle 和旧 Timer 完整保留；
-- 持久替换后进程退出：新进程从新状态重建，旧内存副作用随进程结束；
+- `Reserved` 后持久替换失败：RAII 清除 reservation，删除候选，旧 Bundle 和旧 Timer 完整保留；
+- `Durable` 后同进程无法发布：公开插件服务进入 terminal，不允许继续服务旧 Bundle；
+- `Durable` 后进程退出：新进程从新状态重建，旧内存副作用随进程结束；
 - Bundle 线性化后清理失败：新 Bundle 保持成功，旧清理延后重试，不回滚。
 
 ## 14. SDK 与开发者体验
@@ -531,8 +640,10 @@ Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停
 - Runtime 与窗口请求固定闹铃均得到 `403`，其他合法公开资源仍可读取；
 - RuntimeSnapshot 资源枚举不包含闹铃，AlarmAssetRegistry 包含匹配 activationId 的私有内存资产；
 - CSP 包含 `media-src 'none'`；
-- Runtime 与插件内容 WebView 在首个脚本执行前已原生静音，reload/重建仍静音；
-- 原生静音设置失败时窗口/Runtime 创建失败关闭；
+- Runtime 与插件内容 WebView 先创建 inert URL，完成 `ICoreWebView2_8` cast、set、readback 和 changed-listener
+  后才导航至插件 URL；
+- 首个插件脚本执行前已原生静音，reload/重建仍静音；
+- cast、set、readback、listener、超时或运行中 unmute 任一失败时窗口/Runtime 创建或运行失败关闭；
 - 插件无法通过 `<audio>`、data URL 或 WebAudio oscillator 产生可听声音。
 
 ### 16.3 身份与卸载重装
@@ -547,8 +658,11 @@ Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停
 
 - 候选准备、Runtime ready、包持久化、状态替换和 Bundle 发布逐步故障注入；
 - reservation 阻止并发 enable/disable/update/uninstall 观察或制造半提交状态；
+- `Reserved` panic 自动回滚；`Durable` 后 panic、锁中毒或 CAS 异常使公开插件服务 terminal；
 - 持久替换失败旧 Bundle 完整保留；
-- 线性化点同时发布 config/runtime/asset 并撤销旧 Timer 权威；
+- 新激活线性化点同时发布 config/runtime/asset 并撤销旧 Timer 权威；config-only Bundle 交换复用
+  activationId 并保留 Timer/owner；
+- 锁序固定为 `plugin mutation -> window session -> timer -> ActivationBundle`，锁内不进入 attention；
 - 卸载先撤销 Bundle/owner，再锁外删除包；
 - 线性化后清理失败不回滚新 Bundle。
 
@@ -557,10 +671,15 @@ Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停
 - 第一张有效票证 claim epoch 并循环，后续同 epoch 票证不调用 start、不候补；
 - 第一张无效票证不 claim epoch，下一张有效票可竞争；
 - start 进行中并发到期事件 stamp 旧 epoch，start 失败后不能候补；
-- owner 取消、焦点、Reset、更新和 shutdown 与 start 使用 barrier 覆盖两种线性化顺序；
+- owner 取消、焦点、Reset、更新和 shutdown 与 start 使用 barrier 覆盖调用前、调用中和返回后的顺序；
+- start 迟到成功必须重新 CAS ticket/asset/epoch/reserved；失配后 adapter 只停止同一 PlayingMemory；
 - owner 清除后 admission 的新 epoch 票证可以成为新 owner；
 - 闹铃实际播放期间普通消息不播放公共提示音，停止后的新普通消息可以播放；
-- 启动失败不禁用插件；停止失败保留内存 quarantine 并使 Timer 音频通道 terminal；
+- 启动失败不禁用插件；停止失败保留内存 quarantine 并使整个原生音频 adapter terminal；
+- adapter 持有 PlayingMemory 时，即使上层误发 ordinary 请求也不会播放公共提示音；
+- worker panic、receiver 断开和 emergency-stop 时 adapter 保持 Arc，shutdown 先 stop 再释放，失败移交
+  ProcessAudioQuarantine；
+- 普通、Timer 和 cleanup 的所有 `PlaySoundW` 调用在 adapter 内串行，迟到旧 stop 不能停止新 owner；
 - 所有外部 I/O、WebView 和原生音频调用都发生在相关运行时锁外。
 
 ### 16.6 资源与人工验收
@@ -576,16 +695,20 @@ Windows 音频后端仍是一个进程级声音通道。Timer owner 开始前停
 
 1. 普通消息始终使用主程序公共提示音播放一次，插件不能替换。
 2. 每个 `timer.control` 插件必须携带合法的固定路径闹铃，否则安装或更新失败。
-3. 闹铃是宿主私有内存资源；Runtime/窗口协议返回 `403`，插件 WebView 永久原生静音。
+3. 闹铃是宿主私有内存资源；Runtime/窗口协议返回 `403`，插件 WebView 通过 inert 导航握手永久原生静音。
 4. 插件没有任意音频 API；宿主只在有效 Timer 到期后循环播放签票时冻结的闹铃。
 5. activationId 防止完全卸载重装后的旧票证、事件或结果操作新插件实例。
 6. 第一张有效票证独占当前 alarmEpoch；后续票证不混音、不切换、不候补。
 7. 主窗口聚焦、owner 生命周期撤销、Reset、新轮次或退出按完整身份停止闹铃。
 8. 闹铃期间普通消息仍完整送达，但其公共提示音被抑制且不补播。
 9. 安装期无默认回退；运行期原生音频失败不回滚消息，也不错误停用插件。
-10. 更新失败保留完整旧 Bundle；成功更新原子发布新 Bundle 并只让新计时使用新闹铃。
-11. 音频解析、Web 隔离、激活身份、内存生命周期、原子提交、alarmEpoch 和票证乱序均有确定性测试。
-12. 当前番茄时钟示例重新安装后，关闭插件窗口仍可在到期时播放其包内闹铃，打开主界面即停止。
+10. 更新失败保留完整旧 Bundle；成功更新原子发布新 Bundle 并只让新计时使用新闹铃；config-only 修改保留
+    activationId 和运行中 Timer。
+11. `Reserved` 可回滚，`Durable` 后无法发布会使公开插件服务 terminal，不能继续运行旧 Bundle。
+12. PCM 字节由 Windows audio adapter 最终持有；worker panic、迟到 start/stop 和 emergency-stop 均不会释放
+    正在被 WinMM 使用的内存或停止后来 owner。
+13. 音频解析、Web 隔离、激活身份、内存生命周期、原子提交、alarmEpoch 和票证乱序均有确定性测试。
+14. 当前番茄时钟示例重新安装后，关闭插件窗口仍可在到期时播放其包内闹铃，打开主界面即停止。
 
 ## 18. 结论
 
