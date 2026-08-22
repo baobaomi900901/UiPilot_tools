@@ -238,14 +238,14 @@ fn setup_production_lifecycle(
     });
     let toast = native_attention::windows_toast();
     let tray_attention = native_attention::tauri_tray(tray, icon);
-    let attention_sound = app
+    let message_sound = app
         .path()
         .resolve(
-            "sounds/attention-alarm.wav",
+            "resources/sounds/message-notification.wav",
             tauri::path::BaseDirectory::Resource,
         )
         .map_err(|_| lifecycle_setup_error())?;
-    let attention_audio = native_attention::windows_audio(attention_sound);
+    let attention_audio = native_attention::windows_audio(message_sound);
     message_center
         .install_native_effects(toast, tray_attention, attention_audio)
         .map_err(|_| lifecycle_setup_error())?;

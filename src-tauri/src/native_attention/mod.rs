@@ -37,20 +37,33 @@ pub(crate) fn tauri_tray<R: tauri::Runtime>(
     tray::tauri_tray_port(tray, normal)
 }
 
-pub(crate) fn windows_audio(path: std::path::PathBuf) -> Arc<dyn AttentionAudioPort> {
-    windows_audio::windows_audio(path)
+pub(crate) fn windows_audio(message_path: std::path::PathBuf) -> Arc<dyn AttentionAudioPort> {
+    windows_audio::windows_audio(message_path)
 }
 
 const ORDINARY_CAPACITY: usize = 64;
 const TIMER_KEY_CAPACITY: usize = 64;
 const FOCUS_CAPACITY: usize = 128;
 const TOAST_CALLBACK_CAPACITY: usize = 64;
-const ACTIVE_TIMER_CAPACITY: usize = 64;
 const ACTIVE_TOAST_CAPACITY: usize = 64;
 
 pub(crate) type NativeNotificationId = u64;
 pub(crate) type ToastCallbackSink =
     Arc<dyn Fn(NativeNotificationId, ToastCallbackKind) + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AlarmPlaybackKey(u64);
+
+impl AlarmPlaybackKey {
+    fn from_epoch(epoch: u64) -> Option<Self> {
+        (epoch > 0).then_some(Self(epoch))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(value: u64) -> Self {
+        Self::from_epoch(value).expect("test playback key must be nonzero")
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublishedAttention {
@@ -76,8 +89,12 @@ pub(crate) enum ToastCallbackKind {
 pub(crate) trait AttentionAudioPort: Send + Sync {
     fn play_ordinary(&self) -> Result<(), NativeEffectError>;
     fn stop_ordinary(&self) -> Result<(), NativeEffectError>;
-    fn start_timer_loop(&self, ticket: &AudioTicket) -> Result<bool, NativeEffectError>;
-    fn stop_timer_loop(&self, ticket: &AudioTicket) -> Result<(), NativeEffectError>;
+    fn start_timer_loop(
+        &self,
+        key: AlarmPlaybackKey,
+        bytes: Arc<[u8]>,
+    ) -> Result<(), NativeEffectError>;
+    fn stop_timer_loop(&self, key: AlarmPlaybackKey) -> Result<(), NativeEffectError>;
     fn shutdown(&self);
 }
 
@@ -148,24 +165,74 @@ struct Sequenced<T> {
 struct SequencedPublished {
     attention: PublishedAttention,
     focused_at_admission: bool,
+    alarm_epoch: Option<u64>,
 }
 
 #[derive(Default)]
 struct TimerSlots {
     published: Option<Sequenced<SequencedPublished>>,
-    cancelled: Option<Sequenced<AudioTicket>>,
+    cancelled: Option<Sequenced<TimerCancellation>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerAudioOwnerPhase {
+    Reserved,
+    Playing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TimerAudioOwner {
+    epoch: u64,
+    ticket: AudioTicket,
+    alarm: crate::public_plugins::ValidatedAlarmAsset,
+    playback_key: AlarmPlaybackKey,
+    phase: TimerAudioOwnerPhase,
+}
+
+#[derive(Clone, Debug)]
+struct TimerCancellation {
+    ticket: AudioTicket,
+    stop_key: Option<AlarmPlaybackKey>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FocusEvent {
+    focused: bool,
+    stop_key: Option<AlarmPlaybackKey>,
+}
+
 struct MailboxState {
     next_sequence: u64,
+    alarm_epoch: u64,
+    alarm_epoch_claimed: bool,
+    timer_audio_terminal: bool,
+    timer_audio_owner: Option<TimerAudioOwner>,
     main_focused: bool,
     terminal: bool,
     ordinary: VecDeque<Sequenced<SequencedPublished>>,
     timers: BTreeMap<TimerKey, TimerSlots>,
-    focus: VecDeque<Sequenced<bool>>,
+    focus: VecDeque<Sequenced<FocusEvent>>,
     callbacks: BTreeMap<NativeNotificationId, Sequenced<ToastCallbackKind>>,
     toast_ids: BTreeSet<NativeNotificationId>,
+}
+
+impl Default for MailboxState {
+    fn default() -> Self {
+        Self {
+            next_sequence: 0,
+            alarm_epoch: 1,
+            alarm_epoch_claimed: false,
+            timer_audio_terminal: false,
+            timer_audio_owner: None,
+            main_focused: false,
+            terminal: false,
+            ordinary: VecDeque::new(),
+            timers: BTreeMap::new(),
+            focus: VecDeque::new(),
+            callbacks: BTreeMap::new(),
+            toast_ids: BTreeSet::new(),
+        }
+    }
 }
 
 impl MailboxState {
@@ -173,6 +240,37 @@ impl MailboxState {
         let sequence = self.next_sequence.checked_add(1)?;
         self.next_sequence = sequence;
         Some(sequence)
+    }
+
+    fn advance_alarm_epoch(&mut self) {
+        self.timer_audio_owner = None;
+        self.alarm_epoch_claimed = false;
+        match self.alarm_epoch.checked_add(1) {
+            Some(epoch) => self.alarm_epoch = epoch,
+            None => {
+                self.timer_audio_terminal = true;
+                self.alarm_epoch_claimed = true;
+            }
+        }
+    }
+
+    fn revoke_timer_owner(
+        &mut self,
+        ticket: Option<&AudioTicket>,
+        advance_without_owner: bool,
+    ) -> Option<AlarmPlaybackKey> {
+        let matches = self
+            .timer_audio_owner
+            .as_ref()
+            .is_some_and(|owner| ticket.is_none_or(|ticket| owner.ticket == *ticket));
+        if !matches && !advance_without_owner {
+            return None;
+        }
+        let stop_key = self.timer_audio_owner.as_ref().and_then(|owner| {
+            (owner.phase == TimerAudioOwnerPhase::Playing).then_some(owner.playback_key)
+        });
+        self.advance_alarm_epoch();
+        stop_key
     }
 
     fn next_event(&mut self) -> Option<WorkerEvent> {
@@ -259,8 +357,8 @@ enum EventLocation {
 
 enum WorkerEvent {
     Published(SequencedPublished),
-    TimerAudioCancelled(AudioTicket),
-    MainFocusChanged(bool),
+    TimerAudioCancelled(TimerCancellation),
+    MainFocusChanged(FocusEvent),
     ToastCallback {
         notification_id: NativeNotificationId,
         kind: ToastCallbackKind,
@@ -296,8 +394,6 @@ struct Ports {
 struct WorkerState {
     tray: TrayAnimation,
     ordinary_playing: bool,
-    active_timer_tickets: BTreeSet<AudioTicket>,
-    timer_loop_owner: Option<AudioTicket>,
     active_toasts: BTreeSet<NativeNotificationId>,
 }
 
@@ -421,6 +517,7 @@ impl NativeAttentionCoordinator {
                 value: SequencedPublished {
                     attention,
                     focused_at_admission,
+                    alarm_epoch: None,
                 },
             });
             true
@@ -467,6 +564,12 @@ impl NativeAttentionCoordinator {
                         }
                         return;
                     };
+                    let alarm_epoch = matches!(
+                        &attention.origin,
+                        AttentionOrigin::TimerCompletion { audio: Some(_) }
+                    )
+                    .then_some(state.alarm_epoch)
+                    .filter(|_| !state.timer_audio_terminal);
                     let slots = state.timers.entry(slot_key).or_default();
                     replaced_ticket = slots
                         .published
@@ -475,6 +578,7 @@ impl NativeAttentionCoordinator {
                     slots.published = Some(Sequenced {
                         sequence,
                         value: SequencedPublished {
+                            alarm_epoch,
                             attention,
                             focused_at_admission,
                         },
@@ -510,7 +614,7 @@ impl NativeAttentionCoordinator {
                     .timers
                     .get(&key)
                     .and_then(|slots| slots.cancelled.as_ref())
-                    .is_some_and(|event| event.value == ticket);
+                    .is_some_and(|event| event.value.ticket == ticket);
                 if duplicate {
                     false
                 } else if state
@@ -522,9 +626,10 @@ impl NativeAttentionCoordinator {
                     terminal = true;
                     false
                 } else if let Some(sequence) = state.allocate_sequence() {
+                    let stop_key = state.revoke_timer_owner(Some(&ticket), false);
                     state.timers.entry(key).or_default().cancelled = Some(Sequenced {
                         sequence,
-                        value: ticket,
+                        value: TimerCancellation { ticket, stop_key },
                     });
                     true
                 } else {
@@ -570,9 +675,12 @@ impl NativeAttentionCoordinator {
                 false
             } else if let Some(sequence) = state.allocate_sequence() {
                 state.main_focused = focused;
+                let stop_key = focused
+                    .then(|| state.revoke_timer_owner(None, true))
+                    .flatten();
                 state.focus.push_back(Sequenced {
                     sequence,
-                    value: focused,
+                    value: FocusEvent { focused, stop_key },
                 });
                 true
             } else {
@@ -709,24 +817,22 @@ fn worker_loop(mailbox: Arc<Mailbox>, ports: Arc<Ports>) {
 fn process_event(mailbox: &Mailbox, ports: &Ports, state: &mut WorkerState, event: WorkerEvent) {
     match event {
         WorkerEvent::Published(event) => process_published(mailbox, ports, state, event),
-        WorkerEvent::TimerAudioCancelled(ticket) => {
-            if state.active_timer_tickets.remove(&ticket) && state.active_timer_tickets.is_empty() {
-                if let Some(owner) = state.timer_loop_owner.take() {
-                    let _ = ports.audio.stop_timer_loop(&owner);
-                }
+        WorkerEvent::TimerAudioCancelled(cancellation) => {
+            let _ticket = cancellation.ticket;
+            if let Some(key) = cancellation.stop_key {
+                let _ = ports.audio.stop_timer_loop(key);
             }
         }
-        WorkerEvent::MainFocusChanged(focused) => {
-            let tray_action = state.tray.focus(focused);
+        WorkerEvent::MainFocusChanged(focus) => {
+            let tray_action = state.tray.focus(focus.focused);
             apply_tray_transition(ports.tray.as_ref(), &mut state.tray, tray_action);
-            if focused {
+            if focus.focused {
                 if state.ordinary_playing {
                     let _ = ports.audio.stop_ordinary();
                     state.ordinary_playing = false;
                 }
-                state.active_timer_tickets.clear();
-                if let Some(owner) = state.timer_loop_owner.take() {
-                    let _ = ports.audio.stop_timer_loop(&owner);
+                if let Some(key) = focus.stop_key {
+                    let _ = ports.audio.stop_timer_loop(key);
                 }
             }
         }
@@ -776,37 +882,98 @@ fn process_published(
 
     match event.attention.origin {
         AttentionOrigin::Ordinary => {
-            if state.active_timer_tickets.is_empty() && ports.audio.play_ordinary().is_ok() {
+            let timer_playing = mailbox.state.lock().is_ok_and(|mailbox| {
+                mailbox
+                    .timer_audio_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.phase == TimerAudioOwnerPhase::Playing)
+            });
+            if !timer_playing && ports.audio.play_ordinary().is_ok() {
                 state.ordinary_playing = true;
             }
         }
         AttentionOrigin::TimerCompletion { audio: Some(audio) } => {
-            let ticket = audio.ticket;
-            if state.active_timer_tickets.len() >= ACTIVE_TIMER_CAPACITY
-                || state
-                    .active_timer_tickets
-                    .iter()
-                    .any(|active| active.key() == ticket.key())
-            {
+            let TimerAudioCompletion { ticket, alarm } = *audio;
+            let Some(epoch) = event.alarm_epoch else {
+                let _ = ports.timers.confirm_audio_without_start(&ticket);
+                return;
+            };
+            let epoch_is_open = mailbox.state.lock().is_ok_and(|mailbox| {
+                !mailbox.terminal
+                    && !mailbox.timer_audio_terminal
+                    && mailbox.alarm_epoch == epoch
+                    && !mailbox.alarm_epoch_claimed
+                    && mailbox.timer_audio_owner.is_none()
+            });
+            if !epoch_is_open {
                 let _ = ports.timers.confirm_audio_without_start(&ticket);
                 return;
             }
             if !ports.timers.admit_audio_start(&ticket).unwrap_or(false) {
                 return;
             }
-            let starts_loop = state.active_timer_tickets.is_empty();
-            state.active_timer_tickets.insert(ticket.clone());
-            if starts_loop {
-                match ports.audio.start_timer_loop(&ticket) {
-                    Ok(true) => {
-                        state.ordinary_playing = false;
-                        state.timer_loop_owner = Some(ticket);
+            let reserved = mailbox.state.lock().ok().and_then(|mut mailbox| {
+                if mailbox.terminal
+                    || mailbox.timer_audio_terminal
+                    || mailbox.alarm_epoch != epoch
+                    || mailbox.alarm_epoch_claimed
+                    || mailbox.timer_audio_owner.is_some()
+                {
+                    return None;
+                }
+                let playback_key = AlarmPlaybackKey::from_epoch(epoch)?;
+                let owner = TimerAudioOwner {
+                    epoch,
+                    ticket: ticket.clone(),
+                    alarm: alarm.clone(),
+                    playback_key,
+                    phase: TimerAudioOwnerPhase::Reserved,
+                };
+                mailbox.alarm_epoch_claimed = true;
+                mailbox.timer_audio_owner = Some(owner.clone());
+                Some(owner)
+            });
+            let Some(reserved) = reserved else {
+                let _ = ports.timers.confirm_audio_after_play_failure(&ticket);
+                return;
+            };
+            if state.ordinary_playing {
+                let _ = ports.audio.stop_ordinary();
+                state.ordinary_playing = false;
+            }
+            let started = ports
+                .audio
+                .start_timer_loop(reserved.playback_key, Arc::clone(&reserved.alarm.bytes));
+            if started.is_ok() {
+                let committed = mailbox.state.lock().is_ok_and(|mut mailbox| {
+                    if !mailbox
+                        .timer_audio_owner
+                        .as_ref()
+                        .is_some_and(|current| timer_owner_matches(current, &reserved))
+                    {
+                        return false;
                     }
-                    Ok(false) | Err(_) => {
-                        state.active_timer_tickets.remove(&ticket);
-                        let _ = ports.timers.confirm_audio_after_play_failure(&ticket);
+                    mailbox
+                        .timer_audio_owner
+                        .as_mut()
+                        .expect("matching timer owner missing")
+                        .phase = TimerAudioOwnerPhase::Playing;
+                    true
+                });
+                if !committed {
+                    let _ = ports.audio.stop_timer_loop(reserved.playback_key);
+                }
+            } else {
+                if let Ok(mut mailbox) = mailbox.state.lock() {
+                    if mailbox
+                        .timer_audio_owner
+                        .as_ref()
+                        .is_some_and(|current| timer_owner_matches(current, &reserved))
+                    {
+                        mailbox.advance_alarm_epoch();
                     }
                 }
+                let _ = ports.timers.confirm_audio_after_play_failure(&ticket);
             }
         }
         AttentionOrigin::TimerCompletion { audio: None } => {}
@@ -852,6 +1019,15 @@ fn timer_ticket(attention: &PublishedAttention) -> Option<&AudioTicket> {
     }
 }
 
+fn timer_owner_matches(current: &TimerAudioOwner, expected: &TimerAudioOwner) -> bool {
+    current.epoch == expected.epoch
+        && current.ticket == expected.ticket
+        && current.alarm.identity == expected.alarm.identity
+        && Arc::ptr_eq(&current.alarm.bytes, &expected.alarm.bytes)
+        && current.playback_key == expected.playback_key
+        && current.phase == expected.phase
+}
+
 fn timerless_key(attention: &PublishedAttention) -> TimerKey {
     TimerKey {
         plugin_id: attention.message.plugin_id.clone(),
@@ -881,7 +1057,10 @@ fn emergency_stop(ports: &Ports) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Condvar, Mutex},
+    };
 
     use super::*;
     use crate::public_plugins::{AlarmAssetIdentity, ValidatedAlarmAsset};
@@ -953,18 +1132,96 @@ mod tests {
             Ok(())
         }
 
-        fn start_timer_loop(&self, _ticket: &AudioTicket) -> Result<bool, NativeEffectError> {
+        fn start_timer_loop(
+            &self,
+            _key: AlarmPlaybackKey,
+            _bytes: Arc<[u8]>,
+        ) -> Result<(), NativeEffectError> {
             self.0.push("timer-start");
-            Ok(true)
+            Ok(())
         }
 
-        fn stop_timer_loop(&self, _ticket: &AudioTicket) -> Result<(), NativeEffectError> {
+        fn stop_timer_loop(&self, _key: AlarmPlaybackKey) -> Result<(), NativeEffectError> {
             self.0.push("timer-stop");
             Ok(())
         }
 
         fn shutdown(&self) {
             self.0.push("audio-shutdown");
+        }
+    }
+
+    struct BlockingAudio {
+        calls: Arc<Calls>,
+        succeeds: bool,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl BlockingAudio {
+        fn new(calls: Arc<Calls>) -> Arc<Self> {
+            Arc::new(Self {
+                calls,
+                succeeds: true,
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn new_failing(calls: Arc<Calls>) -> Arc<Self> {
+            Arc::new(Self {
+                calls,
+                succeeds: false,
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl AttentionAudioPort for BlockingAudio {
+        fn play_ordinary(&self) -> Result<(), NativeEffectError> {
+            self.calls.push("ordinary");
+            Ok(())
+        }
+
+        fn stop_ordinary(&self) -> Result<(), NativeEffectError> {
+            self.calls.push("ordinary-stop");
+            Ok(())
+        }
+
+        fn start_timer_loop(
+            &self,
+            _key: AlarmPlaybackKey,
+            _bytes: Arc<[u8]>,
+        ) -> Result<(), NativeEffectError> {
+            self.calls.push("timer-start");
+            let released = self.released.lock().unwrap();
+            drop(
+                self.changed
+                    .wait_while(released, |released| !*released)
+                    .unwrap(),
+            );
+            if self.succeeds {
+                Ok(())
+            } else {
+                self.calls.push("timer-fail");
+                Err(NativeEffectError)
+            }
+        }
+
+        fn stop_timer_loop(&self, _key: AlarmPlaybackKey) -> Result<(), NativeEffectError> {
+            self.calls.push("timer-stop");
+            Ok(())
+        }
+
+        fn shutdown(&self) {
+            self.release();
+            self.calls.push("audio-shutdown");
         }
     }
 
@@ -1027,6 +1284,34 @@ mod tests {
         }
     }
 
+    struct ScriptedTimers(Mutex<VecDeque<bool>>);
+
+    impl TimerAttentionPort for ScriptedTimers {
+        fn admit_audio_start(&self, _ticket: &AudioTicket) -> Result<bool, TimerError> {
+            Ok(self.0.lock().unwrap().pop_front().unwrap_or(true))
+        }
+
+        fn confirm_audio_without_start(&self, _ticket: &AudioTicket) -> Result<bool, TimerError> {
+            Ok(true)
+        }
+
+        fn confirm_audio_after_play_failure(
+            &self,
+            _ticket: &AudioTicket,
+        ) -> Result<bool, TimerError> {
+            Ok(true)
+        }
+
+        fn linearize_focused(&self, admission: &mut dyn FnMut()) -> Result<(), TimerError> {
+            admission();
+            Ok(())
+        }
+
+        fn terminate_all_audio(&self) -> Result<(), TimerError> {
+            Ok(())
+        }
+    }
+
     struct NoopRoute;
 
     impl AttentionRoutePort for NoopRoute {
@@ -1067,6 +1352,20 @@ mod tests {
             Arc::new(FakeToast(Arc::clone(&calls))),
             Arc::new(FakeTray(Arc::clone(&calls))),
             Arc::new(FakeAudio(calls)),
+            Arc::new(NoopRoute),
+        )
+    }
+
+    fn coordinator_with_ports(
+        calls: Arc<Calls>,
+        timers: Arc<dyn TimerAttentionPort>,
+        audio: Arc<dyn AttentionAudioPort>,
+    ) -> Arc<NativeAttentionCoordinator> {
+        NativeAttentionCoordinator::start_with_timer_port(
+            timers,
+            Arc::new(FakeToast(Arc::clone(&calls))),
+            Arc::new(FakeTray(calls)),
+            audio,
             Arc::new(NoopRoute),
         )
     }
@@ -1150,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_timer_tickets_share_one_loop_and_partial_cancel_keeps_it_running() {
+    fn first_valid_timer_owns_the_epoch_and_later_tickets_never_start() {
         let calls = Arc::new(Calls::default());
         let coordinator = coordinator(Arc::clone(&calls));
         let first = ticket("com.example.timer.first", 1);
@@ -1167,8 +1466,8 @@ mod tests {
         );
 
         coordinator.cancel_timer_audio(first);
-        coordinator.cancel_timer_audio(second);
         assert_eq!(calls.wait_for(6).last(), Some(&"timer-stop"));
+        coordinator.cancel_timer_audio(second);
         coordinator.shutdown();
     }
 
@@ -1239,5 +1538,96 @@ mod tests {
 
         assert_eq!(calls.wait_for(2), ["toast", "tray"]);
         coordinator.shutdown();
+    }
+
+    #[test]
+    fn invalid_first_ticket_does_not_claim_the_epoch_from_the_next_valid_ticket() {
+        let calls = Arc::new(Calls::default());
+        let timers: Arc<dyn TimerAttentionPort> =
+            Arc::new(ScriptedTimers(Mutex::new(VecDeque::from([false, true]))));
+        let audio: Arc<dyn AttentionAudioPort> = Arc::new(FakeAudio(Arc::clone(&calls)));
+        let coordinator = coordinator_with_ports(Arc::clone(&calls), timers, audio);
+
+        coordinator.publish(timer("1", ticket("com.example.invalid", 1)));
+        coordinator.publish(timer("2", ticket("com.example.valid", 2)));
+
+        assert_eq!(calls.wait_for(4), ["toast", "tray", "toast", "timer-start"]);
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn focus_during_start_revokes_the_owner_and_late_success_stops_only_its_key() {
+        let calls = Arc::new(Calls::default());
+        let audio = BlockingAudio::new(Arc::clone(&calls));
+        let coordinator =
+            coordinator_with_ports(Arc::clone(&calls), Arc::new(FakeTimers), audio.clone());
+
+        coordinator.publish(timer("1", ticket("com.example.focus-race", 1)));
+        assert_eq!(calls.wait_for(3), ["toast", "tray", "timer-start"]);
+        coordinator.observe_main_focus(true);
+        audio.release();
+
+        assert_eq!(
+            calls.wait_for(5),
+            ["toast", "tray", "timer-start", "timer-stop", "focus"]
+        );
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn matching_cancel_during_start_revokes_without_letting_an_old_stop_hit_a_new_owner() {
+        let calls = Arc::new(Calls::default());
+        let audio = BlockingAudio::new(Arc::clone(&calls));
+        let coordinator =
+            coordinator_with_ports(Arc::clone(&calls), Arc::new(FakeTimers), audio.clone());
+        let owner = ticket("com.example.cancel-race", 1);
+
+        coordinator.publish(timer("1", owner.clone()));
+        assert_eq!(calls.wait_for(3), ["toast", "tray", "timer-start"]);
+        coordinator.cancel_timer_audio(owner);
+        audio.release();
+
+        assert_eq!(calls.wait_for(4).last(), Some(&"timer-stop"));
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn failed_start_has_no_same_epoch_fallback_but_a_new_epoch_can_try() {
+        let calls = Arc::new(Calls::default());
+        let audio = BlockingAudio::new_failing(Arc::clone(&calls));
+        let coordinator =
+            coordinator_with_ports(Arc::clone(&calls), Arc::new(FakeTimers), audio.clone());
+
+        coordinator.publish(timer("1", ticket("com.example.failed-owner", 1)));
+        assert_eq!(calls.wait_for(3), ["toast", "tray", "timer-start"]);
+        coordinator.publish(timer("2", ticket("com.example.same-epoch", 2)));
+        audio.release();
+        assert_eq!(
+            calls.wait_for(5),
+            ["toast", "tray", "timer-start", "timer-fail", "toast"]
+        );
+
+        coordinator.publish(timer("3", ticket("com.example.new-epoch", 3)));
+        let values = calls.wait_for(8);
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| **value == "timer-start")
+                .count(),
+            2
+        );
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn alarm_epoch_exhaustion_fails_only_timer_audio_admission_closed() {
+        let mut mailbox = MailboxState::default();
+        mailbox.alarm_epoch = u64::MAX;
+
+        mailbox.advance_alarm_epoch();
+
+        assert!(mailbox.timer_audio_terminal);
+        assert!(mailbox.alarm_epoch_claimed);
+        assert!(!mailbox.terminal);
     }
 }
