@@ -394,7 +394,7 @@ window.uipilotPluginWindow.onUpdate(async (update) => {
 
 ```js
 await timer.start({
-  durationMs: 10_000,
+  durationMs: 600_000,
   completionMessage: '番茄钟完成',
 })
 await timer.stop()  // running -> paused；再次调用幂等
@@ -403,8 +403,8 @@ await timer.reset() // 回到 idle，保留显示时长但不自动开始
 ```
 
 `durationMs` 是 `1_000..=86_400_000` 的 JavaScript 安全整数。`completionMessage` 是 1 到 500 个
-Unicode 标量值的纯文本。首次 `idle` 的 `durationMs / remainingMs` 都是 `null`；示例页面自己显示
-`00:10`，用户点击 Start 后宿主才冻结输入。`running` 时再次无参 Start、以及 idle/paused/fired 的幂等
+Unicode 标量值的纯文本。首次 `idle` 的 `durationMs / remainingMs` 都是 `null`；参考番茄钟页面自己显示
+`10:00`，用户点击 Start 后宿主才冻结输入。`running` 时再次无参 Start、以及 idle/paused/fired 的幂等
 操作都返回当前权威状态；需要 input 时省略会得到 `TimerInputRequired`，不允许 input 时传入会得到
 `TimerInputNotAllowed`。
 
@@ -438,6 +438,12 @@ await storage.remove('pomodoro.duration-minutes')
 `ExpiredWindowSessionError`。Runtime 与窗口都只能使用匹配 `^[a-z][a-z0-9.-]{0,63}$` 的 key，并拒绝
 `__proto__`、`prototype` 和 `constructor`。值必须是有限 JSON，所有入口共享每插件 5 MiB 配额与原子写入；
 非法 key/value 返回 `InvalidOperation`，配额或持久化失败返回 `StorageError`。
+
+参考番茄钟使用 `pomodoro.duration-minutes` 保存 10、15、25、30 或 45 分钟。首次打开时默认为
+10 分钟；窗口重新打开、UiPilot 重启、插件升级或保留数据重装后恢复上次选择。运行或暂停期间修改
+选择只影响下一轮，当前轮继续使用 Start 时已冻结的 `durationMs`。写入失败时，页面应恢复上次已持久化的
+有效值；没有有效值时恢复 10 分钟。由于 `get()` / `set()` 是异步调用，完成时必须确认原窗口会话仍是
+当前会话；过期会话的迟到结果不得覆盖新窗口的选择或错误状态。
 
 ## 7. 添加插件图标
 
