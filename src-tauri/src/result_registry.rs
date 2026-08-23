@@ -709,7 +709,7 @@ mod tests {
             windows::path_auth::AuthenticatedPathIdentity, EverythingPathAction,
             FileExecutionAction, FilePathKind, FileResultItem, FileResultKind, FileSearchResponse,
         },
-        model::{ResultItem, SearchResponse},
+        model::{LauncherResultActivation, ResultItem, SearchResponse},
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -720,13 +720,13 @@ mod tests {
     fn item(result_id: &str, title: &str) -> ResultItem {
         ResultItem {
             result_id: result_id.to_owned(),
+            activation: LauncherResultActivation::ExecuteResult,
             title: title.to_owned(),
             subtitle: None,
             icon: None,
             plugin_icon_url: None,
             icon_kind: None,
             detail: None,
-            completion_text: None,
             has_default_action: true,
         }
     }

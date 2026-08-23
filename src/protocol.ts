@@ -2,8 +2,14 @@ import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
 
+export type LauncherResultActivation =
+  | { kind: 'completion'; completionText: string }
+  | { kind: 'openFind'; query: string }
+  | { kind: 'executeResult' }
+
 export interface ResultItem {
   resultId: string
+  activation: LauncherResultActivation
   title: string
   subtitle?: string
   icon?: string
@@ -11,7 +17,6 @@ export interface ResultItem {
   iconKind?: ResultIconKind
   detail?: string
   hasDefaultAction?: boolean
-  completionText?: string
 }
 export interface SearchResponse {
   requestId: string

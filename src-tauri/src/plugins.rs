@@ -21,7 +21,7 @@ use unicode_normalization::is_nfc;
 
 use crate::{
     atomic_file::replace_current,
-    model::{ResultItem, SearchResponse},
+    model::{LauncherResultActivation, ResultItem, SearchResponse},
     result_registry::{QueryDomain, QueryToken, ResultAction, ResultRegistry},
 };
 
@@ -1640,13 +1640,13 @@ impl PluginManager {
             items.push((
                 ResultItem {
                     result_id: String::new(),
+                    activation: LauncherResultActivation::ExecuteResult,
                     title: item.title,
                     subtitle: item.subtitle,
                     icon: None,
                     plugin_icon_url: None,
                     icon_kind: None,
                     detail: None,
-                    completion_text: None,
                     has_default_action: true,
                 },
                 action,
@@ -7498,13 +7498,13 @@ mod tests {
                     vec![(
                         ResultItem {
                             result_id: String::new(),
+                            activation: crate::model::LauncherResultActivation::ExecuteResult,
                             title: "late".into(),
                             subtitle: None,
                             icon: None,
                             plugin_icon_url: None,
                             icon_kind: None,
                             detail: None,
-                            completion_text: None,
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
@@ -7581,13 +7581,13 @@ mod tests {
                     vec![(
                         ResultItem {
                             result_id: String::new(),
+                            activation: crate::model::LauncherResultActivation::ExecuteResult,
                             title: "2".into(),
                             subtitle: None,
                             icon: None,
                             plugin_icon_url: None,
                             icon_kind: None,
                             detail: None,
-                            completion_text: None,
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {

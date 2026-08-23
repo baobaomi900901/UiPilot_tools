@@ -7,7 +7,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { theme } from 'antd'
 
-import { createLauncherCore } from './launcher-core'
+import { createLauncherCore, safeLauncherActivation } from './launcher-core'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherCoreSource from './launcher-core.ts?raw'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
@@ -259,6 +259,8 @@ function fakeClient() {
     unlisten,
   }
 }
+
+const executeActivation = { kind: 'executeResult' } as const
 
 function fileItem(
   fullPath = String.raw`C:\Private\UiPilot.txt`,
@@ -581,6 +583,106 @@ describe('startup ownership', () => {
 })
 
 describe('shown and search ownership', () => {
+  it('accepts only the closed launcher activation union and completion grammar', () => {
+    const boundary = `/d ${'a'.repeat(65_533)}`
+    const valid = [
+      { kind: 'completion', completionText: '/demo-win ' },
+      { kind: 'completion', completionText: '/demo-win da  value' },
+      { kind: 'completion', completionText: boundary },
+      { kind: 'openFind', query: ' da  value ' },
+      { kind: 'executeResult' },
+    ]
+    for (const activation of valid) expect(safeLauncherActivation(activation)).toEqual(activation)
+
+    const invalid = [
+      undefined,
+      { kind: 'unknown' },
+      { kind: 'executeResult', query: 'borrowed' },
+      { kind: 'openFind' },
+      { kind: 'openFind', query: 'query', completionText: '/demo-win ' },
+      { kind: 'completion' },
+      { kind: 'completion', completionText: '/demo-win' },
+      { kind: 'completion', completionText: '/demo-win  da' },
+      { kind: 'completion', completionText: '/demo-win da ' },
+      { kind: 'completion', completionText: `/demo-win ${'a'.repeat(65_527)}` },
+      { kind: 'completion', completionText: '/demo-win da\0value' },
+      { kind: 'completion', completionText: '/demo-win da\rvalue' },
+      { kind: 'completion', completionText: '/demo-win da\nvalue' },
+      { kind: 'completion', completionText: '/demo-win da\u2028value' },
+      { kind: 'completion', completionText: '/demo-win da\u2029value' },
+      { kind: 'completion', completionText: '/demo-win da\u0085value' },
+    ]
+    for (const activation of invalid) expect(safeLauncherActivation(activation)).toBeUndefined()
+  })
+
+  it('drops one malformed launcher activation while retaining valid sibling rows', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'activation-filtering',
+      items: [
+        { resultId: 'execute', title: 'Execute', activation: { kind: 'executeResult' } },
+        {
+          resultId: 'malformed',
+          title: 'Malformed',
+          activation: { kind: 'completion', completionText: '/demo win ' },
+        },
+        { resultId: 'find', title: 'Find', activation: { kind: 'openFind', query: 'probe' } },
+        {
+          resultId: 'completion',
+          title: 'Complete',
+          activation: { kind: 'completion', completionText: '/demo-win probe' },
+        },
+      ],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('activation-filtering'))
+
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'probe',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Execute', 'Find', 'Complete'])
+  })
+
+  it('routes a backend openFind activation through the dedicated find transaction', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'backend-find-activation',
+      items: [{
+        resultId: 'non-executable-find',
+        title: '/find',
+        activation: { kind: 'openFind', query: 'windows' },
+        hasDefaultAction: false,
+      }],
+      replaceLocalResults: true,
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('backend-find-activation'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'windows',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'backend-find-activation',
+      querySequence: 1,
+    }))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
   it('refreshes unread messages whenever native shown reopens the main window', async () => {
     const fake = fakeClient()
     const core = createLauncherCore(fake.client)
@@ -603,7 +705,7 @@ describe('shown and search ownership', () => {
         resultId: 'malformed',
         title: '/demo win',
         subtitle: 'invalid completion',
-        completionText: '/demo win ',
+        activation: { kind: 'completion', completionText: '/demo win ' },
         hasDefaultAction: false,
       }],
       replaceLocalResults: true,
@@ -631,7 +733,7 @@ describe('shown and search ownership', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
     vi.mocked(fake.client.searchApps).mockResolvedValue({
       requestId: 'local-navigation-search',
-      items: [{ resultId: 'calculator', title: 'Calculator' }],
+      items: [{ resultId: 'calculator', title: 'Calculator', activation: executeActivation }],
     })
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -748,7 +850,7 @@ describe('shown and search ownership', () => {
       searchPending: true,
       status: '',
     })
-    first.resolve({ requestId: 'old-request', items: [{ resultId: 'old', title: 'old' }] })
+    first.resolve({ requestId: 'old-request', items: [{ resultId: 'old', title: 'old', activation: executeActivation }] })
     await first.promise
     await Promise.resolve()
     expect(core.getSnapshot()).not.toBe(beforeSecond)
@@ -757,8 +859,8 @@ describe('shown and search ownership', () => {
     second.resolve({
       requestId: 'request',
       items: [
-        { resultId: 'one', title: 'One' },
-        { resultId: 'two', title: 'Two', subtitle: 'Second' },
+        { resultId: 'one', title: 'One', activation: executeActivation },
+        { resultId: 'two', title: 'Two', subtitle: 'Second', activation: executeActivation },
       ],
     })
     await second.promise
@@ -785,7 +887,7 @@ describe('shown and search ownership', () => {
 
     response.resolve({
       requestId: 'math-request',
-      items: [{ resultId: 'math-result', title: '2', subtitle: '复制结果', hasDefaultAction: true }],
+      items: [{ resultId: 'math-result', title: '2', subtitle: '复制结果', hasDefaultAction: true, activation: executeActivation }],
       replaceLocalResults: true,
     })
     await response.promise
@@ -807,16 +909,17 @@ describe('shown and search ownership', () => {
     response.resolve({
       requestId: 'icon-kinds',
       items: [
-        { resultId: 'calculator', title: '2', iconKind: 'calculator' },
-        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch' },
-        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==' },
+        { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
+        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==', activation: executeActivation },
         {
           resultId: 'plugin',
           title: '/demo-win',
+          activation: executeActivation,
           pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
         },
-        { resultId: 'forged-plugin', title: 'Forged', pluginIconUrl: 'https://example.com/icon.png' },
-        { resultId: 'unknown', title: 'Unknown', iconKind: 'unknown' },
+        { resultId: 'forged-plugin', title: 'Forged', pluginIconUrl: 'https://example.com/icon.png', activation: executeActivation },
+        { resultId: 'unknown', title: 'Unknown', iconKind: 'unknown', activation: executeActivation },
       ],
     } as unknown as SearchResponse)
     await response.promise
@@ -887,7 +990,7 @@ describe('shown and search ownership', () => {
       })
       submit.resolve({
         requestId: 'public-request',
-        items: [{ resultId: 'answer', title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false }],
+        items: [{ resultId: 'answer', title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false, activation: executeActivation }],
       })
       await submit.promise
       await Promise.resolve()
@@ -944,8 +1047,8 @@ describe('shown and search ownership', () => {
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'icons',
       items: [
-        { resultId: 'valid', title: 'Valid', icon: valid },
-        ...invalid.map((icon, index) => ({ resultId: `bad-${index}`, title: `Bad ${index}`, icon })),
+        { resultId: 'valid', title: 'Valid', icon: valid, activation: executeActivation },
+        ...invalid.map((icon, index) => ({ resultId: `bad-${index}`, title: `Bad ${index}`, icon, activation: executeActivation })),
       ],
     })
     emit(shown('icons'))
@@ -961,7 +1064,7 @@ describe('shown and search ownership', () => {
 describe('execute and hide ownership', () => {
   it('executes the private current mapping once and never asks the frontend to hide on success', async () => {
     const { core, client, emit } = await startedCore()
-    const search: SearchResponse = { requestId: 'private-request', items: [{ resultId: 'private-result', title: 'Calculator' }] }
+    const search: SearchResponse = { requestId: 'private-request', items: [{ resultId: 'private-result', title: 'Calculator', activation: executeActivation }] }
     vi.mocked(client.searchApps).mockResolvedValueOnce(search)
     const execute = deferred<ExecuteOutcome>()
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
@@ -986,8 +1089,8 @@ describe('execute and hide ownership', () => {
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'public-copy-request',
       items: [
-        { resultId: 'copy', title: 'Copy', hasDefaultAction: true },
-        { resultId: 'info', title: 'Info', hasDefaultAction: false },
+        { resultId: 'copy', title: 'Copy', hasDefaultAction: true, activation: executeActivation },
+        { resultId: 'info', title: 'Info', hasDefaultAction: false, activation: executeActivation },
       ],
     })
     emit(shown('public-copy'))
@@ -1008,7 +1111,7 @@ describe('execute and hide ownership', () => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'copy-request',
-      items: [{ resultId: 'copy-result', title: 'Copy' }],
+      items: [{ resultId: 'copy-result', title: 'Copy', activation: executeActivation }],
     })
     vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
     emit(shown('copy'))
@@ -1049,7 +1152,7 @@ describe('execute and hide ownership', () => {
     const hiding = core.requestHide()
     hide.reject({ code: 'windowFailed' })
     await hiding
-    search.resolve({ requestId: 'application-after-hide', items: [{ resultId: 'result', title: 'Calculator' }] })
+    search.resolve({ requestId: 'application-after-hide', items: [{ resultId: 'result', title: 'Calculator', activation: executeActivation }] })
     await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
   })
 })
@@ -1067,7 +1170,7 @@ describe('IME ownership', () => {
     core.text({ kind: 'compositionInput', control, value: '新', inputType: 'insertCompositionText' })
     core.text({ kind: 'compositionInput', control, value: 'old', inputType: 'insertCompositionText' })
     const returned = core.getSnapshot()
-    old.resolve({ requestId: 'retired', items: [{ resultId: 'retired', title: 'Retired' }] })
+    old.resolve({ requestId: 'retired', items: [{ resultId: 'retired', title: 'Retired', activation: executeActivation }] })
     await old.promise
     await Promise.resolve()
     expect(core.getSnapshot()).toBe(returned)
@@ -1089,8 +1192,8 @@ describe('IME ownership', () => {
     core.text({ kind: 'compositionBoundary', control })
     core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
     expect(client.searchApps).toHaveBeenCalledTimes(2)
-    old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old' }] })
-    current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New' }] })
+    old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old', activation: executeActivation }] })
+    current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New', activation: executeActivation }] })
     await Promise.all([old.promise, current.promise])
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find', 'New'])
@@ -2126,7 +2229,7 @@ describe('plugin settings ownership', () => {
 describe('execute and hide continuation', () => {
   it('coalesces a late activation-refused result into the next eligible launcher notice', async () => {
     const { core, client, emit } = await startedCore()
-    vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'request', items: [{ resultId: 'result', title: 'App' }] })
+    vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'request', items: [{ resultId: 'result', title: 'App', activation: executeActivation }] })
     const execute = deferred<ExecuteOutcome>()
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
     emit(shown('execute-old'))
@@ -2160,14 +2263,14 @@ describe('React view and accessibility', () => {
               resultId: 'demo-return-completion',
               title: '/demo-return',
               subtitle: '返回示例文本到主界面',
-              completionText: '/demo-return ',
+              activation: { kind: 'completion', completionText: '/demo-return ' },
               hasDefaultAction: false,
             },
             {
               resultId: 'demo-win-completion',
               title: '/demo-win',
               subtitle: '打开演示子窗口',
-              completionText: '/demo-win ',
+              activation: { kind: 'completion', completionText: '/demo-win ' },
               hasDefaultAction: false,
             },
           ],
@@ -2240,7 +2343,7 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
     vi.mocked(fake.client.searchApps).mockResolvedValue({
       requestId: 'view-navigation-search',
-      items: [{ resultId: 'calculator', title: 'Calculator' }],
+      items: [{ resultId: 'calculator', title: 'Calculator', activation: executeActivation }],
     })
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -2435,7 +2538,7 @@ describe('React view and accessibility', () => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'layout',
-      items: [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==' }],
+      items: [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation }],
     })
     const mounted = await mountLauncherView(core)
     mounted.host.id = 'app'
@@ -2553,15 +2656,16 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
       requestId: 'built-in-icons',
       items: [
-        { resultId: 'calculator', title: '2', iconKind: 'calculator' },
-        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch' },
+        { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         {
           resultId: 'plugin',
           title: '/demo-win',
+          activation: executeActivation,
           pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
         },
-        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,iVBORw==' },
-        { resultId: 'fallback', title: 'Fallback' },
+        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation },
+        { resultId: 'fallback', title: 'Fallback', activation: executeActivation },
       ],
     })
     const core = createLauncherCore(fake.client)
@@ -2603,14 +2707,14 @@ describe('React view and accessibility', () => {
       .mockResolvedValueOnce({
         requestId: 'first-icons',
         items: [
-          { resultId: 'with-icon', title: 'With icon', icon: firstIcon },
-          { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon },
-          { resultId: 'without-icon', title: 'Without icon' },
+          { resultId: 'with-icon', title: 'With icon', icon: firstIcon, activation: executeActivation },
+          { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon, activation: executeActivation },
+          { resultId: 'without-icon', title: 'Without icon', activation: executeActivation },
         ],
       })
       .mockResolvedValueOnce({
         requestId: 'second-icons',
-        items: [{ resultId: 'new-icon', title: 'New icon', icon: secondIcon }],
+        items: [{ resultId: 'new-icon', title: 'New icon', icon: secondIcon, activation: executeActivation }],
       })
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -2673,8 +2777,8 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
       requestId: 'private-request',
       items: [
-        { resultId: 'private-one', title: '<b>literal</b>' },
-        { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value' },
+        { resultId: 'private-one', title: '<b>literal</b>', activation: executeActivation },
+        { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value', activation: executeActivation },
       ],
     })
     const core = createLauncherCore(fake.client)
@@ -3772,7 +3876,7 @@ describe('launcher find forwarding ownership', () => {
 
     applications.resolve({
       requestId: 'application-request',
-      items: [{ resultId: 'windows-terminal', title: 'Windows Terminal' }],
+      items: [{ resultId: 'windows-terminal', title: 'Windows Terminal', activation: executeActivation }],
     })
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot().results.map(({ title }) => title)).toEqual(['/find', 'Windows Terminal'])

@@ -14,6 +14,7 @@ import {
   type FileSort,
   type FindClient,
   type LauncherClient,
+  type LauncherResultActivation,
   type LauncherSnapshot,
   type MessageCenterStateSnapshot,
   type PluginInventoryView,
@@ -72,7 +73,7 @@ export interface LauncherCore {
 interface PrivateApplicationResult extends ViewResult {
   kind: 'application'
   resultId: string
-  completionText?: string
+  activation: LauncherResultActivation
 }
 
 interface PrivateFindResult extends ViewResult {
@@ -251,7 +252,10 @@ export const FILE_CATEGORY_ORDER: readonly FileCategory[] = [
   'archive',
 ]
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
-const PLUGIN_COMPLETION = /^\/[a-z][a-z0-9-]{0,31} $/
+const LAUNCHER_COMMAND = /^[a-z][a-z0-9-]{0,31}$/
+const UNICODE_CONTROL = /[\p{Cc}\u2028\u2029\uD800-\uDFFF]/u
+const OUTER_UNICODE_WHITESPACE = /^(?:\p{White_Space})|(?:\p{White_Space})$/u
+const UTF8_ENCODER = new TextEncoder()
 
 function safeApplicationIcon(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length > MAX_ICON_LENGTH || !value.startsWith(ICON_PREFIX)) return undefined
@@ -263,8 +267,40 @@ function safeResultIconKind(value: unknown): ResultIconKind | undefined {
   return value === 'find' || value === 'calculator' || value === 'webSearch' ? value : undefined
 }
 
-function safeCompletionText(value: unknown): string | undefined {
-  return typeof value === 'string' && PLUGIN_COMPLETION.test(value) ? value : undefined
+function validLauncherCompletion(value: string): boolean {
+  if (UTF8_ENCODER.encode(value).byteLength > 65_536 || !value.startsWith('/')) return false
+  const separator = value.indexOf(' ')
+  if (separator < 2 || !LAUNCHER_COMMAND.test(value.slice(1, separator))) return false
+  const argument = value.slice(separator + 1)
+  return argument.length === 0 || (!OUTER_UNICODE_WHITESPACE.test(argument) && !UNICODE_CONTROL.test(argument))
+}
+
+function exactPlainRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Object.getPrototypeOf(value) !== Object.prototype) return undefined
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  const expected = [...expectedKeys].sort()
+  return keys.length === expected.length && keys.every((key, index) => key === expected[index]) ? record : undefined
+}
+
+export function safeLauncherActivation(value: unknown): LauncherResultActivation | undefined {
+  const candidate = typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : undefined
+  if (candidate?.kind === 'executeResult') {
+    return exactPlainRecord(value, ['kind']) ? { kind: 'executeResult' } : undefined
+  }
+  if (candidate?.kind === 'openFind') {
+    const record = exactPlainRecord(value, ['kind', 'query'])
+    return record && typeof record.query === 'string' ? { kind: 'openFind', query: record.query } : undefined
+  }
+  if (candidate?.kind === 'completion') {
+    const record = exactPlainRecord(value, ['completionText', 'kind'])
+    return record && typeof record.completionText === 'string' && validLauncherCompletion(record.completionText)
+      ? { kind: 'completion', completionText: record.completionText }
+      : undefined
+  }
+  return undefined
 }
 
 function safeCommandHint(value: unknown): string | undefined {
@@ -938,8 +974,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         ? undefined
         : model.results.find((item): item is PrivateFindResult => item.kind === 'find')
       const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
-        const completionText = safeCompletionText(item.completionText)
-        if (item.completionText !== undefined && completionText === undefined) return []
+        const activation = safeLauncherActivation(item.activation)
+        if (activation === undefined || typeof item.resultId !== 'string' ||
+            (activation.kind === 'executeResult' && item.resultId.length === 0)) return []
         const icon = safeApplicationIcon(item.icon)
         const pluginIconUrl = safePublicPluginIconUrl(item.pluginIconUrl)
         const iconKind = safeResultIconKind(item.iconKind)
@@ -947,6 +984,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           kind: 'application',
           key: resultKey++,
           resultId: item.resultId,
+          activation,
           title: item.title,
           ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
           ...(icon === undefined ? {} : { icon }),
@@ -954,7 +992,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           ...(iconKind === undefined ? {} : { iconKind }),
           ...(item.detail === undefined ? {} : { detail: item.detail }),
           ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
-          ...(completionText === undefined ? {} : { completionText }),
         }]
       })
       model.results = findResult ? [findResult, ...applications] : applications
@@ -1577,8 +1614,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         submitFind(selected.query)
         return
       }
-      if (selected.completionText !== undefined) {
-        applyEdit(selected.completionText)
+      if (selected.activation.kind === 'completion') {
+        applyEdit(selected.activation.completionText)
+        return
+      }
+      if (selected.activation.kind === 'openFind') {
+        submitFind(selected.activation.query)
         return
       }
       if (selected.hasDefaultAction === false) return

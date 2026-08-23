@@ -30,7 +30,7 @@ use crate::{
     message_center::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
-    model::{ResultIconKind, SearchResponse},
+    model::{LauncherResultActivation, ResultIconKind, SearchResponse},
     plugin_window::{
         self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
         PluginWindowPinState, PluginWindowUpdate,
@@ -1740,23 +1740,24 @@ fn publish_public_command_suggestions(
     let token = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)?;
     let entries = suggestions
         .into_iter()
-        .map(|suggestion| {
+        .filter_map(|suggestion| {
             let title = format!("/{}", suggestion.effective_name);
             let completion_text = format!("{title} ");
-            (
+            let activation = LauncherResultActivation::completion(completion_text)?;
+            Some((
                 crate::model::ResultItem {
                     result_id: String::new(),
+                    activation,
                     title,
                     subtitle: Some(suggestion.summary.unwrap_or(suggestion.display_name)),
                     icon: None,
                     plugin_icon_url: suggestion.icon_url,
                     icon_kind: None,
                     detail: None,
-                    completion_text: Some(completion_text),
                     has_default_action: false,
                 },
                 None::<ResultAction>,
-            )
+            ))
         })
         .collect();
     registry.publish_if_latest(token, entries, || true, search_response)
@@ -1779,13 +1780,13 @@ fn publish_public_main_results(
             (
                 crate::model::ResultItem {
                     result_id: String::new(),
+                    activation: LauncherResultActivation::ExecuteResult,
                     title: result.title,
                     subtitle: result.subtitle,
                     icon: None,
                     plugin_icon_url: route.icon_url.clone(),
                     icon_kind: None,
                     detail: result.detail,
-                    completion_text: None,
                     has_default_action: action.is_some(),
                 },
                 action,
@@ -1852,13 +1853,13 @@ where
             registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
         let item = crate::model::ResultItem {
             result_id: String::new(),
+            activation: LauncherResultActivation::ExecuteResult,
             title: result.clone(),
             subtitle: Some("复制结果".into()),
             icon: None,
             plugin_icon_url: None,
             icon_kind: Some(ResultIconKind::Calculator),
             detail: None,
-            completion_text: None,
             has_default_action: true,
         };
         return registry.publish_if_latest(
@@ -1888,13 +1889,13 @@ where
         entries.push((
             crate::model::ResultItem {
                 result_id: String::new(),
+                activation: LauncherResultActivation::ExecuteResult,
                 title: crate::web_search::search_result_title(web_search_engine).into(),
                 subtitle: Some(format!("搜索：{query}")),
                 icon: None,
                 plugin_icon_url: None,
                 icon_kind: Some(ResultIconKind::WebSearch),
                 detail: None,
-                completion_text: None,
                 has_default_action: true,
             },
             ResultAction::OpenWebSearch {
@@ -2945,7 +2946,12 @@ mod tests {
                 .map(|item| (
                     item.title.as_str(),
                     item.subtitle.as_deref(),
-                    item.completion_text.as_deref(),
+                    match &item.activation {
+                        crate::model::LauncherResultActivation::Completion { completion_text } => {
+                            Some(completion_text.as_str())
+                        }
+                        _ => None,
+                    },
                     item.has_default_action,
                 ))
                 .collect::<Vec<_>>(),
