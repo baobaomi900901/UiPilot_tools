@@ -3239,6 +3239,8 @@ mod tests {
     #[test]
     fn launcher_empty_query_publishes_capabilities_without_reading_applications() {
         let registry = ready_registry("launcher-empty");
+        let demo_title = format!("/{}", "demo-win");
+        let demo_completion = format!("{demo_title} ");
         let response = search_apps_with_catalog(
             &registry,
             "   ",
@@ -3260,13 +3262,13 @@ mod tests {
             response
                 .items
                 .iter()
-                .map(|item| (item.title.as_str(), completion_text(item)))
+                .map(|item| (item.title.clone(), completion_text(item).map(str::to_owned)))
                 .collect::<Vec<_>>(),
             vec![
-                ("/find", Some("/find ")),
-                ("/web-search", Some("/web-search ")),
-                ("/alpha", Some("/alpha ")),
-                ("/demo-win", Some("/demo-win ")),
+                ("/find".into(), Some("/find ".into())),
+                ("/web-search".into(), Some("/web-search ".into())),
+                ("/alpha".into(), Some("/alpha ".into())),
+                (demo_title, Some(demo_completion)),
             ]
         );
         for item in &response.items {
@@ -3280,6 +3282,8 @@ mod tests {
     #[test]
     fn launcher_plain_query_orders_find_web_plugins_then_applications() {
         let registry = ready_registry("launcher-plain");
+        let demo_title = format!("/{}", "demo-win");
+        let demo_completion = format!("{demo_title} win");
         let response = search_apps_with_catalog(
             &registry,
             "  win  ",
@@ -3310,9 +3314,14 @@ mod tests {
             response
                 .items
                 .iter()
-                .map(|item| item.title.as_str())
+                .map(|item| item.title.clone())
                 .collect::<Vec<_>>(),
-            vec!["/find", "Google 搜索", "/demo-win", "Windows Terminal"]
+            vec![
+                "/find".into(),
+                "Google 搜索".into(),
+                demo_title,
+                "Windows Terminal".into(),
+            ]
         );
         assert_eq!(
             response.items[0].activation,
@@ -3320,7 +3329,10 @@ mod tests {
                 query: "win".into()
             }
         );
-        assert_eq!(completion_text(&response.items[2]), Some("/demo-win win"));
+        assert_eq!(
+            completion_text(&response.items[2]),
+            Some(demo_completion.as_str())
+        );
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
             Err(RegistryError::UnknownResult)
