@@ -122,6 +122,10 @@ export function uiThemeConfig(scheme: UiColorScheme): ThemeConfig {
         activeOutlineColor: 'transparent',
         optionSelectedBg: tokens.accent,
       },
+      Switch: {
+        colorPrimary: '#16a34a',
+        colorPrimaryHover: '#15803d',
+      },
       Tabs: {
         itemColor: tokens.mutedForeground,
         itemHoverColor: tokens.foreground,

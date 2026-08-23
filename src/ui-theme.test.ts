@@ -88,6 +88,14 @@ describe('shared UiPilot visual theme', () => {
       colorPrimary: uiSemanticTokens.dark.primary,
       colorBorder: uiSemanticTokens.dark.border,
     })
+    expect(light.components?.Switch).toMatchObject({
+      colorPrimary: '#16a34a',
+      colorPrimaryHover: '#15803d',
+    })
+    expect(dark.components?.Switch).toMatchObject({
+      colorPrimary: '#16a34a',
+      colorPrimaryHover: '#15803d',
+    })
     expect(light.algorithm).not.toBe(dark.algorithm)
   })
 

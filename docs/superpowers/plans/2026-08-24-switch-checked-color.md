@@ -22,9 +22,9 @@
 
 **Dependencies:** Design sections `Goal`, `Design`, and `Verification`.
 
-- [ ] Extend the focused Ant theme test to require `components.Switch.colorPrimary === '#16a34a'` and `colorPrimaryHover === '#15803d'` for both schemes, while retaining the existing global-primary assertions.
-- [ ] Add only the component-scoped `Switch` tokens to `uiThemeConfig`.
-- [ ] Confirm existing theme projections and dependencies remain unchanged.
+- [x] Extend the focused Ant theme test to require `components.Switch.colorPrimary === '#16a34a'` and `colorPrimaryHover === '#15803d'` for both schemes, while retaining the existing global-primary assertions.
+- [x] Add only the component-scoped `Switch` tokens to `uiThemeConfig`.
+- [x] Confirm existing theme projections and dependencies remain unchanged.
 
 **Distinct test coverage:** Light and dark configurations expose the same green checked/hover tokens, while their global `token.colorPrimary` remains the existing semantic primary.
 
@@ -32,6 +32,6 @@
 
 ## Final Checklist
 
-- [ ] Focused theme test passes.
-- [ ] Production frontend build passes.
-- [ ] No unrelated worktree changes are staged or committed.
+- [x] Focused theme test passes.
+- [x] Production frontend build passes.
+- [x] No unrelated worktree changes are staged or committed.
