@@ -18,6 +18,7 @@ fn main() {
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
             "set_plugin_enabled",
+            "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",

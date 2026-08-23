@@ -379,6 +379,7 @@ pub fn run() {
             commands::commit_public_plugin_install,
             commands::cancel_public_plugin_install,
             commands::set_plugin_enabled,
+            commands::set_plugin_favorite,
             commands::set_plugin_effective_name,
             commands::save_plugin_settings,
             commands::uninstall_plugin,
@@ -631,7 +632,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 50);
+        assert_eq!(production.matches("commands::").count(), 51);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -646,6 +647,7 @@ mod tests {
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
             "set_plugin_enabled",
+            "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
@@ -752,6 +754,7 @@ mod tests {
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
             "set_plugin_enabled",
+            "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",

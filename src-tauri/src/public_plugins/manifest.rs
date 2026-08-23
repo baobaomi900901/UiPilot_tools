@@ -366,7 +366,7 @@ pub(super) fn parse_canonical_version(value: &str) -> Option<[u32; 3]> {
     parts.next().is_none().then_some(values)
 }
 
-pub(super) fn valid_plugin_id(value: &str) -> bool {
+pub(crate) fn valid_plugin_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .bytes()

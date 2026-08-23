@@ -489,6 +489,20 @@ pub(crate) struct SavePublicPluginSettingsInput {
     secrets: BTreeMap<String, Option<String>>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum CompletionOriginPhase {
+    Preview,
+    Commit,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CompletionOriginInput {
+    phase: CompletionOriginPhase,
+    plugin_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginCommandCompletionResult {
@@ -1062,6 +1076,18 @@ pub(crate) async fn set_plugin_enabled(
 }
 
 #[tauri::command]
+pub(crate) fn set_plugin_favorite(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    plugin_id: String,
+    favorite: bool,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    service.manager()?.set_favorite(&plugin_id, favorite)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) fn set_plugin_effective_name(
     window: WebviewWindow,
     app: AppHandle,
@@ -1496,6 +1522,7 @@ pub(crate) async fn search_apps(
     invocation_id: String,
     query_sequence: u64,
     submit: Option<bool>,
+    completion_origin: Option<CompletionOriginInput>,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
     let submit = submit.unwrap_or(false);
@@ -1507,7 +1534,9 @@ pub(crate) async fn search_apps(
     let public = app.state::<Arc<PublicPluginService>>();
     let normalized_query = query.trim().to_owned();
     let web_search_engine = settings.snapshot().web_search_engine;
-    if !normalized_query.starts_with('/') || normalized_query == "/" {
+    if completion_origin.is_none()
+        && (!normalized_query.starts_with('/') || normalized_query == "/")
+    {
         return Ok(search_apps_with_catalog(
             registry,
             &normalized_query,
@@ -1519,10 +1548,11 @@ pub(crate) async fn search_apps(
             web_search_engine,
         ));
     }
-    if normalized_query == "/find"
-        || normalized_query.starts_with("/find ")
-        || normalized_query == "/web-search"
-        || normalized_query.starts_with("/web-search ")
+    if completion_origin.is_none()
+        && (normalized_query == "/find"
+            || normalized_query.starts_with("/find ")
+            || normalized_query == "/web-search"
+            || normalized_query.starts_with("/web-search "))
     {
         return Ok(search_apps_with_catalog(
             registry,
@@ -1535,16 +1565,23 @@ pub(crate) async fn search_apps(
             web_search_engine,
         ));
     }
-    if let Some(prefix) = plugin_discovery_prefix(&normalized_query) {
-        return Ok(publish_public_command_suggestions(
-            registry,
-            &invocation_id,
-            query_sequence,
-            public.manager()?.command_suggestions(prefix)?,
-        ));
+    if completion_origin.is_none() {
+        if let Some(prefix) = plugin_discovery_prefix(&normalized_query) {
+            return Ok(publish_public_command_suggestions(
+                registry,
+                &invocation_id,
+                query_sequence,
+                public.manager()?.command_suggestions(prefix)?,
+            ));
+        }
     }
-    if let Some(route) = public.manager()?.route(&normalized_query)? {
-        match public_plugin_search_decision(&route, submit) {
+    let route_query = completion_origin
+        .as_ref()
+        .map_or(normalized_query.as_str(), |_| query.as_str());
+    if let Some(route) = public.manager()?.route(route_query)? {
+        match public_plugin_search_decision(&route, submit, completion_origin.as_ref())
+            .map_err(|_| CommandError::plugin_query_failed())?
+        {
             PublicPluginSearchDecision::Ignore => return Ok(None),
             PublicPluginSearchDecision::Hint(hint) => {
                 return Ok(public_plugin_prompt(
@@ -1650,6 +1687,9 @@ pub(crate) async fn search_apps(
             }
         };
     }
+    if completion_origin.is_some() {
+        return Err(CommandError::plugin_query_failed());
+    }
     let plugins = app.state::<Arc<PluginManager>>();
     match plugins.begin_routed_query(&normalized_query, registry, &invocation_id, query_sequence) {
         PluginQueryStart::Started { route, token } => {
@@ -1689,16 +1729,34 @@ enum PublicPluginSearchDecision {
 fn public_plugin_search_decision(
     route: &crate::public_plugins::PublicPluginRoute,
     submit: bool,
-) -> PublicPluginSearchDecision {
+    completion_origin: Option<&CompletionOriginInput>,
+) -> Result<PublicPluginSearchDecision, ()> {
+    if let Some(origin) = completion_origin {
+        if !crate::public_plugins::valid_plugin_id(&origin.plugin_id)
+            || origin.plugin_id != route.plugin_id
+            || matches!(origin.phase, CompletionOriginPhase::Preview) == submit
+        {
+            return Err(());
+        }
+    }
     if route.input_required && route.input.is_empty() {
-        return PublicPluginSearchDecision::Hint(
+        return Ok(PublicPluginSearchDecision::Hint(
             route
                 .input_placeholder
                 .clone()
                 .unwrap_or_else(|| "请输入内容".into()),
-        );
+        ));
     }
-    match (route.activation_mode, submit) {
+    if let Some(origin) = completion_origin {
+        return Ok(match origin.phase {
+            CompletionOriginPhase::Preview => route.input_placeholder.clone().map_or(
+                PublicPluginSearchDecision::Ignore,
+                PublicPluginSearchDecision::Hint,
+            ),
+            CompletionOriginPhase::Commit => PublicPluginSearchDecision::Dispatch,
+        });
+    }
+    Ok(match (route.activation_mode, submit) {
         (PublicActivationMode::Submit, true) | (PublicActivationMode::Live, false) => {
             PublicPluginSearchDecision::Dispatch
         }
@@ -1707,7 +1765,7 @@ fn public_plugin_search_decision(
             PublicPluginSearchDecision::Hint,
         ),
         (PublicActivationMode::Live, true) => PublicPluginSearchDecision::Ignore,
-    }
+    })
 }
 
 pub(crate) fn invocation_theme(
@@ -1770,25 +1828,7 @@ fn publish_public_command_suggestions(
     let token = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)?;
     let entries = suggestions
         .into_iter()
-        .filter_map(|suggestion| {
-            let title = format!("/{}", suggestion.effective_name);
-            let completion_text = format!("{title} ");
-            let activation = LauncherResultActivation::completion(completion_text)?;
-            Some((
-                crate::model::ResultItem {
-                    result_id: String::new(),
-                    activation,
-                    title,
-                    subtitle: Some(suggestion.summary.unwrap_or(suggestion.display_name)),
-                    icon: None,
-                    plugin_icon_url: suggestion.icon_url,
-                    icon_kind: None,
-                    detail: None,
-                    has_default_action: false,
-                },
-                None::<ResultAction>,
-            ))
-        })
+        .filter_map(|suggestion| public_plugin_completion_result(suggestion, None))
         .collect();
     registry.publish_if_latest(token, entries, || true, search_response)
 }
@@ -1916,6 +1956,33 @@ fn completion_result(
     ))
 }
 
+fn public_plugin_completion_result(
+    suggestion: crate::public_plugins::PublicCommandSuggestion,
+    argument: Option<&str>,
+) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
+    let title = format!("/{}", suggestion.effective_name);
+    let completion_text =
+        argument.map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
+    Some((
+        crate::model::ResultItem {
+            result_id: String::new(),
+            activation: LauncherResultActivation::plugin_completion(
+                completion_text,
+                suggestion.plugin_id,
+                suggestion.favorite,
+            )?,
+            title,
+            subtitle: Some(suggestion.summary.unwrap_or(suggestion.display_name)),
+            icon: None,
+            plugin_icon_url: suggestion.icon_url,
+            icon_kind: None,
+            detail: None,
+            has_default_action: false,
+        },
+        None,
+    ))
+}
+
 fn search_apps_with_catalog<S, D, P>(
     registry: &ResultRegistry,
     query: &str,
@@ -2005,7 +2072,13 @@ where
         replace_local_results = true;
     } else {
         let mut suggestions = plugin_catalog(catalog_query).unwrap_or_default();
-        suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        suggestions.sort_by(|left, right| {
+            right
+                .favorite
+                .cmp(&left.favorite)
+                .then_with(|| left.effective_name.cmp(&right.effective_name))
+                .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+        });
         if catalog_query.is_empty() {
             entries.extend(completion_result(
                 "find",
@@ -2057,17 +2130,9 @@ where
             ));
         }
         for suggestion in suggestions {
-            let exact_name = catalog_query.eq_ignore_ascii_case(&suggestion.effective_name)
-                || catalog_query
-                    .strip_prefix('/')
-                    .is_some_and(|value| value.eq_ignore_ascii_case(&suggestion.effective_name));
-            entries.extend(completion_result(
-                &suggestion.effective_name,
-                suggestion.summary.unwrap_or(suggestion.display_name),
-                None,
-                suggestion.icon_url,
-                (!catalog_query.is_empty() && !exact_name).then_some(catalog_query),
-            ));
+            let argument =
+                (!catalog_query.is_empty() && suggestion.favorite).then_some(catalog_query);
+            entries.extend(public_plugin_completion_result(suggestion, argument));
         }
         if !catalog_query.is_empty() {
             let mut applications = snapshot();
@@ -3006,8 +3071,9 @@ mod tests {
         resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_apps_with_catalog, search_files_with,
         select_public_plugin_source_with, set_file_preview_preference_with, CommandError,
-        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HotkeySettingsUpdate,
-        PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate, UserSettingsUpdate,
+        CompletionOriginInput, CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate,
+        FindReadyOutcome, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
+        ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -3094,6 +3160,7 @@ mod tests {
             1,
             vec![
                 PublicCommandSuggestion {
+                    plugin_id: "com.example.alpha-return".into(),
                     effective_name: "alpha-return".into(),
                     display_name: "Public Plugin Alpha Return".into(),
                     summary: Some("返回示例文本到主界面".into()),
@@ -3101,12 +3168,15 @@ mod tests {
                         "uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.alpha/1/icon.png"
                             .into(),
                     ),
+                    favorite: false,
                 },
                 PublicCommandSuggestion {
+                    plugin_id: "com.example.alpha-window".into(),
                     effective_name: "alpha-window".into(),
                     display_name: "Public Plugin Alpha Window".into(),
                     summary: None,
                     icon_url: None,
+                    favorite: false,
                 },
             ],
         )
@@ -3119,9 +3189,10 @@ mod tests {
                     item.title.as_str(),
                     item.subtitle.as_deref(),
                     match &item.activation {
-                        crate::model::LauncherResultActivation::Completion { completion_text } => {
-                            Some(completion_text.as_str())
-                        }
+                        crate::model::LauncherResultActivation::PluginCompletion {
+                            completion_text,
+                            ..
+                        } => Some(completion_text.as_str()),
                         _ => None,
                     },
                     item.has_default_action,
@@ -3184,55 +3255,122 @@ mod tests {
             icon_url: None,
         };
         assert_eq!(
-            public_plugin_search_decision(&route, false),
-            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+            public_plugin_search_decision(&route, false, None),
+            Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
         );
         assert_eq!(
-            public_plugin_search_decision(&route, true),
-            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+            public_plugin_search_decision(&route, true, None),
+            Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
         );
 
         route.input = "body".into();
         assert_eq!(
-            public_plugin_search_decision(&route, false),
-            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+            public_plugin_search_decision(&route, false, None),
+            Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
         );
         assert_eq!(
-            public_plugin_search_decision(&route, true),
-            PublicPluginSearchDecision::Dispatch
+            public_plugin_search_decision(&route, true, None),
+            Ok(PublicPluginSearchDecision::Dispatch)
         );
 
         route.activation_mode = PublicActivationMode::Live;
         route.input.clear();
         assert_eq!(
-            public_plugin_search_decision(&route, false),
-            PublicPluginSearchDecision::Hint("请输入信息回车".into())
+            public_plugin_search_decision(&route, false, None),
+            Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
         );
         route.input = "body".into();
         assert_eq!(
-            public_plugin_search_decision(&route, false),
-            PublicPluginSearchDecision::Dispatch
+            public_plugin_search_decision(&route, false, None),
+            Ok(PublicPluginSearchDecision::Dispatch)
         );
         assert_eq!(
-            public_plugin_search_decision(&route, true),
-            PublicPluginSearchDecision::Ignore
+            public_plugin_search_decision(&route, true, None),
+            Ok(PublicPluginSearchDecision::Ignore)
+        );
+    }
+
+    #[test]
+    fn favorite_completion_origin_preview_commit_and_rejection_matrix() {
+        let mut route = PublicPluginRoute {
+            plugin_id: "com.example.demo".into(),
+            generation: 1,
+            activation_id: 1,
+            admission_epoch: 1,
+            runtime_recovery_needed: false,
+            runtime_label: "plugin-runtime-com.example.demo-g1".into(),
+            activation_mode: PublicActivationMode::Live,
+            output_mode: PublicOutputMode::MainResult,
+            input: "body".into(),
+            input_required: false,
+            input_placeholder: Some("请输入信息回车".into()),
+            window_entry: None,
+            icon_url: None,
+        };
+        let preview = CompletionOriginInput {
+            phase: CompletionOriginPhase::Preview,
+            plugin_id: route.plugin_id.clone(),
+        };
+        let commit = CompletionOriginInput {
+            phase: CompletionOriginPhase::Commit,
+            plugin_id: route.plugin_id.clone(),
+        };
+
+        assert_eq!(
+            public_plugin_search_decision(&route, false, Some(&preview)),
+            Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
+        );
+        assert_eq!(
+            public_plugin_search_decision(&route, true, Some(&commit)),
+            Ok(PublicPluginSearchDecision::Dispatch)
+        );
+        route.activation_mode = PublicActivationMode::Submit;
+        assert_eq!(
+            public_plugin_search_decision(&route, true, Some(&commit)),
+            Ok(PublicPluginSearchDecision::Dispatch)
+        );
+
+        for (submit, origin) in [(true, &preview), (false, &commit)] {
+            assert_eq!(
+                public_plugin_search_decision(&route, submit, Some(origin)),
+                Err(())
+            );
+        }
+        let mismatch = CompletionOriginInput {
+            phase: CompletionOriginPhase::Commit,
+            plugin_id: "com.example.other".into(),
+        };
+        assert_eq!(
+            public_plugin_search_decision(&route, true, Some(&mismatch)),
+            Err(())
+        );
+        assert!(
+            serde_json::from_value::<CompletionOriginInput>(serde_json::json!({
+                "phase": "preview",
+                "pluginId": "com.example.demo",
+                "extra": true
+            }))
+            .is_err()
         );
     }
 
     fn command_suggestion(name: &str) -> PublicCommandSuggestion {
         PublicCommandSuggestion {
+            plugin_id: format!("com.example.{name}"),
             effective_name: name.into(),
             display_name: format!("Plugin {name}"),
             summary: Some(format!("Use {name}")),
             icon_url: None,
+            favorite: false,
         }
     }
 
     fn completion_text(item: &crate::model::ResultItem) -> Option<&str> {
         match &item.activation {
-            crate::model::LauncherResultActivation::Completion { completion_text } => {
-                Some(completion_text)
-            }
+            crate::model::LauncherResultActivation::Completion { completion_text }
+            | crate::model::LauncherResultActivation::PluginCompletion {
+                completion_text, ..
+            } => Some(completion_text),
             _ => None,
         }
     }
@@ -3312,7 +3450,7 @@ mod tests {
     fn launcher_plain_query_orders_find_web_plugins_then_applications() {
         let registry = ready_registry("launcher-plain");
         let demo_title = format!("/{}", "demo-win");
-        let demo_completion = format!("{demo_title} win");
+        let demo_completion = format!("{demo_title} ");
         let response = search_apps_with_catalog(
             &registry,
             "  win  ",
@@ -3320,7 +3458,9 @@ mod tests {
             1,
             |query| {
                 assert_eq!(query, "win");
-                Ok(vec![command_suggestion("demo-win")])
+                let mut favorite = command_suggestion("alpha");
+                favorite.favorite = true;
+                Ok(vec![command_suggestion("demo-win"), favorite])
             },
             || {
                 vec![Application {
@@ -3348,6 +3488,7 @@ mod tests {
             vec![
                 "/find".into(),
                 "Google 搜索".into(),
+                "/alpha".into(),
                 demo_title,
                 "Windows Terminal".into(),
             ]
@@ -3358,10 +3499,27 @@ mod tests {
                 query: "win".into()
             }
         );
+        assert_eq!(completion_text(&response.items[2]), Some("/alpha win"));
         assert_eq!(
-            completion_text(&response.items[2]),
+            completion_text(&response.items[3]),
             Some(demo_completion.as_str())
         );
+        assert!(matches!(
+            &response.items[2].activation,
+            crate::model::LauncherResultActivation::PluginCompletion {
+                plugin_id,
+                favorite: true,
+                ..
+            } if plugin_id == "com.example.alpha"
+        ));
+        assert!(matches!(
+            &response.items[3].activation,
+            crate::model::LauncherResultActivation::PluginCompletion {
+                plugin_id,
+                favorite: false,
+                ..
+            } if plugin_id == "com.example.demo-win"
+        ));
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
             Err(RegistryError::UnknownResult)
@@ -3582,6 +3740,7 @@ mod tests {
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
             "set_plugin_enabled",
+            "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
@@ -3634,6 +3793,7 @@ mod tests {
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
             "set_plugin_enabled",
+            "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",

@@ -15,6 +15,13 @@ pub(crate) enum LauncherResultActivation {
         #[serde(rename = "completionText")]
         completion_text: String,
     },
+    PluginCompletion {
+        #[serde(rename = "completionText")]
+        completion_text: String,
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        favorite: bool,
+    },
     OpenFind {
         query: String,
     },
@@ -24,6 +31,20 @@ pub(crate) enum LauncherResultActivation {
 impl LauncherResultActivation {
     pub(crate) fn completion(completion_text: String) -> Option<Self> {
         valid_launcher_completion(&completion_text).then_some(Self::Completion { completion_text })
+    }
+
+    pub(crate) fn plugin_completion(
+        completion_text: String,
+        plugin_id: String,
+        favorite: bool,
+    ) -> Option<Self> {
+        (valid_launcher_completion(&completion_text)
+            && crate::public_plugins::valid_plugin_id(&plugin_id))
+        .then_some(Self::PluginCompletion {
+            completion_text,
+            plugin_id,
+            favorite,
+        })
     }
 }
 
@@ -89,7 +110,7 @@ pub(crate) struct ResultItem {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_launcher_completion;
+    use super::{valid_launcher_completion, LauncherResultActivation};
 
     #[test]
     fn launcher_completion_accepts_only_the_frozen_single_line_grammar() {
@@ -121,5 +142,36 @@ mod tests {
                 "unexpected result for {completion:?}"
             );
         }
+    }
+
+    #[test]
+    fn favorite_plugin_completion_serializes_identity_and_rejects_invalid_ownership() {
+        let activation = LauncherResultActivation::plugin_completion(
+            "/demo-win value".into(),
+            "com.uipilot.demo-win".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(activation).unwrap(),
+            serde_json::json!({
+                "kind": "pluginCompletion",
+                "completionText": "/demo-win value",
+                "pluginId": "com.uipilot.demo-win",
+                "favorite": true
+            })
+        );
+        assert!(LauncherResultActivation::plugin_completion(
+            "/demo-win\nvalue".into(),
+            "com.uipilot.demo-win".into(),
+            false,
+        )
+        .is_none());
+        assert!(LauncherResultActivation::plugin_completion(
+            "/demo-win value".into(),
+            "Invalid Plugin".into(),
+            false,
+        )
+        .is_none());
     }
 }

@@ -148,10 +148,12 @@ pub(crate) struct PublicPluginRoute {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicCommandSuggestion {
+    pub(crate) plugin_id: String,
     pub(crate) effective_name: String,
     pub(crate) display_name: String,
     pub(crate) summary: Option<String>,
     pub(crate) icon_url: Option<String>,
+    pub(crate) favorite: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1741,6 +1743,7 @@ impl PublicPluginManager {
                 || !config.enabled
                 || config.fault.is_some()
                 || config.active_generation != snapshot.generation
+                || bundle.runtime_recovery_needed
                 || (!config.effective_name.starts_with(prefix)
                     && !snapshot
                         .manifest
@@ -1751,13 +1754,19 @@ impl PublicPluginManager {
                 continue;
             }
             suggestions.push(PublicCommandSuggestion {
+                plugin_id: config.plugin_id.clone(),
                 effective_name: config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
+                favorite: config.favorite,
             });
         }
-        suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        suggestions.sort_by(|left, right| {
+            left.effective_name
+                .cmp(&right.effective_name)
+                .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+        });
         Ok(suggestions)
     }
 
@@ -1775,18 +1784,27 @@ impl PublicPluginManager {
                 || config.fault.is_some()
                 || config.active_generation != snapshot.generation
                 || bundle.runtime_recovery_needed
-                || !config.effective_name.to_lowercase().contains(&folded_query)
+                || (!config.favorite
+                    && !config.effective_name.to_lowercase().contains(&folded_query))
             {
                 continue;
             }
             suggestions.push(PublicCommandSuggestion {
+                plugin_id: config.plugin_id.clone(),
                 effective_name: config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
+                favorite: config.favorite,
             });
         }
-        suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        suggestions.sort_by(|left, right| {
+            right
+                .favorite
+                .cmp(&left.favorite)
+                .then_with(|| left.effective_name.cmp(&right.effective_name))
+                .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+        });
         Ok(suggestions)
     }
     pub(crate) fn runtime_candidates(
@@ -4265,16 +4283,20 @@ mod tests {
             manager.command_suggestions("d").unwrap(),
             vec![
                 PublicCommandSuggestion {
+                    plugin_id: "com.example.demo-return".into(),
                     effective_name: "demo-return".into(),
                     display_name: "Public Plugin Demo Return".into(),
                     summary: Some("返回示例文本到主界面".into()),
                     icon_url: None,
+                    favorite: false,
                 },
                 PublicCommandSuggestion {
+                    plugin_id: "com.example.demo-win".into(),
                     effective_name: "demo-win".into(),
                     display_name: "Public Plugin Demo Window".into(),
                     summary: Some("打开演示子窗口".into()),
                     icon_url: None,
+                    favorite: false,
                 },
             ]
         );
@@ -4289,10 +4311,12 @@ mod tests {
         assert_eq!(
             manager.launcher_command_suggestions("WIN").unwrap(),
             vec![PublicCommandSuggestion {
+                plugin_id: "com.example.demo-win".into(),
                 effective_name: "demo-win".into(),
                 display_name: "Public Plugin Demo Window".into(),
                 summary: Some("打开演示子窗口".into()),
                 icon_url: None,
+                favorite: false,
             }]
         );
         assert!(manager
@@ -4407,6 +4431,60 @@ mod tests {
             .unwrap();
         assert_eq!(same.inventory_revision, mutation.inventory_revision);
         assert!(Arc::ptr_eq(&after_noop, &favorited));
+    }
+
+    #[test]
+    fn favorite_launcher_catalog_groups_deduplicates_and_excludes_recovery_pending() {
+        let dir = TestDir::new("favorite-catalog");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let alpha = dir.path().join("source-alpha");
+        let demo = dir.path().join("source-demo");
+        write_discovery_package(
+            &alpha,
+            "com.example.alpha",
+            "Alpha Plugin",
+            "alpha",
+            "Alpha summary",
+        );
+        write_discovery_package(
+            &demo,
+            "com.example.demo",
+            "Demo Plugin",
+            "demo",
+            "Demo summary",
+        );
+        install_discovery_package(&manager, &alpha, now);
+        install_discovery_package(&manager, &demo, now);
+        manager.set_favorite("com.example.demo", true).unwrap();
+
+        let unrelated = manager.launcher_command_suggestions("zzz").unwrap();
+        assert_eq!(unrelated.len(), 1);
+        assert_eq!(unrelated[0].plugin_id, "com.example.demo");
+        assert!(unrelated[0].favorite);
+
+        let matching = manager.launcher_command_suggestions("a").unwrap();
+        assert_eq!(
+            matching
+                .iter()
+                .map(|suggestion| suggestion.effective_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["demo", "alpha"]
+        );
+        assert_eq!(matching.iter().filter(|item| item.favorite).count(), 1);
+
+        let bundle = manager.bundles.bundle("com.example.demo").unwrap().unwrap();
+        let reservation = manager.bundles.reserve("com.example.demo").unwrap();
+        reservation.begin_committing().unwrap();
+        reservation.mark_durable().unwrap();
+        reservation
+            .publish(Some(bundle.with_runtime_recovery(true)))
+            .unwrap();
+        assert!(manager
+            .launcher_command_suggestions("zzz")
+            .unwrap()
+            .is_empty());
+        assert!(manager.command_suggestions("demo").unwrap().is_empty());
     }
 
     #[test]
