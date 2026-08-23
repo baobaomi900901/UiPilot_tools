@@ -1,6 +1,6 @@
 # Launcher Default Capabilities Design
 
-**Status:** Draft - revision 2 awaiting independent review
+**Status:** Draft - revision 3 awaiting independent review
 
 **Date:** 2026-08-23
 
@@ -62,7 +62,7 @@ Every completion uses one of these two forms:
 
 `command` matches `[a-z][a-z0-9-]{0,31}`. The no-argument form ends with exactly one ASCII space. In the argument form, the argument is non-empty after trimming, has no leading or trailing whitespace, preserves internal spaces, and contains no NUL, carriage return, line feed, `U+2028`, `U+2029`, or Unicode control character. The complete `completionText` is at most 65,536 UTF-8 bytes.
 
-The backend generator and frontend parser enforce this same contract. A backend response that violates it is discarded as malformed rather than partially repaired or executed.
+The backend generator and frontend parser enforce this same contract. A result item that violates it is discarded as malformed rather than repaired or executed. Other valid items in the same response remain usable; one malformed completion does not discard the whole response or create a global error by itself.
 
 ### Command Text
 
@@ -127,14 +127,15 @@ The public-plugin inventory uses each enabled plugin's effective activation comm
 
 ## Data Flow
 
-1. Every time the Launcher is shown with a fresh invocation, the frontend increments the application query sequence from zero to one and immediately requests the empty-input snapshot.
+1. Every native show event establishes a backend-registered fresh invocation. When that event targets the Launcher, the frontend increments its application query sequence from zero to one and immediately requests the empty-input snapshot.
 2. Every user edit increments the query sequence. Clearing a non-empty input or entering only whitespace still starts a new empty-input query; it is not treated as a local clear-only operation.
 3. The control retains the user's raw value for ownership. The backend uses the outer-trimmed value for classification and completion arguments.
 4. The backend applies the fixed classifier priority and builds one response. For empty input, it builds only built-in and enabled-plugin completion rows. For plain text, it builds Find and browser actions, matching plugin completion rows, and matching application actions.
 5. It publishes one ordered response for the current query owner.
 6. The frontend accepts the response only if its invocation, sequence, view epoch, control key, and raw control value are still current.
 7. Activating a completion row replaces the input, increments the sequence, and starts a new query generation. Activating `openFind` uses the dedicated current-owner transaction. Activating `executeResult` uses the current registry request.
-8. Returning from Settings to the Launcher or showing the Launcher again establishes a new invocation and requests a new empty snapshot even if the previous view also ended empty.
+8. Local navigation between Settings and the Launcher during one native show keeps the same invocation and never resets its query sequence. Returning to the Launcher increments the current sequence and requests a new empty snapshot even if the previous Launcher view ended empty.
+9. Hiding and later showing the main window is different from local navigation: the backend `on_show` path registers and supplies a fresh invocation, resets the frontend sequence to zero for that invocation, and the Launcher's first empty query uses sequence one.
 
 ## Failure Behavior
 
@@ -145,6 +146,7 @@ The public-plugin inventory uses each enabled plugin's effective activation comm
 - Empty input does not start application discovery, file search, browser navigation, or plugin execution.
 - `/web-search` with an empty argument never opens a browser.
 - An invalid completion value is rejected by the shared completion-contract parser and cannot be executed as a result action.
+- Rejecting one malformed completion item preserves all other valid items from the same current response and does not display an operation error solely for that item.
 - Observing an empty or whitespace-only edit clears the old visible results immediately, then publishes only the new empty-snapshot response if it remains current.
 
 ## Compatibility
@@ -179,10 +181,12 @@ Frontend-focused tests cover:
 
 - Default selection of the first empty-input row.
 - Empty query on first show, non-empty then clear, whitespace-only edit, and a new empty query after reopening the Launcher.
+- Multiple queries followed by local navigation to Settings and back, proving the shared invocation continues with a strictly higher sequence and the empty snapshot succeeds.
 - Arrow and mouse selection using the backend order.
 - Completion rows update the input without hiding the launcher or invoking an action.
 - The second Enter executes only after a complete command has been entered.
 - A stale response or completion cannot overwrite newer input.
+- A mixed response drops one malformed completion item while retaining its valid Find, web-search, plugin, and application items.
 - A stale `openFind` row cannot invoke `open_find_window`; a current row passes the exact owning invocation and sequence.
 
 No real-window, foreground-focus, mouse, or keyboard automation is required.
