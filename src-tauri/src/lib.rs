@@ -631,7 +631,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 47);
+        assert_eq!(production.matches("commands::").count(), 50);
         for command in [
             "open_find_window",
             "prepare_find_initialization",

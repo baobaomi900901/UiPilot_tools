@@ -272,6 +272,8 @@ pub(super) fn remove_owned_directory(path: &Path) -> Result<(), OwnerCleanupErro
     fs::remove_dir_all(path).map_err(|_| OwnerCleanupError::Storage)
 }
 
+// Windows requires clearing FILE_ATTRIBUTE_READONLY before owner deletion.
+#[allow(clippy::permissions_set_readonly_false)]
 fn make_tree_writable(path: &Path) -> Result<(), OwnerCleanupError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| OwnerCleanupError::Storage)?;
     if is_reparse_point(&metadata) {

@@ -262,7 +262,7 @@ impl WindowStorageError {
 
 pub(crate) struct PublicPluginUninstallCommitFailure {
     pub(crate) error: PublicPluginManagementError,
-    pub(crate) transaction: Option<PublicPluginUninstallTransaction>,
+    pub(crate) transaction: Option<Box<PublicPluginUninstallTransaction>>,
 }
 
 impl fmt::Debug for PublicPluginUninstallCommitFailure {
@@ -1423,7 +1423,7 @@ impl PublicPluginManager {
         if !transaction.data_drained || transaction.data_drain.is_some() {
             return Err(PublicPluginUninstallCommitFailure {
                 error: PublicPluginManagementError::Unavailable,
-                transaction: Some(transaction),
+                transaction: Some(Box::new(transaction)),
             });
         }
         let receipt = (!transaction.retain_data)
@@ -1446,7 +1446,7 @@ impl PublicPluginManager {
                         }
                         _ => PublicPluginManagementError::Unavailable,
                     },
-                    transaction: Some(transaction),
+                    transaction: Some(Box::new(transaction)),
                 });
             }
         }
@@ -1459,7 +1459,7 @@ impl PublicPluginManager {
         {
             return Err(PublicPluginUninstallCommitFailure {
                 error,
-                transaction: Some(transaction),
+                transaction: Some(Box::new(transaction)),
             });
         }
         let _mutation = self.lock_mutation()?;
@@ -1544,7 +1544,7 @@ impl PublicPluginManager {
             Ok(committed) => committed,
             Err(mut failure) => {
                 if let Some(transaction) = failure.transaction.take() {
-                    let _ = self.abort_uninstall_before_commit(transaction);
+                    let _ = self.abort_uninstall_before_commit(*transaction);
                 }
                 return Err(failure.error);
             }
@@ -3568,13 +3568,12 @@ mod tests {
             .bundle("com.example.activation")
             .unwrap()
             .is_none());
-        assert!(manager
+        assert!(!manager
             .data
             .lock()
             .unwrap()
             .active_by_plugin
-            .get("com.example.activation")
-            .is_none());
+            .contains_key("com.example.activation"));
         assert!(manager
             .asset(&upgraded.runtime.label, "/dist/runtime.js")
             .is_none());

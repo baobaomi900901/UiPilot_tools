@@ -9,17 +9,18 @@ import type {
 
 const handler: PluginHandler = async (invocation) => ({
   requestId: invocation.requestId,
-  data: { initialDurationMs: 10_000, completionMessage: invocation.input || '番茄钟完成' },
+  data: { completionMessage: invocation.input || '番茄钟完成' },
 })
 
 const consumeWindowApi = (api: Readonly<UiPilotPluginWindowApiV1>) => api.onUpdate(
   async (update: Readonly<PluginWindowUpdate>) => {
     if (update.data === null || typeof update.data !== 'object' || Array.isArray(update.data)) return
-    const duration = update.data.initialDurationMs
     const message = update.data.completionMessage
-    if (typeof duration !== 'number' || typeof message !== 'string') return
+    if (typeof message !== 'string') return
+    const stored: JsonValue | null = await api.storage.get('pomodoro.duration-minutes')
+    const durationMinutes = typeof stored === 'number' ? stored : 10
     const input: Readonly<PluginTimerStartInput> = {
-      durationMs: duration,
+      durationMs: durationMinutes * 60_000,
       completionMessage: message,
     }
     const unsubscribe = api.timer.onStateChanged((state: Readonly<PluginTimerState>) => {
@@ -30,8 +31,7 @@ const consumeWindowApi = (api: Readonly<UiPilotPluginWindowApiV1>) => api.onUpda
     await api.timer.stop()
     await api.timer.start()
     await api.timer.reset()
-    const stored: JsonValue | null = await api.storage.get('pomodoro.duration-minutes')
-    await api.storage.set('pomodoro.duration-minutes', stored ?? 10)
+    await api.storage.set('pomodoro.duration-minutes', durationMinutes)
     await api.storage.remove('pomodoro.duration-minutes')
     unsubscribe()
   },

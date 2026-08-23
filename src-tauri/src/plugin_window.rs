@@ -1161,18 +1161,16 @@ fn create_window(
                 event_controller.close(&plugin_id);
             }
         }
-        tauri::WindowEvent::Moved(position) => {
-            if event_controller.owns_plugin(&plugin_id) {
-                let _ = event_app
-                    .state::<SettingsStore>()
-                    .set_plugin_window_position(
-                        &plugin_id,
-                        crate::settings::WindowPosition {
-                            x: position.x,
-                            y: position.y,
-                        },
-                    );
-            }
+        tauri::WindowEvent::Moved(position) if event_controller.owns_plugin(&plugin_id) => {
+            let _ = event_app
+                .state::<SettingsStore>()
+                .set_plugin_window_position(
+                    &plugin_id,
+                    crate::settings::WindowPosition {
+                        x: position.x,
+                        y: position.y,
+                    },
+                );
         }
         _ => {}
     });

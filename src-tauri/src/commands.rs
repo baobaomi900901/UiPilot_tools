@@ -1130,7 +1130,7 @@ pub(crate) fn uninstall_plugin(
             PublicPluginService::destroy_runtime(&app, previous_runtime_label.as_deref());
             plugin_window::destroy_current(&app, &plugin_id);
             if let Some(transaction) = error.transaction.take() {
-                let _ = manager.abort_uninstall_before_commit(transaction);
+                let _ = manager.abort_uninstall_before_commit(*transaction);
             }
             return Err(error.error.into());
         }

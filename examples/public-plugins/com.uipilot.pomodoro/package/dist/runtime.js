@@ -1,4 +1,3 @@
-const INITIAL_DURATION_MS = 10_000
 const DEFAULT_COMPLETION_MESSAGE = '番茄钟完成'
 
 export async function onCommand(invocation) {
@@ -6,7 +5,6 @@ export async function onCommand(invocation) {
   return {
     requestId: invocation.requestId,
     data: {
-      initialDurationMs: INITIAL_DURATION_MS,
       completionMessage,
     },
   }

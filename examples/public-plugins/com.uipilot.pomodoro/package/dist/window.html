@@ -8,8 +8,18 @@
   </head>
   <body>
     <main>
+      <label class="duration-picker" for="duration">
+        <span>计时长度</span>
+        <select id="duration" aria-label="计时长度" disabled>
+          <option value="10">10分钟</option>
+          <option value="15">15分钟</option>
+          <option value="25">25分钟</option>
+          <option value="30">30分钟</option>
+          <option value="45">45分钟</option>
+        </select>
+      </label>
       <p class="eyebrow">番茄钟</p>
-      <output id="time" aria-live="off">00:10</output>
+      <output id="time" aria-live="off">10:00</output>
       <p id="status" class="status">准备</p>
       <div class="controls">
         <button id="start" type="button">开始</button>
