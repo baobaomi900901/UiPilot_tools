@@ -1083,13 +1083,31 @@ pub(crate) fn uninstall_plugin(
     retain_data: bool,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    let runtime_label = service.manager()?.uninstall(&plugin_id, retain_data)?;
-    PublicPluginService::destroy_runtime(&app, runtime_label.as_deref());
-    plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
-    if !retain_data {
-        app.state::<SettingsStore>()
-            .remove_plugin_window_position(&plugin_id)?;
+    let manager = service.manager()?;
+    let Some(transaction) = manager.begin_uninstall(&plugin_id, retain_data)? else {
+        return Ok(());
+    };
+    let previous_runtime_label = transaction.runtime_label.clone();
+    if !window_controller.close_for_uninstall(&plugin_id) {
+        PublicPluginService::destroy_runtime(&app, previous_runtime_label.as_deref());
+        plugin_window::destroy_current(&app, &plugin_id);
+        let _ = manager.abort_uninstall_before_commit(transaction);
+        return Err(PublicPluginManagementError::Unavailable.into());
     }
+    let committed = match manager.commit_uninstall(transaction) {
+        Ok(committed) => committed,
+        Err(mut error) => {
+            PublicPluginService::destroy_runtime(&app, previous_runtime_label.as_deref());
+            plugin_window::destroy_current(&app, &plugin_id);
+            if let Some(transaction) = error.transaction.take() {
+                let _ = manager.abort_uninstall_before_commit(transaction);
+            }
+            return Err(error.error.into());
+        }
+    };
+    PublicPluginService::destroy_runtime(&app, committed.runtime_label.as_deref());
+    plugin_window::destroy_current(&app, &plugin_id);
+    manager.finish_uninstall_cleanup(&committed, app.state::<SettingsStore>().inner())?;
     Ok(())
 }
 
@@ -1394,7 +1412,18 @@ pub(crate) async fn search_apps(
             Instant::now(),
         )?;
         let submission_token = submission.token.clone();
-        if let Some(dispatch) = submission.dispatch.as_ref() {
+        let dispatch = if let Some(recovery) = submission.recovery.clone() {
+            let service = Arc::clone(public.inner());
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                service.recover_runtime(&app_handle, &recovery, Instant::now())
+            })
+            .await
+            .map_err(|_| CommandError::plugin_query_failed())??
+        } else {
+            submission.dispatch.clone()
+        };
+        if let Some(dispatch) = dispatch.as_ref() {
             if let Err(error) = public.dispatch(app, dispatch, theme, invoked_at.clone()) {
                 public.fail_submission(&submission.token);
                 return Err(error.into());
@@ -1430,6 +1459,7 @@ pub(crate) async fn search_apps(
                     plugin_id: route.plugin_id.clone(),
                     plugin_generation: route.generation,
                     activation_id: route.activation_id,
+                    admission_epoch: route.admission_epoch,
                     request_id: response.request_id.clone(),
                     control_value: query.clone(),
                 };
@@ -2835,6 +2865,8 @@ mod tests {
             plugin_id: "com.example.demo".into(),
             generation: 1,
             activation_id: 1,
+            admission_epoch: 1,
+            runtime_recovery_needed: false,
             runtime_label: "plugin-runtime-com.example.demo-g1".into(),
             activation_mode: PublicActivationMode::Submit,
             output_mode: PublicOutputMode::MainResult,
@@ -3224,6 +3256,72 @@ mod tests {
 
         assert!(suppression < prepare);
         assert!(prepare < wait);
+    }
+
+    #[test]
+    fn public_plugin_search_recovers_runtime_before_dispatch() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let search = source
+            .split("pub(crate) async fn search_apps(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn invocation_theme(").next())
+            .expect("search_apps command is missing");
+        let recovery = search
+            .find("recover_runtime(")
+            .expect("recovery-needed submissions must rebuild Runtime");
+        let dispatch = search
+            .find("public.dispatch(")
+            .expect("public plugin dispatch is missing");
+
+        assert!(recovery < dispatch);
+    }
+
+    #[test]
+    fn public_plugin_uninstall_destroys_old_instances_before_abort_recovery() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let uninstall = source
+            .split("pub(crate) fn uninstall_plugin(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn plugin_api_call(").next())
+            .expect("uninstall command is missing");
+        let close_failure = uninstall
+            .split("if !window_controller.close_for_uninstall(&plugin_id) {")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }").next())
+            .expect("window-close failure branch is missing");
+        let destroy_runtime = close_failure
+            .find("PublicPluginService::destroy_runtime(")
+            .expect("close failure must destroy the old Runtime");
+        let destroy_window = close_failure
+            .find("plugin_window::destroy_current(")
+            .expect("close failure must destroy the old window");
+        let abort = close_failure
+            .find("abort_uninstall_before_commit(")
+            .expect("close failure must publish recovery after teardown");
+        assert!(destroy_runtime < abort);
+        assert!(destroy_window < abort);
+
+        let commit = uninstall
+            .split("let committed = match manager.commit_uninstall(transaction) {")
+            .nth(1)
+            .expect("commit failures must be handled explicitly");
+        let failure = commit
+            .split("Err(mut error) => {")
+            .nth(1)
+            .and_then(|tail| tail.split("\n        }").next())
+            .expect("commit failure branch is missing");
+        assert!(failure.contains("PublicPluginService::destroy_runtime("));
+        assert!(failure.contains("plugin_window::destroy_current("));
+        let abort = failure
+            .find("abort_uninstall_before_commit(")
+            .expect("recoverable commit failure must publish recovery after teardown");
+        assert!(
+            failure
+                .find("PublicPluginService::destroy_runtime(")
+                .unwrap()
+                < abort
+        );
+        assert!(failure.find("plugin_window::destroy_current(").unwrap() < abort);
     }
 
     #[test]

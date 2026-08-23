@@ -767,6 +767,7 @@ mod tests {
                     plugin_id: persisted_manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
+                    admission_epoch: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "input".into(),
                     owner: PluginSubmissionOwner {
@@ -878,6 +879,7 @@ mod tests {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
+                    admission_epoch: 1,
                     activation_mode: PublicActivationMode::Live,
                     input: "input".into(),
                     owner: PluginSubmissionOwner {
@@ -911,6 +913,7 @@ mod tests {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
+                    admission_epoch: 1,
                     activation_mode: PublicActivationMode::Live,
                     input: "new".into(),
                     owner: PluginSubmissionOwner {
@@ -1125,6 +1128,7 @@ mod tests {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
+                    admission_epoch: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "new".into(),
                     owner: PluginSubmissionOwner {
@@ -1221,6 +1225,7 @@ mod tests {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
+                    admission_epoch: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "new".into(),
                     owner: PluginSubmissionOwner {

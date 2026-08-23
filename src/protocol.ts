@@ -170,6 +170,7 @@ export type CommandErrorCode =
   | 'pluginInstallFailed'
   | 'pluginReloadFailed'
   | 'pluginDeleteFailed'
+  | 'dataCleanupPending'
   | 'fileNotFound'
   | 'fileOpenFailed'
   | 'webSearchFailed'

@@ -18,6 +18,15 @@ interface PublicPluginPanelProps {
 
 type PlainSettingValue = string | number | boolean
 
+const CLEANUP_PENDING_MESSAGE = '插件已卸载，数据清理将在下次启动时重试'
+
+function isCleanupPending(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === 'dataCleanupPending'
+}
+
 function initialSetting(setting: PublicSettingView): PlainSettingValue {
   if (setting.value !== undefined) return setting.value
   if (setting.definition.type !== 'secret' && setting.definition.default !== undefined) return setting.definition.default
@@ -31,10 +40,12 @@ function PublicPluginRow({
   client,
   plugin,
   reload,
+  onCleanupPending,
 }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
   reload: () => Promise<void>
+  onCleanupPending: () => Promise<void>
 }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -52,8 +63,9 @@ function PublicPluginRow({
     try {
       await operation()
       await reload()
-    } catch {
-      setError('操作不可用，请重试。')
+    } catch (caught) {
+      if (isCleanupPending(caught)) await onCleanupPending()
+      else setError('操作不可用，请重试。')
     } finally {
       setBusy(false)
     }
@@ -189,6 +201,7 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
   const [inventory, setInventory] = useState<PublicPluginInventory | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [prepared, setPrepared] = useState<PublicPluginPrepareSummary | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -207,6 +220,11 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
       if (owner === epoch.current) setLoading(false)
     }
   }, [client])
+
+  const handleCleanupPending = useCallback(async () => {
+    setNotice(CLEANUP_PENDING_MESSAGE)
+    await reload()
+  }, [reload])
 
   useEffect(() => {
     void reload()
@@ -272,9 +290,10 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
         </div>
       ) : null}
       {error ? <div className="plugin-list-state plugin-list-error" role="alert">{error}</div> : null}
+      {notice ? <div className="plugin-list-state" role="status">{notice}</div> : null}
       {loading && !inventory ? <div className="plugin-list-state"><Spin size="small" /></div> : null}
       {inventory?.items.length === 0 ? <div className="plugin-list-state">未安装公开插件</div> : null}
-      {inventory?.items.map((plugin) => <PublicPluginRow key={`${plugin.pluginId}:${plugin.generation}`} client={client} plugin={plugin} reload={reload} />)}
+      {inventory?.items.map((plugin) => <PublicPluginRow key={`${plugin.pluginId}:${plugin.generation}`} client={client} plugin={plugin} reload={reload} onCleanupPending={handleCleanupPending} />)}
     </section>
   )
 }

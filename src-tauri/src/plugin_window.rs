@@ -37,6 +37,7 @@ pub(crate) struct PluginWindowOwner {
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
     pub(crate) activation_id: u64,
+    pub(crate) admission_epoch: u64,
     pub(crate) request_id: String,
     pub(crate) control_value: String,
 }
@@ -448,6 +449,36 @@ impl PluginWindowController {
             self.changed.notify_all();
         }
         removed
+    }
+
+    pub(crate) fn close_for_uninstall(&self, plugin_id: &str) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(window) = core.windows.get_mut(plugin_id) else {
+            return true;
+        };
+        window.timer_session.phase = TimerSessionPhase::Closing;
+        while core
+            .windows
+            .get(plugin_id)
+            .is_some_and(|window| window.timer_session.in_flight > 0)
+        {
+            let Ok(next) = self.changed.wait(core) else {
+                return false;
+            };
+            core = next;
+        }
+        core.windows.remove(plugin_id);
+        drop(core);
+        self.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn owns_plugin(&self, plugin_id: &str) -> bool {
+        self.core
+            .lock()
+            .is_ok_and(|core| core.windows.contains_key(plugin_id))
     }
     pub(crate) fn invalidate_generation(&self, plugin_id: &str, generation: u64) -> bool {
         let Ok(mut core) = self.core.lock() else {
@@ -1107,15 +1138,17 @@ fn create_window(
             }
         }
         tauri::WindowEvent::Moved(position) => {
-            let _ = event_app
-                .state::<SettingsStore>()
-                .set_plugin_window_position(
-                    &plugin_id,
-                    crate::settings::WindowPosition {
-                        x: position.x,
-                        y: position.y,
-                    },
-                );
+            if event_controller.owns_plugin(&plugin_id) {
+                let _ = event_app
+                    .state::<SettingsStore>()
+                    .set_plugin_window_position(
+                        &plugin_id,
+                        crate::settings::WindowPosition {
+                            x: position.x,
+                            y: position.y,
+                        },
+                    );
+            }
         }
         _ => {}
     });
@@ -1374,10 +1407,14 @@ pub(crate) fn teardown_current(
     plugin_id: &str,
 ) {
     if controller.remove_plugin(plugin_id) {
-        if let Some(label) = plugin_shell_label(plugin_id) {
-            if let Some(window) = app.get_window(&label) {
-                let _ = window.destroy();
-            }
+        destroy_current(app, plugin_id);
+    }
+}
+
+pub(crate) fn destroy_current(app: &AppHandle, plugin_id: &str) {
+    if let Some(label) = plugin_shell_label(plugin_id) {
+        if let Some(window) = app.get_window(&label) {
+            let _ = window.destroy();
         }
     }
 }
@@ -1409,6 +1446,7 @@ mod tests {
             plugin_id: "com.example.demo".into(),
             plugin_generation: generation,
             activation_id: generation,
+            admission_epoch: generation,
             request_id: request.into(),
             control_value: format!("/demo {token}"),
         }
@@ -1576,6 +1614,34 @@ mod tests {
         drop(lease);
         assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(true));
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn uninstall_close_waits_for_call_lease_and_removes_window_owner() {
+        let controller = Arc::new(PluginWindowController::default());
+        let current = owner("uninstall-barrier", 4, "request-uninstall");
+        let transaction = controller.submit(current.clone()).unwrap();
+        let lease = controller
+            .begin_timer_call(
+                &transaction.content_label,
+                transaction.timer_session_generation,
+                false,
+            )
+            .unwrap();
+        let closing = Arc::clone(&controller);
+        let plugin_id = current.plugin_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let result = closing.close_for_uninstall(&plugin_id);
+            let _ = sender.send(result);
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(lease);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(true));
+        thread.join().unwrap();
+        assert!(!controller.owns_plugin(&current.plugin_id));
+        assert!(controller.close_for_uninstall(&current.plugin_id));
     }
 
     #[test]

@@ -1,19 +1,27 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use serde_json::{json, Value};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{
+    activation::{PublicPluginInstallSource, PublicPluginManager},
     manifest::{PublicOutputMode, PublicPermission},
     package, stage_public_package,
     webview_audio_guard::{INERT_DOCUMENT, INERT_PATH},
-    PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost, PublicPluginService,
+    PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost,
+    PublicPluginResponse, PublicPluginService,
 };
+use crate::message_center::MessageCenterService;
 use crate::plugins::{PluginCatalog, Version};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +69,175 @@ fn public_plugin_protocol_csp_denies_media() {
     assert!(super::PUBLIC_PLUGIN_CSP.contains("media-src 'none'"));
 }
 
+#[test]
+fn runtime_recovery_is_single_owner_and_latest_submission_wins() {
+    let root = TestRoot::new("runtime-recovery-latest");
+    let (service, manager) = recovery_service(&root);
+    let now = Instant::now();
+    let first = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    let first_recovery = first.recovery.clone().unwrap();
+    let second = service
+        .schedule_command(
+            manager.route("/demo second").unwrap().unwrap(),
+            2,
+            "/demo second".into(),
+            now,
+        )
+        .unwrap();
+    let second_recovery = second.recovery.clone().unwrap();
+
+    assert_eq!(
+        first.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(None)
+    );
+    let readiness_calls = AtomicU64::new(0);
+    assert!(service
+        .complete_runtime_recovery_with(&first_recovery, now, |_| {
+            readiness_calls.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap()
+        .is_none());
+    let dispatch = service
+        .complete_runtime_recovery_with(&second_recovery, now, |_| {
+            panic!("a recovery waiter must not create a second Runtime")
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(readiness_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(dispatch.candidate.input, "second");
+
+    service.settle_submission(
+        &second.token,
+        Some(Ok(PublicPluginResponse::MainResults(Vec::new()))),
+    );
+    assert_eq!(
+        second.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Some(Ok(PublicPluginResponse::MainResults(Vec::new()))))
+    );
+    let submissions = service.lock_submissions().unwrap();
+    assert!(submissions.by_token.is_empty());
+    assert!(submissions.token_by_request.is_empty());
+    drop(submissions);
+    assert!(service.lock_recoveries().unwrap().by_plugin.is_empty());
+}
+
+#[test]
+fn runtime_recovery_failure_settles_every_waiter_and_clears_indexes() {
+    let root = TestRoot::new("runtime-recovery-failure");
+    let (service, manager) = recovery_service(&root);
+    let now = Instant::now();
+    let first = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    let first_recovery = first.recovery.clone().unwrap();
+    let second = service
+        .schedule_command(
+            manager.route("/demo second").unwrap().unwrap(),
+            2,
+            "/demo second".into(),
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(
+        first.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(None)
+    );
+    assert!(service
+        .complete_runtime_recovery_with(&first_recovery, now, |_| false)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        second.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(None)
+    );
+    let submissions = service.lock_submissions().unwrap();
+    assert!(submissions.by_token.is_empty());
+    assert!(submissions.token_by_request.is_empty());
+    drop(submissions);
+    assert!(service.lock_recoveries().unwrap().by_plugin.is_empty());
+}
+
+#[test]
+fn joining_existing_runtime_recovery_does_not_allocate_another_attempt() {
+    let root = TestRoot::new("runtime-recovery-join-exhausted");
+    let (service, manager) = recovery_service(&root);
+    let now = Instant::now();
+    let first = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    service.next_recovery.store(u64::MAX, Ordering::Release);
+
+    let second = service
+        .schedule_command(
+            manager.route("/demo second").unwrap().unwrap(),
+            2,
+            "/demo second".into(),
+            now,
+        )
+        .expect("joining the existing attempt must not allocate a new recovery ID");
+
+    assert_eq!(
+        first.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(None)
+    );
+    service.settle_submission(&second.token, None);
+}
+
+#[test]
+fn stale_runtime_recovery_completion_cannot_open_scheduler_admission() {
+    let root = TestRoot::new("runtime-recovery-stale");
+    let (service, manager) = recovery_service(&root);
+    let now = Instant::now();
+    let submission = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    let mut stale = submission.recovery.clone().unwrap();
+    stale.attempt_id = stale.attempt_id.checked_add(1).unwrap();
+    let readiness_calls = AtomicU64::new(0);
+
+    assert!(service
+        .complete_runtime_recovery_with(&stale, now, |_| {
+            readiness_calls.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap()
+        .is_none());
+
+    assert_eq!(readiness_calls.load(Ordering::Relaxed), 0);
+    assert!(
+        manager
+            .route("/demo still-recovering")
+            .unwrap()
+            .unwrap()
+            .runtime_recovery_needed
+    );
+    service.settle_submission(&submission.token, None);
+}
+
 struct TestRoot(PathBuf);
 
 impl TestRoot {
@@ -91,6 +268,40 @@ impl Drop for TestRoot {
             fs::remove_dir_all(&self.0).unwrap();
         }
     }
+}
+
+fn recovery_service(root: &TestRoot) -> (Arc<PublicPluginService>, Arc<PublicPluginManager>) {
+    let source = root.package();
+    write_package(&source, &manifest("mainResult"));
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            host(),
+            ["find".into(), "math".into()],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let prepared = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+        .unwrap();
+    let transaction = manager
+        .begin_uninstall("com.uipilot.demo", false)
+        .unwrap()
+        .unwrap();
+    manager.abort_uninstall_before_commit(transaction).unwrap();
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(Arc::clone(&manager)).is_ok());
+    (service, manager)
 }
 
 #[test]

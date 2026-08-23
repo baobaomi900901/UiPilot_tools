@@ -21,11 +21,15 @@ use crate::message_center::{
 use super::{
     activation_bundle::{
         ActivationCandidate, ActivationIdAllocator, ActivationReservation,
-        ActivationReservationBook, ReservationError,
+        ActivationReservationBook, AdmissionEpochAllocator, ReservationError,
     },
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
+    owner_cleanup::{
+        remove_owned_directory, OwnerCleanupError, PluginOwnerCleanupReceipt,
+        PluginOwnerCleanupStore,
+    },
     package, runtime_label, stage_public_package,
     state::{DurableStateOutcome, PreparedStateCommit},
     timers::{
@@ -129,6 +133,8 @@ pub(crate) struct PublicPluginRoute {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
     pub(crate) activation_id: u64,
+    pub(crate) admission_epoch: u64,
+    pub(crate) runtime_recovery_needed: bool,
     pub(crate) runtime_label: String,
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) output_mode: PublicOutputMode,
@@ -173,6 +179,8 @@ pub(crate) struct PublicRuntimeCandidate {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
     pub(crate) activation_id: u64,
+    pub(crate) admission_epoch: u64,
+    pub(crate) runtime_recovery_needed: bool,
     pub(crate) label: String,
     pub(crate) runtime_entry: String,
 }
@@ -191,6 +199,26 @@ pub(crate) struct PublicEnabledCommit {
     pub(crate) closed_runtime_label: Option<String>,
 }
 
+pub(crate) struct PublicPluginUninstallTransaction {
+    plugin_id: String,
+    retain_data: bool,
+    previous_generation: u64,
+    previous_activation_id: Option<u64>,
+    pub(crate) runtime_label: Option<String>,
+    transaction_id: String,
+    reservation: ActivationReservation,
+    prepared_state: PreparedStateCommit,
+    previous_bundle: Option<Arc<super::activation_bundle::ActivationBundle>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PublicPluginUninstallCommit {
+    pub(crate) plugin_id: String,
+    pub(crate) retain_data: bool,
+    pub(crate) runtime_label: Option<String>,
+    receipt: Option<PluginOwnerCleanupReceipt>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicPluginManagementError {
     InvalidPackage,
@@ -203,7 +231,44 @@ pub(crate) enum PublicPluginManagementError {
     InvalidToken,
     ExpiredToken,
     InvalidCaller,
+    DataCleanupPending,
     Unavailable,
+}
+
+pub(crate) struct PublicPluginUninstallCommitFailure {
+    pub(crate) error: PublicPluginManagementError,
+    pub(crate) transaction: Option<PublicPluginUninstallTransaction>,
+}
+
+impl fmt::Debug for PublicPluginUninstallCommitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicPluginUninstallCommitFailure")
+            .field("error", &self.error)
+            .field("recoverable", &self.transaction.is_some())
+            .finish()
+    }
+}
+
+impl From<PublicPluginManagementError> for PublicPluginUninstallCommitFailure {
+    fn from(error: PublicPluginManagementError) -> Self {
+        Self {
+            error,
+            transaction: None,
+        }
+    }
+}
+
+impl From<PluginStateError> for PublicPluginUninstallCommitFailure {
+    fn from(error: PluginStateError) -> Self {
+        PublicPluginManagementError::from(error).into()
+    }
+}
+
+impl From<ReservationError> for PublicPluginUninstallCommitFailure {
+    fn from(error: ReservationError) -> Self {
+        PublicPluginManagementError::from(error).into()
+    }
 }
 
 impl PublicPluginManagementError {
@@ -219,6 +284,7 @@ impl PublicPluginManagementError {
             Self::InvalidToken => "invalidToken",
             Self::ExpiredToken => "expiredToken",
             Self::InvalidCaller => "invalidCaller",
+            Self::DataCleanupPending => "dataCleanupPending",
             Self::Unavailable => "pluginUnavailable",
         }
     }
@@ -269,11 +335,18 @@ pub(super) struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
-    fn candidate(&self, activation_id: u64) -> PublicRuntimeCandidate {
+    fn candidate(
+        &self,
+        activation_id: u64,
+        admission_epoch: u64,
+        runtime_recovery_needed: bool,
+    ) -> PublicRuntimeCandidate {
         PublicRuntimeCandidate {
             plugin_id: self.manifest.plugin_id.clone(),
             generation: self.generation,
             activation_id,
+            admission_epoch,
+            runtime_recovery_needed,
             label: self.label.clone(),
             runtime_entry: self.manifest.runtime.entry.clone(),
         }
@@ -339,6 +412,7 @@ struct TimerClaimDispatch {
 
 pub(crate) struct PublicPluginManager {
     host: PublicPluginHost,
+    app_data_dir: PathBuf,
     staging_root: PathBuf,
     packages_root: PathBuf,
     state: Arc<PluginStateStore>,
@@ -351,11 +425,14 @@ pub(crate) struct PublicPluginManager {
     timers: Arc<PluginTimerService>,
     api: PluginRuntimeApi,
     activation_ids: ActivationIdAllocator,
+    admission_epochs: AdmissionEpochAllocator,
+    owner_cleanup: Arc<PluginOwnerCleanupStore>,
     bundles: Arc<ActivationReservationBook>,
     mutation: Mutex<()>,
     data: Mutex<ActivationData>,
     runtime_faults: Mutex<HashMap<(String, u64), RuntimeFaultWindow>>,
     next_token: AtomicU64,
+    next_uninstall_transaction: AtomicU64,
 }
 
 impl PublicPluginManager {
@@ -387,6 +464,10 @@ impl PublicPluginManager {
         let root = app_data_dir.join("public-plugins");
         let staging_root = root.join("staging");
         let packages_root = root.join("packages");
+        let owner_cleanup = Arc::new(
+            PluginOwnerCleanupStore::load(&app_data_dir.join("public-plugin-owner-cleanup"))
+                .map_err(|_| PublicPluginManagementError::Unavailable)?,
+        );
         fs::create_dir_all(&staging_root).map_err(|_| PublicPluginManagementError::Unavailable)?;
         fs::create_dir_all(&packages_root).map_err(|_| PublicPluginManagementError::Unavailable)?;
         let state = Arc::new(PluginStateStore::load(&root.join("state"), reserved_names)?);
@@ -410,10 +491,17 @@ impl PublicPluginManager {
             message_center.clone(),
         );
         let activation_ids = ActivationIdAllocator::default();
+        let admission_epochs = AdmissionEpochAllocator::default();
         let bundles = Arc::new(ActivationReservationBook::default());
         let mut active_by_plugin = HashMap::new();
         for config in state.configs()? {
             if !config.installed || config.active_generation == 0 {
+                continue;
+            }
+            if owner_cleanup
+                .is_blocked(&config.plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?
+            {
                 continue;
             }
             let Some(digest) = config.package_digest.as_deref() else {
@@ -434,10 +522,18 @@ impl PublicPluginManager {
                             );
                             continue;
                         };
+                        let Some(admission_epoch) = admission_epochs.allocate() else {
+                            let _ = state.disable_for_fault(
+                                &config.plugin_id,
+                                PublicPluginFault::RuntimeUnavailable,
+                            );
+                            continue;
+                        };
                         let candidate = ActivationCandidate::new(
                             Arc::clone(&runtime),
                             alarm.as_ref(),
                             activation_id,
+                            admission_epoch,
                         );
                         if bundles
                             .install_initial(&config.plugin_id, candidate.bundle(config.clone()))
@@ -451,7 +547,7 @@ impl PublicPluginManager {
                         }
                         let _ = scheduler.invalidate_plugin(
                             &config.plugin_id,
-                            Some((config.active_generation, activation_id)),
+                            Some((config.active_generation, activation_id, admission_epoch)),
                         );
                     }
                     active_by_plugin.insert(config.plugin_id, runtime);
@@ -466,6 +562,7 @@ impl PublicPluginManager {
         }
         Ok(Self {
             host,
+            app_data_dir: app_data_dir.to_path_buf(),
             staging_root,
             packages_root,
             state,
@@ -478,6 +575,8 @@ impl PublicPluginManager {
             timers,
             api,
             activation_ids,
+            admission_epochs,
+            owner_cleanup,
             bundles,
             mutation: Mutex::new(()),
             data: Mutex::new(ActivationData {
@@ -486,6 +585,7 @@ impl PublicPluginManager {
             }),
             runtime_faults: Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(1),
+            next_uninstall_transaction: AtomicU64::new(1),
         })
     }
 
@@ -505,6 +605,13 @@ impl PublicPluginManager {
         self.cleanup_expired(now)?;
         let prepared =
             stage_public_package(source.into_package_source(), &self.staging_root, &self.host)?;
+        if self
+            .owner_cleanup
+            .is_blocked(&prepared.manifest.plugin_id)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+        {
+            return Err(PublicPluginManagementError::DataCleanupPending);
+        }
         let icon = if prepared.resources.contains_key(ICON_PATH) {
             Some(
                 fs::read(prepared.package_root.join(ICON_PATH))
@@ -632,12 +739,21 @@ impl PublicPluginManager {
                 .activation_ids
                 .allocate()
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            let admission_epoch = self
+                .admission_epochs
+                .allocate()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             let candidate = Arc::new(ActivationCandidate::new(
                 runtime_snapshot,
                 pending.prepared.alarm.as_ref(),
                 activation_id,
+                admission_epoch,
             ));
-            let runtime = candidate.runtime.candidate(candidate.activation_id);
+            let runtime = candidate.runtime.candidate(
+                candidate.activation_id,
+                candidate.admission_epoch,
+                candidate.runtime_recovery_needed,
+            );
             let previous_bundle = self
                 .bundles
                 .bundle(&runtime.plugin_id)
@@ -724,7 +840,11 @@ impl PublicPluginManager {
         self.scheduler
             .invalidate_plugin(
                 &runtime.plugin_id,
-                Some((runtime.generation, runtime.activation_id)),
+                Some((
+                    runtime.generation,
+                    runtime.activation_id,
+                    runtime.admission_epoch,
+                )),
             )
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.cancel_delayed_messages(&runtime.plugin_id);
@@ -807,8 +927,13 @@ impl PublicPluginManager {
             if before.enabled == enabled {
                 return Ok(PublicEnabledCommit {
                     mutation: mutation_from_config(&before),
-                    runtime: current_bundle
-                        .map(|bundle| bundle.runtime.candidate(bundle.activation_id)),
+                    runtime: current_bundle.map(|bundle| {
+                        bundle.runtime.candidate(
+                            bundle.activation_id,
+                            bundle.admission_epoch,
+                            bundle.runtime_recovery_needed,
+                        )
+                    }),
                     closed_runtime_label: None,
                 });
             }
@@ -832,12 +957,21 @@ impl PublicPluginManager {
                 .activation_ids
                 .allocate()
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            let admission_epoch = self
+                .admission_epochs
+                .allocate()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             let candidate = Arc::new(ActivationCandidate::new(
                 Arc::new(snapshot),
                 alarm.as_ref(),
                 activation_id,
+                admission_epoch,
             ));
-            let runtime = candidate.runtime.candidate(candidate.activation_id);
+            let runtime = candidate.runtime.candidate(
+                candidate.activation_id,
+                candidate.admission_epoch,
+                candidate.runtime_recovery_needed,
+            );
             let replaced = self
                 .lock_data()?
                 .staged_by_label
@@ -893,7 +1027,14 @@ impl PublicPluginManager {
         }
         if self
             .scheduler
-            .invalidate_plugin(plugin_id, Some((runtime.generation, runtime.activation_id)))
+            .invalidate_plugin(
+                plugin_id,
+                Some((
+                    runtime.generation,
+                    runtime.activation_id,
+                    runtime.admission_epoch,
+                )),
+            )
             .is_err()
         {
             data.staged_by_label.remove(&runtime.label);
@@ -944,7 +1085,11 @@ impl PublicPluginManager {
                 .bundles
                 .bundle(plugin_id)?
                 .ok_or(PublicPluginManagementError::Unavailable)?;
-            let runtime = bundle.runtime.candidate(bundle.activation_id);
+            let runtime = bundle.runtime.candidate(
+                bundle.activation_id,
+                bundle.admission_epoch,
+                bundle.runtime_recovery_needed,
+            );
             let reservation = self.bundles.reserve(plugin_id)?;
             let prepared_state = self.state.prepare_set_enabled(plugin_id, false)?;
             (before, runtime, reservation, prepared_state)
@@ -1054,17 +1199,25 @@ impl PublicPluginManager {
         }
     }
 
-    pub(crate) fn uninstall(
+    pub(crate) fn begin_uninstall(
         &self,
         plugin_id: &str,
         retain_data: bool,
-    ) -> Result<Option<String>, PublicPluginManagementError> {
+    ) -> Result<Option<PublicPluginUninstallTransaction>, PublicPluginManagementError> {
+        if self
+            .owner_cleanup
+            .is_blocked(plugin_id)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+        {
+            return Err(PublicPluginManagementError::DataCleanupPending);
+        }
         let (
             previous_generation,
             previous_activation_id,
             runtime_label,
             reservation,
             prepared_state,
+            previous_bundle,
         ) = {
             let _mutation = self.lock_mutation()?;
             let Some(config) = self.state.config(plugin_id)? else {
@@ -1078,47 +1231,228 @@ impl PublicPluginManager {
                 .state
                 .prepare_uninstall(plugin_id, retain_data)?
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            if retain_data {
+                self.scheduler
+                    .invalidate_plugin(plugin_id, None)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            } else {
+                self.scheduler
+                    .forget_plugin(plugin_id)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            }
             (
                 config.active_generation,
                 previous_activation_id,
                 runtime_label,
                 reservation,
                 prepared_state,
+                bundle,
             )
         };
-        self.make_state_durable(&reservation, &prepared_state)?;
+        let number = self
+            .next_uninstall_transaction
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                (value != 0).then_some(value)?.checked_add(1)
+            })
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let transaction_id = format!("{:016x}{number:016x}", std::process::id());
+        Ok(Some(PublicPluginUninstallTransaction {
+            plugin_id: plugin_id.into(),
+            retain_data,
+            previous_generation,
+            previous_activation_id,
+            runtime_label,
+            transaction_id,
+            reservation,
+            prepared_state,
+            previous_bundle,
+        }))
+    }
+
+    pub(crate) fn abort_uninstall_before_commit(
+        &self,
+        transaction: PublicPluginUninstallTransaction,
+    ) -> Result<Option<PublicRuntimeCandidate>, PublicPluginManagementError> {
+        let PublicPluginUninstallTransaction {
+            plugin_id,
+            previous_bundle,
+            reservation,
+            ..
+        } = transaction;
+        drop(reservation);
+        let Some(previous) = previous_bundle else {
+            return Ok(None);
+        };
         let _mutation = self.lock_mutation()?;
-        self.clear_runtime_faults(plugin_id)?;
-        if retain_data {
-            self.scheduler
-                .invalidate_plugin(plugin_id, None)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        } else {
-            self.scheduler
-                .forget_plugin(plugin_id)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let config = self
+            .state
+            .config(&plugin_id)?
+            .filter(|config| config.installed && config.enabled && config.fault.is_none())
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let activation_id = self
+            .activation_ids
+            .allocate()
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let admission_epoch = self
+            .admission_epochs
+            .allocate()
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let candidate = ActivationCandidate::recovery(
+            Arc::clone(&previous.runtime),
+            previous.alarm.as_ref(),
+            activation_id,
+            admission_epoch,
+        );
+        let runtime = candidate.runtime.candidate(
+            candidate.activation_id,
+            candidate.admission_epoch,
+            candidate.runtime_recovery_needed,
+        );
+        let reservation = self.bundles.reserve(&plugin_id)?;
+        self.scheduler
+            .invalidate_plugin(
+                &plugin_id,
+                Some((
+                    runtime.generation,
+                    runtime.activation_id,
+                    runtime.admission_epoch,
+                )),
+            )
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        reservation.begin_committing()?;
+        reservation.mark_durable()?;
+        reservation.publish(Some(candidate.bundle(config)))?;
+        self.lock_data()?.active_by_plugin.remove(&plugin_id);
+        Ok(Some(runtime))
+    }
+
+    pub(crate) fn commit_uninstall(
+        &self,
+        transaction: PublicPluginUninstallTransaction,
+    ) -> Result<PublicPluginUninstallCommit, PublicPluginUninstallCommitFailure> {
+        let receipt = (!transaction.retain_data)
+            .then(|| {
+                PluginOwnerCleanupReceipt::new(
+                    &transaction.plugin_id,
+                    &transaction.transaction_id,
+                    transaction.previous_generation,
+                    transaction.previous_activation_id,
+                )
+            })
+            .transpose()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        if let Some(receipt) = receipt.as_ref() {
+            if let Err(error) = self.owner_cleanup.commit(receipt.clone()) {
+                return Err(PublicPluginUninstallCommitFailure {
+                    error: match error {
+                        OwnerCleanupError::AlreadyPending => {
+                            PublicPluginManagementError::DataCleanupPending
+                        }
+                        _ => PublicPluginManagementError::Unavailable,
+                    },
+                    transaction: Some(transaction),
+                });
+            }
         }
-        self.cancel_delayed_messages(plugin_id);
-        let timer_effects = previous_activation_id
+        if receipt.is_some() {
+            transaction.reservation.begin_committing()?;
+            transaction.reservation.mark_durable()?;
+            let _ = self.state.persist_prepared(&transaction.prepared_state);
+        } else if let Err(error) =
+            self.make_state_durable(&transaction.reservation, &transaction.prepared_state)
+        {
+            return Err(PublicPluginUninstallCommitFailure {
+                error,
+                transaction: Some(transaction),
+            });
+        }
+        let _mutation = self.lock_mutation()?;
+        self.clear_runtime_faults(&transaction.plugin_id)?;
+        self.cancel_delayed_messages(&transaction.plugin_id);
+        let timer_effects = transaction
+            .previous_activation_id
             .map(|activation_id| {
-                self.cancel_timer_generation(plugin_id, previous_generation, activation_id)
+                self.cancel_timer_generation(
+                    &transaction.plugin_id,
+                    transaction.previous_generation,
+                    activation_id,
+                )
             })
             .unwrap_or_default();
-        self.state.publish_prepared(prepared_state)?;
-        reservation.publish(None)?;
-        self.lock_data()?.active_by_plugin.remove(plugin_id);
+        self.state.publish_prepared(transaction.prepared_state)?;
+        transaction.reservation.publish(None)?;
+        self.lock_data()?
+            .active_by_plugin
+            .remove(&transaction.plugin_id);
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
-        if !retain_data {
-            let _ = self.storage.uninstall(plugin_id, false);
-            let _ = self.secrets.uninstall(plugin_id, false);
-            self.state.cleanup_uninstalled_owner(plugin_id);
+        Ok(PublicPluginUninstallCommit {
+            plugin_id: transaction.plugin_id,
+            retain_data: transaction.retain_data,
+            runtime_label: transaction.runtime_label,
+            receipt,
+        })
+    }
+
+    pub(crate) fn finish_uninstall_cleanup(
+        &self,
+        committed: &PublicPluginUninstallCommit,
+        settings: &crate::settings::SettingsStore,
+    ) -> Result<(), PublicPluginManagementError> {
+        let mut failed = false;
+        if !committed.retain_data {
+            failed |= self.storage.uninstall(&committed.plugin_id, false).is_err();
+            failed |= self.secrets.uninstall(&committed.plugin_id, false).is_err();
+            failed |= self
+                .state
+                .cleanup_uninstalled_owner(&committed.plugin_id)
+                .is_err();
         }
-        let packages = self.packages_root.join(plugin_id);
-        if packages.exists() {
-            package::remove_package_tree(packages);
+        failed |= remove_owned_directory(&self.packages_root.join(&committed.plugin_id)).is_err();
+        failed |= settings
+            .remove_plugin_window_position(&committed.plugin_id)
+            .is_err();
+        if failed {
+            return Err(if committed.retain_data {
+                PublicPluginManagementError::Unavailable
+            } else {
+                PublicPluginManagementError::DataCleanupPending
+            });
         }
-        Ok(runtime_label)
+        if let Some(receipt) = committed.receipt.as_ref() {
+            let cleared = self
+                .owner_cleanup
+                .clear(&receipt.plugin_id, &receipt.transaction_id)
+                .map_err(|_| PublicPluginManagementError::DataCleanupPending)?;
+            if !cleared {
+                return Err(PublicPluginManagementError::DataCleanupPending);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uninstall(
+        &self,
+        plugin_id: &str,
+        retain_data: bool,
+    ) -> Result<Option<String>, PublicPluginManagementError> {
+        let Some(transaction) = self.begin_uninstall(plugin_id, retain_data)? else {
+            return Ok(None);
+        };
+        let committed = match self.commit_uninstall(transaction) {
+            Ok(committed) => committed,
+            Err(mut failure) => {
+                if let Some(transaction) = failure.transaction.take() {
+                    let _ = self.abort_uninstall_before_commit(transaction);
+                }
+                return Err(failure.error);
+            }
+        };
+        let settings = crate::settings::SettingsStore::load(&self.app_data_dir)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.finish_uninstall_cleanup(&committed, &settings)?;
+        Ok(committed.runtime_label)
     }
 
     pub(crate) fn inventory(&self) -> Result<PublicPluginInventory, PublicPluginManagementError> {
@@ -1227,6 +1561,13 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
+            if self
+                .owner_cleanup
+                .is_blocked(&config.plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?
+            {
+                continue;
+            }
             if !config.installed
                 || !config.enabled
                 || config.fault.is_some()
@@ -1240,6 +1581,8 @@ impl PublicPluginManager {
                 plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
                 activation_id: bundle.activation_id,
+                admission_epoch: bundle.admission_epoch,
+                runtime_recovery_needed: bundle.runtime_recovery_needed,
                 runtime_label: snapshot.label.clone(),
                 activation_mode: command.activation_mode,
                 output_mode: command.output_mode,
@@ -1297,8 +1640,68 @@ impl PublicPluginManager {
             .bundles()?
             .into_iter()
             .filter(|bundle| bundle.config.installed && bundle.config.enabled)
-            .map(|bundle| bundle.runtime.candidate(bundle.activation_id))
+            .filter(|bundle| !bundle.runtime_recovery_needed)
+            .map(|bundle| {
+                bundle.runtime.candidate(
+                    bundle.activation_id,
+                    bundle.admission_epoch,
+                    bundle.runtime_recovery_needed,
+                )
+            })
             .collect())
+    }
+
+    pub(crate) fn runtime_recovery_candidate(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<Option<PublicRuntimeCandidate>, PublicPluginManagementError> {
+        Ok(self
+            .bundles
+            .bundle(plugin_id)?
+            .filter(|bundle| {
+                bundle.runtime_recovery_needed
+                    && bundle.config.installed
+                    && bundle.config.enabled
+                    && bundle.config.fault.is_none()
+                    && bundle.runtime.generation == generation
+                    && bundle.activation_id == activation_id
+                    && bundle.admission_epoch == admission_epoch
+            })
+            .map(|bundle| {
+                bundle.runtime.candidate(
+                    bundle.activation_id,
+                    bundle.admission_epoch,
+                    bundle.runtime_recovery_needed,
+                )
+            }))
+    }
+
+    pub(crate) fn finish_runtime_recovery(
+        &self,
+        candidate: &PublicRuntimeCandidate,
+    ) -> Result<bool, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        let Some(bundle) = self.bundles.bundle(&candidate.plugin_id)? else {
+            return Ok(false);
+        };
+        if !bundle.runtime_recovery_needed
+            || bundle.runtime.generation != candidate.generation
+            || bundle.activation_id != candidate.activation_id
+            || bundle.admission_epoch != candidate.admission_epoch
+        {
+            return Ok(false);
+        }
+        let reservation = self.bundles.reserve(&candidate.plugin_id)?;
+        reservation.begin_committing()?;
+        reservation.mark_durable()?;
+        reservation.publish(Some(bundle.with_runtime_recovery(false)))?;
+        self.lock_data()?
+            .active_by_plugin
+            .insert(candidate.plugin_id.clone(), Arc::clone(&bundle.runtime));
+        Ok(true)
     }
 
     pub(crate) fn asset(&self, label: &str, request_path: &str) -> Option<PublicRuntimeAsset> {
@@ -1832,6 +2235,15 @@ impl PublicPluginManager {
             .map(|bundle| bundle.activation_id)
     }
 
+    #[cfg(test)]
+    fn admission_epoch(&self, plugin_id: &str) -> Option<u64> {
+        self.bundles
+            .bundle(plugin_id)
+            .ok()
+            .flatten()
+            .map(|bundle| bundle.admission_epoch)
+    }
+
     pub(crate) fn replace_runtime_generation(
         &self,
         plugin_id: &str,
@@ -1859,12 +2271,21 @@ impl PublicPluginManager {
                 .activation_ids
                 .allocate()
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            let admission_epoch = self
+                .admission_epochs
+                .allocate()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             let candidate = Arc::new(ActivationCandidate::reactivate(
                 Arc::new(replacement),
                 current.alarm.as_ref(),
                 activation_id,
+                admission_epoch,
             ));
-            let runtime = candidate.runtime.candidate(candidate.activation_id);
+            let runtime = candidate.runtime.candidate(
+                candidate.activation_id,
+                candidate.admission_epoch,
+                candidate.runtime_recovery_needed,
+            );
             let previous_activation_id = current.activation_id;
             let reservation = self.bundles.reserve(plugin_id)?;
             let prepared_state = self.state.prepare_activation(
@@ -2360,6 +2781,7 @@ mod tests {
         timers::{Clock, PluginTimerPhase, PluginTimerStartInput, TimerKey},
         PublicPlatform,
     };
+    use crate::settings::{SettingsStore, WindowPosition};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -3483,6 +3905,8 @@ mod tests {
                 plugin_id: "com.example.activation".into(),
                 generation: 1,
                 activation_id: manager.activation_id("com.example.activation").unwrap(),
+                admission_epoch: manager.admission_epoch("com.example.activation").unwrap(),
+                runtime_recovery_needed: false,
                 runtime_label: runtime_label("com.example.activation", 1).unwrap(),
                 activation_mode: PublicActivationMode::Live,
                 output_mode: PublicOutputMode::MainResult,
@@ -3885,6 +4309,7 @@ mod tests {
             .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
             .unwrap();
         let first_id = manager.activation_id("com.example.activation").unwrap();
+        let first_epoch = manager.admission_epoch("com.example.activation").unwrap();
 
         manager
             .rename("com.example.activation", Some("renamed"))
@@ -3892,6 +4317,10 @@ mod tests {
         assert_eq!(
             manager.activation_id("com.example.activation"),
             Some(first_id)
+        );
+        assert_eq!(
+            manager.admission_epoch("com.example.activation"),
+            Some(first_epoch)
         );
         manager
             .save_settings(
@@ -3902,6 +4331,10 @@ mod tests {
         assert_eq!(
             manager.activation_id("com.example.activation"),
             Some(first_id)
+        );
+        assert_eq!(
+            manager.admission_epoch("com.example.activation"),
+            Some(first_epoch)
         );
 
         let reservation = manager.bundles.reserve("com.example.activation").unwrap();
@@ -3914,6 +4347,7 @@ mod tests {
 
         manager.uninstall("com.example.activation", false).unwrap();
         assert_eq!(manager.activation_id("com.example.activation"), None);
+        assert_eq!(manager.admission_epoch("com.example.activation"), None);
         let later = now + Duration::from_secs(1);
         let prepared = manager
             .prepare("main", source(&dir.source()), later)
@@ -3923,7 +4357,9 @@ mod tests {
             .unwrap();
         assert_eq!(commit.runtime.generation, 1);
         let second_id = manager.activation_id("com.example.activation").unwrap();
+        let second_epoch = manager.admission_epoch("com.example.activation").unwrap();
         assert_ne!(second_id, first_id);
+        assert_ne!(second_epoch, first_epoch);
         for offset in 0..3 {
             assert!(!manager
                 .record_runtime_result(
@@ -3943,5 +4379,163 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn pending_owner_cleanup_blocks_same_plugin_before_staging() {
+        let dir = TestDir::new("cleanup-block");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        manager
+            .owner_cleanup
+            .commit(
+                PluginOwnerCleanupReceipt::new(
+                    "com.example.activation",
+                    "00000000000000000000000000000001",
+                    1,
+                    Some(1),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.prepare("main", source(&dir.source()), Instant::now()),
+            Err(PublicPluginManagementError::DataCleanupPending)
+        );
+        assert!(staging_is_empty(&manager));
+    }
+
+    #[test]
+    fn pending_cleanup_crash_snapshot_never_constructs_a_bundle() {
+        let dir = TestDir::new("cleanup-crash-snapshot");
+        write_package(&dir.source(), "1.0.0", "one");
+        let installed_manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = installed_manager
+            .prepare("main", source(&dir.source()), now)
+            .unwrap();
+        installed_manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let activation_id = installed_manager
+            .activation_id("com.example.activation")
+            .unwrap();
+        drop(installed_manager);
+
+        let store =
+            PluginOwnerCleanupStore::load(&dir.path().join("public-plugin-owner-cleanup")).unwrap();
+        store
+            .commit(
+                PluginOwnerCleanupReceipt::new(
+                    "com.example.activation",
+                    "00000000000000000000000000000001",
+                    1,
+                    Some(activation_id),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let recovered = manager(&dir);
+        assert!(
+            recovered
+                .state()
+                .config("com.example.activation")
+                .unwrap()
+                .unwrap()
+                .installed
+        );
+        assert_eq!(recovered.activation_id("com.example.activation"), None);
+        assert!(recovered.runtime_candidates().unwrap().is_empty());
+        assert!(recovered.route("/activation value").unwrap().is_none());
+    }
+
+    #[test]
+    fn complete_uninstall_commits_receipt_before_owner_cleanup() {
+        let dir = TestDir::new("uninstall-transaction");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let settings = SettingsStore::load(dir.path()).unwrap();
+        settings
+            .set_plugin_window_position("com.example.activation", WindowPosition { x: 12, y: 34 })
+            .unwrap();
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let package_owner = manager.packages_root.join("com.example.activation");
+        assert!(package_owner.exists());
+
+        let transaction = manager
+            .begin_uninstall("com.example.activation", false)
+            .unwrap()
+            .unwrap();
+        assert!(!manager
+            .owner_cleanup
+            .is_blocked("com.example.activation")
+            .unwrap());
+        let committed = manager.commit_uninstall(transaction).unwrap();
+
+        assert_eq!(manager.activation_id("com.example.activation"), None);
+        assert!(manager
+            .owner_cleanup
+            .is_blocked("com.example.activation")
+            .unwrap());
+        assert!(package_owner.exists());
+        assert_eq!(
+            settings.plugin_window_position("com.example.activation"),
+            Some(WindowPosition { x: 12, y: 34 })
+        );
+
+        manager
+            .finish_uninstall_cleanup(&committed, &settings)
+            .unwrap();
+        assert!(!package_owner.exists());
+        assert_eq!(
+            settings.plugin_window_position("com.example.activation"),
+            None
+        );
+        assert!(!manager
+            .owner_cleanup
+            .is_blocked("com.example.activation")
+            .unwrap());
+    }
+
+    #[test]
+    fn abort_before_uninstall_commit_requires_runtime_recovery_with_new_identity() {
+        let dir = TestDir::new("uninstall-abort-recovery");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let old_activation = manager.activation_id("com.example.activation").unwrap();
+        let old_epoch = manager.admission_epoch("com.example.activation").unwrap();
+
+        let transaction = manager
+            .begin_uninstall("com.example.activation", false)
+            .unwrap()
+            .unwrap();
+        let recovery = manager
+            .abort_uninstall_before_commit(transaction)
+            .unwrap()
+            .unwrap();
+        let route = manager.route("/activation next").unwrap().unwrap();
+
+        assert_eq!(route.generation, 1);
+        assert_ne!(route.activation_id, old_activation);
+        assert_ne!(route.admission_epoch, old_epoch);
+        assert!(route.runtime_recovery_needed);
+        assert_eq!(recovery.activation_id, route.activation_id);
+        assert_eq!(recovery.admission_epoch, route.admission_epoch);
+        assert!(recovery.runtime_recovery_needed);
+        assert!(manager.runtime_candidates().unwrap().is_empty());
+        assert!(!manager
+            .record_runtime_result("com.example.activation", 1, old_activation, false, now,)
+            .unwrap());
     }
 }

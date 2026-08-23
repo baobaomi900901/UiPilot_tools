@@ -4,6 +4,7 @@ mod alarm_asset;
 mod delayed_messages;
 mod icon;
 mod manifest;
+mod owner_cleanup;
 mod package;
 mod runtime;
 mod scheduler;
@@ -35,6 +36,8 @@ use tauri::{
 
 use crate::message_center::MessageCenterService;
 use crate::native_attention::AttentionRoutePort;
+use crate::settings::SettingsStore;
+use owner_cleanup::retry_pending_owner_cleanup;
 
 pub(crate) use activation::{
     parse_main_result_response, parse_window_response, PublicCommandSuggestion, PublicMainResult,
@@ -94,11 +97,36 @@ struct PublicSubmissionState {
     token_by_request: HashMap<PluginRequestContext, String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PublicRuntimeRecovery {
+    attempt_id: u64,
+    submission_token: String,
+    candidate: PublicRuntimeCandidate,
+    owner: bool,
+}
+
+struct RuntimeRecoveryAttempt {
+    attempt_id: u64,
+    candidate: PublicRuntimeCandidate,
+    request: PluginRequestCandidate,
+    current_submission_token: String,
+    finalizing: bool,
+    settled: Option<bool>,
+}
+
+#[derive(Default)]
+struct RuntimeRecoveryState {
+    by_plugin: HashMap<String, RuntimeRecoveryAttempt>,
+}
+
 #[derive(Default)]
 pub(crate) struct PublicPluginService {
     manager: OnceLock<Arc<PublicPluginManager>>,
     submissions: Mutex<PublicSubmissionState>,
+    recoveries: Mutex<RuntimeRecoveryState>,
+    recovery_changed: Condvar,
     next_submission: AtomicU64,
+    next_recovery: AtomicU64,
     startup_runtimes_started: AtomicBool,
     webview_guards: Arc<WebViewGuardAuthority>,
 }
@@ -107,6 +135,7 @@ pub(crate) struct PublicSubmission {
     pub(crate) token: String,
     pub(crate) receiver: mpsc::Receiver<Option<PublicSubmissionResult>>,
     pub(crate) dispatch: Option<ScheduledPluginRequest>,
+    pub(crate) recovery: Option<PublicRuntimeRecovery>,
 }
 impl PublicPluginService {
     pub(crate) fn initialize(
@@ -117,6 +146,8 @@ impl PublicPluginService {
         message_center: Arc<MessageCenterService>,
         attention_route: Arc<dyn AttentionRoutePort>,
     ) -> Result<Arc<PublicPluginManager>, PublicPluginManagementError> {
+        let settings = app.state::<SettingsStore>();
+        let _ = retry_pending_owner_cleanup(app_data_dir, settings.inner());
         let manager = Arc::new(PublicPluginManager::load(
             app_data_dir,
             PublicPluginHost::current(PublicPlatform::Windows),
@@ -204,24 +235,51 @@ impl PublicPluginService {
                 sender,
             },
         );
+        let request_candidate = PluginRequestCandidate {
+            plugin_id: route.plugin_id.clone(),
+            plugin_generation: route.generation,
+            activation_id: route.activation_id,
+            admission_epoch: route.admission_epoch,
+            activation_mode: route.activation_mode,
+            input: route.input.clone(),
+            owner: PluginSubmissionOwner {
+                ui_intent_epoch,
+                control_value,
+                submission_token: token.clone(),
+            },
+        };
+        if route.runtime_recovery_needed {
+            let candidate = match self.manager()?.runtime_recovery_candidate(
+                &route.plugin_id,
+                route.generation,
+                route.activation_id,
+                route.admission_epoch,
+            )? {
+                Some(candidate) => candidate,
+                None => {
+                    self.settle_submission(&token, None);
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+            };
+            let recovery =
+                match self.register_runtime_recovery(candidate, request_candidate, &token) {
+                    Ok(recovery) => recovery,
+                    Err(error) => {
+                        self.settle_submission(&token, None);
+                        return Err(error);
+                    }
+                };
+            return Ok(PublicSubmission {
+                token,
+                receiver,
+                dispatch: None,
+                recovery: Some(recovery),
+            });
+        }
         let outcome = self
             .manager()?
             .scheduler()
-            .enqueue(
-                PluginRequestCandidate {
-                    plugin_id: route.plugin_id.clone(),
-                    plugin_generation: route.generation,
-                    activation_id: route.activation_id,
-                    activation_mode: route.activation_mode,
-                    input: route.input.clone(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch,
-                        control_value,
-                        submission_token: token.clone(),
-                    },
-                },
-                now,
-            )
+            .enqueue(request_candidate, now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let dispatch = match outcome {
             PluginScheduleOutcome::Dispatched(request) => {
@@ -243,7 +301,191 @@ impl PublicPluginService {
             token,
             receiver,
             dispatch,
+            recovery: None,
         })
+    }
+
+    fn register_runtime_recovery(
+        &self,
+        candidate: PublicRuntimeCandidate,
+        request: PluginRequestCandidate,
+        submission_token: &str,
+    ) -> Result<PublicRuntimeRecovery, PublicPluginManagementError> {
+        let mut recoveries = self.lock_recoveries()?;
+        if let Some(attempt) = recoveries
+            .by_plugin
+            .get_mut(&candidate.plugin_id)
+            .filter(|attempt| attempt.candidate == candidate)
+        {
+            let attempt_id = attempt.attempt_id;
+            let replaced = std::mem::replace(
+                &mut attempt.current_submission_token,
+                submission_token.into(),
+            );
+            attempt.request = request;
+            drop(recoveries);
+            if replaced != submission_token {
+                self.settle_submission(&replaced, None);
+            }
+            return Ok(PublicRuntimeRecovery {
+                attempt_id,
+                submission_token: submission_token.into(),
+                candidate,
+                owner: false,
+            });
+        }
+        let attempt_id = self
+            .next_recovery
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+            .checked_add(1)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let replaced = recoveries
+            .by_plugin
+            .remove(&candidate.plugin_id)
+            .map(|attempt| attempt.current_submission_token);
+        recoveries.by_plugin.insert(
+            candidate.plugin_id.clone(),
+            RuntimeRecoveryAttempt {
+                attempt_id,
+                candidate: candidate.clone(),
+                request,
+                current_submission_token: submission_token.into(),
+                finalizing: false,
+                settled: None,
+            },
+        );
+        drop(recoveries);
+        if let Some(replaced) = replaced.filter(|replaced| replaced != submission_token) {
+            self.settle_submission(&replaced, None);
+        }
+        Ok(PublicRuntimeRecovery {
+            attempt_id,
+            submission_token: submission_token.to_owned(),
+            candidate,
+            owner: true,
+        })
+    }
+
+    pub(crate) fn complete_runtime_recovery_with<F>(
+        &self,
+        recovery: &PublicRuntimeRecovery,
+        now: Instant,
+        readiness: F,
+    ) -> Result<Option<ScheduledPluginRequest>, PublicPluginManagementError>
+    where
+        F: FnOnce(&PublicRuntimeCandidate) -> bool,
+    {
+        if recovery.owner {
+            {
+                let mut recoveries = self.lock_recoveries()?;
+                let Some(attempt) = recoveries
+                    .by_plugin
+                    .get_mut(&recovery.candidate.plugin_id)
+                    .filter(|attempt| {
+                        attempt.attempt_id == recovery.attempt_id
+                            && !attempt.finalizing
+                            && attempt.settled.is_none()
+                    })
+                else {
+                    return Ok(None);
+                };
+                attempt.finalizing = true;
+            }
+            let runtime_ready = readiness(&recovery.candidate);
+            let accepted = runtime_ready
+                && self
+                    .manager()?
+                    .finish_runtime_recovery(&recovery.candidate)?;
+            if !accepted
+                && self
+                    .manager()?
+                    .runtime_recovery_candidate(
+                        &recovery.candidate.plugin_id,
+                        recovery.candidate.generation,
+                        recovery.candidate.activation_id,
+                        recovery.candidate.admission_epoch,
+                    )?
+                    .is_some()
+            {
+                let _ = self.manager()?.mark_runtime_unavailable(
+                    &recovery.candidate.plugin_id,
+                    recovery.candidate.generation,
+                    recovery.candidate.activation_id,
+                );
+            }
+            let mut recoveries = self.lock_recoveries()?;
+            let Some(attempt) = recoveries
+                .by_plugin
+                .get_mut(&recovery.candidate.plugin_id)
+                .filter(|attempt| attempt.attempt_id == recovery.attempt_id)
+            else {
+                return Ok(None);
+            };
+            attempt.finalizing = false;
+            attempt.settled = Some(accepted);
+            self.recovery_changed.notify_all();
+        }
+
+        let mut recoveries = self.lock_recoveries()?;
+        while recoveries
+            .by_plugin
+            .get(&recovery.candidate.plugin_id)
+            .is_some_and(|attempt| {
+                attempt.attempt_id == recovery.attempt_id && attempt.settled.is_none()
+            })
+        {
+            recoveries = self
+                .recovery_changed
+                .wait(recoveries)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        }
+        let Some(attempt) = recoveries
+            .by_plugin
+            .get(&recovery.candidate.plugin_id)
+            .filter(|attempt| attempt.attempt_id == recovery.attempt_id)
+        else {
+            return Ok(None);
+        };
+        if attempt.settled != Some(true) {
+            recoveries.by_plugin.remove(&recovery.candidate.plugin_id);
+            drop(recoveries);
+            self.settle_plugin_submissions_with(&recovery.candidate.plugin_id, None);
+            return Ok(None);
+        }
+        if attempt.current_submission_token != recovery.submission_token {
+            return Ok(None);
+        }
+        let request = attempt.request.clone();
+        recoveries.by_plugin.remove(&recovery.candidate.plugin_id);
+        drop(recoveries);
+        let dispatch = self
+            .manager()?
+            .scheduler()
+            .enqueue(request, now)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let PluginScheduleOutcome::Dispatched(dispatch) = dispatch else {
+            self.settle_submission(&recovery.submission_token, None);
+            return Ok(None);
+        };
+        self.bind_request(&recovery.submission_token, &dispatch.context)?;
+        Ok(Some(dispatch))
+    }
+
+    pub(crate) fn recover_runtime(
+        &self,
+        app: &AppHandle,
+        recovery: &PublicRuntimeRecovery,
+        now: Instant,
+    ) -> Result<Option<ScheduledPluginRequest>, PublicPluginManagementError> {
+        let ready = if recovery.owner {
+            self.create_runtime(app, &recovery.candidate).is_ok()
+        } else {
+            false
+        };
+        self.complete_runtime_recovery_with(recovery, now, |_| ready)
     }
 
     pub(crate) fn dispatch(
@@ -469,6 +711,7 @@ impl PublicPluginService {
                     &replacement.plugin_id,
                     replacement.new_generation,
                     candidate.activation_id,
+                    candidate.admission_epoch,
                     now,
                 )
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
@@ -492,6 +735,14 @@ impl PublicPluginService {
     }
 
     fn settle_plugin_submissions(&self, plugin_id: &str) {
+        self.settle_plugin_submissions_with(plugin_id, Some(Err(PluginRuntimeError::Unavailable)));
+    }
+
+    fn settle_plugin_submissions_with(
+        &self,
+        plugin_id: &str,
+        result: Option<PublicSubmissionResult>,
+    ) {
         let pending = self.lock_submissions().ok().map(|mut submissions| {
             let tokens = submissions
                 .by_token
@@ -509,9 +760,7 @@ impl PublicPluginService {
         });
         if let Some(pending) = pending {
             for pending in pending {
-                let _ = pending
-                    .sender
-                    .send(Some(Err(PluginRuntimeError::Unavailable)));
+                let _ = pending.sender.send(result.clone());
             }
         }
     }
@@ -548,10 +797,12 @@ impl PublicPluginService {
         }
     }
     fn settle_submission(&self, token: &str, result: Option<PublicSubmissionResult>) {
-        let pending = self
-            .lock_submissions()
-            .ok()
-            .and_then(|mut submissions| submissions.by_token.remove(token));
+        let pending = self.lock_submissions().ok().and_then(|mut submissions| {
+            submissions
+                .token_by_request
+                .retain(|_, mapped_token| mapped_token != token);
+            submissions.by_token.remove(token)
+        });
         if let Some(pending) = pending {
             let _ = pending.sender.send(result);
         }
@@ -561,6 +812,14 @@ impl PublicPluginService {
         &self,
     ) -> Result<std::sync::MutexGuard<'_, PublicSubmissionState>, PublicPluginManagementError> {
         self.submissions
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
+    fn lock_recoveries(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeRecoveryState>, PublicPluginManagementError> {
+        self.recoveries
             .lock()
             .map_err(|_| PublicPluginManagementError::Unavailable)
     }

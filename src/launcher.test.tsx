@@ -3363,6 +3363,49 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
+  it('treats pending public owner cleanup as a committed uninstall', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    const item = {
+      pluginId: 'com.example.cleanup', name: 'Cleanup', description: null, version: '1.0.0',
+      source: 'localPackage' as const, defaultName: 'cleanup', effectiveName: 'cleanup', enabled: true,
+      fault: null, generation: 1, iconUrl: null, permissions: [], settings: [],
+    }
+    vi.mocked(fake.client.listPublicPlugins)
+      .mockResolvedValueOnce({ revision: '1', items: [item] })
+      .mockResolvedValueOnce({ revision: '2', items: [] })
+    vi.mocked(fake.client.uninstallPublicPlugin).mockRejectedValueOnce({
+      code: 'dataCleanupPending',
+      message: 'private cleanup path',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-cleanup-pending', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+
+    const deleteButton = mounted.host
+      .querySelector<HTMLButtonElement>('button[aria-label="卸载并删除数据"]')!
+    await act(async () => deleteButton.click())
+    let confirm: HTMLButtonElement | undefined
+    await vi.waitFor(() => {
+      confirm = [...document.querySelectorAll<HTMLButtonElement>('button')]
+        .find((button) => button.textContent?.replace(/\s/g, '') === '删除')
+      expect(confirm).toBeTruthy()
+    })
+    await act(async () => confirm!.click())
+
+    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
+    expect(mounted.host.querySelector('.public-plugin-item')).toBeNull()
+    expect(mounted.host.textContent).toContain('插件已卸载，数据清理将在下次启动时重试')
+    expect(mounted.host.textContent).not.toContain('操作不可用')
+    expect(mounted.host.textContent).not.toContain('private cleanup path')
+    await mounted.unmount()
+    core.destroy()
+  })
+
   it('shows the prepared public plugin icon before installation', async () => {
     installMatchMedia(false)
     const fake = fakeClient()

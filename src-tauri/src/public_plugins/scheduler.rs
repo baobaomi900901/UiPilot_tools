@@ -45,6 +45,7 @@ pub(crate) struct PluginRequestCandidate {
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
     pub(crate) activation_id: u64,
+    pub(crate) admission_epoch: u64,
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) input: String,
     pub(crate) owner: PluginSubmissionOwner,
@@ -55,6 +56,7 @@ impl PluginRequestCandidate {
         valid_plugin_id(&self.plugin_id)
             && self.plugin_generation != 0
             && self.activation_id != 0
+            && self.admission_epoch != 0
             && self.input.len() <= 64 * 1024
             && !self.input.contains('\0')
             && self.owner.ui_intent_epoch != 0
@@ -98,6 +100,7 @@ pub(crate) struct PluginCompletionOutcome {
 pub(crate) struct PluginRuntimeReplacement {
     pub(crate) plugin_id: String,
     pub(crate) previous_activation_id: u64,
+    pub(crate) previous_admission_epoch: u64,
     pub(crate) expired: PluginRequestContext,
     pub(crate) previous_generation: u64,
     pub(crate) new_generation: u64,
@@ -147,6 +150,7 @@ impl PluginCurrentRequest<'_> {
 struct PluginQueue {
     generation: u64,
     activation_id: u64,
+    admission_epoch: u64,
     running: Option<RunningRequest>,
     waiting: Option<PluginRequestCandidate>,
     rebuilding: bool,
@@ -155,10 +159,11 @@ struct PluginQueue {
 }
 
 impl PluginQueue {
-    fn new(generation: u64, activation_id: u64) -> Self {
+    fn new(generation: u64, activation_id: u64, admission_epoch: u64) -> Self {
         Self {
             generation,
             activation_id,
+            admission_epoch,
             running: None,
             waiting: None,
             rebuilding: false,
@@ -210,11 +215,13 @@ impl PluginRequestScheduler {
         let plugin_id = candidate.plugin_id.clone();
         let generation = candidate.plugin_generation;
         let activation_id = candidate.activation_id;
-        let queue = state
-            .by_plugin
-            .entry(plugin_id.clone())
-            .or_insert_with(|| PluginQueue::new(generation, activation_id));
-        if queue.generation != generation || queue.activation_id != activation_id {
+        let queue = state.by_plugin.entry(plugin_id.clone()).or_insert_with(|| {
+            PluginQueue::new(generation, activation_id, candidate.admission_epoch)
+        });
+        if queue.generation != generation
+            || queue.activation_id != activation_id
+            || queue.admission_epoch != candidate.admission_epoch
+        {
             return Err(PluginScheduleError::GenerationMismatch);
         }
         if queue.rebuilding {
@@ -373,6 +380,7 @@ impl PluginRequestScheduler {
             replacements.push(PluginRuntimeReplacement {
                 plugin_id: plugin_id.clone(),
                 previous_activation_id: queue.activation_id,
+                previous_admission_epoch: queue.admission_epoch,
                 expired: running.request.context,
                 previous_generation,
                 new_generation,
@@ -388,6 +396,7 @@ impl PluginRequestScheduler {
         plugin_id: &str,
         generation: u64,
         activation_id: u64,
+        admission_epoch: u64,
         now: Instant,
     ) -> Result<Option<ScheduledPluginRequest>, PluginScheduleError> {
         let mut state = self.lock()?;
@@ -397,14 +406,17 @@ impl PluginRequestScheduler {
             .ok_or(PluginScheduleError::InvalidCandidate)?;
         if activation_id == 0
             || queue.generation != generation
+            || admission_epoch == 0
             || !queue.rebuilding
             || queue.running.is_some()
         {
             return Err(PluginScheduleError::GenerationMismatch);
         }
         queue.activation_id = activation_id;
+        queue.admission_epoch = admission_epoch;
         if let Some(waiting) = queue.waiting.as_mut() {
             waiting.activation_id = activation_id;
+            waiting.admission_epoch = admission_epoch;
         }
         queue.rebuilding = false;
         let candidate = queue.waiting.take();
@@ -416,17 +428,17 @@ impl PluginRequestScheduler {
     pub(crate) fn invalidate_plugin(
         &self,
         plugin_id: &str,
-        next_activation: Option<(u64, u64)>,
+        next_activation: Option<(u64, u64, u64)>,
     ) -> Result<Option<PluginRequestContext>, PluginScheduleError> {
         let mut state = self.lock()?;
         let Some(queue) = state.by_plugin.get_mut(plugin_id) else {
-            if let Some((generation, activation_id)) = next_activation {
-                if generation == 0 || activation_id == 0 {
+            if let Some((generation, activation_id, admission_epoch)) = next_activation {
+                if generation == 0 || activation_id == 0 || admission_epoch == 0 {
                     return Err(PluginScheduleError::GenerationMismatch);
                 }
                 state.by_plugin.insert(
                     plugin_id.into(),
-                    PluginQueue::new(generation, activation_id),
+                    PluginQueue::new(generation, activation_id, admission_epoch),
                 );
             }
             return Ok(None);
@@ -434,16 +446,19 @@ impl PluginRequestScheduler {
         let expired = queue.running.take().map(|running| running.request.context);
         queue.waiting = None;
         queue.rebuilding = false;
-        if let Some((generation, activation_id)) = next_activation {
+        if let Some((generation, activation_id, admission_epoch)) = next_activation {
             if generation == 0
                 || activation_id == 0
                 || generation <= queue.generation
                 || activation_id == queue.activation_id
+                || admission_epoch == 0
+                || admission_epoch == queue.admission_epoch
             {
                 return Err(PluginScheduleError::GenerationMismatch);
             }
             queue.generation = generation;
             queue.activation_id = activation_id;
+            queue.admission_epoch = admission_epoch;
         }
         Ok(expired)
     }
@@ -499,6 +514,8 @@ fn dispatch(
     if queue.running.is_some()
         || queue.rebuilding
         || queue.generation != request.context.plugin_generation
+        || queue.activation_id != request.candidate.activation_id
+        || queue.admission_epoch != request.candidate.admission_epoch
     {
         return Err(PluginScheduleError::Unavailable);
     }
@@ -532,6 +549,7 @@ mod tests {
             plugin_id: "com.example.scheduler".into(),
             plugin_generation: generation,
             activation_id: 17,
+            admission_epoch: 23,
             activation_mode: mode,
             input: value.into(),
             owner: owner(value),
@@ -625,6 +643,7 @@ mod tests {
             vec![PluginRuntimeReplacement {
                 plugin_id: "com.example.scheduler".into(),
                 previous_activation_id: 17,
+                previous_admission_epoch: 23,
                 expired: a.context.clone(),
                 previous_generation: 7,
                 new_generation: 8,
@@ -641,12 +660,14 @@ mod tests {
                 "com.example.scheduler",
                 8,
                 18,
+                24,
                 start + Duration::from_secs(6),
             )
             .unwrap()
             .unwrap();
         assert_eq!(b.candidate.input, "B");
         assert_eq!(b.candidate.activation_id, 18);
+        assert_eq!(b.candidate.admission_epoch, 24);
         assert_eq!(b.context.plugin_generation, 8);
         assert_eq!(b.dispatched_at, start + Duration::from_secs(6));
     }
@@ -659,6 +680,7 @@ mod tests {
             plugin_id: plugin_id.into(),
             plugin_generation: generation,
             activation_id: generation + 10,
+            admission_epoch: generation + 20,
             activation_mode: PublicActivationMode::Live,
             input: value.into(),
             owner: owner(value),
@@ -700,7 +722,7 @@ mod tests {
         );
 
         let latest = scheduler
-            .runtime_replaced("com.example.failed", 2, 12, start + LIVE_TIMEOUT)
+            .runtime_replaced("com.example.failed", 2, 12, 22, start + LIVE_TIMEOUT)
             .unwrap()
             .unwrap();
         assert_eq!(latest.candidate.input, "latest");
@@ -760,6 +782,7 @@ mod tests {
 
         let mut current = candidate("current", 1, PublicActivationMode::Submit);
         current.activation_id = 18;
+        current.admission_epoch = 24;
         assert!(matches!(
             scheduler.enqueue(current, now),
             Ok(PluginScheduleOutcome::Dispatched(_))

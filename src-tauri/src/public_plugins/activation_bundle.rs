@@ -16,6 +16,8 @@ pub(super) struct ActivationBundle {
     pub(super) runtime: Arc<RuntimeSnapshot>,
     pub(super) alarm: Option<ValidatedAlarmAsset>,
     pub(super) activation_id: u64,
+    pub(super) admission_epoch: u64,
+    pub(super) runtime_recovery_needed: bool,
 }
 
 impl ActivationBundle {
@@ -25,6 +27,19 @@ impl ActivationBundle {
             runtime: Arc::clone(&self.runtime),
             alarm: self.alarm.clone(),
             activation_id: self.activation_id,
+            admission_epoch: self.admission_epoch,
+            runtime_recovery_needed: self.runtime_recovery_needed,
+        })
+    }
+
+    pub(super) fn with_runtime_recovery(&self, runtime_recovery_needed: bool) -> Arc<Self> {
+        Arc::new(Self {
+            config: self.config.clone(),
+            runtime: Arc::clone(&self.runtime),
+            alarm: self.alarm.clone(),
+            activation_id: self.activation_id,
+            admission_epoch: self.admission_epoch,
+            runtime_recovery_needed,
         })
     }
 }
@@ -34,6 +49,8 @@ pub(super) struct ActivationCandidate {
     pub(super) runtime: Arc<RuntimeSnapshot>,
     pub(super) alarm: Option<ValidatedAlarmAsset>,
     pub(super) activation_id: u64,
+    pub(super) admission_epoch: u64,
+    pub(super) runtime_recovery_needed: bool,
 }
 
 impl ActivationCandidate {
@@ -41,6 +58,7 @@ impl ActivationCandidate {
         runtime: Arc<RuntimeSnapshot>,
         prepared_alarm: Option<&PreparedAlarmAsset>,
         activation_id: u64,
+        admission_epoch: u64,
     ) -> Self {
         let alarm = prepared_alarm.map(|alarm| {
             alarm.activate(
@@ -54,6 +72,8 @@ impl ActivationCandidate {
             runtime,
             alarm,
             activation_id,
+            admission_epoch,
+            runtime_recovery_needed: false,
         }
     }
 
@@ -63,6 +83,8 @@ impl ActivationCandidate {
             runtime: Arc::clone(&self.runtime),
             alarm: self.alarm.clone(),
             activation_id: self.activation_id,
+            admission_epoch: self.admission_epoch,
+            runtime_recovery_needed: self.runtime_recovery_needed,
         })
     }
 
@@ -70,18 +92,42 @@ impl ActivationCandidate {
         runtime: Arc<RuntimeSnapshot>,
         previous_alarm: Option<&ValidatedAlarmAsset>,
         activation_id: u64,
+        admission_epoch: u64,
     ) -> Self {
         let alarm = previous_alarm.map(|alarm| alarm.reactivate(runtime.generation, activation_id));
         Self {
             runtime,
             alarm,
             activation_id,
+            admission_epoch,
+            runtime_recovery_needed: false,
+        }
+    }
+
+    pub(super) fn recovery(
+        runtime: Arc<RuntimeSnapshot>,
+        previous_alarm: Option<&ValidatedAlarmAsset>,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Self {
+        let alarm = previous_alarm.map(|alarm| alarm.reactivate(runtime.generation, activation_id));
+        Self {
+            runtime,
+            alarm,
+            activation_id,
+            admission_epoch,
+            runtime_recovery_needed: true,
         }
     }
 }
 
 #[derive(Debug)]
 pub(super) struct ActivationIdAllocator {
+    next: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(super) struct AdmissionEpochAllocator {
     next: AtomicU64,
 }
 
@@ -325,11 +371,38 @@ impl ActivationIdAllocator {
     }
 }
 
+impl Default for AdmissionEpochAllocator {
+    fn default() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+        }
+    }
+}
+
+impl AdmissionEpochAllocator {
+    pub(super) fn allocate(&self) -> Option<u64> {
+        self.next
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                (value != 0).then_some(value)?.checked_add(1)
+            })
+            .ok()
+    }
+
+    #[cfg(test)]
+    fn with_next(next: u64) -> Self {
+        Self {
+            next: AtomicU64::new(next),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{ActivationIdAllocator, ActivationReservationBook, ReservationError};
+    use super::{
+        ActivationIdAllocator, ActivationReservationBook, AdmissionEpochAllocator, ReservationError,
+    };
 
     #[test]
     fn activation_ids_are_monotonic_allow_holes_and_never_wrap() {
@@ -338,6 +411,17 @@ mod tests {
         assert_eq!(allocator.allocate(), Some(8));
 
         let exhausted = ActivationIdAllocator::with_next(u64::MAX);
+        assert_eq!(exhausted.allocate(), None);
+        assert_eq!(exhausted.allocate(), None);
+    }
+
+    #[test]
+    fn admission_epochs_are_monotonic_and_never_wrap() {
+        let allocator = AdmissionEpochAllocator::with_next(41);
+        assert_eq!(allocator.allocate(), Some(41));
+        assert_eq!(allocator.allocate(), Some(42));
+
+        let exhausted = AdmissionEpochAllocator::with_next(u64::MAX);
         assert_eq!(exhausted.allocate(), None);
         assert_eq!(exhausted.allocate(), None);
     }

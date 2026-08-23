@@ -223,6 +223,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   pluginInstallFailed: '无法安装插件。',
   pluginReloadFailed: '无法重新加载插件。',
   pluginDeleteFailed: '无法删除插件。',
+  dataCleanupPending: '插件已卸载，数据清理将在下次启动时重试',
 }
 
 const NOTICE_TEXT = {

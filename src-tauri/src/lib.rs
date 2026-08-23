@@ -879,6 +879,36 @@ mod tests {
     }
 
     #[test]
+    fn public_plugin_cleanup_recovery_precedes_activation() {
+        let lifecycle = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = lifecycle
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let settings = production
+            .find("let settings = load_settings_store(&app_data_dir)?;")
+            .expect("settings must load before public plugins");
+        let initialize = production
+            .find("public_plugin_service.initialize(")
+            .expect("public plugin initialization is missing");
+        assert!(settings < initialize);
+
+        let service = include_str!("public_plugins.rs").replace("\r\n", "\n");
+        let initialize_body = service
+            .split("pub(crate) fn initialize(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn manager(").next())
+            .expect("public plugin initialize body is missing");
+        let recovery = initialize_body
+            .find("retry_pending_owner_cleanup(")
+            .expect("owner cleanup recovery is missing");
+        let manager_load = initialize_body
+            .find("PublicPluginManager::load(")
+            .expect("manager load is missing");
+        assert!(recovery < manager_load);
+    }
+
+    #[test]
     fn process_identity_is_prepared_before_tauri_builder() {
         let main = include_str!("main.rs");
         let prepare = main

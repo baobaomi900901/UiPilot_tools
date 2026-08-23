@@ -628,9 +628,15 @@ impl PluginStateStore {
             .map(Some)
     }
 
-    pub(crate) fn cleanup_uninstalled_owner(&self, plugin_id: &str) {
-        if let Ok(owner) = owner_root(&self.root, plugin_id) {
-            let _ = fs::remove_dir_all(owner);
+    pub(crate) fn cleanup_uninstalled_owner(
+        &self,
+        plugin_id: &str,
+    ) -> Result<(), PluginStateError> {
+        let owner = owner_root(&self.root, plugin_id)?;
+        match fs::remove_dir_all(owner) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(PluginStateError::Storage),
         }
     }
 
