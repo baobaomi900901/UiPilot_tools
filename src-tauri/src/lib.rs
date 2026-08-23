@@ -252,7 +252,7 @@ fn setup_production_lifecycle(
     public_plugin_service.initialize(
         app.handle(),
         &app_data_dir,
-        ["find".into(), "math".into()],
+        ["find".into(), "math".into(), "web-search".into()],
         Arc::clone(&message_center),
         native_attention::attention_route(route_messages),
     )?;

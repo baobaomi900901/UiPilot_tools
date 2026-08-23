@@ -130,7 +130,11 @@ fn definitions() -> Value {
 #[test]
 fn effective_names_are_global_and_failed_rename_is_atomic() {
     let dir = TestDir::new("names");
-    let store = PluginStateStore::load(dir.path(), ["find".into(), "math".into()]).unwrap();
+    let store = PluginStateStore::load(
+        dir.path(),
+        ["find".into(), "math".into(), "web-search".into()],
+    )
+    .unwrap();
     let alpha = manifest("com.example.alpha", "alpha", json!([]));
     let beta = manifest("com.example.beta", "beta", json!([]));
     install(&store, &alpha);
@@ -153,9 +157,24 @@ fn effective_names_are_global_and_failed_rename_is_atomic() {
         store.rename("com.example.beta", Some("find")),
         Err(PluginStateError::NameConflict { owner: None })
     );
+    assert_eq!(
+        store.rename("com.example.beta", Some("web-search")),
+        Err(PluginStateError::NameConflict { owner: None })
+    );
+    assert!(matches!(
+        store.install_or_upgrade(
+            &manifest("com.example.web", "web-search", json!([])),
+            BTreeSet::new(),
+        ),
+        Err(PluginStateError::NameConflict { owner: None })
+    ));
 
     drop(store);
-    let reloaded = PluginStateStore::load(dir.path(), ["find".into(), "math".into()]).unwrap();
+    let reloaded = PluginStateStore::load(
+        dir.path(),
+        ["find".into(), "math".into(), "web-search".into()],
+    )
+    .unwrap();
     assert_eq!(
         reloaded
             .config("com.example.beta")

@@ -1732,6 +1732,35 @@ impl PublicPluginManager {
         suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
         Ok(suggestions)
     }
+
+    pub(crate) fn launcher_command_suggestions(
+        &self,
+        query: &str,
+    ) -> Result<Vec<PublicCommandSuggestion>, PublicPluginManagementError> {
+        let folded_query = query.to_lowercase();
+        let mut suggestions = Vec::new();
+        for bundle in self.bundles.bundles()? {
+            let config = &bundle.config;
+            let snapshot = &bundle.runtime;
+            if !config.installed
+                || !config.enabled
+                || config.fault.is_some()
+                || config.active_generation != snapshot.generation
+                || bundle.runtime_recovery_needed
+                || !config.effective_name.to_lowercase().contains(&folded_query)
+            {
+                continue;
+            }
+            suggestions.push(PublicCommandSuggestion {
+                effective_name: config.effective_name.clone(),
+                display_name: snapshot.manifest.name.clone(),
+                summary: snapshot.manifest.command.summary.clone(),
+                icon_url: snapshot.icon_url(),
+            });
+        }
+        suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        Ok(suggestions)
+    }
     pub(crate) fn runtime_candidates(
         &self,
     ) -> Result<Vec<PublicRuntimeCandidate>, PublicPluginManagementError> {
@@ -4225,12 +4254,33 @@ mod tests {
             manager.command_suggestions("window").unwrap()[0].effective_name,
             "demo-win"
         );
+        assert_eq!(
+            manager.launcher_command_suggestions("").unwrap(),
+            manager.command_suggestions("").unwrap()
+        );
+        assert_eq!(
+            manager.launcher_command_suggestions("WIN").unwrap(),
+            vec![PublicCommandSuggestion {
+                effective_name: "demo-win".into(),
+                display_name: "Public Plugin Demo Window".into(),
+                summary: Some("打开演示子窗口".into()),
+                icon_url: None,
+            }]
+        );
+        assert!(manager
+            .launcher_command_suggestions("window")
+            .unwrap()
+            .is_empty());
 
         manager
             .rename("com.example.demo-win", Some("alpha-win"))
             .unwrap();
         assert_eq!(
             manager.command_suggestions("a").unwrap()[0].effective_name,
+            "alpha-win"
+        );
+        assert_eq!(
+            manager.launcher_command_suggestions("ALPHA").unwrap()[0].effective_name,
             "alpha-win"
         );
 
@@ -4275,6 +4325,10 @@ mod tests {
             )
             .unwrap();
         assert!(manager.command_suggestions("a").unwrap().is_empty());
+        assert!(manager
+            .launcher_command_suggestions("alpha")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

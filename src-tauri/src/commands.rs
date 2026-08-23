@@ -1505,7 +1505,37 @@ pub(crate) async fn search_apps(
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let public = app.state::<Arc<PublicPluginService>>();
-    if let Some(prefix) = plugin_discovery_prefix(&query) {
+    let normalized_query = query.trim().to_owned();
+    let web_search_engine = settings.snapshot().web_search_engine;
+    if !normalized_query.starts_with('/') {
+        return Ok(search_apps_with_catalog(
+            registry,
+            &normalized_query,
+            &invocation_id,
+            query_sequence,
+            |plain_query| public.manager()?.launcher_command_suggestions(plain_query),
+            || cache.snapshot(),
+            |applications| settings.decorate_applications(applications),
+            web_search_engine,
+        ));
+    }
+    if normalized_query == "/find"
+        || normalized_query.starts_with("/find ")
+        || normalized_query == "/web-search"
+        || normalized_query.starts_with("/web-search ")
+    {
+        return Ok(search_apps_with_catalog(
+            registry,
+            &normalized_query,
+            &invocation_id,
+            query_sequence,
+            |_| Ok(Vec::new()),
+            Vec::new,
+            |_| {},
+            web_search_engine,
+        ));
+    }
+    if let Some(prefix) = plugin_discovery_prefix(&normalized_query) {
         return Ok(publish_public_command_suggestions(
             registry,
             &invocation_id,
@@ -1513,7 +1543,7 @@ pub(crate) async fn search_apps(
             public.manager()?.command_suggestions(prefix)?,
         ));
     }
-    if let Some(route) = public.manager()?.route(&query)? {
+    if let Some(route) = public.manager()?.route(&normalized_query)? {
         match public_plugin_search_decision(&route, submit) {
             PublicPluginSearchDecision::Ignore => return Ok(None),
             PublicPluginSearchDecision::Hint(hint) => {
@@ -1621,7 +1651,7 @@ pub(crate) async fn search_apps(
         };
     }
     let plugins = app.state::<Arc<PluginManager>>();
-    match plugins.begin_routed_query(&query, registry, &invocation_id, query_sequence) {
+    match plugins.begin_routed_query(&normalized_query, registry, &invocation_id, query_sequence) {
         PluginQueryStart::Started { route, token } => {
             let entries = match plugins.query(window.app_handle(), route.clone()).await {
                 Ok(entries) => entries,
@@ -1635,12 +1665,12 @@ pub(crate) async fn search_apps(
     }
     Ok(search_apps_with(
         registry,
-        &query,
+        &normalized_query,
         &invocation_id,
         query_sequence,
         || cache.snapshot(),
         |applications| settings.decorate_applications(applications),
-        settings.snapshot().web_search_engine,
+        web_search_engine,
     ))
 }
 
@@ -1848,9 +1878,67 @@ where
     S: FnOnce() -> Vec<Application>,
     D: FnOnce(&mut [Application]),
 {
+    search_apps_with_catalog(
+        registry,
+        query,
+        invocation_id,
+        query_sequence,
+        |_| Ok(Vec::new()),
+        snapshot,
+        decorate,
+        web_search_engine,
+    )
+}
+
+fn completion_result(
+    command: &str,
+    subtitle: String,
+    icon_kind: Option<ResultIconKind>,
+    plugin_icon_url: Option<String>,
+    argument: Option<&str>,
+) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
+    let title = format!("/{command}");
+    let completion_text =
+        argument.map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
+    Some((
+        crate::model::ResultItem {
+            result_id: String::new(),
+            activation: LauncherResultActivation::completion(completion_text)?,
+            title,
+            subtitle: Some(subtitle),
+            icon: None,
+            plugin_icon_url,
+            icon_kind,
+            detail: None,
+            has_default_action: false,
+        },
+        None,
+    ))
+}
+
+fn search_apps_with_catalog<S, D, P>(
+    registry: &ResultRegistry,
+    query: &str,
+    invocation_id: &str,
+    query_sequence: u64,
+    plugin_catalog: P,
+    snapshot: S,
+    decorate: D,
+    web_search_engine: WebSearchEngine,
+) -> Option<SearchResponse>
+where
+    S: FnOnce() -> Vec<Application>,
+    D: FnOnce(&mut [Application]),
+    P: FnOnce(
+        &str,
+    ) -> Result<
+        Vec<crate::public_plugins::PublicCommandSuggestion>,
+        PublicPluginManagementError,
+    >,
+{
+    let query = query.trim();
+    let token = registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
     if let Some(result) = crate::calculator::evaluate(query) {
-        let token =
-            registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
         let item = crate::model::ResultItem {
             result_id: String::new(),
             activation: LauncherResultActivation::ExecuteResult,
@@ -1881,34 +1969,117 @@ where
             },
         );
     }
-    let token = registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)?;
-    let mut applications = snapshot();
-    decorate(&mut applications);
-    let mut entries = Vec::new();
-    if !query.is_empty() && !query.starts_with('/') {
-        entries.push((
-            crate::model::ResultItem {
-                result_id: String::new(),
-                activation: LauncherResultActivation::ExecuteResult,
-                title: crate::web_search::search_result_title(web_search_engine).into(),
-                subtitle: Some(format!("搜索：{query}")),
-                icon: None,
-                plugin_icon_url: None,
-                icon_kind: Some(ResultIconKind::WebSearch),
-                detail: None,
-                has_default_action: true,
-            },
-            ResultAction::OpenWebSearch {
-                engine: web_search_engine,
-                query: query.to_owned(),
-            },
-        ));
+
+    let mut command_hint = None;
+    let mut replace_local_results = false;
+    let mut entries: Vec<(crate::model::ResultItem, Option<ResultAction>)> = Vec::new();
+    if query == "/web-search" {
+        command_hint = Some("请输入搜索内容".into());
+        replace_local_results = true;
+    } else if let Some(argument) = query.strip_prefix("/web-search ") {
+        let argument = argument.trim();
+        if argument.is_empty() {
+            command_hint = Some("请输入搜索内容".into());
+        } else {
+            entries.push((
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    activation: LauncherResultActivation::ExecuteResult,
+                    title: crate::web_search::search_result_title(web_search_engine).into(),
+                    subtitle: Some(format!("搜索：{argument}")),
+                    icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: Some(ResultIconKind::WebSearch),
+                    detail: None,
+                    has_default_action: true,
+                },
+                Some(ResultAction::OpenWebSearch {
+                    engine: web_search_engine,
+                    query: argument.to_owned(),
+                }),
+            ));
+        }
+        replace_local_results = true;
+    } else if query.starts_with('/') {
+        replace_local_results = true;
+    } else {
+        let mut suggestions = plugin_catalog(query).unwrap_or_default();
+        suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        if query.is_empty() {
+            entries.extend(completion_result(
+                "find",
+                "搜索文件".into(),
+                Some(ResultIconKind::Find),
+                None,
+                None,
+            ));
+            entries.extend(completion_result(
+                "web-search",
+                "使用默认搜索引擎搜索".into(),
+                Some(ResultIconKind::WebSearch),
+                None,
+                None,
+            ));
+        } else {
+            entries.push((
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    activation: LauncherResultActivation::OpenFind {
+                        query: query.to_owned(),
+                    },
+                    title: "/find".into(),
+                    subtitle: Some(format!("搜索文件：{query}")),
+                    icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: Some(ResultIconKind::Find),
+                    detail: None,
+                    has_default_action: false,
+                },
+                None,
+            ));
+            entries.push((
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    activation: LauncherResultActivation::ExecuteResult,
+                    title: crate::web_search::search_result_title(web_search_engine).into(),
+                    subtitle: Some(format!("搜索：{query}")),
+                    icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: Some(ResultIconKind::WebSearch),
+                    detail: None,
+                    has_default_action: true,
+                },
+                Some(ResultAction::OpenWebSearch {
+                    engine: web_search_engine,
+                    query: query.to_owned(),
+                }),
+            ));
+        }
+        for suggestion in suggestions {
+            let exact_name = query.eq_ignore_ascii_case(&suggestion.effective_name)
+                || query
+                    .strip_prefix('/')
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&suggestion.effective_name));
+            entries.extend(completion_result(
+                &suggestion.effective_name,
+                suggestion.summary.unwrap_or(suggestion.display_name),
+                None,
+                suggestion.icon_url,
+                (!query.is_empty() && !exact_name).then_some(query),
+            ));
+        }
+        if !query.is_empty() {
+            let mut applications = snapshot();
+            decorate(&mut applications);
+            entries.extend(
+                apps::rank(&applications, query)
+                    .iter()
+                    .map(apps::registry_entry)
+                    .map(|(item, action)| (item, Some(action))),
+            );
+        }
     }
-    entries.extend(
-        apps::rank(&applications, query)
-            .iter()
-            .map(apps::registry_entry),
-    );
+
     registry.publish_if_latest(
         token,
         entries,
@@ -1922,9 +2093,9 @@ where
                     item
                 })
                 .collect(),
-            command_hint: None,
+            command_hint,
             window_transfer_token: None,
-            replace_local_results: false,
+            replace_local_results,
         },
     )
 }
@@ -2832,7 +3003,7 @@ mod tests {
         public_plugin_search_decision, publish_everything_search,
         publish_public_command_suggestions, require_find_label, require_main_label,
         resolve_invocation_theme, save_settings_core, save_settings_with,
-        save_settings_worker_with, search_apps_with, search_files_with,
+        save_settings_worker_with, search_apps_with, search_apps_with_catalog, search_files_with,
         select_public_plugin_source_with, set_file_preview_preference_with, CommandError,
         ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HotkeySettingsUpdate,
         PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate, UserSettingsUpdate,
@@ -3045,6 +3216,174 @@ mod tests {
             public_plugin_search_decision(&route, true),
             PublicPluginSearchDecision::Ignore
         );
+    }
+
+    fn command_suggestion(name: &str) -> PublicCommandSuggestion {
+        PublicCommandSuggestion {
+            effective_name: name.into(),
+            display_name: format!("Plugin {name}"),
+            summary: Some(format!("Use {name}")),
+            icon_url: None,
+        }
+    }
+
+    fn completion_text(item: &crate::model::ResultItem) -> Option<&str> {
+        match &item.activation {
+            crate::model::LauncherResultActivation::Completion { completion_text } => {
+                Some(completion_text)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn launcher_empty_query_publishes_capabilities_without_reading_applications() {
+        let registry = ready_registry("launcher-empty");
+        let response = search_apps_with_catalog(
+            &registry,
+            "   ",
+            "launcher-empty",
+            1,
+            |_| {
+                Ok(vec![
+                    command_suggestion("demo-win"),
+                    command_suggestion("alpha"),
+                ])
+            },
+            || panic!("empty launcher query must not read the application snapshot"),
+            |_| panic!("empty launcher query must not decorate applications"),
+            WebSearchEngine::Bing,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| (item.title.as_str(), completion_text(item)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/find", Some("/find ")),
+                ("/web-search", Some("/web-search ")),
+                ("/alpha", Some("/alpha ")),
+                ("/demo-win", Some("/demo-win ")),
+            ]
+        );
+        for item in &response.items {
+            assert_eq!(
+                registry.resolve(&response.request_id, &item.result_id),
+                Err(RegistryError::UnknownResult)
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_plain_query_orders_find_web_plugins_then_applications() {
+        let registry = ready_registry("launcher-plain");
+        let response = search_apps_with_catalog(
+            &registry,
+            "  win  ",
+            "launcher-plain",
+            1,
+            |query| {
+                assert_eq!(query, "win");
+                Ok(vec![command_suggestion("demo-win")])
+            },
+            || {
+                vec![Application {
+                    app_id: "app-windows-terminal".into(),
+                    display_name: "Windows Terminal".into(),
+                    target: ApplicationLaunchTarget::Shortcut {
+                        shortcut: PathBuf::from(r"C:\Private\Windows Terminal.lnk"),
+                        executable: None,
+                    },
+                    icon: None,
+                    use_count: 0,
+                }]
+            },
+            |_| {},
+            WebSearchEngine::Google,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/find", "Google 搜索", "/demo-win", "Windows Terminal"]
+        );
+        assert_eq!(
+            response.items[0].activation,
+            crate::model::LauncherResultActivation::OpenFind {
+                query: "win".into()
+            }
+        );
+        assert_eq!(completion_text(&response.items[2]), Some("/demo-win win"));
+        assert_eq!(
+            registry.resolve(&response.request_id, &response.items[0].result_id),
+            Err(RegistryError::UnknownResult)
+        );
+        assert!(matches!(
+            registry.resolve(&response.request_id, &response.items[1].result_id),
+            Ok(ResultAction::OpenWebSearch { engine: WebSearchEngine::Google, query }) if query == "win"
+        ));
+    }
+
+    #[test]
+    fn launcher_catalog_failure_keeps_built_ins_and_direct_web_command_uses_engine() {
+        let registry = ready_registry("launcher-fallback");
+        let fallback = search_apps_with_catalog(
+            &registry,
+            "",
+            "launcher-fallback",
+            1,
+            |_| Err(crate::public_plugins::PublicPluginManagementError::Unavailable),
+            || panic!("empty launcher query must not read applications"),
+            |_| {},
+            WebSearchEngine::Baidu,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/find", "/web-search"]
+        );
+
+        let direct = search_apps_with_catalog(
+            &registry,
+            " /web-search  UiPilot docs ",
+            "launcher-fallback",
+            2,
+            |_| panic!("reserved web command must not read plugin inventory"),
+            || panic!("reserved web command must not read applications"),
+            |_| {},
+            WebSearchEngine::Baidu,
+        )
+        .unwrap();
+        assert_eq!(direct.items.len(), 1);
+        assert!(matches!(
+            registry.resolve(&direct.request_id, &direct.items[0].result_id),
+            Ok(ResultAction::OpenWebSearch { engine: WebSearchEngine::Baidu, query }) if query == "UiPilot docs"
+        ));
+
+        let hint = search_apps_with_catalog(
+            &registry,
+            "/web-search   ",
+            "launcher-fallback",
+            3,
+            |_| panic!("reserved web hint must not read plugin inventory"),
+            || panic!("reserved web hint must not read applications"),
+            |_| {},
+            WebSearchEngine::Baidu,
+        )
+        .unwrap();
+        assert!(hint.items.is_empty());
+        assert_eq!(hint.command_hint.as_deref(), Some("请输入搜索内容"));
     }
 
     const APP_CURRENT: &str =
@@ -3639,12 +3978,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(response.items.len(), 21);
-        assert_eq!(response.items[0].title, "Bing 搜索");
-        assert_eq!(response.items[0].subtitle.as_deref(), Some("搜索：app"));
+        assert_eq!(response.items.len(), 22);
+        assert_eq!(response.items[0].title, "/find");
+        assert_eq!(response.items[1].title, "Bing 搜索");
+        assert_eq!(response.items[1].subtitle.as_deref(), Some("搜索：app"));
         assert_eq!(
             registry
-                .resolve(&response.request_id, &response.items[0].result_id)
+                .resolve(&response.request_id, &response.items[1].result_id)
                 .unwrap(),
             ResultAction::OpenWebSearch {
                 engine: WebSearchEngine::Bing,
@@ -3656,7 +3996,7 @@ mod tests {
             assert!(!json.contains(private));
         }
         assert!(registry
-            .resolve(&response.request_id, &response.items[0].result_id)
+            .resolve(&response.request_id, &response.items[1].result_id)
             .is_ok());
     }
 
@@ -3680,15 +4020,15 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(response.items[0].title, expected_title);
-            assert_eq!(response.items[0].subtitle.as_deref(), Some("搜索：windows"));
+            assert_eq!(response.items[1].title, expected_title);
+            assert_eq!(response.items[1].subtitle.as_deref(), Some("搜索：windows"));
             assert_eq!(
-                response.items[0].icon_kind,
+                response.items[1].icon_kind,
                 Some(crate::model::ResultIconKind::WebSearch)
             );
             assert_eq!(
                 registry
-                    .resolve(&response.request_id, &response.items[0].result_id)
+                    .resolve(&response.request_id, &response.items[1].result_id)
                     .unwrap(),
                 ResultAction::OpenWebSearch {
                     engine,
@@ -3780,7 +4120,7 @@ mod tests {
     }
 
     #[test]
-    fn search_empty_query_publishes_an_empty_result_set() {
+    fn search_empty_query_publishes_only_builtin_completions() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation".into());
         let response = search_apps_with(
@@ -3788,12 +4128,19 @@ mod tests {
             "",
             "invocation",
             1,
-            || vec![application(1)],
-            |_| {},
+            || panic!("empty query must not read applications"),
+            |_| panic!("empty query must not decorate applications"),
             WebSearchEngine::Bing,
         )
         .unwrap();
-        assert!(response.items.is_empty());
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/find", "/web-search"]
+        );
     }
 
     #[test]
@@ -4486,7 +4833,7 @@ mod tests",
             WebSearchEngine::Bing,
         )
         .unwrap();
-        let result_id = &response.items[0].result_id;
+        let result_id = &response.items[1].result_id;
         assert!(registry.resolve(&response.request_id, result_id).is_ok());
 
         assert_eq!(
