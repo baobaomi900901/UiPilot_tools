@@ -1507,7 +1507,7 @@ pub(crate) async fn search_apps(
     let public = app.state::<Arc<PublicPluginService>>();
     let normalized_query = query.trim().to_owned();
     let web_search_engine = settings.snapshot().web_search_engine;
-    if !normalized_query.starts_with('/') {
+    if !normalized_query.starts_with('/') || normalized_query == "/" {
         return Ok(search_apps_with_catalog(
             registry,
             &normalized_query,
@@ -1676,7 +1676,7 @@ pub(crate) async fn search_apps(
 
 fn plugin_discovery_prefix(query: &str) -> Option<&str> {
     let command = query.strip_prefix('/')?;
-    (!command.contains(' ')).then_some(command)
+    (!command.is_empty() && !command.contains(' ')).then_some(command)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1973,6 +1973,7 @@ where
     let mut command_hint = None;
     let mut replace_local_results = false;
     let mut entries: Vec<(crate::model::ResultItem, Option<ResultAction>)> = Vec::new();
+    let catalog_query = if query == "/" { "" } else { query };
     if query == "/web-search" {
         command_hint = Some("请输入搜索内容".into());
         replace_local_results = true;
@@ -2000,12 +2001,12 @@ where
             ));
         }
         replace_local_results = true;
-    } else if query.starts_with('/') {
+    } else if query.starts_with('/') && query != "/" {
         replace_local_results = true;
     } else {
-        let mut suggestions = plugin_catalog(query).unwrap_or_default();
+        let mut suggestions = plugin_catalog(catalog_query).unwrap_or_default();
         suggestions.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
-        if query.is_empty() {
+        if catalog_query.is_empty() {
             entries.extend(completion_result(
                 "find",
                 "搜索文件".into(),
@@ -2025,10 +2026,10 @@ where
                 crate::model::ResultItem {
                     result_id: String::new(),
                     activation: LauncherResultActivation::OpenFind {
-                        query: query.to_owned(),
+                        query: catalog_query.to_owned(),
                     },
                     title: "/find".into(),
-                    subtitle: Some(format!("搜索文件：{query}")),
+                    subtitle: Some(format!("搜索文件：{catalog_query}")),
                     icon: None,
                     plugin_icon_url: None,
                     icon_kind: Some(ResultIconKind::Find),
@@ -2051,13 +2052,13 @@ where
                 },
                 Some(ResultAction::OpenWebSearch {
                     engine: web_search_engine,
-                    query: query.to_owned(),
+                    query: catalog_query.to_owned(),
                 }),
             ));
         }
         for suggestion in suggestions {
-            let exact_name = query.eq_ignore_ascii_case(&suggestion.effective_name)
-                || query
+            let exact_name = catalog_query.eq_ignore_ascii_case(&suggestion.effective_name)
+                || catalog_query
                     .strip_prefix('/')
                     .is_some_and(|value| value.eq_ignore_ascii_case(&suggestion.effective_name));
             entries.extend(completion_result(
@@ -2065,14 +2066,14 @@ where
                 suggestion.summary.unwrap_or(suggestion.display_name),
                 None,
                 suggestion.icon_url,
-                (!query.is_empty() && !exact_name).then_some(query),
+                (!catalog_query.is_empty() && !exact_name).then_some(catalog_query),
             ));
         }
-        if !query.is_empty() {
+        if !catalog_query.is_empty() {
             let mut applications = snapshot();
             decorate(&mut applications);
             entries.extend(
-                apps::rank(&applications, query)
+                apps::rank(&applications, catalog_query)
                     .iter()
                     .map(apps::registry_entry)
                     .map(|(item, action)| (item, Some(action))),
@@ -3075,7 +3076,7 @@ mod tests {
     #[test]
     fn public_plugin_command_discovery_publishes_safe_completions_and_hint() {
         for (query, expected) in [
-            ("/", Some("")),
+            ("/", None),
             ("/a", Some("a")),
             ("/alpha-window", Some("alpha-window")),
             ("/alpha-window ", None),
@@ -3277,6 +3278,34 @@ mod tests {
                 Err(RegistryError::UnknownResult)
             );
         }
+    }
+
+    #[test]
+    fn launcher_slash_query_publishes_the_command_catalog_without_reading_applications() {
+        let registry = ready_registry("launcher-slash");
+        let response = search_apps_with_catalog(
+            &registry,
+            "/",
+            "launcher-slash",
+            1,
+            |query| {
+                assert_eq!(query, "");
+                Ok(vec![command_suggestion("alpha")])
+            },
+            || panic!("slash command catalog must not read the application snapshot"),
+            |_| panic!("slash command catalog must not decorate applications"),
+            WebSearchEngine::Bing,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/find", "/web-search", "/alpha"]
+        );
     }
 
     #[test]
