@@ -1,6 +1,6 @@
 # Launcher Default Capabilities Design
 
-**Status:** Draft - revision 3 awaiting independent review
+**Status:** Approved - revision 3 passed independent review
 
 **Date:** 2026-08-23
 
