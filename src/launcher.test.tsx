@@ -1439,8 +1439,37 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().query).toBe('unrelated')
   })
 
+  it('keeps a current favorite failure local and publishes only the fixed error', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.setPublicPluginFavorite).mockRejectedValueOnce({
+      code: 'pluginListFailed', message: 'private backend detail',
+    })
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `favorite-failure-${request.querySequence}`,
+      items: request.query === 'abc' ? [{
+        resultId: 'demo-completion', title: '/demo-win',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win abc',
+          pluginId: 'com.uipilot.demo-win', favorite: false,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('favorite-current-failure'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    const resultKey = core.getSnapshot().results[0]?.key
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, true)
+    core.closePluginContextMenu()
+    await vi.waitFor(() => expect(core.getSnapshot().favoriteMutationPending).toBe(false))
+    expect(core.getSnapshot()).toMatchObject({ query: 'abc', status: '操作不可用，请重试。' })
+    expect(core.getSnapshot().results[0]?.key).toBe(resultKey)
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend detail')
+  })
+
   it('keeps late favorite success and failure inert after interaction ownership changes', async () => {
-    for (const invalidation of ['keyboard', 'menu', 'hideReopen'] as const) {
+    for (const invalidation of ['keyboard', 'edit', 'pointer', 'menu', 'view', 'hideReopen'] as const) {
       const { core, client, emit } = await startedCore()
       const mutation = deferred<void>()
       vi.mocked(client.setPublicPluginFavorite).mockReturnValueOnce(mutation.promise)
@@ -1472,15 +1501,24 @@ describe('shown and search ownership', () => {
       core.closePluginContextMenu()
 
       if (invalidation === 'keyboard') core.keyDown('ArrowDown', false)
+      if (invalidation === 'edit') core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'changed', inputType: 'insertText',
+      })
+      if (invalidation === 'pointer') core.activateResult(1)
       if (invalidation === 'menu') core.openPluginContextMenu(1)
+      if (invalidation === 'view') core.navigate('settings')
       if (invalidation === 'hideReopen') {
         await core.requestHide()
         emit(shown(`favorite-reopened-${invalidation}`))
         await new Promise((resolve) => setTimeout(resolve, 0))
       }
+      if (invalidation === 'edit') {
+        await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+      }
       const searches = vi.mocked(client.searchApps).mock.calls.length
       const statusBeforeSettlement = core.getSnapshot().status
-      if (invalidation === 'keyboard') mutation.resolve()
+      if (invalidation === 'keyboard' || invalidation === 'edit' || invalidation === 'view') mutation.resolve()
       else mutation.reject({ code: 'pluginListFailed' })
       await mutation.promise.catch(() => undefined)
       await Promise.resolve()
