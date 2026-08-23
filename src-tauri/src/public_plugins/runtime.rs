@@ -8,10 +8,12 @@ use crate::message_center::{
 };
 
 use super::{
+    data_call_gate::{DataCallGateError, PluginDataCallGate, PluginDataCallIdentity},
     delayed_messages::{
         DelayedMessageRegistration, DelayedMessageScheduleError, DelayedMessageScheduler,
     },
     scheduler::{PluginContextAccessError, PluginCurrentRequest, PluginRequestScheduler},
+    storage::PluginStorageError,
     PluginDataScope, PluginRequestContext, PluginSecretStore, PluginStateStore, PluginStorageStore,
     PublicManifestV1, PublicPermission,
 };
@@ -179,6 +181,7 @@ impl std::error::Error for PluginRuntimeError {}
 
 pub(crate) struct PluginRuntimeApi {
     scheduler: Arc<PluginRequestScheduler>,
+    data_gate: Arc<PluginDataCallGate>,
     state: Arc<PluginStateStore>,
     storage: Arc<PluginStorageStore>,
     secrets: Arc<PluginSecretStore>,
@@ -212,8 +215,9 @@ impl PluginApiExecution {
 }
 
 impl PluginRuntimeApi {
-    pub(crate) fn new(
+    pub(super) fn new(
         scheduler: Arc<PluginRequestScheduler>,
+        data_gate: Arc<PluginDataCallGate>,
         state: Arc<PluginStateStore>,
         storage: Arc<PluginStorageStore>,
         secrets: Arc<PluginSecretStore>,
@@ -222,6 +226,7 @@ impl PluginRuntimeApi {
     ) -> Self {
         Self {
             scheduler,
+            data_gate,
             state,
             storage,
             secrets,
@@ -273,6 +278,28 @@ impl PluginRuntimeApi {
         if request.notification.is_some() {
             return PluginApiExecution::failed(PluginRuntimeError::InvalidOperation);
         }
+        let _data_lease = if matches!(
+            request.operation,
+            PluginApiOperation::StorageGet
+                | PluginApiOperation::StorageSet
+                | PluginApiOperation::StorageRemove
+        ) {
+            let identity = match PluginDataCallIdentity::new(
+                &request.context.plugin_id,
+                current.plugin_generation(),
+                current.activation_id(),
+                current.admission_epoch(),
+            ) {
+                Ok(identity) => identity,
+                Err(_) => return PluginApiExecution::failed(PluginRuntimeError::InvalidContext),
+            };
+            match self.data_gate.try_acquire(&identity) {
+                Ok(lease) => Some(lease),
+                Err(error) => return PluginApiExecution::failed(map_data_gate_error(error)),
+            }
+        } else {
+            None
+        };
         PluginApiExecution::complete(self.execute_data_api(scope, request, manifest), None)
     }
 
@@ -295,13 +322,13 @@ impl PluginRuntimeApi {
                         .ok_or(PluginRuntimeError::InvalidOperation)?,
                 )
                 .map(|value| value.unwrap_or(Value::Null))
-                .map_err(|_| PluginRuntimeError::Storage),
+                .map_err(map_storage_error),
             PluginApiOperation::StorageSet => {
                 let key = request.key.ok_or(PluginRuntimeError::InvalidOperation)?;
                 let value = request.value.ok_or(PluginRuntimeError::InvalidOperation)?;
                 self.storage
                     .set(scope, plugin_id, &key, value)
-                    .map_err(|_| PluginRuntimeError::Storage)?;
+                    .map_err(map_storage_error)?;
                 Ok(Value::Null)
             }
             PluginApiOperation::StorageRemove if request.value.is_none() => {
@@ -314,7 +341,7 @@ impl PluginRuntimeApi {
                             .as_deref()
                             .ok_or(PluginRuntimeError::InvalidOperation)?,
                     )
-                    .map_err(|_| PluginRuntimeError::Storage)?;
+                    .map_err(map_storage_error)?;
                 Ok(Value::Null)
             }
             PluginApiOperation::SettingGet if request.value.is_none() => self
@@ -494,6 +521,28 @@ impl PluginRuntimeApi {
             Err(DelayedMessageScheduleError::Unavailable) => {
                 PluginApiExecution::failed(PluginRuntimeError::Unavailable)
             }
+        }
+    }
+}
+
+fn map_data_gate_error(error: DataCallGateError) -> PluginRuntimeError {
+    match error {
+        DataCallGateError::InvalidIdentity => PluginRuntimeError::InvalidContext,
+        DataCallGateError::Expired => PluginRuntimeError::ExpiredRequest,
+        DataCallGateError::Unavailable => PluginRuntimeError::Unavailable,
+    }
+}
+
+fn map_storage_error(error: PluginStorageError) -> PluginRuntimeError {
+    match error {
+        PluginStorageError::InvalidKey | PluginStorageError::InvalidValue => {
+            PluginRuntimeError::InvalidOperation
+        }
+        PluginStorageError::Storage | PluginStorageError::QuotaExceeded => {
+            PluginRuntimeError::Storage
+        }
+        PluginStorageError::InvalidPlugin | PluginStorageError::InvalidScope => {
+            PluginRuntimeError::InvalidContext
         }
     }
 }
@@ -739,6 +788,7 @@ mod tests {
     ) -> (
         PluginRuntimeApi,
         Arc<PluginRequestScheduler>,
+        Arc<PluginDataCallGate>,
         Arc<DelayedMessageScheduler>,
         ScheduledPluginRequest,
         String,
@@ -753,8 +803,13 @@ mod tests {
         let storage = Arc::new(PluginStorageStore::load(&dir.path().join("storage")).unwrap());
         let secrets = Arc::new(PluginSecretStore::load(&dir.path().join("secrets")).unwrap());
         let delayed_messages = Arc::new(DelayedMessageScheduler::default());
+        let data_gate = Arc::new(PluginDataCallGate::default());
+        data_gate
+            .activate(PluginDataCallIdentity::new(&persisted_manifest.plugin_id, 1, 1, 1).unwrap())
+            .unwrap();
         let api = PluginRuntimeApi::new(
             Arc::clone(&scheduler),
+            Arc::clone(&data_gate),
             state,
             storage,
             secrets,
@@ -784,7 +839,14 @@ mod tests {
             PluginScheduleOutcome::Waiting { .. } => panic!("first request must dispatch"),
         };
         let label = runtime_label(&persisted_manifest.plugin_id, 1).unwrap();
-        (api, scheduler, delayed_messages, scheduled, label)
+        (
+            api,
+            scheduler,
+            data_gate,
+            delayed_messages,
+            scheduled,
+            label,
+        )
     }
 
     #[derive(Clone, Copy)]
@@ -864,8 +926,13 @@ mod tests {
         let storage = Arc::new(PluginStorageStore::load(&dir.path().join("storage")).unwrap());
         let secrets = Arc::new(PluginSecretStore::load(&dir.path().join("secrets")).unwrap());
         let publisher = Arc::new(FakePublisher::new([]));
+        let data_gate = Arc::new(PluginDataCallGate::default());
+        data_gate
+            .activate(PluginDataCallIdentity::new("com.example.runtime", 1, 1, 1).unwrap())
+            .unwrap();
         let api = PluginRuntimeApi::new(
             Arc::clone(&scheduler),
+            data_gate,
             state,
             storage,
             secrets,
@@ -953,6 +1020,69 @@ mod tests {
     }
 
     #[test]
+    fn runtime_storage_requires_current_data_lease_and_maps_storage_errors_exactly() {
+        let dir = TestDir::new();
+        let persisted = manifest();
+        let publisher = Arc::new(FakePublisher::new([]));
+        let (api, _, data_gate, _, scheduled, label) =
+            runtime_fixture(&dir, &persisted, BTreeSet::new(), publisher);
+
+        let mut invalid_key = request(scheduled.context.clone(), PluginApiOperation::StorageSet);
+        invalid_key.key = Some("Uppercase".into());
+        invalid_key.value = Some(json!(true));
+        assert_eq!(
+            api.execute(&label, invalid_key, &persisted).result,
+            Err(PluginRuntimeError::InvalidOperation)
+        );
+
+        let mut invalid_value = request(scheduled.context.clone(), PluginApiOperation::StorageSet);
+        invalid_value.value = Some(json!({ "nested": { "constructor": true } }));
+        assert_eq!(
+            api.execute(&label, invalid_value, &persisted).result,
+            Err(PluginRuntimeError::InvalidOperation)
+        );
+
+        let identity = PluginDataCallIdentity::new(&persisted.plugin_id, 1, 1, 1).unwrap();
+        let drain = data_gate.close(&identity).unwrap();
+        let mut closed = request(scheduled.context.clone(), PluginApiOperation::StorageSet);
+        closed.value = Some(json!("rejected"));
+        assert_eq!(
+            api.execute(&label, closed, &persisted).result,
+            Err(PluginRuntimeError::ExpiredRequest)
+        );
+        drain.wait().unwrap();
+    }
+
+    #[test]
+    fn runtime_storage_error_classes_are_stable() {
+        for (error, expected) in [
+            (
+                PluginStorageError::InvalidKey,
+                PluginRuntimeError::InvalidOperation,
+            ),
+            (
+                PluginStorageError::InvalidValue,
+                PluginRuntimeError::InvalidOperation,
+            ),
+            (PluginStorageError::Storage, PluginRuntimeError::Storage),
+            (
+                PluginStorageError::QuotaExceeded,
+                PluginRuntimeError::Storage,
+            ),
+            (
+                PluginStorageError::InvalidPlugin,
+                PluginRuntimeError::InvalidContext,
+            ),
+            (
+                PluginStorageError::InvalidScope,
+                PluginRuntimeError::InvalidContext,
+            ),
+        ] {
+            assert_eq!(map_storage_error(error), expected);
+        }
+    }
+
+    #[test]
     fn runtime_labels_and_bootstrap_are_narrow() {
         let label = runtime_label("com.example.runtime", 42).unwrap();
         assert!(label.starts_with(PUBLIC_RUNTIME_LABEL_PREFIX));
@@ -976,7 +1106,7 @@ mod tests {
         let persisted = manifest();
         let declared = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, _, _, scheduled, label) =
+        let (api, _, _, _, scheduled, label) =
             runtime_fixture(&dir, &persisted, BTreeSet::new(), publisher.clone());
         let input = Some(json!({ "content": "message" }));
 
@@ -1006,7 +1136,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, _, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1053,7 +1183,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, _, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1081,7 +1211,7 @@ mod tests {
             FakePublishOutcome::OperationFailed,
             FakePublishOutcome::Succeed,
         ]));
-        let (api, _, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1107,7 +1237,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let message_center = Arc::new(MessageCenterService::load(dir.path()));
-        let (api, scheduler, _, scheduled, label) = runtime_fixture(
+        let (api, scheduler, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1172,7 +1302,7 @@ mod tests {
         .unwrap();
         let manifest = notification_manifest();
         let message_center = Arc::new(MessageCenterService::load(dir.path()));
-        let (api, _, _, scheduled, label) = runtime_fixture(
+        let (api, _, _, _, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1203,7 +1333,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([]));
-        let (api, scheduler, delayed_messages, scheduled, label) = runtime_fixture(
+        let (api, scheduler, _, delayed_messages, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1260,7 +1390,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::unavailable());
-        let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+        let (api, _, _, delayed_messages, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1297,7 +1427,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([]));
-        let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+        let (api, _, _, delayed_messages, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1369,7 +1499,7 @@ mod tests {
             let dir = TestDir::new();
             let manifest = notification_manifest();
             let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-            let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+            let (api, _, _, delayed_messages, scheduled, label) = runtime_fixture(
                 &dir,
                 &manifest,
                 BTreeSet::from([PublicPermission::NotificationsPublish]),
@@ -1409,7 +1539,7 @@ mod tests {
         let dir = TestDir::new();
         let manifest = notification_manifest();
         let publisher = Arc::new(FakePublisher::new([]));
-        let (api, _, delayed_messages, scheduled, label) = runtime_fixture(
+        let (api, _, _, delayed_messages, scheduled, label) = runtime_fixture(
             &dir,
             &manifest,
             BTreeSet::from([PublicPermission::NotificationsPublish]),

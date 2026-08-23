@@ -1084,15 +1084,22 @@ pub(crate) fn uninstall_plugin(
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
     let manager = service.manager()?;
-    let Some(transaction) = manager.begin_uninstall(&plugin_id, retain_data)? else {
+    let Some(mut transaction) = manager.begin_uninstall(&plugin_id, retain_data)? else {
         return Ok(());
     };
     let previous_runtime_label = transaction.runtime_label.clone();
     if !window_controller.close_for_uninstall(&plugin_id) {
+        let _ = manager.drain_uninstall_data(&mut transaction);
         PublicPluginService::destroy_runtime(&app, previous_runtime_label.as_deref());
         plugin_window::destroy_current(&app, &plugin_id);
         let _ = manager.abort_uninstall_before_commit(transaction);
         return Err(PublicPluginManagementError::Unavailable.into());
+    }
+    if let Err(error) = manager.drain_uninstall_data(&mut transaction) {
+        PublicPluginService::destroy_runtime(&app, previous_runtime_label.as_deref());
+        plugin_window::destroy_current(&app, &plugin_id);
+        let _ = manager.abort_uninstall_before_commit(transaction);
+        return Err(error.into());
     }
     let committed = match manager.commit_uninstall(transaction) {
         Ok(committed) => committed,

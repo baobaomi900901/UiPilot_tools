@@ -129,13 +129,23 @@ struct RunningRequest {
 }
 
 pub(crate) struct PluginCurrentRequest<'a> {
+    plugin_generation: u64,
     activation_id: u64,
+    admission_epoch: u64,
     notification_published: &'a mut bool,
 }
 
 impl PluginCurrentRequest<'_> {
     pub(crate) fn activation_id(&self) -> u64 {
         self.activation_id
+    }
+
+    pub(crate) fn plugin_generation(&self) -> u64 {
+        self.plugin_generation
+    }
+
+    pub(crate) fn admission_epoch(&self) -> u64 {
+        self.admission_epoch
     }
 
     pub(crate) fn notification_published(&self) -> bool {
@@ -340,7 +350,9 @@ impl PluginRequestScheduler {
                 .as_mut()
                 .ok_or(PluginContextAccessError::Unavailable)?;
             Ok(operation(&mut PluginCurrentRequest {
+                plugin_generation: running.request.candidate.plugin_generation,
                 activation_id: running.request.candidate.activation_id,
+                admission_epoch: running.request.candidate.admission_epoch,
                 notification_published: &mut running.notification_published,
             }))
         } else if queue.issued.contains(context) {

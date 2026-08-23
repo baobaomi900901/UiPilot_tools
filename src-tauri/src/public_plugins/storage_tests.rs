@@ -105,6 +105,47 @@ fn quota_failure_keeps_the_previous_value_in_memory_and_on_disk() {
 }
 
 #[test]
+fn storage_keys_follow_the_single_runtime_and_window_contract() {
+    let dir = TestDir::new("keys");
+    let plugin_id = "com.example.keys";
+    let scope = PluginDataScope::new(plugin_id).unwrap();
+    let store = PluginStorageStore::load(dir.path()).unwrap();
+    let max_key = format!("a{}", "9.-".repeat(21));
+    let too_long_key = format!("a{}", "b".repeat(64));
+    assert_eq!(max_key.len(), 64);
+
+    for key in ["a", "pomodoro.duration-minutes", max_key.as_str()] {
+        store.set(&scope, plugin_id, key, json!(key)).unwrap();
+        assert_eq!(store.get(&scope, plugin_id, key).unwrap(), Some(json!(key)));
+    }
+
+    store
+        .set(&scope, plugin_id, "stable", json!("before"))
+        .unwrap();
+    for key in [
+        "",
+        "1starts-with-digit",
+        "Uppercase",
+        "has_underscore",
+        "has/slash",
+        "__proto__",
+        "prototype",
+        "constructor",
+        too_long_key.as_str(),
+    ] {
+        assert_eq!(
+            store.set(&scope, plugin_id, key, json!("rejected")),
+            Err(PluginStorageError::InvalidKey),
+            "key={key}"
+        );
+    }
+    assert_eq!(
+        store.get(&scope, plugin_id, "stable").unwrap(),
+        Some(json!("before"))
+    );
+}
+
+#[test]
 fn uninstall_can_retain_or_delete_private_storage() {
     let dir = TestDir::new("uninstall");
     let plugin_id = "com.example.storage";
@@ -121,4 +162,27 @@ fn uninstall_can_retain_or_delete_private_storage() {
     store.uninstall(plugin_id, false).unwrap();
     assert_eq!(store.get(&scope, plugin_id, "value").unwrap(), None);
     assert!(!dir.path().join(plugin_id).exists());
+}
+
+#[test]
+fn loaded_document_with_legacy_invalid_key_is_quarantined() {
+    let dir = TestDir::new("legacy-invalid-key");
+    let plugin_id = "com.example.legacy";
+    let owner = dir.path().join(plugin_id);
+    fs::create_dir_all(&owner).unwrap();
+    fs::write(
+        owner.join("storage.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "pluginId": plugin_id,
+            "values": { "Uppercase": true }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let store = PluginStorageStore::load(dir.path()).unwrap();
+    let scope = PluginDataScope::new(plugin_id).unwrap();
+    assert_eq!(store.get(&scope, plugin_id, "valid-key").unwrap(), None);
+    assert!(!owner.join("storage.json").exists());
 }

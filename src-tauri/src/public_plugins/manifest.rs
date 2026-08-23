@@ -390,7 +390,12 @@ pub(super) fn valid_command_name(value: &str) -> bool {
 }
 
 pub(super) fn valid_storage_key(value: &str) -> bool {
-    !matches!(value, "__proto__" | "prototype" | "constructor")
+    (1..=64).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        })
+        && !matches!(value, "__proto__" | "prototype" | "constructor")
 }
 
 pub(super) fn valid_setting_key(value: &str) -> bool {

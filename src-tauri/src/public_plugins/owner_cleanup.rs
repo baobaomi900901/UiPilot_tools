@@ -187,6 +187,7 @@ impl PluginOwnerCleanupStore {
         Ok(self.lock()?.document.receipts.contains_key(plugin_id))
     }
 
+    #[cfg(test)]
     pub(super) fn receipt(
         &self,
         plugin_id: &str,

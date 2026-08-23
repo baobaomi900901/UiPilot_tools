@@ -23,6 +23,7 @@ use super::{
         ActivationCandidate, ActivationIdAllocator, ActivationReservation,
         ActivationReservationBook, AdmissionEpochAllocator, ReservationError,
     },
+    data_call_gate::{PluginDataCallDrain, PluginDataCallGate, PluginDataCallIdentity},
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
     manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
@@ -209,6 +210,9 @@ pub(crate) struct PublicPluginUninstallTransaction {
     reservation: ActivationReservation,
     prepared_state: PreparedStateCommit,
     previous_bundle: Option<Arc<super::activation_bundle::ActivationBundle>>,
+    data_identity: Option<PluginDataCallIdentity>,
+    data_drain: Option<PluginDataCallDrain>,
+    data_drained: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +416,7 @@ struct TimerClaimDispatch {
 
 pub(crate) struct PublicPluginManager {
     host: PublicPluginHost,
+    #[cfg(test)]
     app_data_dir: PathBuf,
     staging_root: PathBuf,
     packages_root: PathBuf,
@@ -419,6 +424,7 @@ pub(crate) struct PublicPluginManager {
     storage: Arc<PluginStorageStore>,
     secrets: Arc<PluginSecretStore>,
     scheduler: Arc<PluginRequestScheduler>,
+    data_gate: Arc<PluginDataCallGate>,
     delayed_messages: Arc<DelayedMessageScheduler>,
     message_center: Arc<MessageCenterService>,
     timer_publisher: Arc<dyn MessagePublisher>,
@@ -480,10 +486,12 @@ impl PublicPluginManager {
                 .map_err(|_| PublicPluginManagementError::Unavailable)?,
         );
         let scheduler = Arc::new(PluginRequestScheduler::default());
+        let data_gate = Arc::new(PluginDataCallGate::default());
         let delayed_messages = Arc::new(DelayedMessageScheduler::default());
         let timers = Arc::new(PluginTimerService::new(timer_clock));
         let api = PluginRuntimeApi::new(
             Arc::clone(&scheduler),
+            Arc::clone(&data_gate),
             Arc::clone(&state),
             Arc::clone(&storage),
             Arc::clone(&secrets),
@@ -535,10 +543,25 @@ impl PublicPluginManager {
                             activation_id,
                             admission_epoch,
                         );
+                        let identity = PluginDataCallIdentity::new(
+                            &config.plugin_id,
+                            config.active_generation,
+                            activation_id,
+                            admission_epoch,
+                        )
+                        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                        if data_gate.activate(identity.clone()).is_err() {
+                            let _ = state.disable_for_fault(
+                                &config.plugin_id,
+                                PublicPluginFault::RuntimeUnavailable,
+                            );
+                            continue;
+                        }
                         if bundles
                             .install_initial(&config.plugin_id, candidate.bundle(config.clone()))
                             .is_err()
                         {
+                            let _ = data_gate.remove(&identity);
                             let _ = state.disable_for_fault(
                                 &config.plugin_id,
                                 PublicPluginFault::RuntimeUnavailable,
@@ -562,6 +585,7 @@ impl PublicPluginManager {
         }
         Ok(Self {
             host,
+            #[cfg(test)]
             app_data_dir: app_data_dir.to_path_buf(),
             staging_root,
             packages_root,
@@ -569,6 +593,7 @@ impl PublicPluginManager {
             storage,
             secrets,
             scheduler,
+            data_gate,
             delayed_messages,
             message_center,
             timer_publisher,
@@ -847,6 +872,7 @@ impl PublicPluginManager {
                 )),
             )
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.activate_runtime_data_gate(&runtime)?;
         self.cancel_delayed_messages(&runtime.plugin_id);
         let timer_effects = previous_config
             .as_ref()
@@ -1040,6 +1066,7 @@ impl PublicPluginManager {
             data.staged_by_label.remove(&runtime.label);
             return Err(PublicPluginManagementError::Unavailable);
         }
+        self.activate_runtime_data_gate(&runtime)?;
         self.cancel_delayed_messages(plugin_id);
         let timer_effects = Vec::new();
         self.clear_runtime_faults(plugin_id)?;
@@ -1100,6 +1127,7 @@ impl PublicPluginManager {
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let _ = self.close_runtime_data_gate(&runtime);
         self.cancel_delayed_messages(plugin_id);
         let timer_effects = self.cancel_timer_generation(
             plugin_id,
@@ -1218,6 +1246,8 @@ impl PublicPluginManager {
             reservation,
             prepared_state,
             previous_bundle,
+            data_identity,
+            data_drain,
         ) = {
             let _mutation = self.lock_mutation()?;
             let Some(config) = self.state.config(plugin_id)? else {
@@ -1240,6 +1270,26 @@ impl PublicPluginManager {
                     .forget_plugin(plugin_id)
                     .map_err(|_| PublicPluginManagementError::Unavailable)?;
             }
+            let data_identity = bundle
+                .as_ref()
+                .map(|bundle| {
+                    PluginDataCallIdentity::new(
+                        plugin_id,
+                        bundle.runtime.generation,
+                        bundle.activation_id,
+                        bundle.admission_epoch,
+                    )
+                    .map_err(|_| PublicPluginManagementError::Unavailable)
+                })
+                .transpose()?;
+            let data_drain = data_identity
+                .as_ref()
+                .map(|identity| {
+                    self.data_gate
+                        .close(identity)
+                        .map_err(|_| PublicPluginManagementError::Unavailable)
+                })
+                .transpose()?;
             (
                 config.active_generation,
                 previous_activation_id,
@@ -1247,6 +1297,8 @@ impl PublicPluginManager {
                 reservation,
                 prepared_state,
                 bundle,
+                data_identity,
+                data_drain,
             )
         };
         let number = self
@@ -1266,7 +1318,23 @@ impl PublicPluginManager {
             reservation,
             prepared_state,
             previous_bundle,
+            data_identity,
+            data_drained: data_drain.is_none(),
+            data_drain,
         }))
+    }
+
+    pub(crate) fn drain_uninstall_data(
+        &self,
+        transaction: &mut PublicPluginUninstallTransaction,
+    ) -> Result<(), PublicPluginManagementError> {
+        if let Some(drain) = transaction.data_drain.take() {
+            drain
+                .wait()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        }
+        transaction.data_drained = true;
+        Ok(())
     }
 
     pub(crate) fn abort_uninstall_before_commit(
@@ -1319,6 +1387,7 @@ impl PublicPluginManager {
                 )),
             )
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.activate_runtime_data_gate(&runtime)?;
         reservation.begin_committing()?;
         reservation.mark_durable()?;
         reservation.publish(Some(candidate.bundle(config)))?;
@@ -1330,6 +1399,12 @@ impl PublicPluginManager {
         &self,
         transaction: PublicPluginUninstallTransaction,
     ) -> Result<PublicPluginUninstallCommit, PublicPluginUninstallCommitFailure> {
+        if !transaction.data_drained || transaction.data_drain.is_some() {
+            return Err(PublicPluginUninstallCommitFailure {
+                error: PublicPluginManagementError::Unavailable,
+                transaction: Some(transaction),
+            });
+        }
         let receipt = (!transaction.retain_data)
             .then(|| {
                 PluginOwnerCleanupReceipt::new(
@@ -1381,6 +1456,9 @@ impl PublicPluginManager {
             .unwrap_or_default();
         self.state.publish_prepared(transaction.prepared_state)?;
         transaction.reservation.publish(None)?;
+        if let Some(identity) = transaction.data_identity.as_ref() {
+            let _ = self.data_gate.remove(identity);
+        }
         self.lock_data()?
             .active_by_plugin
             .remove(&transaction.plugin_id);
@@ -1437,9 +1515,10 @@ impl PublicPluginManager {
         plugin_id: &str,
         retain_data: bool,
     ) -> Result<Option<String>, PublicPluginManagementError> {
-        let Some(transaction) = self.begin_uninstall(plugin_id, retain_data)? else {
+        let Some(mut transaction) = self.begin_uninstall(plugin_id, retain_data)? else {
             return Ok(None);
         };
+        self.drain_uninstall_data(&mut transaction)?;
         let committed = match self.commit_uninstall(transaction) {
             Ok(committed) => committed,
             Err(mut failure) => {
@@ -2308,6 +2387,7 @@ impl PublicPluginManager {
         let timer_effects =
             self.cancel_timer_generation(plugin_id, previous_generation, previous_activation_id);
         let config = self.state.publish_prepared(prepared_state)?;
+        self.activate_runtime_data_gate(&runtime)?;
         reservation.publish(Some(candidate.bundle(config)))?;
         self.lock_data()?
             .active_by_plugin
@@ -2401,7 +2481,7 @@ impl PublicPluginManager {
         activation_id: u64,
         fault: PublicPluginFault,
     ) -> Result<bool, PublicPluginManagementError> {
-        let (generation, reservation, prepared_state) = {
+        let (generation, runtime, reservation, prepared_state) = {
             let _mutation = self.lock_mutation()?;
             let config = self
                 .state
@@ -2417,13 +2497,23 @@ impl PublicPluginManager {
             }
             let reservation = self.bundles.reserve(plugin_id)?;
             let prepared_state = self.state.prepare_disable_for_fault(plugin_id, fault)?;
-            (config.active_generation, reservation, prepared_state)
+            (
+                config.active_generation,
+                bundle.runtime.candidate(
+                    bundle.activation_id,
+                    bundle.admission_epoch,
+                    bundle.runtime_recovery_needed,
+                ),
+                reservation,
+                prepared_state,
+            )
         };
         self.make_state_durable(&reservation, &prepared_state)?;
         let _mutation = self.lock_mutation()?;
         self.scheduler
             .invalidate_plugin(plugin_id, None)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let _ = self.close_runtime_data_gate(&runtime);
         self.cancel_delayed_messages(plugin_id);
         let timer_effects = self.cancel_timer_generation(plugin_id, generation, activation_id);
         self.state.publish_prepared(prepared_state)?;
@@ -2523,6 +2613,38 @@ impl PublicPluginManager {
     ) -> Result<std::sync::MutexGuard<'_, ActivationData>, PublicPluginManagementError> {
         self.data
             .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
+    fn activate_runtime_data_gate(
+        &self,
+        runtime: &PublicRuntimeCandidate,
+    ) -> Result<(), PublicPluginManagementError> {
+        let identity = PluginDataCallIdentity::new(
+            &runtime.plugin_id,
+            runtime.generation,
+            runtime.activation_id,
+            runtime.admission_epoch,
+        )
+        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.data_gate
+            .activate(identity)
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
+    fn close_runtime_data_gate(
+        &self,
+        runtime: &PublicRuntimeCandidate,
+    ) -> Result<PluginDataCallDrain, PublicPluginManagementError> {
+        let identity = PluginDataCallIdentity::new(
+            &runtime.plugin_id,
+            runtime.generation,
+            runtime.activation_id,
+            runtime.admission_epoch,
+        )
+        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.data_gate
+            .close(&identity)
             .map_err(|_| PublicPluginManagementError::Unavailable)
     }
 
@@ -2769,7 +2891,12 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc, Arc,
+        },
+        thread,
+        time::Duration,
     };
 
     use serde_json::json;
@@ -2778,6 +2905,7 @@ mod tests {
     use crate::message_center::MessagePostGuardEffect;
     use crate::public_plugins::{
         delayed_messages::{DelayedMessageRegistration, ScheduledPluginMessage},
+        scheduler::{PluginRequestCandidate, PluginScheduleOutcome, PluginSubmissionOwner},
         timers::{Clock, PluginTimerPhase, PluginTimerStartInput, TimerKey},
         PublicPlatform,
     };
@@ -4310,6 +4438,10 @@ mod tests {
             .unwrap();
         let first_id = manager.activation_id("com.example.activation").unwrap();
         let first_epoch = manager.admission_epoch("com.example.activation").unwrap();
+        let first_data_identity =
+            PluginDataCallIdentity::new("com.example.activation", 1, first_id, first_epoch)
+                .unwrap();
+        assert!(manager.data_gate.try_acquire(&first_data_identity).is_ok());
 
         manager
             .rename("com.example.activation", Some("renamed"))
@@ -4322,6 +4454,7 @@ mod tests {
             manager.admission_epoch("com.example.activation"),
             Some(first_epoch)
         );
+        assert!(manager.data_gate.try_acquire(&first_data_identity).is_ok());
         manager
             .save_settings(
                 "com.example.activation",
@@ -4348,6 +4481,13 @@ mod tests {
         manager.uninstall("com.example.activation", false).unwrap();
         assert_eq!(manager.activation_id("com.example.activation"), None);
         assert_eq!(manager.admission_epoch("com.example.activation"), None);
+        assert_eq!(
+            manager
+                .data_gate
+                .try_acquire(&first_data_identity)
+                .unwrap_err(),
+            crate::public_plugins::data_call_gate::DataCallGateError::Expired
+        );
         let later = now + Duration::from_secs(1);
         let prepared = manager
             .prepare("main", source(&dir.source()), later)
@@ -4360,6 +4500,10 @@ mod tests {
         let second_epoch = manager.admission_epoch("com.example.activation").unwrap();
         assert_ne!(second_id, first_id);
         assert_ne!(second_epoch, first_epoch);
+        let second_data_identity =
+            PluginDataCallIdentity::new("com.example.activation", 1, second_id, second_epoch)
+                .unwrap();
+        assert!(manager.data_gate.try_acquire(&second_data_identity).is_ok());
         for offset in 0..3 {
             assert!(!manager
                 .record_runtime_result(
@@ -4468,7 +4612,7 @@ mod tests {
         let package_owner = manager.packages_root.join("com.example.activation");
         assert!(package_owner.exists());
 
-        let transaction = manager
+        let mut transaction = manager
             .begin_uninstall("com.example.activation", false)
             .unwrap()
             .unwrap();
@@ -4476,6 +4620,7 @@ mod tests {
             .owner_cleanup
             .is_blocked("com.example.activation")
             .unwrap());
+        manager.drain_uninstall_data(&mut transaction).unwrap();
         let committed = manager.commit_uninstall(transaction).unwrap();
 
         assert_eq!(manager.activation_id("com.example.activation"), None);
@@ -4501,6 +4646,85 @@ mod tests {
             .owner_cleanup
             .is_blocked("com.example.activation")
             .unwrap());
+    }
+
+    #[test]
+    fn begin_uninstall_waits_for_runtime_current_guard_and_data_lease() {
+        let dir = TestDir::new("uninstall-runtime-data-lease");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = Arc::new(manager(&dir));
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let route = manager.route("/activation value").unwrap().unwrap();
+        let request = match manager
+            .scheduler
+            .enqueue(
+                PluginRequestCandidate {
+                    plugin_id: route.plugin_id.clone(),
+                    plugin_generation: route.generation,
+                    activation_id: route.activation_id,
+                    admission_epoch: route.admission_epoch,
+                    activation_mode: route.activation_mode,
+                    input: route.input,
+                    owner: PluginSubmissionOwner {
+                        ui_intent_epoch: 1,
+                        control_value: "/activation value".into(),
+                        submission_token: "runtime-data-lease".into(),
+                    },
+                },
+                now,
+            )
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("first request must dispatch"),
+        };
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let runtime_manager = Arc::clone(&manager);
+        let context = request.context.clone();
+        let runtime = thread::spawn(move || {
+            runtime_manager
+                .scheduler
+                .with_current(&context, |current| {
+                    let identity = PluginDataCallIdentity::new(
+                        &context.plugin_id,
+                        current.plugin_generation(),
+                        current.activation_id(),
+                        current.admission_epoch(),
+                    )
+                    .unwrap();
+                    let lease = runtime_manager.data_gate.try_acquire(&identity).unwrap();
+                    entered_sender.send(()).unwrap();
+                    release_receiver.recv().unwrap();
+                    drop(lease);
+                })
+                .unwrap();
+        });
+        entered_receiver.recv().unwrap();
+        let uninstall_manager = Arc::clone(&manager);
+        let (uninstall_sender, uninstall_receiver) = mpsc::channel();
+        let uninstall = thread::spawn(move || {
+            let result = uninstall_manager.begin_uninstall("com.example.activation", false);
+            uninstall_sender.send(result).unwrap();
+        });
+
+        assert!(uninstall_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        release_sender.send(()).unwrap();
+        runtime.join().unwrap();
+        let mut transaction = uninstall_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        uninstall.join().unwrap();
+        manager.drain_uninstall_data(&mut transaction).unwrap();
+        manager.abort_uninstall_before_commit(transaction).unwrap();
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod activation;
 mod activation_bundle;
 mod alarm_asset;
+mod data_call_gate;
 mod delayed_messages;
 mod icon;
 mod manifest;
