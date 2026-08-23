@@ -109,4 +109,4 @@
 - [x] Run `cargo fmt --manifest-path src-tauri/Cargo.toml --check` and `cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features -- -D warnings`.
 - [x] Run `npm.cmd test` and `npm.cmd run build` and confirm zero failures.
 - [x] Compare the implementation against every item in the specification `Acceptance Criteria`, including persistence, disable/re-enable, uninstall/reinstall, `/prefix`, exact `/`, Find, Web Search, calculator, application execution, submit plugins, and live plugins.
-- [ ] Ask the user before manual UI acceptance. The user performs right-click, keyboard, restart, disable/re-enable, and uninstall/reinstall checks; the implementation agent observes logs/results only and never controls mouse or keyboard.
+- [x] Ask the user before manual UI acceptance. The user performs right-click, keyboard, restart, disable/re-enable, and uninstall/reinstall checks; the implementation agent observes logs/results only and never controls mouse or keyboard.
