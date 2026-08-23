@@ -1,6 +1,6 @@
 # Launcher Default Capabilities Design
 
-**Status:** Draft - user-approved interaction, awaiting written-spec confirmation
+**Status:** Draft - revision 2 awaiting independent review
 
 **Date:** 2026-08-23
 
@@ -51,6 +51,19 @@ Choosing a plugin completes rather than executes:
 
 The completed plugin command is invoked only after the user presses Enter again.
 
+### Completion Text Contract
+
+Every completion uses one of these two forms:
+
+```text
+"/<command> "
+"/<command> <argument>"
+```
+
+`command` matches `[a-z][a-z0-9-]{0,31}`. The no-argument form ends with exactly one ASCII space. In the argument form, the argument is non-empty after trimming, has no leading or trailing whitespace, preserves internal spaces, and contains no NUL, carriage return, line feed, `U+2028`, `U+2029`, or Unicode control character. The complete `completionText` is at most 65,536 UTF-8 bytes.
+
+The backend generator and frontend parser enforce this same contract. A backend response that violates it is discarded as malformed rather than partially repaired or executed.
+
 ### Command Text
 
 The existing contracts remain valid:
@@ -71,34 +84,68 @@ It searches `<query>` with the search engine currently selected in persisted set
 
 Calculator recognition and its existing result priority remain unchanged.
 
+Classification priority is fixed as:
+
+1. A valid calculator expression.
+2. Empty input after outer trimming.
+3. Host-reserved `/find` and `/web-search` commands.
+4. Public-plugin slash discovery or exact invocation.
+5. Plain text.
+
+A valid calculator expression returns only the existing calculator result. It is not combined with Find, browser-search, plugin, or application rows.
+
+## Launcher Result Activation Protocol
+
+Every item in the main-launcher `SearchResponse` carries one discriminated activation value:
+
+```ts
+type LauncherResultActivation =
+  | { kind: 'completion'; completionText: string }
+  | { kind: 'openFind'; query: string }
+  | { kind: 'executeResult' }
+```
+
+The combinations are closed:
+
+- `completion` requires a valid `completionText`, has no executable `ResultAction`, and must never call `execute_result`.
+- `openFind` requires the plain-text query captured by that response, has no ordinary `ResultAction`, and invokes the dedicated `open_find_window` transaction.
+- `executeResult` requires a non-empty result ID authorized by the current result-registry request and is the only kind that calls `execute_result`.
+
+Empty-input Find, web-search, and plugin rows use `completion`. A plain-text Find row uses `openFind`. Plain-text browser search, calculator, plugin-produced main results, and computer applications use `executeResult`.
+
+`openFind` deliberately remains outside `ResultAction`; the frontend may activate it only while the response invocation, query sequence, view epoch, control key, and control value are current. It passes that exact owner to `open_find_window`, whose existing conditional retirement/CAS path rejects a stale activation.
+
 ## Architecture
 
-The backend `search_apps` pipeline remains the single source of launcher rows. It will generate built-in capability rows, completion-only plugin rows, and executable application rows from one current query snapshot.
+The backend `search_apps` pipeline remains the single source of launcher rows. It will generate built-in capability rows, completion-only plugin rows, and executable application rows from one current query snapshot. The frontend's current synthetic `localFindResult` is removed.
 
 The frontend must not independently query or merge a second capability list. This preserves one ordering, one selected index, and the existing query-ownership rules.
 
-Executable rows continue to receive result-registry authorization. Completion-only rows carry a backend-validated `completionText`; activating them updates the current input locally and does not call `execute_result`.
+Executable rows continue to receive result-registry authorization. Completion-only and `openFind` rows are published under the current response owner but receive no ordinary result action.
 
 The public-plugin inventory uses each enabled plugin's effective activation command after user settings have been applied. Manifest defaults do not override the effective command. Disabled, failed, unavailable, or uninstalled plugins are absent.
 
 ## Data Flow
 
-1. The frontend publishes the current trusted input using the existing invocation and query sequence.
-2. The backend classifies empty input, plain text, reserved commands, plugin slash commands, and calculator expressions.
-3. For empty input, it builds only built-in and enabled-plugin completion rows.
-4. For plain text, it builds Find and browser actions, matching plugin completion rows, and matching application actions.
+1. Every time the Launcher is shown with a fresh invocation, the frontend increments the application query sequence from zero to one and immediately requests the empty-input snapshot.
+2. Every user edit increments the query sequence. Clearing a non-empty input or entering only whitespace still starts a new empty-input query; it is not treated as a local clear-only operation.
+3. The control retains the user's raw value for ownership. The backend uses the outer-trimmed value for classification and completion arguments.
+4. The backend applies the fixed classifier priority and builds one response. For empty input, it builds only built-in and enabled-plugin completion rows. For plain text, it builds Find and browser actions, matching plugin completion rows, and matching application actions.
 5. It publishes one ordered response for the current query owner.
-6. The frontend accepts the response only if its invocation, sequence, view epoch, and control ownership are still current.
-7. Activating a completion row replaces the input and starts a new query generation. Activating an executable row uses the existing authorized execution path.
+6. The frontend accepts the response only if its invocation, sequence, view epoch, control key, and raw control value are still current.
+7. Activating a completion row replaces the input, increments the sequence, and starts a new query generation. Activating `openFind` uses the dedicated current-owner transaction. Activating `executeResult` uses the current registry request.
+8. Returning from Settings to the Launcher or showing the Launcher again establishes a new invocation and requests a new empty snapshot even if the previous view also ended empty.
 
 ## Failure Behavior
 
 - A stale response never replaces newer text, selection, or results.
 - Continuing to edit immediately invalidates the previous completion owner.
+- A stale `openFind` row cannot begin a focus transfer; both the frontend owner check and backend CAS must reject it.
 - If the enabled-plugin inventory cannot be read, Find and browser search remain available and plugin rows are omitted.
 - Empty input does not start application discovery, file search, browser navigation, or plugin execution.
 - `/web-search` with an empty argument never opens a browser.
-- An invalid completion value is rejected by the existing frontend parser and cannot be executed as a result action.
+- An invalid completion value is rejected by the shared completion-contract parser and cannot be executed as a result action.
+- Observing an empty or whitespace-only edit clears the old visible results immediately, then publishes only the new empty-snapshot response if it remains current.
 
 ## Compatibility
 
@@ -118,9 +165,11 @@ The reserved-command set expands only by `web-search`.
 Backend-focused tests cover:
 
 - Empty-input contents, ordering, and omission of computer applications.
+- Classifier priority, including a calculator expression returning only its existing result.
 - Enabled-only plugin inventory and effective-command ordering.
 - Case-insensitive containment for `d`, `win`, and mixed-case text.
 - Completion values for empty input, exact bare plugin names, exact slash plugin names, and unrelated plain text.
+- Completion grammar for `/demo-win `, `/demo-win da`, preserved internal spaces, outer trimming, byte exhaustion, NUL, line separators, and control characters.
 - Direct `/web-search <query>` execution with each persisted engine.
 - Empty `/web-search` behavior and hint.
 - Installation and settings rejection for a plugin activation name that collides with `web-search`.
@@ -129,10 +178,12 @@ Backend-focused tests cover:
 Frontend-focused tests cover:
 
 - Default selection of the first empty-input row.
+- Empty query on first show, non-empty then clear, whitespace-only edit, and a new empty query after reopening the Launcher.
 - Arrow and mouse selection using the backend order.
 - Completion rows update the input without hiding the launcher or invoking an action.
 - The second Enter executes only after a complete command has been entered.
 - A stale response or completion cannot overwrite newer input.
+- A stale `openFind` row cannot invoke `open_find_window`; a current row passes the exact owning invocation and sequence.
 
 No real-window, foreground-focus, mouse, or keyboard automation is required.
 
