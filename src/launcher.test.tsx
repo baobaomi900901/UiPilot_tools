@@ -235,6 +235,7 @@ function fakeClient() {
     commitPublicPlugin: vi.fn(async () => undefined),
     cancelPublicPlugin: vi.fn(async () => undefined),
     setPublicPluginEnabled: vi.fn(async () => undefined),
+    setPublicPluginFavorite: vi.fn(async () => undefined),
     setPublicPluginEffectiveName: vi.fn(async () => undefined),
     savePublicPluginSettings: vi.fn(async () => undefined),
     uninstallPublicPlugin: vi.fn(async () => undefined),    listPlugins: vi.fn(async () => pluginInventory()),
@@ -736,6 +737,12 @@ describe('shown and search ownership', () => {
       { kind: 'completion', completionText: '/demo-win ' },
       { kind: 'completion', completionText: '/demo-win da  value' },
       { kind: 'completion', completionText: boundary },
+      {
+        kind: 'pluginCompletion',
+        completionText: '/demo-win value',
+        pluginId: 'com.uipilot.demo-win',
+        favorite: true,
+      },
       { kind: 'openFind', query: ' da  value ' },
       { kind: 'executeResult' },
     ]
@@ -758,6 +765,11 @@ describe('shown and search ownership', () => {
       { kind: 'completion', completionText: '/demo-win da\u2028value' },
       { kind: 'completion', completionText: '/demo-win da\u2029value' },
       { kind: 'completion', completionText: '/demo-win da\u0085value' },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'Invalid Plugin', favorite: true },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win' },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: 1 },
+      { kind: 'pluginCompletion', completionText: '/demo win ', pluginId: 'com.uipilot.demo-win', favorite: false },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: true, extra: false },
     ]
     for (const activation of invalid) expect(safeLauncherActivation(activation)).toBeUndefined()
   })
@@ -1148,6 +1160,306 @@ describe('shown and search ownership', () => {
       expect(client.executeResult).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
+    }
+  })
+
+  it('arms a host plugin completion, commits once, and lets a returned action execute', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const preview = deferred<SearchResponse | null>()
+      const commit = deferred<SearchResponse | null>()
+      vi.mocked(client.searchApps).mockImplementation((request) => {
+        if (request.query === 'abc') {
+          return Promise.resolve({
+            requestId: 'catalog',
+            items: [{
+              resultId: 'demo-win-completion',
+              title: '/demo-win',
+              activation: {
+                kind: 'pluginCompletion',
+                completionText: '/demo-win abc',
+                pluginId: 'com.uipilot.demo-win',
+                favorite: true,
+              },
+              hasDefaultAction: false,
+            }],
+          } as unknown as SearchResponse)
+        }
+        return request.completionOrigin?.phase === 'preview' ? preview.promise : commit.promise
+      })
+      emit(shown('plugin-origin'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(client.searchApps).mockClear()
+
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      expect(core.getSnapshot().query).toBe('/demo-win abc')
+      await vi.advanceTimersByTimeAsync(150)
+      expect(client.searchApps).toHaveBeenLastCalledWith({
+        query: '/demo-win abc',
+        invocationId: 'plugin-origin',
+        querySequence: 3,
+        submit: false,
+        completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+      })
+
+      core.keyDown('Enter', false)
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenLastCalledWith({
+        query: '/demo-win abc',
+        invocationId: 'plugin-origin',
+        querySequence: 4,
+        submit: true,
+        completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.demo-win' },
+      })
+      expect(client.searchApps).toHaveBeenCalledTimes(3)
+
+      preview.reject({ code: 'searchUnavailable' })
+      await Promise.resolve()
+      commit.resolve({
+        requestId: 'plugin-result',
+        items: [{ resultId: 'copy', title: 'abc result', activation: executeActivation }],
+      })
+      await commit.promise
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      expect(core.getSnapshot().status).toBe('')
+
+      core.keyDown('Enter', false)
+      expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'plugin-result', resultId: 'copy' })
+      expect(client.searchApps).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('replaces a committing completion with an edited armed owner and rejects late A failure', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const commitA = deferred<SearchResponse | null>()
+      vi.mocked(client.searchApps).mockImplementation((request) => {
+        if (request.query === 'seed') {
+          return Promise.resolve({
+            requestId: 'catalog',
+            items: [{
+              resultId: 'demo-completion',
+              title: '/demo-win',
+              activation: {
+                kind: 'pluginCompletion', completionText: '/demo-win seed',
+                pluginId: 'com.uipilot.demo-win', favorite: true,
+              },
+            }],
+          } as unknown as SearchResponse)
+        }
+        if (request.completionOrigin?.phase === 'commit' && request.query.endsWith('seed')) return commitA.promise
+        return Promise.resolve({ requestId: `preview-${request.querySequence}`, items: [], commandHint: '请输入信息回车' })
+      })
+      emit(shown('plugin-edit-owner'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(client.searchApps).mockClear()
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'seed', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(150)
+      await Promise.resolve()
+      core.keyDown('Enter', false)
+
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/demo-win B', inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(150)
+      expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({
+        query: '/demo-win B', submit: false,
+        completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+      }))
+      commitA.reject({ code: 'windowFailed' })
+      await Promise.resolve()
+      expect(core.getSnapshot()).toMatchObject({ query: '/demo-win B', status: '', commandHint: '请输入信息回车' })
+
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({
+        query: '/demo-win B', submit: true,
+        completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.demo-win' },
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('consumes an ambiguous plugin commit and keeps a third Enter inert', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(client.searchApps).mockImplementation((request) => {
+        if (request.query === 'seed') return Promise.resolve({
+          requestId: 'catalog',
+          items: [{
+            resultId: 'demo-completion', title: '/demo-win',
+            activation: {
+              kind: 'pluginCompletion', completionText: '/demo-win seed',
+              pluginId: 'com.uipilot.demo-win', favorite: true,
+            },
+          }],
+        } as unknown as SearchResponse)
+        if (request.completionOrigin?.phase === 'commit') return Promise.reject({ code: 'windowFailed' })
+        return Promise.resolve({ requestId: 'preview', items: [] })
+      })
+      emit(shown('plugin-consumed'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(client.searchApps).mockClear()
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'seed', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(150)
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(core.getSnapshot().status).toBe('窗口操作失败。'))
+      const calls = vi.mocked(client.searchApps).mock.calls.length
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenCalledTimes(calls)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('makes plugin commit sequence exhaustion absorbing until a new native shown invocation', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client, 3)
+    await core.start()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === ''
+        ? null
+        : request.query === 'seed' ? ({
+            requestId: 'catalog',
+            items: [{
+              resultId: 'demo-completion', title: '/demo-win',
+              activation: {
+                kind: 'pluginCompletion', completionText: '/demo-win seed',
+                pluginId: 'com.uipilot.demo-win', favorite: true,
+              },
+            }],
+          } as unknown as SearchResponse) : ({ requestId: 'preview', items: [] }))
+      fake.emit(shown('plugin-exhausted'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(fake.client.searchApps).mockClear()
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'seed', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(150)
+      core.keyDown('Enter', false)
+      expect(core.getSnapshot().status).toBe('查询次数已达上限，请重新打开主界面。')
+      const calls = vi.mocked(fake.client.searchApps).mock.calls.length
+
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/demo-win edited', inputType: 'insertText',
+      })
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(500)
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(calls)
+      expect(core.getSnapshot().status).toBe('查询次数已达上限，请重新打开主界面。')
+
+      fake.emit(shown('plugin-reopened'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 1, status: '' })
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(calls + 1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('refreshes the captured query after a current favorite mutation succeeds', async () => {
+    const { core, client, emit } = await startedCore()
+    const mutation = deferred<void>()
+    let favorite = false
+    vi.mocked(client.setPublicPluginFavorite).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `favorite-${request.querySequence}`,
+      items: request.query === 'abc' ? [{
+        resultId: 'demo-completion',
+        title: '/demo-win',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win abc',
+          pluginId: 'com.uipilot.demo-win', favorite,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('favorite-current'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    vi.mocked(client.searchApps).mockClear()
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, true)
+    core.closePluginContextMenu()
+    expect(client.setPublicPluginFavorite).toHaveBeenCalledWith({
+      pluginId: 'com.uipilot.demo-win', favorite: true,
+    })
+    expect(core.getSnapshot().favoriteMutationPending).toBe(true)
+    favorite = true
+    mutation.resolve()
+    await mutation.promise
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.pluginCompletion?.favorite).toBe(true))
+    expect(core.getSnapshot()).toMatchObject({ query: 'abc', status: '', favoriteMutationPending: false })
+    expect(client.executeResult).not.toHaveBeenCalled()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('keeps late favorite success and failure inert after interaction ownership changes', async () => {
+    for (const invalidation of ['keyboard', 'menu', 'hideReopen'] as const) {
+      const { core, client, emit } = await startedCore()
+      const mutation = deferred<void>()
+      vi.mocked(client.setPublicPluginFavorite).mockReturnValueOnce(mutation.promise)
+      vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+        requestId: `${invalidation}-${request.querySequence}`,
+        items: request.query === 'abc' ? [
+          {
+            resultId: 'first', title: '/demo-a',
+            activation: {
+              kind: 'pluginCompletion', completionText: '/demo-a abc',
+              pluginId: 'com.uipilot.demo-a', favorite: false,
+            },
+          },
+          {
+            resultId: 'second', title: '/demo-b',
+            activation: {
+              kind: 'pluginCompletion', completionText: '/demo-b abc',
+              pluginId: 'com.uipilot.demo-b', favorite: false,
+            },
+          },
+        ] : [],
+      } as unknown as SearchResponse))
+      emit(shown(`favorite-stale-${invalidation}`))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+      core.openPluginContextMenu(0)
+      core.setPluginFavorite(0, true)
+      core.closePluginContextMenu()
+
+      if (invalidation === 'keyboard') core.keyDown('ArrowDown', false)
+      if (invalidation === 'menu') core.openPluginContextMenu(1)
+      if (invalidation === 'hideReopen') {
+        await core.requestHide()
+        emit(shown(`favorite-reopened-${invalidation}`))
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      const searches = vi.mocked(client.searchApps).mock.calls.length
+      const statusBeforeSettlement = core.getSnapshot().status
+      if (invalidation === 'keyboard') mutation.resolve()
+      else mutation.reject({ code: 'pluginListFailed' })
+      await mutation.promise.catch(() => undefined)
+      await Promise.resolve()
+
+      expect(client.searchApps).toHaveBeenCalledTimes(searches)
+      expect(core.getSnapshot().status).toBe(statusBeforeSettlement)
+      expect(core.getSnapshot().favoriteMutationPending).toBe(false)
+      core.destroy()
     }
   })
   it('commits a prepared plugin window only for the still-current query owner', async () => {
@@ -3793,11 +4105,15 @@ describe('real adapter and startup', () => {
       return Promise.resolve(undefined)
     })
     const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const, webSearchEngine: 'bing' as const }
-    await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
+    await main.client.searchApps({
+      query: '/demo-win calc', invocationId: 'inv-1', querySequence: 1, submit: false,
+      completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+    })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
+    await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', favorite: true })
     await main.client.selectPublicPluginDirectory()
     await main.client.listPlugins()
     await main.client.installPlugin({ pluginId: 'internal.math' })
@@ -3805,11 +4121,15 @@ describe('real adapter and startup', () => {
     await main.client.deletePlugin({ pluginId: 'internal.math' })
     await main.client.hideLauncher()
     const invokeRows = [
-      ['search_apps', [{ query: 'calc', invocationId: 'inv-1', querySequence: 1 }]],
+      ['search_apps', [{
+        query: '/demo-win calc', invocationId: 'inv-1', querySequence: 1, submit: false,
+        completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+      }]],
       ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
+      ['set_plugin_favorite', [{ pluginId: 'com.uipilot.demo-win', favorite: true }]],
       ['select_public_plugin_directory', []],
       ['list_plugins', []],
       ['install_plugin', [{ pluginId: 'internal.math' }]],

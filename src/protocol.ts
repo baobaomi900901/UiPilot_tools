@@ -4,8 +4,22 @@ export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
 
 export type LauncherResultActivation =
   | { kind: 'completion'; completionText: string }
+  | { kind: 'pluginCompletion'; completionText: string; pluginId: string; favorite: boolean }
   | { kind: 'openFind'; query: string }
   | { kind: 'executeResult' }
+
+export type CompletionOrigin = Readonly<{
+  phase: 'preview' | 'commit'
+  pluginId: string
+}>
+
+export interface SearchAppsInput {
+  query: string
+  invocationId: string
+  querySequence: number
+  submit?: boolean
+  completionOrigin?: CompletionOrigin
+}
 
 export interface ResultItem {
   resultId: string
@@ -236,7 +250,7 @@ export interface LauncherClient {
   openMessageCenter(): Promise<unknown>
   readMessageCenter(): Promise<unknown>
   clearMessages(): Promise<unknown>
-  searchApps(input: { query: string; invocationId: string; querySequence: number; submit?: boolean }): Promise<SearchResponse | null>
+  searchApps(input: SearchAppsInput): Promise<SearchResponse | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
@@ -247,6 +261,7 @@ export interface LauncherClient {
   commitPublicPlugin(input: { input: { token: string; permissionGrants: readonly PublicPermission[] } }): Promise<void>
   cancelPublicPlugin(input: { token: string }): Promise<void>
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
+  setPublicPluginFavorite(input: { pluginId: string; favorite: boolean }): Promise<void>
   setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
   savePublicPluginSettings(input: { input: { pluginId: string; settings: Readonly<Record<string, string | number | boolean>>; secrets: Readonly<Record<string, string | null>> } }): Promise<void>
   uninstallPublicPlugin(input: { pluginId: string; retainData: boolean }): Promise<void>
@@ -346,6 +361,7 @@ export interface ViewResult {
   iconKind?: ResultIconKind
   detail?: string
   hasDefaultAction?: boolean
+  pluginCompletion?: Readonly<{ pluginId: string; favorite: boolean }>
 }
 export interface TextControlView {
   key: ControlKey
@@ -450,6 +466,7 @@ export interface LauncherSnapshot {
   searchPending: boolean
   executePending: boolean
   hidePending: boolean
+  favoriteMutationPending: boolean
   shownNotice?: string
   commandHint?: string
   status: string

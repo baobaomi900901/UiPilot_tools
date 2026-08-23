@@ -49,6 +49,9 @@ export interface LauncherCore {
   readonly selectSettingsTab: (key: SettingsTabKey) => void
   readonly requestHide: () => Promise<void>
   readonly activateResult: (index: number) => void
+  readonly openPluginContextMenu: (index: number) => void
+  readonly closePluginContextMenu: () => void
+  readonly setPluginFavorite: (index: number, favorite: boolean) => void
   readonly setAutostart: (checked: boolean) => void
   readonly setThemePreference: (theme: ThemePreference) => void
   readonly setWebSearchEngine: (engine: WebSearchEngine) => void
@@ -114,6 +117,7 @@ interface Model {
   searchPending: boolean
   executePending: boolean
   hidePending: boolean
+  favoriteMutationPending: boolean
   shownNotice?: string
   commandHint?: string
   status: string
@@ -222,6 +226,48 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   dataCleanupPending: '插件已卸载，数据清理将在下次启动时重试',
 }
 
+interface CompletionOriginOwner {
+  token: number
+  phase: 'armed' | 'committing' | 'consumed'
+  epoch: number
+  invocationId: string
+  control: ControlKey
+  querySequence: number
+  value: string
+  resultKey: number
+  pluginId: string
+  command: string
+}
+
+interface ApplicationSearchOwner {
+  token: number
+  epoch: number
+  invocationId: string
+  sequence: number
+  query: string
+  submit: boolean
+  completionOrigin?: {
+    token: number
+    phase: 'preview' | 'commit'
+    pluginId: string
+  }
+}
+
+interface FavoriteInteractionOwner {
+  token: number
+  epoch: number
+  invocationId: string
+  control: ControlKey
+  querySequence: number
+  value: string
+  resultKey: number
+  pluginId: string
+}
+
+interface FavoriteMutationOwner extends FavoriteInteractionOwner {
+  favorite: boolean
+}
+
 const NOTICE_TEXT = {
   settingsFailed: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
 } as const
@@ -251,6 +297,8 @@ const LAUNCHER_COMMAND = /^[a-z][a-z0-9-]{0,31}$/
 const UNICODE_CONTROL = /[\p{Cc}\u2028\u2029\uD800-\uDFFF]/u
 const OUTER_UNICODE_WHITESPACE = /^(?:\p{White_Space})|(?:\p{White_Space})$/u
 const UTF8_ENCODER = new TextEncoder()
+const PUBLIC_PLUGIN_ID = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
+const QUERY_SEQUENCE_EXHAUSTED = '查询次数已达上限，请重新打开主界面。'
 
 function safeApplicationIcon(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length > MAX_ICON_LENGTH || !value.startsWith(ICON_PREFIX)) return undefined
@@ -295,6 +343,19 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
       ? { kind: 'completion', completionText: record.completionText }
       : undefined
   }
+  if (candidate?.kind === 'pluginCompletion') {
+    const record = exactPlainRecord(value, ['completionText', 'favorite', 'kind', 'pluginId'])
+    return record && typeof record.completionText === 'string' && validLauncherCompletion(record.completionText) &&
+        typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.favorite === 'boolean'
+      ? {
+          kind: 'pluginCompletion',
+          completionText: record.completionText,
+          pluginId: record.pluginId,
+          favorite: record.favorite,
+        }
+      : undefined
+  }
   return undefined
 }
 
@@ -310,7 +371,7 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, hasDefaultAction }) =>
+    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, hasDefaultAction, activation }) =>
       Object.freeze({
         key,
         title,
@@ -320,6 +381,9 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(iconKind === undefined ? {} : { iconKind }),
         ...(detail === undefined ? {} : { detail }),
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
+        ...(activation.kind === 'pluginCompletion'
+          ? { pluginCompletion: Object.freeze({ pluginId: activation.pluginId, favorite: activation.favorite }) }
+          : {}),
       }),
     ),
   )
@@ -387,6 +451,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     searchPending: model.searchPending,
     executePending: model.executePending,
     hidePending: model.hidePending,
+    favoriteMutationPending: model.favoriteMutationPending,
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
     ...(model.commandHint === undefined ? {} : { commandHint: model.commandHint }),
     status:
@@ -419,6 +484,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     searchPending: false,
     executePending: false,
     hidePending: false,
+    favoriteMutationPending: false,
     status: '',
     settingsUncertain: false,
     settingsLoadStatus: 'loading',
@@ -468,6 +534,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     sequence: number
     query: string
   } | undefined
+  let completionOrigin: CompletionOriginOwner | undefined
+  let completionOriginToken = 0
+  let sequenceExhausted = false
+  let favoriteInteractionToken = 0
+  let favoriteInteraction: FavoriteInteractionOwner | undefined
+  let favoriteMutation: FavoriteMutationOwner | undefined
+  let favoriteMenuConsumed = false
 
 
   function publish(mutated: boolean): void {
@@ -553,9 +626,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function commitControl(control: ControlKey, value: string): void {
     if (control === model.queryControl) {
-      const visibleChanged = setControlDraft(control, value)
       if (model.query === value) {
-        publish(visibleChanged)
+        publish(setControlDraft(control, value))
         return
       }
       applyEdit(value)
@@ -841,6 +913,97 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     clearTimeout(slashSearchTimer)
     slashSearchTimer = undefined
   }
+
+  function completionCommand(value: string): string | undefined {
+    if (!validLauncherCompletion(value)) return undefined
+    return value.slice(1, value.indexOf(' '))
+  }
+
+  function ownsCompletionOrigin(owner: CompletionOriginOwner | undefined): owner is CompletionOriginOwner {
+    return owner !== undefined &&
+      owner.epoch === model.viewEpoch &&
+      owner.invocationId === model.invocationId &&
+      owner.control === model.queryControl &&
+      owner.querySequence === model.querySequence &&
+      owner.value === model.query &&
+      owner.value === model.queryControlValue
+  }
+
+  function replaceCompletionOrigin(
+    source: Pick<CompletionOriginOwner, 'resultKey' | 'pluginId' | 'command'>,
+    phase: CompletionOriginOwner['phase'],
+  ): void {
+    const invocationId = model.invocationId
+    if (!invocationId) {
+      completionOrigin = undefined
+      return
+    }
+    completionOrigin = {
+      token: ++completionOriginToken,
+      phase,
+      epoch: model.viewEpoch,
+      invocationId,
+      control: model.queryControl,
+      querySequence: model.querySequence,
+      value: model.query,
+      resultKey: source.resultKey,
+      pluginId: source.pluginId,
+      command: source.command,
+    }
+  }
+
+  function enterSequenceExhausted(): void {
+    sequenceExhausted = true
+    cancelSlashSearch()
+    searchToken = ++token
+    model.searchPending = false
+    pendingDefaultActivation = undefined
+    if (ownsCompletionOrigin(completionOrigin)) {
+      completionOrigin = { ...completionOrigin, phase: 'consumed' }
+    } else {
+      completionOrigin = undefined
+    }
+    clearResults()
+    model.status = QUERY_SEQUENCE_EXHAUSTED
+    publish(true)
+  }
+
+  function advanceApplicationSequence(): boolean {
+    if (sequenceExhausted) return false
+    if (model.querySequence >= maximumQuerySequence) {
+      enterSequenceExhausted()
+      return false
+    }
+    model.querySequence += 1
+    return true
+  }
+
+  function invalidateFavoriteInteraction(): void {
+    favoriteInteractionToken += 1
+    favoriteInteraction = undefined
+    favoriteMenuConsumed = false
+  }
+
+  function ownsFavoriteInteraction(owner: FavoriteInteractionOwner): boolean {
+    if (
+      destroyed ||
+      owner.token !== favoriteInteractionToken ||
+      favoriteInteraction?.token !== owner.token ||
+      model.view !== 'launcher' ||
+      model.launcherMode !== 'applications' ||
+      owner.epoch !== model.viewEpoch ||
+      owner.invocationId !== model.invocationId ||
+      owner.control !== model.queryControl ||
+      owner.querySequence !== model.querySequence ||
+      owner.value !== model.query ||
+      owner.value !== model.queryControlValue
+    ) return false
+    const selected = model.results[model.selectedIndex]
+    return selected?.key === owner.resultKey &&
+      selected.activation.kind === 'pluginCompletion' &&
+      selected.activation.pluginId === owner.pluginId
+  }
+
   unsubscribeMessages = messageCenter.subscribe(() => {
     model.messageCenter = messageCenter.getSnapshot()
     publish(true)
@@ -848,14 +1011,25 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function beginSearch(submit = false): void {
     const invocationId = model.invocationId
-    if (!invocationId || fileCommand(model.query) !== null) return
-    const captured = {
+    if (!invocationId || fileCommand(model.query) !== null || sequenceExhausted) return
+    let ownedOrigin: ApplicationSearchOwner['completionOrigin']
+    if (ownsCompletionOrigin(completionOrigin)) {
+      if (!submit && completionOrigin.phase === 'armed') {
+        ownedOrigin = { token: completionOrigin.token, phase: 'preview', pluginId: completionOrigin.pluginId }
+      } else if (submit && completionOrigin.phase === 'committing') {
+        ownedOrigin = { token: completionOrigin.token, phase: 'commit', pluginId: completionOrigin.pluginId }
+      } else {
+        return
+      }
+    }
+    const captured: ApplicationSearchOwner = {
       token: ++token,
       epoch: model.viewEpoch,
       invocationId,
       sequence: model.querySequence,
       query: model.query,
       submit,
+      ...(ownedOrigin === undefined ? {} : { completionOrigin: ownedOrigin }),
     }
     searchToken = captured.token
     model.searchPending = true
@@ -866,6 +1040,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         invocationId,
         querySequence: captured.sequence,
         ...(captured.query.startsWith('/') ? { submit } : {}),
+        ...(captured.completionOrigin === undefined
+          ? {}
+          : {
+              completionOrigin: {
+                phase: captured.completionOrigin.phase,
+                pluginId: captured.completionOrigin.pluginId,
+              },
+            }),
       })
     } catch (error) {
       pending = Promise.reject(error)
@@ -924,8 +1106,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       publish(true)
     }, 0)
   }
-  function ownsSearch(captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string; submit: boolean }): boolean {
-    return (
+  function ownsSearch(captured: ApplicationSearchOwner): boolean {
+    const ownsBase = (
       !destroyed &&
       captured.token === searchToken &&
       captured.epoch === model.viewEpoch &&
@@ -934,13 +1116,30 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       captured.query === model.query &&
       captured.query === model.queryControlValue
     )
+    if (!ownsBase || captured.completionOrigin === undefined) return ownsBase
+    if (!ownsCompletionOrigin(completionOrigin) || completionOrigin.token !== captured.completionOrigin.token) return false
+    return captured.completionOrigin.phase === 'preview'
+      ? completionOrigin.phase === 'armed'
+      : completionOrigin.phase === 'committing' || completionOrigin.phase === 'consumed'
+  }
+
+  function settleCompletionCommit(captured: ApplicationSearchOwner): void {
+    if (
+      captured.completionOrigin?.phase === 'commit' &&
+      ownsCompletionOrigin(completionOrigin) &&
+      completionOrigin.token === captured.completionOrigin.token &&
+      completionOrigin.phase === 'committing'
+    ) {
+      completionOrigin = { ...completionOrigin, phase: 'consumed' }
+    }
   }
 
   function finishSearch(
-    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string; submit: boolean },
+    captured: ApplicationSearchOwner,
     response: import('./protocol').SearchResponse | null,
   ): void {
     if (!ownsSearch(captured)) return
+    settleCompletionCommit(captured)
     const transferToken = response?.windowTransferToken
     if (transferToken !== undefined) {
       let pending: Promise<void>
@@ -1022,24 +1221,38 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function failSearch(
-    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string; submit: boolean },
+    captured: ApplicationSearchOwner,
     error: unknown,
   ): void {
     if (!ownsSearch(captured)) return
+    settleCompletionCommit(captured)
     model.searchPending = false
     model.status = errorText(error)
     publish(true)
   }
 
   function applyEdit(value: string): void {
+    invalidateFavoriteInteraction()
     if (model.launcherMode === 'files') {
       applyFileEdit(value)
       return
     }
+    if (sequenceExhausted) {
+      const changed = model.query !== value || model.queryControlValue !== value
+      model.query = value
+      model.queryControlValue = value
+      publish(changed)
+      return
+    }
+    const previousOrigin = ownsCompletionOrigin(completionOrigin) ? completionOrigin : undefined
+    const retainsOrigin = previousOrigin !== undefined &&
+      completionCommand(value) === previousOrigin.command
+    if (!advanceApplicationSequence()) return
     model.shownNotice = undefined
     model.query = value
     model.queryControlValue = value
-    model.querySequence += 1
+    if (retainsOrigin) replaceCompletionOrigin(previousOrigin, 'armed')
+    else completionOrigin = undefined
     searchToken = ++token
     model.searchPending = false
     model.status = ''
@@ -1202,6 +1415,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     notice: import('./protocol').LifecycleNotice | null,
     source: 'native' | 'local',
   ): void {
+    invalidateFavoriteInteraction()
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
     const nextSettingsTab: SettingsTabKey =
       target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
@@ -1215,7 +1429,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.view = nextView
     model.settingsTab = nextSettingsTab
     pluginInventoryActive = false
-    if (source === 'native') model.querySequence = 0
+    completionOrigin = undefined
+    if (source === 'native') {
+      model.querySequence = 0
+      sequenceExhausted = false
+    }
     cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
@@ -1628,14 +1846,56 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     finishSettingsMutation(operation, false)
   }
 
+  function applyPluginCompletion(result: PrivateApplicationResult): void {
+    if (sequenceExhausted || result.activation.kind !== 'pluginCompletion') return
+    const command = completionCommand(result.activation.completionText)
+    if (command === undefined || !advanceApplicationSequence()) return
+    model.shownNotice = undefined
+    model.query = result.activation.completionText
+    model.queryControlValue = result.activation.completionText
+    model.status = ''
+    searchToken = ++token
+    model.searchPending = false
+    clearResults()
+    replaceCompletionOrigin({
+      resultKey: result.key,
+      pluginId: result.activation.pluginId,
+      command,
+    }, 'armed')
+    scheduleSearch()
+    publish(true)
+  }
+
+  function commitArmedPluginCompletion(): boolean {
+    if (!ownsCompletionOrigin(completionOrigin)) return false
+    if (completionOrigin.phase === 'committing' || completionOrigin.phase === 'consumed') return true
+    const previous = completionOrigin
+    cancelSlashSearch()
+    searchToken = ++token
+    model.searchPending = false
+    if (!advanceApplicationSequence()) return true
+    replaceCompletionOrigin(previous, 'committing')
+    model.shownNotice = undefined
+    model.status = ''
+    clearResults()
+    beginSearch(true)
+    publish(true)
+    return true
+  }
+
   function executeSelection(): void {
     if (model.view !== 'launcher' || model.executePending) return
+    invalidateFavoriteInteraction()
     let resultId: string | undefined
     if (model.launcherMode === 'applications') {
       const selected = model.results[model.selectedIndex]
       if (!selected) return
       if (selected.activation.kind === 'completion') {
         applyEdit(selected.activation.completionText)
+        return
+      }
+      if (selected.activation.kind === 'pluginCompletion') {
+        applyPluginCompletion(selected)
         return
       }
       if (selected.activation.kind === 'openFind') {
@@ -1679,21 +1939,107 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function activateResult(index: number): void {
     if (
+      sequenceExhausted ||
       model.view !== 'launcher' ||
       model.launcherMode !== 'applications' ||
       !Number.isInteger(index) ||
       index < 0 ||
       index >= model.results.length
     ) return
+    invalidateFavoriteInteraction()
     model.selectedIndex = index
     publish(true)
     executeSelection()
   }
+
+  function openPluginContextMenu(index: number): void {
+    if (
+      destroyed ||
+      sequenceExhausted ||
+      model.view !== 'launcher' ||
+      model.launcherMode !== 'applications' ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= model.results.length
+    ) return
+    const result = model.results[index]
+    if (result?.activation.kind !== 'pluginCompletion' || !model.invocationId) return
+    invalidateFavoriteInteraction()
+    model.selectedIndex = index
+    favoriteInteraction = {
+      token: favoriteInteractionToken,
+      epoch: model.viewEpoch,
+      invocationId: model.invocationId,
+      control: model.queryControl,
+      querySequence: model.querySequence,
+      value: model.queryControlValue,
+      resultKey: result.key,
+      pluginId: result.activation.pluginId,
+    }
+    publish(true)
+  }
+
+  function closePluginContextMenu(): void {
+    if (favoriteMenuConsumed) {
+      favoriteMenuConsumed = false
+      return
+    }
+    invalidateFavoriteInteraction()
+  }
+
+  function setPluginFavorite(index: number, favorite: boolean): void {
+    if (model.favoriteMutationPending || !Number.isInteger(index)) return
+    const result = model.results[index]
+    const interaction = favoriteInteraction
+    if (
+      !interaction ||
+      !ownsFavoriteInteraction(interaction) ||
+      result?.key !== interaction.resultKey ||
+      result.activation.kind !== 'pluginCompletion' ||
+      result.activation.pluginId !== interaction.pluginId ||
+      result.activation.favorite === favorite
+    ) return
+    const owner: FavoriteMutationOwner = { ...interaction, favorite }
+    favoriteMutation = owner
+    favoriteMenuConsumed = true
+    model.favoriteMutationPending = true
+    model.status = ''
+    publish(true)
+    let pending: Promise<void>
+    try {
+      pending = client.setPublicPluginFavorite({ pluginId: owner.pluginId, favorite })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      () => finishFavoriteMutation(owner, false),
+      () => finishFavoriteMutation(owner, true),
+    )
+  }
+
+  function finishFavoriteMutation(owner: FavoriteMutationOwner, failed: boolean): void {
+    if (favoriteMutation?.token !== owner.token || favoriteMutation.pluginId !== owner.pluginId) return
+    favoriteMutation = undefined
+    model.favoriteMutationPending = false
+    if (!ownsFavoriteInteraction(owner)) {
+      publish(true)
+      return
+    }
+    if (failed) {
+      model.status = FALLBACK_ERROR
+      publish(true)
+      return
+    }
+    applyEdit(owner.value)
+  }
+
   async function requestHide(): Promise<void> {
     if (destroyed || model.hidePending) return
     model.shownNotice = undefined
     model.status = ''
     model.hidePending = true
+    completionOrigin = undefined
+    invalidateFavoriteInteraction()
     leaveFileMode()
     const captured = { token: ++token, epoch: model.viewEpoch }
     hideToken = captured.token
@@ -1718,6 +2064,19 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     if (key === 'Enter') {
+      if (sequenceExhausted) return
+      if (
+        model.view === 'launcher' &&
+        model.launcherMode === 'applications' &&
+        model.selectedIndex >= 0 &&
+        model.selectedIndex < model.results.length
+      ) {
+        executeSelection()
+        return
+      }
+      if (model.view === 'launcher' && model.launcherMode === 'applications' && commitArmedPluginCompletion()) {
+        return
+      }
       const fileQuery = model.launcherMode === 'applications' ? fileCommand(model.query) : null
       if (model.view === 'launcher' && fileQuery !== null && model.queryControlValue === model.query) {
         submitFind(fileQuery)
@@ -1757,6 +2116,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       executeSelection()
       return
     }
+    if (sequenceExhausted) return
     if (model.launcherMode === 'files') {
       const file = model.file
       if (!file?.results.length) return
@@ -1764,6 +2124,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const offset = key === 'ArrowDown' ? 1 : -1
       const selectedIndex = (file.selectedIndex + offset + file.results.length) % file.results.length
       if (selectedIndex === file.selectedIndex) return
+      invalidateFavoriteInteraction()
       file.selectedIndex = selectedIndex
       publish(true)
       return
@@ -1771,7 +2132,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!model.results.length) return
     model.shownNotice = undefined
     const offset = key === 'ArrowDown' ? 1 : -1
-    model.selectedIndex = (model.selectedIndex + offset + model.results.length) % model.results.length
+    const selectedIndex = (model.selectedIndex + offset + model.results.length) % model.results.length
+    if (selectedIndex === model.selectedIndex) return
+    invalidateFavoriteInteraction()
+    model.selectedIndex = selectedIndex
     publish(true)
   }
 
@@ -1834,6 +2198,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
+    completionOrigin = undefined
+    favoriteMutation = undefined
+    model.favoriteMutationPending = false
+    invalidateFavoriteInteraction()
     settingsOperation = undefined
     pendingSettingsLoadEpoch = undefined
     pluginListOwner = undefined
@@ -1947,6 +2315,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     selectSettingsTab,
     requestHide,
     activateResult,
+    openPluginContextMenu,
+    closePluginContextMenu,
+    setPluginFavorite,
     setAutostart,
     setThemePreference,
     setWebSearchEngine,

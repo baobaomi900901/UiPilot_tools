@@ -76,12 +76,12 @@
 
 **Dependencies:** Task 2; specification sections `Completion And Execution`, `Launcher Wire Contract`, `Frontend Ownership And Data Flow`, and `Failure Behavior`.
 
-- [ ] Add the strict TypeScript `pluginCompletion` activation and `completionOrigin` request types, parse plugin identity/favorite without downgrade, and wire `setPublicPluginFavorite` to `set_plugin_favorite`.
-- [ ] Implement post-completion `armed` ownership before scheduling preview; trusted same-command argument edits rebind preview ownership, while command-identity edits restore independently typed behavior.
-- [ ] Implement the explicit Enter linearization: selected valid result first; otherwise allocate a newer query sequence/search token, rebind `armed -> committing`, invalidate the preview locally, and send commit. Settle only the still-current owner into `consumed`.
-- [ ] Implement committing-edit replacement (`A committing -> B armed`) so A may finish admitted side effects but cannot publish a hint/result/status, commit a plugin-window transfer, or alter B's completion state.
-- [ ] Make `consumed` block only plugin-command preview/submission fallback for the untouched value; preserve activation of returned main results. Implement the sequence-exhausted absorbing state and its fixed reopen status.
-- [ ] Add the opaque favorite-interaction token and favorite mutation owner. Selection movement, another menu, result activation, editing, view change, hide, or new shown invocation invalidates late UI continuation; durable success remains observable on a later ordinary query.
+- [x] Add the strict TypeScript `pluginCompletion` activation and `completionOrigin` request types, parse plugin identity/favorite without downgrade, and wire `setPublicPluginFavorite` to `set_plugin_favorite`.
+- [x] Implement post-completion `armed` ownership before scheduling preview; trusted same-command argument edits rebind preview ownership, while command-identity edits restore independently typed behavior.
+- [x] Implement the explicit Enter linearization: selected valid result first; otherwise allocate a newer query sequence/search token, rebind `armed -> committing`, invalidate the preview locally, and send commit. Settle only the still-current owner into `consumed`.
+- [x] Implement committing-edit replacement (`A committing -> B armed`) so A may finish admitted side effects but cannot publish a hint/result/status, commit a plugin-window transfer, or alter B's completion state.
+- [x] Make `consumed` block only plugin-command preview/submission fallback for the untouched value; preserve activation of returned main results. Implement the sequence-exhausted absorbing state and its fixed reopen status.
+- [x] Add the opaque favorite-interaction token and favorite mutation owner. Selection movement, another menu, result activation, editing, view change, hide, or new shown invocation invalidates late UI continuation; durable success remains observable on a later ordinary query.
 
 **Distinct test coverage:** malformed plugin completion drops one row and preserves siblings/built-ins; preview pending then commit with late preview success/failure; duplicate Enter while committing; commit A pending then edit/preview B with late A success/failure; ambiguous failure then third Enter is inert; argument edit/reselection creates a fresh arm; returned copy result executes without a second Runtime invocation; sequence exhaustion remains absorbing through edits/selections until new shown; late favorite success/failure after keyboard selection, another right-click, and hide/reopen is inert.
 
