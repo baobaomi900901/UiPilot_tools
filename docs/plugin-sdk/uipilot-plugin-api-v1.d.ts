@@ -118,11 +118,18 @@ export interface UiPilotPluginWindowTimerApiV1 {
   onStateChanged(handler: (state: Readonly<PluginTimerState>) => void): () => void
 }
 
+export interface UiPilotPluginWindowStorageApiV1 {
+  get(key: string): Promise<JsonValue | null>
+  set(key: string, value: JsonValue): Promise<void>
+  remove(key: string): Promise<void>
+}
+
 export interface UiPilotPluginWindowApiV1 {
   onUpdate(
     handler: (update: Readonly<PluginWindowUpdate>) => void | Promise<void>,
   ): () => void
   readonly timer: Readonly<UiPilotPluginWindowTimerApiV1>
+  readonly storage: Readonly<UiPilotPluginWindowStorageApiV1>
 }
 
 declare global {

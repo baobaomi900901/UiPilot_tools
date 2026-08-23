@@ -421,6 +421,24 @@ remaining 锚点。页面可以用 `performance.now()` 插值显示数字，但�
 常见错误包括 `PermissionDenied`、`ExpiredWindowSessionError`、`InvalidTimerInput`、
 `TimerInputRequired`、`TimerInputNotAllowed`、`MessageStoreUnavailable` 和 `TimerUnavailable`。
 
+### 6.5 在子窗口保存插件私有状态
+
+所有合法插件内容窗口都可以使用冻结的 `window.uipilotPluginWindow.storage`，无需新增 Manifest 权限。它与
+Runtime 的 `api.storage` 共用该插件的私有命名空间：
+
+```js
+const storage = window.uipilotPluginWindow.storage
+const previous = await storage.get('pomodoro.duration-minutes')
+await storage.set('pomodoro.duration-minutes', 25)
+await storage.remove('pomodoro.duration-minutes')
+```
+
+`get()` 可在 `onUpdate` 的 Prepared 阶段使用；`set()` 和 `remove()` 要等窗口完成显示并进入 Active 后才可
+调用。窗口隐藏、会话被替换、插件禁用、升级或卸载后，保存的旧 `storage` 引用会返回
+`ExpiredWindowSessionError`。Runtime 与窗口都只能使用匹配 `^[a-z][a-z0-9.-]{0,63}$` 的 key，并拒绝
+`__proto__`、`prototype` 和 `constructor`。值必须是有限 JSON，所有入口共享每插件 5 MiB 配额与原子写入；
+非法 key/value 返回 `InvalidOperation`，配额或持久化失败返回 `StorageError`。
+
 ## 7. 添加插件图标
 
 图标是可选的固定文件，不写入 `plugin.json`：
@@ -615,7 +633,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plu
 
 ## 12. 可选：插件私有状态与设置
 
-Runtime API 还提供请求期内的插件隔离存储和设置读取：
+Runtime API 还提供请求期内的插件隔离存储和设置读取；窗口存储与其共享同一命名空间，窗口端会话规则见
+6.5：
 
 ```js
 const previous = await api.storage.get('last-value')

@@ -38,10 +38,10 @@ use super::{
         SystemClock, TimerAudioCompletion, TimerError, TimerKey, TimerPostLockEffect,
     },
     EffectivePluginConfig, PluginApiExecution, PluginApiRequest, PluginCommandCompletion,
-    PluginCompletionOutcome, PluginRequestContext, PluginRequestScheduler, PluginRuntimeApi,
-    PluginRuntimeError, PluginSecretStore, PluginStateError, PluginStateStore, PluginStorageStore,
-    PreparedPublicPlugin, PublicManifestV1, PublicPackageError, PublicPackageSource,
-    PublicPluginFault, PublicPluginHost, PublicResource, ValidatedAlarmAsset,
+    PluginCompletionOutcome, PluginDataScope, PluginRequestContext, PluginRequestScheduler,
+    PluginRuntimeApi, PluginRuntimeError, PluginSecretStore, PluginStateError, PluginStateStore,
+    PluginStorageStore, PreparedPublicPlugin, PublicManifestV1, PublicPackageError,
+    PublicPackageSource, PublicPluginFault, PublicPluginHost, PublicResource, ValidatedAlarmAsset,
 };
 
 const PREPARE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -237,6 +237,27 @@ pub(crate) enum PublicPluginManagementError {
     InvalidCaller,
     DataCleanupPending,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowStorageError {
+    InvalidCaller,
+    InvalidContext,
+    ExpiredWindowSessionError,
+    InvalidOperation,
+    StorageError,
+}
+
+impl WindowStorageError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::InvalidCaller => "InvalidCaller",
+            Self::InvalidContext => "InvalidContext",
+            Self::ExpiredWindowSessionError => "ExpiredWindowSessionError",
+            Self::InvalidOperation => "InvalidOperation",
+            Self::StorageError => "StorageError",
+        }
+    }
 }
 
 pub(crate) struct PublicPluginUninstallCommitFailure {
@@ -1980,6 +2001,103 @@ impl PublicPluginManager {
         Arc::clone(&self.timers)
     }
 
+    pub(crate) fn window_storage_get(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        key: &str,
+    ) -> Result<Option<Value>, WindowStorageError> {
+        let (scope, _lease) =
+            self.authorize_window_storage(plugin_id, generation, activation_id, admission_epoch)?;
+        self.storage
+            .get(&scope, plugin_id, key)
+            .map_err(map_window_storage_error)
+    }
+
+    pub(crate) fn window_storage_set(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        key: &str,
+        value: Value,
+    ) -> Result<(), WindowStorageError> {
+        let (scope, _lease) =
+            self.authorize_window_storage(plugin_id, generation, activation_id, admission_epoch)?;
+        self.storage
+            .set(&scope, plugin_id, key, value)
+            .map_err(map_window_storage_error)
+    }
+
+    pub(crate) fn window_storage_remove(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        key: &str,
+    ) -> Result<(), WindowStorageError> {
+        let (scope, _lease) =
+            self.authorize_window_storage(plugin_id, generation, activation_id, admission_epoch)?;
+        self.storage
+            .remove(&scope, plugin_id, key)
+            .map_err(map_window_storage_error)
+    }
+
+    fn authorize_window_storage(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<(PluginDataScope, super::data_call_gate::PluginDataCallLease), WindowStorageError>
+    {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| WindowStorageError::StorageError)?;
+        let bundle = self
+            .bundles
+            .bundle(plugin_id)
+            .map_err(|_| WindowStorageError::StorageError)?
+            .filter(|bundle| {
+                bundle.config.installed
+                    && bundle.config.enabled
+                    && bundle.config.fault.is_none()
+                    && !bundle.runtime_recovery_needed
+                    && bundle.runtime.generation == generation
+                    && bundle.activation_id == activation_id
+                    && bundle.admission_epoch == admission_epoch
+            })
+            .ok_or(WindowStorageError::ExpiredWindowSessionError)?;
+        let identity = PluginDataCallIdentity::new(
+            plugin_id,
+            bundle.runtime.generation,
+            bundle.activation_id,
+            bundle.admission_epoch,
+        )
+        .map_err(|_| WindowStorageError::InvalidContext)?;
+        let lease = self
+            .data_gate
+            .try_acquire(&identity)
+            .map_err(|error| match error {
+                super::data_call_gate::DataCallGateError::Expired => {
+                    WindowStorageError::ExpiredWindowSessionError
+                }
+                super::data_call_gate::DataCallGateError::InvalidIdentity => {
+                    WindowStorageError::InvalidContext
+                }
+                super::data_call_gate::DataCallGateError::Unavailable => {
+                    WindowStorageError::StorageError
+                }
+            })?;
+        let scope =
+            PluginDataScope::new(plugin_id).map_err(|_| WindowStorageError::InvalidContext)?;
+        Ok((scope, lease))
+    }
+
     pub(crate) fn window_timer_get_state(
         &self,
         plugin_id: &str,
@@ -2661,6 +2779,17 @@ fn mutation_from_config(config: &EffectivePluginConfig) -> PublicPluginMutation 
         generation: config.active_generation,
         inventory_revision: config.inventory_revision,
         enabled: config.enabled,
+    }
+}
+
+fn map_window_storage_error(error: super::storage::PluginStorageError) -> WindowStorageError {
+    match error {
+        super::storage::PluginStorageError::InvalidKey
+        | super::storage::PluginStorageError::InvalidValue => WindowStorageError::InvalidOperation,
+        super::storage::PluginStorageError::Storage
+        | super::storage::PluginStorageError::QuotaExceeded => WindowStorageError::StorageError,
+        super::storage::PluginStorageError::InvalidPlugin
+        | super::storage::PluginStorageError::InvalidScope => WindowStorageError::InvalidContext,
     }
 }
 
@@ -4761,5 +4890,132 @@ mod tests {
         assert!(!manager
             .record_runtime_result("com.example.activation", 1, old_activation, false, now,)
             .unwrap());
+    }
+
+    #[test]
+    fn window_storage_shares_runtime_namespace_and_revalidates_activation_identity() {
+        let dir = TestDir::new("window-storage");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let installed = manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let plugin_id = "com.example.activation";
+        let generation = installed.runtime.generation;
+        let activation_id = manager.activation_id(plugin_id).unwrap();
+        let admission_epoch = manager.admission_epoch(plugin_id).unwrap();
+        let scheduled = match manager
+            .scheduler
+            .enqueue(
+                crate::public_plugins::PluginRequestCandidate {
+                    plugin_id: plugin_id.into(),
+                    plugin_generation: generation,
+                    activation_id,
+                    admission_epoch,
+                    activation_mode: PublicActivationMode::Live,
+                    input: "storage".into(),
+                    owner: crate::public_plugins::PluginSubmissionOwner {
+                        ui_intent_epoch: 1,
+                        control_value: "/activation storage".into(),
+                        submission_token: "window-storage".into(),
+                    },
+                },
+                now,
+            )
+            .unwrap()
+        {
+            crate::public_plugins::PluginScheduleOutcome::Dispatched(request) => request,
+            crate::public_plugins::PluginScheduleOutcome::Waiting { .. } => {
+                panic!("first request must dispatch")
+            }
+        };
+        let runtime_label = runtime_label(plugin_id, generation).unwrap();
+        let runtime_call = |operation, value| PluginApiRequest {
+            context: scheduled.context.clone(),
+            operation,
+            key: Some("shared.value".into()),
+            value,
+            notification: None,
+        };
+
+        assert_eq!(
+            manager
+                .execute_api(
+                    &runtime_label,
+                    runtime_call(
+                        super::super::runtime::PluginApiOperation::StorageSet,
+                        Some(json!(10)),
+                    ),
+                )
+                .result,
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            manager.window_storage_get(
+                plugin_id,
+                generation,
+                activation_id,
+                admission_epoch,
+                "shared.value",
+            ),
+            Ok(Some(json!(10)))
+        );
+
+        manager
+            .window_storage_set(
+                plugin_id,
+                generation,
+                activation_id,
+                admission_epoch,
+                "shared.value",
+                json!(25),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .execute_api(
+                    &runtime_label,
+                    runtime_call(super::super::runtime::PluginApiOperation::StorageGet, None),
+                )
+                .result,
+            Ok(json!(25))
+        );
+        let other_scope = PluginDataScope::new("com.example.other").unwrap();
+        assert_eq!(
+            manager
+                .storage
+                .get(&other_scope, "com.example.other", "shared.value"),
+            Ok(None)
+        );
+
+        for (stale_generation, stale_activation, stale_epoch) in [
+            (generation + 1, activation_id, admission_epoch),
+            (generation, activation_id + 1, admission_epoch),
+            (generation, activation_id, admission_epoch + 1),
+        ] {
+            assert_eq!(
+                manager.window_storage_get(
+                    plugin_id,
+                    stale_generation,
+                    stale_activation,
+                    stale_epoch,
+                    "shared.value",
+                ),
+                Err(WindowStorageError::ExpiredWindowSessionError)
+            );
+        }
+        assert_eq!(
+            manager.window_storage_set(
+                plugin_id,
+                generation,
+                activation_id,
+                admission_epoch,
+                "Invalid_Key",
+                json!(30),
+            ),
+            Err(WindowStorageError::InvalidOperation)
+        );
     }
 }

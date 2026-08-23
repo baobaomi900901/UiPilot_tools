@@ -1,4 +1,5 @@
 import type {
+  JsonValue,
   PluginHandler,
   PluginTimerStartInput,
   PluginTimerState,
@@ -29,6 +30,9 @@ const consumeWindowApi = (api: Readonly<UiPilotPluginWindowApiV1>) => api.onUpda
     await api.timer.stop()
     await api.timer.start()
     await api.timer.reset()
+    const stored: JsonValue | null = await api.storage.get('pomodoro.duration-minutes')
+    await api.storage.set('pomodoro.duration-minutes', stored ?? 10)
+    await api.storage.remove('pomodoro.duration-minutes')
     unsubscribe()
   },
 )

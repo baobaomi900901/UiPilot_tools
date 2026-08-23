@@ -32,7 +32,8 @@ use crate::{
     },
     model::{ResultIconKind, SearchResponse},
     plugin_window::{
-        self, PluginWindowController, PluginWindowOwner, PluginWindowPinState, PluginWindowUpdate,
+        self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
+        PluginWindowPinState, PluginWindowUpdate,
     },
     plugins::{
         PluginCopyError, PluginInventorySnapshot, PluginManagementError, PluginManager,
@@ -44,7 +45,7 @@ use crate::{
         PublicOutputMode, PublicPermission, PublicPluginInstallSource, PublicPluginInventory,
         PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
         PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginService,
-        PublicPluginWindowIdentity, TimerError,
+        PublicPluginWindowIdentity, TimerError, WindowStorageError,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -437,6 +438,15 @@ impl From<TimerError> for CommandError {
     }
 }
 
+impl From<WindowStorageError> for CommandError {
+    fn from(error: WindowStorageError) -> Self {
+        Self {
+            code: error.code(),
+            message: "public plugin window storage operation failed",
+        }
+    }
+}
+
 fn parse_timer_session_generation(value: &str) -> Result<u64, TimerError> {
     if value == "0"
         || value.is_empty()
@@ -448,6 +458,19 @@ fn parse_timer_session_generation(value: &str) -> Result<u64, TimerError> {
     value
         .parse::<u64>()
         .map_err(|_| TimerError::ExpiredWindowSessionError)
+}
+
+fn parse_window_storage_session_generation(value: &str) -> Result<u64, WindowStorageError> {
+    if value == "0"
+        || value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(WindowStorageError::ExpiredWindowSessionError);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| WindowStorageError::ExpiredWindowSessionError)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1178,6 +1201,93 @@ pub(crate) fn plugin_window_content_ack(
 }
 
 #[tauri::command]
+pub(crate) fn plugin_window_storage_get(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+    key: String,
+) -> Result<Option<serde_json::Value>, CommandError> {
+    let session_generation = parse_window_storage_session_generation(&session_generation)?;
+    let lease = controller
+        .inner()
+        .begin_window_call(webview.label(), session_generation, false)
+        .map_err(map_storage_window_call_error)?;
+    let owner = lease.owner().clone();
+    let value = service.manager()?.window_storage_get(
+        &owner.plugin_id,
+        owner.plugin_generation,
+        owner.activation_id,
+        owner.admission_epoch,
+        &key,
+    )?;
+    drop(lease);
+    Ok(value)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_storage_set(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+    key: String,
+    value: serde_json::Value,
+) -> Result<(), CommandError> {
+    let session_generation = parse_window_storage_session_generation(&session_generation)?;
+    let lease = controller
+        .inner()
+        .begin_window_call(webview.label(), session_generation, true)
+        .map_err(map_storage_window_call_error)?;
+    let owner = lease.owner().clone();
+    service.manager()?.window_storage_set(
+        &owner.plugin_id,
+        owner.plugin_generation,
+        owner.activation_id,
+        owner.admission_epoch,
+        &key,
+        value,
+    )?;
+    drop(lease);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_window_storage_remove(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+    key: String,
+) -> Result<(), CommandError> {
+    let session_generation = parse_window_storage_session_generation(&session_generation)?;
+    let lease = controller
+        .inner()
+        .begin_window_call(webview.label(), session_generation, true)
+        .map_err(map_storage_window_call_error)?;
+    let owner = lease.owner().clone();
+    service.manager()?.window_storage_remove(
+        &owner.plugin_id,
+        owner.plugin_generation,
+        owner.activation_id,
+        owner.admission_epoch,
+        &key,
+    )?;
+    drop(lease);
+    Ok(())
+}
+
+fn map_storage_window_call_error(error: PluginWindowCallError) -> WindowStorageError {
+    match error {
+        PluginWindowCallError::InvalidCaller => WindowStorageError::InvalidCaller,
+        PluginWindowCallError::ExpiredWindowSession => {
+            WindowStorageError::ExpiredWindowSessionError
+        }
+        PluginWindowCallError::Unavailable => WindowStorageError::StorageError,
+    }
+}
+
+#[tauri::command]
 pub(crate) fn plugin_window_timer_get_state(
     webview: tauri::Webview,
     app: AppHandle,
@@ -1188,7 +1298,8 @@ pub(crate) fn plugin_window_timer_get_state(
     let session_generation = parse_timer_session_generation(&session_generation)?;
     let lease = controller
         .inner()
-        .begin_timer_call(webview.label(), session_generation, false)?;
+        .begin_window_call(webview.label(), session_generation, false)
+        .map_err(map_timer_window_call_error)?;
     let owner = lease.owner().clone();
     let state = service.manager()?.window_timer_get_state(
         &owner.plugin_id,
@@ -1296,7 +1407,9 @@ fn plugin_window_timer_mutation(
     ) -> Result<PluginTimerState, TimerError>,
 ) -> Result<PluginTimerState, CommandError> {
     let session_generation = parse_timer_session_generation(session_generation)?;
-    let lease = controller.begin_timer_call(caller_label, session_generation, true)?;
+    let lease = controller
+        .begin_window_call(caller_label, session_generation, true)
+        .map_err(map_timer_window_call_error)?;
     let owner = lease.owner().clone();
     let state = operation(service.manager()?.as_ref(), &owner)?;
     drop(lease);
@@ -1308,6 +1421,14 @@ fn plugin_window_timer_mutation(
     .ok_or(TimerError::TimerUnavailable)?;
     plugin_window::publish_timer_state(app, controller.as_ref(), &key, &state);
     Ok(state)
+}
+
+fn map_timer_window_call_error(error: PluginWindowCallError) -> TimerError {
+    match error {
+        PluginWindowCallError::InvalidCaller => TimerError::InvalidCaller,
+        PluginWindowCallError::ExpiredWindowSession => TimerError::ExpiredWindowSessionError,
+        PluginWindowCallError::Unavailable => TimerError::TimerUnavailable,
+    }
 }
 
 #[tauri::command]
@@ -2705,8 +2826,9 @@ mod tests {
         execute_result_with, load_settings_core, load_settings_ready_with,
         map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
         map_theme_preference_worker_result, parse_timer_session_generation,
-        plugin_discovery_prefix, prepare_file_query, prepare_hotkey_save, prepare_settings_save,
-        public_plugin_prompt, public_plugin_search_decision, publish_everything_search,
+        parse_window_storage_session_generation, plugin_discovery_prefix, prepare_file_query,
+        prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
+        public_plugin_search_decision, publish_everything_search,
         publish_public_command_suggestions, require_find_label, require_main_label,
         resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_files_with,
@@ -2728,7 +2850,7 @@ mod tests {
         lifecycle::LifecycleCoordinator,
         public_plugins::{
             PluginInvocationTheme, PublicActivationMode, PublicCommandSuggestion, PublicOutputMode,
-            PublicPluginRoute, TimerError,
+            PublicPluginRoute, TimerError, WindowStorageError,
         },
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine},
@@ -3417,9 +3539,12 @@ mod tests {
     }
 
     #[test]
-    fn plugin_window_timer_commands_are_content_only_and_session_bound() {
+    fn plugin_window_timer_and_storage_commands_are_content_only_and_session_bound() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         for command in [
+            "plugin_window_storage_get",
+            "plugin_window_storage_set",
+            "plugin_window_storage_remove",
             "plugin_window_timer_get_state",
             "plugin_window_timer_start",
             "plugin_window_timer_stop",
@@ -3429,13 +3554,16 @@ mod tests {
                 .split(&format!("pub(crate) fn {command}("))
                 .nth(1)
                 .and_then(|tail| tail.split("\n#[tauri::command]").next())
-                .unwrap_or_else(|| panic!("missing timer command {command}"));
+                .unwrap_or_else(|| panic!("missing plugin window command {command}"));
             assert!(body.contains("webview: tauri::Webview"));
             assert!(body.contains("session_generation: String"));
             assert!(!body.contains("plugin_id: String"));
         }
         let capability = include_str!("../capabilities/plugin-window-content.json");
         for command in [
+            "plugin_window_storage_get",
+            "plugin_window_storage_set",
+            "plugin_window_storage_remove",
             "plugin_window_timer_get_state",
             "plugin_window_timer_start",
             "plugin_window_timer_stop",
@@ -3447,14 +3575,19 @@ mod tests {
     }
 
     #[test]
-    fn timer_session_generation_is_canonical_nonzero_u64() {
+    fn window_session_generation_is_canonical_nonzero_u64() {
         for value in ["1", "9", "10", "18446744073709551615"] {
             assert!(parse_timer_session_generation(value).is_ok());
+            assert!(parse_window_storage_session_generation(value).is_ok());
         }
         for value in ["", "0", "00", "01", "-1", "+1", "18446744073709551616"] {
             assert_eq!(
                 parse_timer_session_generation(value),
                 Err(TimerError::ExpiredWindowSessionError)
+            );
+            assert_eq!(
+                parse_window_storage_session_generation(value),
+                Err(WindowStorageError::ExpiredWindowSessionError)
             );
         }
     }

@@ -51,6 +51,13 @@ pub(crate) enum PluginWindowPhase {
     Visible,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginWindowCallError {
+    InvalidCaller,
+    ExpiredWindowSession,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginWindowTransaction {
     pub(crate) owner: PluginWindowOwner,
@@ -95,22 +102,22 @@ struct WindowState {
     timer_session: TimerSessionState,
 }
 
-pub(crate) struct TimerCallLease {
+pub(crate) struct PluginWindowCallLease {
     controller: Arc<PluginWindowController>,
     owner: PluginWindowOwner,
     session_generation: u64,
 }
 
-impl TimerCallLease {
+impl PluginWindowCallLease {
     pub(crate) fn owner(&self) -> &PluginWindowOwner {
         &self.owner
     }
 }
 
-impl Drop for TimerCallLease {
+impl Drop for PluginWindowCallLease {
     fn drop(&mut self) {
         self.controller
-            .finish_timer_call(&self.owner.plugin_id, self.session_generation);
+            .finish_window_call(&self.owner.plugin_id, self.session_generation);
     }
 }
 
@@ -205,22 +212,22 @@ impl PluginWindowController {
         true
     }
 
-    pub(crate) fn begin_timer_call(
+    pub(crate) fn begin_window_call(
         self: &Arc<Self>,
         content_label: &str,
         session_generation: u64,
         mutable: bool,
-    ) -> Result<TimerCallLease, crate::public_plugins::TimerError> {
+    ) -> Result<PluginWindowCallLease, PluginWindowCallError> {
         let plugin_id = plugin_id_from_content_label(content_label)
-            .ok_or(crate::public_plugins::TimerError::InvalidCaller)?;
+            .ok_or(PluginWindowCallError::InvalidCaller)?;
         let mut core = self
             .core
             .lock()
-            .map_err(|_| crate::public_plugins::TimerError::TimerUnavailable)?;
+            .map_err(|_| PluginWindowCallError::Unavailable)?;
         let window = core
             .windows
             .get_mut(&plugin_id)
-            .ok_or(crate::public_plugins::TimerError::ExpiredWindowSessionError)?;
+            .ok_or(PluginWindowCallError::ExpiredWindowSession)?;
         let allowed = window.timer_session.generation == session_generation
             && match window.timer_session.phase {
                 TimerSessionPhase::Prepared => !mutable,
@@ -228,14 +235,14 @@ impl PluginWindowController {
                 TimerSessionPhase::Closing | TimerSessionPhase::Revoked => false,
             };
         if !allowed {
-            return Err(crate::public_plugins::TimerError::ExpiredWindowSessionError);
+            return Err(PluginWindowCallError::ExpiredWindowSession);
         }
         window.timer_session.in_flight = window
             .timer_session
             .in_flight
             .checked_add(1)
-            .ok_or(crate::public_plugins::TimerError::TimerUnavailable)?;
-        Ok(TimerCallLease {
+            .ok_or(PluginWindowCallError::Unavailable)?;
+        Ok(PluginWindowCallLease {
             controller: Arc::clone(self),
             owner: window.owner.clone(),
             session_generation,
@@ -297,7 +304,7 @@ impl PluginWindowController {
         true
     }
 
-    fn finish_timer_call(&self, plugin_id: &str, session_generation: u64) {
+    fn finish_window_call(&self, plugin_id: &str, session_generation: u64) {
         let Ok(mut core) = self.core.lock() else {
             return;
         };
@@ -685,6 +692,11 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
     reset: async () => { throw new Error('ExpiredWindowSessionError'); },
     onStateChanged: () => { throw new Error('ExpiredWindowSessionError'); },
   });
+  const expiredStorage = deepFreeze({
+    get: async () => { throw new Error('ExpiredWindowSessionError'); },
+    set: async () => { throw new Error('ExpiredWindowSessionError'); },
+    remove: async () => { throw new Error('ExpiredWindowSessionError'); },
+  });
   const createTimerSession = (sessionGeneration) => {
     const session = { sessionGeneration, active: true, state: null, stateHandler: null, readToken: 0 };
     const call = async (command, args = {}) => {
@@ -721,6 +733,17 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
         };
       },
     });
+    session.storage = deepFreeze({
+      async get(key) {
+        return call('plugin_window_storage_get', { key });
+      },
+      async set(key, value) {
+        await call('plugin_window_storage_set', { key, value: deepFreeze(value) });
+      },
+      async remove(key) {
+        await call('plugin_window_storage_remove', { key });
+      },
+    });
     return session;
   };
   const sendReady = async () => {
@@ -736,6 +759,7 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
       return () => { if (handler === next) handler = null; };
     },
     get timer() { return timerSession ? timerSession.facade : expiredTimer; },
+    get storage() { return timerSession ? timerSession.storage : expiredStorage; },
   });
   Object.defineProperty(window, 'uipilotPluginWindow', { value: api, configurable: false });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_TIMER_PREPARE__', {
@@ -1437,8 +1461,6 @@ mod tests {
     use std::{sync::mpsc, thread};
 
     use super::*;
-    use crate::public_plugins::TimerError;
-
     fn owner(token: &str, generation: u64, request: &str) -> PluginWindowOwner {
         PluginWindowOwner {
             ui_intent_epoch: generation,
@@ -1481,14 +1503,14 @@ mod tests {
     }
 
     #[test]
-    fn timer_session_is_read_only_until_visible_and_old_generations_expire() {
+    fn window_session_is_read_only_until_visible_and_old_generations_expire() {
         let controller = Arc::new(PluginWindowController::default());
         let first = owner("timer-a", 3, "request-a");
         let transaction = controller.submit(first.clone()).unwrap();
         assert_eq!(transaction.timer_session_generation, 1);
 
         let read = controller
-            .begin_timer_call(
+            .begin_window_call(
                 &transaction.content_label,
                 transaction.timer_session_generation,
                 false,
@@ -1497,12 +1519,12 @@ mod tests {
         assert_eq!(read.owner(), &first);
         drop(read);
         assert!(matches!(
-            controller.begin_timer_call(
+            controller.begin_window_call(
                 &transaction.content_label,
                 transaction.timer_session_generation,
                 true,
             ),
-            Err(TimerError::ExpiredWindowSessionError)
+            Err(PluginWindowCallError::ExpiredWindowSession)
         ));
 
         for (expected, next) in [
@@ -1537,7 +1559,7 @@ mod tests {
             .is_none());
         drop(
             controller
-                .begin_timer_call(
+                .begin_window_call(
                     &transaction.content_label,
                     transaction.timer_session_generation,
                     true,
@@ -1547,12 +1569,12 @@ mod tests {
 
         assert!(controller.begin_timer_session_close(&first.plugin_id));
         assert!(matches!(
-            controller.begin_timer_call(
+            controller.begin_window_call(
                 &transaction.content_label,
                 transaction.timer_session_generation,
                 false,
             ),
-            Err(TimerError::ExpiredWindowSessionError)
+            Err(PluginWindowCallError::ExpiredWindowSession)
         ));
         assert!(controller.finish_timer_session_hide(&first.plugin_id, true));
 
@@ -1560,12 +1582,12 @@ mod tests {
         let next = controller.submit(second).unwrap();
         assert!(next.timer_session_generation > transaction.timer_session_generation);
         assert!(matches!(
-            controller.begin_timer_call(
+            controller.begin_window_call(
                 &next.content_label,
                 transaction.timer_session_generation,
                 false,
             ),
-            Err(TimerError::ExpiredWindowSessionError)
+            Err(PluginWindowCallError::ExpiredWindowSession)
         ));
     }
 
@@ -1596,7 +1618,7 @@ mod tests {
         }
         assert!(controller.activate_timer_session(&current));
         let lease = controller
-            .begin_timer_call(
+            .begin_window_call(
                 &transaction.content_label,
                 transaction.timer_session_generation,
                 true,
@@ -1622,7 +1644,7 @@ mod tests {
         let current = owner("uninstall-barrier", 4, "request-uninstall");
         let transaction = controller.submit(current.clone()).unwrap();
         let lease = controller
-            .begin_timer_call(
+            .begin_window_call(
                 &transaction.content_label,
                 transaction.timer_session_generation,
                 false,
@@ -1671,13 +1693,17 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_owns_a_session_bound_timer_facade_without_general_events() {
+    fn bootstrap_owns_session_bound_timer_and_storage_facades_without_general_events() {
         for fragment in [
             "get timer()",
+            "get storage()",
             "plugin_window_timer_get_state",
             "plugin_window_timer_start",
             "plugin_window_timer_stop",
             "plugin_window_timer_reset",
+            "plugin_window_storage_get",
+            "plugin_window_storage_set",
+            "plugin_window_storage_remove",
             "__UIPILOT_PLUGIN_TIMER_PREPARE__",
             "__UIPILOT_PLUGIN_TIMER_STATE__",
             "sessionGeneration",
@@ -1689,6 +1715,8 @@ mod tests {
             );
         }
         assert!(!PUBLIC_CONTENT_BOOTSTRAP.contains("listen("));
+        assert!(PUBLIC_CONTENT_BOOTSTRAP.contains("session.storage = deepFreeze({"));
+        assert!(PUBLIC_CONTENT_BOOTSTRAP.contains("const api = deepFreeze({"));
         assert!(PUBLIC_CONTENT_BOOTSTRAP
             .contains("Reflect.deleteProperty(window, '__TAURI_INTERNALS__')"));
     }

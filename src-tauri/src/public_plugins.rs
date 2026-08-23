@@ -44,7 +44,7 @@ pub(crate) use activation::{
     parse_main_result_response, parse_window_response, PublicCommandSuggestion, PublicMainResult,
     PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
     PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginRoute,
-    PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse,
+    PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse, WindowStorageError,
 };
 #[cfg(test)]
 pub(crate) use alarm_asset::AlarmAssetIdentity;
