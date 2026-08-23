@@ -262,6 +262,19 @@ function fakeClient() {
 
 const executeActivation = { kind: 'executeResult' } as const
 
+function findLauncherItem(query: string) {
+  return {
+    resultId: `find-${query || 'empty'}`,
+    title: '/find',
+    subtitle: query ? `搜索文件：${query}` : '搜索文件',
+    iconKind: 'find' as const,
+    activation: query
+      ? { kind: 'openFind' as const, query }
+      : { kind: 'completion' as const, completionText: '/find ' },
+    hasDefaultAction: false,
+  }
+}
+
 function fileItem(
   fullPath = String.raw`C:\Private\UiPilot.txt`,
   resultId = 'file-result-1',
@@ -578,11 +591,145 @@ describe('startup ownership', () => {
     await core.start()
     fake.emit(shown('launcher'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
-    expect(fake.client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'launcher', querySequence: 1 })
+    expect(fake.client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'launcher', querySequence: 2 })
   })
 })
 
 describe('shown and search ownership', () => {
+  it('requests and selects the backend empty capability snapshot on native show', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: `empty-${request.invocationId}-${request.querySequence}`,
+      items: [
+        {
+          resultId: 'find-completion',
+          title: '/find',
+          activation: { kind: 'completion', completionText: '/find ' },
+          hasDefaultAction: false,
+        },
+        {
+          resultId: 'web-completion',
+          title: '/web-search',
+          activation: { kind: 'completion', completionText: '/web-search ' },
+          hasDefaultAction: false,
+        },
+      ],
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+
+    fake.emit(shown('native-empty'))
+
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith({
+      query: '', invocationId: 'native-empty', querySequence: 1,
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results.map((item) => item.title)).toEqual([
+      '/find', '/web-search',
+    ]))
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+  })
+
+  it('queries empty classification for clear and whitespace edits with increasing ownership', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: `request-${request.querySequence}`,
+      items: [{
+        resultId: `row-${request.querySequence}`,
+        title: request.query.trim() === '' ? '/find' : `Result ${request.query}`,
+        activation: request.query.trim() === ''
+          ? { kind: 'completion', completionText: '/find ' }
+          : executeActivation,
+      }],
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('empty-edits'))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('Result alpha'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '', inputType: 'deleteContentBackward' })
+    expect(core.getSnapshot().results).toEqual([])
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('/find'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '   ', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(vi.mocked(fake.client.searchApps).mock.calls.map(([request]) => ({
+      query: request.query, sequence: request.querySequence,
+    }))).toEqual([
+      { query: '', sequence: 1 },
+      { query: 'alpha', sequence: 2 },
+      { query: '', sequence: 3 },
+      { query: '   ', sequence: 4 },
+    ])
+  })
+
+  it('keeps local navigation on one invocation and resets only a native re-show', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValue({ requestId: 'navigation', items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('first-native'))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(1))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(2))
+
+    core.navigate('settings')
+    core.navigate('launcher')
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(3))
+    expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+      query: '', invocationId: 'first-native', querySequence: 3,
+    })
+
+    fake.emit(shown('second-native'))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(4))
+    expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+      query: '', invocationId: 'second-native', querySequence: 1,
+    })
+  })
+
+  it('executes a fast submitted web-search response exactly once', async () => {
+    const fake = fakeClient()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+        if (request.query === '') return { requestId: 'empty', items: [] }
+        return {
+          requestId: 'submitted-web',
+          items: [{
+            resultId: 'web-result',
+            title: 'Bing 搜索',
+            activation: executeActivation,
+            hasDefaultAction: true,
+          }],
+        }
+      })
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('fast-web'))
+      await vi.runAllTicks()
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/web-search UiPilot', inputType: 'insertText',
+      })
+
+      core.keyDown('Enter', false)
+      await vi.runAllTicks()
+      await Promise.resolve()
+
+      expect(fake.client.searchApps).toHaveBeenCalledWith({
+        query: '/web-search UiPilot', invocationId: 'fast-web', querySequence: 3, submit: true,
+      })
+      expect(fake.client.executeResult).toHaveBeenCalledOnce()
+      expect(fake.client.executeResult).toHaveBeenCalledWith({
+        requestId: 'submitted-web', resultId: 'web-result',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('accepts only the closed launcher activation union and completion grammar', () => {
     const boundary = `/d ${'a'.repeat(65_533)}`
     const valid = [
@@ -678,7 +825,7 @@ describe('shown and search ownership', () => {
     await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
       query: 'windows',
       invocationId: 'backend-find-activation',
-      querySequence: 1,
+      querySequence: 2,
     }))
     expect(fake.client.executeResult).not.toHaveBeenCalled()
   })
@@ -728,12 +875,12 @@ describe('shown and search ownership', () => {
     expect(fake.client.executeResult).not.toHaveBeenCalled()
   })
 
-  it('navigates between launcher and settings without hiding while preserving and refreshing the query', async () => {
+  it('navigates between launcher and settings without hiding and refreshes the empty launcher catalog', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
     vi.mocked(fake.client.searchApps).mockResolvedValue({
       requestId: 'local-navigation-search',
-      items: [{ resultId: 'calculator', title: 'Calculator', activation: executeActivation }],
+      items: [findLauncherItem('calc'), { resultId: 'calculator', title: 'Calculator', activation: executeActivation }],
     })
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -774,16 +921,16 @@ describe('shown and search ownership', () => {
       view: 'launcher',
       viewEpoch: launcherEpoch + 2,
       invocationId: 'local-navigation',
-      query: 'calc',
-      queryControlValue: 'calc',
-      querySequence: 1,
-      searchPending: true,
+      query: '',
+      queryControlValue: '',
+      querySequence: 3,
+      searchPending: false,
     })
-    expect(fake.client.searchApps).toHaveBeenCalledWith({
-      query: 'calc',
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith({
+      query: '',
       invocationId: 'local-navigation',
-      querySequence: 1,
-    })
+      querySequence: 3,
+    }))
     expect(fake.client.hideLauncher).not.toHaveBeenCalled()
   })
 
@@ -807,25 +954,25 @@ describe('shown and search ownership', () => {
     expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
   })
 
-  it('uses the exact shown reset and preserved-query search rules', async () => {
+  it('uses the exact native shown reset and empty-catalog search rules', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('first'))
-    expect(client.searchApps).not.toHaveBeenCalled()
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
     vi.mocked(client.searchApps).mockClear()
 
     emit(shown('second', 'launcher', 'settingsFailed'))
     expect(core.getSnapshot()).toMatchObject({
       invocationId: 'second',
-      query: 'calc',
-      queryControlValue: 'calc',
+      query: '',
+      queryControlValue: '',
       querySequence: 1,
-      results: [{ title: '/find', subtitle: '搜索文件：calc' }],
-      selectedIndex: 0,
+      results: [],
+      selectedIndex: -1,
       shownNotice: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
     })
-    expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'second', querySequence: 1 })
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledWith({
+      query: '', invocationId: 'second', querySequence: 1,
+    }))
 
     vi.mocked(client.searchApps).mockClear()
     emit(shown('settings', 'settings'))
@@ -844,9 +991,9 @@ describe('shown and search ownership', () => {
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'ab', inputType: 'insertText' })
     expect(core.getSnapshot()).toMatchObject({
       query: 'ab',
-      querySequence: 2,
-      results: [{ title: '/find', subtitle: '搜索文件：ab' }],
-      selectedIndex: 0,
+      querySequence: 3,
+      results: [],
+      selectedIndex: -1,
       searchPending: true,
       status: '',
     })
@@ -854,11 +1001,12 @@ describe('shown and search ownership', () => {
     await first.promise
     await Promise.resolve()
     expect(core.getSnapshot()).not.toBe(beforeSecond)
-    expect(core.getSnapshot().results).toMatchObject([{ title: '/find', subtitle: '搜索文件：ab' }])
+    expect(core.getSnapshot().results).toEqual([])
 
     second.resolve({
       requestId: 'request',
       items: [
+        findLauncherItem('ab'),
         { resultId: 'one', title: 'One', activation: executeActivation },
         { resultId: 'two', title: 'Two', subtitle: 'Second', activation: executeActivation },
       ],
@@ -873,17 +1021,17 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().selectedIndex).toBe(0)
 
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '', inputType: 'deleteContentBackward' })
-    expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 3, results: [], selectedIndex: -1, searchPending: false, status: '' })
+    expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 4, results: [], selectedIndex: -1, searchPending: true, status: '' })
   })
 
-  it('replaces the local find suggestion with an exclusive built-in result', async () => {
+  it('replaces ordinary backend capabilities with an exclusive built-in result', async () => {
     const { core, client, emit } = await startedCore()
     const response = deferred<SearchResponse | null>()
     vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
     emit(shown('math'))
 
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '1+1', inputType: 'insertText' })
-    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find'])
+    expect(core.getSnapshot().results).toEqual([])
 
     response.resolve({
       requestId: 'math-request',
@@ -904,11 +1052,12 @@ describe('shown and search ownership', () => {
     emit(shown('result-icon-kinds'))
 
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
-    expect(core.getSnapshot().results[0]).toMatchObject({ title: '/find', iconKind: 'find' })
+    expect(core.getSnapshot().results).toEqual([])
 
     response.resolve({
       requestId: 'icon-kinds',
       items: [
+        findLauncherItem('alpha'),
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==', activation: executeActivation },
@@ -974,7 +1123,7 @@ describe('shown and search ownership', () => {
       expect(client.searchApps).toHaveBeenCalledWith({
         query: '/demo   I am  Jack  ',
         invocationId: 'public-plugin',
-        querySequence: 1,
+        querySequence: 2,
         submit: false,
       })
       live.resolve(null)
@@ -985,7 +1134,7 @@ describe('shown and search ownership', () => {
       expect(client.searchApps).toHaveBeenLastCalledWith({
         query: '/demo   I am  Jack  ',
         invocationId: 'public-plugin',
-        querySequence: 2,
+        querySequence: 3,
         submit: true,
       })
       submit.resolve({
@@ -1047,6 +1196,7 @@ describe('shown and search ownership', () => {
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'icons',
       items: [
+        findLauncherItem('icon'),
         { resultId: 'valid', title: 'Valid', icon: valid, activation: executeActivation },
         ...invalid.map((icon, index) => ({ resultId: `bad-${index}`, title: `Bad ${index}`, icon, activation: executeActivation })),
       ],
@@ -1064,7 +1214,10 @@ describe('shown and search ownership', () => {
 describe('execute and hide ownership', () => {
   it('executes the private current mapping once and never asks the frontend to hide on success', async () => {
     const { core, client, emit } = await startedCore()
-    const search: SearchResponse = { requestId: 'private-request', items: [{ resultId: 'private-result', title: 'Calculator', activation: executeActivation }] }
+    const search: SearchResponse = {
+      requestId: 'private-request',
+      items: [findLauncherItem('calc'), { resultId: 'private-result', title: 'Calculator', activation: executeActivation }],
+    }
     vi.mocked(client.searchApps).mockResolvedValueOnce(search)
     const execute = deferred<ExecuteOutcome>()
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
@@ -1089,6 +1242,7 @@ describe('execute and hide ownership', () => {
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'public-copy-request',
       items: [
+        findLauncherItem('public'),
         { resultId: 'copy', title: 'Copy', hasDefaultAction: true, activation: executeActivation },
         { resultId: 'info', title: 'Info', hasDefaultAction: false, activation: executeActivation },
       ],
@@ -1111,7 +1265,7 @@ describe('execute and hide ownership', () => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'copy-request',
-      items: [{ resultId: 'copy-result', title: 'Copy', activation: executeActivation }],
+      items: [findLauncherItem('copy'), { resultId: 'copy-result', title: 'Copy', activation: executeActivation }],
     })
     vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
     emit(shown('copy'))
@@ -1152,7 +1306,10 @@ describe('execute and hide ownership', () => {
     const hiding = core.requestHide()
     hide.reject({ code: 'windowFailed' })
     await hiding
-    search.resolve({ requestId: 'application-after-hide', items: [{ resultId: 'result', title: 'Calculator', activation: executeActivation }] })
+    search.resolve({
+      requestId: 'application-after-hide',
+      items: [findLauncherItem('calc'), { resultId: 'result', title: 'Calculator', activation: executeActivation }],
+    })
     await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
   })
 })
@@ -1166,7 +1323,7 @@ describe('IME ownership', () => {
     const control = core.getSnapshot().queryControl
     core.text({ kind: 'ordinaryInput', control, value: 'old', inputType: 'insertText' })
     core.text({ kind: 'compositionStart', control })
-    expect(core.getSnapshot()).toMatchObject({ query: 'old', queryControlValue: 'old', querySequence: 1, searchPending: false, results: [] })
+    expect(core.getSnapshot()).toMatchObject({ query: 'old', queryControlValue: 'old', querySequence: 2, searchPending: false, results: [] })
     core.text({ kind: 'compositionInput', control, value: '新', inputType: 'insertCompositionText' })
     core.text({ kind: 'compositionInput', control, value: 'old', inputType: 'insertCompositionText' })
     const returned = core.getSnapshot()
@@ -1188,15 +1345,16 @@ describe('IME ownership', () => {
     core.text({ kind: 'compositionStart', control })
     core.text({ kind: 'compositionInput', control, value: '计算', inputType: 'insertCompositionText' })
     emit(shown('new-invocation'))
-    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: 'calc', querySequence: 1, searchPending: true })
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 1, searchPending: false })
     core.text({ kind: 'compositionBoundary', control })
     core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
-    expect(client.searchApps).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().searchPending).toBe(true)
     old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old', activation: executeActivation }] })
     current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New', activation: executeActivation }] })
     await Promise.all([old.promise, current.promise])
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
-    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find', 'New'])
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['New'])
   })
 
   it('keeps an exact empty commit state-idempotent', async () => {
@@ -1208,7 +1366,7 @@ describe('IME ownership', () => {
     core.text({ kind: 'compositionBoundary', control })
     expect(core.getSnapshot()).toBe(started)
     expect(client.searchApps).not.toHaveBeenCalled()
-    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 0, searchPending: false })
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 1, searchPending: false })
   })
 
   it('retires active ownership and its visible draft idempotently', async () => {
@@ -1238,15 +1396,15 @@ describe('R3 correlated composition boundary', () => {
 
     core.text(r3({ kind: 'compositionStart', control }))
     core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
-    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: '\u6d4b\u8bd5', querySequence: 1 })
+    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: '\u6d4b\u8bd5', querySequence: 2 })
     expect(client.searchApps).not.toHaveBeenCalled()
 
     const boundary = r3({ kind: 'compositionBoundary', control })
     expect(Object.keys(boundary).sort()).toEqual(['control', 'kind'])
     core.text(boundary)
-    expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5', querySequence: 2 })
+    expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5', querySequence: 3 })
     expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: '\u6d4b\u8bd5', invocationId: 'r3-launcher', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '\u6d4b\u8bd5', invocationId: 'r3-launcher', querySequence: 3 })
 
     const committed = core.getSnapshot()
     core.text(r3({ kind: 'ordinaryInput', control, value: '\u6d4b\u8bd5', inputType: 'insertText' }))
@@ -1342,7 +1500,7 @@ describe('R3 correlated composition boundary', () => {
 
     core.text(r3({ kind: 'ordinaryInput', control, value: 'cal', inputType: 'deleteContentBackward' }))
     expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: 'cal', invocationId: 'cancel', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenCalledWith({ query: 'cal', invocationId: 'cancel', querySequence: 3 })
     const cancelled = core.getSnapshot()
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(core.getSnapshot()).toBe(cancelled)
@@ -1416,36 +1574,12 @@ describe('R3 correlated composition boundary', () => {
     emit(shown('idempotent-rerun', 'launcher', 'settingsFailed'))
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({
-      query: '/unknown',
+      query: '',
       querySequence: 1,
       results: [],
       selectedIndex: -1,
       shownNotice: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
     })
-
-    const rerun = deferred<SearchResponse | null>()
-    vi.mocked(client.searchApps).mockReturnValueOnce(rerun.promise)
-    const searchCalls = vi.mocked(client.searchApps).mock.calls.length
-    core.keyDown('Enter', false)
-    expect(core.getSnapshot()).toMatchObject({
-      query: '/unknown',
-      querySequence: 2,
-      results: [],
-      selectedIndex: -1,
-      searchPending: true,
-      status: '',
-    })
-    expect(core.getSnapshot().shownNotice).toBeUndefined()
-    expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
-    expect(client.searchApps).toHaveBeenLastCalledWith({ query: '/unknown', invocationId: 'idempotent-rerun', querySequence: 2, submit: true })
-    expect(client.executeResult).not.toHaveBeenCalled()
-
-    core.keyDown('Enter', false)
-    expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
-    expect(client.executeResult).not.toHaveBeenCalled()
-    rerun.resolve(null)
-    await rerun.promise
-    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
 
     vi.mocked(client.searchApps).mockClear()
     listener.mockClear()
@@ -2229,7 +2363,10 @@ describe('plugin settings ownership', () => {
 describe('execute and hide continuation', () => {
   it('coalesces a late activation-refused result into the next eligible launcher notice', async () => {
     const { core, client, emit } = await startedCore()
-    vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'request', items: [{ resultId: 'result', title: 'App', activation: executeActivation }] })
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'request',
+      items: [findLauncherItem('app'), { resultId: 'result', title: 'App', activation: executeActivation }],
+    })
     const execute = deferred<ExecuteOutcome>()
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
     emit(shown('execute-old'))
@@ -2341,10 +2478,12 @@ describe('React view and accessibility', () => {
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
-    vi.mocked(fake.client.searchApps).mockResolvedValue({
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
       requestId: 'view-navigation-search',
-      items: [{ resultId: 'calculator', title: 'Calculator', activation: executeActivation }],
-    })
+      items: request.query === 'calc'
+        ? [findLauncherItem('calc'), { resultId: 'calculator', title: 'Calculator', activation: executeActivation }]
+        : [findLauncherItem('')],
+    }))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2383,7 +2522,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
     const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')
     await vi.waitFor(() => expect(document.activeElement).toBe(query))
-    expect(query?.value).toBe('calc')
+    expect(query?.value).toBe('')
     expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
     expect(stylesSource).toMatch(/\.launcher-settings-button\.ant-btn\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(/\.settings-title-group\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s)
@@ -2536,10 +2675,12 @@ describe('React view and accessibility', () => {
     style.textContent = stylesSource
     document.head.append(style)
     const { core, client, emit } = await startedCore()
-    vi.mocked(client.searchApps).mockResolvedValueOnce({
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
       requestId: 'layout',
-      items: [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation }],
-    })
+      items: request.query === 'layout'
+        ? [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation }]
+        : [],
+    }))
     const mounted = await mountLauncherView(core)
     mounted.host.id = 'app'
     try {
@@ -2653,9 +2794,10 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
-    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
       requestId: 'built-in-icons',
-      items: [
+      items: request.query === 'icons' ? [
+        findLauncherItem('icons'),
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         {
@@ -2666,8 +2808,8 @@ describe('React view and accessibility', () => {
         },
         { resultId: 'app', title: 'App', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation },
         { resultId: 'fallback', title: 'Fallback', activation: executeActivation },
-      ],
-    })
+      ] : [],
+    }))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2703,19 +2845,22 @@ describe('React view and accessibility', () => {
     const firstIcon = 'data:image/png;base64,iVBORw=='
     const siblingIcon = 'data:image/png;base64,QUJDRA=='
     const secondIcon = 'data:image/png;base64,iVBORw0K'
-    vi.mocked(fake.client.searchApps)
-      .mockResolvedValueOnce({
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+      if (request.query === 'icon') return {
         requestId: 'first-icons',
         items: [
+          findLauncherItem('icon'),
           { resultId: 'with-icon', title: 'With icon', icon: firstIcon, activation: executeActivation },
           { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon, activation: executeActivation },
           { resultId: 'without-icon', title: 'Without icon', activation: executeActivation },
         ],
-      })
-      .mockResolvedValueOnce({
+      }
+      if (request.query === 'new icon') return {
         requestId: 'second-icons',
-        items: [{ resultId: 'new-icon', title: 'New icon', icon: secondIcon, activation: executeActivation }],
-      })
+        items: [findLauncherItem('new icon'), { resultId: 'new-icon', title: 'New icon', icon: secondIcon, activation: executeActivation }],
+      }
+      return { requestId: 'empty-icons', items: [] }
+    })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2774,13 +2919,14 @@ describe('React view and accessibility', () => {
   it('renders local combobox/listbox ownership and keeps the active option visible', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
       requestId: 'private-request',
-      items: [
+      items: request.query === 'app' ? [
+        findLauncherItem('app'),
         { resultId: 'private-one', title: '<b>literal</b>', activation: executeActivation },
         { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value', activation: executeActivation },
-      ],
-    })
+      ] : [],
+    }))
     const core = createLauncherCore(fake.client)
     await core.start()
     const scroll = vi.fn()
@@ -2819,7 +2965,10 @@ describe('React view and accessibility', () => {
   it('keeps empty startup quiet, announces no results, and gives composing Escape to IME', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({ requestId: 'empty', items: [] })
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: 'empty',
+      items: request.query === 'missing' ? [findLauncherItem('missing')] : [],
+    }))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -3352,7 +3501,7 @@ describe('React view and accessibility', () => {
       core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
       core.text({ kind: 'compositionBoundary', control })
     })
-    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'stable-binding', querySequence: 1 })
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'stable-binding', querySequence: 2 })
 
     await mounted.unmount()
     expect(unbind).toHaveBeenCalledOnce()
@@ -3869,14 +4018,14 @@ describe('launcher find forwarding ownership', () => {
     core.text({ kind: 'ordinaryInput', control, value: 'windows', inputType: 'insertText' })
     expect(core.getSnapshot()).toMatchObject({
       query: 'windows',
-      selectedIndex: 0,
+      selectedIndex: -1,
       searchPending: true,
-      results: [{ title: '/find', subtitle: '搜索文件：windows' }],
+      results: [],
     })
 
     applications.resolve({
       requestId: 'application-request',
-      items: [{ resultId: 'windows-terminal', title: 'Windows Terminal', activation: executeActivation }],
+      items: [findLauncherItem('windows'), { resultId: 'windows-terminal', title: 'Windows Terminal', activation: executeActivation }],
     })
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot().results.map(({ title }) => title)).toEqual(['/find', 'Windows Terminal'])
@@ -3905,7 +4054,7 @@ describe('launcher find forwarding ownership', () => {
     core.keyDown('Enter', false)
     expect(fake.client.openFind).not.toHaveBeenCalled()
 
-    applications.resolve({ requestId: 'application-request', items: [] })
+    applications.resolve({ requestId: 'application-request', items: [findLauncherItem('windows')] })
     await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
       query: 'windows',
       invocationId: 'find-pending-ownership',

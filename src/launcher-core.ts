@@ -76,12 +76,7 @@ interface PrivateApplicationResult extends ViewResult {
   activation: LauncherResultActivation
 }
 
-interface PrivateFindResult extends ViewResult {
-  kind: 'find'
-  query: string
-}
-
-type PrivateResult = PrivateApplicationResult | PrivateFindResult
+type PrivateResult = PrivateApplicationResult
 
 interface PrivateFileResult {
   resultId: string
@@ -467,6 +462,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     query: string
     completion: Promise<SearchResponse | null>
   } | undefined
+  let pendingDefaultActivation: {
+    epoch: number
+    invocationId: string
+    sequence: number
+    query: string
+  } | undefined
 
 
   function publish(mutated: boolean): void {
@@ -602,17 +603,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function fileCommand(value: string): string | null {
     if (value === '/find') return ''
     return value.startsWith('/find ') ? value.slice(6) : null
-  }
-
-  function localFindResult(query: string): PrivateFindResult {
-    return {
-      kind: 'find',
-      key: resultKey++,
-      query,
-      title: '/find',
-      subtitle: `搜索文件：${query}`,
-      iconKind: 'find',
-    }
   }
 
   function submitFind(query: string): void {
@@ -858,17 +848,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function beginSearch(submit = false): void {
     const invocationId = model.invocationId
-    if (!invocationId || model.query === '' || fileCommand(model.query) !== null) return
-    if (!model.query.startsWith('/')) {
-      model.results = [localFindResult(model.query)]
-      model.selectedIndex = 0
-    }
+    if (!invocationId || fileCommand(model.query) !== null) return
     const captured = {
       token: ++token,
       epoch: model.viewEpoch,
       invocationId,
       sequence: model.querySequence,
       query: model.query,
+      submit,
     }
     searchToken = captured.token
     model.searchPending = true
@@ -920,7 +907,24 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       publish(true)
     }, 150)
   }
-  function ownsSearch(captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string }): boolean {
+  function deferCurrentSearch(): void {
+    const owner = {
+      epoch: model.viewEpoch,
+      invocationId: model.invocationId,
+      sequence: model.querySequence,
+      query: model.query,
+    }
+    setTimeout(() => {
+      if (
+        destroyed || model.view !== 'launcher' || owner.epoch !== model.viewEpoch ||
+        owner.invocationId !== model.invocationId || owner.sequence !== model.querySequence ||
+        owner.query !== model.query || owner.query !== model.queryControlValue
+      ) return
+      beginSearch()
+      publish(true)
+    }, 0)
+  }
+  function ownsSearch(captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string; submit: boolean }): boolean {
     return (
       !destroyed &&
       captured.token === searchToken &&
@@ -933,7 +937,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function finishSearch(
-    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string },
+    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string; submit: boolean },
     response: import('./protocol').SearchResponse | null,
   ): void {
     if (!ownsSearch(captured)) return
@@ -970,9 +974,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (response !== null) {
       model.requestId = response.requestId
       model.commandHint = safeCommandHint(response.commandHint)
-      const findResult = response.replaceLocalResults
-        ? undefined
-        : model.results.find((item): item is PrivateFindResult => item.kind === 'find')
       const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
         const activation = safeLauncherActivation(item.activation)
         if (activation === undefined || typeof item.resultId !== 'string' ||
@@ -994,15 +995,34 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
         }]
       })
-      model.results = findResult ? [findResult, ...applications] : applications
+      model.results = applications
       model.selectedIndex = model.results.length ? 0 : -1
       model.status = model.results.length || model.commandHint ? '' : '未找到应用'
+      const activateDefault =
+        pendingDefaultActivation?.epoch === captured.epoch &&
+        pendingDefaultActivation.invocationId === captured.invocationId &&
+        pendingDefaultActivation.sequence === captured.sequence &&
+        pendingDefaultActivation.query === captured.query
+      if (activateDefault) pendingDefaultActivation = undefined
+      publish(true)
+      if (
+        captured.submit &&
+        /^\/web-search\s+\S/u.test(captured.query.trim()) &&
+        applications.length === 1 &&
+        applications[0]?.activation.kind === 'executeResult' &&
+        applications[0]?.hasDefaultAction !== false
+      ) {
+        executeSelection()
+      } else if (activateDefault && applications.length > 0) {
+        executeSelection()
+      }
+      return
     }
     publish(true)
   }
 
   function failSearch(
-    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string },
+    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string; submit: boolean },
     error: unknown,
   ): void {
     if (!ownsSearch(captured)) return
@@ -1024,7 +1044,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     model.status = ''
     clearResults()
-    if (value !== '') scheduleSearch()
+    scheduleSearch()
     publish(true)
   }
 
@@ -1180,6 +1200,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     target: ShowTarget,
     invocationId: string,
     notice: import('./protocol').LifecycleNotice | null,
+    source: 'native' | 'local',
   ): void {
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
     const nextSettingsTab: SettingsTabKey =
@@ -1194,8 +1215,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.view = nextView
     model.settingsTab = nextSettingsTab
     pluginInventoryActive = false
-    model.queryControlValue = model.query
-    model.querySequence = 0
+    if (source === 'native') model.querySequence = 0
     cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
@@ -1212,9 +1232,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       activationNoticePending = false
       model.shownNotice = REFUSED_NOTICE
     }
-    if (nextView === 'launcher' && model.query !== '') {
-      model.querySequence = 1
-      scheduleSearch()
+    if (nextView === 'launcher') {
+      model.query = ''
+      model.queryControlValue = ''
+      model.querySequence = source === 'native' ? 1 : model.querySequence + 1
+      deferCurrentSearch()
+    } else {
+      model.queryControlValue = model.query
     }
     publish(true)
     if (nextView === 'settings') {
@@ -1227,7 +1251,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
-    transitionView(event.target, event.invocationId, event.notice)
+    transitionView(event.target, event.invocationId, event.notice, 'native')
     void messageCenter.refresh()
   }
 
@@ -1241,7 +1265,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     ) {
       return
     }
-    transitionView(target, model.invocationId, null)
+    transitionView(target, model.invocationId, null, 'local')
   }
 
   function selectSettingsTab(key: SettingsTabKey): void {
@@ -1610,10 +1634,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (model.launcherMode === 'applications') {
       const selected = model.results[model.selectedIndex]
       if (!selected) return
-      if (selected.kind === 'find') {
-        submitFind(selected.query)
-        return
-      }
       if (selected.activation.kind === 'completion') {
         applyEdit(selected.activation.completionText)
         return
@@ -1704,13 +1724,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         return
       }
       if (
+        model.launcherMode === 'applications' && model.view === 'launcher' && model.searchPending &&
+        !model.executePending && !model.results.length && model.query !== '' &&
+        !model.query.startsWith('/') && model.queryControlValue === model.query && model.invocationId
+      ) {
+        pendingDefaultActivation = {
+          epoch: model.viewEpoch,
+          invocationId: model.invocationId,
+          sequence: model.querySequence,
+          query: model.query,
+        }
+        return
+      }
+      if (
         model.launcherMode === 'applications' &&
         model.view === 'launcher' &&
-        !model.searchPending &&
         !model.executePending &&
         !model.results.length &&
         model.query !== '' &&
-        model.queryControlValue === model.query
+        model.queryControlValue === model.query &&
+        (!model.searchPending || model.query.startsWith('/'))
       ) {
         model.shownNotice = undefined
         cancelSlashSearch()
