@@ -4,6 +4,7 @@ import {
   Button,
   Checkbox,
   ConfigProvider,
+  Dropdown,
   Form,
   Input,
   Popconfirm,
@@ -15,7 +16,7 @@ import {
   type InputProps,
   type InputRef,
 } from 'antd'
-import { ArrowLeft, Calculator, FolderSearch, PanelsTopLeft, Search, Settings } from 'lucide-react'
+import { ArrowLeft, Calculator, FolderSearch, PanelsTopLeft, Search, Settings, Star } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -426,14 +427,16 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         <div className="launcher-result-surface">
           {snapshot.commandHint ? <div className="command-hint">{snapshot.commandHint}</div> : null}
           <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
-            {snapshot.results.map((item, index) => (
-              <div
+            {snapshot.results.map((item, index) => {
+              const row = (
+                <div
                 key={item.key}
                 id={`launcher-result-${item.key}`}
                 role="option"
                 aria-selected={snapshot.selectedIndex === index}
                 className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
                 onClick={() => core.activateResult(index)}
+                onContextMenu={item.pluginCompletion ? (event) => event.preventDefault() : undefined}
                 ref={(element) => {
                   if (element) optionRefs.current.set(item.key, element)
                   else optionRefs.current.delete(item.key)
@@ -465,12 +468,45 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                   )}
                 </span>
                 <span className="result-copy">
-                  <span className="result-title">{item.title}</span>
+                  <span className="result-title-line">
+                    <span className="result-title">{item.title}</span>
+                    {item.pluginCompletion?.favorite ? (
+                      <Star
+                        aria-label="常用"
+                        className="result-favorite-star"
+                        fill="currentColor"
+                        size={14}
+                        strokeWidth={1.8}
+                      />
+                    ) : null}
+                  </span>
                   {item.subtitle ? <span className="result-subtitle">{item.subtitle}</span> : null}
                   {item.detail ? <span className="result-detail">{item.detail}</span> : null}
                 </span>
               </div>
-            ))}
+              )
+              if (!item.pluginCompletion) return row
+              return (
+                <Dropdown
+                  key={item.key}
+                  trigger={['contextMenu']}
+                  menu={{
+                    items: [{
+                      key: 'favorite',
+                      label: item.pluginCompletion.favorite ? '取消常用' : '设为常用',
+                      disabled: snapshot.favoriteMutationPending,
+                    }],
+                    onClick: () => core.setPluginFavorite(index, !item.pluginCompletion!.favorite),
+                  }}
+                  onOpenChange={(open) => {
+                    if (open) core.openPluginContextMenu(index)
+                    else core.closePluginContextMenu()
+                  }}
+                >
+                  {row}
+                </Dropdown>
+              )
+            })}
           </div>
         </div>
       </Spin>

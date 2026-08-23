@@ -466,6 +466,18 @@ label,
   font-weight: 600;
 }
 
+.result-title-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.result-favorite-star {
+  flex: 0 0 auto;
+  color: #e3a008;
+}
+
 .result-subtitle {
   color: var(--uipilot-ui-muted-foreground);
   font-size: 0.875rem;

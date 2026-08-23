@@ -1964,6 +1964,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     ) return
     const result = model.results[index]
     if (result?.activation.kind !== 'pluginCompletion' || !model.invocationId) return
+    if (
+      favoriteInteraction &&
+      ownsFavoriteInteraction(favoriteInteraction) &&
+      favoriteInteraction.resultKey === result.key &&
+      favoriteInteraction.pluginId === result.activation.pluginId
+    ) {
+      favoriteMenuConsumed = false
+      publish(false)
+      return
+    }
     invalidateFavoriteInteraction()
     model.selectedIndex = index
     favoriteInteraction = {

@@ -1410,6 +1410,35 @@ describe('shown and search ownership', () => {
     expect(client.hideLauncher).not.toHaveBeenCalled()
   })
 
+  it('removes a nonmatching plugin from the captured plain query after cancelling favorite', async () => {
+    const { core, client, emit } = await startedCore()
+    let favorite = true
+    vi.mocked(client.setPublicPluginFavorite).mockImplementationOnce(async () => { favorite = false })
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `favorite-cancel-${request.querySequence}`,
+      items: request.query === 'unrelated' && favorite ? [{
+        resultId: 'demo-completion', title: '/demo-win',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win unrelated',
+          pluginId: 'com.uipilot.demo-win', favorite: true,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('favorite-cancel-current'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'unrelated', inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, false)
+    core.closePluginContextMenu()
+    await vi.waitFor(() => expect(core.getSnapshot().favoriteMutationPending).toBe(false))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toEqual([]))
+    expect(core.getSnapshot().query).toBe('unrelated')
+  })
+
   it('keeps late favorite success and failure inert after interaction ownership changes', async () => {
     for (const invalidation of ['keyboard', 'menu', 'hideReopen'] as const) {
       const { core, client, emit } = await startedCore()
@@ -2699,6 +2728,101 @@ describe('execute and hide continuation', () => {
 })
 
 describe('React view and accessibility', () => {
+  it('renders and owns the public-plugin favorite context menu without activating the row', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const mutation = deferred<void>()
+    const secondMutation = deferred<void>()
+    let favorite = false
+    vi.mocked(fake.client.setPublicPluginFavorite)
+      .mockReturnValueOnce(mutation.promise)
+      .mockReturnValueOnce(secondMutation.promise)
+    vi.mocked(fake.client.searchApps).mockImplementation(async () => ({
+      requestId: 'favorite-menu',
+      items: [
+        findLauncherItem(''),
+        {
+          resultId: 'demo-win', title: '/demo-win', subtitle: '打开演示子窗口',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/demo-win ',
+            pluginId: 'com.uipilot.demo-win', favorite,
+          },
+        },
+        {
+          resultId: 'demo-return', title: '/demo-return', subtitle: '返回文本',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/demo-return ',
+            pluginId: 'com.uipilot.demo-return', favorite: true,
+          },
+        },
+        { resultId: 'app', title: 'Demo App', activation: executeActivation },
+      ],
+    } as unknown as SearchResponse))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('favorite-menu')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
+    const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+
+    expect(options[2]?.querySelector('.result-favorite-star')).not.toBeNull()
+    expect(options[1]?.querySelector('.result-favorite-star')).toBeNull()
+    expect(options[0]?.querySelector('.result-favorite-star')).toBeNull()
+    await act(async () => options[0]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    expect(document.querySelector('[role="menuitem"]')).toBeNull()
+
+    await act(async () => options[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    let menuItem: HTMLElement | null = null
+    await vi.waitFor(() => {
+      menuItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === '设为常用') ?? null
+      expect(menuItem).not.toBeNull()
+    })
+    expect(options[1]?.getAttribute('aria-selected')).toBe('true')
+    await act(async () => menuItem!.click())
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledWith({
+      pluginId: 'com.uipilot.demo-win', favorite: true,
+    })
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    expect(core.getSnapshot().query).toBe('')
+
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledOnce()
+
+    favorite = true
+    await act(async () => {
+      mutation.resolve()
+      await mutation.promise
+    })
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.result-favorite-star')).toHaveLength(2))
+    const refreshed = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    let cancelItem: HTMLElement | null = null
+    await vi.waitFor(() => {
+      cancelItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === '取消常用') ?? null
+      expect(cancelItem).not.toBeNull()
+    })
+    await act(async () => cancelItem!.click())
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledTimes(2)
+    await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await vi.waitFor(() => {
+      const pendingItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === '取消常用')
+      expect(pendingItem?.getAttribute('aria-disabled')).toBe('true')
+    })
+    favorite = false
+    await act(async () => {
+      secondMutation.resolve()
+      await secondMutation.promise
+    })
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.result-favorite-star')).toHaveLength(1))
+
+    await mounted.unmount()
+    core.destroy()
+  })
+
   it('completes a plugin command and keeps an unselectable command usage hint until submit', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })

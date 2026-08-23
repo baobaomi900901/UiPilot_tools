@@ -93,11 +93,11 @@
 
 **Dependencies:** Task 3; specification sections `Main-Launcher Context Menu`, `Frontend Ownership And Data Flow`, and `Acceptance Criteria`.
 
-- [ ] Render the custom menu with the existing Ant Design in-WebView components. Right-click selects only a host `pluginCompletion` row, prevents the browser menu, and shows exactly `设为常用` or `取消常用`.
-- [ ] Route menu open/dismiss/consume events through the core interaction-owner API so consuming the current command does not invalidate itself, while independent dismissal or another menu does.
-- [ ] Disable duplicate mutation commands while one favorite mutation is pending; never complete/execute the row, hide the launcher, invoke plugin JavaScript, or request native focus from the menu path.
-- [ ] Render a compact filled Lucide star after favorite plugin titles as a noninteractive status indicator. Do not show menu/star behavior for Find, Web Search, calculator, applications, or plugin-produced results.
-- [ ] Keep menu and star styling aligned with current light/dark tokens, within the launcher bounds, and without changing row height or causing text overlap.
+- [x] Render the custom menu with the existing Ant Design in-WebView components. Right-click selects only a host `pluginCompletion` row, prevents the browser menu, and shows exactly `设为常用` or `取消常用`.
+- [x] Route menu open/dismiss/consume events through the core interaction-owner API so consuming the current command does not invalidate itself, while independent dismissal or another menu does.
+- [x] Disable duplicate mutation commands while one favorite mutation is pending; never complete/execute the row, hide the launcher, invoke plugin JavaScript, or request native focus from the menu path.
+- [x] Render a compact filled Lucide star after favorite plugin titles as a noninteractive status indicator. Do not show menu/star behavior for Find, Web Search, calculator, applications, or plugin-produced results.
+- [x] Keep menu and star styling aligned with current light/dark tokens, within the launcher bounds, and without changing row height or causing text overlap.
 
 **Distinct test coverage:** eligible right-click selection and exact label; set/cancel action; favorite star only on plugin completion; non-plugin context-menu rejection; duplicate pending action disabled; menu action preserves launcher visibility/focus/query; current mutation refreshes grouping/star; cancelling a nonmatching favorite removes it from the current plain query.
 
