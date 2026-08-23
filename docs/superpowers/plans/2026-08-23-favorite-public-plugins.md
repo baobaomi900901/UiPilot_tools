@@ -45,10 +45,10 @@
 
 **Dependencies:** Approved specification sections `Favorite State`, `Persistent State`, and `Failure Behavior`.
 
-- [ ] Add the serde-defaulted state/config field and preserve it across install/upgrade, rename, settings, enable/disable, fault transitions, and other state rewrites; both uninstall retention modes clear it and reinstall starts false.
-- [ ] Add the installed-only `prepare_set_favorite` candidate builder and the idempotent manager fast path that performs no reservation, durable write, or revision increment when the value is unchanged.
-- [ ] Implement `PublicPluginManager::set_favorite` with the existing mutation lock, activation reservation, `make_state_durable`, `publish_prepared`, and `bundle.with_config` order. Publish success only after the running bundle contains the durable value, without scheduler or Runtime invalidation.
-- [ ] Preserve the existing fail-closed transaction behavior: known-not-committed rolls back to the old bundle; unknown durability or post-durable publication failure makes the manager terminal until restart.
+- [x] Add the serde-defaulted state/config field and preserve it across install/upgrade, rename, settings, enable/disable, fault transitions, and other state rewrites; both uninstall retention modes clear it and reinstall starts false.
+- [x] Add the installed-only `prepare_set_favorite` candidate builder and the idempotent manager fast path that performs no reservation, durable write, or revision increment when the value is unchanged.
+- [x] Implement `PublicPluginManager::set_favorite` with the existing mutation lock, activation reservation, `make_state_durable`, `publish_prepared`, and `bundle.with_config` order. Publish success only after the running bundle contains the durable value, without scheduler or Runtime invalidation.
+- [x] Preserve the existing fail-closed transaction behavior: known-not-committed rolls back to the old bundle; unknown durability or post-durable publication failure makes the manager terminal until restart.
 
 **Distinct test coverage:** legacy state defaults false; canonical next write; idempotent no-op revision/write behavior; same-process catalog visibility; restart/rename/update/disable-reenable preservation; both uninstall modes and reinstall; known-not-committed rollback; unknown/post-durable failures enter terminal state without returning success.
 

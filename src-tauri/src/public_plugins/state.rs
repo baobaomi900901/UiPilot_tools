@@ -36,6 +36,7 @@ pub(crate) struct EffectivePluginConfig {
     pub(crate) name_override: Option<String>,
     pub(crate) installed: bool,
     pub(crate) enabled: bool,
+    pub(crate) favorite: bool,
     pub(crate) fault: Option<PublicPluginFault>,
     pub(crate) permission_grants: BTreeSet<PublicPermission>,
     pub(crate) inventory_revision: u64,
@@ -81,6 +82,8 @@ struct PluginStateDocument {
     name_override: Option<String>,
     installed: bool,
     enabled: bool,
+    #[serde(default)]
+    favorite: bool,
     fault: Option<PublicPluginFault>,
     permission_grants: BTreeSet<PublicPermission>,
     inventory_revision: u64,
@@ -104,6 +107,7 @@ impl PluginStateDocument {
             name_override: self.name_override.clone(),
             installed: self.installed,
             enabled: self.enabled,
+            favorite: self.favorite,
             fault: self.fault,
             permission_grants: self.permission_grants.clone(),
             inventory_revision: self.inventory_revision,
@@ -265,10 +269,14 @@ impl PluginStateStore {
             previous.map(|stored| &stored.document.settings),
             &manifest.settings,
         );
-        let (enabled, fault) = previous
+        let (enabled, fault, favorite) = previous
             .filter(|stored| stored.document.installed)
-            .map_or((true, None), |stored| {
-                (stored.document.enabled, stored.document.fault)
+            .map_or((true, None, false), |stored| {
+                (
+                    stored.document.enabled,
+                    stored.document.fault,
+                    stored.document.favorite,
+                )
             });
         let document = PluginStateDocument {
             schema: 1,
@@ -278,6 +286,7 @@ impl PluginStateStore {
             name_override: override_name,
             installed: true,
             enabled,
+            favorite,
             fault,
             permission_grants,
             inventory_revision: revision,
@@ -485,6 +494,25 @@ impl PluginStateStore {
         self.prepare_document(&state, plugin_id, document, false)
     }
 
+    pub(crate) fn prepare_set_favorite(
+        &self,
+        plugin_id: &str,
+        favorite: bool,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut document = previous.document.clone();
+        document.favorite = favorite;
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
+    }
+
     pub(crate) fn prepare_enable_with_generation(
         &self,
         plugin_id: &str,
@@ -593,6 +621,7 @@ impl PluginStateStore {
             let mut document = previous.document.clone();
             document.installed = false;
             document.enabled = false;
+            document.favorite = false;
             document.fault = None;
             document.inventory_revision = revision;
             self.persist_revision(revision)?;
@@ -622,6 +651,7 @@ impl PluginStateStore {
         let mut document = previous.document.clone();
         document.installed = false;
         document.enabled = false;
+        document.favorite = false;
         document.fault = None;
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, !retain_data)

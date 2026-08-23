@@ -369,3 +369,81 @@ fn not_committed_rollback_requires_the_exact_previous_owner_bytes() {
     .unwrap();
     assert!(!store.revalidate_previous(&prepared));
 }
+
+#[test]
+fn favorite_state_defaults_persists_and_survives_non_uninstall_mutations() {
+    let dir = TestDir::new("favorite-state");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let mut plugin = manifest("com.example.favorite", "favorite", definitions());
+    let installed = install(&store, &plugin);
+    assert!(!installed.favorite);
+
+    let prepared = store.prepare_set_favorite(&plugin.plugin_id, true).unwrap();
+    assert_eq!(
+        store.persist_prepared(&prepared),
+        DurableStateOutcome::Committed
+    );
+    let favorited = store.publish_prepared(prepared).unwrap();
+    assert!(favorited.favorite);
+
+    let renamed = store
+        .rename(&plugin.plugin_id, Some("favorite-renamed"))
+        .unwrap();
+    assert!(renamed.favorite);
+    let disabled = store.set_enabled(&plugin.plugin_id, false).unwrap();
+    assert!(disabled.favorite);
+    plugin.version = "1.1.0".into();
+    let upgraded = install(&store, &plugin);
+    assert!(upgraded.favorite);
+    drop(store);
+
+    let reloaded = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    assert!(
+        reloaded
+            .config(&plugin.plugin_id)
+            .unwrap()
+            .unwrap()
+            .favorite
+    );
+
+    let prepared = reloaded
+        .prepare_uninstall(&plugin.plugin_id, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.persist_prepared(&prepared),
+        DurableStateOutcome::Committed
+    );
+    let removed = reloaded.publish_prepared(prepared).unwrap();
+    assert!(!removed.installed);
+    assert!(!removed.favorite);
+    assert!(!install(&reloaded, &plugin).favorite);
+}
+
+#[test]
+fn legacy_state_without_favorite_loads_false_and_next_write_is_canonical() {
+    let dir = TestDir::new("favorite-legacy");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let plugin = manifest("com.example.legacy-favorite", "legacy-favorite", json!([]));
+    install(&store, &plugin);
+    drop(store);
+
+    let state_path = dir.path().join(&plugin.plugin_id).join("state.json");
+    let mut document = serde_json::from_slice::<Value>(&fs::read(&state_path).unwrap()).unwrap();
+    document.as_object_mut().unwrap().remove("favorite");
+    fs::write(&state_path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let reloaded = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    assert!(
+        !reloaded
+            .config(&plugin.plugin_id)
+            .unwrap()
+            .unwrap()
+            .favorite
+    );
+    reloaded
+        .rename(&plugin.plugin_id, Some("legacy-favorite-renamed"))
+        .unwrap();
+    let canonical = serde_json::from_slice::<Value>(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(canonical["favorite"], false);
+}

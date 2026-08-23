@@ -1192,6 +1192,34 @@ impl PublicPluginManager {
         Ok(mutation_from_config(&config))
     }
 
+    pub(crate) fn set_favorite(
+        &self,
+        plugin_id: &str,
+        favorite: bool,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let (bundle, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let bundle = self
+                .bundles
+                .bundle(plugin_id)?
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            if !bundle.config.installed {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            if bundle.config.favorite == favorite {
+                return Ok(mutation_from_config(&bundle.config));
+            }
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state = self.state.prepare_set_favorite(plugin_id, favorite)?;
+            (bundle, reservation, prepared_state)
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
+        let _mutation = self.lock_mutation()?;
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(Some(bundle.with_config(config.clone())))?;
+        Ok(mutation_from_config(&config))
+    }
+
     pub(crate) fn save_settings(
         &self,
         plugin_id: &str,
@@ -4329,6 +4357,56 @@ mod tests {
             .launcher_command_suggestions("alpha")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn favorite_mutation_publishes_config_without_reloading_runtime_and_is_idempotent() {
+        let dir = TestDir::new("favorite-mutation");
+        let manager = manager(&dir);
+        let source = dir.path().join("source-favorite");
+        write_discovery_package(
+            &source,
+            "com.example.favorite",
+            "Favorite Plugin",
+            "favorite",
+            "Favorite summary",
+        );
+        install_discovery_package(&manager, &source, Instant::now());
+
+        let before = manager
+            .bundles
+            .bundle("com.example.favorite")
+            .unwrap()
+            .unwrap();
+        assert!(!before.config.favorite);
+        let before_revision = before.config.inventory_revision;
+        let before_activation = before.activation_id;
+        let before_admission = before.admission_epoch;
+
+        let mutation = manager.set_favorite("com.example.favorite", true).unwrap();
+        let favorited = manager
+            .bundles
+            .bundle("com.example.favorite")
+            .unwrap()
+            .unwrap();
+        assert!(favorited.config.favorite);
+        assert!(mutation.inventory_revision > before_revision);
+        assert_eq!(
+            favorited.config.inventory_revision,
+            mutation.inventory_revision
+        );
+        assert_eq!(favorited.activation_id, before_activation);
+        assert_eq!(favorited.admission_epoch, before_admission);
+        assert!(Arc::ptr_eq(&favorited.runtime, &before.runtime));
+
+        let same = manager.set_favorite("com.example.favorite", true).unwrap();
+        let after_noop = manager
+            .bundles
+            .bundle("com.example.favorite")
+            .unwrap()
+            .unwrap();
+        assert_eq!(same.inventory_revision, mutation.inventory_revision);
+        assert!(Arc::ptr_eq(&after_noop, &favorited));
     }
 
     #[test]
