@@ -120,9 +120,16 @@ fn setup_production_lifecycle(
     let window = app
         .get_webview_window("main")
         .ok_or_else(lifecycle_setup_error)?;
+    let panel_controller = Arc::clone(
+        app.state::<Arc<plugin_panel::PluginPanelController>>()
+            .inner(),
+    );
+    plugin_panel::register_main_focus_events(&window, Arc::clone(&panel_controller))
+        .map_err(|_| lifecycle_setup_error())?;
     let event_app = app.handle().clone();
     let event_window = window.clone();
     let event_coordinator = Arc::clone(coordinator);
+    let event_panel_controller = Arc::clone(&panel_controller);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
             event_app
@@ -134,12 +141,9 @@ fn setup_production_lifecycle(
             if expected_blur {
                 return;
             }
-            if !*focused
-                && lifecycle::normalize_main_focus_event(
-                    *focused,
-                    lifecycle::foreground_belongs_to_current_process(),
-                )
-            {
+            if *focused {
+                let _ = event_panel_controller.observe_main_content_focus(true);
+            } else if event_panel_controller.consume_internal_main_blur(std::time::Instant::now()) {
                 return;
             }
             let registries = event_app.state::<result_registry::ResultRegistries>();
@@ -1058,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn main_focus_normalizes_panel_child_blur_before_hide_dispatch() {
+    fn main_focus_checks_webview_content_ownership_before_hide_dispatch() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let focused_branch = source
             .split("tauri::WindowEvent::Focused(focused) => {")
@@ -1069,13 +1073,12 @@ mod tests {
             .find("consume_expected_main_blur()")
             .expect("expected main blur handling is missing");
         let panel_focus = focused_branch
-            .find("normalize_main_focus_event(")
-            .expect("panel child focus normalization is missing");
+            .find("consume_internal_main_blur(std::time::Instant::now())")
+            .expect("webview content focus normalization is missing");
         let hide = focused_branch
             .find("commands::clear_and_hide(")
             .expect("main hide dispatch is missing");
 
-        assert!(focused_branch.contains("foreground_belongs_to_current_process()"));
         assert!(expected_blur < panel_focus);
         assert!(panel_focus < hide);
     }

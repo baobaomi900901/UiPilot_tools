@@ -17,8 +17,8 @@ use windows::Win32::{
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId, WM_ENDSESSION, WM_ENTERSIZEMOVE,
-            WM_EXITSIZEMOVE, WM_NCDESTROY, WM_QUERYENDSESSION,
+            GetForegroundWindow, WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
+            WM_QUERYENDSESSION,
         },
     },
 };
@@ -1622,23 +1622,6 @@ fn normalize_native_focus_snapshot(
     }
 }
 
-pub(crate) fn normalize_main_focus_event(focused: bool, foreground_belongs_to_app: bool) -> bool {
-    focused || foreground_belongs_to_app
-}
-
-pub(crate) fn foreground_belongs_to_current_process() -> bool {
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.0.is_null() {
-        return false;
-    }
-    let mut process_id = 0;
-    let thread_id = unsafe { GetWindowThreadProcessId(foreground, Some(&mut process_id)) };
-    if thread_id == 0 {
-        return false;
-    }
-    process_id == std::process::id()
-}
-
 fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, LifecycleError> {
     let main = app
         .get_webview_window("main")
@@ -1949,20 +1932,6 @@ mod tests {
         ] {
             assert_eq!(
                 normalize_native_focus_snapshot(main_focused, find_focused, foreground),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn app_owned_webview_focus_keeps_main_active() {
-        for (focused, foreground_belongs_to_app, expected) in [
-            (true, false, true),
-            (false, false, false),
-            (false, true, true),
-        ] {
-            assert_eq!(
-                normalize_main_focus_event(focused, foreground_belongs_to_app),
                 expected
             );
         }

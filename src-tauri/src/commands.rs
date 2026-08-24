@@ -3741,7 +3741,10 @@ pub(crate) fn clear_and_hide(
         },
         || registry.hide_and_clear(),
         || window.hide().map_err(|_| ()),
-        || plugin_panel::teardown(&app, panel_controller.as_ref(), None),
+        || {
+            plugin_panel::teardown(&app, panel_controller.as_ref(), None);
+            panel_controller.host_hidden();
+        },
         |position| settings.set_window_position(position).map_err(|_| ()),
     )
 }
