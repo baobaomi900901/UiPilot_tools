@@ -424,35 +424,41 @@ impl PluginPanelController {
         session_epoch: u64,
         request_id: &str,
         timeout: Duration,
-    ) -> Result<(), PublicPluginManagementError> {
+    ) -> Result<(), PanelSettlementError> {
         let Ok(mut core) = self.core.lock() else {
-            return Err(PublicPluginManagementError::Unavailable);
+            return Err(PanelSettlementError::Unavailable);
         };
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
+            .ok_or(PanelSettlementError::Unavailable)?;
         loop {
-            if let Some(session) = core.session.as_mut() {
-                if session.identity.session_epoch == session_epoch
-                    && session.current_request_id == request_id
-                    && session.phase == PanelPhase::Acknowledged
-                {
+            match core.session.as_mut() {
+                None => return Err(PanelSettlementError::Stale),
+                Some(session) if session.identity.session_epoch != session_epoch => {
+                    return Err(PanelSettlementError::Stale);
+                }
+                Some(session) if session.current_request_id != request_id => {
+                    return Err(PanelSettlementError::Stale);
+                }
+                Some(session) if session.phase == PanelPhase::Acknowledged => {
                     session.phase = PanelPhase::Ready;
                     self.changed.notify_all();
                     return Ok(());
                 }
+                Some(session) if session.phase == PanelPhase::Ready => return Ok(()),
+                Some(_) => {}
             }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(PublicPluginManagementError::Unavailable);
+                return Err(PanelSettlementError::Unavailable);
             }
             let (guard, result) = self
                 .changed
                 .wait_timeout(core, deadline.saturating_duration_since(now))
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                .map_err(|_| PanelSettlementError::Unavailable)?;
             core = guard;
             if result.timed_out() {
-                return Err(PublicPluginManagementError::Unavailable);
+                return Err(PanelSettlementError::Unavailable);
             }
         }
     }
@@ -681,27 +687,29 @@ fn deliver_update(
     controller: &PluginPanelController,
     identity: &PanelSessionIdentity,
     update: PluginPanelUpdate,
-) -> Result<(), PublicPluginManagementError> {
-    controller.set_current_request(identity.session_epoch, &update.request_id)?;
+) -> Result<(), PanelSettlementError> {
+    controller
+        .set_current_request(identity.session_epoch, &update.request_id)
+        .map_err(|_| PanelSettlementError::Unavailable)?;
     let content = app
         .get_webview(&identity.content_label)
-        .ok_or(PublicPluginManagementError::Unavailable)?;
+        .ok_or(PanelSettlementError::Unavailable)?;
     let session_payload = serde_json::to_string(&serde_json::json!({
         "sessionEpoch": identity.session_epoch.to_string(),
     }))
-    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+    .map_err(|_| PanelSettlementError::Unavailable)?;
     content
         .eval(format!(
             "window.__UIPILOT_PLUGIN_PANEL_PREPARE__({session_payload});"
         ))
-        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        .map_err(|_| PanelSettlementError::Unavailable)?;
     let payload =
-        serde_json::to_string(&update).map_err(|_| PublicPluginManagementError::Unavailable)?;
+        serde_json::to_string(&update).map_err(|_| PanelSettlementError::Unavailable)?;
     content
         .eval(format!(
             "window.__UIPILOT_PLUGIN_PANEL_UPDATE__({payload});"
         ))
-        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        .map_err(|_| PanelSettlementError::Unavailable)?;
     controller.wait_until_acked(
         identity.session_epoch,
         &update.request_id,
@@ -732,7 +740,6 @@ pub(crate) fn deliver_panel_update(
         submission_token,
     )?;
     deliver_update(app, controller, identity, update)
-        .map_err(|_| PanelSettlementError::Unavailable)
 }
 
 pub(crate) fn queue_dispatch(
@@ -746,7 +753,7 @@ pub(crate) fn queue_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::Arc, thread, time::Duration};
+    use std::time::Duration;
 
     fn owner(request: &str) -> PanelOwner {
         PanelOwner {
@@ -1315,8 +1322,8 @@ mod tests {
     }
 
     #[test]
-    fn wait_until_acked_succeeds_when_enter_queues_before_waiter_wakes() {
-        let controller = Arc::new(PluginPanelController::default());
+    fn acknowledged_enter_buffers_before_wait_consumes_ack() {
+        let controller = PluginPanelController::default();
         let identity = content_ready_session(&controller);
         assert_eq!(
             controller
@@ -1330,14 +1337,6 @@ mod tests {
         assert!(controller
             .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
             .is_ok());
-
-        let waiter = {
-            let controller = Arc::clone(&controller);
-            let epoch = identity.session_epoch;
-            thread::spawn(move || controller.wait_until_acked(epoch, "a", Duration::from_secs(2)))
-        };
-
-        thread::sleep(Duration::from_millis(10));
         assert!(content_ack(
             &controller,
             &identity.content_label,
@@ -1353,13 +1352,91 @@ mod tests {
                 .unwrap(),
             QueueDispatchOutcome::Buffered
         );
-
-        assert_eq!(waiter.join().unwrap(), Ok(()));
+        assert_eq!(
+            controller
+                .wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1))
+                .unwrap(),
+            ()
+        );
         assert!(controller.accepted_submission_token(identity.session_epoch, "token-a"));
         let pending = controller
             .promote_pending_dispatch(identity.session_epoch)
             .unwrap();
         assert_eq!(pending.request_id, "b");
+    }
+
+    #[test]
+    fn wait_until_acked_returns_stale_after_teardown() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .is_ok());
+        controller.teardown_session(Some(identity.session_epoch));
+        assert_eq!(
+            controller.wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1)),
+            Err(PanelSettlementError::Stale)
+        );
+    }
+
+    #[test]
+    fn wait_until_acked_returns_stale_when_session_epoch_superseded() {
+        let controller = PluginPanelController::default();
+        let first = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    first.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(first.session_epoch, "a", "token-a")
+            .is_ok());
+        controller.teardown_session(Some(first.session_epoch));
+        let second = controller.open_session(owner("b")).unwrap();
+        assert!(content_ready(
+            &controller,
+            &second.content_label,
+            second.session_epoch,
+        ));
+        assert_eq!(
+            controller.wait_until_acked(first.session_epoch, "a", Duration::from_secs(1)),
+            Err(PanelSettlementError::Stale)
+        );
+    }
+
+    #[test]
+    fn wait_until_acked_times_out_with_unavailable_for_live_unacked_delivery() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .is_ok());
+        assert_eq!(
+            controller.wait_until_acked(identity.session_epoch, "a", Duration::from_millis(1)),
+            Err(PanelSettlementError::Unavailable)
+        );
     }
 
     #[test]
