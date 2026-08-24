@@ -530,6 +530,12 @@ pub(crate) struct SubmitPluginPanelInput {
     ui_intent_epoch: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ClosePluginPanelInput {
+    session_epoch: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginPanelCommandResult {
@@ -1706,6 +1712,19 @@ pub(crate) async fn submit_plugin_panel(
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
     require_main_window(&window)?;
     submit_plugin_panel_impl(app, public, controller, settings, input).await
+}
+
+#[tauri::command]
+pub(crate) fn close_plugin_panel(
+    window: WebviewWindow,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    input: ClosePluginPanelInput,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
+    plugin_panel::teardown(&app, controller.inner().as_ref(), Some(session_epoch));
+    Ok(())
 }
 
 fn parse_panel_session_epoch(value: &str) -> Result<u64, CommandError> {
@@ -4492,6 +4511,7 @@ mod tests {
             "clear_messages",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "close_plugin_panel",
         ] {
             let trace = RefCell::new(Vec::new());
             let result = require_main_label("secondary").map(|()| {
@@ -4504,7 +4524,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_open_and_submit_are_main_only_and_use_decimal_session_epochs() {
+    fn panel_open_submit_and_close_are_main_only_and_use_decimal_session_epochs() {
         assert_eq!(parse_panel_session_epoch("1"), Ok(1));
         assert_eq!(
             parse_panel_session_epoch("18446744073709551615"),
@@ -4533,6 +4553,16 @@ mod tests {
                 "{command} must guard before state access"
             );
         }
+        let close = source
+            .split("pub(crate) fn close_plugin_panel(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("missing close_plugin_panel");
+        let statements = close.split_once("{\n").unwrap().1;
+        let guard = statements.find("require_main_window(&window)?;").unwrap();
+        let state_access = statements.find("controller.inner()").unwrap();
+        assert!(guard < state_access);
+        assert!(close.contains("Some(session_epoch)"));
     }
 
     #[test]

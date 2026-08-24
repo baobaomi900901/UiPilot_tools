@@ -18,6 +18,7 @@
     "allow-uninstall-plugin",
     "allow-open-plugin-panel",
     "allow-submit-plugin-panel",
+    "allow-close-plugin-panel",
     "allow-commit-plugin-window-transfer",
     "allow-get-message-summary",
     "allow-open-message-center",

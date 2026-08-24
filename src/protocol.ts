@@ -247,6 +247,7 @@ export type ClassifiedTextRecord =
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
+  listenPluginPanelError(handler: (payload: unknown) => void): Promise<() => void>
   getMessageSummary(): Promise<unknown>
   openMessageCenter(): Promise<unknown>
   readMessageCenter(): Promise<unknown>
@@ -254,6 +255,13 @@ export interface LauncherClient {
   searchApps(input: SearchAppsInput): Promise<SearchResponse | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  openPluginPanel(input: { pluginId: string; argument: string }): Promise<PluginPanelCommandResult>
+  submitPluginPanel(input: {
+    sessionEpoch: U64Decimal
+    argument: string
+    uiIntentEpoch: number
+  }): Promise<PluginPanelCommandResult>
+  closePluginPanel(input: { sessionEpoch: U64Decimal }): Promise<void>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
@@ -364,6 +372,26 @@ export interface ViewResult {
   hasDefaultAction?: boolean
   pluginCompletion?: Readonly<{ pluginId: string; favorite: boolean }>
   panelActivation?: Readonly<{ pluginId: string; initialArgument: string; favorite: boolean }>
+}
+
+export interface PluginPanelCommandResult {
+  sessionEpoch: U64Decimal
+  pluginId: string
+  commandLabel: string
+}
+
+export interface PluginPanelErrorEvent {
+  sessionEpoch: U64Decimal
+}
+
+export interface PluginPanelSnapshot {
+  pluginId: string
+  commandLabel: string
+  sessionEpoch: U64Decimal
+  suffixControl: ControlKey
+  suffix: string
+  submitPending: boolean
+  closePending: boolean
 }
 export interface TextControlView {
   key: ControlKey
@@ -477,6 +505,7 @@ export interface LauncherSnapshot {
   plugins?: PluginListSnapshot
   publicPlugins?: PublicPluginInventory
   file?: FileSnapshot
+  panel?: PluginPanelSnapshot
 }
 
 const shownKeys = ['invocationId', 'notice', 'target']
@@ -496,6 +525,7 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
 
 const U64_MAX = 18_446_744_073_709_551_615n
 const DECIMAL_U64 = /^(0|[1-9][0-9]*)$/
+const PUBLIC_PLUGIN_ID = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
 const UTC_RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/
 const fileStatuses = new Set<FileIndexStatus>(['building', 'ready', 'partial', 'rebuilding', 'unavailable'])
 
@@ -722,6 +752,29 @@ export const compareDecimalRevision = compareU64Decimal
 export function parseU64Decimal(value: unknown): U64Decimal | null {
   if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return null
   return BigInt(value) <= U64_MAX ? value as U64Decimal : null
+}
+
+export function parsePluginPanelCommandResult(value: unknown): PluginPanelCommandResult | null {
+  const record = plainRecord(value)
+  if (!record || !exactKeys(record, ['commandLabel', 'pluginId', 'sessionEpoch'])) return null
+  const sessionEpoch = parseU64Decimal(record.sessionEpoch)
+  if (
+    sessionEpoch === null ||
+    sessionEpoch === '0' ||
+    typeof record.pluginId !== 'string' ||
+    record.pluginId.length > 64 ||
+    !PUBLIC_PLUGIN_ID.test(record.pluginId) ||
+    typeof record.commandLabel !== 'string' ||
+    !/^[a-z][a-z0-9-]{0,31}$/u.test(record.commandLabel)
+  ) return null
+  return { sessionEpoch, pluginId: record.pluginId, commandLabel: record.commandLabel }
+}
+
+export function parsePluginPanelErrorEvent(value: unknown): PluginPanelErrorEvent | null {
+  const record = plainRecord(value)
+  if (!record || !exactKeys(record, ['sessionEpoch'])) return null
+  const sessionEpoch = parseU64Decimal(record.sessionEpoch)
+  return sessionEpoch === null || sessionEpoch === '0' ? null : { sessionEpoch }
 }
 
 function validTimerDuration(value: unknown): value is number {

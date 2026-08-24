@@ -34,6 +34,8 @@ input {
 .launcher-surface,
 .launcher-view,
 .file-workspace,
+.panel-launcher,
+.panel-host-region,
 .settings-view,
 .settings-header,
 .status-region {
@@ -44,6 +46,7 @@ button,
 input,
 label,
 .result-list,
+.panel-input-row,
 .file-preview,
 .file-toolbar,
 .settings-tabs,
@@ -80,6 +83,54 @@ label,
   display: grid;
   grid-template-rows: 44px minmax(0, 1fr);
   gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.panel-launcher {
+  display: grid;
+  grid-template-rows: 44px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+  height: 44px;
+}
+
+.panel-input-row > .ant-input {
+  min-width: 0;
+  height: 44px;
+}
+
+.panel-command-tag {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  height: 44px;
+  padding-inline: 10px 4px;
+  overflow: hidden;
+  color: var(--uipilot-ui-foreground);
+  background: var(--uipilot-ui-muted);
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: var(--uipilot-ui-radius-sm);
+}
+
+.panel-command-tag > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-host-region {
   min-width: 0;
   min-height: 0;
 }

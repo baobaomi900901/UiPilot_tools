@@ -16,7 +16,7 @@ import {
   type InputProps,
   type InputRef,
 } from 'antd'
-import { ArrowLeft, Calculator, FolderSearch, PanelsTopLeft, Search, Settings, Star } from 'lucide-react'
+import { ArrowLeft, Calculator, FolderSearch, PanelsTopLeft, Search, Settings, Star, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -263,6 +263,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const [systemDark, setSystemDark] = useState(scheme.matches)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
+  const panelInputRef = useRef<HTMLInputElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const activeSettingsTab = snapshot.settingsTab
@@ -298,6 +299,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (snapshot.view === 'launcher' && snapshot.invocationId) queryRef.current?.focus()
     reportReady()
   }, [reportReady, snapshot.invocationId, snapshot.queryControl, snapshot.view])
+
+  const panel = snapshot.panel
+  const reportPanelBound = useCallback(() => {
+    if (!panel) return
+    panelInputRef.current = document.getElementById(`launcher-panel-suffix-${panel.suffixControl}`) as HTMLInputElement | null
+    const input = panelInputRef.current
+    if (!input) return
+    input.focus()
+    const caret = input.value.length
+    input.setSelectionRange(caret, caret)
+  }, [panel?.sessionEpoch, panel?.suffixControl])
 
   useLayoutEffect(() => {
     if (!snapshot.invocationId) return
@@ -365,6 +377,20 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (event.key === 'Escape' && !isComposing) event.preventDefault()
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
   }
+  const panelKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    const isComposing = composing(event)
+    if (event.key === 'Backspace' && !isComposing) {
+      const input = event.currentTarget
+      if (input.selectionStart === 0 && input.selectionEnd === 0) {
+        event.preventDefault()
+        void core.closePanel()
+      }
+      return
+    }
+    if (event.key !== 'Enter' && event.key !== 'Escape') return
+    if (!isComposing) event.preventDefault()
+    core.keyDown(event.key, isComposing)
+  }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== 'Escape') return
     const isComposing = composing(event)
@@ -428,6 +454,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           {snapshot.commandHint ? <div className="command-hint">{snapshot.commandHint}</div> : null}
           <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
             {snapshot.results.map((item, index) => {
+              const pluginActivation = item.pluginCompletion ?? item.panelActivation
               const row = (
                 <div
                 key={item.key}
@@ -436,7 +463,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 aria-selected={snapshot.selectedIndex === index}
                 className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
                 onClick={() => core.activateResult(index)}
-                onContextMenu={item.pluginCompletion ? (event) => event.preventDefault() : undefined}
+                onContextMenu={pluginActivation ? (event) => event.preventDefault() : undefined}
                 ref={(element) => {
                   if (element) optionRefs.current.set(item.key, element)
                   else optionRefs.current.delete(item.key)
@@ -470,7 +497,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 <span className="result-copy">
                   <span className="result-title-line">
                     <span className="result-title">{item.title}</span>
-                    {item.pluginCompletion?.favorite ? (
+                    {pluginActivation?.favorite ? (
                       <Star
                         aria-label="常用"
                         className="result-favorite-star"
@@ -485,7 +512,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 </span>
               </div>
               )
-              if (!item.pluginCompletion) return row
+              if (!pluginActivation) return row
               return (
                 <Dropdown
                   key={item.key}
@@ -493,10 +520,10 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                   menu={{
                     items: [{
                       key: 'favorite',
-                      label: item.pluginCompletion.favorite ? '取消常用' : '设为常用',
+                      label: pluginActivation.favorite ? '取消常用' : '设为常用',
                       disabled: snapshot.favoriteMutationPending,
                     }],
-                    onClick: () => core.setPluginFavorite(index, !item.pluginCompletion!.favorite),
+                    onClick: () => core.setPluginFavorite(index, !pluginActivation.favorite),
                   }}
                   onOpenChange={(open) => {
                     if (open) core.openPluginContextMenu(index)
@@ -635,6 +662,44 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           </Button>
         </Tooltip>
       </footer>
+    </section>
+  ) : null
+  const panelLauncher = panel ? (
+    <section className="panel-launcher" aria-label={`${panel.commandLabel} 面板`}>
+      <div className="panel-input-row">
+        <div className="panel-command-tag" role="group" aria-label={`command ${panel.commandLabel}`}>
+          <span>/{panel.commandLabel}</span>
+          <Tooltip title="退出面板">
+            <Button
+              aria-label={`退出 ${panel.commandLabel} 面板`}
+              disabled={panel.closePending}
+              icon={<X aria-hidden size={14} strokeWidth={2} />}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => void core.closePanel()}
+              size="small"
+              type="text"
+            />
+          </Tooltip>
+        </div>
+        <label className="visually-hidden" htmlFor={`launcher-panel-suffix-${panel.suffixControl}`}>
+          {panel.commandLabel} argument
+        </label>
+        <BoundInput
+          core={core}
+          control={panel.suffixControl}
+          value={panel.suffix}
+          id={`launcher-panel-suffix-${panel.suffixControl}`}
+          name={`launcher-panel-suffix-${panel.suffixControl}`}
+          aria-label={`${panel.commandLabel} argument`}
+          autoComplete="off"
+          spellCheck={false}
+          disabled={!snapshot.invocationId || panel.closePending}
+          onKeyDown={panelKeyDown}
+          onBound={reportPanelBound}
+          onBindingFailed={reportFailed}
+        />
+      </div>
+      <div className="panel-host-region" aria-label="插件面板内容" />
     </section>
   ) : null
 
@@ -923,7 +988,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     <ConfigProvider theme={uiThemeConfig(colorScheme)}>
       <App>
         <main className="launcher-surface" data-color-scheme={colorScheme}>
-          {snapshot.view === 'launcher' ? launcher : settingsView}
+          {snapshot.view === 'launcher' ? (panelLauncher ?? filePanel ?? launcher) : settingsView}
           <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
             {status}
           </div>

@@ -411,6 +411,7 @@ pub fn run() {
             commands::plugin_panel_storage_remove,
             commands::open_plugin_panel,
             commands::submit_plugin_panel,
+            commands::close_plugin_panel,
             commands::commit_plugin_window_transfer,
             commands::get_public_plugin_window_identity,
             commands::set_plugin_window_pinned,

@@ -24,7 +24,10 @@ import {
   parseFileSearchResponse,
   parseLauncherShown,
   parsePluginInventorySnapshot,
+  parsePluginPanelCommandResult,
+  parsePluginPanelErrorEvent,
   parsePluginMutationOutcome,
+  parseU64Decimal,
   parsePublicPluginInventory,
   type ClassifiedTextRecord,
   type ControlKey,
@@ -36,6 +39,7 @@ import {
   type LauncherShown,
   type PluginInventorySnapshot,
   type PluginInventoryView,
+  type PluginPanelCommandResult,
   type SearchResponse,
   type SettingsView,
 } from './protocol'
@@ -140,6 +144,24 @@ describe('plugin protocol', () => {
     expect(compareDecimalRevision('9007199254740991', '9007199254740992')).toBe(-1)
     expect(compareDecimalRevision('18446744073709551614', '18446744073709551615')).toBe(-1)
   })
+
+  it('strictly parses panel command identities and epoch-bound error events', () => {
+    const identity = {
+      sessionEpoch: '18446744073709551615',
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+    }
+    expect(parsePluginPanelCommandResult(identity)).toEqual(identity)
+    expect(parsePluginPanelErrorEvent({ sessionEpoch: '9' })).toEqual({ sessionEpoch: '9' })
+    for (const invalid of [
+      { ...identity, sessionEpoch: '0' },
+      { ...identity, sessionEpoch: '01' },
+      { ...identity, pluginId: 'Invalid Plugin' },
+      { ...identity, commandLabel: '/demo-panel' },
+      { ...identity, extra: true },
+    ]) expect(parsePluginPanelCommandResult(invalid)).toBeNull()
+    expect(parsePluginPanelErrorEvent({ sessionEpoch: '9', extra: true })).toBeNull()
+  })
 })
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
@@ -206,6 +228,7 @@ type TestLauncherClient = LauncherClient & {
 function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
   let messageStateHandler: ((payload: unknown) => void) | undefined
+  let panelErrorHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
@@ -214,6 +237,10 @@ function fakeClient() {
     }),
     listenMessageStateChanged: vi.fn(async (handler) => {
       messageStateHandler = handler
+      return vi.fn()
+    }),
+    listenPluginPanelError: vi.fn(async (handler) => {
+      panelErrorHandler = handler
       return vi.fn()
     }),
     getMessageSummary: vi.fn(async () => ({ revision: '0', unreadCount: 0 })),
@@ -228,6 +255,17 @@ function fakeClient() {
     setThemePreference: vi.fn(async () => undefined),
     setWebSearchEngine: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
+    openPluginPanel: vi.fn(async () => ({
+      sessionEpoch: '1',
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+    })),
+    submitPluginPanel: vi.fn(async (input: { sessionEpoch: string }) => ({
+      sessionEpoch: input.sessionEpoch,
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+    })),
+    closePluginPanel: vi.fn(async () => undefined),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
     selectPublicPluginArchive: vi.fn(async () => null),
     selectPublicPluginDirectory: vi.fn(async () => null),
@@ -257,7 +295,30 @@ function fakeClient() {
       if (!messageStateHandler) throw new Error('message state listener is not installed')
       messageStateHandler(payload)
     },
+    emitPanelError(payload: unknown) {
+      if (!panelErrorHandler) throw new Error('panel error listener is not installed')
+      panelErrorHandler(payload)
+    },
     unlisten,
+  }
+}
+
+function u64(value: string) {
+  return parseU64Decimal(value)!
+}
+
+function panelItem(initialArgument: string, pluginId = 'com.uipilot.demo-panel') {
+  return {
+    resultId: `panel-${pluginId}`,
+    title: '/demo-panel',
+    subtitle: '打开面板',
+    activation: {
+      kind: 'panelActivation' as const,
+      pluginId,
+      initialArgument,
+      favorite: false,
+    },
+    hasDefaultAction: false,
   }
 }
 
@@ -1170,6 +1231,172 @@ describe('shown and search ownership', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('opens a panel activation in one Enter, owns the epoch before first submit, and preserves the initial argument', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `panel-catalog-${request.querySequence}`,
+      items: request.query === 'hello' ? [panelItem('hello')] : [],
+    } as unknown as SearchResponse))
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('7'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+    })
+    vi.mocked(client.submitPluginPanel).mockImplementationOnce(async (input) => {
+      expect(core.getSnapshot().panel).toMatchObject({
+        pluginId: 'com.uipilot.demo-panel',
+        sessionEpoch: '7',
+        suffix: 'hello',
+      })
+      return {
+        sessionEpoch: input.sessionEpoch,
+        pluginId: 'com.uipilot.demo-panel',
+        commandLabel: 'demo-panel',
+      }
+    })
+
+    emit(shown('panel-list-entry'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'hello',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('7'))
+    expect(client.openPluginPanel).toHaveBeenCalledWith({
+      pluginId: 'com.uipilot.demo-panel',
+      argument: 'hello',
+    })
+    expect(client.submitPluginPanel).toHaveBeenCalledWith({
+      sessionEpoch: '7',
+      argument: 'hello',
+      uiIntentEpoch: 1,
+    })
+    expect(core.getSnapshot()).toMatchObject({ results: [], selectedIndex: -1 })
+    expect(vi.mocked(client.openPluginPanel).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(client.submitPluginPanel).mock.invocationCallOrder[0]!)
+  })
+
+  it('submits a slash panel activation on the first Enter and keeps only the latest frontend owner', async () => {
+    const { core, client, emit } = await startedCore()
+    const submitA = deferred<PluginPanelCommandResult>()
+    const submitB = deferred<PluginPanelCommandResult>()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-slash-result',
+      items: [panelItem('seed')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('9'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+    })
+    vi.mocked(client.submitPluginPanel)
+      .mockResolvedValueOnce({
+        sessionEpoch: u64('9'),
+        pluginId: 'com.uipilot.demo-panel',
+        commandLabel: 'demo-panel',
+      })
+      .mockReturnValueOnce(submitA.promise)
+      .mockReturnValueOnce(submitB.promise)
+
+    emit(shown('panel-slash-entry'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo-panel seed',
+      inputType: 'insertText',
+    })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('9'))
+
+    const suffixControl = core.getSnapshot().panel!.suffixControl
+    core.text({ kind: 'ordinaryInput', control: suffixControl, value: 'A', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    core.text({ kind: 'ordinaryInput', control: suffixControl, value: 'B', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    expect(client.submitPluginPanel).toHaveBeenNthCalledWith(2, {
+      sessionEpoch: '9', argument: 'A', uiIntentEpoch: 2,
+    })
+    expect(client.submitPluginPanel).toHaveBeenNthCalledWith(3, {
+      sessionEpoch: '9', argument: 'B', uiIntentEpoch: 3,
+    })
+
+    submitA.reject({ code: 'windowFailed' })
+    await Promise.resolve()
+    expect(core.getSnapshot().panel).toMatchObject({ sessionEpoch: '9', suffix: 'B' })
+    expect(core.getSnapshot().status).toBe('')
+    submitB.resolve({
+      sessionEpoch: u64('9'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+    })
+    await submitB.promise
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+  })
+
+  it('discards stale panel errors and clears only the matching session epoch', async () => {
+    const { core, client, emit, emitPanelError } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-error-result',
+      items: [panelItem('')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('12'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+    })
+    emit(shown('panel-error-entry'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '/demo-panel', inputType: 'insertText',
+    })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('12'))
+
+    emitPanelError({ sessionEpoch: '11' })
+    expect(core.getSnapshot().panel?.sessionEpoch).toBe('12')
+    emitPanelError({ sessionEpoch: '12' })
+    expect(core.getSnapshot().panel).toBeUndefined()
+    expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
+  })
+
+  it('closes the panel tag only for non-composing Backspace at suffix caret zero', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-dom-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('panel-dom-entry')))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'hello', inputType: 'insertText',
+      }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+    expect(input).not.toBeNull()
+
+    input.setSelectionRange(2, 2)
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
+    expect(client.closePluginPanel).not.toHaveBeenCalled()
+    expect(core.getSnapshot().panel).toBeDefined()
+
+    input.setSelectionRange(0, 0)
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
+    await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+    await mounted.unmount()
   })
 
   it('arms a host plugin completion, commits once, and lets a returned action execute', async () => {
@@ -4253,8 +4480,9 @@ describe('real adapter and startup', () => {
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 4)).toEqual([
+    expect(order.slice(0, 5)).toEqual([
       'launcher://shown',
+      'uipilot-plugin-panel-error',
       'message-center://state-changed',
       'get_message_summary',
       'load_settings',
@@ -4270,6 +4498,9 @@ describe('real adapter and startup', () => {
     tauriCapture.invoke.mockClear()
     tauriCapture.invoke.mockImplementation((command) => {
       if (command === 'list_plugins') return Promise.resolve(pluginInventory([installedPlugin()]))
+      if (command === 'open_plugin_panel' || command === 'submit_plugin_panel') return Promise.resolve({
+        sessionEpoch: '7', pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      })
       if (command === 'install_plugin' || command === 'reload_plugin' || command === 'delete_plugin') {
         return Promise.resolve({ revision: '2' })
       }
@@ -4285,6 +4516,9 @@ describe('real adapter and startup', () => {
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
     await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', favorite: true })
+    await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
+    await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
+    await main.client.closePluginPanel({ sessionEpoch: u64('7') })
     await main.client.selectPublicPluginDirectory()
     await main.client.listPlugins()
     await main.client.installPlugin({ pluginId: 'internal.math' })
@@ -4301,6 +4535,9 @@ describe('real adapter and startup', () => {
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
       ['set_plugin_favorite', [{ pluginId: 'com.uipilot.demo-win', favorite: true }]],
+      ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
+      ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
+      ['close_plugin_panel', [{ input: { sessionEpoch: '7' } }]],
       ['select_public_plugin_directory', []],
       ['list_plugins', []],
       ['install_plugin', [{ pluginId: 'internal.math' }]],
@@ -4384,6 +4621,7 @@ describe('real adapter and startup', () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const shownUnlisten = vi.fn()
     const messageUnlisten = vi.fn()
+    const panelUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
@@ -4404,6 +4642,7 @@ describe('real adapter and startup', () => {
         shownHandler = handler as (event: { payload: unknown }) => void
         return shownUnlisten
       }
+      if (event === 'uipilot-plugin-panel-error') return panelUnlisten
       return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
@@ -4434,6 +4673,7 @@ describe('real adapter and startup', () => {
       mountedCore!.failInitialization()
       await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
       expect(messageUnlisten).toHaveBeenCalledOnce()
+      expect(panelUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -4445,6 +4685,7 @@ describe('real adapter and startup', () => {
       await pagehide()
       expect(shownUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
+      expect(panelUnlisten).toHaveBeenCalledOnce()
     } finally {
       await pagehide()
       vi.doUnmock('./launcher-view')

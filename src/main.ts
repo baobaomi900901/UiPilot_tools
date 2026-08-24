@@ -16,6 +16,7 @@ import {
   parseMessageCenterSnapshot,
   parseMessageSummary,
   parsePluginInventorySnapshot,
+  parsePluginPanelCommandResult,
   parsePublicPluginInventory,
   parsePublicPluginWindowIdentity,
   parseFindPreviewPreferenceResult,
@@ -37,6 +38,8 @@ export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
   listenMessageStateChanged: (handler) =>
     listen('message-center://state-changed', (event) => handler(event.payload)),
+  listenPluginPanelError: (handler) =>
+    listen('uipilot-plugin-panel-error', (event) => handler(event.payload)),
   getMessageSummary: async () => {
     const value = await invoke<unknown>('get_message_summary')
     const summary = parseMessageSummary(value)
@@ -64,6 +67,19 @@ export const client: LauncherClient = {
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', { ...input }),
   openFind: (input) => invoke('open_find_window', { input }),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
+  openPluginPanel: async (input) => {
+    const value = await invoke<unknown>('open_plugin_panel', { input })
+    const result = parsePluginPanelCommandResult(value)
+    if (!result) throw { code: 'windowFailed', message: 'panel open failed' }
+    return result
+  },
+  submitPluginPanel: async (input) => {
+    const value = await invoke<unknown>('submit_plugin_panel', { input })
+    const result = parsePluginPanelCommandResult(value)
+    if (!result) throw { code: 'windowFailed', message: 'panel submit failed' }
+    return result
+  },
+  closePluginPanel: async (input) => { await invoke('close_plugin_panel', { input }) },
   commitPluginWindowTransfer: (input) => invoke<void>('commit_plugin_window_transfer', input),
   listPublicPlugins: async () => {
     const value = await invoke<unknown>('list_public_plugins')
