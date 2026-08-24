@@ -391,13 +391,14 @@ impl PluginRequestScheduler {
     pub(crate) fn cancel(
         &self,
         context: &PluginRequestContext,
-    ) -> Result<bool, PluginScheduleError> {
+        now: Instant,
+    ) -> Result<Option<ScheduledPluginRequest>, PluginScheduleError> {
         if !context.valid_shape() {
-            return Ok(false);
+            return Ok(None);
         }
         let mut state = self.lock()?;
         let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if queue
             .running
@@ -405,7 +406,14 @@ impl PluginRequestScheduler {
             .is_some_and(|running| running.request.context == *context)
         {
             queue.running = None;
-            return Ok(true);
+            let next = if queue.rebuilding {
+                None
+            } else {
+                queue.waiting.take()
+            };
+            return next
+                .map(|candidate| dispatch(&mut state, candidate, now))
+                .transpose();
         }
         if queue
             .waiting
@@ -413,9 +421,9 @@ impl PluginRequestScheduler {
             .is_some_and(|waiting| waiting.context == *context)
         {
             queue.waiting = None;
-            return Ok(true);
+            return Ok(None);
         }
-        Ok(false)
+        Ok(None)
     }
 
     pub(crate) fn with_current<T>(
@@ -712,7 +720,7 @@ mod tests {
             PluginScheduleOutcome::Dispatched(request) => request,
             PluginScheduleOutcome::Waiting { .. } => panic!("A must dispatch"),
         };
-        assert!(scheduler.cancel(&first.context).unwrap());
+        assert!(scheduler.cancel(&first.context, start).unwrap().is_none());
         assert_eq!(
             scheduler.context_status(&first.context),
             PluginContextStatus::Expired
@@ -726,6 +734,43 @@ mod tests {
                 .unwrap(),
             PluginScheduleOutcome::Dispatched(request) if request.candidate.input == "B"
         ));
+    }
+
+    #[test]
+    fn cancelling_running_request_promotes_existing_waiter_atomically() {
+        let scheduler = PluginRequestScheduler::default();
+        let start = Instant::now();
+        let first = match scheduler
+            .enqueue(candidate("A", 1, PublicActivationMode::Submit), start)
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("A must dispatch"),
+        };
+        assert!(matches!(
+            scheduler
+                .enqueue(
+                    candidate("C", 1, PublicActivationMode::Submit),
+                    start + Duration::from_secs(1),
+                )
+                .unwrap(),
+            PluginScheduleOutcome::Waiting { .. }
+        ));
+
+        let promoted = scheduler
+            .cancel(&first.context, start + Duration::from_secs(2))
+            .unwrap()
+            .expect("C must be promoted while cancelling A");
+
+        assert_eq!(promoted.candidate.input, "C");
+        assert_eq!(
+            scheduler.context_status(&promoted.context),
+            PluginContextStatus::Current
+        );
+        assert_eq!(
+            scheduler.context_status(&first.context),
+            PluginContextStatus::Expired
+        );
     }
 
     #[test]

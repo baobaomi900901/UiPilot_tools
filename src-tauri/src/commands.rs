@@ -1744,7 +1744,7 @@ fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandRe
 
 fn rollback_panel_submission(
     app: &AppHandle,
-    public: &PublicPluginService,
+    public: &Arc<PublicPluginService>,
     controller: &PluginPanelController,
     identity: &PanelSessionIdentity,
     request_id: &str,
@@ -1756,14 +1756,34 @@ fn rollback_panel_submission(
         return false;
     };
     plugin_panel::destroy_content(app, &removed.content_label);
-    let _ = public.abort_submission_request(
+    let mut next = public.abort_submission_request(
         &PluginRequestContext {
             plugin_id: identity.plugin_id.clone(),
             plugin_generation: identity.generation,
             request_id: request_id.to_owned(),
         },
         submission_token,
+        Instant::now(),
     );
+    let settings = app.state::<SettingsStore>();
+    while let Ok(Some(request)) = next {
+        if public
+            .dispatch(
+                app,
+                &request,
+                invocation_theme(app, settings.snapshot().theme),
+                invoked_at_rfc3339(),
+            )
+            .is_ok()
+        {
+            break;
+        }
+        next = public.abort_submission_request(
+            &request.context,
+            &request.candidate.owner.submission_token,
+            Instant::now(),
+        );
+    }
     true
 }
 

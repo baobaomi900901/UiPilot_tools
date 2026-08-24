@@ -830,13 +830,34 @@ impl PublicPluginService {
         &self,
         context: &PluginRequestContext,
         submission_token: &str,
-    ) -> Result<(), PublicPluginManagementError> {
-        self.manager()?
+        now: Instant,
+    ) -> Result<Option<ScheduledPluginRequest>, PublicPluginManagementError> {
+        let mut next = self
+            .manager()?
             .scheduler()
-            .cancel(context)
+            .cancel(context, now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.settle_submission(submission_token, Some(Err(PluginRuntimeError::Unavailable)));
-        Ok(())
+        while let Some(candidate) = next.as_ref() {
+            if self
+                .bind_request(
+                    &candidate.candidate.owner.submission_token,
+                    &candidate.context,
+                )
+                .is_ok()
+            {
+                break;
+            }
+            let token = candidate.candidate.owner.submission_token.clone();
+            let context = candidate.context.clone();
+            self.settle_submission(&token, Some(Err(PluginRuntimeError::Unavailable)));
+            next = self
+                .manager()?
+                .scheduler()
+                .cancel(&context, now)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        }
+        Ok(next)
     }
 
     fn bind_request(

@@ -152,7 +152,7 @@ fn request_scoped_abort_preserves_a_newer_unadmitted_preparation() {
     let second_token = second.token.clone();
 
     service
-        .abort_submission_request(&first_context, &first_token)
+        .abort_submission_request(&first_context, &first_token, Instant::now())
         .unwrap();
 
     assert_eq!(
@@ -164,6 +164,64 @@ fn request_scoped_abort_preserves_a_newer_unadmitted_preparation() {
     assert!(submissions.by_token.contains_key(&second_token));
     drop(submissions);
     service.fail_submission(&second_token);
+}
+
+#[test]
+fn request_scoped_abort_promotes_and_binds_a_newer_waiting_submission() {
+    let root = TestRoot::new("request-scoped-abort-waiting");
+    let (service, manager) = recovery_service(&root);
+    let now = Instant::now();
+    let first = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    let first_recovery = first.recovery.clone().unwrap();
+    let first_dispatch = service
+        .complete_runtime_recovery_with(&first_recovery, now, |_| true)
+        .unwrap()
+        .unwrap();
+    let first_context = first_dispatch.context;
+    let first_token = first.token.clone();
+    let second = service
+        .schedule_command(
+            manager.route("/demo second").unwrap().unwrap(),
+            2,
+            "/demo second".into(),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let second_token = second.token.clone();
+    assert!(second.dispatch.is_none());
+    assert_eq!(
+        first.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(None)
+    );
+
+    let promoted = service
+        .abort_submission_request(&first_context, &first_token, now + Duration::from_secs(2))
+        .unwrap()
+        .expect("the waiting request must be promoted");
+
+    assert_eq!(promoted.candidate.owner.submission_token, second_token);
+    assert_eq!(
+        manager.scheduler().context_status(&promoted.context),
+        super::PluginContextStatus::Current
+    );
+    service
+        .abort_submission_request(
+            &promoted.context,
+            &second_token,
+            now + Duration::from_secs(3),
+        )
+        .unwrap();
+    assert_eq!(
+        second.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Some(Err(PluginRuntimeError::Unavailable)))
+    );
 }
 
 #[test]
