@@ -1,7 +1,7 @@
 # Public Plugin Panel Mode Design
 
 **Date:** 2026-08-24  
-**Status:** Revised draft — P1/P2 closed; awaiting Codex re-review  
+**Status:** Approved — HCI validated; technical P1/P2 frozen; implementation plan at `docs/superpowers/plans/2026-08-24-public-plugin-panel-mode.md`  
 **Related:** `docs/plugin-sdk/public-plugin-v1.md`, `src-tauri/src/plugin_window.rs`, `src-tauri/src/public_plugins/manifest.rs`, `src/launcher-core.ts`  
 **Supersedes:** earlier open questions that left webview placement, R1/R2, manifest names, and list-Enter behavior undecided.
 
@@ -337,4 +337,4 @@ Tear down session + destroy child webview when:
 | Isolation | Child webview, not main DOM |
 | Runtime | R1 + dual identity sequences |
 
-HCI owners re-validate §3 and §6. Codex re-reviews §4–§5 and §8; if accepted, this draft can move to implementation planning.
+HCI owners re-validate §3 and §6. Technical contracts in §4–§5 and §8 are frozen for implementation planning.
