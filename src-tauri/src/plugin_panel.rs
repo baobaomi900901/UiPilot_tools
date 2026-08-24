@@ -58,13 +58,18 @@ pub(crate) enum PanelCallError {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PendingArgument {
+pub(crate) struct PendingDispatch {
     pub(crate) request_id: String,
     pub(crate) submission_token: String,
     pub(crate) argument: String,
     pub(crate) theme: PluginInvocationTheme,
     pub(crate) invoked_at: String,
-    pub(crate) data: Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueueDispatchOutcome {
+    Buffered,
+    Ready,
 }
 
 struct LiveSession {
@@ -72,7 +77,7 @@ struct LiveSession {
     phase: PanelPhase,
     current_request_id: String,
     current_submission_token: String,
-    pending: Option<PendingArgument>,
+    pending: Option<PendingDispatch>,
 }
 
 #[derive(Default)]
@@ -168,7 +173,10 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       names.forEach((name, index) => root.style.setProperty(`--uipilot-color-${name}`, tokens[index]));
       root.style.setProperty('--uipilot-font-family', 'Segoe UI, system-ui, sans-serif');
       await handler(deepFreeze(update));
-      await invoke('plugin_panel_content_ack', { requestId: update.requestId });
+      await invoke('plugin_panel_content_ack', {
+        requestId: update.requestId,
+        sessionEpoch: update.sessionEpoch,
+      });
     },
   });
   const wait = () => {
@@ -182,12 +190,8 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 })();
 "#;
 
-fn panel_bootstrap(session_epoch: u64) -> &'static str {
-    Box::leak(
-        PUBLIC_PANEL_BOOTSTRAP_TEMPLATE
-            .replace("__SESSION_EPOCH__", &session_epoch.to_string())
-            .into_boxed_str(),
-    )
+fn panel_bootstrap(session_epoch: u64) -> String {
+    PUBLIC_PANEL_BOOTSTRAP_TEMPLATE.replace("__SESSION_EPOCH__", &session_epoch.to_string())
 }
 
 fn label_component(plugin_id: &str) -> Option<String> {
@@ -253,10 +257,10 @@ impl PluginPanelController {
         Some(identity)
     }
 
-    pub(crate) fn buffer_pending(
+    pub(crate) fn buffer_pending_dispatch(
         &self,
         session_epoch: u64,
-        pending: PendingArgument,
+        pending: PendingDispatch,
     ) -> Result<(), PublicPluginManagementError> {
         let mut core = self
             .core
@@ -278,7 +282,7 @@ impl PluginPanelController {
         Ok(())
     }
 
-    pub(crate) fn take_pending(&self, session_epoch: u64) -> Option<PendingArgument> {
+    pub(crate) fn take_pending_dispatch(&self, session_epoch: u64) -> Option<PendingDispatch> {
         let mut core = self.core.lock().ok()?;
         let session = core
             .session
@@ -307,7 +311,12 @@ impl PluginPanelController {
         true
     }
 
-    pub(crate) fn mark_ack(&self, content_label: &str, request_id: &str) -> bool {
+    pub(crate) fn mark_ack(
+        &self,
+        content_label: &str,
+        session_epoch: u64,
+        request_id: &str,
+    ) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
         };
@@ -315,6 +324,7 @@ impl PluginPanelController {
             return false;
         };
         if session.identity.content_label != content_label
+            || session.identity.session_epoch != session_epoch
             || session.current_request_id != request_id
         {
             return false;
@@ -513,9 +523,10 @@ pub(crate) fn content_ready(
 pub(crate) fn content_ack(
     controller: &PluginPanelController,
     label: &str,
+    session_epoch: u64,
     request_id: &str,
 ) -> bool {
-    controller.mark_ack(label, request_id)
+    controller.mark_ack(label, session_epoch, request_id)
 }
 
 pub(crate) fn destroy_content(app: &AppHandle, content_label: &str) {
@@ -638,18 +649,6 @@ fn mount_webview(
     Ok(())
 }
 
-fn pending_to_update(identity: &PanelSessionIdentity, pending: PendingArgument) -> PluginPanelUpdate {
-    PluginPanelUpdate {
-        request_id: pending.request_id,
-        input: pending.argument,
-        platform: "windows",
-        theme: pending.theme,
-        invoked_at: pending.invoked_at,
-        session_epoch: identity.session_epoch.to_string(),
-        data: pending.data,
-    }
-}
-
 fn deliver_update(
     app: &AppHandle,
     controller: &PluginPanelController,
@@ -683,57 +682,26 @@ fn deliver_update(
     )
 }
 
-fn drain_pending_updates(
-    app: &AppHandle,
-    controller: &PluginPanelController,
-    identity: &PanelSessionIdentity,
-) -> Result<(), PublicPluginManagementError> {
-    while let Some(pending) = controller.take_pending(identity.session_epoch) {
-        controller.bind_submission(
-            identity.session_epoch,
-            &pending.request_id,
-            &pending.submission_token,
-        )?;
-        deliver_update(app, controller, identity, pending_to_update(identity, pending))?;
-    }
-    Ok(())
-}
-
 pub(crate) fn deliver_panel_update(
     app: &AppHandle,
     controller: &PluginPanelController,
     identity: &PanelSessionIdentity,
-    pending: PendingArgument,
+    submission_token: &str,
+    update: PluginPanelUpdate,
 ) -> Result<(), PublicPluginManagementError> {
     controller.bind_submission(
         identity.session_epoch,
-        &pending.request_id,
-        &pending.submission_token,
+        &update.request_id,
+        submission_token,
     )?;
-    deliver_update(
-        app,
-        controller,
-        identity,
-        pending_to_update(identity, pending),
-    )?;
-    drain_pending_updates(app, controller, identity)
+    deliver_update(app, controller, identity, update)
 }
 
-pub(crate) fn submit_update(
-    app: &AppHandle,
+pub(crate) fn queue_dispatch(
     controller: &PluginPanelController,
     session_epoch: u64,
-    request_id: String,
-    submission_token: String,
-    argument: String,
-    theme: PluginInvocationTheme,
-    invoked_at: String,
-    data: Value,
-) -> Result<(), PublicPluginManagementError> {
-    let identity = controller
-        .live_identity()
-        .filter(|identity| identity.session_epoch == session_epoch)
-        .ok_or(PublicPluginManagementError::Unavailable)?;
+    dispatch: PendingDispatch,
+) -> Result<QueueDispatchOutcome, PublicPluginManagementError> {
     let phase_ready = {
         let core = controller
             .core
@@ -744,32 +712,16 @@ pub(crate) fn submit_update(
         })
     };
     if !phase_ready {
-        controller.buffer_pending(
-            session_epoch,
-            PendingArgument {
-                request_id,
-                submission_token,
-                argument,
-                theme,
-                invoked_at,
-                data,
-            },
-        )?;
-        return Ok(());
+        controller.buffer_pending_dispatch(session_epoch, dispatch)?;
+        return Ok(QueueDispatchOutcome::Buffered);
     }
-    deliver_panel_update(
-        app,
-        controller,
-        &identity,
-        PendingArgument {
-            request_id,
-            submission_token,
-            argument,
-            theme,
-            invoked_at,
-            data,
-        },
-    )
+    controller.bind_submission(
+        session_epoch,
+        &dispatch.request_id,
+        &dispatch.submission_token,
+    )?;
+    let _ = dispatch;
+    Ok(QueueDispatchOutcome::Ready)
 }
 
 #[cfg(test)]
@@ -825,35 +777,50 @@ mod tests {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
         controller
-            .buffer_pending(
+            .buffer_pending_dispatch(
                 identity.session_epoch,
-                PendingArgument {
+                PendingDispatch {
                     request_id: "a".into(),
                     submission_token: "ta".into(),
                     argument: "one".into(),
                     theme: PluginInvocationTheme::Dark,
                     invoked_at: "t0".into(),
-                    data: Value::Null,
                 },
             )
             .unwrap();
         controller
-            .buffer_pending(
+            .buffer_pending_dispatch(
                 identity.session_epoch,
-                PendingArgument {
+                PendingDispatch {
                     request_id: "b".into(),
                     submission_token: "tb".into(),
                     argument: "two".into(),
                     theme: PluginInvocationTheme::Light,
                     invoked_at: "t1".into(),
-                    data: serde_json::json!({"ok": true}),
                 },
             )
             .unwrap();
-        let pending = controller.take_pending(identity.session_epoch).unwrap();
+        let pending = controller.take_pending_dispatch(identity.session_epoch).unwrap();
         assert_eq!(pending.request_id, "b");
         assert_eq!(pending.argument, "two");
-        assert!(controller.take_pending(identity.session_epoch).is_none());
+        assert!(controller.take_pending_dispatch(identity.session_epoch).is_none());
+    }
+
+    #[test]
+    fn pending_dispatch_stores_argument_only_for_runtime_after_ready() {
+        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("plugin panel test module marker is missing");
+        assert!(production.contains("struct PendingDispatch"));
+        assert!(!production.contains("struct PendingArgument"));
+        assert!(!production.contains("pending.data"));
+        assert!(production.contains("pub(crate) fn take_pending_dispatch"));
+        assert!(production.contains("pub(crate) fn queue_dispatch"));
+        assert!(production.contains("pub(crate) fn deliver_panel_update"));
+        assert!(!production.contains("drain_pending_updates"));
+        assert!(!production.contains("submit_update"));
     }
 
     #[test]
@@ -878,18 +845,41 @@ mod tests {
         assert!(!content_ack(
             &controller,
             &identity.content_label,
+            identity.session_epoch,
             "wrong-request"
         ));
         assert!(content_ack(
             &controller,
             &identity.content_label,
+            identity.session_epoch,
             "request-1"
         ));
         controller.teardown_session(Some(identity.session_epoch));
         assert!(!content_ack(
             &controller,
             &identity.content_label,
+            identity.session_epoch,
             "request-1"
+        ));
+    }
+
+    #[test]
+    fn stale_ack_from_reused_label_cannot_complete_new_session() {
+        let controller = PluginPanelController::default();
+        let first = controller.open_session(owner("a")).unwrap();
+        let label = first.content_label.clone();
+        let stale_epoch = first.session_epoch;
+        assert!(content_ready(&controller, &label, stale_epoch));
+        controller.teardown_session(None);
+        let second = controller.open_session(owner("b")).unwrap();
+        assert_eq!(second.content_label, label);
+        assert!(!content_ack(&controller, &label, stale_epoch, "a"));
+        assert!(content_ready(&controller, &label, second.session_epoch));
+        assert!(content_ack(
+            &controller,
+            &label,
+            second.session_epoch,
+            "b"
         ));
     }
 
@@ -920,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_buffered_during_ack_is_drained_after_update() {
+    fn pending_buffered_during_ack_survives_until_runtime_dispatch() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
         assert!(content_ready(
@@ -932,25 +922,26 @@ mod tests {
             .bind_submission(identity.session_epoch, "a", "token-a")
             .unwrap();
         controller
-            .buffer_pending(
+            .buffer_pending_dispatch(
                 identity.session_epoch,
-                PendingArgument {
+                PendingDispatch {
                     request_id: "b".into(),
                     submission_token: "token-b".into(),
                     argument: "two".into(),
                     theme: PluginInvocationTheme::Light,
                     invoked_at: "t1".into(),
-                    data: serde_json::json!({"ok": true}),
                 },
             )
             .unwrap();
         assert!(content_ack(
             &controller,
             &identity.content_label,
+            identity.session_epoch,
             "a"
         ));
-        let pending = controller.take_pending(identity.session_epoch).unwrap();
+        let pending = controller.take_pending_dispatch(identity.session_epoch).unwrap();
         assert_eq!(pending.request_id, "b");
+        assert_eq!(pending.argument, "two");
     }
 
     #[test]
@@ -959,18 +950,49 @@ mod tests {
         let identity = controller.open_session(owner("a")).unwrap();
         controller.teardown_session(Some(identity.session_epoch));
         assert!(controller
-            .buffer_pending(
+            .buffer_pending_dispatch(
                 identity.session_epoch,
-                PendingArgument {
+                PendingDispatch {
                     request_id: "late".into(),
                     submission_token: "late".into(),
                     argument: "x".into(),
                     theme: PluginInvocationTheme::Dark,
                     invoked_at: "t".into(),
-                    data: Value::Null,
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn queue_dispatch_buffers_before_ready_and_signals_ready_after() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        let dispatch = PendingDispatch {
+            request_id: "a".into(),
+            submission_token: "token-a".into(),
+            argument: "hello".into(),
+            theme: PluginInvocationTheme::Dark,
+            invoked_at: "t0".into(),
+        };
+        assert_eq!(
+            queue_dispatch(&controller, identity.session_epoch, dispatch.clone()).unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch
+        ));
+        assert!(content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "a"
+        ));
+        assert_eq!(
+            queue_dispatch(&controller, identity.session_epoch, dispatch).unwrap(),
+            QueueDispatchOutcome::Ready
+        );
     }
 
     #[test]
@@ -996,6 +1018,7 @@ mod tests {
         assert!(content_ack(
             &controller,
             &identity.content_label,
+            identity.session_epoch,
             "a"
         ));
         assert!(controller
@@ -1017,6 +1040,7 @@ mod tests {
             "plugin_panel_content_ready",
             "sessionEpoch: '42'",
             "plugin_panel_content_ack",
+            "sessionEpoch: update.sessionEpoch",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -1062,6 +1086,17 @@ mod tests {
         assert!(!mount_body.contains("deliver_update"));
         assert!(!mount_body.contains("deliver_panel_update"));
         assert!(mount_body.contains("wait_until_ready"));
+    }
+
+    #[test]
+    fn panel_bootstrap_is_owned_and_not_leaked() {
+        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("plugin panel test module marker is missing");
+        assert!(!production.contains("Box::leak"));
+        assert!(production.contains("fn panel_bootstrap(session_epoch: u64) -> String"));
     }
 
     #[test]

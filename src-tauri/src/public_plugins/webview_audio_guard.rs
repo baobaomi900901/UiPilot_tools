@@ -274,7 +274,7 @@ pub(crate) fn prepare_windows_webview(
     webview: &tauri::Webview,
     authority: Arc<WebViewGuardAuthority>,
     owner: WebViewGuardOwner,
-    bootstrap: &'static str,
+    bootstrap: String,
     target_url: tauri::Url,
     on_unmuted: UnmutedCallback,
     timeout: Duration,
@@ -348,7 +348,7 @@ pub(crate) fn prepare_windows_webview(
     _webview: &tauri::Webview,
     _authority: Arc<WebViewGuardAuthority>,
     _owner: WebViewGuardOwner,
-    _bootstrap: &'static str,
+    _bootstrap: String,
     _target_url: tauri::Url,
     _on_unmuted: UnmutedCallback,
     _timeout: Duration,
@@ -361,7 +361,7 @@ fn schedule_windows_bootstrap(
     controller: ICoreWebView2Controller,
     authority: Arc<WebViewGuardAuthority>,
     guard: WebViewGuardHandle,
-    bootstrap: &'static str,
+    bootstrap: String,
     target_url: tauri::Url,
     on_unmuted: UnmutedCallback,
     sender: mpsc::SyncSender<Result<(), WebViewGuardError>>,
@@ -408,7 +408,7 @@ fn schedule_windows_bootstrap(
             let _ = sender.send(result);
             Ok(())
         }));
-    let script = CoTaskMemPWSTR::from(bootstrap);
+    let script = CoTaskMemPWSTR::from(bootstrap.as_str());
     unsafe {
         core.AddScriptToExecuteOnDocumentCreated(*script.as_ref().as_pcwstr(), &completion)
             .map_err(|_| WebViewGuardError::Native)

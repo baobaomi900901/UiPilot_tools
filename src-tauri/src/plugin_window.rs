@@ -1106,7 +1106,7 @@ fn create_window(
             plugin_id: transaction.owner.plugin_id.clone(),
             session_generation: transaction.timer_session_generation,
         },
-        PUBLIC_CONTENT_BOOTSTRAP,
+        PUBLIC_CONTENT_BOOTSTRAP.to_string(),
         content_url,
         on_unmuted,
         CONTENT_READY_TIMEOUT,

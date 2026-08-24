@@ -954,7 +954,7 @@ impl PublicPluginService {
                 generation: candidate.generation,
                 activation_id: candidate.activation_id,
             },
-            PUBLIC_RUNTIME_BOOTSTRAP,
+            PUBLIC_RUNTIME_BOOTSTRAP.to_string(),
             target_url,
             on_unmuted,
             PUBLIC_RUNTIME_READY_TIMEOUT,
