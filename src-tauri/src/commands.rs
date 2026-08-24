@@ -4544,7 +4544,8 @@ mod tests {
             activation_id: 13,
             admission_epoch: 17,
             command_label: "panel".into(),
-            content_label: "plugin-panel-content-636f6d2e6578616d706c652e70616e656c".into(),
+            content_label:
+                "plugin-panel-content-636f6d2e6578616d706c652e70616e656c-s0000000000000007".into(),
         };
         let mut route = PublicPluginRoute {
             plugin_id: identity.plugin_id.clone(),

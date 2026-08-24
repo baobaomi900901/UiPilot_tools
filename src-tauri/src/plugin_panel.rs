@@ -235,12 +235,21 @@ fn decode_label_component(value: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-pub(crate) fn plugin_panel_content_label(plugin_id: &str) -> Option<String> {
-    label_component(plugin_id).map(|value| format!("plugin-panel-content-{value}"))
+pub(crate) fn plugin_panel_content_label(plugin_id: &str, session_epoch: u64) -> Option<String> {
+    if session_epoch == 0 {
+        return None;
+    }
+    label_component(plugin_id)
+        .map(|value| format!("plugin-panel-content-{value}-s{session_epoch:016x}"))
 }
 
 pub(crate) fn plugin_id_from_panel_content_label(label: &str) -> Option<String> {
-    decode_label_component(label.strip_prefix("plugin-panel-content-")?)
+    let encoded = label.strip_prefix("plugin-panel-content-")?;
+    let (plugin_id, session) = encoded.rsplit_once("-s")?;
+    if session.len() != 16 || u64::from_str_radix(session, 16).ok()? == 0 {
+        return None;
+    }
+    decode_label_component(plugin_id)
 }
 
 impl PluginPanelController {
@@ -254,9 +263,9 @@ impl PluginPanelController {
     }
 
     pub(crate) fn open_session(&self, owner: PanelOwner) -> Option<PanelSessionIdentity> {
-        let content_label = plugin_panel_content_label(&owner.plugin_id)?;
         let mut core = self.core.lock().ok()?;
         let session_epoch = core.next_epoch.checked_add(1)?;
+        let content_label = plugin_panel_content_label(&owner.plugin_id, session_epoch)?;
         core.next_epoch = session_epoch;
         let identity = PanelSessionIdentity {
             session_epoch,
@@ -905,14 +914,20 @@ mod tests {
 
     #[test]
     fn panel_labels_are_hex_encoded_and_round_trip() {
-        let label = plugin_panel_content_label("com.uipilot.demo-panel").unwrap();
+        let label = plugin_panel_content_label("com.uipilot.demo-panel", 42).unwrap();
         assert!(label.starts_with("plugin-panel-content-"));
+        assert!(label.ends_with("-s000000000000002a"));
         assert_eq!(
             plugin_id_from_panel_content_label(&label).as_deref(),
             Some("com.uipilot.demo-panel")
         );
         assert!(plugin_id_from_panel_content_label("plugin-content-abc").is_none());
         assert!(plugin_id_from_panel_content_label("plugin-panel-content-zz").is_none());
+        assert!(plugin_id_from_panel_content_label(
+            "plugin-panel-content-636f6d-s0000000000000000"
+        )
+        .is_none());
+        assert!(plugin_id_from_panel_content_label("plugin-panel-content-636f6d-s1").is_none());
     }
 
     #[test]
@@ -921,6 +936,7 @@ mod tests {
         let first = controller.open_session(owner("a")).unwrap();
         let second = controller.open_session(owner("b")).unwrap();
         assert_ne!(first.session_epoch, second.session_epoch);
+        assert_ne!(first.content_label, second.content_label);
         assert_eq!(
             controller.live_identity().map(|value| value.session_epoch),
             Some(second.session_epoch)
@@ -1318,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_ack_from_reused_label_cannot_complete_new_session() {
+    fn stale_ack_from_previous_session_cannot_complete_new_session() {
         let controller = PluginPanelController::default();
         let first = controller.open_session(owner("a")).unwrap();
         let label = first.content_label.clone();
@@ -1326,9 +1342,13 @@ mod tests {
         assert!(content_ready(&controller, &label, stale_epoch));
         controller.teardown_session(None);
         let second = controller.open_session(owner("b")).unwrap();
-        assert_eq!(second.content_label, label);
+        assert_ne!(second.content_label, label);
         assert!(!content_ack(&controller, &label, stale_epoch, "a"));
-        assert!(content_ready(&controller, &label, second.session_epoch));
+        assert!(content_ready(
+            &controller,
+            &second.content_label,
+            second.session_epoch
+        ));
         assert_eq!(
             controller
                 .queue_dispatch(
@@ -1341,21 +1361,30 @@ mod tests {
         assert!(controller
             .claim_delivery_settlement(second.session_epoch, "b", "token-b")
             .is_ok());
-        assert!(content_ack(&controller, &label, second.session_epoch, "b"));
+        assert!(content_ack(
+            &controller,
+            &second.content_label,
+            second.session_epoch,
+            "b"
+        ));
     }
 
     #[test]
-    fn stale_ready_from_reused_label_cannot_unlock_new_session() {
+    fn stale_ready_from_previous_session_cannot_unlock_new_session() {
         let controller = PluginPanelController::default();
         let first = controller.open_session(owner("a")).unwrap();
         let label = first.content_label.clone();
         let stale_epoch = first.session_epoch;
         controller.teardown_session(None);
         let second = controller.open_session(owner("b")).unwrap();
-        assert_eq!(second.content_label, label);
+        assert_ne!(second.content_label, label);
         assert_ne!(second.session_epoch, stale_epoch);
         assert!(!content_ready(&controller, &label, stale_epoch));
-        assert!(content_ready(&controller, &label, second.session_epoch));
+        assert!(content_ready(
+            &controller,
+            &second.content_label,
+            second.session_epoch
+        ));
     }
 
     #[test]
