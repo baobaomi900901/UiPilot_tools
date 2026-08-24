@@ -229,6 +229,7 @@ function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
   let messageStateHandler: ((payload: unknown) => void) | undefined
   let panelErrorHandler: ((payload: unknown) => void) | undefined
+  let panelResetHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
@@ -241,6 +242,10 @@ function fakeClient() {
     }),
     listenPluginPanelError: vi.fn(async (handler) => {
       panelErrorHandler = handler
+      return vi.fn()
+    }),
+    listenPluginPanelReset: vi.fn(async (handler) => {
+      panelResetHandler = handler
       return vi.fn()
     }),
     getMessageSummary: vi.fn(async () => ({ revision: '0', unreadCount: 0 })),
@@ -298,6 +303,10 @@ function fakeClient() {
     emitPanelError(payload: unknown) {
       if (!panelErrorHandler) throw new Error('panel error listener is not installed')
       panelErrorHandler(payload)
+    },
+    emitPanelReset(payload: unknown) {
+      if (!panelResetHandler) throw new Error('panel reset listener is not installed')
+      panelResetHandler(payload)
     },
     unlisten,
   }
@@ -1407,6 +1416,60 @@ describe('shown and search ownership', () => {
     emitPanelError({ sessionEpoch: '12' })
     expect(core.getSnapshot().panel).toBeUndefined()
     expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
+  })
+
+  it('discards a panel after hide and starts the next shown invocation as a fresh launcher', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-hide-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('21'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+    })
+    emit(shown('panel-hide-entry'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'hello', inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('21'))
+
+    await core.requestHide()
+    expect(client.hideLauncher).toHaveBeenCalledOnce()
+    expect(core.getSnapshot().panel).toBeUndefined()
+
+    emit(shown('panel-hide-next'))
+    expect(core.getSnapshot()).toMatchObject({
+      invocationId: 'panel-hide-next', query: '', results: [],
+    })
+    expect(core.getSnapshot().panel).toBeUndefined()
+  })
+
+  it('silently resets only the matching panel session after a host-driven plugin mutation', async () => {
+    const { core, client, emit, emitPanelReset } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-reset-result', items: [panelItem('')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('22'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+    })
+    emit(shown('panel-reset-entry'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '/demo-panel', inputType: 'insertText',
+    })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('22'))
+
+    emitPanelReset({ sessionEpoch: '21' })
+    expect(core.getSnapshot().panel?.sessionEpoch).toBe('22')
+    emitPanelReset({ sessionEpoch: '22' })
+    expect(core.getSnapshot().panel).toBeUndefined()
+    expect(core.getSnapshot().status).toBe('')
   })
 
   it('closes the panel tag only for non-composing Backspace at suffix caret zero', async () => {
@@ -4534,9 +4597,10 @@ describe('real adapter and startup', () => {
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 5)).toEqual([
+    expect(order.slice(0, 6)).toEqual([
       'launcher://shown',
       'uipilot-plugin-panel-error',
+      'uipilot-plugin-panel-reset',
       'message-center://state-changed',
       'get_message_summary',
       'load_settings',
@@ -4676,6 +4740,7 @@ describe('real adapter and startup', () => {
     const shownUnlisten = vi.fn()
     const messageUnlisten = vi.fn()
     const panelUnlisten = vi.fn()
+    const panelResetUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
@@ -4697,6 +4762,7 @@ describe('real adapter and startup', () => {
         return shownUnlisten
       }
       if (event === 'uipilot-plugin-panel-error') return panelUnlisten
+      if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
       return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
@@ -4728,6 +4794,7 @@ describe('real adapter and startup', () => {
       await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
+      expect(panelResetUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -4740,6 +4807,7 @@ describe('real adapter and startup', () => {
       expect(shownUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
+      expect(panelResetUnlisten).toHaveBeenCalledOnce()
     } finally {
       await pagehide()
       vi.doUnmock('./launcher-view')

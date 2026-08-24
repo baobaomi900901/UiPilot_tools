@@ -552,6 +552,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let started = false
   let unlisten: (() => void) | undefined
   let unlistenPanelError: (() => void) | undefined
+  let unlistenPanelReset: (() => void) | undefined
   let unsubscribeMessages: (() => void) | undefined
   let previewPreferenceToken = 0
   let previewPreferencePending: PreviewPreferenceOwner | undefined
@@ -1558,6 +1559,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    const panelSessionEpoch = model.panel?.sessionEpoch
+    discardPanelUi()
+    if (panelSessionEpoch) {
+      void client.closePluginPanel({ sessionEpoch: panelSessionEpoch }).catch(() => undefined)
+    }
     transitionView(event.target, event.invocationId, event.notice, 'native')
     void messageCenter.refresh()
   }
@@ -1937,7 +1943,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     finishSettingsMutation(operation, false)
   }
 
-  function resetPanelUi(status = ''): void {
+  function discardPanelUi(): boolean {
+    if (!model.panel) return false
     if (composition?.control === model.panel?.suffix.key) composition = undefined
     panelActionToken += 1
     panelSubmissionToken += 1
@@ -1948,8 +1955,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.panel = undefined
     model.query = ''
     model.queryControlValue = ''
-    model.status = status
     clearResults()
+    return true
+  }
+
+  function resetPanelUi(status = ''): void {
+    discardPanelUi()
+    model.status = status
     if (advanceApplicationSequence()) deferCurrentSearch()
     publish(true)
   }
@@ -2130,6 +2142,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const panel = model.panel
     if (!event || !panel || event.sessionEpoch !== panel.sessionEpoch) return
     resetPanelUi(FALLBACK_ERROR)
+  }
+
+  function handlePanelReset(payload: unknown): void {
+    const event = parsePluginPanelErrorEvent(payload)
+    const panel = model.panel
+    if (!event || !panel || event.sessionEpoch !== panel.sessionEpoch) return
+    resetPanelUi()
   }
 
   function applyPluginCompletion(result: PrivateApplicationResult): void {
@@ -2349,6 +2368,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       await client.hideLauncher()
       if (destroyed || captured.token !== hideToken || captured.epoch !== model.viewEpoch) return
       model.hidePending = false
+      discardPanelUi()
       publish(true)
     } catch (error) {
       if (destroyed || captured.token !== hideToken || captured.epoch !== model.viewEpoch) return
@@ -2457,24 +2477,27 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     started = true
     let registered: (() => void) | undefined
     let panelErrorsRegistered: (() => void) | undefined
+    let panelResetsRegistered: (() => void) | undefined
     try {
-      ;[registered, panelErrorsRegistered] = await Promise.all([
-        client.listenShown(shown),
-        client.listenPluginPanelError(handlePanelError),
-      ])
+      registered = await client.listenShown(shown)
+      panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
+      panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
     } catch {
       registered?.()
       panelErrorsRegistered?.()
+      panelResetsRegistered?.()
       failInitialization()
       return
     }
     if (destroyed) {
       registered()
       panelErrorsRegistered()
+      panelResetsRegistered()
       return
     }
     unlisten = registered
     unlistenPanelError = panelErrorsRegistered
+    unlistenPanelReset = panelResetsRegistered
     await messageCenter.start()
     if (destroyed) return
     const operation = startSettingsOperation('load', {
@@ -2528,6 +2551,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlisten = undefined
     unlistenPanelError?.()
     unlistenPanelError = undefined
+    unlistenPanelReset?.()
+    unlistenPanelReset = undefined
     listeners.clear()
   }
 

@@ -10,6 +10,7 @@
 
 - [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：主界面结果与复制。
 - [`com.uipilot.demo-win`](../../examples/public-plugins/com.uipilot.demo-win)：单例子窗口。
+- [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)：启动器内嵌面板。
 - [`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)：窗口隐藏后仍由宿主计时的番茄钟。
 
 完整字段、上限和安全合同见 [`Public Plugin API v1`](./public-plugin-v1.md)、[`plugin.json` Schema](./uipilot-plugin-v1.schema.json) 和 [TypeScript API 类型](./uipilot-plugin-api-v1.d.ts)。
@@ -21,7 +22,7 @@
 | 按 Enter 后在主界面显示结果 | `submit` | `mainResult` | 复制时使用 `clipboard.write` | `demo-return` |
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
-| 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（`minimumHostVersion` ≥ `0.3.0`） | Task 6 `demo-panel` |
+| 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（`minimumHostVersion` ≥ `0.3.0`） | `demo-panel` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
 MVP 中每个插件只能注册一个启动名称。用户可以在 UiPilot 设置中修改该名称，所以 Runtime 不应硬编码 `/命令名`。
@@ -82,7 +83,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - `command.defaultName` 不包含 `/`，只能有一个。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`，以及仅 Windows 可用的 `notifications.publish` 和 `timer.control`。
+- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `notifications.publish` 和 `timer.control`。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -151,6 +152,35 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 ```
 
 `window` 输出必须使用 `submit`，并同时声明窗口入口和 `ui.window`。
+
+### 分支 C：启动器面板型 Manifest
+
+面板模式要求 UiPilot `0.3.0+`，仅支持 Windows、`submit` 激活和独立的 `panel.entry`：
+
+```json
+{
+  "schemaVersion": 1,
+  "pluginId": "com.example.hello-panel",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.3.0",
+  "name": "Hello Panel",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "hello-panel",
+    "summary": "在启动器内打开面板",
+    "activationMode": "submit",
+    "outputMode": "panel",
+    "inputRequired": false
+  },
+  "runtime": { "entry": "dist/runtime.js" },
+  "panel": { "entry": "dist/panel.html" },
+  "permissions": ["ui.panel"],
+  "settings": []
+}
+```
+
+`panel` 不能与 `window`、`ui.window`、`timer.control` 或 `live` 组合。面板内容由宿主放在独立 child WebView 中，不会注入主界面 DOM。
 
 ## 4. 理解 Runtime 调用
 
@@ -311,7 +341,7 @@ window.uipilotPluginWindow.onUpdate((update) => {
 
 窗口更新对象还包含 `requestId` 和 `invokedAt`。`instanceNumber` 在 v1 中始终为 `1`，因为每个插件只能有一个子窗口。
 
-### 6.3 使用宿主主题
+### 6.4 使用宿主主题
 
 `package/dist/window.css`：
 
@@ -353,7 +383,7 @@ p {
 
 图钉、关闭、拖拽、焦点交接、窗口位置和主题切换均由 UiPilot 外层窗口管理。插件页面不要实现自己的标题栏，也不能调用 Tauri 命令控制窗口。
 
-### 6.4 使用宿主持有的窗口计时器（仅 Windows）
+### 6.5 使用宿主持有的窗口计时器（仅 Windows）
 
 需要窗口隐藏后继续计时时，Manifest 必须同时声明 `ui.window`、`notifications.publish` 和
 `timer.control`，并使用 `submit + window`。三项权限必须在安装时全部确认；`timer.control` 不能用于
@@ -423,7 +453,7 @@ remaining 锚点。页面可以用 `performance.now()` 插值显示数字，但�
 常见错误包括 `PermissionDenied`、`ExpiredWindowSessionError`、`InvalidTimerInput`、
 `TimerInputRequired`、`TimerInputNotAllowed`、`MessageStoreUnavailable` 和 `TimerUnavailable`。
 
-### 6.5 在子窗口保存插件私有状态
+### 6.6 在子窗口保存插件私有状态
 
 所有合法插件内容窗口都可以使用冻结的 `window.uipilotPluginWindow.storage`，无需新增 Manifest 权限。它与
 Runtime 的 `api.storage` 共用该插件的私有命名空间：
@@ -447,7 +477,33 @@ await storage.remove('pomodoro.duration-minutes')
 有效值；没有有效值时恢复 10 分钟。由于 `get()` / `set()` 是异步调用，完成时必须确认原窗口会话仍是
 当前会话；过期会话的迟到结果不得覆盖新窗口的选择或错误状态。
 
-## 7. 添加插件图标
+## 7. 分支 C：在启动器内挂载面板
+
+Runtime 每次 Enter 都会重新执行，并返回当前面板数据：
+
+```js
+export async function onCommand(invocation) {
+  return {
+    requestId: invocation.requestId,
+    data: { echo: invocation.input },
+  }
+}
+```
+
+`panel.js` 必须尽早注册独立面板桥；它只能接收更新和访问插件私有存储：
+
+```js
+window.uipilotPluginPanel.onUpdate(async (update) => {
+  document.querySelector('#result').textContent = String(update.data.echo ?? '')
+  await window.uipilotPluginPanel.storage.set('last-input', update.input)
+})
+```
+
+面板桥没有 `close()`、计时器或通知接口，也不能调用 Tauri `invoke`、网络或 Shell。宿主拥有命令 tag 和参数输入框：第一次 Enter 打开面板，后续 Enter 提交当前参数；× 或参数光标位于 0 时的 Backspace 退出。Escape、失焦隐藏、插件停用、卸载或升级都会销毁当前面板，下次打开主界面从空白启动器开始。
+
+完整实现见 [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)。
+
+## 8. 添加插件图标
 
 图标是可选的固定文件，不写入 `plugin.json`：
 
@@ -466,7 +522,7 @@ package/icon.png
 
 未提供 `icon.png` 时，UiPilot 会显示默认插件符号。提供了图标但格式、尺寸或大小不合法时，插件会在准备安装阶段被拒绝；已经通过安装的图标若在界面加载时失败，才会回退到默认插件符号。
 
-## 8. 编写 Runtime 测试
+## 9. 编写 Runtime 测试
 
 Node.js 内置测试足以验证纯 Runtime。创建 `tests/runtime.test.js`：
 
@@ -538,17 +594,18 @@ node --test .\tests\runtime.test.js
 
 测试使用设置时，可传入 `createApiMock({ settings: { prefix: '[demo]' } })`；测试消息时传入 `publish` 或 `schedule` spy，并验证调用次数和完整 DTO。这个 mock 只覆盖 Runtime 单元测试需要的异步接口，不模拟宿主的权限、配额、请求过期和数据持久化检查；这些边界仍以 UiPilot 宿主为准。
 
-还应针对自己的业务结果添加精确断言。子窗口型插件应额外检查 `window.js` 使用 `window.uipilotPluginWindow.onUpdate`，且不包含 `invoke(`、`fetch(`、`WebSocket` 或窗口置顶逻辑。
+还应针对自己的业务结果添加精确断言。子窗口型插件应额外检查 `window.js` 使用 `window.uipilotPluginWindow.onUpdate`；面板型插件应检查 `panel.js` 使用 `window.uipilotPluginPanel.onUpdate`。两者都不得包含 `invoke(`、`fetch(`、`WebSocket` 或窗口置顶逻辑。
 
 仓库参考测试：
 
 ```powershell
 node --test examples/public-plugins/com.uipilot.demo-return/tests/runtime.test.js
 node --test examples/public-plugins/com.uipilot.demo-win/tests/runtime.test.js
+node --test examples/public-plugins/com.uipilot.demo-panel/tests/runtime.test.js
 node --test examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js
 ```
 
-## 9. 使用独立 CLI 验证
+## 10. 使用独立 CLI 验证
 
 UiPilot 提供纯 TypeScript 的 `@uipilot/plugin-cli`。第三方开发者只需要 Node.js 20 或更高版本和已提供的 npm `.tgz`，不需要安装 Rust、UiPilot 或下载 UiPilot 源码。CLI 只读取并验证包，不安装插件、不运行 Runtime/窗口代码、不联网，也不修改源目录。
 
@@ -579,7 +636,7 @@ uipilot-plugin validate .\package --platform windows --json
 
 使用 `timer.control` 时，CLI 会检查完整的 Windows `submit + window` 权限组合，以及唯一固定文件 `assets/sounds/timer-alarm.wav`。缺少/多带 WAV、使用其他 WAV 路径、非规范 RIFF/WAVE、错误声道/采样率/位深、超过 2 MiB 或 15 秒都会返回 `RESOURCE_INVALID`。CLI 通过后仍应在目标平台用 UiPilot 做最终安装和交互验收。
 
-## 10. 使用开发目录安装
+## 11. 使用开发目录安装
 
 1. 启动 UiPilot。
 2. 打开 **设置 > 插件 > 公开插件**。
@@ -599,7 +656,7 @@ uipilot-plugin validate .\package --platform windows --json
 
 更新会在 Runtime 通过 ready 校验后原子生效。更新失败时，当前已安装版本保持可用。
 
-## 11. 打包 `.uipilot-plugin`
+## 12. 打包 `.uipilot-plugin`
 
 `.uipilot-plugin` 是 ZIP 内容，归档根目录必须直接包含 `plugin.json`，不能再包一层 `package/`。
 
@@ -639,10 +696,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plu
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plugin.ps1 -PluginId com.uipilot.demo-win
 ```
 
-## 12. 可选：插件私有状态与设置
+## 13. 可选：插件私有状态与设置
 
 Runtime API 还提供请求期内的插件隔离存储和设置读取；窗口存储与其共享同一命名空间，窗口端会话规则见
-6.5：
+6.6：
 
 ```js
 const previous = await api.storage.get('last-value')
@@ -655,7 +712,7 @@ const hasToken = await api.settings.isSecretConfigured('token')
 
 存储只能保存 JSON。插件不能读取 secret 明文。设置字段定义、类型和限制见完整 API 文档与 Schema。
 
-## 13. 常见问题
+## 14. 常见问题
 
 ### 准备安装时失败
 
@@ -689,7 +746,11 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 确认窗口脚本尽早注册了 `window.uipilotPluginWindow.onUpdate`，并且回调能在五秒内完成。不要在内容页调用 Tauri、Shell、网络或其他宿主能力。
 
-## 14. MVP 边界
+### 面板没有内容或隐藏后仍残留
+
+确认 `minimumHostVersion` 至少为 `0.3.0`，Manifest 使用 `submit + panel + ui.panel`，并且 `panel.js` 尽早注册 `window.uipilotPluginPanel.onUpdate`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
+
+## 15. MVP 边界
 
 当前不支持：
 
@@ -702,18 +763,19 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 遇到未覆盖的需求时，不要通过 WebView 或 Tauri 私有对象绕过限制；应等待宿主公开相应版本化 API。
 
-## 15. 发布前检查清单
+## 16. 发布前检查清单
 
 - [ ] `pluginId` 使用自己的稳定命名空间。
 - [ ] `version` 已提高，`minimumHostVersion` 合理。
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
-- [ ] `outputMode`、权限和 `window` 入口组合正确。
+- [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；面板包要求 Windows 与宿主 `0.3.0+`。
 - [ ] Runtime 始终原样返回 `requestId`。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。
 - [ ] `timer.control` 包只包含唯一的 `assets/sounds/timer-alarm.wav`，且 WAV 满足固定 PCM、大小与时长限制。
 - [ ] 内部空格不会被插件意外压缩。
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
+- [ ] 面板内容只通过 `uipilotPluginPanel.onUpdate` 与 `storage`，隐藏/停用/卸载/升级后不保留会话。
 - [ ] `icon.png` 满足固定规则。
 - [ ] Runtime 测试通过。
 - [ ] 开发目录和最终 `.uipilot-plugin` 均通过 `uipilot-plugin validate`。

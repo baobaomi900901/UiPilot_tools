@@ -638,6 +638,20 @@ impl PluginPanelController {
         Some(session.identity)
     }
 
+    pub(crate) fn teardown_plugin(&self, plugin_id: &str) -> Option<PanelSessionIdentity> {
+        let mut core = self.core.lock().ok()?;
+        if core
+            .session
+            .as_ref()
+            .is_none_or(|session| session.identity.plugin_id != plugin_id)
+        {
+            return None;
+        }
+        let identity = core.session.take()?.identity;
+        self.changed.notify_all();
+        Some(identity)
+    }
+
     pub(crate) fn teardown_current(
         &self,
         session_epoch: u64,
@@ -705,6 +719,16 @@ pub(crate) fn teardown(
     if let Some(identity) = controller.teardown_session(session_epoch) {
         destroy_content(app, &identity.content_label);
     }
+}
+
+pub(crate) fn teardown_plugin(
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    plugin_id: &str,
+) -> Option<PanelSessionIdentity> {
+    let identity = controller.teardown_plugin(plugin_id)?;
+    destroy_content(app, &identity.content_label);
+    Some(identity)
 }
 
 fn panel_bounds(main: &tauri::Window) -> Result<(LogicalPosition<f64>, LogicalSize<f64>), ()> {
@@ -958,6 +982,20 @@ mod tests {
         assert!(controller
             .teardown_session(Some(second.session_epoch))
             .is_some());
+        assert!(controller.live_identity().is_none());
+    }
+
+    #[test]
+    fn plugin_mutation_teardown_only_removes_the_matching_live_session() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+
+        assert!(controller.teardown_plugin("com.uipilot.other").is_none());
+        assert_eq!(controller.live_identity(), Some(identity.clone()));
+        assert_eq!(
+            controller.teardown_plugin("com.uipilot.demo-panel"),
+            Some(identity)
+        );
         assert!(controller.live_identity().is_none());
     }
 

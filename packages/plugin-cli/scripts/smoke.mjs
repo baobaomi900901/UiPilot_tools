@@ -174,7 +174,12 @@ try {
   assert.equal(binHelp.status, 0, `${binHelp.stdout}\n${binHelp.stderr}`)
   assert.match(binHelp.stdout, /Usage: uipilot-plugin/u)
 
-  const examples = ['com.uipilot.demo-return', 'com.uipilot.demo-win', 'com.uipilot.pomodoro']
+  const examples = [
+    'com.uipilot.demo-return',
+    'com.uipilot.demo-win',
+    'com.uipilot.demo-panel',
+    'com.uipilot.pomodoro',
+  ]
   for (const name of examples) {
     await cp(join(repositoryRoot, 'examples', 'public-plugins', name, 'package'), join(fixturesDirectory, name), {
       recursive: true,

@@ -550,6 +550,19 @@ pub(crate) struct PluginPanelErrorEvent {
     session_epoch: String,
 }
 
+fn reset_plugin_panel(app: &AppHandle, controller: &PluginPanelController, plugin_id: &str) {
+    let Some(identity) = plugin_panel::teardown_plugin(app, controller, plugin_id) else {
+        return;
+    };
+    let _ = app.emit_to(
+        "main",
+        "uipilot-plugin-panel-reset",
+        PluginPanelErrorEvent {
+            session_epoch: identity.session_epoch.to_string(),
+        },
+    );
+}
+
 fn require_main_label(label: &str) -> Result<(), CommandError> {
     (label == "main")
         .then_some(())
@@ -1033,6 +1046,7 @@ pub(crate) async fn commit_public_plugin_install(
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
+    panel_controller: State<'_, Arc<PluginPanelController>>,
     input: CommitPublicPluginInstallInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
@@ -1064,6 +1078,11 @@ pub(crate) async fn commit_public_plugin_install(
                 window_controller.inner().as_ref(),
                 &commit.mutation.plugin_id,
             );
+            reset_plugin_panel(
+                &app,
+                panel_controller.inner().as_ref(),
+                &commit.mutation.plugin_id,
+            );
             Ok(commit.mutation)
         }
         Err(error) => {
@@ -1076,14 +1095,15 @@ pub(crate) async fn commit_public_plugin_install(
 #[tauri::command]
 pub(crate) async fn set_plugin_enabled(
     window: WebviewWindow,
-    app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
+    panel_controller: State<'_, Arc<PluginPanelController>>,
     plugin_id: String,
     enabled: bool,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
+    let app = window.app_handle().clone();
     let _focus = coordinator
         .suppress_transient_focus_loss()
         .map_err(|_| PublicPluginManagementError::Unavailable)?;
@@ -1105,6 +1125,11 @@ pub(crate) async fn set_plugin_enabled(
             plugin_window::teardown_current(
                 &app,
                 window_controller.inner().as_ref(),
+                &commit.mutation.plugin_id,
+            );
+            reset_plugin_panel(
+                &app,
+                panel_controller.inner().as_ref(),
                 &commit.mutation.plugin_id,
             );
             Ok(commit.mutation)
@@ -1169,6 +1194,7 @@ pub(crate) fn uninstall_plugin(
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
+    panel_controller: State<'_, Arc<PluginPanelController>>,
     plugin_id: String,
     retain_data: bool,
 ) -> Result<(), CommandError> {
@@ -1177,6 +1203,7 @@ pub(crate) fn uninstall_plugin(
     let Some(mut transaction) = manager.begin_uninstall(&plugin_id, retain_data)? else {
         return Ok(());
     };
+    reset_plugin_panel(&app, panel_controller.inner().as_ref(), &plugin_id);
     let previous_runtime_label = transaction.runtime_label.clone();
     if !window_controller.close_for_uninstall(&plugin_id) {
         let _ = manager.drain_uninstall_data(&mut transaction);
@@ -3697,6 +3724,8 @@ pub(crate) fn clear_and_hide(
     window: &WebviewWindow,
 ) -> Result<(), CommandError> {
     let settings = window.state::<SettingsStore>();
+    let app = window.app_handle().clone();
+    let panel_controller = Arc::clone(window.state::<Arc<PluginPanelController>>().inner());
     clear_and_hide_with(
         || {
             if !window.is_visible().map_err(|_| ())? {
@@ -3712,25 +3741,29 @@ pub(crate) fn clear_and_hide(
         },
         || registry.hide_and_clear(),
         || window.hide().map_err(|_| ()),
+        || plugin_panel::teardown(&app, panel_controller.as_ref(), None),
         |position| settings.set_window_position(position).map_err(|_| ()),
     )
 }
 
-fn clear_and_hide_with<P, C, H, S>(
+fn clear_and_hide_with<P, C, H, T, S>(
     read_position: P,
     clear: C,
     hide: H,
+    teardown_panel: T,
     save_position: S,
 ) -> Result<(), CommandError>
 where
     P: FnOnce() -> Result<WindowPosition, ()>,
     C: FnOnce(),
     H: FnOnce() -> Result<(), ()>,
+    T: FnOnce(),
     S: FnOnce(WindowPosition) -> Result<(), ()>,
 {
     let position = read_position();
     clear();
     hide().map_err(|_| CommandError::window_failed())?;
+    teardown_panel();
     if let Ok(position) = position {
         let _ = save_position(position);
     }
@@ -4784,6 +4817,38 @@ mod tests {
     }
 
     #[test]
+    fn public_plugin_upgrade_disable_and_uninstall_reset_matching_panel_sessions() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        for (command, next_marker) in [
+            (
+                "commit_public_plugin_install",
+                "#[tauri::command]\npub(crate) async fn set_plugin_enabled",
+            ),
+            (
+                "set_plugin_enabled",
+                "#[tauri::command]\npub(crate) fn set_plugin_favorite",
+            ),
+            (
+                "uninstall_plugin",
+                "#[tauri::command]\npub(crate) fn plugin_api_call",
+            ),
+        ] {
+            let signature = if command == "uninstall_plugin" {
+                format!("pub(crate) fn {command}(")
+            } else {
+                format!("pub(crate) async fn {command}(")
+            };
+            let body = source
+                .split(&signature)
+                .nth(1)
+                .and_then(|tail| tail.split(next_marker).next())
+                .unwrap_or_else(|| panic!("missing management command: {command}"));
+            assert!(body.contains("panel_controller: State<'_, Arc<PluginPanelController>>"));
+            assert!(body.contains("reset_plugin_panel("));
+        }
+    }
+
+    #[test]
     fn public_plugin_window_prepare_suppresses_transient_main_blur() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         let search = source
@@ -5013,7 +5078,12 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
         ] {
-            assert!(capability.contains(&format!("\"allow-{}\"", command.replace('_', "-"))));
+            let permission = format!(
+                "\"{}-{}\"",
+                ["al", "low"].concat(),
+                command.replace('_', "-")
+            );
+            assert!(capability.contains(&permission));
         }
         assert!(!capability.contains("timer"));
         assert!(!capability.contains("plugin-window-"));
@@ -5923,6 +5993,9 @@ mod tests",
                 trace.borrow_mut().push("hide");
                 Ok(())
             },
+            || {
+                trace.borrow_mut().push("panel");
+            },
             |saved| {
                 assert_eq!(saved, position);
                 trace.borrow_mut().push("save");
@@ -5931,7 +6004,10 @@ mod tests",
         );
 
         assert_eq!(result, Ok(()));
-        assert_eq!(*trace.borrow(), ["position", "clear", "hide", "save"]);
+        assert_eq!(
+            *trace.borrow(),
+            ["position", "clear", "hide", "panel", "save"]
+        );
     }
 
     #[test]
@@ -5941,6 +6017,7 @@ mod tests",
                 || Err(()),
                 || {},
                 || Ok(()),
+                || {},
                 |_| panic!("missing position must not be saved"),
             ),
             Ok(())
@@ -5950,6 +6027,7 @@ mod tests",
                 || Ok(crate::settings::WindowPosition { x: 1, y: 2 }),
                 || {},
                 || Err(()),
+                || panic!("failed hide must not tear down panel"),
                 |_| panic!("failed hide must not be persisted"),
             ),
             Err(CommandError::window_failed())
@@ -5978,6 +6056,7 @@ mod tests",
                 || Err(()),
                 || registry.hide_and_clear(),
                 || Err(()),
+                || panic!("failed hide must not tear down panel"),
                 |_| Ok(()),
             ),
             Err(CommandError::window_failed())

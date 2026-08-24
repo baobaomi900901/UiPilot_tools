@@ -248,6 +248,7 @@ export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelError(handler: (payload: unknown) => void): Promise<() => void>
+  listenPluginPanelReset(handler: (payload: unknown) => void): Promise<() => void>
   getMessageSummary(): Promise<unknown>
   openMessageCenter(): Promise<unknown>
   readMessageCenter(): Promise<unknown>

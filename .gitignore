@@ -13,6 +13,8 @@ develop-eggs/
 dist/
 !/examples/public-plugins/com.uipilot.demo-win/package/dist/
 !/examples/public-plugins/com.uipilot.demo-win/package/dist/**
+!/examples/public-plugins/com.uipilot.demo-panel/package/dist/
+!/examples/public-plugins/com.uipilot.demo-panel/package/dist/**
 !/examples/public-plugins/com.uipilot.note/package/dist/
 !/examples/public-plugins/com.uipilot.note/package/dist/**
 downloads/

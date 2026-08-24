@@ -1123,6 +1123,34 @@ fn repository_demo_examples_stage_as_independently_removable_public_plugins() {
         }
     }
 }
+
+#[test]
+fn repository_demo_panel_stages_with_the_panel_only_contract() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let root = TestRoot::new("demo-panel-reference");
+    let source = workspace.join("examples/public-plugins/com.uipilot.demo-panel/package");
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-panel");
+    assert_eq!(prepared.manifest.command.default_name, "demo-panel");
+    assert_eq!(
+        prepared.manifest.command.output_mode,
+        PublicOutputMode::Panel
+    );
+    assert_eq!(
+        prepared.manifest.permissions,
+        vec![PublicPermission::UiPanel]
+    );
+    assert!(prepared.manifest.panel.is_some());
+    assert!(prepared.manifest.window.is_none());
+    assert_eq!(prepared.resources.len(), 5);
+}
+
 #[cfg(windows)]
 #[test]
 fn demo_packaging_script_writes_both_installable_archives() {

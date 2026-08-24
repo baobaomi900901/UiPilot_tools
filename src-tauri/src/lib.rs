@@ -650,7 +650,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 59);
+        assert_eq!(production.matches("commands::").count(), 60);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -688,6 +688,7 @@ mod tests {
             "plugin_panel_storage_remove",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "close_plugin_panel",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
@@ -787,6 +788,7 @@ mod tests {
             "uninstall_plugin",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "close_plugin_panel",
         ] {
             assert!(build.contains(&format!("\"{command}\",")));
             let permission = format!("\"allow-{}\"", command.replace('_', "-"));
