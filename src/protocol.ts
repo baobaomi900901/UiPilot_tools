@@ -98,6 +98,7 @@ export interface PluginInventorySnapshot {
 export type PublicPluginFault = 'runtimeUnavailable' | 'consecutiveFailures'
 export type PublicPermission =
   | 'ui.window'
+  | 'ui.panel'
   | 'clipboard.write'
   | 'clipboard.read'
   | 'network.https'
@@ -648,7 +649,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 }
 
 const publicPermissions = new Set<PublicPermission>([
-  'ui.window', 'clipboard.write', 'clipboard.read', 'network.https',
+  'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.read', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])

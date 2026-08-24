@@ -72,4 +72,26 @@ describe('public plugin timer protocol', () => {
     }
     expect(parsePublicPluginInventory(inventory)).toEqual(inventory)
   })
+
+  it('accepts ui.panel in public plugin inventory permissions', () => {
+    const inventory = {
+      revision: '1',
+      items: [{
+        pluginId: 'com.example.panel',
+        name: 'Panel',
+        description: null,
+        version: '1.0.0',
+        source: 'localPackage',
+        defaultName: 'panel',
+        effectiveName: 'panel',
+        enabled: true,
+        fault: null,
+        generation: 1,
+        iconUrl: null,
+        permissions: [{ permission: 'ui.panel', supported: true, granted: true }],
+        settings: [],
+      }],
+    }
+    expect(parsePublicPluginInventory(inventory)).toEqual(inventory)
+  })
 })
