@@ -17,8 +17,11 @@ use crate::public_plugins::{
 
 const CONTENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Approximate launcher input chrome height inside the 720×420 main window.
-const PANEL_TOP_OFFSET: f64 = 56.0;
+// Mirrors the fixed launcher slot: 12px outer padding, 44px input, 8px gap,
+// and a 24px status row above the 12px bottom padding.
+const PANEL_HORIZONTAL_INSET: f64 = 12.0;
+const PANEL_TOP_OFFSET: f64 = 64.0;
+const PANEL_BOTTOM_INSET: f64 = 36.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PanelSessionIdentity {
@@ -709,12 +712,20 @@ fn panel_bounds(main: &tauri::Window) -> Result<(LogicalPosition<f64>, LogicalSi
     let scale = main.scale_factor().map_err(|_| ())?;
     let width = (size.width as f64 / scale).max(1.0);
     let height = (size.height as f64 / scale).max(1.0);
-    let top = PANEL_TOP_OFFSET.min(height * 0.25);
-    let panel_height = (height - top).max(1.0);
-    Ok((
-        LogicalPosition::new(0.0, top),
-        LogicalSize::new(width, panel_height),
-    ))
+    Ok(panel_logical_bounds(width, height))
+}
+
+fn panel_logical_bounds(width: f64, height: f64) -> (LogicalPosition<f64>, LogicalSize<f64>) {
+    let left = PANEL_HORIZONTAL_INSET.min((width - 1.0).max(0.0) / 2.0);
+    let top = PANEL_TOP_OFFSET.min((height - 1.0).max(0.0));
+    let bottom = PANEL_BOTTOM_INSET.min((height - top - 1.0).max(0.0));
+    (
+        LogicalPosition::new(left, top),
+        LogicalSize::new(
+            (width - left * 2.0).max(1.0),
+            (height - top - bottom).max(1.0),
+        ),
+    )
 }
 
 pub(crate) fn mount(
@@ -1973,5 +1984,16 @@ mod tests {
                 "forbidden panel fragment: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn panel_bounds_match_the_fixed_launcher_result_slot() {
+        let (position, size) = panel_logical_bounds(720.0, 420.0);
+        assert_eq!((position.x, position.y), (12.0, 64.0));
+        assert_eq!((size.width, size.height), (696.0, 320.0));
+
+        let (position, size) = panel_logical_bounds(20.0, 20.0);
+        assert!(position.x >= 0.0 && position.y >= 0.0);
+        assert!(size.width >= 1.0 && size.height >= 1.0);
     }
 }

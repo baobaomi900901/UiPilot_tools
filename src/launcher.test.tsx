@@ -1283,6 +1283,49 @@ describe('shown and search ownership', () => {
       .toBeLessThan(vi.mocked(client.submitPluginPanel).mock.invocationCallOrder[0]!)
   })
 
+  it.each(['success', 'failure'] as const)(
+    'releases panel open busy state when its query owner becomes stale after %s',
+    async (outcome) => {
+      const { core, client, emit } = await startedCore()
+      const opened = deferred<PluginPanelCommandResult>()
+      vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+        requestId: `panel-stale-${request.querySequence}`,
+        items: request.query === 'hello' ? [panelItem('hello')] : [],
+      } as unknown as SearchResponse))
+      vi.mocked(client.openPluginPanel).mockReturnValueOnce(opened.promise)
+
+      emit(shown(`panel-stale-${outcome}`))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'hello', inputType: 'insertText',
+      })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      expect(core.getSnapshot().executePending).toBe(true)
+
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'changed', inputType: 'insertText',
+      })
+      if (outcome === 'success') {
+        opened.resolve({
+          sessionEpoch: u64('8'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+        })
+      } else {
+        opened.reject({ code: 'windowFailed' })
+      }
+
+      await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+      expect(core.getSnapshot()).toMatchObject({ query: 'changed', status: '未找到应用' })
+      if (outcome === 'success') {
+        expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '8' })
+      } else {
+        expect(client.closePluginPanel).not.toHaveBeenCalled()
+      }
+    },
+  )
+
   it('submits a slash panel activation on the first Enter and keeps only the latest frontend owner', async () => {
     const { core, client, emit } = await startedCore()
     const submitA = deferred<PluginPanelCommandResult>()
@@ -1386,11 +1429,22 @@ describe('shown and search ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
     const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
     expect(input).not.toBeNull()
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5])
 
     input.setSelectionRange(2, 2)
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
     expect(client.closePluginPanel).not.toHaveBeenCalled()
     expect(core.getSnapshot().panel).toBeDefined()
+
+    input.setSelectionRange(0, 2)
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
+    expect(client.closePluginPanel).not.toHaveBeenCalled()
+
+    input.setSelectionRange(0, 0)
+    await act(async () => input.dispatchEvent(new KeyboardEvent(
+      'keydown', { key: 'Backspace', bubbles: true, isComposing: true },
+    )))
+    expect(client.closePluginPanel).not.toHaveBeenCalled()
 
     input.setSelectionRange(0, 0)
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))

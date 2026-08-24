@@ -2037,13 +2037,18 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     } catch (error) {
       pending = Promise.reject(error)
     }
-    const owns = () => !destroyed && owner.token === panelActionToken && owner.viewEpoch === model.viewEpoch &&
-      owner.invocationId === model.invocationId && owner.control === model.queryControl &&
+    const ownsAction = () => !destroyed && owner.token === panelActionToken &&
+      owner.viewEpoch === model.viewEpoch && owner.invocationId === model.invocationId
+    const ownsQuery = () => ownsAction() && owner.control === model.queryControl &&
       owner.querySequence === model.querySequence && owner.query === model.query &&
       owner.query === model.queryControlValue && model.results.some(({ key }) => key === owner.resultKey)
     void pending.then(
       (identity) => {
-        if (!owns()) {
+        if (!ownsQuery()) {
+          if (ownsAction()) {
+            model.executePending = false
+            publish(true)
+          }
           void client.closePluginPanel({ sessionEpoch: identity.sessionEpoch }).catch(() => undefined)
           return
         }
@@ -2073,9 +2078,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         submitPanel(owner.argument)
       },
       () => {
-        if (!owns()) return
+        if (!ownsAction()) return
         model.executePending = false
-        model.status = FALLBACK_ERROR
+        if (ownsQuery()) model.status = FALLBACK_ERROR
         publish(true)
       },
     )
