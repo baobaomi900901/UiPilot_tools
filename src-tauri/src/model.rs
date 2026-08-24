@@ -22,6 +22,13 @@ pub(crate) enum LauncherResultActivation {
         plugin_id: String,
         favorite: bool,
     },
+    PanelActivation {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        #[serde(rename = "initialArgument")]
+        initial_argument: String,
+        favorite: bool,
+    },
     OpenFind {
         query: String,
     },
@@ -46,6 +53,28 @@ impl LauncherResultActivation {
             favorite,
         })
     }
+
+    pub(crate) fn panel_activation(
+        plugin_id: String,
+        initial_argument: String,
+        favorite: bool,
+    ) -> Option<Self> {
+        (crate::public_plugins::valid_plugin_id(&plugin_id)
+            && valid_panel_initial_argument(&initial_argument))
+        .then_some(Self::PanelActivation {
+            plugin_id,
+            initial_argument,
+            favorite,
+        })
+    }
+}
+
+pub(crate) fn valid_panel_initial_argument(value: &str) -> bool {
+    value.len() <= 65_536
+        && value.trim() == value
+        && !value.chars().any(|character| {
+            character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+        })
 }
 
 pub(crate) fn valid_launcher_completion(value: &str) -> bool {
@@ -170,6 +199,37 @@ mod tests {
         assert!(LauncherResultActivation::plugin_completion(
             "/demo-win value".into(),
             "Invalid Plugin".into(),
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn panel_activation_serializes_initial_argument_and_rejects_invalid_identity() {
+        let activation = LauncherResultActivation::panel_activation(
+            "com.uipilot.demo-panel".into(),
+            "hello".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(activation).unwrap(),
+            serde_json::json!({
+                "kind": "panelActivation",
+                "pluginId": "com.uipilot.demo-panel",
+                "initialArgument": "hello",
+                "favorite": true
+            })
+        );
+        assert!(LauncherResultActivation::panel_activation(
+            "Invalid Plugin".into(),
+            "".into(),
+            false,
+        )
+        .is_none());
+        assert!(LauncherResultActivation::panel_activation(
+            "com.uipilot.demo-panel".into(),
+            "bad\narg".into(),
             false,
         )
         .is_none());

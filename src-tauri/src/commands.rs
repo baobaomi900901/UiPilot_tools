@@ -1699,6 +1699,13 @@ pub(crate) async fn search_apps(
                     replace_local_results: false,
                 }))
             }
+            PublicPluginResponse::Panel(_) => {
+                if route.output_mode != PublicOutputMode::Panel {
+                    return Err(CommandError::plugin_query_failed());
+                }
+                // Panel session open/submit settlement lands in Task 4.
+                Ok(None)
+            }
         };
     }
     if completion_origin.is_some() {
@@ -1985,18 +1992,34 @@ fn public_plugin_completion_result(
     argument: Option<&str>,
 ) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
     let title = format!("/{}", suggestion.effective_name);
-    let completion_text =
-        argument.map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
+    let subtitle = Some(
+        suggestion
+            .summary
+            .clone()
+            .unwrap_or_else(|| suggestion.display_name.clone()),
+    );
+    let activation = match suggestion.output_mode {
+        PublicOutputMode::Panel => LauncherResultActivation::panel_activation(
+            suggestion.plugin_id.clone(),
+            argument.unwrap_or("").to_owned(),
+            suggestion.favorite,
+        )?,
+        _ => {
+            let completion_text = argument
+                .map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
+            LauncherResultActivation::plugin_completion(
+                completion_text,
+                suggestion.plugin_id.clone(),
+                suggestion.favorite,
+            )?
+        }
+    };
     Some((
         crate::model::ResultItem {
             result_id: String::new(),
-            activation: LauncherResultActivation::plugin_completion(
-                completion_text,
-                suggestion.plugin_id,
-                suggestion.favorite,
-            )?,
+            activation,
             title,
-            subtitle: Some(suggestion.summary.unwrap_or(suggestion.display_name)),
+            subtitle,
             icon: None,
             plugin_icon_url: suggestion.icon_url,
             icon_kind: None,
@@ -2155,8 +2178,15 @@ where
             ));
         }
         for suggestion in suggestions {
-            let argument =
-                (!catalog_query.is_empty() && suggestion.favorite).then_some(catalog_query);
+            let argument = match suggestion.output_mode {
+                PublicOutputMode::Panel
+                    if !catalog_query.is_empty() && !catalog_query.starts_with('/') =>
+                {
+                    Some(catalog_query)
+                }
+                _ if !catalog_query.is_empty() && suggestion.favorite => Some(catalog_query),
+                _ => None,
+            };
             entries.extend(public_plugin_completion_result(suggestion, argument));
         }
         if !catalog_query.is_empty() {
@@ -3194,6 +3224,7 @@ mod tests {
                             .into(),
                     ),
                     favorite: false,
+                    output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
                     plugin_id: "com.example.alpha-window".into(),
@@ -3202,6 +3233,7 @@ mod tests {
                     summary: None,
                     icon_url: None,
                     favorite: false,
+                    output_mode: PublicOutputMode::Window,
                 },
             ],
         )
@@ -3387,6 +3419,7 @@ mod tests {
             summary: Some(format!("Use {name}")),
             icon_url: None,
             favorite: false,
+            output_mode: PublicOutputMode::MainResult,
         }
     }
 
@@ -3398,6 +3431,54 @@ mod tests {
             } => Some(completion_text),
             _ => None,
         }
+    }
+
+    #[test]
+    fn panel_activation_rows_emit_panel_activation_with_initial_argument_rules() {
+        let panel = PublicCommandSuggestion {
+            plugin_id: "com.example.panel".into(),
+            effective_name: "panel".into(),
+            display_name: "Panel".into(),
+            summary: None,
+            icon_url: None,
+            favorite: true,
+            output_mode: PublicOutputMode::Panel,
+        };
+        let (empty, _) = super::public_plugin_completion_result(panel.clone(), None).unwrap();
+        match empty.activation {
+            crate::model::LauncherResultActivation::PanelActivation {
+                plugin_id,
+                initial_argument,
+                favorite,
+            } => {
+                assert_eq!(plugin_id, "com.example.panel");
+                assert_eq!(initial_argument, "");
+                assert!(favorite);
+            }
+            _ => panic!("expected panelActivation"),
+        }
+
+        let (matched, _) = super::public_plugin_completion_result(panel, Some("hello")).unwrap();
+        match matched.activation {
+            crate::model::LauncherResultActivation::PanelActivation {
+                initial_argument, ..
+            } => assert_eq!(initial_argument, "hello"),
+            _ => panic!("expected panelActivation"),
+        }
+
+        let (window, _) = super::public_plugin_completion_result(
+            PublicCommandSuggestion {
+                output_mode: PublicOutputMode::Window,
+                effective_name: "demo-win".into(),
+                ..command_suggestion("demo-win")
+            },
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            window.activation,
+            crate::model::LauncherResultActivation::PluginCompletion { .. }
+        ));
     }
 
     #[test]

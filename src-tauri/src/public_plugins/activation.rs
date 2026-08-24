@@ -154,6 +154,7 @@ pub(crate) struct PublicCommandSuggestion {
     pub(crate) summary: Option<String>,
     pub(crate) icon_url: Option<String>,
     pub(crate) favorite: bool,
+    pub(crate) output_mode: PublicOutputMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -174,6 +175,12 @@ pub(crate) struct PublicMainResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicWindowResponse {
+    pub(crate) request_id: String,
+    pub(crate) data: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicPanelResponse {
     pub(crate) request_id: String,
     pub(crate) data: Value,
 }
@@ -1760,6 +1767,7 @@ impl PublicPluginManager {
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
                 favorite: config.favorite,
+                output_mode: snapshot.manifest.command.output_mode,
             });
         }
         suggestions.sort_by(|left, right| {
@@ -1796,6 +1804,7 @@ impl PublicPluginManager {
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
                 favorite: config.favorite,
+                output_mode: snapshot.manifest.command.output_mode,
             });
         }
         suggestions.sort_by(|left, right| {
@@ -3024,6 +3033,34 @@ pub(crate) fn parse_window_response(
     context: &PluginRequestContext,
     value: Value,
 ) -> Result<PublicWindowResponse, PluginRuntimeError> {
+    let response = parse_data_response(context, value)?;
+    Ok(PublicWindowResponse {
+        request_id: response.request_id,
+        data: response.data,
+    })
+}
+
+pub(crate) fn parse_panel_response(
+    context: &PluginRequestContext,
+    value: Value,
+) -> Result<PublicPanelResponse, PluginRuntimeError> {
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("results"))
+    {
+        return Err(PluginRuntimeError::InvalidOperation);
+    }
+    let response = parse_data_response(context, value)?;
+    Ok(PublicPanelResponse {
+        request_id: response.request_id,
+        data: response.data,
+    })
+}
+
+fn parse_data_response(
+    context: &PluginRequestContext,
+    value: Value,
+) -> Result<WindowResponseWire, PluginRuntimeError> {
     if serde_json::to_vec(&value)
         .map_err(|_| PluginRuntimeError::InvalidOperation)?
         .len()
@@ -3036,10 +3073,7 @@ pub(crate) fn parse_window_response(
     if response.request_id != context.request_id || !super::valid_json_value(&response.data) {
         return Err(PluginRuntimeError::InvalidOperation);
     }
-    Ok(PublicWindowResponse {
-        request_id: response.request_id,
-        data: response.data,
-    })
+    Ok(response)
 }
 pub(crate) fn parse_main_result_response(
     context: &PluginRequestContext,
@@ -4289,6 +4323,7 @@ mod tests {
                     summary: Some("返回示例文本到主界面".into()),
                     icon_url: None,
                     favorite: false,
+                    output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
                     plugin_id: "com.example.demo-win".into(),
@@ -4297,6 +4332,7 @@ mod tests {
                     summary: Some("打开演示子窗口".into()),
                     icon_url: None,
                     favorite: false,
+                    output_mode: PublicOutputMode::MainResult,
                 },
             ]
         );
@@ -4317,6 +4353,7 @@ mod tests {
                 summary: Some("打开演示子窗口".into()),
                 icon_url: None,
                 favorite: false,
+                output_mode: PublicOutputMode::MainResult,
             }]
         );
         assert!(manager
@@ -4640,6 +4677,37 @@ mod tests {
         assert!(parse_window_response(
             &context,
             json!({ "requestId": "public-request-1", "data": "x".repeat(65_536) })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn panel_response_accepts_data_payload_and_rejects_main_result_shape() {
+        let context = PluginRequestContext {
+            plugin_id: "com.example.panel".into(),
+            plugin_generation: 1,
+            request_id: "public-request-1".into(),
+        };
+        assert_eq!(
+            parse_panel_response(
+                &context,
+                json!({
+                    "requestId": "public-request-1",
+                    "data": { "label": "ready" }
+                })
+            )
+            .unwrap(),
+            PublicPanelResponse {
+                request_id: "public-request-1".into(),
+                data: json!({ "label": "ready" }),
+            }
+        );
+        assert!(parse_panel_response(
+            &context,
+            json!({
+                "requestId": "public-request-1",
+                "results": [{ "id": "one", "title": "Nope" }]
+            })
         )
         .is_err());
     }

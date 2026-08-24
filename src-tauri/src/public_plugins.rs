@@ -41,10 +41,11 @@ use crate::settings::SettingsStore;
 use owner_cleanup::retry_pending_owner_cleanup;
 
 pub(crate) use activation::{
-    parse_main_result_response, parse_window_response, PublicCommandSuggestion, PublicMainResult,
-    PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
-    PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginRoute,
-    PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse, WindowStorageError,
+    parse_main_result_response, parse_panel_response, parse_window_response, PublicCommandSuggestion,
+    PublicMainResult, PublicPanelResponse, PublicPluginInstallSource, PublicPluginInventory,
+    PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
+    PublicPluginPrepareSummary, PublicPluginRoute, PublicPluginWindowIdentity,
+    PublicRuntimeCandidate, PublicWindowResponse, WindowStorageError,
 };
 #[cfg(test)]
 pub(crate) use alarm_asset::AlarmAssetIdentity;
@@ -83,6 +84,7 @@ const PUBLIC_PLUGIN_CSP: &str = "default-src 'self'; script-src 'self'; style-sr
 pub(crate) enum PublicPluginResponse {
     MainResults(Vec<PublicMainResult>),
     Window(PublicWindowResponse),
+    Panel(PublicPanelResponse),
 }
 
 pub(crate) type PublicSubmissionResult = Result<PublicPluginResponse, PluginRuntimeError>;
@@ -584,7 +586,9 @@ impl PublicPluginService {
                         PublicOutputMode::Window => value
                             .and_then(|value| parse_window_response(&completion.context, value))
                             .map(PublicPluginResponse::Window),
-                        PublicOutputMode::Panel => Err(PluginRuntimeError::InvalidOperation),
+                        PublicOutputMode::Panel => value
+                            .and_then(|value| parse_panel_response(&completion.context, value))
+                            .map(PublicPluginResponse::Panel),
                     };
                     Some(result)
                 };

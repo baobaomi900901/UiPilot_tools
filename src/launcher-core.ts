@@ -356,6 +356,28 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
         }
       : undefined
   }
+  if (candidate?.kind === 'panelActivation') {
+    const record = exactPlainRecord(value, ['favorite', 'initialArgument', 'kind', 'pluginId'])
+    return record &&
+        typeof record.pluginId === 'string' &&
+        record.pluginId.length <= 64 &&
+        PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.initialArgument === 'string' &&
+        record.initialArgument.length <= 65_536 &&
+        record.initialArgument.trim() === record.initialArgument &&
+        ![...record.initialArgument].some(
+          (character) =>
+            /\p{Cc}/u.test(character) || character === '\u{2028}' || character === '\u{2029}',
+        ) &&
+        typeof record.favorite === 'boolean'
+      ? {
+          kind: 'panelActivation',
+          pluginId: record.pluginId,
+          initialArgument: record.initialArgument,
+          favorite: record.favorite,
+        }
+      : undefined
+  }
   return undefined
 }
 
@@ -383,6 +405,15 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
         ...(activation.kind === 'pluginCompletion'
           ? { pluginCompletion: Object.freeze({ pluginId: activation.pluginId, favorite: activation.favorite }) }
+          : {}),
+        ...(activation.kind === 'panelActivation'
+          ? {
+              panelActivation: Object.freeze({
+                pluginId: activation.pluginId,
+                initialArgument: activation.initialArgument,
+                favorite: activation.favorite,
+              }),
+            }
           : {}),
       }),
     ),

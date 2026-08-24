@@ -743,6 +743,12 @@ describe('shown and search ownership', () => {
         pluginId: 'com.uipilot.demo-win',
         favorite: true,
       },
+      {
+        kind: 'panelActivation',
+        pluginId: 'com.uipilot.demo-panel',
+        initialArgument: 'hello',
+        favorite: true,
+      },
       { kind: 'openFind', query: ' da  value ' },
       { kind: 'executeResult' },
     ]
@@ -770,6 +776,9 @@ describe('shown and search ownership', () => {
       { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: 1 },
       { kind: 'pluginCompletion', completionText: '/demo win ', pluginId: 'com.uipilot.demo-win', favorite: false },
       { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: true, extra: false },
+      { kind: 'panelActivation', pluginId: 'Invalid Plugin', initialArgument: '', favorite: true },
+      { kind: 'panelActivation', pluginId: 'com.uipilot.demo-panel', initialArgument: 'bad\narg', favorite: false },
+      { kind: 'panelActivation', pluginId: 'com.uipilot.demo-panel', initialArgument: ' hello', favorite: false },
     ]
     for (const activation of invalid) expect(safeLauncherActivation(activation)).toBeUndefined()
   })

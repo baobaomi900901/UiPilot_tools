@@ -5,6 +5,7 @@ export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
 export type LauncherResultActivation =
   | { kind: 'completion'; completionText: string }
   | { kind: 'pluginCompletion'; completionText: string; pluginId: string; favorite: boolean }
+  | { kind: 'panelActivation'; pluginId: string; initialArgument: string; favorite: boolean }
   | { kind: 'openFind'; query: string }
   | { kind: 'executeResult' }
 
@@ -362,6 +363,7 @@ export interface ViewResult {
   detail?: string
   hasDefaultAction?: boolean
   pluginCompletion?: Readonly<{ pluginId: string; favorite: boolean }>
+  panelActivation?: Readonly<{ pluginId: string; initialArgument: string; favorite: boolean }>
 }
 export interface TextControlView {
   key: ControlKey
