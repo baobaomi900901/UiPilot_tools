@@ -2128,8 +2128,8 @@ fn public_plugin_completion_result(
             suggestion.favorite,
         )?,
         _ => {
-            let completion_text = argument
-                .map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
+            let completion_text =
+                argument.map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
             LauncherResultActivation::plugin_completion(
                 completion_text,
                 suggestion.plugin_id.clone(),
@@ -4361,7 +4361,9 @@ mod tests {
         }
         let ready = command_body("plugin_panel_content_ready");
         assert!(ready.contains("session_epoch: String"));
-        assert!(ready.contains("content_ready(controller.inner().as_ref(), webview.label(), session_epoch)"));
+        assert!(ready.contains(
+            "content_ready(controller.inner().as_ref(), webview.label(), session_epoch)"
+        ));
         let ack = command_body("plugin_panel_content_ack");
         assert!(ack.contains("session_epoch: String"));
         assert!(ack.contains("content_ack("));
@@ -4375,10 +4377,7 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
         ] {
-            assert!(capability.contains(&format!(
-                "\"allow-{}\"",
-                command.replace('_', "-")
-            )));
+            assert!(capability.contains(&format!("\"allow-{}\"", command.replace('_', "-"))));
         }
         assert!(!capability.contains("timer"));
         assert!(!capability.contains("plugin-window-"));

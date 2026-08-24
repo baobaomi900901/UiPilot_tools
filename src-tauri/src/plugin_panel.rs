@@ -73,6 +73,13 @@ pub(crate) enum PanelSettlementError {
     Unavailable,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PanelDeliveryTicket {
+    session_epoch: u64,
+    request_id: String,
+    submission_token: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueueDispatchOutcome {
     Buffered,
@@ -296,10 +303,7 @@ impl PluginPanelController {
         Ok(QueueDispatchOutcome::Buffered)
     }
 
-    pub(crate) fn promote_pending_dispatch(
-        &self,
-        session_epoch: u64,
-    ) -> Option<PendingDispatch> {
+    pub(crate) fn promote_pending_dispatch(&self, session_epoch: u64) -> Option<PendingDispatch> {
         let mut core = self.core.lock().ok()?;
         let session = core
             .session
@@ -337,6 +341,26 @@ impl PluginPanelController {
         }
         session.phase = PanelPhase::AwaitingAck;
         Ok(())
+    }
+
+    fn classify_delivery_failure(&self, ticket: &PanelDeliveryTicket) -> PanelSettlementError {
+        let Ok(core) = self.core.lock() else {
+            return PanelSettlementError::Unavailable;
+        };
+        let current = core.session.as_ref().is_some_and(|session| {
+            session.identity.session_epoch == ticket.session_epoch
+                && session.current_request_id == ticket.request_id
+                && session.current_submission_token == ticket.submission_token
+                && matches!(
+                    session.phase,
+                    PanelPhase::AwaitingAck | PanelPhase::Acknowledged | PanelPhase::Ready
+                )
+        });
+        if current {
+            PanelSettlementError::Unavailable
+        } else {
+            PanelSettlementError::Stale
+        }
     }
 
     pub(crate) fn mark_ready(&self, content_label: &str, session_epoch: u64) -> bool {
@@ -452,14 +476,11 @@ impl PluginPanelController {
             if now >= deadline {
                 return Err(PanelSettlementError::Unavailable);
             }
-            let (guard, result) = self
+            let (guard, _) = self
                 .changed
                 .wait_timeout(core, deadline.saturating_duration_since(now))
                 .map_err(|_| PanelSettlementError::Unavailable)?;
             core = guard;
-            if result.timed_out() {
-                return Err(PanelSettlementError::Unavailable);
-            }
         }
     }
 
@@ -471,15 +492,13 @@ impl PluginPanelController {
     ) -> Result<PanelSessionIdentity, PanelCallError> {
         let plugin_id = plugin_id_from_panel_content_label(content_label)
             .ok_or(PanelCallError::InvalidCaller)?;
-        let core = self
-            .core
-            .lock()
-            .map_err(|_| PanelCallError::Unavailable)?;
+        let core = self.core.lock().map_err(|_| PanelCallError::Unavailable)?;
         let session = core
             .session
             .as_ref()
             .ok_or(PanelCallError::ExpiredSession)?;
-        if session.identity.content_label != content_label || session.identity.plugin_id != plugin_id
+        if session.identity.content_label != content_label
+            || session.identity.plugin_id != plugin_id
         {
             return Err(PanelCallError::InvalidCaller);
         }
@@ -496,7 +515,10 @@ impl PluginPanelController {
         Ok(session.identity.clone())
     }
 
-    pub(crate) fn teardown_session(&self, session_epoch: Option<u64>) -> Option<PanelSessionIdentity> {
+    pub(crate) fn teardown_session(
+        &self,
+        session_epoch: Option<u64>,
+    ) -> Option<PanelSessionIdentity> {
         let mut core = self.core.lock().ok()?;
         let session = core.session.take()?;
         if let Some(expected) = session_epoch {
@@ -521,27 +543,6 @@ impl PluginPanelController {
             session.identity.session_epoch == session_epoch
                 && session.current_submission_token == submission_token
         })
-    }
-
-    pub(crate) fn set_current_request(
-        &self,
-        session_epoch: u64,
-        request_id: &str,
-    ) -> Result<(), PublicPluginManagementError> {
-        let mut core = self
-            .core
-            .lock()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let session = core
-            .session
-            .as_mut()
-            .filter(|session| session.identity.session_epoch == session_epoch)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        session.current_request_id = request_id.to_owned();
-        if session.phase == PanelPhase::Ready {
-            session.phase = PanelPhase::AwaitingAck;
-        }
-        Ok(())
     }
 }
 
@@ -686,30 +687,36 @@ fn deliver_update(
     app: &AppHandle,
     controller: &PluginPanelController,
     identity: &PanelSessionIdentity,
+    ticket: &PanelDeliveryTicket,
     update: PluginPanelUpdate,
 ) -> Result<(), PanelSettlementError> {
-    controller
-        .set_current_request(identity.session_epoch, &update.request_id)
-        .map_err(|_| PanelSettlementError::Unavailable)?;
-    let content = app
-        .get_webview(&identity.content_label)
-        .ok_or(PanelSettlementError::Unavailable)?;
-    let session_payload = serde_json::to_string(&serde_json::json!({
-        "sessionEpoch": identity.session_epoch.to_string(),
-    }))
-    .map_err(|_| PanelSettlementError::Unavailable)?;
-    content
-        .eval(format!(
+    let content = settle_delivery_operation(
+        controller,
+        ticket,
+        app.get_webview(&identity.content_label).ok_or(()),
+    )?;
+    let session_payload = settle_delivery_operation(
+        controller,
+        ticket,
+        serde_json::to_string(&serde_json::json!({
+            "sessionEpoch": identity.session_epoch.to_string(),
+        })),
+    )?;
+    settle_delivery_operation(
+        controller,
+        ticket,
+        content.eval(format!(
             "window.__UIPILOT_PLUGIN_PANEL_PREPARE__({session_payload});"
-        ))
-        .map_err(|_| PanelSettlementError::Unavailable)?;
-    let payload =
-        serde_json::to_string(&update).map_err(|_| PanelSettlementError::Unavailable)?;
-    content
-        .eval(format!(
+        )),
+    )?;
+    let payload = settle_delivery_operation(controller, ticket, serde_json::to_string(&update))?;
+    settle_delivery_operation(
+        controller,
+        ticket,
+        content.eval(format!(
             "window.__UIPILOT_PLUGIN_PANEL_UPDATE__({payload});"
-        ))
-        .map_err(|_| PanelSettlementError::Unavailable)?;
+        )),
+    )?;
     controller.wait_until_acked(
         identity.session_epoch,
         &update.request_id,
@@ -722,8 +729,21 @@ pub(crate) fn claim_panel_delivery(
     session_epoch: u64,
     request_id: &str,
     submission_token: &str,
-) -> Result<(), PanelSettlementError> {
-    controller.claim_delivery_settlement(session_epoch, request_id, submission_token)
+) -> Result<PanelDeliveryTicket, PanelSettlementError> {
+    controller.claim_delivery_settlement(session_epoch, request_id, submission_token)?;
+    Ok(PanelDeliveryTicket {
+        session_epoch,
+        request_id: request_id.to_owned(),
+        submission_token: submission_token.to_owned(),
+    })
+}
+
+fn settle_delivery_operation<T, E>(
+    controller: &PluginPanelController,
+    ticket: &PanelDeliveryTicket,
+    result: Result<T, E>,
+) -> Result<T, PanelSettlementError> {
+    result.map_err(|_| controller.classify_delivery_failure(ticket))
 }
 
 pub(crate) fn deliver_panel_update(
@@ -733,13 +753,13 @@ pub(crate) fn deliver_panel_update(
     submission_token: &str,
     update: PluginPanelUpdate,
 ) -> Result<(), PanelSettlementError> {
-    claim_panel_delivery(
+    let ticket = claim_panel_delivery(
         controller,
         identity.session_epoch,
         &update.request_id,
         submission_token,
     )?;
-    deliver_update(app, controller, identity, update)
+    deliver_update(app, controller, identity, &ticket, update)
 }
 
 pub(crate) fn queue_dispatch(
@@ -799,7 +819,11 @@ mod tests {
         assert!(controller.live_identity().is_none());
     }
 
-    fn pending_dispatch(request: &str, argument: &str, theme: PluginInvocationTheme) -> PendingDispatch {
+    fn pending_dispatch(
+        request: &str,
+        argument: &str,
+        theme: PluginInvocationTheme,
+    ) -> PendingDispatch {
         PendingDispatch {
             request_id: request.into(),
             submission_token: format!("token-{request}"),
@@ -1163,12 +1187,7 @@ mod tests {
         assert!(controller
             .claim_delivery_settlement(second.session_epoch, "b", "token-b")
             .is_ok());
-        assert!(content_ack(
-            &controller,
-            &label,
-            second.session_epoch,
-            "b"
-        ));
+        assert!(content_ack(&controller, &label, second.session_epoch, "b"));
     }
 
     #[test]
@@ -1322,6 +1341,51 @@ mod tests {
     }
 
     #[test]
+    fn native_delivery_failure_is_stale_after_claimed_session_teardown() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        let ticket =
+            claim_panel_delivery(&controller, identity.session_epoch, "a", "token-a").unwrap();
+        controller.teardown_session(Some(identity.session_epoch));
+
+        assert_eq!(
+            settle_delivery_operation(&controller, &ticket, Err::<(), _>(())),
+            Err(PanelSettlementError::Stale)
+        );
+    }
+
+    #[test]
+    fn native_delivery_failure_is_unavailable_for_live_claimed_session() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        let ticket =
+            claim_panel_delivery(&controller, identity.session_epoch, "a", "token-a").unwrap();
+
+        assert_eq!(
+            settle_delivery_operation(&controller, &ticket, Err::<(), _>(())),
+            Err(PanelSettlementError::Unavailable)
+        );
+    }
+
+    #[test]
     fn acknowledged_enter_buffers_before_wait_consumes_ack() {
         let controller = PluginPanelController::default();
         let identity = content_ready_session(&controller);
@@ -1444,11 +1508,19 @@ mod tests {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
         assert_eq!(
-            controller.begin_storage_call("plugin-panel-content-forged", identity.session_epoch, false),
+            controller.begin_storage_call(
+                "plugin-panel-content-forged",
+                identity.session_epoch,
+                false
+            ),
             Err(PanelCallError::InvalidCaller)
         );
         assert_eq!(
-            controller.begin_storage_call(&identity.content_label, identity.session_epoch + 1, false),
+            controller.begin_storage_call(
+                &identity.content_label,
+                identity.session_epoch + 1,
+                false
+            ),
             Err(PanelCallError::ExpiredSession)
         );
         assert!(controller
@@ -1458,7 +1530,11 @@ mod tests {
             controller.begin_storage_call(&identity.content_label, identity.session_epoch, true),
             Err(PanelCallError::ExpiredSession)
         );
-        assert!(content_ready(&controller, &identity.content_label, identity.session_epoch));
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch
+        ));
         assert!(controller
             .begin_storage_call(&identity.content_label, identity.session_epoch, true)
             .is_ok());

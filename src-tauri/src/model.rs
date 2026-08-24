@@ -72,9 +72,9 @@ impl LauncherResultActivation {
 pub(crate) fn valid_panel_initial_argument(value: &str) -> bool {
     value.len() <= 65_536
         && value.trim() == value
-        && !value.chars().any(|character| {
-            character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
-        })
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
 }
 
 pub(crate) fn valid_launcher_completion(value: &str) -> bool {

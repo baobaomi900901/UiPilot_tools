@@ -41,9 +41,9 @@ use crate::settings::SettingsStore;
 use owner_cleanup::retry_pending_owner_cleanup;
 
 pub(crate) use activation::{
-    parse_main_result_response, parse_panel_response, parse_window_response, PublicCommandSuggestion,
-    PublicMainResult, PublicPanelResponse, PublicPluginInstallSource, PublicPluginInventory,
-    PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
+    parse_main_result_response, parse_panel_response, parse_window_response,
+    PublicCommandSuggestion, PublicMainResult, PublicPanelResponse, PublicPluginInstallSource,
+    PublicPluginInventory, PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
     PublicPluginPrepareSummary, PublicPluginRoute, PublicPluginWindowIdentity,
     PublicRuntimeCandidate, PublicWindowResponse, WindowStorageError,
 };
@@ -869,13 +869,16 @@ impl PublicPluginService {
             return Response::builder().status(403).body(Vec::new()).unwrap();
         }
         let Some(asset) = manager.and_then(|manager| {
-            manager.asset(label, path).or_else(|| {
-                crate::plugin_window::plugin_id_from_content_label(label)
-                    .and_then(|plugin_id| manager.window_asset(&plugin_id, path))
-            }).or_else(|| {
-                crate::plugin_panel::plugin_id_from_panel_content_label(label)
-                    .and_then(|plugin_id| manager.panel_asset(&plugin_id, path))
-            })
+            manager
+                .asset(label, path)
+                .or_else(|| {
+                    crate::plugin_window::plugin_id_from_content_label(label)
+                        .and_then(|plugin_id| manager.window_asset(&plugin_id, path))
+                })
+                .or_else(|| {
+                    crate::plugin_panel::plugin_id_from_panel_content_label(label)
+                        .and_then(|plugin_id| manager.panel_asset(&plugin_id, path))
+                })
         }) else {
             return Response::builder().status(403).body(Vec::new()).unwrap();
         };
