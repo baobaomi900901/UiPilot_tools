@@ -447,6 +447,10 @@ fn validate_manifest_entries(
             .window
             .as_ref()
             .is_some_and(|window| !resources.contains_key(&window.entry))
+        || manifest
+            .panel
+            .as_ref()
+            .is_some_and(|panel| !resources.contains_key(&panel.entry))
     {
         return Err(PublicPackageError::InvalidPackage);
     }

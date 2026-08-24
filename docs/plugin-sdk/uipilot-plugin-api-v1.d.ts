@@ -60,7 +60,12 @@ export interface WindowResponse {
   data: JsonValue
 }
 
-export type PluginResponse = MainResultResponse | WindowResponse
+export interface PanelResponse {
+  requestId: string
+  data: JsonValue
+}
+
+export type PluginResponse = MainResultResponse | WindowResponse | PanelResponse
 
 export type PluginHandler = (
   invocation: Readonly<PluginInvocation>,
@@ -133,8 +138,32 @@ export interface UiPilotPluginWindowApiV1 {
   close(): Promise<void>
 }
 
+export interface PluginPanelUpdate {
+  requestId: string
+  input: string
+  platform: 'windows' | 'macos'
+  theme: 'dark' | 'light'
+  invokedAt: string
+  sessionEpoch: U64Decimal
+  data: JsonValue
+}
+
+export interface UiPilotPluginPanelStorageApiV1 {
+  get(key: string): Promise<JsonValue | null>
+  set(key: string, value: JsonValue): Promise<void>
+  remove(key: string): Promise<void>
+}
+
+export interface UiPilotPluginPanelApiV1 {
+  onUpdate(
+    handler: (update: Readonly<PluginPanelUpdate>) => void | Promise<void>,
+  ): () => void
+  readonly storage: Readonly<UiPilotPluginPanelStorageApiV1>
+}
+
 declare global {
   interface Window {
     readonly uipilotPluginWindow: Readonly<UiPilotPluginWindowApiV1>
+    readonly uipilotPluginPanel: Readonly<UiPilotPluginPanelApiV1>
   }
 }

@@ -38,8 +38,8 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `command.defaultName` is the initial slash command name. Users may rename it, but reserved and conflicting names fail closed.
 - `command.summary` is an optional one-line discovery hint. It is limited to 512 Unicode scalar values; when omitted, the launcher uses `name`.
 - `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
-- `activationMode` is `live` or `submit`; `window` output requires `submit`.
-- `outputMode` is static. `window` requires a window entry and `ui.window`; `mainResult` forbids both.
+- `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
+- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages must set `minimumHostVersion` to at least `0.3.0`.
 
 Installation and reload use staging. Static validation and Runtime readiness must succeed before the generation becomes active. A failed upgrade leaves the previous generation usable.
 
@@ -74,6 +74,8 @@ Both notification methods are request-bound. `publish()` resolves at the atomic 
 
 `window` returns `{ requestId, data }`. The host creates or reuses one window for that plugin and sends a `PluginWindowUpdate` through `window.uipilotPluginWindow.onUpdate`. Content receives input, platform, theme, invocation time, singleton instance `1`, and plugin data. It cannot invoke commands or own pin, close, drag, focus, theme, or position behavior.
 
+`panel` returns `{ requestId, data }`. The host mounts one launcher panel session for that plugin and sends a `PluginPanelUpdate` through `window.uipilotPluginPanel.onUpdate`. Panel content receives input, platform, theme, invocation time, session epoch, and plugin data. It gets storage only; it cannot close itself, own timers, or publish notifications. Panel packages require host `0.3.0+`.
+
 Every plugin content window also sees the frozen `window.uipilotPluginWindow.timer` facade. Calls require the Windows-only `timer.control` permission together with `ui.window` and `notifications.publish`; unpermitted callers receive `PermissionDenied`. The host owns one process-local timer per active plugin generation, continues it while the window is hidden, and discards it on process exit.
 
 Every valid plugin content window also receives the frozen `window.uipilotPluginWindow.storage` facade without an additional permission. It shares the Runtime `api.storage` namespace for that plugin. `get` is available while the window session is prepared or active; `set` and `remove` are active-only. A hidden, replaced, disabled, upgraded, or uninstalled session returns `ExpiredWindowSessionError`. Keys must match `^[a-z][a-z0-9.-]{0,63}$` and cannot be `__proto__`, `prototype`, or `constructor`; values are finite JSON and count toward the same 5 MiB plugin quota.
@@ -98,6 +100,7 @@ Settings support `text`, `secret`, `number`, `boolean`, and `select`. Keys match
 API v1 implements only:
 
 - `ui.window`: create the host-owned singleton window.
+- `ui.panel`: mount the host-owned launcher panel surface.
 - `clipboard.write`: expose a host-owned `copyText` default action.
 - `notifications.publish`: on Windows only, submit one immediate or host-owned delayed plain-text message and ask the host to show its own notification and tray reminder.
 - `timer.control`: on Windows only, control one host-owned plugin-window timer that can continue after the window hides; requires `ui.window`, `notifications.publish`, and `submit + window`.

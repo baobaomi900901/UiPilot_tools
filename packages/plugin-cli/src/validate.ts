@@ -22,6 +22,7 @@ function validateEntries(
 ): void {
   const entries = [manifest.runtime.entry]
   if (manifest.window) entries.push(manifest.window.entry)
+  if (manifest.panel) entries.push(manifest.panel.entry)
   entries.forEach((path, index) => {
     if (!files.has(path)) {
       issues.add({
@@ -146,7 +147,7 @@ export function validateSnapshot(
     schemaVersion: 1,
     valid: finished.issues.length === 0,
     source: { kind: snapshot.kind, path: sourcePath },
-    target: { platform, hostVersion: '0.2.0', apiVersion: 1 },
+    target: { platform, hostVersion: '0.3.0', apiVersion: 1 },
     ...(manifest
       ? {
           plugin: {

@@ -308,6 +308,7 @@ fn recovery_service(root: &TestRoot) -> (Arc<PublicPluginService>, Arc<PublicPlu
 fn accepts_archive_and_directory_packages() {
     for (name, archive, mode) in [
         ("directory-window", false, "window"),
+        ("directory-panel", false, "panel"),
         ("archive-main", true, "mainResult"),
     ] {
         let root = TestRoot::new(name);
@@ -341,10 +342,10 @@ fn accepts_archive_and_directory_packages() {
         }
         assert_eq!(
             prepared.manifest.command.output_mode,
-            if mode == "window" {
-                PublicOutputMode::Window
-            } else {
-                PublicOutputMode::MainResult
+            match mode {
+                "window" => PublicOutputMode::Window,
+                "panel" => PublicOutputMode::Panel,
+                _ => PublicOutputMode::MainResult,
             }
         );
         let transaction = prepared.transaction_root().to_path_buf();
@@ -705,25 +706,35 @@ fn host() -> PublicPluginHost {
 
 fn manifest(mode: &str) -> Value {
     let window = mode == "window";
+    let panel = mode == "panel";
     let mut value = json!({
         "schemaVersion":1,
         "pluginId":"com.uipilot.demo",
         "version":"1.0.0",
         "apiVersion":1,
-        "minimumHostVersion":"0.2.0",
+        "minimumHostVersion": if panel { "0.3.0" } else { "0.2.0" },
         "name":"Demo",
         "supportedPlatforms":["windows"],
         "command":{
             "defaultName":"demo",
-            "activationMode":if window { "submit" } else { "live" },
+            "activationMode":if window || panel { "submit" } else { "live" },
             "outputMode":mode,
             "inputRequired":false
         },
         "runtime":{"entry":"dist/runtime.js"},
-        "permissions":if window { json!(["ui.window"]) } else { json!([]) }
+        "permissions": if window {
+            json!(["ui.window"])
+        } else if panel {
+            json!(["ui.panel"])
+        } else {
+            json!([])
+        }
     });
     if window {
         value["window"] = json!({"entry":"dist/window.html"});
+    }
+    if panel {
+        value["panel"] = json!({"entry":"dist/panel.html"});
     }
     value
 }
@@ -784,6 +795,9 @@ fn write_package(root: &Path, manifest: &Value) {
     .unwrap();
     if manifest["command"]["outputMode"] == "window" {
         fs::write(root.join("dist/window.html"), "<!doctype html>").unwrap();
+    }
+    if manifest["command"]["outputMode"] == "panel" {
+        fs::write(root.join("dist/panel.html"), "<!doctype html>").unwrap();
     }
 }
 

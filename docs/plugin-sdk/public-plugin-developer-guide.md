@@ -1,9 +1,10 @@
 # UiPilot 第三方插件开发教程
 
-本教程面向第一次为 UiPilot 编写公开插件的开发者。示例使用原生 JavaScript，不需要前端框架或构建工具，并覆盖两种 MVP 插件：
+本教程面向第一次为 UiPilot 编写公开插件的开发者。示例使用原生 JavaScript，不需要前端框架或构建工具，并覆盖三种 MVP 插件：
 
 - **主界面结果型**：处理命令后在 UiPilot 主界面显示结果，用户再次按 Enter 执行复制。
 - **单例子窗口型**：处理命令后打开一个由 UiPilot 托管的子窗口。
+- **启动器面板型**：处理命令后在主启动器内挂载插件面板（需宿主 `0.3.0+`）。
 
 仓库中的完整参考实现：
 
@@ -20,6 +21,7 @@
 | 按 Enter 后在主界面显示结果 | `submit` | `mainResult` | 复制时使用 `clipboard.write` | `demo-return` |
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
+| 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（`minimumHostVersion` ≥ `0.3.0`） | Task 6 `demo-panel` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
 MVP 中每个插件只能注册一个启动名称。用户可以在 UiPilot 设置中修改该名称，所以 Runtime 不应硬编码 `/命令名`。

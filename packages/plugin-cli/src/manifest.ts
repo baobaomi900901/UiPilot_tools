@@ -5,6 +5,7 @@ import type { PluginPlatform, PluginValidationIssueCode } from './contracts.js'
 
 export type PublicPermission =
   | 'ui.window'
+  | 'ui.panel'
   | 'clipboard.write'
   | 'clipboard.read'
   | 'network.https'
@@ -27,12 +28,13 @@ export interface PublicManifestV1 {
     defaultName: string
     summary?: string | null
     activationMode: 'live' | 'submit'
-    outputMode: 'mainResult' | 'window'
+    outputMode: 'mainResult' | 'window' | 'panel'
     inputRequired: boolean
     inputPlaceholder?: string | null
   }
   runtime: { entry: string }
   window?: { entry: string } | null
+  panel?: { entry: string } | null
   permissions: PublicPermission[]
   settings?: PublicSettingV1[]
 }
@@ -190,6 +192,7 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     (manifest.command.inputPlaceholder != null && !plainText(manifest.command.inputPlaceholder)) ||
     !validEntry(manifest.runtime.entry, 'js') ||
     (manifest.window != null && !validEntry(manifest.window.entry, 'html')) ||
+    (manifest.panel != null && !validEntry(manifest.panel.entry, 'html')) ||
     duplicates(permissions) ||
     settings.some((setting) => !validSetting(setting)) ||
     duplicates(settings.map((setting) => setting.key))
@@ -200,11 +203,29 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     if (
       manifest.command.activationMode !== 'submit' ||
       manifest.window == null ||
-      !permissions.includes('ui.window')
+      manifest.panel != null ||
+      !permissions.includes('ui.window') ||
+      permissions.includes('ui.panel')
     ) {
       return false
     }
-  } else if (manifest.window != null || permissions.includes('ui.window')) {
+  } else if (manifest.command.outputMode === 'panel') {
+    if (
+      manifest.command.activationMode !== 'submit' ||
+      manifest.panel == null ||
+      manifest.window != null ||
+      !permissions.includes('ui.panel') ||
+      permissions.includes('ui.window') ||
+      permissions.includes('timer.control')
+    ) {
+      return false
+    }
+  } else if (
+    manifest.window != null ||
+    manifest.panel != null ||
+    permissions.includes('ui.window') ||
+    permissions.includes('ui.panel')
+  ) {
     return false
   }
   if (
@@ -212,7 +233,9 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     (manifest.command.activationMode !== 'submit' ||
       manifest.command.outputMode !== 'window' ||
       manifest.window == null ||
+      manifest.panel != null ||
       !permissions.includes('ui.window') ||
+      permissions.includes('ui.panel') ||
       !permissions.includes('notifications.publish'))
   ) {
     return false
@@ -231,6 +254,7 @@ function schemaIssue(error: StandaloneValidationError): ManifestValidationIssue 
 function permissionAvailable(permission: PublicPermission, platform: PluginPlatform): boolean {
   return (
     permission === 'ui.window' ||
+    permission === 'ui.panel' ||
     permission === 'clipboard.write' ||
     ((permission === 'notifications.publish' || permission === 'timer.control') && platform === 'windows')
   )
@@ -272,7 +296,7 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 2, 0])
+    versionGreater(minimumHost, [0, 3, 0])
   ) {
     issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })
   }

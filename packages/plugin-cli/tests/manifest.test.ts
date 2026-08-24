@@ -53,6 +53,62 @@ describe('validateManifest', () => {
     expect(validate(value)).toMatchObject({ ok: false, issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }] })
   })
 
+  it('accepts a legal panel package and rejects illegal panel combinations', () => {
+    const value = {
+      schemaVersion: 1,
+      pluginId: 'com.example.panel',
+      version: '1.0.0',
+      apiVersion: 1,
+      minimumHostVersion: '0.3.0',
+      name: 'Panel',
+      supportedPlatforms: ['windows'],
+      command: {
+        defaultName: 'panel',
+        activationMode: 'submit',
+        outputMode: 'panel',
+        inputRequired: false,
+      },
+      runtime: { entry: 'dist/runtime.js' },
+      panel: { entry: 'dist/panel.html' },
+      permissions: ['ui.panel'],
+      settings: [],
+    }
+    expect(validate(value)).toMatchObject({ ok: true })
+
+    const missingPermission = structuredClone(value)
+    missingPermission.permissions = []
+    expect(validate(missingPermission)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }],
+    })
+
+    const missingEntry = structuredClone(value)
+    delete (missingEntry as { panel?: unknown }).panel
+    expect(validate(missingEntry)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }],
+    })
+
+    const withTimer = structuredClone(value)
+    withTimer.permissions = ['ui.panel', 'notifications.publish', 'timer.control']
+    expect(validate(withTimer)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }],
+    })
+
+    const tooNewHost = structuredClone(value)
+    tooNewHost.minimumHostVersion = '0.4.0'
+    expect(validate(tooNewHost)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'API_INCOMPATIBLE' }],
+    })
+  })
+
+  it('still accepts older non-panel packages that declare minimumHostVersion 0.2.0', () => {
+    const value = timerManifest()
+    expect(validate(value)).toMatchObject({ ok: true })
+  })
+
   it('rejects timer.control for macOS even when the manifest lists both platforms', () => {
     const value = timerManifest()
     value.supportedPlatforms = ['windows', 'macos']

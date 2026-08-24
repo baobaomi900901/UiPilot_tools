@@ -48,13 +48,27 @@
     "PublicOutputMode": {
       "enum": [
         "mainResult",
-        "window"
+        "window",
+        "panel"
       ],
       "type": "string"
+    },
+    "PublicPanelV1": {
+      "additionalProperties": false,
+      "properties": {
+        "entry": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry"
+      ],
+      "type": "object"
     },
     "PublicPermission": {
       "enum": [
         "ui.window",
+        "ui.panel",
         "clipboard.write",
         "clipboard.read",
         "network.https",
@@ -306,6 +320,17 @@
     },
     "name": {
       "type": "string"
+    },
+    "panel": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PublicPanelV1"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "permissions": {
       "items": {

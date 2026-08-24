@@ -103,7 +103,7 @@ fn setup_production_lifecycle(
     public_plugin_service: &Arc<public_plugins::PublicPluginService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
-    plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
+    plugin_manager.load(&app_data_dir, Version::new(0, 3, 0))?;
     plugin_manager.create_runtimes(app, &app_data_dir)?;
     let message_center = Arc::new(message_center::MessageCenterService::load(&app_data_dir));
     if !app.manage(Arc::clone(&message_center)) {
@@ -857,7 +857,7 @@ mod tests {
             "public_plugin_service.initialize(",
             ".register_uri_scheme_protocol(\"uipilot-public-plugin\"",
             ".manage(Arc::clone(&public_plugin_service))",
-            "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
+            "plugin_manager.load(&app_data_dir, Version::new(0, 3, 0))?;",
             "plugin_manager.create_runtimes(app, &app_data_dir)?;",
             "lifecycle::install_session_end_hook",
             "lifecycle::install_find_position_hook",

@@ -584,6 +584,7 @@ impl PublicPluginService {
                         PublicOutputMode::Window => value
                             .and_then(|value| parse_window_response(&completion.context, value))
                             .map(PublicPluginResponse::Window),
+                        PublicOutputMode::Panel => Err(PluginRuntimeError::InvalidOperation),
                     };
                     Some(result)
                 };
@@ -1052,7 +1053,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 2, 0],
+            version: [0, 3, 0],
             api_version: 1,
         }
     }

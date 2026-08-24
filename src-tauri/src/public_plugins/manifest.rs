@@ -20,6 +20,8 @@ pub(crate) enum PublicPlatform {
 pub(crate) enum PublicPermission {
     #[serde(rename = "ui.window")]
     UiWindow,
+    #[serde(rename = "ui.panel")]
+    UiPanel,
     #[serde(rename = "clipboard.write")]
     ClipboardWrite,
     #[serde(rename = "clipboard.read")]
@@ -40,7 +42,7 @@ pub(crate) enum PublicPermission {
 
 impl PublicPermission {
     pub(super) fn is_available(self, platform: PublicPlatform) -> bool {
-        matches!(self, Self::UiWindow | Self::ClipboardWrite)
+        matches!(self, Self::UiWindow | Self::UiPanel | Self::ClipboardWrite)
             || (matches!(self, Self::NotificationsPublish | Self::TimerControl)
                 && platform == PublicPlatform::Windows)
     }
@@ -58,6 +60,7 @@ pub(crate) enum PublicActivationMode {
 pub(crate) enum PublicOutputMode {
     MainResult,
     Window,
+    Panel,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -82,6 +85,12 @@ pub(crate) struct PublicRuntimeV1 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicWindowV1 {
+    pub(crate) entry: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PublicPanelV1 {
     pub(crate) entry: String,
 }
 
@@ -242,6 +251,8 @@ pub(crate) struct PublicManifestV1 {
     pub(crate) runtime: PublicRuntimeV1,
     #[serde(default)]
     pub(crate) window: Option<PublicWindowV1>,
+    #[serde(default)]
+    pub(crate) panel: Option<PublicPanelV1>,
     pub(crate) permissions: Vec<PublicPermission>,
     #[serde(default)]
     pub(crate) settings: Vec<PublicSettingV1>,
@@ -294,6 +305,10 @@ fn validate_manifest(
             .window
             .as_ref()
             .is_some_and(|window| !valid_entry(&window.entry, "html"))
+        || manifest
+            .panel
+            .as_ref()
+            .is_some_and(|panel| !valid_entry(&panel.entry, "html"))
         || has_duplicates(manifest.permissions.iter().copied())
         || manifest.settings.iter().any(|setting| !setting.validate())
         || has_duplicates(manifest.settings.iter().map(PublicSettingV1::key))
@@ -305,13 +320,29 @@ fn validate_manifest(
         PublicOutputMode::Window
             if manifest.command.activation_mode != PublicActivationMode::Submit
                 || manifest.window.is_none()
-                || !manifest.permissions.contains(&PublicPermission::UiWindow) =>
+                || manifest.panel.is_some()
+                || !manifest.permissions.contains(&PublicPermission::UiWindow)
+                || manifest.permissions.contains(&PublicPermission::UiPanel) =>
+        {
+            return Err(PublicPackageError::InvalidPackage);
+        }
+        PublicOutputMode::Panel
+            if manifest.command.activation_mode != PublicActivationMode::Submit
+                || manifest.panel.is_none()
+                || manifest.window.is_some()
+                || !manifest.permissions.contains(&PublicPermission::UiPanel)
+                || manifest.permissions.contains(&PublicPermission::UiWindow)
+                || manifest
+                    .permissions
+                    .contains(&PublicPermission::TimerControl) =>
         {
             return Err(PublicPackageError::InvalidPackage);
         }
         PublicOutputMode::MainResult
             if manifest.window.is_some()
-                || manifest.permissions.contains(&PublicPermission::UiWindow) =>
+                || manifest.panel.is_some()
+                || manifest.permissions.contains(&PublicPermission::UiWindow)
+                || manifest.permissions.contains(&PublicPermission::UiPanel) =>
         {
             return Err(PublicPackageError::InvalidPackage);
         }
@@ -324,7 +355,9 @@ fn validate_manifest(
         && (manifest.command.activation_mode != PublicActivationMode::Submit
             || manifest.command.output_mode != PublicOutputMode::Window
             || manifest.window.is_none()
+            || manifest.panel.is_some()
             || !manifest.permissions.contains(&PublicPermission::UiWindow)
+            || manifest.permissions.contains(&PublicPermission::UiPanel)
             || !manifest
                 .permissions
                 .contains(&PublicPermission::NotificationsPublish))
@@ -504,8 +537,10 @@ mod schema_tests {
             "PublicSettingV1",
             "PublicPermission",
             "PublicWindowV1",
+            "PublicPanelV1",
             "additionalProperties",
             "ui.window",
+            "ui.panel",
             "clipboard.write",
             "timer.control",
         ] {
@@ -583,6 +618,15 @@ mod schema_tests {
                 candidate.as_object_mut().unwrap().remove("window");
                 candidate
             }),
+            ("panel-with-timer", {
+                let mut candidate = valid.clone();
+                candidate["command"]["outputMode"] = serde_json::json!("panel");
+                candidate["panel"] = serde_json::json!({ "entry": "dist/panel.html" });
+                candidate.as_object_mut().unwrap().remove("window");
+                candidate["permissions"] =
+                    serde_json::json!(["ui.panel", "notifications.publish", "timer.control"]);
+                candidate
+            }),
         ] {
             assert_eq!(
                 parse(&candidate),
@@ -599,6 +643,86 @@ mod schema_tests {
                 &PublicPluginHost::current(PublicPlatform::Macos),
             ),
             Err(PublicPackageError::UnsupportedPermission)
+        );
+    }
+
+    #[test]
+    fn panel_output_mode_accepts_legal_matrix_and_rejects_illegal_combinations() {
+        let mut valid = manifest(None);
+        valid["minimumHostVersion"] = serde_json::json!("0.3.0");
+        valid["command"] = serde_json::json!({
+            "defaultName": "panel",
+            "activationMode": "submit",
+            "outputMode": "panel",
+            "inputRequired": false
+        });
+        valid["panel"] = serde_json::json!({ "entry": "dist/panel.html" });
+        valid["permissions"] = serde_json::json!(["ui.panel"]);
+        assert!(parse(&valid).is_ok());
+
+        for (label, candidate) in [
+            ("live-activation", {
+                let mut candidate = valid.clone();
+                candidate["command"]["activationMode"] = serde_json::json!("live");
+                candidate
+            }),
+            ("missing-panel-entry", {
+                let mut candidate = valid.clone();
+                candidate.as_object_mut().unwrap().remove("panel");
+                candidate
+            }),
+            ("missing-ui-panel", {
+                let mut candidate = valid.clone();
+                candidate["permissions"] = serde_json::json!([]);
+                candidate
+            }),
+            ("with-window-entry", {
+                let mut candidate = valid.clone();
+                candidate["window"] = serde_json::json!({ "entry": "dist/window.html" });
+                candidate
+            }),
+            ("with-ui-window", {
+                let mut candidate = valid.clone();
+                candidate["permissions"] = serde_json::json!(["ui.panel", "ui.window"]);
+                candidate
+            }),
+            ("with-timer-control", {
+                let mut candidate = valid.clone();
+                candidate["permissions"] =
+                    serde_json::json!(["ui.panel", "notifications.publish", "timer.control"]);
+                candidate
+            }),
+            ("main-result-with-panel", {
+                let mut candidate = valid.clone();
+                candidate["command"]["outputMode"] = serde_json::json!("mainResult");
+                candidate["command"]["activationMode"] = serde_json::json!("live");
+                candidate
+            }),
+            ("main-result-with-ui-panel", {
+                let mut candidate = manifest(None);
+                candidate["permissions"] = serde_json::json!(["ui.panel"]);
+                candidate
+            }),
+        ] {
+            assert_eq!(
+                parse(&candidate),
+                Err(PublicPackageError::InvalidPackage),
+                "{label}"
+            );
+        }
+
+        let mut older_host = valid.clone();
+        older_host["minimumHostVersion"] = serde_json::json!("0.3.0");
+        assert_eq!(
+            parse_manifest(
+                &serde_json::to_vec(&older_host).unwrap(),
+                &PublicPluginHost {
+                    platform: PublicPlatform::Windows,
+                    version: [0, 2, 0],
+                    api_version: 1,
+                },
+            ),
+            Err(PublicPackageError::IncompatibleApi)
         );
     }
 }
