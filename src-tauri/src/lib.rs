@@ -163,6 +163,7 @@ fn setup_production_lifecycle(
         .ok_or_else(lifecycle_setup_error)?;
     let find_app = app.handle().clone();
     let find_window = find.clone();
+    let find_coordinator = Arc::clone(coordinator);
     find.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
             let registries = find_app.state::<result_registry::ResultRegistries>();
@@ -176,14 +177,16 @@ fn setup_production_lifecycle(
             );
         }
         tauri::WindowEvent::CloseRequested { api, .. } => {
-            api.prevent_close();
-            let registries = find_app.state::<result_registry::ResultRegistries>();
-            let controller = find_app.state::<Arc<find_window::FindWindowController>>();
-            if let Some(invocation_id) = controller.current_invocation() {
-                let hidden = find_window.hide().is_ok();
-                controller.finish_explicit_hide(&invocation_id, hidden, &registries);
-            } else {
-                let _ = find_window.hide();
+            if find_coordinator.should_prevent_close() {
+                api.prevent_close();
+                let registries = find_app.state::<result_registry::ResultRegistries>();
+                let controller = find_app.state::<Arc<find_window::FindWindowController>>();
+                if let Some(invocation_id) = controller.current_invocation() {
+                    let hidden = find_window.hide().is_ok();
+                    controller.finish_explicit_hide(&invocation_id, hidden, &registries);
+                } else {
+                    let _ = find_window.hide();
+                }
             }
         }
         _ => {}
@@ -387,6 +390,7 @@ pub fn run() {
             commands::complete_plugin_command,
             commands::plugin_window_content_ready,
             commands::plugin_window_content_ack,
+            commands::plugin_window_content_close,
             commands::plugin_window_storage_get,
             commands::plugin_window_storage_set,
             commands::plugin_window_storage_remove,
@@ -655,6 +659,7 @@ mod tests {
             "complete_plugin_command",
             "plugin_window_content_ready",
             "plugin_window_content_ack",
+            "plugin_window_content_close",
             "plugin_window_storage_get",
             "plugin_window_storage_set",
             "plugin_window_storage_remove",
@@ -790,6 +795,7 @@ mod tests {
         for command in [
             "plugin_window_content_ready",
             "plugin_window_content_ack",
+            "plugin_window_content_close",
             "plugin_window_storage_get",
             "plugin_window_storage_set",
             "plugin_window_storage_remove",

@@ -1227,6 +1227,16 @@ pub(crate) fn plugin_window_content_ack(
 }
 
 #[tauri::command]
+pub(crate) fn plugin_window_content_close(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+) -> Result<(), CommandError> {
+    plugin_window::content_close(&app, controller.inner().as_ref(), webview.label())
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub(crate) fn plugin_window_storage_get(
     webview: tauri::Webview,
     controller: State<'_, Arc<PluginWindowController>>,
@@ -4089,6 +4099,9 @@ mod tests {
         let ack = command_body("plugin_window_content_ack");
         assert!(ack.contains("webview.label(), &request_id"));
         assert!(!ack.contains("plugin_id:"));
+        let content_close = command_body("plugin_window_content_close");
+        assert!(content_close.contains("webview.label()"));
+        assert!(!content_close.contains("plugin_id:"));
         let commit = command_body("commit_plugin_window_transfer");
         let guard = commit.find("require_main_window(&window)?;").unwrap();
         let transfer = commit.find("plugin_window::commit(").unwrap();

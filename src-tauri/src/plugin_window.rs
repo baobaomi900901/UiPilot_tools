@@ -487,6 +487,14 @@ impl PluginWindowController {
             .lock()
             .is_ok_and(|core| core.windows.contains_key(plugin_id))
     }
+
+    pub(crate) fn active_plugin_ids(&self) -> Vec<String> {
+        self.core
+            .lock()
+            .map(|core| core.windows.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn invalidate_generation(&self, plugin_id: &str, generation: u64) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
@@ -760,6 +768,10 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
     },
     get timer() { return timerSession ? timerSession.facade : expiredTimer; },
     get storage() { return timerSession ? timerSession.storage : expiredStorage; },
+    close: async () => {
+      if (!invoke) throw new Error('Unavailable');
+      await invoke('plugin_window_content_close');
+    },
   });
   Object.defineProperty(window, 'uipilotPluginWindow', { value: api, configurable: false });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_TIMER_PREPARE__', {
@@ -848,6 +860,19 @@ pub(crate) fn content_ack(
         owner.plugin_id
     );
     accepted
+}
+
+pub(crate) fn content_close(
+    app: &AppHandle,
+    controller: &PluginWindowController,
+    content_label: &str,
+) -> Result<(), PublicPluginManagementError> {
+    let owner = controller
+        .owner_for_content(content_label)
+        .ok_or(PublicPluginManagementError::InvalidCaller)?;
+    let shell_label =
+        plugin_shell_label(&owner.plugin_id).ok_or(PublicPluginManagementError::Unavailable)?;
+    close(app, controller, &shell_label)
 }
 
 pub(crate) fn prepare(
@@ -1013,7 +1038,7 @@ fn create_window(
         transaction.shell_label.clone(),
         WebviewUrl::App("index.html".into()),
     )
-    .title("UiPilot Plugin")
+    .title("UiPilot_tools Plugin")
     .inner_size(PLUGIN_WINDOW_WIDTH, PLUGIN_WINDOW_HEIGHT)
     .visible(false)
     .decorations(false)
@@ -1147,18 +1172,21 @@ fn create_window(
             });
         }
         tauri::WindowEvent::CloseRequested { api, .. } => {
-            api.prevent_close();
-            if hide_and_revoke(
-                event_controller.as_ref(),
-                &plugin_id,
-                || event_shell.hide().is_ok(),
-                || {
-                    let _ = event_shell.destroy();
-                },
-            )
-            .is_ok()
-            {
-                event_controller.close(&plugin_id);
+            let lifecycle = event_app.state::<Arc<lifecycle::LifecycleCoordinator>>();
+            if lifecycle.should_prevent_close() {
+                api.prevent_close();
+                if hide_and_revoke(
+                    event_controller.as_ref(),
+                    &plugin_id,
+                    || event_shell.hide().is_ok(),
+                    || {
+                        let _ = event_shell.destroy();
+                    },
+                )
+                .is_ok()
+                {
+                    event_controller.close(&plugin_id);
+                }
             }
         }
         tauri::WindowEvent::Moved(position) if event_controller.owns_plugin(&plugin_id) => {
@@ -1438,6 +1466,13 @@ pub(crate) fn destroy_current(app: &AppHandle, plugin_id: &str) {
         if let Some(window) = app.get_window(&label) {
             let _ = window.destroy();
         }
+    }
+}
+
+pub(crate) fn destroy_all_for_exit(app: &AppHandle, controller: &PluginWindowController) {
+    for plugin_id in controller.active_plugin_ids() {
+        let _ = controller.close_for_uninstall(&plugin_id);
+        destroy_current(app, &plugin_id);
     }
 }
 pub(crate) fn teardown(
@@ -1900,6 +1935,8 @@ mod tests {
             "onUpdate(next)",
             "plugin_window_content_ready",
             "plugin_window_content_ack",
+            "plugin_window_content_close",
+            "close: async () =>",
             "Reflect.deleteProperty(window, '__TAURI_INTERNALS__')",
             "--uipilot-color-${name}",
             "background",
@@ -1937,6 +1974,7 @@ mod tests {
             ".on_new_window(|_, _| NewWindowResponse::Deny)",
             ".on_download(|_, _| false)",
             ".add_child(",
+            "should_prevent_close()",
         ] {
             assert!(
                 production.contains(required),

@@ -130,6 +130,7 @@ export interface UiPilotPluginWindowApiV1 {
   ): () => void
   readonly timer: Readonly<UiPilotPluginWindowTimerApiV1>
   readonly storage: Readonly<UiPilotPluginWindowStorageApiV1>
+  close(): Promise<void>
 }
 
 declare global {

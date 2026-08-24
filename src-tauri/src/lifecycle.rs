@@ -32,6 +32,9 @@ use crate::{
     },
     hotkey::{DoubleTapModifier, HotkeyKind},
     hotkey_hook::HotkeyHook,
+    message_center::MessageCenterService,
+    plugin_window::{self, PluginWindowController},
+    public_plugins::PublicPluginService,
     result_registry::ResultRegistries,
     settings::{Settings, SettingsStore, SettingsUpdate, WindowPosition},
     window_transfer::{MainWindowSnapshot, MainWindowTransferCoordinator, TransferTarget},
@@ -1315,6 +1318,21 @@ impl LifecycleCoordinator {
     }
 
     pub(crate) fn request_tray_quit(self: &Arc<Self>, app: &AppHandle) {
+        if matches!(
+            self.observe_exit(),
+            ExitState::Clean | ExitState::SystemEnding
+        ) {
+            let coordinator = Arc::clone(self);
+            let dispatcher = app.clone();
+            let exit_app = app.clone();
+            let _ = dispatcher.run_on_main_thread(move || {
+                prepare_application_shutdown(&exit_app);
+                coordinator.uninstall_hook_for_exit();
+                exit_app.exit(0);
+            });
+            return;
+        }
+
         let start = self.begin_tray_clean_start(Instant::now() + Duration::from_secs(5));
         if start.decision == CleanDecision::ObserveOnly {
             return;
@@ -1349,6 +1367,7 @@ impl LifecycleCoordinator {
                 },
                 move || {
                     exit_index.enter_terminal();
+                    prepare_application_shutdown(&exit_app);
                     exit_coordinator.uninstall_hook_for_exit();
                     let app = exit_app.clone();
                     let _ = exit_dispatcher.run_on_main_thread(move || app.exit(0));
@@ -1400,6 +1419,20 @@ impl LifecycleCoordinator {
             gate.clean_attempt = CleanAttempt::Waiting { owner, deadline };
             CleanDecision::Wait { deadline }
         }
+    }
+}
+
+fn prepare_application_shutdown(app: &AppHandle) {
+    if let Some(controller) = app.try_state::<Arc<PluginWindowController>>() {
+        plugin_window::destroy_all_for_exit(app, controller.inner().as_ref());
+    }
+    if let Some(find) = app.get_webview_window("find") {
+        let _ = find.destroy();
+    }
+    app.state::<Arc<MessageCenterService>>().shutdown();
+    app.state::<Arc<FindWindowController>>().shutdown();
+    if let Some(service) = app.try_state::<Arc<PublicPluginService>>() {
+        service.shutdown();
     }
 }
 
@@ -3598,6 +3631,18 @@ mod tests {
         assert_eq!(exit_calls.get(), 1);
         assert_eq!(show_calls.get(), 0);
         assert_eq!(exit_snapshot(&coordinator).0, ExitState::Clean);
+    }
+
+    #[test]
+    fn tray_quit_retries_exit_when_clean_shutdown_was_already_reached() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let tray = source
+            .split("pub(crate) fn request_tray_quit")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_system_end").next())
+            .expect("tray quit source markers are missing");
+        assert!(tray.contains("ExitState::Clean | ExitState::SystemEnding"));
+        assert!(tray.contains("prepare_application_shutdown(&exit_app)"));
     }
 
     #[test]

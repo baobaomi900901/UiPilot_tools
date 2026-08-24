@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Note</title>
+    <link rel="stylesheet" href="./window.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="toolbar">
+          <label class="search-field">
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input
+              id="search-input"
+              class="search-input"
+              type="search"
+              placeholder="搜索标题或内容"
+              autocomplete="off"
+            />
+          </label>
+        </div>
+
+        <div
+          id="note-list"
+          class="note-list"
+          role="listbox"
+          tabindex="0"
+          aria-label="笔记列表"
+        >
+          <div id="list-empty" class="list-empty" hidden>暂无笔记，按 Ctrl+N 新建</div>
+          <div id="note-list-virtual" class="note-list-virtual" hidden>
+            <div id="note-list-spacer" class="note-list-spacer"></div>
+            <ul id="note-list-viewport" class="note-list-viewport"></ul>
+          </div>
+        </div>
+      </aside>
+
+      <section class="editor" aria-label="笔记编辑区">
+        <div id="empty-state" class="empty-state">
+          <div class="empty-icon" aria-hidden="true">✎</div>
+          <p class="empty-title">还没有选中笔记</p>
+          <p class="empty-hint">从左侧选择一条笔记，或按 Ctrl+N 开始记录</p>
+        </div>
+
+        <div id="editor-panel" class="editor-panel" hidden>
+          <div class="editor-surface">
+            <textarea
+              id="editor-content"
+              class="editor-content"
+              spellcheck="false"
+              placeholder="在此记录笔记或代码片段…"
+            ></textarea>
+          </div>
+
+          <footer class="editor-actions">
+            <div class="action-group">
+              <button id="copy-btn" class="btn btn-ghost" type="button">复制</button>
+              <button id="save-btn" class="btn btn-primary" type="button">保存</button>
+            </div>
+            <span id="editor-status" class="editor-status" aria-live="polite"></span>
+          </footer>
+        </div>
+      </section>
+    </div>
+
+    <dialog id="new-dialog" class="dialog">
+      <form id="new-form" method="dialog" class="dialog-body">
+        <h3 class="dialog-title">新建笔记</h3>
+        <p class="dialog-hint">为这条笔记起一个目录名，便于在列表中识别。</p>
+        <label class="field-label" for="new-title-input">目录名</label>
+        <input
+          id="new-title-input"
+          class="text-input"
+          type="text"
+          placeholder="例如：项目备忘、代码片段"
+          autocomplete="off"
+        />
+        <div class="dialog-actions">
+          <button id="new-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+          <button id="new-save-btn" class="btn btn-primary" type="submit" disabled>保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="delete-dialog" class="dialog">
+      <form id="delete-form" method="dialog" class="dialog-body">
+        <h3 class="dialog-title">确认删除</h3>
+        <p id="delete-message" class="dialog-message"></p>
+        <div class="dialog-actions">
+          <button id="delete-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+          <button id="delete-confirm-btn" class="btn btn-danger" type="submit">删除</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="unsaved-dialog" class="dialog">
+      <form id="unsaved-form" method="dialog" class="dialog-body">
+        <h3 class="dialog-title">未保存的更改</h3>
+        <p class="dialog-message">当前笔记有未保存的更改，是否保存？</p>
+        <div class="dialog-actions">
+          <button id="unsaved-discard-btn" class="btn btn-ghost" type="button">不保存</button>
+          <button id="unsaved-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+          <button id="unsaved-save-btn" class="btn btn-primary" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="./window.js"></script>
+  </body>
+</html>

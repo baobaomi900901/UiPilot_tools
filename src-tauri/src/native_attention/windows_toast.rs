@@ -70,8 +70,12 @@ impl<B: ToastBackend> ToastController<B> {
             return Err(ToastError::Capacity);
         }
         let notification_id = parse_notification_id(&message.id)?;
-        if !self.backend.enabled()? {
-            return Err(ToastError::Disabled);
+        match self.backend.enabled() {
+            Ok(true) => {}
+            Ok(false) => return Err(ToastError::Disabled),
+            // A failed preflight cannot override the authoritative Show result.
+            Err(ToastError::Platform) => {}
+            Err(error) => return Err(error),
         }
         let document = build_toast_document(&message.plugin_name_snapshot, &message.content)?;
         let handle = self.backend.prepare(document, notification_id, sink)?;
@@ -239,8 +243,8 @@ impl WindowsToastPort {
     pub(crate) fn new() -> Self {
         let state = match windows_identity::prepare_shortcut() {
             Ok(identity) => ToastPortState::Uninitialized(identity),
-            Err(_) => {
-                eprintln!("[native-attention] Toast identity unavailable");
+            Err(error) => {
+                eprintln!("[native-attention] Toast identity unavailable: {error:?}");
                 ToastPortState::Disabled
             }
         };
@@ -366,6 +370,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         enabled: AtomicBool,
+        fail_setting: AtomicBool,
         fail_show: AtomicBool,
         fail_hide: AtomicBool,
         next_handle: AtomicU64,
@@ -391,6 +396,9 @@ mod tests {
 
         fn enabled(&self) -> Result<bool, ToastError> {
             self.calls.lock().unwrap().push("setting".into());
+            if self.fail_setting.load(Ordering::SeqCst) {
+                return Err(ToastError::Platform);
+            }
             Ok(self.enabled.load(Ordering::SeqCst))
         }
 
@@ -482,6 +490,20 @@ mod tests {
             Err(ToastError::Disabled)
         );
         assert_eq!(*backend.calls.lock().unwrap(), ["setting"]);
+    }
+
+    #[test]
+    fn setting_query_failure_still_attempts_to_show() {
+        let backend = Arc::new(FakeBackend::enabled());
+        backend.fail_setting.store(true, Ordering::SeqCst);
+        let mut controller = ToastController::new(Arc::clone(&backend));
+
+        controller.show(&message("4"), Arc::new(|_, _| {})).unwrap();
+
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            ["setting", "prepare:4", "show"]
+        );
     }
 
     #[test]

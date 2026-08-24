@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-window-content-close"
+description = "Enables the plugin_window_content_close command without any pre-configured scope."
+commands.allow = ["plugin_window_content_close"]
+
+[[permission]]
+identifier = "deny-plugin-window-content-close"
+description = "Denies the plugin_window_content_close command without any pre-configured scope."
+commands.deny = ["plugin_window_content_close"]

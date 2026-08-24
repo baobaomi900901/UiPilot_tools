@@ -6,6 +6,7 @@
   "permissions": [
     "allow-plugin-window-content-ready",
     "allow-plugin-window-content-ack",
+    "allow-plugin-window-content-close",
     "allow-plugin-window-storage-get",
     "allow-plugin-window-storage-set",
     "allow-plugin-window-storage-remove",

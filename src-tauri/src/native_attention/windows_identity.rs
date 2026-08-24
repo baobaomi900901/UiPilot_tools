@@ -62,12 +62,12 @@ pub(crate) const fn build_identity(debug: bool) -> BuildIdentity {
     if debug {
         BuildIdentity {
             aumid: "com.uipilot.launcher.dev",
-            shortcut_name: "UiPilot Dev.lnk",
+            shortcut_name: "UiPilot_tools Dev.lnk",
         }
     } else {
         BuildIdentity {
             aumid: "com.uipilot.launcher",
-            shortcut_name: "UiPilot.lnk",
+            shortcut_name: "UiPilot_tools.lnk",
         }
     }
 }
@@ -195,11 +195,11 @@ fn read_aumid(store: &IPropertyStore) -> Result<Option<String>, IdentityError> {
 fn write_shortcut(path: &Path, executable: &Path, aumid: &str) -> Result<(), IdentityError> {
     let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
         .map_err(|_| IdentityError::ShortcutUnavailable)?;
-    let executable_wide = wide(executable.as_os_str());
+    let executable_wide = shell_link_wide(executable.as_os_str());
     let working_directory = executable
         .parent()
         .ok_or(IdentityError::ShortcutUnavailable)?;
-    let working_wide = wide(working_directory.as_os_str());
+    let working_wide = shell_link_wide(working_directory.as_os_str());
     unsafe { link.SetPath(PCWSTR(executable_wide.as_ptr())) }
         .map_err(|_| IdentityError::ShortcutUnavailable)?;
     unsafe { link.SetWorkingDirectory(PCWSTR(working_wide.as_ptr())) }
@@ -283,7 +283,7 @@ fn unique_temporary_path(destination: &Path) -> Result<PathBuf, IdentityError> {
     for _ in 0..16 {
         let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(
-            ".{}.{}.{id}.tmp",
+            ".{}.{}.{id}.tmp.lnk",
             destination
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -315,6 +315,32 @@ fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+fn shell_link_wide(value: &std::ffi::OsStr) -> Vec<u16> {
+    const VERBATIM_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: [u16; 8] = [
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    let encoded = value.encode_wide().collect::<Vec<_>>();
+    let mut normalized = if encoded.starts_with(&VERBATIM_UNC_PREFIX) {
+        let mut path = vec![b'\\' as u16, b'\\' as u16];
+        path.extend_from_slice(&encoded[VERBATIM_UNC_PREFIX.len()..]);
+        path
+    } else if encoded.starts_with(&VERBATIM_PREFIX) {
+        encoded[VERBATIM_PREFIX.len()..].to_vec()
+    } else {
+        encoded
+    };
+    normalized.push(0);
+    normalized
+}
+
 struct ComGuard;
 
 impl Drop for ComGuard {
@@ -325,17 +351,25 @@ impl Drop for ComGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_identity, shortcut_ownership, ShortcutOwnership};
+    use std::{fs, path::Path, thread};
+
+    use super::{
+        build_identity, read_shortcut_identity, shortcut_ownership, unique_temporary_path,
+        write_shortcut, ComGuard, ShortcutOwnership, NEXT_TEMP,
+    };
+    use windows::Win32::System::Com::{
+        CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
 
     #[test]
     fn build_identity_uses_fixed_debug_and_release_values() {
         let debug = build_identity(true);
         assert_eq!(debug.aumid, "com.uipilot.launcher.dev");
-        assert_eq!(debug.shortcut_name, "UiPilot Dev.lnk");
+        assert_eq!(debug.shortcut_name, "UiPilot_tools Dev.lnk");
 
         let release = build_identity(false);
         assert_eq!(release.aumid, "com.uipilot.launcher");
-        assert_eq!(release.shortcut_name, "UiPilot.lnk");
+        assert_eq!(release.shortcut_name, "UiPilot_tools.lnk");
     }
 
     #[test]
@@ -356,6 +390,51 @@ mod tests {
             shortcut_ownership(false, Some("foreign.application")),
             ShortcutOwnership::Unknown
         );
+    }
+
+    #[test]
+    fn temporary_shortcut_path_keeps_the_shell_link_extension() {
+        let destination = Path::new(r"C:\Temp\UiPilot_tools Dev.lnk");
+
+        let temporary = unique_temporary_path(destination).unwrap();
+
+        assert_eq!(
+            temporary.extension().and_then(|value| value.to_str()),
+            Some("lnk")
+        );
+        assert_ne!(temporary, destination);
+    }
+
+    #[test]
+    fn shortcut_round_trip_preserves_target_and_aumid() {
+        let root = std::env::temp_dir().join(format!(
+            "uipilot-shortcut-round-trip-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let shortcut = root.join("UiPilot_tools Test.lnk");
+        let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let test_shortcut = shortcut.clone();
+        let test_executable = executable.clone();
+
+        let result = thread::spawn(move || {
+            let initialized =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            if initialized.is_err() {
+                return Err("initialize");
+            }
+            let _guard = ComGuard;
+            write_shortcut(&test_shortcut, &test_executable, "com.uipilot.launcher.dev")
+                .map_err(|_| "write")?;
+            read_shortcut_identity(&test_shortcut, &test_executable).map_err(|_| "read")
+        })
+        .join();
+        let _ = fs::remove_dir_all(root);
+
+        let (target_is_current, aumid) = result.unwrap().unwrap();
+        assert!(target_is_current);
+        assert_eq!(aumid.as_deref(), Some("com.uipilot.launcher.dev"));
     }
 
     #[test]
