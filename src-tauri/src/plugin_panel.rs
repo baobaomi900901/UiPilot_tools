@@ -263,31 +263,6 @@ impl PluginPanelController {
         Some(identity)
     }
 
-    pub(crate) fn buffer_pending_dispatch(
-        &self,
-        session_epoch: u64,
-        pending: PendingDispatch,
-    ) -> Result<(), PublicPluginManagementError> {
-        let mut core = self
-            .core
-            .lock()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let session = core
-            .session
-            .as_mut()
-            .filter(|session| session.identity.session_epoch == session_epoch)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        if session.phase == PanelPhase::Ready {
-            return Err(PublicPluginManagementError::Unavailable);
-        }
-        if session.phase == PanelPhase::AwaitingReady {
-            session.current_request_id = pending.request_id.clone();
-            session.current_submission_token = pending.submission_token.clone();
-        }
-        session.pending = Some(pending);
-        Ok(())
-    }
-
     pub(crate) fn queue_dispatch(
         &self,
         session_epoch: u64,
@@ -303,6 +278,7 @@ impl PluginPanelController {
             .filter(|session| session.identity.session_epoch == session_epoch)
             .ok_or(PublicPluginManagementError::Unavailable)?;
         if session.phase == PanelPhase::Ready {
+            session.pending = None;
             session.current_request_id = dispatch.request_id;
             session.current_submission_token = dispatch.submission_token;
             return Ok(QueueDispatchOutcome::Ready);
@@ -313,6 +289,24 @@ impl PluginPanelController {
         }
         session.pending = Some(dispatch);
         Ok(QueueDispatchOutcome::Buffered)
+    }
+
+    pub(crate) fn promote_pending_dispatch(
+        &self,
+        session_epoch: u64,
+    ) -> Option<PendingDispatch> {
+        let mut core = self.core.lock().ok()?;
+        let session = core
+            .session
+            .as_mut()
+            .filter(|session| session.identity.session_epoch == session_epoch)?;
+        if session.phase != PanelPhase::Ready {
+            return None;
+        }
+        let dispatch = session.pending.take()?;
+        session.current_request_id = dispatch.request_id.clone();
+        session.current_submission_token = dispatch.submission_token.clone();
+        Some(dispatch)
     }
 
     pub(crate) fn claim_delivery_settlement(
@@ -340,15 +334,6 @@ impl PluginPanelController {
         Ok(())
     }
 
-    pub(crate) fn take_pending_dispatch(&self, session_epoch: u64) -> Option<PendingDispatch> {
-        let mut core = self.core.lock().ok()?;
-        let session = core
-            .session
-            .as_mut()
-            .filter(|session| session.identity.session_epoch == session_epoch)?;
-        session.pending.take()
-    }
-
     pub(crate) fn mark_ready(&self, content_label: &str, session_epoch: u64) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
@@ -362,9 +347,9 @@ impl PluginPanelController {
             return false;
         }
         if session.phase != PanelPhase::AwaitingReady {
-            return session.phase == PanelPhase::AwaitingAck || session.phase == PanelPhase::Ready;
+            return session.phase == PanelPhase::Ready;
         }
-        session.phase = PanelPhase::AwaitingAck;
+        session.phase = PanelPhase::Ready;
         self.changed.notify_all();
         true
     }
@@ -387,7 +372,7 @@ impl PluginPanelController {
         {
             return false;
         }
-        if session.phase != PanelPhase::AwaitingAck && session.phase != PanelPhase::Ready {
+        if session.phase != PanelPhase::AwaitingAck {
             return false;
         }
         session.phase = PanelPhase::Ready;
@@ -409,7 +394,7 @@ impl PluginPanelController {
         loop {
             let ready = core.session.as_ref().is_some_and(|session| {
                 session.identity.session_epoch == session_epoch
-                    && matches!(session.phase, PanelPhase::AwaitingAck | PanelPhase::Ready)
+                    && session.phase == PanelPhase::Ready
             });
             if ready {
                 return Ok(());
@@ -509,29 +494,6 @@ impl PluginPanelController {
         }
         self.changed.notify_all();
         Some(session.identity)
-    }
-
-    pub(crate) fn bind_submission(
-        &self,
-        session_epoch: u64,
-        request_id: &str,
-        submission_token: &str,
-    ) -> Result<(), PublicPluginManagementError> {
-        let mut core = self
-            .core
-            .lock()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let session = core
-            .session
-            .as_mut()
-            .filter(|session| session.identity.session_epoch == session_epoch)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        session.current_request_id = request_id.to_owned();
-        session.current_submission_token = submission_token.to_owned();
-        if session.phase == PanelPhase::Ready {
-            session.phase = PanelPhase::AwaitingAck;
-        }
-        Ok(())
     }
 
     pub(crate) fn accepted_submission_token(
@@ -746,15 +708,14 @@ pub(crate) fn deliver_panel_update(
     identity: &PanelSessionIdentity,
     submission_token: &str,
     update: PluginPanelUpdate,
-) -> Result<(), PublicPluginManagementError> {
-    controller
-        .claim_delivery_settlement(identity.session_epoch, &update.request_id, submission_token)
-        .map_err(|error| match error {
-            PanelSettlementError::Stale | PanelSettlementError::Unavailable => {
-                PublicPluginManagementError::Unavailable
-            }
-        })?;
+) -> Result<(), PanelSettlementError> {
+    controller.claim_delivery_settlement(
+        identity.session_epoch,
+        &update.request_id,
+        submission_token,
+    )?;
     deliver_update(app, controller, identity, update)
+        .map_err(|_| PanelSettlementError::Unavailable)
 }
 
 pub(crate) fn queue_dispatch(
@@ -813,38 +774,61 @@ mod tests {
         assert!(controller.live_identity().is_none());
     }
 
+    fn pending_dispatch(request: &str, argument: &str, theme: PluginInvocationTheme) -> PendingDispatch {
+        PendingDispatch {
+            request_id: request.into(),
+            submission_token: format!("token-{request}"),
+            argument: argument.into(),
+            theme,
+            invoked_at: format!("t-{request}"),
+        }
+    }
+
+    fn content_ready_session(controller: &PluginPanelController) -> PanelSessionIdentity {
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert!(content_ready(
+            controller,
+            &identity.content_label,
+            identity.session_epoch,
+        ));
+        identity
+    }
+
     #[test]
     fn not_ready_keeps_only_latest_pending_argument() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
-        controller
-            .buffer_pending_dispatch(
-                identity.session_epoch,
-                PendingDispatch {
-                    request_id: "a".into(),
-                    submission_token: "ta".into(),
-                    argument: "one".into(),
-                    theme: PluginInvocationTheme::Dark,
-                    invoked_at: "t0".into(),
-                },
-            )
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+        ));
+        let pending = controller
+            .promote_pending_dispatch(identity.session_epoch)
             .unwrap();
-        controller
-            .buffer_pending_dispatch(
-                identity.session_epoch,
-                PendingDispatch {
-                    request_id: "b".into(),
-                    submission_token: "tb".into(),
-                    argument: "two".into(),
-                    theme: PluginInvocationTheme::Light,
-                    invoked_at: "t1".into(),
-                },
-            )
-            .unwrap();
-        let pending = controller.take_pending_dispatch(identity.session_epoch).unwrap();
         assert_eq!(pending.request_id, "b");
         assert_eq!(pending.argument, "two");
-        assert!(controller.take_pending_dispatch(identity.session_epoch).is_none());
+        assert!(controller
+            .promote_pending_dispatch(identity.session_epoch)
+            .is_none());
     }
 
     #[test]
@@ -857,57 +841,142 @@ mod tests {
         assert!(production.contains("struct PendingDispatch"));
         assert!(!production.contains("struct PendingArgument"));
         assert!(!production.contains("pending.data"));
-        assert!(production.contains("pub(crate) fn take_pending_dispatch"));
+        assert!(production.contains("pub(crate) fn promote_pending_dispatch"));
         assert!(production.contains("pub(crate) fn queue_dispatch"));
         assert!(production.contains("pub(crate) fn claim_delivery_settlement"));
-        assert!(!production.contains("bind_submission(\n        identity.session_epoch"));
+        assert!(!production.contains("pub(crate) fn buffer_pending_dispatch"));
+        assert!(!production.contains("pub(crate) fn bind_submission"));
         assert!(!production.contains("drain_pending_updates"));
         assert!(!production.contains("submit_update"));
     }
 
-    fn ready_session(controller: &PluginPanelController) -> PanelSessionIdentity {
+    #[test]
+    fn first_runtime_delivery_settles_after_content_ready_without_spurious_ack() {
+        let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
         assert!(content_ready(
             &controller,
             &identity.content_label,
-            identity.session_epoch
+            identity.session_epoch,
         ));
-        assert!(content_ack(
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "hello", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(!content_ack(
             &controller,
             &identity.content_label,
             identity.session_epoch,
             "a"
         ));
-        identity
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .is_ok());
+    }
+
+    #[test]
+    fn ready_admission_discards_stale_pending_before_later_promotion() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "buffered", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+        ));
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("c", "ready", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .promote_pending_dispatch(identity.session_epoch)
+            .is_none());
+        assert_eq!(
+            controller.claim_delivery_settlement(identity.session_epoch, "b", "token-b"),
+            Err(PanelSettlementError::Stale)
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "c", "token-c")
+            .is_ok());
+    }
+
+    #[test]
+    fn promote_pending_binds_atomically_and_later_ready_supersedes() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "buffered", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+        ));
+        let promoted = controller
+            .promote_pending_dispatch(identity.session_epoch)
+            .unwrap();
+        assert_eq!(promoted.request_id, "b");
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("c", "ready", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert_eq!(
+            controller.claim_delivery_settlement(identity.session_epoch, "b", "token-b"),
+            Err(PanelSettlementError::Stale)
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "c", "token-c")
+            .is_ok());
     }
 
     #[test]
     fn superseding_queue_dispatch_invalidates_stale_runtime_settlement() {
         let controller = PluginPanelController::default();
-        let identity = ready_session(&controller);
-        let dispatch_a = PendingDispatch {
-            request_id: "a".into(),
-            submission_token: "token-a".into(),
-            argument: "one".into(),
-            theme: PluginInvocationTheme::Dark,
-            invoked_at: "t0".into(),
-        };
-        let dispatch_b = PendingDispatch {
-            request_id: "b".into(),
-            submission_token: "token-b".into(),
-            argument: "two".into(),
-            theme: PluginInvocationTheme::Light,
-            invoked_at: "t1".into(),
-        };
+        let identity = content_ready_session(&controller);
         assert_eq!(
             controller
-                .queue_dispatch(identity.session_epoch, dispatch_a)
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
                 .unwrap(),
             QueueDispatchOutcome::Ready
         );
         assert_eq!(
             controller
-                .queue_dispatch(identity.session_epoch, dispatch_b)
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
                 .unwrap(),
             QueueDispatchOutcome::Ready
         );
@@ -928,7 +997,7 @@ mod tests {
         };
 
         let controller = Arc::new(PluginPanelController::default());
-        let identity = ready_session(&controller);
+        let identity = content_ready_session(&controller);
         let epoch = identity.session_epoch;
         let barrier = Arc::new(Barrier::new(2));
         let first = {
@@ -1012,6 +1081,24 @@ mod tests {
             identity.session_epoch,
             "wrong-request"
         ));
+        assert!(!content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "request-1"
+        ));
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("request-1", "hello", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "request-1", "token-request-1")
+            .is_ok());
         assert!(content_ack(
             &controller,
             &identity.content_label,
@@ -1039,6 +1126,18 @@ mod tests {
         assert_eq!(second.content_label, label);
         assert!(!content_ack(&controller, &label, stale_epoch, "a"));
         assert!(content_ready(&controller, &label, second.session_epoch));
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    second.session_epoch,
+                    pending_dispatch("b", "hello", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(second.session_epoch, "b", "token-b")
+            .is_ok());
         assert!(content_ack(
             &controller,
             &label,
@@ -1066,9 +1165,20 @@ mod tests {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
         assert!(controller.accepted_submission_token(identity.session_epoch, "token-a"));
-        controller
-            .bind_submission(identity.session_epoch, "b", "token-b")
-            .unwrap();
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+        ));
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
         assert!(!controller.accepted_submission_token(identity.session_epoch, "token-a"));
         assert!(controller.accepted_submission_token(identity.session_epoch, "token-b"));
     }
@@ -1082,30 +1192,41 @@ mod tests {
             &identity.content_label,
             identity.session_epoch
         ));
-        controller
-            .bind_submission(identity.session_epoch, "a", "token-a")
-            .unwrap();
-        controller
-            .buffer_pending_dispatch(
-                identity.session_epoch,
-                PendingDispatch {
-                    request_id: "b".into(),
-                    submission_token: "token-b".into(),
-                    argument: "two".into(),
-                    theme: PluginInvocationTheme::Light,
-                    invoked_at: "t1".into(),
-                },
-            )
-            .unwrap();
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .is_ok());
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
         assert!(content_ack(
             &controller,
             &identity.content_label,
             identity.session_epoch,
             "a"
         ));
-        let pending = controller.take_pending_dispatch(identity.session_epoch).unwrap();
+        let pending = controller
+            .promote_pending_dispatch(identity.session_epoch)
+            .unwrap();
         assert_eq!(pending.request_id, "b");
         assert_eq!(pending.argument, "two");
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "b", "token-b")
+            .is_ok());
     }
 
     #[test]
@@ -1114,30 +1235,18 @@ mod tests {
         let identity = controller.open_session(owner("a")).unwrap();
         controller.teardown_session(Some(identity.session_epoch));
         assert!(controller
-            .buffer_pending_dispatch(
+            .queue_dispatch(
                 identity.session_epoch,
-                PendingDispatch {
-                    request_id: "late".into(),
-                    submission_token: "late".into(),
-                    argument: "x".into(),
-                    theme: PluginInvocationTheme::Dark,
-                    invoked_at: "t".into(),
-                },
+                pending_dispatch("late", "x", PluginInvocationTheme::Dark),
             )
             .is_err());
     }
 
     #[test]
-    fn queue_dispatch_buffers_before_ready_and_signals_ready_after() {
+    fn queue_dispatch_buffers_before_ready_and_promotes_after_content_ready() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
-        let dispatch = PendingDispatch {
-            request_id: "a".into(),
-            submission_token: "token-a".into(),
-            argument: "hello".into(),
-            theme: PluginInvocationTheme::Dark,
-            invoked_at: "t0".into(),
-        };
+        let dispatch = pending_dispatch("a", "hello", PluginInvocationTheme::Dark);
         assert_eq!(
             queue_dispatch(&controller, identity.session_epoch, dispatch.clone()).unwrap(),
             QueueDispatchOutcome::Buffered
@@ -1147,16 +1256,29 @@ mod tests {
             &identity.content_label,
             identity.session_epoch
         ));
-        assert!(content_ack(
-            &controller,
-            &identity.content_label,
-            identity.session_epoch,
-            "a"
-        ));
-        assert_eq!(
-            queue_dispatch(&controller, identity.session_epoch, dispatch).unwrap(),
-            QueueDispatchOutcome::Ready
-        );
+        let promoted = controller
+            .promote_pending_dispatch(identity.session_epoch)
+            .unwrap();
+        assert_eq!(promoted.request_id, "a");
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .is_ok());
+    }
+
+    #[test]
+    fn deliver_panel_update_preserves_stale_outcome() {
+        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("plugin panel test module marker is missing");
+        let deliver_body = production
+            .split("pub(crate) fn deliver_panel_update(")
+            .nth(1)
+            .and_then(|tail| tail.split("\npub(crate) fn queue_dispatch").next())
+            .expect("deliver_panel_update body is missing");
+        assert!(deliver_body.contains("-> Result<(), PanelSettlementError>"));
+        assert!(!deliver_body.contains("PublicPluginManagementError::Unavailable"));
     }
 
     #[test]
@@ -1179,12 +1301,6 @@ mod tests {
             Err(PanelCallError::ExpiredSession)
         );
         assert!(content_ready(&controller, &identity.content_label, identity.session_epoch));
-        assert!(content_ack(
-            &controller,
-            &identity.content_label,
-            identity.session_epoch,
-            "a"
-        ));
         assert!(controller
             .begin_storage_call(&identity.content_label, identity.session_epoch, true)
             .is_ok());
