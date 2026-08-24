@@ -318,13 +318,12 @@ impl PluginPanelController {
         session_epoch: u64,
         request_id: &str,
         submission_token: &str,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<PendingDispatch, PanelSettlementError> {
         match self.wait_until_dispatchable_and_admit(
             session_epoch,
             request_id,
             submission_token,
-            timeout,
             || Ok::<_, ()>(()),
         ) {
             Ok((dispatch, ())) => Ok(dispatch),
@@ -365,16 +364,12 @@ impl PluginPanelController {
         session_epoch: u64,
         request_id: &str,
         submission_token: &str,
-        timeout: Duration,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Result<(PendingDispatch, T), PanelAdmissionError<E>> {
         let mut core = self
             .core
             .lock()
             .map_err(|_| PanelAdmissionError::Unavailable)?;
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(PanelAdmissionError::Unavailable)?;
         loop {
             let session = core
                 .session
@@ -395,15 +390,10 @@ impl PluginPanelController {
                 self.changed.notify_all();
                 return Ok((dispatch, result));
             }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Err(PanelAdmissionError::Unavailable);
-            }
-            let (guard, _) = self
+            core = self
                 .changed
-                .wait_timeout(core, deadline.saturating_duration_since(now))
+                .wait(core)
                 .map_err(|_| PanelAdmissionError::Unavailable)?;
-            core = guard;
         }
     }
 
@@ -636,6 +626,29 @@ impl PluginPanelController {
         Some(session.identity)
     }
 
+    pub(crate) fn teardown_current_with<T>(
+        &self,
+        session_epoch: u64,
+        request_id: &str,
+        submission_token: &str,
+        operation: impl FnOnce() -> T,
+    ) -> Option<(PanelSessionIdentity, T)> {
+        let mut core = self.core.lock().ok()?;
+        let current = core.session.as_ref().is_some_and(|session| {
+            session.identity.session_epoch == session_epoch
+                && session.current_request_id == request_id
+                && session.current_submission_token == submission_token
+        });
+        if !current {
+            return None;
+        }
+        let identity = core.session.take()?.identity;
+        let result = operation();
+        self.changed.notify_all();
+        Some((identity, result))
+    }
+
+    #[cfg(test)]
     pub(crate) fn accepted_submission_token(
         &self,
         session_epoch: u64,
@@ -1636,6 +1649,37 @@ mod tests {
             settle_delivery_operation(&controller, &ticket, Err::<(), _>(())),
             Err(PanelSettlementError::Unavailable)
         );
+    }
+
+    #[test]
+    fn stale_failure_cannot_teardown_a_newer_submission() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+            )
+            .unwrap();
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("b", "two", PluginInvocationTheme::Light),
+            )
+            .unwrap();
+
+        let stale =
+            controller.teardown_current_with(identity.session_epoch, "a", "token-a", || {
+                panic!("stale failure must not run rollback effects")
+            });
+        assert!(stale.is_none());
+        assert!(controller.accepted_submission_token(identity.session_epoch, "token-b"));
+
+        let current = controller
+            .teardown_current_with(identity.session_epoch, "b", "token-b", || "aborted")
+            .unwrap();
+        assert_eq!(current.1, "aborted");
+        assert!(controller.live_identity().is_none());
     }
 
     #[test]

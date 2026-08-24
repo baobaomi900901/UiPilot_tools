@@ -538,6 +538,12 @@ pub(crate) struct PluginPanelCommandResult {
     command_label: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginPanelErrorEvent {
+    session_epoch: String,
+}
+
 fn require_main_label(label: &str) -> Result<(), CommandError> {
     (label == "main")
         .then_some(())
@@ -1737,14 +1743,25 @@ fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandRe
     }
 }
 
-fn rollback_panel_session(
+fn rollback_panel_submission(
     app: &AppHandle,
     public: &PublicPluginService,
     controller: &PluginPanelController,
     identity: &PanelSessionIdentity,
-) {
-    plugin_panel::teardown(app, controller, Some(identity.session_epoch));
-    let _ = public.abort_plugin_requests(&identity.plugin_id);
+    request_id: &str,
+    submission_token: &str,
+) -> bool {
+    let plugin_id = identity.plugin_id.clone();
+    let Some((removed, _)) = controller.teardown_current_with(
+        identity.session_epoch,
+        request_id,
+        submission_token,
+        || public.abort_plugin_requests(&plugin_id),
+    ) else {
+        return false;
+    };
+    plugin_panel::destroy_content(app, &removed.content_label);
+    true
 }
 
 async fn run_panel_submission(
@@ -1755,14 +1772,14 @@ async fn run_panel_submission(
     prepared: PreparedPublicSubmission,
     pending: PendingDispatch,
     queue_outcome: QueueDispatchOutcome,
-) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+) -> Result<(), CommandError> {
     let submission_token = prepared.token.clone();
     let admission_controller = Arc::clone(&controller);
     let admission_public = Arc::clone(&public);
     let admission_pending = pending.clone();
     let admission_token = submission_token.clone();
     let session_epoch = identity.session_epoch;
-    let admission = tauri::async_runtime::spawn_blocking(move || {
+    let admission_task = tauri::async_runtime::spawn_blocking(move || {
         let mut prepared = Some(prepared);
         let result = match queue_outcome {
             QueueDispatchOutcome::Ready => admission_controller
@@ -1783,7 +1800,6 @@ async fn run_panel_submission(
                     session_epoch,
                     &admission_pending.request_id,
                     &admission_pending.submission_token,
-                    Duration::from_secs(5),
                     || {
                         admission_public.admit_prepared_command(
                             prepared.take().expect("panel preparation consumed once"),
@@ -1799,19 +1815,51 @@ async fn run_panel_submission(
             admission_public.fail_submission(&admission_token);
         }
         result
-    })
-    .await
-    .map_err(|_| CommandError::plugin_query_failed())?;
+    });
+    let admission = match admission_task.await {
+        Ok(admission) => admission,
+        Err(_) => {
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Err(CommandError::plugin_query_failed());
+            }
+            return Ok(());
+        }
+    };
     let (pending, submission) = match admission {
         Ok(value) => value,
-        Err(PanelAdmissionError::Stale) => return Ok(None),
+        Err(PanelAdmissionError::Stale) => return Ok(()),
         Err(PanelAdmissionError::Unavailable) => {
-            rollback_panel_session(&app, &public, &controller, &identity);
-            return Err(CommandError::plugin_query_failed());
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Err(CommandError::plugin_query_failed());
+            }
+            return Ok(());
         }
         Err(PanelAdmissionError::Operation(error)) => {
-            rollback_panel_session(&app, &public, &controller, &identity);
-            return Err(error.into());
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Err(error.into());
+            }
+            return Ok(());
         }
     };
     let dispatch_result = if let Some(recovery) = submission.recovery.clone() {
@@ -1832,10 +1880,17 @@ async fn run_panel_submission(
         Ok(dispatch) => dispatch,
         Err(error) => {
             public.fail_submission(&submission.token);
-            if controller.accepted_submission_token(identity.session_epoch, &submission_token) {
-                rollback_panel_session(&app, &public, &controller, &identity);
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Err(error.into());
             }
-            return Err(error.into());
+            return Ok(());
         }
     };
     if let Some(dispatch) = dispatch.as_ref() {
@@ -1843,8 +1898,17 @@ async fn run_panel_submission(
             public.dispatch(&app, dispatch, pending.theme, pending.invoked_at.clone())
         {
             public.fail_submission(&submission.token);
-            rollback_panel_session(&app, &public, &controller, &identity);
-            return Err(error.into());
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Err(error.into());
+            }
+            return Ok(());
         }
     }
 
@@ -1852,25 +1916,39 @@ async fn run_panel_submission(
     let received = match tauri::async_runtime::spawn_blocking(move || receiver.recv()).await {
         Ok(Ok(received)) => received,
         Ok(Err(_)) | Err(_) => {
-            if controller.accepted_submission_token(identity.session_epoch, &submission_token) {
-                rollback_panel_session(&app, &public, &controller, &identity);
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Err(CommandError::plugin_query_failed());
             }
-            return Err(CommandError::plugin_query_failed());
+            return Ok(());
         }
     };
     let Some(response) = received else {
-        return Ok(None);
+        return Ok(());
     };
     let response = match response {
         Ok(PublicPluginResponse::Panel(response)) => response,
         Ok(PublicPluginResponse::MainResults(_) | PublicPluginResponse::Window(_)) | Err(_) => {
-            if !controller.accepted_submission_token(identity.session_epoch, &submission_token) {
-                return Ok(None);
+            if !rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &pending.request_id,
+                &submission_token,
+            ) {
+                return Ok(());
             }
-            rollback_panel_session(&app, &public, &controller, &identity);
             return Err(CommandError::plugin_query_failed());
         }
     };
+    let settlement_request_id = response.request_id.clone();
     let update = PluginPanelUpdate {
         request_id: response.request_id,
         input: pending.argument,
@@ -1884,7 +1962,7 @@ async fn run_panel_submission(
     let delivery_controller = Arc::clone(&controller);
     let delivery_identity = identity.clone();
     let delivery_token = submission_token.clone();
-    match tauri::async_runtime::spawn_blocking(move || {
+    let delivery = tauri::async_runtime::spawn_blocking(move || {
         plugin_panel::deliver_panel_update(
             &delivery_app,
             &delivery_controller,
@@ -1893,16 +1971,72 @@ async fn run_panel_submission(
             update,
         )
     })
-    .await
-    .map_err(|_| CommandError::plugin_query_failed())?
-    {
-        Ok(()) => Ok(Some(panel_command_result(&identity))),
-        Err(PanelSettlementError::Stale) => Ok(None),
-        Err(PanelSettlementError::Unavailable) => {
-            rollback_panel_session(&app, &public, &controller, &identity);
-            Err(CommandError::plugin_query_failed())
+    .await;
+    match delivery {
+        Err(_) => {
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &settlement_request_id,
+                &submission_token,
+            ) {
+                Err(CommandError::plugin_query_failed())
+            } else {
+                Ok(())
+            }
+        }
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(PanelSettlementError::Stale)) => Ok(()),
+        Ok(Err(PanelSettlementError::Unavailable)) => {
+            if rollback_panel_submission(
+                &app,
+                &public,
+                &controller,
+                &identity,
+                &settlement_request_id,
+                &submission_token,
+            ) {
+                Err(CommandError::plugin_query_failed())
+            } else {
+                Ok(())
+            }
         }
     }
+}
+
+fn spawn_panel_submission(
+    app: AppHandle,
+    public: Arc<PublicPluginService>,
+    controller: Arc<PluginPanelController>,
+    identity: PanelSessionIdentity,
+    prepared: PreparedPublicSubmission,
+    pending: PendingDispatch,
+    queue_outcome: QueueDispatchOutcome,
+) {
+    let event_app = app.clone();
+    let session_epoch = identity.session_epoch.to_string();
+    tauri::async_runtime::spawn(async move {
+        if run_panel_submission(
+            app,
+            public,
+            controller,
+            identity,
+            prepared,
+            pending,
+            queue_outcome,
+        )
+        .await
+        .is_err()
+        {
+            let _ = event_app.emit_to(
+                "main",
+                "uipilot-plugin-panel-error",
+                PluginPanelErrorEvent { session_epoch },
+            );
+        }
+    });
 }
 
 async fn open_plugin_panel_impl(
@@ -1964,7 +2098,8 @@ async fn open_plugin_panel_impl(
                 return Err(error.into());
             }
         };
-    run_panel_submission(
+    let result = panel_command_result(&identity);
+    spawn_panel_submission(
         app,
         Arc::clone(public.inner()),
         Arc::clone(controller.inner()),
@@ -1972,8 +2107,8 @@ async fn open_plugin_panel_impl(
         prepared,
         pending,
         outcome,
-    )
-    .await
+    );
+    Ok(Some(result))
 }
 
 async fn submit_plugin_panel_impl(
@@ -2008,7 +2143,8 @@ async fn submit_plugin_panel_impl(
             return Err(error.into());
         }
     };
-    run_panel_submission(
+    let result = panel_command_result(&identity);
+    spawn_panel_submission(
         app,
         Arc::clone(public.inner()),
         Arc::clone(controller.inner()),
@@ -2016,8 +2152,8 @@ async fn submit_plugin_panel_impl(
         prepared,
         pending,
         outcome,
-    )
-    .await
+    );
+    Ok(Some(result))
 }
 #[tauri::command]
 pub(crate) async fn search_apps(
@@ -4448,6 +4584,38 @@ mod tests {
         route.generation = identity.generation;
         route.command_label = "renamed".into();
         assert!(!panel_route_matches_identity(&route, &identity));
+    }
+
+    #[test]
+    fn panel_commands_return_identity_before_runtime_completion_and_emit_epoch_bound_errors() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        for (function, end) in [
+            (
+                "open_plugin_panel_impl",
+                "async fn submit_plugin_panel_impl",
+            ),
+            (
+                "submit_plugin_panel_impl",
+                "#[tauri::command]\npub(crate) async fn search_apps",
+            ),
+        ] {
+            let body = source
+                .split(&format!("async fn {function}("))
+                .nth(1)
+                .and_then(|tail| tail.split(end).next())
+                .unwrap_or_else(|| panic!("missing {function}"));
+            let background = body.find("spawn_panel_submission(").unwrap();
+            let returned = body.find("Ok(Some(result))").unwrap();
+            assert!(background < returned);
+        }
+        let background = source
+            .split("fn spawn_panel_submission(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn open_plugin_panel_impl").next())
+            .unwrap();
+        assert!(background.contains("run_panel_submission("));
+        assert!(background.contains("uipilot-plugin-panel-error"));
+        assert!(background.contains("PluginPanelErrorEvent { session_epoch }"));
     }
 
     #[test]
