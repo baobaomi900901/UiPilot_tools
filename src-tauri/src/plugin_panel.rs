@@ -47,6 +47,7 @@ pub(crate) struct PanelOwner {
 enum PanelPhase {
     AwaitingReady,
     AwaitingAck,
+    Acknowledged,
     Ready,
 }
 
@@ -283,6 +284,10 @@ impl PluginPanelController {
             session.current_submission_token = dispatch.submission_token;
             return Ok(QueueDispatchOutcome::Ready);
         }
+        if session.phase == PanelPhase::Acknowledged {
+            session.pending = Some(dispatch);
+            return Ok(QueueDispatchOutcome::Buffered);
+        }
         if session.phase == PanelPhase::AwaitingReady {
             session.current_request_id = dispatch.request_id.clone();
             session.current_submission_token = dispatch.submission_token.clone();
@@ -375,7 +380,7 @@ impl PluginPanelController {
         if session.phase != PanelPhase::AwaitingAck {
             return false;
         }
-        session.phase = PanelPhase::Ready;
+        session.phase = PanelPhase::Acknowledged;
         self.changed.notify_all();
         true
     }
@@ -427,13 +432,15 @@ impl PluginPanelController {
             .checked_add(timeout)
             .ok_or(PublicPluginManagementError::Unavailable)?;
         loop {
-            let ready = core.session.as_ref().is_some_and(|session| {
-                session.identity.session_epoch == session_epoch
+            if let Some(session) = core.session.as_mut() {
+                if session.identity.session_epoch == session_epoch
                     && session.current_request_id == request_id
-                    && session.phase == PanelPhase::Ready
-            });
-            if ready {
-                return Ok(());
+                    && session.phase == PanelPhase::Acknowledged
+                {
+                    session.phase = PanelPhase::Ready;
+                    self.changed.notify_all();
+                    return Ok(());
+                }
             }
             let now = std::time::Instant::now();
             if now >= deadline {
@@ -475,7 +482,7 @@ impl PluginPanelController {
         }
         let allowed = match session.phase {
             PanelPhase::AwaitingReady => !mutable,
-            PanelPhase::AwaitingAck | PanelPhase::Ready => true,
+            PanelPhase::AwaitingAck | PanelPhase::Acknowledged | PanelPhase::Ready => true,
         };
         if !allowed {
             return Err(PanelCallError::ExpiredSession);
@@ -702,6 +709,15 @@ fn deliver_update(
     )
 }
 
+pub(crate) fn claim_panel_delivery(
+    controller: &PluginPanelController,
+    session_epoch: u64,
+    request_id: &str,
+    submission_token: &str,
+) -> Result<(), PanelSettlementError> {
+    controller.claim_delivery_settlement(session_epoch, request_id, submission_token)
+}
+
 pub(crate) fn deliver_panel_update(
     app: &AppHandle,
     controller: &PluginPanelController,
@@ -709,7 +725,8 @@ pub(crate) fn deliver_panel_update(
     submission_token: &str,
     update: PluginPanelUpdate,
 ) -> Result<(), PanelSettlementError> {
-    controller.claim_delivery_settlement(
+    claim_panel_delivery(
+        controller,
         identity.session_epoch,
         &update.request_id,
         submission_token,
@@ -729,6 +746,7 @@ pub(crate) fn queue_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::Arc, thread, time::Duration};
 
     fn owner(request: &str) -> PanelOwner {
         PanelOwner {
@@ -1219,6 +1237,9 @@ mod tests {
             identity.session_epoch,
             "a"
         ));
+        assert!(controller
+            .wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1))
+            .is_ok());
         let pending = controller
             .promote_pending_dispatch(identity.session_epoch)
             .unwrap();
@@ -1266,19 +1287,79 @@ mod tests {
     }
 
     #[test]
-    fn deliver_panel_update_preserves_stale_outcome() {
-        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
-        let production = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("plugin panel test module marker is missing");
-        let deliver_body = production
-            .split("pub(crate) fn deliver_panel_update(")
-            .nth(1)
-            .and_then(|tail| tail.split("\npub(crate) fn queue_dispatch").next())
-            .expect("deliver_panel_update body is missing");
-        assert!(deliver_body.contains("-> Result<(), PanelSettlementError>"));
-        assert!(!deliver_body.contains("PublicPluginManagementError::Unavailable"));
+    fn claim_panel_delivery_returns_stale_when_submission_superseded() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert_eq!(
+            claim_panel_delivery(&controller, identity.session_epoch, "a", "token-a"),
+            Err(PanelSettlementError::Stale)
+        );
+    }
+
+    #[test]
+    fn wait_until_acked_succeeds_when_enter_queues_before_waiter_wakes() {
+        let controller = Arc::new(PluginPanelController::default());
+        let identity = content_ready_session(&controller);
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .is_ok());
+
+        let waiter = {
+            let controller = Arc::clone(&controller);
+            let epoch = identity.session_epoch;
+            thread::spawn(move || controller.wait_until_acked(epoch, "a", Duration::from_secs(2)))
+        };
+
+        thread::sleep(Duration::from_millis(10));
+        assert!(content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "a"
+        ));
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+        assert!(controller.accepted_submission_token(identity.session_epoch, "token-a"));
+        let pending = controller
+            .promote_pending_dispatch(identity.session_epoch)
+            .unwrap();
+        assert_eq!(pending.request_id, "b");
     }
 
     #[test]
