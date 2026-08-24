@@ -296,7 +296,8 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 3, 0])
+    versionGreater(minimumHost, [0, 3, 0]) ||
+    (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost))
   ) {
     issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })
   }

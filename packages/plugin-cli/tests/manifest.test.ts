@@ -102,6 +102,13 @@ describe('validateManifest', () => {
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
     })
+
+    const lowHostPanel = structuredClone(value)
+    lowHostPanel.minimumHostVersion = '0.2.0'
+    expect(validate(lowHostPanel)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'API_INCOMPATIBLE' }],
+    })
   })
 
   it('still accepts older non-panel packages that declare minimumHostVersion 0.2.0', () => {

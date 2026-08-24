@@ -1349,8 +1349,10 @@ fn map_storage_panel_call_error(error: PanelCallError) -> WindowStorageError {
 pub(crate) fn plugin_panel_content_ready(
     webview: tauri::Webview,
     controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
 ) -> Result<(), CommandError> {
-    plugin_panel::content_ready(controller.inner().as_ref(), webview.label())
+    let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    plugin_panel::content_ready(controller.inner().as_ref(), webview.label(), session_epoch)
         .then_some(())
         .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
 }
@@ -4350,6 +4352,9 @@ mod tests {
             assert!(body.contains("session_epoch: String"));
             assert!(body.contains("begin_storage_call(webview.label(), session_epoch"));
         }
+        let ready = command_body("plugin_panel_content_ready");
+        assert!(ready.contains("session_epoch: String"));
+        assert!(ready.contains("content_ready(controller.inner().as_ref(), webview.label(), session_epoch)"));
         let capability = include_str!("../capabilities/plugin-panel-content.json");
         assert!(capability.contains("\"webviews\": [\"plugin-panel-content-*\"]"));
         for command in [

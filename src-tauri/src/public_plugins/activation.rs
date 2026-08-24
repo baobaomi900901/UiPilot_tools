@@ -1922,33 +1922,33 @@ impl PublicPluginManager {
         plugin_id: &str,
         request_path: &str,
     ) -> Option<PublicRuntimeAsset> {
-        let bundle = self.bundles.bundle(plugin_id).ok()??;
-        let snapshot = &bundle.runtime;
-        let config = &bundle.config;
-        if !config.installed
-            || !config.enabled
-            || config.fault.is_some()
-            || config.active_generation != snapshot.generation
-            || snapshot.manifest.command.output_mode != PublicOutputMode::Window
-            || !snapshot
-                .manifest
-                .permissions
-                .contains(&PublicPermission::UiWindow)
-        {
-            return None;
-        }
-        let relative = decode_request_path(request_path)?;
-        let resource = snapshot.resources.get(&relative)?;
-        Some(PublicRuntimeAsset {
-            mime: resource.mime,
-            bytes: resource.bytes.clone(),
-        })
+        self.output_mode_asset(
+            plugin_id,
+            request_path,
+            PublicOutputMode::Window,
+            PublicPermission::UiWindow,
+        )
     }
 
     pub(crate) fn panel_asset(
         &self,
         plugin_id: &str,
         request_path: &str,
+    ) -> Option<PublicRuntimeAsset> {
+        self.output_mode_asset(
+            plugin_id,
+            request_path,
+            PublicOutputMode::Panel,
+            PublicPermission::UiPanel,
+        )
+    }
+
+    fn output_mode_asset(
+        &self,
+        plugin_id: &str,
+        request_path: &str,
+        output_mode: PublicOutputMode,
+        permission: PublicPermission,
     ) -> Option<PublicRuntimeAsset> {
         let bundle = self.bundles.bundle(plugin_id).ok()??;
         let snapshot = &bundle.runtime;
@@ -1957,11 +1957,8 @@ impl PublicPluginManager {
             || !config.enabled
             || config.fault.is_some()
             || config.active_generation != snapshot.generation
-            || snapshot.manifest.command.output_mode != PublicOutputMode::Panel
-            || !snapshot
-                .manifest
-                .permissions
-                .contains(&PublicPermission::UiPanel)
+            || snapshot.manifest.command.output_mode != output_mode
+            || !snapshot.manifest.permissions.contains(&permission)
         {
             return None;
         }

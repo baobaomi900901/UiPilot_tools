@@ -376,6 +376,9 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.command.output_mode == PublicOutputMode::Panel && minimum_host < [0, 3, 0] {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest
         .permissions
         .iter()
@@ -659,6 +662,14 @@ mod schema_tests {
         valid["panel"] = serde_json::json!({ "entry": "dist/panel.html" });
         valid["permissions"] = serde_json::json!(["ui.panel"]);
         assert!(parse(&valid).is_ok());
+
+        let mut low_host = valid.clone();
+        low_host["minimumHostVersion"] = serde_json::json!("0.2.0");
+        assert_eq!(
+            parse(&low_host),
+            Err(PublicPackageError::IncompatibleApi),
+            "panel package must require host 0.3.0"
+        );
 
         for (label, candidate) in [
             ("live-activation", {

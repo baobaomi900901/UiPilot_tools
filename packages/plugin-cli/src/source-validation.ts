@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 
 import { readArchiveSnapshot } from './archive-reader.js'
 import type { PluginPlatform, PluginValidationReportV1, ValidationRequest } from './contracts.js'
+import { PLUGIN_CLI_HOST_VERSION } from './contracts.js'
 import { readDirectorySnapshot } from './directory-reader.js'
 import { PACKAGE_LIMITS, PackagePolicyError } from './package-policy.js'
 import { validateSnapshot } from './validate.js'
@@ -28,7 +29,7 @@ function failure(
     schemaVersion: 1,
     valid: false,
     source: { kind, path: source },
-    target: { platform, hostVersion: '0.2.0', apiVersion: 1 },
+    target: { platform, hostVersion: PLUGIN_CLI_HOST_VERSION, apiVersion: 1 },
     truncated: false,
     issues: [{ code, message }],
   }

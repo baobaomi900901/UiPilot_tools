@@ -1,5 +1,6 @@
 import { CssValidationError, validateCssReferences } from './css-validator.js'
 import type { PluginPlatform, PluginValidationReportV1 } from './contracts.js'
+import { PLUGIN_CLI_HOST_VERSION } from './contracts.js'
 import { validateManifest, type ManifestValidationIssue, type PublicManifestV1 } from './manifest.js'
 import type { PackageSnapshot } from './package-policy.js'
 import { PngValidationError, validatePluginIcon } from './png-validator.js'
@@ -147,7 +148,7 @@ export function validateSnapshot(
     schemaVersion: 1,
     valid: finished.issues.length === 0,
     source: { kind: snapshot.kind, path: sourcePath },
-    target: { platform, hostVersion: '0.3.0', apiVersion: 1 },
+    target: { platform, hostVersion: PLUGIN_CLI_HOST_VERSION, apiVersion: 1 },
     ...(manifest
       ? {
           plugin: {
