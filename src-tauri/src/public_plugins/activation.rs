@@ -26,7 +26,9 @@ use super::{
     data_call_gate::{PluginDataCallDrain, PluginDataCallGate, PluginDataCallIdentity},
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
-    manifest::{PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1},
+    manifest::{
+        valid_plugin_id, PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1,
+    },
     owner_cleanup::{
         remove_owned_directory, OwnerCleanupError, PluginOwnerCleanupReceipt,
         PluginOwnerCleanupStore,
@@ -139,10 +141,12 @@ pub(crate) struct PublicPluginRoute {
     pub(crate) runtime_label: String,
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) output_mode: PublicOutputMode,
+    pub(crate) command_label: String,
     pub(crate) input: String,
     pub(crate) input_required: bool,
     pub(crate) input_placeholder: Option<String>,
     pub(crate) window_entry: Option<String>,
+    pub(crate) panel_entry: Option<String>,
     pub(crate) icon_url: Option<String>,
 }
 
@@ -1723,6 +1727,7 @@ impl PublicPluginManager {
                 runtime_label: snapshot.label.clone(),
                 activation_mode: command.activation_mode,
                 output_mode: command.output_mode,
+                command_label: config.effective_name.clone(),
                 input: input.to_owned(),
                 input_required: command.input_required,
                 input_placeholder: command.input_placeholder.clone(),
@@ -1731,6 +1736,68 @@ impl PublicPluginManager {
                     .window
                     .as_ref()
                     .map(|window| window.entry.clone()),
+                panel_entry: snapshot
+                    .manifest
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.entry.clone()),
+                icon_url: snapshot.icon_url(),
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn panel_route(
+        &self,
+        plugin_id: &str,
+        input: &str,
+    ) -> Result<Option<PublicPluginRoute>, PublicPluginManagementError> {
+        if !valid_plugin_id(plugin_id) || input.len() > 64 * 1024 || input.contains('\0') {
+            return Ok(None);
+        }
+        for bundle in self.bundles.bundles()? {
+            let config = &bundle.config;
+            let snapshot = &bundle.runtime;
+            if self
+                .owner_cleanup
+                .is_blocked(&config.plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?
+            {
+                continue;
+            }
+            if config.plugin_id != plugin_id
+                || !config.installed
+                || !config.enabled
+                || config.fault.is_some()
+                || config.active_generation != snapshot.generation
+            {
+                continue;
+            }
+            let command = &snapshot.manifest.command;
+            if command.output_mode != PublicOutputMode::Panel
+                || command.activation_mode != PublicActivationMode::Submit
+            {
+                return Ok(None);
+            }
+            return Ok(Some(PublicPluginRoute {
+                plugin_id: config.plugin_id.clone(),
+                generation: snapshot.generation,
+                activation_id: bundle.activation_id,
+                admission_epoch: bundle.admission_epoch,
+                runtime_recovery_needed: bundle.runtime_recovery_needed,
+                runtime_label: snapshot.label.clone(),
+                activation_mode: command.activation_mode,
+                output_mode: command.output_mode,
+                command_label: config.effective_name.clone(),
+                input: input.to_owned(),
+                input_required: command.input_required,
+                input_placeholder: command.input_placeholder.clone(),
+                window_entry: None,
+                panel_entry: snapshot
+                    .manifest
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.entry.clone()),
                 icon_url: snapshot.icon_url(),
             }));
         }
@@ -4300,10 +4367,12 @@ mod tests {
                 runtime_label: runtime_label("com.example.activation", 1).unwrap(),
                 activation_mode: PublicActivationMode::Live,
                 output_mode: PublicOutputMode::MainResult,
+                command_label: "activation".into(),
                 input: "I am  Jack".into(),
                 input_required: false,
                 input_placeholder: None,
                 window_entry: None,
+                panel_entry: None,
                 icon_url: None,
             }
         );

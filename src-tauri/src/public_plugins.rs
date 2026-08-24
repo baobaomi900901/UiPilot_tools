@@ -62,7 +62,8 @@ pub(crate) use runtime::{
 };
 pub(crate) use scheduler::{
     PluginCompletionOutcome, PluginContextStatus, PluginRequestCandidate, PluginRequestContext,
-    PluginRequestScheduler, PluginScheduleOutcome, PluginSubmissionOwner, ScheduledPluginRequest,
+    PluginRequestScheduler, PluginScheduleOutcome, PluginSubmissionOwner, ReservedPluginRequest,
+    ScheduledPluginRequest,
 };
 pub(crate) use secrets::PluginSecretStore;
 pub(crate) use state::{
@@ -111,7 +112,7 @@ pub(crate) struct PublicRuntimeRecovery {
 struct RuntimeRecoveryAttempt {
     attempt_id: u64,
     candidate: PublicRuntimeCandidate,
-    request: PluginRequestCandidate,
+    request: ReservedPluginRequest,
     current_submission_token: String,
     finalizing: bool,
     settled: Option<bool>,
@@ -139,6 +140,19 @@ pub(crate) struct PublicSubmission {
     pub(crate) receiver: mpsc::Receiver<Option<PublicSubmissionResult>>,
     pub(crate) dispatch: Option<ScheduledPluginRequest>,
     pub(crate) recovery: Option<PublicRuntimeRecovery>,
+}
+
+pub(crate) struct PreparedPublicSubmission {
+    pub(crate) token: String,
+    pub(crate) receiver: mpsc::Receiver<Option<PublicSubmissionResult>>,
+    route: PublicPluginRoute,
+    request: ReservedPluginRequest,
+}
+
+impl PreparedPublicSubmission {
+    pub(crate) fn request_context(&self) -> &PluginRequestContext {
+        &self.request.context
+    }
 }
 impl PublicPluginService {
     pub(crate) fn initialize(
@@ -223,6 +237,16 @@ impl PublicPluginService {
         control_value: String,
         now: Instant,
     ) -> Result<PublicSubmission, PublicPluginManagementError> {
+        let prepared = self.prepare_command(route, ui_intent_epoch, control_value)?;
+        self.admit_prepared_command(prepared, now)
+    }
+
+    pub(crate) fn prepare_command(
+        &self,
+        route: PublicPluginRoute,
+        ui_intent_epoch: u64,
+        control_value: String,
+    ) -> Result<PreparedPublicSubmission, PublicPluginManagementError> {
         let number = self
             .next_submission
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -238,7 +262,7 @@ impl PublicPluginService {
                 sender,
             },
         );
-        let request_candidate = PluginRequestCandidate {
+        let request = self.manager()?.scheduler().reserve(PluginRequestCandidate {
             plugin_id: route.plugin_id.clone(),
             plugin_generation: route.generation,
             activation_id: route.activation_id,
@@ -250,7 +274,33 @@ impl PublicPluginService {
                 control_value,
                 submission_token: token.clone(),
             },
+        });
+        let request = match request {
+            Ok(request) => request,
+            Err(_) => {
+                self.settle_submission(&token, None);
+                return Err(PublicPluginManagementError::Unavailable);
+            }
         };
+        Ok(PreparedPublicSubmission {
+            token,
+            receiver,
+            route,
+            request,
+        })
+    }
+
+    pub(crate) fn admit_prepared_command(
+        &self,
+        prepared: PreparedPublicSubmission,
+        now: Instant,
+    ) -> Result<PublicSubmission, PublicPluginManagementError> {
+        let PreparedPublicSubmission {
+            token,
+            receiver,
+            route,
+            request,
+        } = prepared;
         if route.runtime_recovery_needed {
             let candidate = match self.manager()?.runtime_recovery_candidate(
                 &route.plugin_id,
@@ -264,14 +314,13 @@ impl PublicPluginService {
                     return Err(PublicPluginManagementError::Unavailable);
                 }
             };
-            let recovery =
-                match self.register_runtime_recovery(candidate, request_candidate, &token) {
-                    Ok(recovery) => recovery,
-                    Err(error) => {
-                        self.settle_submission(&token, None);
-                        return Err(error);
-                    }
-                };
+            let recovery = match self.register_runtime_recovery(candidate, request, &token) {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    self.settle_submission(&token, None);
+                    return Err(error);
+                }
+            };
             return Ok(PublicSubmission {
                 token,
                 receiver,
@@ -279,11 +328,13 @@ impl PublicPluginService {
                 recovery: Some(recovery),
             });
         }
-        let outcome = self
-            .manager()?
-            .scheduler()
-            .enqueue(request_candidate, now)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let outcome = match self.manager()?.scheduler().enqueue_reserved(request, now) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.settle_submission(&token, None);
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+        };
         let dispatch = match outcome {
             PluginScheduleOutcome::Dispatched(request) => {
                 self.bind_request(&token, &request.context)?;
@@ -292,6 +343,7 @@ impl PublicPluginService {
             PluginScheduleOutcome::Waiting {
                 expired,
                 replaced_submission_token,
+                ..
             } => {
                 self.settle_request(&expired, None);
                 if let Some(replaced) = replaced_submission_token {
@@ -311,7 +363,7 @@ impl PublicPluginService {
     fn register_runtime_recovery(
         &self,
         candidate: PublicRuntimeCandidate,
-        request: PluginRequestCandidate,
+        request: ReservedPluginRequest,
         submission_token: &str,
     ) -> Result<PublicRuntimeRecovery, PublicPluginManagementError> {
         let mut recoveries = self.lock_recoveries()?;
@@ -467,7 +519,7 @@ impl PublicPluginService {
         let dispatch = self
             .manager()?
             .scheduler()
-            .enqueue(request, now)
+            .enqueue_reserved(request, now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let PluginScheduleOutcome::Dispatched(dispatch) = dispatch else {
             self.settle_submission(&recovery.submission_token, None);
@@ -772,6 +824,18 @@ impl PublicPluginService {
     }
     pub(crate) fn fail_submission(&self, token: &str) {
         self.settle_submission(token, Some(Err(PluginRuntimeError::Unavailable)));
+    }
+
+    pub(crate) fn abort_plugin_requests(
+        &self,
+        plugin_id: &str,
+    ) -> Result<(), PublicPluginManagementError> {
+        self.manager()?
+            .scheduler()
+            .invalidate_plugin(plugin_id, None)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.settle_plugin_submissions(plugin_id);
+        Ok(())
     }
 
     fn bind_request(

@@ -31,7 +31,11 @@ use crate::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
     model::{LauncherResultActivation, ResultIconKind, SearchResponse},
-    plugin_panel::{self, PanelCallError, PluginPanelController},
+    plugin_panel::{
+        self, PanelAdmissionError, PanelCallError, PanelOwner, PanelSessionIdentity,
+        PanelSettlementError, PendingDispatch, PluginPanelController, PluginPanelUpdate,
+        QueueDispatchOutcome,
+    },
     plugin_window::{
         self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
         PluginWindowPinState, PluginWindowUpdate,
@@ -42,11 +46,11 @@ use crate::{
     },
     public_plugins::{
         PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
-        PluginTimerStartInput, PluginTimerState, PublicActivationMode, PublicMainResult,
-        PublicOutputMode, PublicPermission, PublicPluginInstallSource, PublicPluginInventory,
-        PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
-        PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginService,
-        PublicPluginWindowIdentity, TimerError, WindowStorageError,
+        PluginTimerStartInput, PluginTimerState, PreparedPublicSubmission, PublicActivationMode,
+        PublicMainResult, PublicOutputMode, PublicPermission, PublicPluginInstallSource,
+        PublicPluginInventory, PublicPluginManagementError, PublicPluginManager,
+        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginRoute,
+        PublicPluginService, PublicPluginWindowIdentity, TimerError, WindowStorageError,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -508,6 +512,30 @@ pub(crate) struct CompletionOriginInput {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginCommandCompletionResult {
     accepted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OpenPluginPanelInput {
+    plugin_id: String,
+    argument: String,
+    ui_intent_epoch: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SubmitPluginPanelInput {
+    session_epoch: String,
+    argument: String,
+    ui_intent_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginPanelCommandResult {
+    session_epoch: String,
+    plugin_id: String,
+    command_label: String,
 }
 
 fn require_main_label(label: &str) -> Result<(), CommandError> {
@@ -1648,6 +1676,349 @@ pub(crate) fn close_plugin_window(
     plugin_window::close(&app, controller.inner().as_ref(), webview.label())?;
     Ok(())
 }
+
+#[tauri::command]
+pub(crate) async fn open_plugin_panel(
+    window: WebviewWindow,
+    app: AppHandle,
+    public: State<'_, Arc<PublicPluginService>>,
+    controller: State<'_, Arc<PluginPanelController>>,
+    settings: State<'_, SettingsStore>,
+    input: OpenPluginPanelInput,
+) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+    require_main_window(&window)?;
+    open_plugin_panel_impl(app, public, controller, settings, input).await
+}
+
+#[tauri::command]
+pub(crate) async fn submit_plugin_panel(
+    window: WebviewWindow,
+    app: AppHandle,
+    public: State<'_, Arc<PublicPluginService>>,
+    controller: State<'_, Arc<PluginPanelController>>,
+    settings: State<'_, SettingsStore>,
+    input: SubmitPluginPanelInput,
+) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+    require_main_window(&window)?;
+    submit_plugin_panel_impl(app, public, controller, settings, input).await
+}
+
+fn parse_panel_session_epoch(value: &str) -> Result<u64, CommandError> {
+    if value.is_empty()
+        || value == "0"
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(CommandError::plugin_query_failed());
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| CommandError::plugin_query_failed())
+}
+
+fn panel_route_matches_identity(
+    route: &PublicPluginRoute,
+    identity: &PanelSessionIdentity,
+) -> bool {
+    route.output_mode == PublicOutputMode::Panel
+        && route.plugin_id == identity.plugin_id
+        && route.generation == identity.generation
+        && route.activation_id == identity.activation_id
+        && route.admission_epoch == identity.admission_epoch
+        && route.command_label == identity.command_label
+        && route.panel_entry.is_some()
+}
+
+fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandResult {
+    PluginPanelCommandResult {
+        session_epoch: identity.session_epoch.to_string(),
+        plugin_id: identity.plugin_id.clone(),
+        command_label: identity.command_label.clone(),
+    }
+}
+
+fn rollback_panel_session(
+    app: &AppHandle,
+    public: &PublicPluginService,
+    controller: &PluginPanelController,
+    identity: &PanelSessionIdentity,
+) {
+    plugin_panel::teardown(app, controller, Some(identity.session_epoch));
+    let _ = public.abort_plugin_requests(&identity.plugin_id);
+}
+
+async fn run_panel_submission(
+    app: AppHandle,
+    public: Arc<PublicPluginService>,
+    controller: Arc<PluginPanelController>,
+    identity: PanelSessionIdentity,
+    prepared: PreparedPublicSubmission,
+    pending: PendingDispatch,
+    queue_outcome: QueueDispatchOutcome,
+) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+    let submission_token = prepared.token.clone();
+    let admission_controller = Arc::clone(&controller);
+    let admission_public = Arc::clone(&public);
+    let admission_pending = pending.clone();
+    let admission_token = submission_token.clone();
+    let session_epoch = identity.session_epoch;
+    let admission = tauri::async_runtime::spawn_blocking(move || {
+        let mut prepared = Some(prepared);
+        let result = match queue_outcome {
+            QueueDispatchOutcome::Ready => admission_controller
+                .admit_current_dispatch(
+                    session_epoch,
+                    &admission_pending.request_id,
+                    &admission_pending.submission_token,
+                    || {
+                        admission_public.admit_prepared_command(
+                            prepared.take().expect("panel preparation consumed once"),
+                            Instant::now(),
+                        )
+                    },
+                )
+                .map(|submission| (admission_pending, submission)),
+            QueueDispatchOutcome::Buffered => admission_controller
+                .wait_until_dispatchable_and_admit(
+                    session_epoch,
+                    &admission_pending.request_id,
+                    &admission_pending.submission_token,
+                    Duration::from_secs(5),
+                    || {
+                        admission_public.admit_prepared_command(
+                            prepared.take().expect("panel preparation consumed once"),
+                            Instant::now(),
+                        )
+                    },
+                ),
+        };
+        if matches!(
+            &result,
+            Err(PanelAdmissionError::Stale | PanelAdmissionError::Unavailable)
+        ) {
+            admission_public.fail_submission(&admission_token);
+        }
+        result
+    })
+    .await
+    .map_err(|_| CommandError::plugin_query_failed())?;
+    let (pending, submission) = match admission {
+        Ok(value) => value,
+        Err(PanelAdmissionError::Stale) => return Ok(None),
+        Err(PanelAdmissionError::Unavailable) => {
+            rollback_panel_session(&app, &public, &controller, &identity);
+            return Err(CommandError::plugin_query_failed());
+        }
+        Err(PanelAdmissionError::Operation(error)) => {
+            rollback_panel_session(&app, &public, &controller, &identity);
+            return Err(error.into());
+        }
+    };
+    let dispatch_result = if let Some(recovery) = submission.recovery.clone() {
+        let service = Arc::clone(&public);
+        let app_handle = app.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            service.recover_runtime(&app_handle, &recovery, Instant::now())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(PublicPluginManagementError::Unavailable),
+        }
+    } else {
+        Ok(submission.dispatch.clone())
+    };
+    let dispatch = match dispatch_result {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            public.fail_submission(&submission.token);
+            if controller.accepted_submission_token(identity.session_epoch, &submission_token) {
+                rollback_panel_session(&app, &public, &controller, &identity);
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(dispatch) = dispatch.as_ref() {
+        if let Err(error) =
+            public.dispatch(&app, dispatch, pending.theme, pending.invoked_at.clone())
+        {
+            public.fail_submission(&submission.token);
+            rollback_panel_session(&app, &public, &controller, &identity);
+            return Err(error.into());
+        }
+    }
+
+    let receiver = submission.receiver;
+    let received = match tauri::async_runtime::spawn_blocking(move || receiver.recv()).await {
+        Ok(Ok(received)) => received,
+        Ok(Err(_)) | Err(_) => {
+            if controller.accepted_submission_token(identity.session_epoch, &submission_token) {
+                rollback_panel_session(&app, &public, &controller, &identity);
+            }
+            return Err(CommandError::plugin_query_failed());
+        }
+    };
+    let Some(response) = received else {
+        return Ok(None);
+    };
+    let response = match response {
+        Ok(PublicPluginResponse::Panel(response)) => response,
+        Ok(PublicPluginResponse::MainResults(_) | PublicPluginResponse::Window(_)) | Err(_) => {
+            if !controller.accepted_submission_token(identity.session_epoch, &submission_token) {
+                return Ok(None);
+            }
+            rollback_panel_session(&app, &public, &controller, &identity);
+            return Err(CommandError::plugin_query_failed());
+        }
+    };
+    let update = PluginPanelUpdate {
+        request_id: response.request_id,
+        input: pending.argument,
+        platform: "windows",
+        theme: pending.theme,
+        invoked_at: pending.invoked_at,
+        session_epoch: identity.session_epoch.to_string(),
+        data: response.data,
+    };
+    let delivery_app = app.clone();
+    let delivery_controller = Arc::clone(&controller);
+    let delivery_identity = identity.clone();
+    let delivery_token = submission_token.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        plugin_panel::deliver_panel_update(
+            &delivery_app,
+            &delivery_controller,
+            &delivery_identity,
+            &delivery_token,
+            update,
+        )
+    })
+    .await
+    .map_err(|_| CommandError::plugin_query_failed())?
+    {
+        Ok(()) => Ok(Some(panel_command_result(&identity))),
+        Err(PanelSettlementError::Stale) => Ok(None),
+        Err(PanelSettlementError::Unavailable) => {
+            rollback_panel_session(&app, &public, &controller, &identity);
+            Err(CommandError::plugin_query_failed())
+        }
+    }
+}
+
+async fn open_plugin_panel_impl(
+    app: AppHandle,
+    public: State<'_, Arc<PublicPluginService>>,
+    controller: State<'_, Arc<PluginPanelController>>,
+    settings: State<'_, SettingsStore>,
+    input: OpenPluginPanelInput,
+) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+    let route = public
+        .manager()?
+        .panel_route(&input.plugin_id, &input.argument)?
+        .ok_or_else(CommandError::plugin_query_failed)?;
+    let panel_entry = route
+        .panel_entry
+        .clone()
+        .ok_or_else(CommandError::plugin_query_failed)?;
+    let prepared =
+        public.prepare_command(route.clone(), input.ui_intent_epoch, input.argument.clone())?;
+    let request_id = prepared.request_context().request_id.clone();
+    let submission_token = prepared.token.clone();
+    let owner = PanelOwner {
+        plugin_id: route.plugin_id.clone(),
+        plugin_generation: route.generation,
+        activation_id: route.activation_id,
+        admission_epoch: route.admission_epoch,
+        command_label: route.command_label.clone(),
+        request_id: request_id.clone(),
+        submission_token: submission_token.clone(),
+        argument: input.argument.clone(),
+    };
+    let mount_app = app.clone();
+    let mount_controller = Arc::clone(controller.inner());
+    let identity = match tauri::async_runtime::spawn_blocking(move || {
+        plugin_panel::mount(&mount_app, mount_controller, owner, &panel_entry)
+    })
+    .await
+    .map_err(|_| CommandError::plugin_query_failed())?
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            public.fail_submission(&submission_token);
+            return Err(error.into());
+        }
+    };
+    let pending = PendingDispatch {
+        request_id,
+        submission_token,
+        argument: input.argument,
+        theme: invocation_theme(&app, settings.snapshot().theme),
+        invoked_at: invoked_at_rfc3339(),
+    };
+    let outcome =
+        match plugin_panel::queue_dispatch(&controller, identity.session_epoch, pending.clone()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                public.fail_submission(&prepared.token);
+                plugin_panel::teardown(&app, &controller, Some(identity.session_epoch));
+                return Err(error.into());
+            }
+        };
+    run_panel_submission(
+        app,
+        Arc::clone(public.inner()),
+        Arc::clone(controller.inner()),
+        identity,
+        prepared,
+        pending,
+        outcome,
+    )
+    .await
+}
+
+async fn submit_plugin_panel_impl(
+    app: AppHandle,
+    public: State<'_, Arc<PublicPluginService>>,
+    controller: State<'_, Arc<PluginPanelController>>,
+    settings: State<'_, SettingsStore>,
+    input: SubmitPluginPanelInput,
+) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+    let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
+    let identity = controller
+        .live_identity()
+        .filter(|identity| identity.session_epoch == session_epoch)
+        .ok_or_else(CommandError::plugin_query_failed)?;
+    let route = public
+        .manager()?
+        .panel_route(&identity.plugin_id, &input.argument)?
+        .filter(|route| panel_route_matches_identity(route, &identity))
+        .ok_or_else(CommandError::plugin_query_failed)?;
+    let prepared = public.prepare_command(route, input.ui_intent_epoch, input.argument.clone())?;
+    let pending = PendingDispatch {
+        request_id: prepared.request_context().request_id.clone(),
+        submission_token: prepared.token.clone(),
+        argument: input.argument,
+        theme: invocation_theme(&app, settings.snapshot().theme),
+        invoked_at: invoked_at_rfc3339(),
+    };
+    let outcome = match plugin_panel::queue_dispatch(&controller, session_epoch, pending.clone()) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            public.fail_submission(&prepared.token);
+            return Err(error.into());
+        }
+    };
+    run_panel_submission(
+        app,
+        Arc::clone(public.inner()),
+        Arc::clone(controller.inner()),
+        identity,
+        prepared,
+        pending,
+        outcome,
+    )
+    .await
+}
 #[tauri::command]
 pub(crate) async fn search_apps(
     window: WebviewWindow,
@@ -1729,6 +2100,9 @@ pub(crate) async fn search_apps(
                 ))
             }
             PublicPluginSearchDecision::Dispatch => {}
+        }
+        if route.output_mode == PublicOutputMode::Panel {
+            return Err(CommandError::plugin_query_failed());
         }
         let Some(registry_token) =
             registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
@@ -3241,7 +3615,8 @@ mod tests {
         clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
         execute_result_with, load_settings_core, load_settings_ready_with,
         map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
-        map_theme_preference_worker_result, parse_timer_session_generation,
+        map_theme_preference_worker_result, panel_route_matches_identity,
+        parse_panel_session_epoch, parse_timer_session_generation,
         parse_window_storage_session_generation, plugin_discovery_prefix, prepare_file_query,
         prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
         public_plugin_search_decision, publish_everything_search,
@@ -3265,6 +3640,7 @@ mod tests {
         },
         hotkey::{DoubleTapModifier, HotkeyKind},
         lifecycle::LifecycleCoordinator,
+        plugin_panel::PanelSessionIdentity,
         public_plugins::{
             PluginInvocationTheme, PublicActivationMode, PublicCommandSuggestion, PublicOutputMode,
             PublicPluginRoute, TimerError, WindowStorageError,
@@ -3428,10 +3804,12 @@ mod tests {
             runtime_label: "plugin-runtime-com.example.demo-g1".into(),
             activation_mode: PublicActivationMode::Submit,
             output_mode: PublicOutputMode::MainResult,
+            command_label: "demo".into(),
             input: String::new(),
             input_required: true,
             input_placeholder: Some("请输入信息回车".into()),
             window_entry: None,
+            panel_entry: None,
             icon_url: None,
         };
         assert_eq!(
@@ -3481,10 +3859,12 @@ mod tests {
             runtime_label: "plugin-runtime-com.example.demo-g1".into(),
             activation_mode: PublicActivationMode::Live,
             output_mode: PublicOutputMode::MainResult,
+            command_label: "demo".into(),
             input: "body".into(),
             input_required: false,
             input_placeholder: Some("请输入信息回车".into()),
             window_entry: None,
+            panel_entry: None,
             icon_url: None,
         };
         let preview = CompletionOriginInput {
@@ -3989,6 +4369,8 @@ mod tests {
             "open_message_center",
             "read_message_center",
             "clear_messages",
+            "open_plugin_panel",
+            "submit_plugin_panel",
         ] {
             let trace = RefCell::new(Vec::new());
             let result = require_main_label("secondary").map(|()| {
@@ -3998,6 +4380,74 @@ mod tests {
             assert_eq!(result, Err(CommandError::invalid_caller()), "{command}");
             assert!(trace.borrow().is_empty(), "{command} touched state");
         }
+    }
+
+    #[test]
+    fn panel_open_and_submit_are_main_only_and_use_decimal_session_epochs() {
+        assert_eq!(parse_panel_session_epoch("1"), Ok(1));
+        assert_eq!(
+            parse_panel_session_epoch("18446744073709551615"),
+            Ok(u64::MAX)
+        );
+        for invalid in ["", "0", "01", "-1", "18446744073709551616"] {
+            assert_eq!(
+                parse_panel_session_epoch(invalid),
+                Err(CommandError::plugin_query_failed()),
+                "{invalid}"
+            );
+        }
+
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        for command in ["open_plugin_panel", "submit_plugin_panel"] {
+            let body = source
+                .split(&format!("pub(crate) async fn {command}("))
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .unwrap_or_else(|| panic!("missing {command}"));
+            let statements = body.split_once("{\n").unwrap().1;
+            let guard = statements.find("require_main_window(&window)?;").unwrap();
+            let state_access = statements.find("public").unwrap();
+            assert!(
+                guard < state_access,
+                "{command} must guard before state access"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_submit_route_must_match_the_live_session_identity() {
+        let identity = PanelSessionIdentity {
+            session_epoch: 7,
+            plugin_id: "com.example.panel".into(),
+            generation: 11,
+            activation_id: 13,
+            admission_epoch: 17,
+            command_label: "panel".into(),
+            content_label: "plugin-panel-content-636f6d2e6578616d706c652e70616e656c".into(),
+        };
+        let mut route = PublicPluginRoute {
+            plugin_id: identity.plugin_id.clone(),
+            generation: identity.generation,
+            activation_id: identity.activation_id,
+            admission_epoch: identity.admission_epoch,
+            runtime_recovery_needed: false,
+            runtime_label: "plugin-runtime".into(),
+            activation_mode: PublicActivationMode::Submit,
+            output_mode: PublicOutputMode::Panel,
+            command_label: identity.command_label.clone(),
+            input: String::new(),
+            input_required: false,
+            input_placeholder: None,
+            window_entry: None,
+            panel_entry: Some("dist/panel.html".into()),
+            icon_url: None,
+        };
+        assert!(panel_route_matches_identity(&route, &identity));
+        route.generation += 1;
+        assert!(!panel_route_matches_identity(&route, &identity));
+        route.generation = identity.generation;
+        route.command_label = "renamed".into();
+        assert!(!panel_route_matches_identity(&route, &identity));
     }
 
     #[test]

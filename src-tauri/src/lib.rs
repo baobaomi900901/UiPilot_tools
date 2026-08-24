@@ -409,6 +409,8 @@ pub fn run() {
             commands::plugin_panel_storage_get,
             commands::plugin_panel_storage_set,
             commands::plugin_panel_storage_remove,
+            commands::open_plugin_panel,
+            commands::submit_plugin_panel,
             commands::commit_plugin_window_transfer,
             commands::get_public_plugin_window_identity,
             commands::set_plugin_window_pinned,
@@ -647,7 +649,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 56);
+        assert_eq!(production.matches("commands::").count(), 59);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -683,6 +685,8 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "open_plugin_panel",
+            "submit_plugin_panel",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
@@ -780,6 +784,8 @@ mod tests {
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
+            "open_plugin_panel",
+            "submit_plugin_panel",
         ] {
             assert!(build.contains(&format!("\"{command}\",")));
             let permission = format!("\"allow-{}\"", command.replace('_', "-"));

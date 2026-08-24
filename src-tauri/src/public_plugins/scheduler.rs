@@ -72,6 +72,12 @@ pub(crate) struct ScheduledPluginRequest {
     pub(crate) deadline: Instant,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReservedPluginRequest {
+    pub(crate) context: PluginRequestContext,
+    pub(crate) candidate: PluginRequestCandidate,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PluginScheduleError {
     InvalidCandidate,
@@ -86,6 +92,7 @@ pub(crate) enum PluginScheduleOutcome {
     Dispatched(ScheduledPluginRequest),
     Waiting {
         expired: PluginRequestContext,
+        request_context: PluginRequestContext,
         replaced_submission_token: Option<String>,
     },
 }
@@ -162,7 +169,7 @@ struct PluginQueue {
     activation_id: u64,
     admission_epoch: u64,
     running: Option<RunningRequest>,
-    waiting: Option<PluginRequestCandidate>,
+    waiting: Option<ReservedPluginRequest>,
     rebuilding: bool,
     issued: HashSet<PluginRequestContext>,
     issued_order: VecDeque<PluginRequestContext>,
@@ -191,6 +198,19 @@ impl PluginQueue {
             }
         }
     }
+
+    fn rebind_waiting_generation(&mut self, generation: u64) {
+        let Some(waiting) = self.waiting.as_mut() else {
+            return;
+        };
+        let previous = waiting.context.clone();
+        waiting.candidate.plugin_generation = generation;
+        waiting.context.plugin_generation = generation;
+        let current = waiting.context.clone();
+        self.issued.remove(&previous);
+        self.issued_order.retain(|context| context != &previous);
+        self.remember(current);
+    }
 }
 
 struct SchedulerState {
@@ -213,32 +233,74 @@ pub(crate) struct PluginRequestScheduler {
 }
 
 impl PluginRequestScheduler {
+    pub(crate) fn reserve(
+        &self,
+        candidate: PluginRequestCandidate,
+    ) -> Result<ReservedPluginRequest, PluginScheduleError> {
+        if !candidate.valid() {
+            return Err(PluginScheduleError::InvalidCandidate);
+        }
+        let mut state = self.lock()?;
+        let request_number = state.next_request;
+        state.next_request = state
+            .next_request
+            .checked_add(1)
+            .ok_or(PluginScheduleError::RequestExhausted)?;
+        Ok(ReservedPluginRequest {
+            context: PluginRequestContext {
+                plugin_id: candidate.plugin_id.clone(),
+                plugin_generation: candidate.plugin_generation,
+                request_id: format!("public-request-{request_number:016x}"),
+            },
+            candidate,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn enqueue(
         &self,
         candidate: PluginRequestCandidate,
         now: Instant,
     ) -> Result<PluginScheduleOutcome, PluginScheduleError> {
-        if !candidate.valid() {
+        let reserved = self.reserve(candidate)?;
+        self.enqueue_reserved(reserved, now)
+    }
+
+    pub(crate) fn enqueue_reserved(
+        &self,
+        reserved: ReservedPluginRequest,
+        now: Instant,
+    ) -> Result<PluginScheduleOutcome, PluginScheduleError> {
+        if !reserved.candidate.valid()
+            || reserved.context.plugin_id != reserved.candidate.plugin_id
+            || reserved.context.plugin_generation != reserved.candidate.plugin_generation
+            || !reserved.context.valid_shape()
+        {
             return Err(PluginScheduleError::InvalidCandidate);
         }
         let mut state = self.lock()?;
-        let plugin_id = candidate.plugin_id.clone();
-        let generation = candidate.plugin_generation;
-        let activation_id = candidate.activation_id;
+        let plugin_id = reserved.candidate.plugin_id.clone();
+        let generation = reserved.candidate.plugin_generation;
+        let activation_id = reserved.candidate.activation_id;
         let queue = state.by_plugin.entry(plugin_id.clone()).or_insert_with(|| {
-            PluginQueue::new(generation, activation_id, candidate.admission_epoch)
+            PluginQueue::new(
+                generation,
+                activation_id,
+                reserved.candidate.admission_epoch,
+            )
         });
         if queue.generation != generation
             || queue.activation_id != activation_id
-            || queue.admission_epoch != candidate.admission_epoch
+            || queue.admission_epoch != reserved.candidate.admission_epoch
         {
             return Err(PluginScheduleError::GenerationMismatch);
         }
+        queue.remember(reserved.context.clone());
         if queue.rebuilding {
             let replaced_submission_token = queue
                 .waiting
-                .replace(candidate)
-                .map(|candidate| candidate.owner.submission_token);
+                .replace(reserved.clone())
+                .map(|request| request.candidate.owner.submission_token);
             let expired = queue
                 .running
                 .as_ref()
@@ -246,6 +308,7 @@ impl PluginRequestScheduler {
                 .ok_or(PluginScheduleError::Unavailable)?;
             return Ok(PluginScheduleOutcome::Waiting {
                 expired,
+                request_context: reserved.context,
                 replaced_submission_token,
             });
         }
@@ -254,14 +317,15 @@ impl PluginRequestScheduler {
             let expired = running.request.context.clone();
             let replaced_submission_token = queue
                 .waiting
-                .replace(candidate)
-                .map(|candidate| candidate.owner.submission_token);
+                .replace(reserved.clone())
+                .map(|request| request.candidate.owner.submission_token);
             return Ok(PluginScheduleOutcome::Waiting {
                 expired,
+                request_context: reserved.context,
                 replaced_submission_token,
             });
         }
-        let request = dispatch(&mut state, candidate, now)?;
+        let request = dispatch(&mut state, reserved, now)?;
         Ok(PluginScheduleOutcome::Dispatched(request))
     }
 
@@ -384,9 +448,7 @@ impl PluginRequestScheduler {
             let new_generation = previous_generation
                 .checked_add(1)
                 .ok_or(PluginScheduleError::GenerationExhausted)?;
-            if let Some(waiting) = queue.waiting.as_mut() {
-                waiting.plugin_generation = new_generation;
-            }
+            queue.rebind_waiting_generation(new_generation);
             queue.generation = new_generation;
             queue.rebuilding = true;
             replacements.push(PluginRuntimeReplacement {
@@ -427,8 +489,8 @@ impl PluginRequestScheduler {
         queue.activation_id = activation_id;
         queue.admission_epoch = admission_epoch;
         if let Some(waiting) = queue.waiting.as_mut() {
-            waiting.activation_id = activation_id;
-            waiting.admission_epoch = admission_epoch;
+            waiting.candidate.activation_id = activation_id;
+            waiting.candidate.admission_epoch = admission_epoch;
         }
         queue.rebuilding = false;
         let candidate = queue.waiting.take();
@@ -495,25 +557,16 @@ impl PluginRequestScheduler {
 
 fn dispatch(
     state: &mut SchedulerState,
-    candidate: PluginRequestCandidate,
+    reserved: ReservedPluginRequest,
     now: Instant,
 ) -> Result<ScheduledPluginRequest, PluginScheduleError> {
-    let request_number = state.next_request;
-    state.next_request = state
-        .next_request
-        .checked_add(1)
-        .ok_or(PluginScheduleError::RequestExhausted)?;
-    let timeout = match candidate.activation_mode {
+    let timeout = match reserved.candidate.activation_mode {
         PublicActivationMode::Live => LIVE_TIMEOUT,
         PublicActivationMode::Submit => SUBMIT_TIMEOUT,
     };
     let request = ScheduledPluginRequest {
-        context: PluginRequestContext {
-            plugin_id: candidate.plugin_id.clone(),
-            plugin_generation: candidate.plugin_generation,
-            request_id: format!("public-request-{request_number:016x}"),
-        },
-        candidate,
+        context: reserved.context,
+        candidate: reserved.candidate,
         dispatched_at: now,
         deadline: now
             .checked_add(timeout)
@@ -531,7 +584,6 @@ fn dispatch(
     {
         return Err(PluginScheduleError::Unavailable);
     }
-    queue.remember(request.context.clone());
     queue.running = Some(RunningRequest {
         request: request.clone(),
         current: true,
@@ -569,6 +621,57 @@ mod tests {
     }
 
     #[test]
+    fn reserved_request_identity_is_stable_until_dispatch() {
+        let scheduler = PluginRequestScheduler::default();
+        let start = Instant::now();
+        let reserved = scheduler
+            .reserve(candidate("A", 1, PublicActivationMode::Submit))
+            .unwrap();
+        let request_id = reserved.context.request_id.clone();
+
+        let dispatched = match scheduler.enqueue_reserved(reserved, start).unwrap() {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("A must dispatch"),
+        };
+
+        assert_eq!(dispatched.context.request_id, request_id);
+    }
+
+    #[test]
+    fn waiting_request_keeps_reserved_identity_when_promoted() {
+        let scheduler = PluginRequestScheduler::default();
+        let start = Instant::now();
+        let first = match scheduler
+            .enqueue(candidate("A", 1, PublicActivationMode::Submit), start)
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("A must dispatch"),
+        };
+        let reserved = scheduler
+            .reserve(candidate("B", 1, PublicActivationMode::Submit))
+            .unwrap();
+        let request_id = reserved.context.request_id.clone();
+
+        assert!(matches!(
+            scheduler
+                .enqueue_reserved(reserved, start + Duration::from_secs(1))
+                .unwrap(),
+            PluginScheduleOutcome::Waiting {
+                request_context,
+                ..
+            } if request_context.request_id == request_id
+        ));
+        let promoted = scheduler
+            .complete(&first.context, start + Duration::from_secs(2))
+            .unwrap()
+            .next
+            .unwrap();
+
+        assert_eq!(promoted.context.request_id, request_id);
+    }
+
+    #[test]
     fn running_a_expires_while_waiting_b_is_replaced_by_c() {
         let scheduler = PluginRequestScheduler::default();
         let start = Instant::now();
@@ -594,6 +697,11 @@ mod tests {
                 .unwrap(),
             PluginScheduleOutcome::Waiting {
                 expired: a.context.clone(),
+                request_context: PluginRequestContext {
+                    plugin_id: "com.example.scheduler".into(),
+                    plugin_generation: 1,
+                    request_id: "public-request-0000000000000002".into(),
+                },
                 replaced_submission_token: None,
             }
         );

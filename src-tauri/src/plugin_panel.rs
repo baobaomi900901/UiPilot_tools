@@ -58,7 +58,7 @@ pub(crate) enum PanelCallError {
     Unavailable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PendingDispatch {
     pub(crate) request_id: String,
     pub(crate) submission_token: String,
@@ -71,6 +71,13 @@ pub(crate) struct PendingDispatch {
 pub(crate) enum PanelSettlementError {
     Stale,
     Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PanelAdmissionError<E> {
+    Stale,
+    Unavailable,
+    Operation(E),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,6 +296,7 @@ impl PluginPanelController {
             session.pending = None;
             session.current_request_id = dispatch.request_id;
             session.current_submission_token = dispatch.submission_token;
+            self.changed.notify_all();
             return Ok(QueueDispatchOutcome::Ready);
         }
         if session.phase == PanelPhase::Acknowledged {
@@ -300,9 +308,106 @@ impl PluginPanelController {
             session.current_submission_token = dispatch.submission_token.clone();
         }
         session.pending = Some(dispatch);
+        self.changed.notify_all();
         Ok(QueueDispatchOutcome::Buffered)
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_until_dispatchable(
+        &self,
+        session_epoch: u64,
+        request_id: &str,
+        submission_token: &str,
+        timeout: Duration,
+    ) -> Result<PendingDispatch, PanelSettlementError> {
+        match self.wait_until_dispatchable_and_admit(
+            session_epoch,
+            request_id,
+            submission_token,
+            timeout,
+            || Ok::<_, ()>(()),
+        ) {
+            Ok((dispatch, ())) => Ok(dispatch),
+            Err(PanelAdmissionError::Stale) => Err(PanelSettlementError::Stale),
+            Err(PanelAdmissionError::Unavailable | PanelAdmissionError::Operation(())) => {
+                Err(PanelSettlementError::Unavailable)
+            }
+        }
+    }
+
+    pub(crate) fn admit_current_dispatch<T, E>(
+        &self,
+        session_epoch: u64,
+        request_id: &str,
+        submission_token: &str,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, PanelAdmissionError<E>> {
+        let core = self
+            .core
+            .lock()
+            .map_err(|_| PanelAdmissionError::Unavailable)?;
+        let session = core
+            .session
+            .as_ref()
+            .filter(|session| session.identity.session_epoch == session_epoch)
+            .ok_or(PanelAdmissionError::Stale)?;
+        if session.phase != PanelPhase::Ready
+            || session.current_request_id != request_id
+            || session.current_submission_token != submission_token
+        {
+            return Err(PanelAdmissionError::Stale);
+        }
+        operation().map_err(PanelAdmissionError::Operation)
+    }
+
+    pub(crate) fn wait_until_dispatchable_and_admit<T, E>(
+        &self,
+        session_epoch: u64,
+        request_id: &str,
+        submission_token: &str,
+        timeout: Duration,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<(PendingDispatch, T), PanelAdmissionError<E>> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelAdmissionError::Unavailable)?;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(PanelAdmissionError::Unavailable)?;
+        loop {
+            let session = core
+                .session
+                .as_mut()
+                .filter(|session| session.identity.session_epoch == session_epoch)
+                .ok_or(PanelAdmissionError::Stale)?;
+            let pending_matches = session.pending.as_ref().is_some_and(|pending| {
+                pending.request_id == request_id && pending.submission_token == submission_token
+            });
+            if !pending_matches {
+                return Err(PanelAdmissionError::Stale);
+            }
+            if session.phase == PanelPhase::Ready {
+                let dispatch = session.pending.take().ok_or(PanelAdmissionError::Stale)?;
+                session.current_request_id = dispatch.request_id.clone();
+                session.current_submission_token = dispatch.submission_token.clone();
+                let result = operation().map_err(PanelAdmissionError::Operation)?;
+                self.changed.notify_all();
+                return Ok((dispatch, result));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(PanelAdmissionError::Unavailable);
+            }
+            let (guard, _) = self
+                .changed
+                .wait_timeout(core, deadline.saturating_duration_since(now))
+                .map_err(|_| PanelAdmissionError::Unavailable)?;
+            core = guard;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn promote_pending_dispatch(&self, session_epoch: u64) -> Option<PendingDispatch> {
         let mut core = self.core.lock().ok()?;
         let session = core
@@ -608,9 +713,8 @@ pub(crate) fn mount(
     }
     controller
         .wait_until_ready(identity.session_epoch, CONTENT_READY_TIMEOUT)
-        .map_err(|error| {
+        .inspect_err(|_| {
             teardown(app, &controller, Some(identity.session_epoch));
-            error
         })?;
     Ok(identity)
 }
@@ -1039,6 +1143,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_admission_cannot_reverse_newer_enter_order() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("b", "two", PluginInvocationTheme::Light),
+            )
+            .unwrap();
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("c", "three", PluginInvocationTheme::Dark),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            controller.admit_current_dispatch(
+                identity.session_epoch,
+                "b",
+                "token-b",
+                || Ok::<_, ()>("B"),
+            ),
+            Err(PanelAdmissionError::Stale)
+        ));
+        assert_eq!(
+            controller
+                .admit_current_dispatch(
+                    identity.session_epoch,
+                    "c",
+                    "token-c",
+                    || Ok::<_, ()>("C"),
+                )
+                .unwrap(),
+            "C"
+        );
+    }
+
+    #[test]
     fn concurrent_enter_admissions_keep_single_current_token() {
         use std::{
             sync::{Arc, Barrier},
@@ -1277,6 +1420,99 @@ mod tests {
     }
 
     #[test]
+    fn only_latest_buffered_enter_becomes_runtime_dispatchable() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+            )
+            .unwrap();
+        controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .unwrap();
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert_eq!(
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("c", "three", PluginInvocationTheme::Dark),
+                )
+                .unwrap(),
+            QueueDispatchOutcome::Buffered
+        );
+        assert!(content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "a"
+        ));
+        controller
+            .wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(
+            controller.wait_until_dispatchable(
+                identity.session_epoch,
+                "b",
+                "token-b",
+                Duration::from_secs(1),
+            ),
+            Err(PanelSettlementError::Stale)
+        );
+        let promoted = controller
+            .wait_until_dispatchable(
+                identity.session_epoch,
+                "c",
+                "token-c",
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(promoted.argument, "three");
+    }
+
+    #[test]
+    fn buffered_enter_is_stale_after_panel_teardown() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("a", "one", PluginInvocationTheme::Dark),
+            )
+            .unwrap();
+        controller
+            .claim_delivery_settlement(identity.session_epoch, "a", "token-a")
+            .unwrap();
+        controller
+            .queue_dispatch(
+                identity.session_epoch,
+                pending_dispatch("b", "two", PluginInvocationTheme::Light),
+            )
+            .unwrap();
+        controller.teardown_session(Some(identity.session_epoch));
+
+        assert_eq!(
+            controller.wait_until_dispatchable(
+                identity.session_epoch,
+                "b",
+                "token-b",
+                Duration::from_secs(1),
+            ),
+            Err(PanelSettlementError::Stale)
+        );
+    }
+
+    #[test]
     fn late_submission_after_teardown_is_ignored() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
@@ -1287,6 +1523,23 @@ mod tests {
                 pending_dispatch("late", "x", PluginInvocationTheme::Dark),
             )
             .is_err());
+    }
+
+    #[test]
+    fn empty_argument_is_a_valid_panel_submission() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        let dispatch = pending_dispatch("empty", "", PluginInvocationTheme::Dark);
+        assert_eq!(dispatch.argument, "");
+        assert_eq!(
+            controller
+                .queue_dispatch(identity.session_epoch, dispatch)
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "empty", "token-empty")
+            .is_ok());
     }
 
     #[test]

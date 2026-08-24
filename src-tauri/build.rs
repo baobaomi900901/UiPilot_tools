@@ -39,6 +39,8 @@ fn main() {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "open_plugin_panel",
+            "submit_plugin_panel",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
