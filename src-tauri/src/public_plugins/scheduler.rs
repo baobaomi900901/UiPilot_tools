@@ -388,6 +388,36 @@ impl PluginRequestScheduler {
         }
     }
 
+    pub(crate) fn cancel(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<bool, PluginScheduleError> {
+        if !context.valid_shape() {
+            return Ok(false);
+        }
+        let mut state = self.lock()?;
+        let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) else {
+            return Ok(false);
+        };
+        if queue
+            .running
+            .as_ref()
+            .is_some_and(|running| running.request.context == *context)
+        {
+            queue.running = None;
+            return Ok(true);
+        }
+        if queue
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.context == *context)
+        {
+            queue.waiting = None;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub(crate) fn with_current<T>(
         &self,
         context: &PluginRequestContext,
@@ -669,6 +699,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(promoted.context.request_id, request_id);
+    }
+
+    #[test]
+    fn cancelling_one_current_request_leaves_scheduler_ready_for_a_new_request() {
+        let scheduler = PluginRequestScheduler::default();
+        let start = Instant::now();
+        let first = match scheduler
+            .enqueue(candidate("A", 1, PublicActivationMode::Submit), start)
+            .unwrap()
+        {
+            PluginScheduleOutcome::Dispatched(request) => request,
+            PluginScheduleOutcome::Waiting { .. } => panic!("A must dispatch"),
+        };
+        assert!(scheduler.cancel(&first.context).unwrap());
+        assert_eq!(
+            scheduler.context_status(&first.context),
+            PluginContextStatus::Expired
+        );
+        assert!(matches!(
+            scheduler
+                .enqueue(
+                    candidate("B", 1, PublicActivationMode::Submit),
+                    start + Duration::from_secs(1),
+                )
+                .unwrap(),
+            PluginScheduleOutcome::Dispatched(request) if request.candidate.input == "B"
+        ));
     }
 
     #[test]

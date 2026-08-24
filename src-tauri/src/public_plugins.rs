@@ -826,15 +826,16 @@ impl PublicPluginService {
         self.settle_submission(token, Some(Err(PluginRuntimeError::Unavailable)));
     }
 
-    pub(crate) fn abort_plugin_requests(
+    pub(crate) fn abort_submission_request(
         &self,
-        plugin_id: &str,
+        context: &PluginRequestContext,
+        submission_token: &str,
     ) -> Result<(), PublicPluginManagementError> {
         self.manager()?
             .scheduler()
-            .invalidate_plugin(plugin_id, None)
+            .cancel(context)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        self.settle_plugin_submissions(plugin_id);
+        self.settle_submission(submission_token, Some(Err(PluginRuntimeError::Unavailable)));
         Ok(())
     }
 

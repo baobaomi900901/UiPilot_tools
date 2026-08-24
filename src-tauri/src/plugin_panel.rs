@@ -626,13 +626,12 @@ impl PluginPanelController {
         Some(session.identity)
     }
 
-    pub(crate) fn teardown_current_with<T>(
+    pub(crate) fn teardown_current(
         &self,
         session_epoch: u64,
         request_id: &str,
         submission_token: &str,
-        operation: impl FnOnce() -> T,
-    ) -> Option<(PanelSessionIdentity, T)> {
+    ) -> Option<PanelSessionIdentity> {
         let mut core = self.core.lock().ok()?;
         let current = core.session.as_ref().is_some_and(|session| {
             session.identity.session_epoch == session_epoch
@@ -643,9 +642,8 @@ impl PluginPanelController {
             return None;
         }
         let identity = core.session.take()?.identity;
-        let result = operation();
         self.changed.notify_all();
-        Some((identity, result))
+        Some(identity)
     }
 
     #[cfg(test)]
@@ -1668,17 +1666,14 @@ mod tests {
             )
             .unwrap();
 
-        let stale =
-            controller.teardown_current_with(identity.session_epoch, "a", "token-a", || {
-                panic!("stale failure must not run rollback effects")
-            });
+        let stale = controller.teardown_current(identity.session_epoch, "a", "token-a");
         assert!(stale.is_none());
         assert!(controller.accepted_submission_token(identity.session_epoch, "token-b"));
 
         let current = controller
-            .teardown_current_with(identity.session_epoch, "b", "token-b", || "aborted")
+            .teardown_current(identity.session_epoch, "b", "token-b")
             .unwrap();
-        assert_eq!(current.1, "aborted");
+        assert_eq!(current, identity);
         assert!(controller.live_identity().is_none());
     }
 

@@ -45,12 +45,13 @@ use crate::{
         PluginMutationOutcome, PluginQueryError, PluginQueryStart,
     },
     public_plugins::{
-        PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRuntimeError,
-        PluginTimerStartInput, PluginTimerState, PreparedPublicSubmission, PublicActivationMode,
-        PublicMainResult, PublicOutputMode, PublicPermission, PublicPluginInstallSource,
-        PublicPluginInventory, PublicPluginManagementError, PublicPluginManager,
-        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginRoute,
-        PublicPluginService, PublicPluginWindowIdentity, TimerError, WindowStorageError,
+        PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRequestContext,
+        PluginRuntimeError, PluginTimerStartInput, PluginTimerState, PreparedPublicSubmission,
+        PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
+        PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
+        PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary,
+        PublicPluginResponse, PublicPluginRoute, PublicPluginService, PublicPluginWindowIdentity,
+        TimerError, WindowStorageError,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -519,7 +520,6 @@ pub(crate) struct PluginCommandCompletionResult {
 pub(crate) struct OpenPluginPanelInput {
     plugin_id: String,
     argument: String,
-    ui_intent_epoch: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1689,11 +1689,10 @@ pub(crate) async fn open_plugin_panel(
     app: AppHandle,
     public: State<'_, Arc<PublicPluginService>>,
     controller: State<'_, Arc<PluginPanelController>>,
-    settings: State<'_, SettingsStore>,
     input: OpenPluginPanelInput,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
     require_main_window(&window)?;
-    open_plugin_panel_impl(app, public, controller, settings, input).await
+    open_plugin_panel_impl(app, public, controller, input).await
 }
 
 #[tauri::command]
@@ -1751,16 +1750,20 @@ fn rollback_panel_submission(
     request_id: &str,
     submission_token: &str,
 ) -> bool {
-    let plugin_id = identity.plugin_id.clone();
-    let Some((removed, _)) = controller.teardown_current_with(
-        identity.session_epoch,
-        request_id,
-        submission_token,
-        || public.abort_plugin_requests(&plugin_id),
-    ) else {
+    let Some(removed) =
+        controller.teardown_current(identity.session_epoch, request_id, submission_token)
+    else {
         return false;
     };
     plugin_panel::destroy_content(app, &removed.content_label);
+    let _ = public.abort_submission_request(
+        &PluginRequestContext {
+            plugin_id: identity.plugin_id.clone(),
+            plugin_generation: identity.generation,
+            request_id: request_id.to_owned(),
+        },
+        submission_token,
+    );
     true
 }
 
@@ -2043,7 +2046,6 @@ async fn open_plugin_panel_impl(
     app: AppHandle,
     public: State<'_, Arc<PublicPluginService>>,
     controller: State<'_, Arc<PluginPanelController>>,
-    settings: State<'_, SettingsStore>,
     input: OpenPluginPanelInput,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
     let route = public
@@ -2054,61 +2056,24 @@ async fn open_plugin_panel_impl(
         .panel_entry
         .clone()
         .ok_or_else(CommandError::plugin_query_failed)?;
-    let prepared =
-        public.prepare_command(route.clone(), input.ui_intent_epoch, input.argument.clone())?;
-    let request_id = prepared.request_context().request_id.clone();
-    let submission_token = prepared.token.clone();
     let owner = PanelOwner {
         plugin_id: route.plugin_id.clone(),
         plugin_generation: route.generation,
         activation_id: route.activation_id,
         admission_epoch: route.admission_epoch,
         command_label: route.command_label.clone(),
-        request_id: request_id.clone(),
-        submission_token: submission_token.clone(),
+        request_id: String::new(),
+        submission_token: String::new(),
         argument: input.argument.clone(),
     };
     let mount_app = app.clone();
     let mount_controller = Arc::clone(controller.inner());
-    let identity = match tauri::async_runtime::spawn_blocking(move || {
+    let identity = tauri::async_runtime::spawn_blocking(move || {
         plugin_panel::mount(&mount_app, mount_controller, owner, &panel_entry)
     })
     .await
-    .map_err(|_| CommandError::plugin_query_failed())?
-    {
-        Ok(identity) => identity,
-        Err(error) => {
-            public.fail_submission(&submission_token);
-            return Err(error.into());
-        }
-    };
-    let pending = PendingDispatch {
-        request_id,
-        submission_token,
-        argument: input.argument,
-        theme: invocation_theme(&app, settings.snapshot().theme),
-        invoked_at: invoked_at_rfc3339(),
-    };
-    let outcome =
-        match plugin_panel::queue_dispatch(&controller, identity.session_epoch, pending.clone()) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                public.fail_submission(&prepared.token);
-                plugin_panel::teardown(&app, &controller, Some(identity.session_epoch));
-                return Err(error.into());
-            }
-        };
-    let result = panel_command_result(&identity);
-    spawn_panel_submission(
-        app,
-        Arc::clone(public.inner()),
-        Arc::clone(controller.inner()),
-        identity,
-        prepared,
-        pending,
-        outcome,
-    );
-    Ok(Some(result))
+    .map_err(|_| CommandError::plugin_query_failed())??;
+    Ok(Some(panel_command_result(&identity)))
 }
 
 async fn submit_plugin_panel_impl(
@@ -4587,27 +4552,29 @@ mod tests {
     }
 
     #[test]
-    fn panel_commands_return_identity_before_runtime_completion_and_emit_epoch_bound_errors() {
+    fn panel_open_returns_ownership_before_submit_can_emit_epoch_bound_errors() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
-        for (function, end) in [
-            (
-                "open_plugin_panel_impl",
-                "async fn submit_plugin_panel_impl",
-            ),
-            (
-                "submit_plugin_panel_impl",
-                "#[tauri::command]\npub(crate) async fn search_apps",
-            ),
-        ] {
-            let body = source
-                .split(&format!("async fn {function}("))
-                .nth(1)
-                .and_then(|tail| tail.split(end).next())
-                .unwrap_or_else(|| panic!("missing {function}"));
-            let background = body.find("spawn_panel_submission(").unwrap();
-            let returned = body.find("Ok(Some(result))").unwrap();
-            assert!(background < returned);
-        }
+        let open = source
+            .split("async fn open_plugin_panel_impl(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn submit_plugin_panel_impl").next())
+            .unwrap();
+        assert!(open.contains("plugin_panel::mount("));
+        assert!(open.contains("Ok(Some(panel_command_result(&identity)))"));
+        assert!(!open.contains("prepare_command("));
+        assert!(!open.contains("spawn_panel_submission("));
+
+        let submit = source
+            .split("async fn submit_plugin_panel_impl(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("#[tauri::command]\npub(crate) async fn search_apps")
+                    .next()
+            })
+            .unwrap();
+        let background_start = submit.find("spawn_panel_submission(").unwrap();
+        let returned = submit.find("Ok(Some(result))").unwrap();
+        assert!(background_start < returned);
         let background = source
             .split("fn spawn_panel_submission(")
             .nth(1)

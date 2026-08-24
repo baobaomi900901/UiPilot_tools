@@ -18,7 +18,7 @@ use super::{
     manifest::{PublicOutputMode, PublicPermission},
     package, stage_public_package,
     webview_audio_guard::{INERT_DOCUMENT, INERT_PATH},
-    PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost,
+    PluginRuntimeError, PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost,
     PublicPluginResponse, PublicPluginService,
 };
 use crate::message_center::MessageCenterService;
@@ -127,6 +127,43 @@ fn runtime_recovery_is_single_owner_and_latest_submission_wins() {
     assert!(submissions.token_by_request.is_empty());
     drop(submissions);
     assert!(service.lock_recoveries().unwrap().by_plugin.is_empty());
+}
+
+#[test]
+fn request_scoped_abort_preserves_a_newer_unadmitted_preparation() {
+    let root = TestRoot::new("request-scoped-abort");
+    let (service, manager) = recovery_service(&root);
+    let first = service
+        .prepare_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+        )
+        .unwrap();
+    let second = service
+        .prepare_command(
+            manager.route("/demo second").unwrap().unwrap(),
+            2,
+            "/demo second".into(),
+        )
+        .unwrap();
+    let first_context = first.request_context().clone();
+    let first_token = first.token.clone();
+    let second_token = second.token.clone();
+
+    service
+        .abort_submission_request(&first_context, &first_token)
+        .unwrap();
+
+    assert_eq!(
+        first.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Some(Err(PluginRuntimeError::Unavailable)))
+    );
+    let submissions = service.lock_submissions().unwrap();
+    assert!(!submissions.by_token.contains_key(&first_token));
+    assert!(submissions.by_token.contains_key(&second_token));
+    drop(submissions);
+    service.fail_submission(&second_token);
 }
 
 #[test]
