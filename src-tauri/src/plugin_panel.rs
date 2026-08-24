@@ -67,6 +67,12 @@ pub(crate) struct PendingDispatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PanelSettlementError {
+    Stale,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueueDispatchOutcome {
     Buffered,
     Ready,
@@ -279,6 +285,58 @@ impl PluginPanelController {
             session.current_submission_token = pending.submission_token.clone();
         }
         session.pending = Some(pending);
+        Ok(())
+    }
+
+    pub(crate) fn queue_dispatch(
+        &self,
+        session_epoch: u64,
+        dispatch: PendingDispatch,
+    ) -> Result<QueueDispatchOutcome, PublicPluginManagementError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let session = core
+            .session
+            .as_mut()
+            .filter(|session| session.identity.session_epoch == session_epoch)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        if session.phase == PanelPhase::Ready {
+            session.current_request_id = dispatch.request_id;
+            session.current_submission_token = dispatch.submission_token;
+            return Ok(QueueDispatchOutcome::Ready);
+        }
+        if session.phase == PanelPhase::AwaitingReady {
+            session.current_request_id = dispatch.request_id.clone();
+            session.current_submission_token = dispatch.submission_token.clone();
+        }
+        session.pending = Some(dispatch);
+        Ok(QueueDispatchOutcome::Buffered)
+    }
+
+    pub(crate) fn claim_delivery_settlement(
+        &self,
+        session_epoch: u64,
+        request_id: &str,
+        submission_token: &str,
+    ) -> Result<(), PanelSettlementError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelSettlementError::Unavailable)?;
+        let session = core
+            .session
+            .as_mut()
+            .filter(|session| session.identity.session_epoch == session_epoch)
+            .ok_or(PanelSettlementError::Stale)?;
+        if session.current_request_id != request_id
+            || session.current_submission_token != submission_token
+            || session.phase != PanelPhase::Ready
+        {
+            return Err(PanelSettlementError::Stale);
+        }
+        session.phase = PanelPhase::AwaitingAck;
         Ok(())
     }
 
@@ -689,11 +747,13 @@ pub(crate) fn deliver_panel_update(
     submission_token: &str,
     update: PluginPanelUpdate,
 ) -> Result<(), PublicPluginManagementError> {
-    controller.bind_submission(
-        identity.session_epoch,
-        &update.request_id,
-        submission_token,
-    )?;
+    controller
+        .claim_delivery_settlement(identity.session_epoch, &update.request_id, submission_token)
+        .map_err(|error| match error {
+            PanelSettlementError::Stale | PanelSettlementError::Unavailable => {
+                PublicPluginManagementError::Unavailable
+            }
+        })?;
     deliver_update(app, controller, identity, update)
 }
 
@@ -702,26 +762,7 @@ pub(crate) fn queue_dispatch(
     session_epoch: u64,
     dispatch: PendingDispatch,
 ) -> Result<QueueDispatchOutcome, PublicPluginManagementError> {
-    let phase_ready = {
-        let core = controller
-            .core
-            .lock()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        core.session.as_ref().is_some_and(|session| {
-            session.identity.session_epoch == session_epoch && session.phase == PanelPhase::Ready
-        })
-    };
-    if !phase_ready {
-        controller.buffer_pending_dispatch(session_epoch, dispatch)?;
-        return Ok(QueueDispatchOutcome::Buffered);
-    }
-    controller.bind_submission(
-        session_epoch,
-        &dispatch.request_id,
-        &dispatch.submission_token,
-    )?;
-    let _ = dispatch;
-    Ok(QueueDispatchOutcome::Ready)
+    controller.queue_dispatch(session_epoch, dispatch)
 }
 
 #[cfg(test)]
@@ -818,9 +859,132 @@ mod tests {
         assert!(!production.contains("pending.data"));
         assert!(production.contains("pub(crate) fn take_pending_dispatch"));
         assert!(production.contains("pub(crate) fn queue_dispatch"));
-        assert!(production.contains("pub(crate) fn deliver_panel_update"));
+        assert!(production.contains("pub(crate) fn claim_delivery_settlement"));
+        assert!(!production.contains("bind_submission(\n        identity.session_epoch"));
         assert!(!production.contains("drain_pending_updates"));
         assert!(!production.contains("submit_update"));
+    }
+
+    fn ready_session(controller: &PluginPanelController) -> PanelSessionIdentity {
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch
+        ));
+        assert!(content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "a"
+        ));
+        identity
+    }
+
+    #[test]
+    fn superseding_queue_dispatch_invalidates_stale_runtime_settlement() {
+        let controller = PluginPanelController::default();
+        let identity = ready_session(&controller);
+        let dispatch_a = PendingDispatch {
+            request_id: "a".into(),
+            submission_token: "token-a".into(),
+            argument: "one".into(),
+            theme: PluginInvocationTheme::Dark,
+            invoked_at: "t0".into(),
+        };
+        let dispatch_b = PendingDispatch {
+            request_id: "b".into(),
+            submission_token: "token-b".into(),
+            argument: "two".into(),
+            theme: PluginInvocationTheme::Light,
+            invoked_at: "t1".into(),
+        };
+        assert_eq!(
+            controller
+                .queue_dispatch(identity.session_epoch, dispatch_a)
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert_eq!(
+            controller
+                .queue_dispatch(identity.session_epoch, dispatch_b)
+                .unwrap(),
+            QueueDispatchOutcome::Ready
+        );
+        assert_eq!(
+            controller.claim_delivery_settlement(identity.session_epoch, "a", "token-a"),
+            Err(PanelSettlementError::Stale)
+        );
+        assert!(controller
+            .claim_delivery_settlement(identity.session_epoch, "b", "token-b")
+            .is_ok());
+    }
+
+    #[test]
+    fn concurrent_enter_admissions_keep_single_current_token() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        let controller = Arc::new(PluginPanelController::default());
+        let identity = ready_session(&controller);
+        let epoch = identity.session_epoch;
+        let barrier = Arc::new(Barrier::new(2));
+        let first = {
+            let controller = Arc::clone(&controller);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                controller.queue_dispatch(
+                    epoch,
+                    PendingDispatch {
+                        request_id: "a".into(),
+                        submission_token: "token-a".into(),
+                        argument: "a".into(),
+                        theme: PluginInvocationTheme::Dark,
+                        invoked_at: "t0".into(),
+                    },
+                )
+            })
+        };
+        let second = {
+            let controller = Arc::clone(&controller);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                controller.queue_dispatch(
+                    epoch,
+                    PendingDispatch {
+                        request_id: "b".into(),
+                        submission_token: "token-b".into(),
+                        argument: "b".into(),
+                        theme: PluginInvocationTheme::Light,
+                        invoked_at: "t1".into(),
+                    },
+                )
+            })
+        };
+        assert_eq!(first.join().unwrap().unwrap(), QueueDispatchOutcome::Ready);
+        assert_eq!(second.join().unwrap().unwrap(), QueueDispatchOutcome::Ready);
+        let accepts_a = controller.accepted_submission_token(epoch, "token-a");
+        let accepts_b = controller.accepted_submission_token(epoch, "token-b");
+        assert_ne!(accepts_a, accepts_b);
+        if accepts_a {
+            assert!(controller
+                .claim_delivery_settlement(epoch, "b", "token-b")
+                .is_err());
+            assert!(controller
+                .claim_delivery_settlement(epoch, "a", "token-a")
+                .is_ok());
+        } else {
+            assert!(controller
+                .claim_delivery_settlement(epoch, "a", "token-a")
+                .is_err());
+            assert!(controller
+                .claim_delivery_settlement(epoch, "b", "token-b")
+                .is_ok());
+        }
     }
 
     #[test]
