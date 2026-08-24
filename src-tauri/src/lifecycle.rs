@@ -1622,6 +1622,24 @@ fn normalize_native_focus_snapshot(
     }
 }
 
+pub(crate) fn normalize_main_focus_event(
+    focused: bool,
+    panel_live: bool,
+    main_foreground: bool,
+) -> bool {
+    focused || (panel_live && main_foreground)
+}
+
+pub(crate) fn main_window_is_foreground(app: &AppHandle) -> bool {
+    let Some(main) = app.get_webview_window("main") else {
+        return false;
+    };
+    let Ok(main_hwnd) = main.hwnd() else {
+        return false;
+    };
+    unsafe { GetForegroundWindow() == main_hwnd }
+}
+
 fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, LifecycleError> {
     let main = app
         .get_webview_window("main")
@@ -1932,6 +1950,21 @@ mod tests {
         ] {
             assert_eq!(
                 normalize_native_focus_snapshot(main_focused, find_focused, foreground),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn panel_child_focus_keeps_main_active_only_while_main_is_foreground() {
+        for (focused, panel_live, main_foreground, expected) in [
+            (true, false, false, true),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, true),
+        ] {
+            assert_eq!(
+                normalize_main_focus_event(focused, panel_live, main_foreground),
                 expected
             );
         }

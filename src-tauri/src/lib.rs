@@ -134,6 +134,19 @@ fn setup_production_lifecycle(
             if expected_blur {
                 return;
             }
+            let panel_live = event_app
+                .state::<Arc<plugin_panel::PluginPanelController>>()
+                .live_identity()
+                .is_some();
+            if !*focused
+                && lifecycle::normalize_main_focus_event(
+                    *focused,
+                    panel_live,
+                    lifecycle::main_window_is_foreground(&event_app),
+                )
+            {
+                return;
+            }
             let registries = event_app.state::<result_registry::ResultRegistries>();
             let controller = event_app.state::<Arc<find_window::FindWindowController>>();
             let effect = controller.observe_focus(WindowLabel::Main, *focused);
@@ -1047,6 +1060,30 @@ mod tests {
             .expect("expected blur early return is missing");
 
         assert!(observe < consume && consume < early_return);
+    }
+
+    #[test]
+    fn main_focus_normalizes_panel_child_blur_before_hide_dispatch() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let focused_branch = source
+            .split("tauri::WindowEvent::Focused(focused) => {")
+            .nth(1)
+            .and_then(|tail| tail.split("tauri::WindowEvent::CloseRequested").next())
+            .expect("main focused branch is missing");
+        let expected_blur = focused_branch
+            .find("consume_expected_main_blur()")
+            .expect("expected main blur handling is missing");
+        let panel_focus = focused_branch
+            .find("normalize_main_focus_event(")
+            .expect("panel child focus normalization is missing");
+        let hide = focused_branch
+            .find("commands::clear_and_hide(")
+            .expect("main hide dispatch is missing");
+
+        assert!(focused_branch.contains("live_identity()"));
+        assert!(focused_branch.contains("main_window_is_foreground(&event_app)"));
+        assert!(expected_blur < panel_focus);
+        assert!(panel_focus < hide);
     }
 
     #[test]
