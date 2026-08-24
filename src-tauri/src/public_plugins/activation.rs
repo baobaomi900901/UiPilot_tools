@@ -1945,6 +1945,34 @@ impl PublicPluginManager {
         })
     }
 
+    pub(crate) fn panel_asset(
+        &self,
+        plugin_id: &str,
+        request_path: &str,
+    ) -> Option<PublicRuntimeAsset> {
+        let bundle = self.bundles.bundle(plugin_id).ok()??;
+        let snapshot = &bundle.runtime;
+        let config = &bundle.config;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || config.active_generation != snapshot.generation
+            || snapshot.manifest.command.output_mode != PublicOutputMode::Panel
+            || !snapshot
+                .manifest
+                .permissions
+                .contains(&PublicPermission::UiPanel)
+        {
+            return None;
+        }
+        let relative = decode_request_path(request_path)?;
+        let resource = snapshot.resources.get(&relative)?;
+        Some(PublicRuntimeAsset {
+            mime: resource.mime,
+            bytes: resource.bytes.clone(),
+        })
+    }
+
     pub(crate) fn icon_asset(
         &self,
         caller_label: &str,

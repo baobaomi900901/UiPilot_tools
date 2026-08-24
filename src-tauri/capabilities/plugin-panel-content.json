@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "plugin-panel-content",
+  "description": "Ready/ack and storage bridge for isolated public plugin panel content",
+  "webviews": ["plugin-panel-content-*"],
+  "permissions": [
+    "allow-plugin-panel-content-ready",
+    "allow-plugin-panel-content-ack",
+    "allow-plugin-panel-storage-get",
+    "allow-plugin-panel-storage-set",
+    "allow-plugin-panel-storage-remove"
+  ]
+}

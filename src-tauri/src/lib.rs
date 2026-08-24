@@ -66,6 +66,8 @@ mod file_index;
 mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod plugin_panel;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_window;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugins;
@@ -298,6 +300,9 @@ pub fn run() {
     let plugin_window_controller = Arc::new(plugin_window::PluginWindowController::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let plugin_panel_controller = Arc::new(plugin_panel::PluginPanelController::default());
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
     let main_window_transfers = Arc::new(window_transfer::MainWindowTransferCoordinator::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -367,6 +372,7 @@ pub fn run() {
         .manage(result_registries)
         .manage(Arc::clone(&find_controller))
         .manage(Arc::clone(&plugin_window_controller))
+        .manage(Arc::clone(&plugin_panel_controller))
         .manage(Arc::clone(&main_window_transfers))
         .invoke_handler(tauri::generate_handler![
             commands::open_find_window,
@@ -398,6 +404,11 @@ pub fn run() {
             commands::plugin_window_timer_start,
             commands::plugin_window_timer_stop,
             commands::plugin_window_timer_reset,
+            commands::plugin_panel_content_ready,
+            commands::plugin_panel_content_ack,
+            commands::plugin_panel_storage_get,
+            commands::plugin_panel_storage_set,
+            commands::plugin_panel_storage_remove,
             commands::commit_plugin_window_transfer,
             commands::get_public_plugin_window_identity,
             commands::set_plugin_window_pinned,
@@ -636,7 +647,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 51);
+        assert_eq!(production.matches("commands::").count(), 56);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -667,6 +678,11 @@ mod tests {
             "plugin_window_timer_start",
             "plugin_window_timer_stop",
             "plugin_window_timer_reset",
+            "plugin_panel_content_ready",
+            "plugin_panel_content_ack",
+            "plugin_panel_storage_get",
+            "plugin_panel_storage_set",
+            "plugin_panel_storage_remove",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",
             "set_plugin_window_pinned",
@@ -753,6 +769,7 @@ mod tests {
         let runtime = include_str!("../capabilities/plugin-runtime.json");
         let shell = include_str!("../capabilities/plugin-window-shell.json");
         let content = include_str!("../capabilities/plugin-window-content.json");
+        let panel = include_str!("../capabilities/plugin-panel-content.json");
         for command in [
             "list_public_plugins",
             "prepare_public_plugin_install",
@@ -778,6 +795,7 @@ mod tests {
         assert!(main.contains("allow-commit-plugin-window-transfer"));
         assert!(!shell.contains("commit-plugin-window-transfer"));
         assert!(!content.contains("commit-plugin-window-transfer"));
+        assert!(!panel.contains("commit-plugin-window-transfer"));
         assert!(shell.contains("\"webviews\": [\"plugin-shell-*\"]"));
         for command in [
             "get_public_plugin_window_identity",
@@ -790,6 +808,7 @@ mod tests {
             assert!(!main.contains(&permission));
             assert!(!runtime.contains(&permission));
             assert!(!content.contains(&permission));
+            assert!(!panel.contains(&permission));
         }
         assert!(content.contains("\"webviews\": [\"plugin-content-*\"]"));
         for command in [
@@ -810,14 +829,35 @@ mod tests {
             assert!(!main.contains(&permission));
             assert!(!runtime.contains(&permission));
             assert!(!shell.contains(&permission));
+            assert!(!panel.contains(&permission));
         }
-        for capability in [main, runtime, shell, content] {
+        assert!(panel.contains("\"webviews\": [\"plugin-panel-content-*\"]"));
+        for command in [
+            "plugin_panel_content_ready",
+            "plugin_panel_content_ack",
+            "plugin_panel_storage_get",
+            "plugin_panel_storage_set",
+            "plugin_panel_storage_remove",
+        ] {
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")));
+            assert!(panel.contains(&permission));
+            assert!(!main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+            assert!(!shell.contains(&permission));
+            assert!(!content.contains(&permission));
+        }
+        for capability in [main, runtime, shell, content, panel] {
             assert!(!capability.contains("\"shell:"));
         }
         assert!(runtime.contains("\"windows\": [\"plugin-runtime-*\"]"));
         assert!(!runtime.contains("\"plugin-*\""));
         assert!(!runtime.contains("plugin-shell-"));
         assert!(!runtime.contains("plugin-content-"));
+        assert!(!runtime.contains("plugin-panel-content-"));
+        assert!(!content.contains("plugin-panel-"));
+        assert!(!panel.contains("plugin-window-"));
+        assert!(!panel.contains("timer"));
     }
 
     #[test]
@@ -850,8 +890,10 @@ mod tests {
             "&public_plugin_service,",
             "let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());",
             "let plugin_window_controller = Arc::new(plugin_window::PluginWindowController::default());",
+            "let plugin_panel_controller = Arc::new(plugin_panel::PluginPanelController::default());",
             "window_transfer::MainWindowTransferCoordinator::default()",
             ".manage(Arc::clone(&plugin_window_controller))",
+            ".manage(Arc::clone(&plugin_panel_controller))",
             ".manage(Arc::clone(&main_window_transfers))",
             "transfers.consume_expected_main_blur()",
             "public_plugin_service.initialize(",

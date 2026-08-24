@@ -872,6 +872,9 @@ impl PublicPluginService {
             manager.asset(label, path).or_else(|| {
                 crate::plugin_window::plugin_id_from_content_label(label)
                     .and_then(|plugin_id| manager.window_asset(&plugin_id, path))
+            }).or_else(|| {
+                crate::plugin_panel::plugin_id_from_panel_content_label(label)
+                    .and_then(|plugin_id| manager.panel_asset(&plugin_id, path))
             })
         }) else {
             return Response::builder().status(403).body(Vec::new()).unwrap();

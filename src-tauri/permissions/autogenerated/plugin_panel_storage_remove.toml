@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-panel-storage-remove"
+description = "Enables the plugin_panel_storage_remove command without any pre-configured scope."
+commands.allow = ["plugin_panel_storage_remove"]
+
+[[permission]]
+identifier = "deny-plugin-panel-storage-remove"
+description = "Denies the plugin_panel_storage_remove command without any pre-configured scope."
+commands.deny = ["plugin_panel_storage_remove"]

@@ -31,6 +31,7 @@ use crate::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
     model::{LauncherResultActivation, ResultIconKind, SearchResponse},
+    plugin_panel::{self, PanelCallError, PluginPanelController},
     plugin_window::{
         self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
         PluginWindowPinState, PluginWindowUpdate,
@@ -1321,6 +1322,119 @@ fn map_storage_window_call_error(error: PluginWindowCallError) -> WindowStorageE
         }
         PluginWindowCallError::Unavailable => WindowStorageError::StorageError,
     }
+}
+
+fn parse_panel_storage_session_epoch(value: &str) -> Result<u64, WindowStorageError> {
+    if value == "0"
+        || value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(WindowStorageError::ExpiredWindowSessionError);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| WindowStorageError::ExpiredWindowSessionError)
+}
+
+fn map_storage_panel_call_error(error: PanelCallError) -> WindowStorageError {
+    match error {
+        PanelCallError::InvalidCaller => WindowStorageError::InvalidCaller,
+        PanelCallError::ExpiredSession => WindowStorageError::ExpiredWindowSessionError,
+        PanelCallError::Unavailable => WindowStorageError::StorageError,
+    }
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_content_ready(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+) -> Result<(), CommandError> {
+    plugin_panel::content_ready(controller.inner().as_ref(), webview.label())
+        .then_some(())
+        .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_content_ack(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    request_id: String,
+) -> Result<(), CommandError> {
+    plugin_panel::content_ack(controller.inner().as_ref(), webview.label(), &request_id)
+        .then_some(())
+        .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_storage_get(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    key: String,
+) -> Result<Option<serde_json::Value>, CommandError> {
+    let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    let identity = controller
+        .inner()
+        .begin_storage_call(webview.label(), session_epoch, false)
+        .map_err(map_storage_panel_call_error)?;
+    let value = service.manager()?.window_storage_get(
+        &identity.plugin_id,
+        identity.generation,
+        identity.activation_id,
+        identity.admission_epoch,
+        &key,
+    )?;
+    Ok(value)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_storage_set(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    key: String,
+    value: serde_json::Value,
+) -> Result<(), CommandError> {
+    let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    let identity = controller
+        .inner()
+        .begin_storage_call(webview.label(), session_epoch, true)
+        .map_err(map_storage_panel_call_error)?;
+    service.manager()?.window_storage_set(
+        &identity.plugin_id,
+        identity.generation,
+        identity.activation_id,
+        identity.admission_epoch,
+        &key,
+        value,
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_storage_remove(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    key: String,
+) -> Result<(), CommandError> {
+    let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    let identity = controller
+        .inner()
+        .begin_storage_call(webview.label(), session_epoch, true)
+        .map_err(map_storage_panel_call_error)?;
+    service.manager()?.window_storage_remove(
+        &identity.plugin_id,
+        identity.generation,
+        identity.activation_id,
+        identity.admission_epoch,
+        &key,
+    )?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -4203,6 +4317,56 @@ mod tests {
         let manager_read = identity.find("service.manager()?").unwrap();
         assert!(label_guard < manager_read);
         assert!(!identity.contains("plugin_id:"));
+    }
+
+    #[test]
+    fn plugin_panel_commands_derive_identity_from_exact_caller_labels() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let command_body = |name: &str| {
+            source
+                .split(&format!("pub(crate) fn {name}("))
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .unwrap_or_else(|| panic!("missing command {name}"))
+        };
+        for command in [
+            "plugin_panel_content_ready",
+            "plugin_panel_content_ack",
+            "plugin_panel_storage_get",
+            "plugin_panel_storage_set",
+            "plugin_panel_storage_remove",
+        ] {
+            let body = command_body(command);
+            assert!(body.contains("webview: tauri::Webview"));
+            assert!(body.contains("webview.label()"));
+            assert!(!body.contains("plugin_id: String"));
+        }
+        for command in [
+            "plugin_panel_storage_get",
+            "plugin_panel_storage_set",
+            "plugin_panel_storage_remove",
+        ] {
+            let body = command_body(command);
+            assert!(body.contains("session_epoch: String"));
+            assert!(body.contains("begin_storage_call(webview.label(), session_epoch"));
+        }
+        let capability = include_str!("../capabilities/plugin-panel-content.json");
+        assert!(capability.contains("\"webviews\": [\"plugin-panel-content-*\"]"));
+        for command in [
+            "plugin_panel_content_ready",
+            "plugin_panel_content_ack",
+            "plugin_panel_storage_get",
+            "plugin_panel_storage_set",
+            "plugin_panel_storage_remove",
+        ] {
+            assert!(capability.contains(&format!(
+                "\"allow-{}\"",
+                command.replace('_', "-")
+            )));
+        }
+        assert!(!capability.contains("timer"));
+        assert!(!capability.contains("plugin-window-"));
+        assert!(!capability.contains("close"));
     }
 
     #[test]
