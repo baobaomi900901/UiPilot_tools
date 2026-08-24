@@ -43,14 +43,19 @@ Preconditions:
 On success:
 
 - Main input shows a **command tag** labeled with the plugin’s effective command name (e.g. `bbm`).
-- Focus moves to the argument suffix field, caret at start, ready for optional arguments.
+- Focus moves to the argument suffix field.
+- **Caret placement:** if the initial argument is empty, caret at `0`; if non-empty, caret at **end of suffix text** (so continued typing appends rather than prepends).
 - The main result list is replaced by the plugin panel surface.
 - Exactly one panel session exists host-wide.
 
 Initial argument:
 
-- Slash submit `/bbm` or `/bbm hello` → argument is the text after the command token (`""` or `"hello"`).
-- List `panelActivation` row → initial argument is **empty** unless the activation payload explicitly carries `initialArgument` (v1 list rows always carry empty).
+- **Slash submit** `/bbm` or `/bbm hello` → argument is the text after the command token (`""` or `"hello"`).
+- **List `panelActivation` row** — depends on how the row was reached:
+  - **Default / command discovery** (empty launcher home, favorites list, or slash-prefix search such as `/bb` with no free-text query): `initialArgument` is `""`.
+  - **Plain-text match** (user typed free text such as `hello` and the selected row is a panel plugin matched from that query): `initialArgument` is the current launcher query string at activation time (e.g. `"hello"`).
+
+The `panelActivation` payload must carry `initialArgument` explicitly so the host does not discard the user’s typed query when opening from a text match.
 
 ### 3.2 Command tag and input chrome
 
@@ -103,8 +108,10 @@ While the tag is present:
 
 ### 3.7 HCI acceptance checklist
 
-- `/bbm` + Enter shows tag + panel in one step.
+- `/bbm` + Enter shows tag + panel in one step; `/bbm hello` leaves suffix `hello` with caret at end.
 - List select panel plugin + Enter shows the same in one step (no completion intermediate).
+- Typing `hello` and selecting a matched panel plugin preserves `hello` as initial suffix with caret at end.
+- Default/favorite list entry opens with empty suffix and caret at `0`.
 - Typing after tag + Enter updates panel with that text.
 - × closes to empty launcher.
 - Backspace only at suffix caret 0 with empty selection removes tag.
@@ -265,6 +272,7 @@ Add a dedicated launcher activation discriminant for inventory/search rows of pa
 
 - One Enter calls host “open panel” directly.
 - **Must not** route through `pluginCompletion` → `applyPluginCompletion` → armed second Enter (`commitArmedPluginCompletion`).
+- Payload includes `initialArgument: string` computed per §3.1 (empty for default/command discovery; current free-text query for plain-text match).
 - Window plugins keep today’s completion behavior; only `outputMode: panel` rows use `panelActivation`.
 
 ### 5.7 Teardown triggers
