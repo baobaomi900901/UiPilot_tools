@@ -30,6 +30,15 @@ pub(crate) enum ThemePreference {
     Light,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WebSearchEngine {
+    #[default]
+    Bing,
+    Baidu,
+    Google,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
@@ -37,23 +46,40 @@ pub(crate) struct Settings {
     pub(crate) autostart: bool,
     #[serde(default)]
     pub(crate) theme: ThemePreference,
+    #[serde(default)]
+    pub(crate) web_search_engine: WebSearchEngine,
     #[serde(default = "default_file_preview_enabled")]
     pub(crate) file_preview_enabled: bool,
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window_position: Option<WindowPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) find_window_position: Option<WindowPosition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) plugin_window_positions: BTreeMap<String, WindowPosition>,
 }
 
 pub(crate) struct SettingsUpdate {
     pub(crate) hotkey: String,
     pub(crate) autostart: bool,
     pub(crate) theme: ThemePreference,
+    pub(crate) web_search_engine: WebSearchEngine,
 }
 
 struct SettingsState {
     value: Settings,
     current_is_valid: bool,
+    theme_revision: u64,
+    file_preview_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FindPreferenceSnapshot {
+    pub(crate) theme_revision: u64,
+    pub(crate) theme: ThemePreference,
+    pub(crate) file_preview_revision: u64,
+    pub(crate) file_preview_enabled: bool,
 }
 
 pub(crate) struct SettingsStore {
@@ -75,9 +101,12 @@ impl Default for Settings {
             hotkey: "Shift+Space".into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: default_file_preview_enabled(),
             use_counts: BTreeMap::new(),
             window_position: None,
+            find_window_position: None,
+            plugin_window_positions: BTreeMap::new(),
         }
     }
 }
@@ -116,6 +145,8 @@ impl SettingsStore {
                 state: Mutex::new(SettingsState {
                     value,
                     current_is_valid: true,
+                    theme_revision: 0,
+                    file_preview_revision: 0,
                 }),
             });
         }
@@ -125,6 +156,8 @@ impl SettingsStore {
                 state: Mutex::new(SettingsState {
                     value,
                     current_is_valid: false,
+                    theme_revision: 0,
+                    file_preview_revision: 0,
                 }),
             });
         }
@@ -134,6 +167,8 @@ impl SettingsStore {
             state: Mutex::new(SettingsState {
                 value: Settings::default(),
                 current_is_valid: false,
+                theme_revision: 0,
+                file_preview_revision: 0,
             }),
         })
     }
@@ -157,6 +192,7 @@ impl SettingsStore {
         candidate.hotkey = update.hotkey;
         candidate.autostart = update.autostart;
         candidate.theme = update.theme;
+        candidate.web_search_engine = update.web_search_engine;
         self.persist(&mut state, candidate)
     }
 
@@ -183,18 +219,61 @@ impl SettingsStore {
         self.persist(&mut state, candidate)
     }
 
-    pub(crate) fn set_file_preview_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+    pub(crate) fn set_web_search_engine(
+        &self,
+        engine: WebSearchEngine,
+    ) -> Result<(), SettingsError> {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
-        candidate.file_preview_enabled = enabled;
+        candidate.web_search_engine = engine;
         self.persist(&mut state, candidate)
     }
 
-    pub(crate) fn set_theme_preference(&self, theme: ThemePreference) -> Result<(), SettingsError> {
+    pub(crate) fn set_file_preview_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.set_file_preview_enabled_with_revision(enabled)
+            .map(|_| ())
+    }
+
+    pub(crate) fn set_file_preview_enabled_with_revision(
+        &self,
+        enabled: bool,
+    ) -> Result<u64, SettingsError> {
         let mut state = self.state.lock().expect("settings lock poisoned");
+        let revision = state
+            .file_preview_revision
+            .checked_add(1)
+            .ok_or(SettingsError::CountOverflow)?;
+        let mut candidate = state.value.clone();
+        candidate.file_preview_enabled = enabled;
+        self.persist(&mut state, candidate)?;
+        state.file_preview_revision = revision;
+        Ok(revision)
+    }
+
+    pub(crate) fn set_theme_preference_with_revision(
+        &self,
+        theme: ThemePreference,
+    ) -> Result<u64, SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let revision = state
+            .theme_revision
+            .checked_add(1)
+            .ok_or(SettingsError::CountOverflow)?;
         let mut candidate = state.value.clone();
         candidate.theme = theme;
-        self.persist(&mut state, candidate)
+        self.persist(&mut state, candidate)?;
+        state.theme_revision = revision;
+        Ok(revision)
+    }
+
+    pub(crate) fn find_preference_snapshot(&self) -> FindPreferenceSnapshot {
+        let state = self.state.lock().expect("settings lock poisoned");
+        FindPreferenceSnapshot {
+            theme_revision: state.theme_revision,
+            theme: state.value.theme,
+            file_preview_revision: state.file_preview_revision,
+            file_preview_enabled: state.value.file_preview_enabled,
+        }
     }
 
     pub(crate) fn set_window_position(
@@ -215,6 +294,55 @@ impl SettingsStore {
             .window_position
     }
 
+    pub(crate) fn set_find_window_position(
+        &self,
+        position: WindowPosition,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.find_window_position = Some(position);
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn find_window_position(&self) -> Option<WindowPosition> {
+        self.state
+            .lock()
+            .expect("settings lock poisoned")
+            .value
+            .find_window_position
+    }
+    pub(crate) fn set_plugin_window_position(
+        &self,
+        plugin_id: &str,
+        position: WindowPosition,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate
+            .plugin_window_positions
+            .insert(plugin_id.to_owned(), position);
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn plugin_window_position(&self, plugin_id: &str) -> Option<WindowPosition> {
+        self.state
+            .lock()
+            .expect("settings lock poisoned")
+            .value
+            .plugin_window_positions
+            .get(plugin_id)
+            .copied()
+    }
+
+    pub(crate) fn remove_plugin_window_position(
+        &self,
+        plugin_id: &str,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.plugin_window_positions.remove(plugin_id);
+        self.persist(&mut state, candidate)
+    }
     pub(crate) fn snapshot(&self) -> Settings {
         self.state
             .lock()
@@ -234,9 +362,13 @@ impl SettingsStore {
             serde_json::to_vec(&candidate).map_err(|_| SettingsError::Serialize)?;
         let previous = state.current_is_valid.then_some(previous_bytes.as_slice());
         commit_with_backup(&self.paths, previous, &candidate_bytes)?;
+        let theme_revision = state.theme_revision;
+        let file_preview_revision = state.file_preview_revision;
         **state = SettingsState {
             value: candidate,
             current_is_valid: true,
+            theme_revision,
+            file_preview_revision,
         };
         Ok(())
     }
@@ -355,6 +487,7 @@ mod tests {
             hotkey: "Alt+Space".into(),
             autostart: false,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
         }
     }
 
@@ -371,6 +504,57 @@ mod tests {
         assert_eq!(Settings::default().hotkey, "Shift+Space");
     }
 
+    #[test]
+    fn web_search_engine_defaults_and_round_trips_strict_values() {
+        let legacy: Settings = serde_json::from_value(serde_json::json!({
+            "hotkey": "Shift+Space",
+            "autostart": false
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap()["webSearchEngine"],
+            "bing"
+        );
+
+        for engine in ["bing", "baidu", "google"] {
+            let value: Settings = serde_json::from_value(serde_json::json!({
+                "hotkey": "Shift+Space",
+                "autostart": false,
+                "webSearchEngine": engine
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(value).unwrap()["webSearchEngine"],
+                engine
+            );
+        }
+        assert!(serde_json::from_value::<Settings>(serde_json::json!({
+            "hotkey": "Shift+Space",
+            "autostart": false,
+            "webSearchEngine": "unknown"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn invalid_web_search_engine_uses_existing_backup_recovery() {
+        let dir = TestDir::new("invalid-web-search-engine");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Ctrl+Space","autostart":false,"webSearchEngine":"unknown"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.backup(),
+            br#"{"hotkey":"Alt+Space","autostart":false,"webSearchEngine":"bing"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(dir.path()).unwrap();
+
+        assert_eq!(store.snapshot().hotkey, "Alt+Space");
+        assert!(!dir.current().exists());
+    }
     #[test]
     fn theme_defaults_system_and_round_trips_all_values() {
         let dir = TestDir::new("theme-legacy");
@@ -390,7 +574,7 @@ mod tests {
             ThemePreference::Dark,
             ThemePreference::Light,
         ] {
-            store.set_theme_preference(theme).unwrap();
+            store.set_theme_preference_with_revision(theme).unwrap();
             assert_eq!(store.snapshot().theme, theme);
             assert_eq!(
                 SettingsStore::load(dir.path()).unwrap().snapshot().theme,
@@ -412,7 +596,9 @@ mod tests {
         write_settings(&dir.current(), &initial);
         let store = SettingsStore::load(dir.path()).unwrap();
         let before = store.snapshot();
-        store.set_theme_preference(ThemePreference::Dark).unwrap();
+        store
+            .set_theme_preference_with_revision(ThemePreference::Dark)
+            .unwrap();
 
         assert_eq!(
             store.snapshot(),
@@ -580,6 +766,7 @@ mod tests {
                 hotkey: "Ctrl+Space".into(),
                 autostart: true,
                 theme: ThemePreference::Dark,
+                web_search_engine: WebSearchEngine::Google,
             })
             .unwrap();
 
@@ -588,6 +775,7 @@ mod tests {
         assert_eq!(value.hotkey, "Ctrl+Space");
         assert!(value.autostart);
         assert_eq!(value.theme, ThemePreference::Dark);
+        assert_eq!(value.web_search_engine, WebSearchEngine::Google);
     }
 
     #[test]
@@ -627,6 +815,93 @@ mod tests {
             }
         );
         assert_eq!(read_current(&dir), store.snapshot());
+    }
+
+    #[test]
+    fn find_window_position_defaults_and_updates_only_that_field() {
+        let dir = TestDir::new("find-window-position");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Ctrl+Space","autostart":true,"filePreviewEnabled":false,"useCounts":{},"windowPosition":{"x":12,"y":34}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let before = store.snapshot();
+
+        assert_eq!(store.find_window_position(), None);
+        let position = WindowPosition { x: 640, y: -240 };
+        store.set_find_window_position(position).unwrap();
+
+        assert_eq!(store.find_window_position(), Some(position));
+        assert_eq!(store.window_position(), before.window_position);
+        assert_eq!(
+            store.snapshot(),
+            Settings {
+                find_window_position: Some(position),
+                ..before
+            }
+        );
+        assert_eq!(read_current(&dir), store.snapshot());
+    }
+
+    #[test]
+    fn plugin_window_positions_are_plugin_scoped_and_delete_independently() {
+        let dir = TestDir::new("plugin-window-positions");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let first = WindowPosition { x: 120, y: 240 };
+        let second = WindowPosition { x: -20, y: 80 };
+        store
+            .set_plugin_window_position("com.example.first", first)
+            .unwrap();
+        store
+            .set_plugin_window_position("com.example.second", second)
+            .unwrap();
+        assert_eq!(
+            store.plugin_window_position("com.example.first"),
+            Some(first)
+        );
+        assert_eq!(
+            store.plugin_window_position("com.example.second"),
+            Some(second)
+        );
+        store
+            .remove_plugin_window_position("com.example.first")
+            .unwrap();
+        assert_eq!(store.plugin_window_position("com.example.first"), None);
+        assert_eq!(
+            store.plugin_window_position("com.example.second"),
+            Some(second)
+        );
+        assert_eq!(read_current(&dir), store.snapshot());
+    }
+    #[test]
+    fn find_preference_revisions_advance_independently_after_durable_writes() {
+        let dir = TestDir::new("find-preference-revisions");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            store.find_preference_snapshot(),
+            FindPreferenceSnapshot {
+                theme_revision: 0,
+                theme: ThemePreference::System,
+                file_preview_revision: 0,
+                file_preview_enabled: true,
+            }
+        );
+
+        assert_eq!(
+            store.set_theme_preference_with_revision(ThemePreference::Dark),
+            Ok(1)
+        );
+        assert_eq!(store.set_file_preview_enabled_with_revision(false), Ok(1));
+        assert_eq!(
+            store.set_theme_preference_with_revision(ThemePreference::Light),
+            Ok(2)
+        );
+        let snapshot = store.find_preference_snapshot();
+        assert_eq!(snapshot.theme_revision, 2);
+        assert_eq!(snapshot.file_preview_revision, 1);
+        assert_eq!(snapshot.theme, ThemePreference::Light);
+        assert!(!snapshot.file_preview_enabled);
     }
 
     #[test]
@@ -798,9 +1073,12 @@ mod tests {
             hotkey: "Ctrl+Space".into(),
             autostart: true,
             theme: ThemePreference::System,
+            web_search_engine: WebSearchEngine::Bing,
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             window_position: None,
+            find_window_position: None,
+            plugin_window_positions: BTreeMap::new(),
         };
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();

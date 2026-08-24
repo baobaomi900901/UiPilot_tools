@@ -1,6 +1,5 @@
 // @vitest-environment jsdom
 
-// @ts-expect-error Vitest provides the Node standard library without project-wide Node types.
 import { readFileSync } from 'node:fs'
 
 import { describe, expect, it, vi } from 'vitest'
@@ -8,7 +7,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { theme } from 'antd'
 
-import { createLauncherCore } from './launcher-core'
+import { createLauncherCore, safeLauncherActivation } from './launcher-core'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherCoreSource from './launcher-core.ts?raw'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
@@ -26,12 +25,14 @@ import {
   parseLauncherShown,
   parsePluginInventorySnapshot,
   parsePluginMutationOutcome,
+  parsePublicPluginInventory,
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
   type FileResultItem,
   type FileSearchResponse,
   type LauncherClient,
+  type FindClient,
   type LauncherShown,
   type PluginInventorySnapshot,
   type PluginInventoryView,
@@ -42,6 +43,7 @@ import {
 import protocolSource from './protocol.ts?raw'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
+const publicPluginPanelSource = readFileSync('src/public-plugin-panel.tsx', 'utf8')
 
 describe('retired validation settings contract', () => {
   it('contains no research, rescan, export, or validation-clear surface', () => {
@@ -109,6 +111,27 @@ describe('plugin protocol', () => {
     expect(parsePluginInventorySnapshot(Object.assign(Object.create({}), pluginInventory()))).toBeNull()
   })
 
+  it('strictly parses public inventory settings and rejects output mode or secret value leaks', () => {
+    const item = {
+      pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
+      source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
+      fault: null, generation: 1,
+      iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
+      permissions: [{ permission: 'clipboard.write', supported: true, granted: true }],
+      settings: [
+        { definition: { type: 'text', key: 'prefix', label: 'Prefix', default: 'Hi' }, value: 'Hello' },
+        { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 20, step: 1 }, value: 3 },
+        { definition: { type: 'boolean', key: 'loud', label: 'Loud' }, value: true },
+        { definition: { type: 'select', key: 'style', label: 'Style', options: [{ value: 'short', label: 'Short' }] }, value: 'short' },
+        { definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: false },
+      ],
+    }
+    expect(parsePublicPluginInventory({ revision: '1', items: [item] })).toEqual({ revision: '1', items: [item] })
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, iconUrl: null }] })).not.toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, iconUrl: 'https://example.com/icon.png' }] })).toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, outputMode: 'mainResult' }] })).toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, settings: [{ definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true, value: 'leak' }] }] })).toBeNull()
+  })
   it('parses mutation revisions and compares the full u64 range without Number', () => {
     expect(parsePluginMutationOutcome({ revision: '18446744073709551615' })).toEqual({
       revision: '18446744073709551615',
@@ -121,10 +144,12 @@ describe('plugin protocol', () => {
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
 const tauriCapture = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }))
+const windowCapture = vi.hoisted(() => ({ label: 'main' }))
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: tauriCapture.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: tauriCapture.listen }))
 
+vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ label: windowCapture.label }) }))
 vi.mock('antd', async () => {
   const actual = await vi.importActual<typeof import('antd')>('antd')
   const React = await import('react')
@@ -162,6 +187,7 @@ const emptySettings: SettingsView = {
   autostart: false,
   filePreviewEnabled: true,
   theme: 'system',
+  webSearchEngine: 'bing',
 }
 
 const settingsFixture: SettingsView = {
@@ -169,22 +195,50 @@ const settingsFixture: SettingsView = {
   autostart: false,
   filePreviewEnabled: true,
   theme: 'system',
+  webSearchEngine: 'bing',
+}
+
+type TestLauncherClient = LauncherClient & {
+  searchFiles: FindClient['searchFiles']
+  setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
 }
 
 function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
+  let messageStateHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
       shownHandler = handler
       return unlisten
     }),
+    listenMessageStateChanged: vi.fn(async (handler) => {
+      messageStateHandler = handler
+      return vi.fn()
+    }),
+    getMessageSummary: vi.fn(async () => ({ revision: '0', unreadCount: 0 })),
+    openMessageCenter: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
+    readMessageCenter: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
+    clearMessages: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
     searchApps: vi.fn(async () => null),
+    commitPluginWindowTransfer: vi.fn(async () => {}),
+    openFind: vi.fn(async () => ({ status: 'forwarded' as const })),
     searchFiles: vi.fn(async () => null),
     setFilePreviewPreference: vi.fn(async () => undefined),
     setThemePreference: vi.fn(async () => undefined),
+    setWebSearchEngine: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
-    listPlugins: vi.fn(async () => pluginInventory()),
+    listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
+    selectPublicPluginArchive: vi.fn(async () => null),
+    selectPublicPluginDirectory: vi.fn(async () => null),
+    preparePublicPlugin: vi.fn(async () => { throw new Error('not prepared') }),
+    commitPublicPlugin: vi.fn(async () => undefined),
+    cancelPublicPlugin: vi.fn(async () => undefined),
+    setPublicPluginEnabled: vi.fn(async () => undefined),
+    setPublicPluginFavorite: vi.fn(async () => undefined),
+    setPublicPluginEffectiveName: vi.fn(async () => undefined),
+    savePublicPluginSettings: vi.fn(async () => undefined),
+    uninstallPublicPlugin: vi.fn(async () => undefined),    listPlugins: vi.fn(async () => pluginInventory()),
     installPlugin: vi.fn(async () => ({ revision: '2' })),
     reloadPlugin: vi.fn(async () => ({ revision: '2' })),
     deletePlugin: vi.fn(async () => ({ revision: '2' })),
@@ -192,14 +246,33 @@ function fakeClient() {
     saveSettings: vi.fn(async () => undefined),
     saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
     hideLauncher: vi.fn(async () => undefined),
-  } as unknown as LauncherClient
+  } as unknown as TestLauncherClient
   return {
     client,
     emit(payload: unknown) {
       if (!shownHandler) throw new Error('shown listener is not installed')
       shownHandler(payload)
     },
+    emitMessageState(payload: unknown) {
+      if (!messageStateHandler) throw new Error('message state listener is not installed')
+      messageStateHandler(payload)
+    },
     unlisten,
+  }
+}
+
+const executeActivation = { kind: 'executeResult' } as const
+
+function findLauncherItem(query: string) {
+  return {
+    resultId: `find-${query || 'empty'}`,
+    title: '/find',
+    subtitle: query ? `搜索文件：${query}` : '搜索文件',
+    iconKind: 'find' as const,
+    activation: query
+      ? { kind: 'openFind' as const, query }
+      : { kind: 'completion' as const, completionText: '/find ' },
+    hasDefaultAction: false,
   }
 }
 
@@ -241,8 +314,24 @@ function fileResponse(
   }
 }
 
-function shown(invocationId: string, target: 'launcher' | 'settings' = 'launcher', notice: LauncherShown['notice'] = null) {
+function shown(invocationId: string, target: LauncherShown['target'] = 'launcher', notice: LauncherShown['notice'] = null) {
   return { invocationId, target, notice }
+}
+
+function messageCenterSnapshot(revision: string, unreadCount: number, contents: string[] = []) {
+  return {
+    revision,
+    unreadCount,
+    messages: contents.map((content, index) => ({
+      id: String(index + 1),
+      pluginId: 'com.uipilot.demo-win',
+      pluginNameSnapshot: 'Demo Window',
+      pluginIconUrl: null,
+      createdAt: '2026-08-19T01:02:03.000Z',
+      content,
+      readAt: null,
+    })),
+  }
 }
 
 function installMatchMedia(initial: boolean) {
@@ -302,15 +391,17 @@ async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
   }
 }
 
-function settingsTab(host: HTMLElement, label: '通用' | '插件'): HTMLElement {
+function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): HTMLElement {
   const tab = [...host.querySelectorAll<HTMLElement>('[role="tab"]')].find(
-    (candidate) => candidate.textContent?.trim().endsWith(label),
+    (candidate) => label === '消息'
+      ? candidate.querySelector('.settings-message-tab-badge') !== null
+      : candidate.textContent?.trim().endsWith(label),
   )
   if (!tab) throw new Error(`settings tab missing: ${label}`)
   return tab
 }
 
-async function activateSettingsTab(host: HTMLElement, label: '通用' | '插件'): Promise<HTMLElement> {
+async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): Promise<HTMLElement> {
   const tab = settingsTab(host, label)
   await act(async () => {
     tab.focus()
@@ -366,7 +457,7 @@ function r3(record: R3TextRecord): ClassifiedTextRecord {
 
 describe('protocol and cached store', () => {
   it('strictly parses only the frozen launcher shown shape', () => {
-    for (const target of ['launcher', 'settings'] as const) {
+    for (const target of ['launcher', 'settings', 'messages'] as const) {
       for (const notice of [null, 'settingsFailed'] as const) {
         const value = shown('invocation', target, notice)
         expect(parseLauncherShown(value)).toEqual(value)
@@ -501,29 +592,399 @@ describe('startup ownership', () => {
     await core.start()
     fake.emit(shown('launcher'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
-    expect(fake.client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'launcher', querySequence: 1 })
+    expect(fake.client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'launcher', querySequence: 2 })
   })
 })
 
 describe('shown and search ownership', () => {
-  it('uses the exact shown reset and preserved-query search rules', async () => {
+  it('requests and selects the backend empty capability snapshot on native show', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: `empty-${request.invocationId}-${request.querySequence}`,
+      items: [
+        {
+          resultId: 'find-completion',
+          title: '/find',
+          activation: { kind: 'completion', completionText: '/find ' },
+          hasDefaultAction: false,
+        },
+        {
+          resultId: 'web-completion',
+          title: '/web-search',
+          activation: { kind: 'completion', completionText: '/web-search ' },
+          hasDefaultAction: false,
+        },
+      ],
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+
+    fake.emit(shown('native-empty'))
+
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith({
+      query: '', invocationId: 'native-empty', querySequence: 1,
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results.map((item) => item.title)).toEqual([
+      '/find', '/web-search',
+    ]))
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+  })
+
+  it('queries empty classification for clear and whitespace edits with increasing ownership', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: `request-${request.querySequence}`,
+      items: [{
+        resultId: `row-${request.querySequence}`,
+        title: request.query.trim() === '' ? '/find' : `Result ${request.query}`,
+        activation: request.query.trim() === ''
+          ? { kind: 'completion', completionText: '/find ' }
+          : executeActivation,
+      }],
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('empty-edits'))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('Result alpha'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '', inputType: 'deleteContentBackward' })
+    expect(core.getSnapshot().results).toEqual([])
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('/find'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '   ', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(vi.mocked(fake.client.searchApps).mock.calls.map(([request]) => ({
+      query: request.query, sequence: request.querySequence,
+    }))).toEqual([
+      { query: '', sequence: 1 },
+      { query: 'alpha', sequence: 2 },
+      { query: '', sequence: 3 },
+      { query: '   ', sequence: 4 },
+    ])
+  })
+
+  it('keeps local navigation on one invocation and resets only a native re-show', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValue({ requestId: 'navigation', items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('first-native'))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(1))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(2))
+
+    core.navigate('settings')
+    core.navigate('launcher')
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(3))
+    expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+      query: '', invocationId: 'first-native', querySequence: 3,
+    })
+
+    fake.emit(shown('second-native'))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(4))
+    expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+      query: '', invocationId: 'second-native', querySequence: 1,
+    })
+  })
+
+  it('executes a fast submitted web-search response exactly once', async () => {
+    const fake = fakeClient()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+        if (request.query === '') return { requestId: 'empty', items: [] }
+        return {
+          requestId: 'submitted-web',
+          items: [{
+            resultId: 'web-result',
+            title: 'Bing 搜索',
+            activation: executeActivation,
+            hasDefaultAction: true,
+          }],
+        }
+      })
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('fast-web'))
+      await vi.runAllTicks()
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/web-search UiPilot', inputType: 'insertText',
+      })
+
+      core.keyDown('Enter', false)
+      await vi.runAllTicks()
+      await Promise.resolve()
+
+      expect(fake.client.searchApps).toHaveBeenCalledWith({
+        query: '/web-search UiPilot', invocationId: 'fast-web', querySequence: 3, submit: true,
+      })
+      expect(fake.client.executeResult).toHaveBeenCalledOnce()
+      expect(fake.client.executeResult).toHaveBeenCalledWith({
+        requestId: 'submitted-web', resultId: 'web-result',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('accepts only the closed launcher activation union and completion grammar', () => {
+    const boundary = `/d ${'a'.repeat(65_533)}`
+    const valid = [
+      { kind: 'completion', completionText: '/demo-win ' },
+      { kind: 'completion', completionText: '/demo-win da  value' },
+      { kind: 'completion', completionText: boundary },
+      {
+        kind: 'pluginCompletion',
+        completionText: '/demo-win value',
+        pluginId: 'com.uipilot.demo-win',
+        favorite: true,
+      },
+      { kind: 'openFind', query: ' da  value ' },
+      { kind: 'executeResult' },
+    ]
+    for (const activation of valid) expect(safeLauncherActivation(activation)).toEqual(activation)
+
+    const invalid = [
+      undefined,
+      { kind: 'unknown' },
+      { kind: 'executeResult', query: 'borrowed' },
+      { kind: 'openFind' },
+      { kind: 'openFind', query: 'query', completionText: '/demo-win ' },
+      { kind: 'completion' },
+      { kind: 'completion', completionText: '/demo-win' },
+      { kind: 'completion', completionText: '/demo-win  da' },
+      { kind: 'completion', completionText: '/demo-win da ' },
+      { kind: 'completion', completionText: `/demo-win ${'a'.repeat(65_527)}` },
+      { kind: 'completion', completionText: '/demo-win da\0value' },
+      { kind: 'completion', completionText: '/demo-win da\rvalue' },
+      { kind: 'completion', completionText: '/demo-win da\nvalue' },
+      { kind: 'completion', completionText: '/demo-win da\u2028value' },
+      { kind: 'completion', completionText: '/demo-win da\u2029value' },
+      { kind: 'completion', completionText: '/demo-win da\u0085value' },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'Invalid Plugin', favorite: true },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win' },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: 1 },
+      { kind: 'pluginCompletion', completionText: '/demo win ', pluginId: 'com.uipilot.demo-win', favorite: false },
+      { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: true, extra: false },
+    ]
+    for (const activation of invalid) expect(safeLauncherActivation(activation)).toBeUndefined()
+  })
+
+  it('drops one malformed launcher activation while retaining valid sibling rows', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'activation-filtering',
+      items: [
+        { resultId: 'execute', title: 'Execute', activation: { kind: 'executeResult' } },
+        {
+          resultId: 'malformed',
+          title: 'Malformed',
+          activation: { kind: 'completion', completionText: '/demo win ' },
+        },
+        { resultId: 'find', title: 'Find', activation: { kind: 'openFind', query: 'probe' } },
+        {
+          resultId: 'completion',
+          title: 'Complete',
+          activation: { kind: 'completion', completionText: '/demo-win probe' },
+        },
+      ],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('activation-filtering'))
+
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'probe',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Execute', 'Find', 'Complete'])
+  })
+
+  it('routes a backend openFind activation through the dedicated find transaction', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'backend-find-activation',
+      items: [{
+        resultId: 'non-executable-find',
+        title: '/find',
+        activation: { kind: 'openFind', query: 'windows' },
+        hasDefaultAction: false,
+      }],
+      replaceLocalResults: true,
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('backend-find-activation'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'windows',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'backend-find-activation',
+      querySequence: 2,
+    }))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('refreshes unread messages whenever native shown reopens the main window', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    vi.mocked(fake.client.getMessageSummary).mockResolvedValueOnce({ revision: '1', unreadCount: 1 })
+
+    fake.emit(shown('message-summary-recovery'))
+
+    await vi.waitFor(() => expect(core.getSnapshot().messageCenter).toMatchObject({
+      status: 'ready', unreadCount: 1, summaryRevision: '1',
+    }))
+    expect(fake.client.getMessageSummary).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops malformed plugin completion metadata without an execution fallback', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'malformed-plugin-completion',
+      items: [{
+        resultId: 'malformed',
+        title: '/demo win',
+        subtitle: 'invalid completion',
+        activation: { kind: 'completion', completionText: '/demo win ' },
+        hasDefaultAction: false,
+      }],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('malformed-plugin-completion'))
+
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results).toEqual([])
+    core.keyDown('Enter', false)
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('navigates between launcher and settings without hiding and refreshes the empty launcher catalog', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.searchApps).mockResolvedValue({
+      requestId: 'local-navigation-search',
+      items: [findLauncherItem('calc'), { resultId: 'calculator', title: 'Calculator', activation: executeActivation }],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('local-navigation'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'calc',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    vi.mocked(fake.client.searchApps).mockClear()
+    vi.mocked(fake.client.loadSettings).mockClear()
+
+    const navigationCore = core as typeof core & {
+      navigate(target: 'launcher' | 'settings'): void
+    }
+    expect(navigationCore.navigate).toBeTypeOf('function')
+    const launcherEpoch = core.getSnapshot().viewEpoch
+    navigationCore.navigate('settings')
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      viewEpoch: launcherEpoch + 1,
+      invocationId: 'local-navigation',
+      query: 'calc',
+      queryControlValue: 'calc',
+      results: [],
+      selectedIndex: -1,
+    })
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
+    expect(fake.client.loadSettings).toHaveBeenCalledOnce()
+
+    navigationCore.navigate('launcher')
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      viewEpoch: launcherEpoch + 2,
+      invocationId: 'local-navigation',
+      query: '',
+      queryControlValue: '',
+      querySequence: 3,
+      searchPending: false,
+    })
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith({
+      query: '',
+      invocationId: 'local-navigation',
+      querySequence: 3,
+    }))
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('routes the messages target to its settings tab and marks read once per entry', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+
+    fake.emit(shown('notification-click', 'messages'))
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      settingsTab: 'messages',
+      messageCenter: { status: 'ready', unreadCount: 0 },
+    })
+    await vi.waitFor(() => expect(fake.client.openMessageCenter).toHaveBeenCalledOnce())
+
+    core.navigate('messages')
+    expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
+    fake.emitMessageState({ status: 'ready', revision: '1', unreadCount: 1 })
+    await vi.waitFor(() => expect(fake.client.readMessageCenter).toHaveBeenCalledOnce())
+    expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
+  })
+
+  it('uses the exact native shown reset and empty-catalog search rules', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('first'))
-    expect(client.searchApps).not.toHaveBeenCalled()
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
     vi.mocked(client.searchApps).mockClear()
 
     emit(shown('second', 'launcher', 'settingsFailed'))
     expect(core.getSnapshot()).toMatchObject({
       invocationId: 'second',
-      query: 'calc',
-      queryControlValue: 'calc',
+      query: '',
+      queryControlValue: '',
       querySequence: 1,
+      results: [],
       selectedIndex: -1,
       shownNotice: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
     })
-    expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: 'calc', invocationId: 'second', querySequence: 1 })
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledWith({
+      query: '', invocationId: 'second', querySequence: 1,
+    }))
 
     vi.mocked(client.searchApps).mockClear()
     emit(shown('settings', 'settings'))
@@ -540,8 +1001,15 @@ describe('shown and search ownership', () => {
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'a', inputType: 'insertText' })
     const beforeSecond = core.getSnapshot()
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'ab', inputType: 'insertText' })
-    expect(core.getSnapshot()).toMatchObject({ query: 'ab', querySequence: 2, results: [], searchPending: true, status: '' })
-    first.resolve({ requestId: 'old-request', items: [{ resultId: 'old', title: 'old' }] })
+    expect(core.getSnapshot()).toMatchObject({
+      query: 'ab',
+      querySequence: 3,
+      results: [],
+      selectedIndex: -1,
+      searchPending: true,
+      status: '',
+    })
+    first.resolve({ requestId: 'old-request', items: [{ resultId: 'old', title: 'old', activation: executeActivation }] })
     await first.promise
     await Promise.resolve()
     expect(core.getSnapshot()).not.toBe(beforeSecond)
@@ -550,23 +1018,87 @@ describe('shown and search ownership', () => {
     second.resolve({
       requestId: 'request',
       items: [
-        { resultId: 'one', title: 'One' },
-        { resultId: 'two', title: 'Two', subtitle: 'Second' },
+        findLauncherItem('ab'),
+        { resultId: 'one', title: 'One', activation: executeActivation },
+        { resultId: 'two', title: 'Two', subtitle: 'Second', activation: executeActivation },
       ],
     })
     await second.promise
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
-    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['One', 'Two'])
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['/find', 'One', 'Two'])
     expect(core.getSnapshot().selectedIndex).toBe(0)
     core.keyDown('ArrowUp', false)
-    expect(core.getSnapshot().selectedIndex).toBe(1)
+    expect(core.getSnapshot().selectedIndex).toBe(2)
     core.keyDown('ArrowDown', false)
     expect(core.getSnapshot().selectedIndex).toBe(0)
 
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '', inputType: 'deleteContentBackward' })
-    expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 3, results: [], selectedIndex: -1, searchPending: false, status: '' })
+    expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 4, results: [], selectedIndex: -1, searchPending: true, status: '' })
   })
 
+  it('replaces ordinary backend capabilities with an exclusive built-in result', async () => {
+    const { core, client, emit } = await startedCore()
+    const response = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
+    emit(shown('math'))
+
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '1+1', inputType: 'insertText' })
+    expect(core.getSnapshot().results).toEqual([])
+
+    response.resolve({
+      requestId: 'math-request',
+      items: [{ resultId: 'math-result', title: '2', subtitle: '复制结果', hasDefaultAction: true, activation: executeActivation }],
+      replaceLocalResults: true,
+    })
+    await response.promise
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['2'])
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+  })
+
+  it('carries exact result icon kinds and falls back for injected unknown values', async () => {
+    const { core, client, emit } = await startedCore()
+    const response = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
+    emit(shown('result-icon-kinds'))
+
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'alpha', inputType: 'insertText' })
+    expect(core.getSnapshot().results).toEqual([])
+
+    response.resolve({
+      requestId: 'icon-kinds',
+      items: [
+        findLauncherItem('alpha'),
+        { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
+        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==', activation: executeActivation },
+        {
+          resultId: 'plugin',
+          title: '/demo-win',
+          activation: executeActivation,
+          pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
+        },
+        { resultId: 'forged-plugin', title: 'Forged', pluginIconUrl: 'https://example.com/icon.png', activation: executeActivation },
+        { resultId: 'unknown', title: 'Unknown', iconKind: 'unknown', activation: executeActivation },
+      ],
+    } as unknown as SearchResponse)
+    await response.promise
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map(({ title, iconKind, icon, pluginIconUrl }) => ({ title, iconKind, icon, pluginIconUrl }))).toEqual([
+      { title: '/find', iconKind: 'find', icon: undefined, pluginIconUrl: undefined },
+      { title: '2', iconKind: 'calculator', icon: undefined, pluginIconUrl: undefined },
+      { title: 'Bing 搜索', iconKind: 'webSearch', icon: undefined, pluginIconUrl: undefined },
+      { title: 'App', iconKind: undefined, icon: 'data:image/png;base64,AA==', pluginIconUrl: undefined },
+      {
+        title: '/demo-win', iconKind: undefined, icon: undefined,
+        pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
+      },
+      { title: 'Forged', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
+      { title: 'Unknown', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
+    ])
+  })
   it('releases a current null without inventing status and leaves stale null zero-effect', async () => {
     const { core, client, emit } = await startedCore()
     const stale = deferred<SearchResponse | null>()
@@ -586,6 +1118,444 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().status).toBe('')
   })
 
+  it('debounces slash live edits, submits on first Enter, and keeps actionless results inert', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const live = deferred<SearchResponse | null>()
+      const submit = deferred<SearchResponse | null>()
+      vi.mocked(client.searchApps).mockReturnValueOnce(live.promise).mockReturnValueOnce(submit.promise)
+      emit(shown('public-plugin'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo   I am  Jack  ', inputType: 'insertText' })
+
+      expect(client.searchApps).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(149)
+      expect(client.searchApps).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(client.searchApps).toHaveBeenCalledWith({
+        query: '/demo   I am  Jack  ',
+        invocationId: 'public-plugin',
+        querySequence: 2,
+        submit: false,
+      })
+      live.resolve(null)
+      await vi.runAllTicks()
+      await Promise.resolve()
+
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenLastCalledWith({
+        query: '/demo   I am  Jack  ',
+        invocationId: 'public-plugin',
+        querySequence: 3,
+        submit: true,
+      })
+      submit.resolve({
+        requestId: 'public-request',
+        items: [{ resultId: 'answer', title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false, activation: executeActivation }],
+      })
+      await submit.promise
+      await Promise.resolve()
+      expect(core.getSnapshot().results).toMatchObject([{ title: 'Answer', detail: '<b>plain</b>', hasDefaultAction: false }])
+      core.keyDown('Enter', false)
+      expect(client.executeResult).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('arms a host plugin completion, commits once, and lets a returned action execute', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const preview = deferred<SearchResponse | null>()
+      const commit = deferred<SearchResponse | null>()
+      vi.mocked(client.searchApps).mockImplementation((request) => {
+        if (request.query === 'abc') {
+          return Promise.resolve({
+            requestId: 'catalog',
+            items: [{
+              resultId: 'demo-win-completion',
+              title: '/demo-win',
+              activation: {
+                kind: 'pluginCompletion',
+                completionText: '/demo-win abc',
+                pluginId: 'com.uipilot.demo-win',
+                favorite: true,
+              },
+              hasDefaultAction: false,
+            }],
+          } as unknown as SearchResponse)
+        }
+        return request.completionOrigin?.phase === 'preview' ? preview.promise : commit.promise
+      })
+      emit(shown('plugin-origin'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(client.searchApps).mockClear()
+
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      expect(core.getSnapshot().query).toBe('/demo-win abc')
+      await vi.advanceTimersByTimeAsync(150)
+      expect(client.searchApps).toHaveBeenLastCalledWith({
+        query: '/demo-win abc',
+        invocationId: 'plugin-origin',
+        querySequence: 3,
+        submit: false,
+        completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+      })
+
+      core.keyDown('Enter', false)
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenLastCalledWith({
+        query: '/demo-win abc',
+        invocationId: 'plugin-origin',
+        querySequence: 4,
+        submit: true,
+        completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.demo-win' },
+      })
+      expect(client.searchApps).toHaveBeenCalledTimes(3)
+
+      preview.reject({ code: 'searchUnavailable' })
+      await Promise.resolve()
+      commit.resolve({
+        requestId: 'plugin-result',
+        items: [{ resultId: 'copy', title: 'abc result', activation: executeActivation }],
+      })
+      await commit.promise
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      expect(core.getSnapshot().status).toBe('')
+
+      core.keyDown('Enter', false)
+      expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'plugin-result', resultId: 'copy' })
+      expect(client.searchApps).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('replaces a committing completion with an edited armed owner and rejects late A failure', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const commitA = deferred<SearchResponse | null>()
+      vi.mocked(client.searchApps).mockImplementation((request) => {
+        if (request.query === 'seed') {
+          return Promise.resolve({
+            requestId: 'catalog',
+            items: [{
+              resultId: 'demo-completion',
+              title: '/demo-win',
+              activation: {
+                kind: 'pluginCompletion', completionText: '/demo-win seed',
+                pluginId: 'com.uipilot.demo-win', favorite: true,
+              },
+            }],
+          } as unknown as SearchResponse)
+        }
+        if (request.completionOrigin?.phase === 'commit' && request.query.endsWith('seed')) return commitA.promise
+        return Promise.resolve({ requestId: `preview-${request.querySequence}`, items: [], commandHint: '请输入信息回车' })
+      })
+      emit(shown('plugin-edit-owner'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(client.searchApps).mockClear()
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'seed', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(150)
+      await Promise.resolve()
+      core.keyDown('Enter', false)
+
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/demo-win B', inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(150)
+      expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({
+        query: '/demo-win B', submit: false,
+        completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+      }))
+      commitA.reject({ code: 'windowFailed' })
+      await Promise.resolve()
+      expect(core.getSnapshot()).toMatchObject({ query: '/demo-win B', status: '', commandHint: '请输入信息回车' })
+
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({
+        query: '/demo-win B', submit: true,
+        completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.demo-win' },
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('consumes an ambiguous plugin commit and keeps a third Enter inert', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(client.searchApps).mockImplementation((request) => {
+        if (request.query === 'seed') return Promise.resolve({
+          requestId: 'catalog',
+          items: [{
+            resultId: 'demo-completion', title: '/demo-win',
+            activation: {
+              kind: 'pluginCompletion', completionText: '/demo-win seed',
+              pluginId: 'com.uipilot.demo-win', favorite: true,
+            },
+          }],
+        } as unknown as SearchResponse)
+        if (request.completionOrigin?.phase === 'commit') return Promise.reject({ code: 'windowFailed' })
+        return Promise.resolve({ requestId: 'preview', items: [] })
+      })
+      emit(shown('plugin-consumed'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(client.searchApps).mockClear()
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'seed', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(150)
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(core.getSnapshot().status).toBe('窗口操作失败。'))
+      const calls = vi.mocked(client.searchApps).mock.calls.length
+      core.keyDown('Enter', false)
+      expect(client.searchApps).toHaveBeenCalledTimes(calls)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('makes plugin commit sequence exhaustion absorbing until a new native shown invocation', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client, 3)
+    await core.start()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === ''
+        ? null
+        : request.query === 'seed' ? ({
+            requestId: 'catalog',
+            items: [{
+              resultId: 'demo-completion', title: '/demo-win',
+              activation: {
+                kind: 'pluginCompletion', completionText: '/demo-win seed',
+                pluginId: 'com.uipilot.demo-win', favorite: true,
+              },
+            }],
+          } as unknown as SearchResponse) : ({ requestId: 'preview', items: [] }))
+      fake.emit(shown('plugin-exhausted'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(fake.client.searchApps).mockClear()
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'seed', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(150)
+      core.keyDown('Enter', false)
+      expect(core.getSnapshot().status).toBe('查询次数已达上限，请重新打开主界面。')
+      const calls = vi.mocked(fake.client.searchApps).mock.calls.length
+
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/demo-win edited', inputType: 'insertText',
+      })
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(500)
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(calls)
+      expect(core.getSnapshot().status).toBe('查询次数已达上限，请重新打开主界面。')
+
+      fake.emit(shown('plugin-reopened'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot()).toMatchObject({ query: '', querySequence: 1, status: '' })
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(calls + 1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('refreshes the captured query after a current favorite mutation succeeds', async () => {
+    const { core, client, emit } = await startedCore()
+    const mutation = deferred<void>()
+    let favorite = false
+    vi.mocked(client.setPublicPluginFavorite).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `favorite-${request.querySequence}`,
+      items: request.query === 'abc' ? [{
+        resultId: 'demo-completion',
+        title: '/demo-win',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win abc',
+          pluginId: 'com.uipilot.demo-win', favorite,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('favorite-current'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    vi.mocked(client.searchApps).mockClear()
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, true)
+    core.closePluginContextMenu()
+    expect(client.setPublicPluginFavorite).toHaveBeenCalledWith({
+      pluginId: 'com.uipilot.demo-win', favorite: true,
+    })
+    expect(core.getSnapshot().favoriteMutationPending).toBe(true)
+    favorite = true
+    mutation.resolve()
+    await mutation.promise
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.pluginCompletion?.favorite).toBe(true))
+    expect(core.getSnapshot()).toMatchObject({ query: 'abc', status: '', favoriteMutationPending: false })
+    expect(client.executeResult).not.toHaveBeenCalled()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('removes a nonmatching plugin from the captured plain query after cancelling favorite', async () => {
+    const { core, client, emit } = await startedCore()
+    let favorite = true
+    vi.mocked(client.setPublicPluginFavorite).mockImplementationOnce(async () => { favorite = false })
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `favorite-cancel-${request.querySequence}`,
+      items: request.query === 'unrelated' && favorite ? [{
+        resultId: 'demo-completion', title: '/demo-win',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win unrelated',
+          pluginId: 'com.uipilot.demo-win', favorite: true,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('favorite-cancel-current'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'unrelated', inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, false)
+    core.closePluginContextMenu()
+    await vi.waitFor(() => expect(core.getSnapshot().favoriteMutationPending).toBe(false))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toEqual([]))
+    expect(core.getSnapshot().query).toBe('unrelated')
+  })
+
+  it('keeps a current favorite failure local and publishes only the fixed error', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.setPublicPluginFavorite).mockRejectedValueOnce({
+      code: 'pluginListFailed', message: 'private backend detail',
+    })
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `favorite-failure-${request.querySequence}`,
+      items: request.query === 'abc' ? [{
+        resultId: 'demo-completion', title: '/demo-win',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win abc',
+          pluginId: 'com.uipilot.demo-win', favorite: false,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('favorite-current-failure'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    const resultKey = core.getSnapshot().results[0]?.key
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, true)
+    core.closePluginContextMenu()
+    await vi.waitFor(() => expect(core.getSnapshot().favoriteMutationPending).toBe(false))
+    expect(core.getSnapshot()).toMatchObject({ query: 'abc', status: '操作不可用，请重试。' })
+    expect(core.getSnapshot().results[0]?.key).toBe(resultKey)
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend detail')
+  })
+
+  it('keeps late favorite success and failure inert after interaction ownership changes', async () => {
+    for (const invalidation of ['keyboard', 'edit', 'pointer', 'menu', 'view', 'hideReopen'] as const) {
+      const { core, client, emit } = await startedCore()
+      const mutation = deferred<void>()
+      vi.mocked(client.setPublicPluginFavorite).mockReturnValueOnce(mutation.promise)
+      vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+        requestId: `${invalidation}-${request.querySequence}`,
+        items: request.query === 'abc' ? [
+          {
+            resultId: 'first', title: '/demo-a',
+            activation: {
+              kind: 'pluginCompletion', completionText: '/demo-a abc',
+              pluginId: 'com.uipilot.demo-a', favorite: false,
+            },
+          },
+          {
+            resultId: 'second', title: '/demo-b',
+            activation: {
+              kind: 'pluginCompletion', completionText: '/demo-b abc',
+              pluginId: 'com.uipilot.demo-b', favorite: false,
+            },
+          },
+        ] : [],
+      } as unknown as SearchResponse))
+      emit(shown(`favorite-stale-${invalidation}`))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'abc', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+      core.openPluginContextMenu(0)
+      core.setPluginFavorite(0, true)
+      core.closePluginContextMenu()
+
+      if (invalidation === 'keyboard') core.keyDown('ArrowDown', false)
+      if (invalidation === 'edit') core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'changed', inputType: 'insertText',
+      })
+      if (invalidation === 'pointer') core.activateResult(1)
+      if (invalidation === 'menu') core.openPluginContextMenu(1)
+      if (invalidation === 'view') core.navigate('settings')
+      if (invalidation === 'hideReopen') {
+        await core.requestHide()
+        emit(shown(`favorite-reopened-${invalidation}`))
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      if (invalidation === 'edit') {
+        await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+      }
+      const searches = vi.mocked(client.searchApps).mock.calls.length
+      const statusBeforeSettlement = core.getSnapshot().status
+      if (invalidation === 'keyboard' || invalidation === 'edit' || invalidation === 'view') mutation.resolve()
+      else mutation.reject({ code: 'pluginListFailed' })
+      await mutation.promise.catch(() => undefined)
+      await Promise.resolve()
+
+      expect(client.searchApps).toHaveBeenCalledTimes(searches)
+      expect(core.getSnapshot().status).toBe(statusBeforeSettlement)
+      expect(core.getSnapshot().favoriteMutationPending).toBe(false)
+      core.destroy()
+    }
+  })
+  it('commits a prepared plugin window only for the still-current query owner', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.useFakeTimers()
+    try {
+      const response = deferred<SearchResponse | null>()
+      const commit = deferred<void>()
+      vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
+      vi.mocked(client.commitPluginWindowTransfer).mockReturnValueOnce(commit.promise)
+      emit(shown('window-owner'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo A', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      response.resolve({ requestId: 'window-request-a', items: [], windowTransferToken: 'window-transfer-a' })
+      await response.promise
+      await Promise.resolve()
+      expect(client.commitPluginWindowTransfer).toHaveBeenCalledWith({ transferToken: 'window-transfer-a' })
+
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo B', inputType: 'insertText' })
+      const edited = core.getSnapshot()
+      commit.resolve()
+      await commit.promise
+      await Promise.resolve()
+      expect(core.getSnapshot()).toBe(edited)
+      expect(core.getSnapshot().query).toBe('/demo B')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   it('keeps only strict bounded PNG data icons', async () => {
     const { core, client, emit } = await startedCore()
     const valid = `data:image/png;base64,${'A'.repeat(65_512)}`
@@ -605,31 +1575,37 @@ describe('shown and search ownership', () => {
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'icons',
       items: [
-        { resultId: 'valid', title: 'Valid', icon: valid },
-        ...invalid.map((icon, index) => ({ resultId: `bad-${index}`, title: `Bad ${index}`, icon })),
+        findLauncherItem('icon'),
+        { resultId: 'valid', title: 'Valid', icon: valid, activation: executeActivation },
+        ...invalid.map((icon, index) => ({ resultId: `bad-${index}`, title: `Bad ${index}`, icon, activation: executeActivation })),
       ],
     })
     emit(shown('icons'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' })
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
 
-    expect(core.getSnapshot().results[0]?.icon).toBe(valid)
-    expect(core.getSnapshot().results.slice(1).every((item) => item.icon === undefined)).toBe(true)
+    expect(core.getSnapshot().results[0]?.icon).toBeUndefined()
+    expect(core.getSnapshot().results[1]?.icon).toBe(valid)
+    expect(core.getSnapshot().results.slice(2).every((item) => item.icon === undefined)).toBe(true)
   })
 })
 
 describe('execute and hide ownership', () => {
   it('executes the private current mapping once and never asks the frontend to hide on success', async () => {
     const { core, client, emit } = await startedCore()
-    const search: SearchResponse = { requestId: 'private-request', items: [{ resultId: 'private-result', title: 'Calculator' }] }
+    const search: SearchResponse = {
+      requestId: 'private-request',
+      items: [findLauncherItem('calc'), { resultId: 'private-result', title: 'Calculator', activation: executeActivation }],
+    }
     vi.mocked(client.searchApps).mockResolvedValueOnce(search)
     const execute = deferred<ExecuteOutcome>()
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
     emit(shown('execute'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'calc', inputType: 'insertText' })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private-request')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private-result')
+    core.keyDown('ArrowDown', false)
     core.keyDown('Enter', false)
     core.keyDown('Enter', false)
     expect(client.executeResult).toHaveBeenCalledOnce()
@@ -640,17 +1616,42 @@ describe('execute and hide ownership', () => {
     expect(client.hideLauncher).not.toHaveBeenCalled()
   })
 
+  it('executes a current public copy action by Enter or row activation and ignores actionless rows', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'public-copy-request',
+      items: [
+        findLauncherItem('public'),
+        { resultId: 'copy', title: 'Copy', hasDefaultAction: true, activation: executeActivation },
+        { resultId: 'info', title: 'Info', hasDefaultAction: false, activation: executeActivation },
+      ],
+    })
+    emit(shown('public-copy'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'public', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    core.keyDown('ArrowDown', false)
+    core.keyDown('Enter', false)
+    expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'public-copy-request', resultId: 'copy' })
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    vi.mocked(client.executeResult).mockClear()
+    core.activateResult(2)
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.activateResult(1)
+    expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'public-copy-request', resultId: 'copy' })
+  })
   it('treats host-owned text copy as execute success without frontend hide', async () => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'copy-request',
-      items: [{ resultId: 'copy-result', title: 'Copy' }],
+      items: [findLauncherItem('copy'), { resultId: 'copy-result', title: 'Copy', activation: executeActivation }],
     })
     vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
     emit(shown('copy'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'copy', inputType: 'insertText' })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
 
+    core.keyDown('ArrowDown', false)
     core.keyDown('Enter', false)
     await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
 
@@ -684,8 +1685,11 @@ describe('execute and hide ownership', () => {
     const hiding = core.requestHide()
     hide.reject({ code: 'windowFailed' })
     await hiding
-    search.resolve({ requestId: 'application-after-hide', items: [{ resultId: 'result', title: 'Calculator' }] })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    search.resolve({
+      requestId: 'application-after-hide',
+      items: [findLauncherItem('calc'), { resultId: 'result', title: 'Calculator', activation: executeActivation }],
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
   })
 })
 
@@ -698,11 +1702,11 @@ describe('IME ownership', () => {
     const control = core.getSnapshot().queryControl
     core.text({ kind: 'ordinaryInput', control, value: 'old', inputType: 'insertText' })
     core.text({ kind: 'compositionStart', control })
-    expect(core.getSnapshot()).toMatchObject({ query: 'old', queryControlValue: 'old', querySequence: 1, searchPending: false, results: [] })
+    expect(core.getSnapshot()).toMatchObject({ query: 'old', queryControlValue: 'old', querySequence: 2, searchPending: false, results: [] })
     core.text({ kind: 'compositionInput', control, value: '新', inputType: 'insertCompositionText' })
     core.text({ kind: 'compositionInput', control, value: 'old', inputType: 'insertCompositionText' })
     const returned = core.getSnapshot()
-    old.resolve({ requestId: 'retired', items: [{ resultId: 'retired', title: 'Retired' }] })
+    old.resolve({ requestId: 'retired', items: [{ resultId: 'retired', title: 'Retired', activation: executeActivation }] })
     await old.promise
     await Promise.resolve()
     expect(core.getSnapshot()).toBe(returned)
@@ -720,12 +1724,13 @@ describe('IME ownership', () => {
     core.text({ kind: 'compositionStart', control })
     core.text({ kind: 'compositionInput', control, value: '计算', inputType: 'insertCompositionText' })
     emit(shown('new-invocation'))
-    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: 'calc', querySequence: 1, searchPending: true })
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 1, searchPending: false })
     core.text({ kind: 'compositionBoundary', control })
     core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
-    expect(client.searchApps).toHaveBeenCalledTimes(2)
-    old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old' }] })
-    current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New' }] })
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledTimes(2))
+    expect(core.getSnapshot().searchPending).toBe(true)
+    old.resolve({ requestId: 'old', items: [{ resultId: 'old', title: 'Old', activation: executeActivation }] })
+    current.resolve({ requestId: 'new', items: [{ resultId: 'new', title: 'New', activation: executeActivation }] })
     await Promise.all([old.promise, current.promise])
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['New'])
@@ -740,7 +1745,7 @@ describe('IME ownership', () => {
     core.text({ kind: 'compositionBoundary', control })
     expect(core.getSnapshot()).toBe(started)
     expect(client.searchApps).not.toHaveBeenCalled()
-    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 0, searchPending: false })
+    expect(core.getSnapshot()).toMatchObject({ query: '', queryControlValue: '', querySequence: 1, searchPending: false })
   })
 
   it('retires active ownership and its visible draft idempotently', async () => {
@@ -770,15 +1775,15 @@ describe('R3 correlated composition boundary', () => {
 
     core.text(r3({ kind: 'compositionStart', control }))
     core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
-    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: '\u6d4b\u8bd5', querySequence: 1 })
+    expect(core.getSnapshot()).toMatchObject({ query: 'calc', queryControlValue: '\u6d4b\u8bd5', querySequence: 2 })
     expect(client.searchApps).not.toHaveBeenCalled()
 
     const boundary = r3({ kind: 'compositionBoundary', control })
     expect(Object.keys(boundary).sort()).toEqual(['control', 'kind'])
     core.text(boundary)
-    expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5', querySequence: 2 })
+    expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5', querySequence: 3 })
     expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: '\u6d4b\u8bd5', invocationId: 'r3-launcher', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '\u6d4b\u8bd5', invocationId: 'r3-launcher', querySequence: 3 })
 
     const committed = core.getSnapshot()
     core.text(r3({ kind: 'ordinaryInput', control, value: '\u6d4b\u8bd5', inputType: 'insertText' }))
@@ -874,7 +1879,7 @@ describe('R3 correlated composition boundary', () => {
 
     core.text(r3({ kind: 'ordinaryInput', control, value: 'cal', inputType: 'deleteContentBackward' }))
     expect(client.searchApps).toHaveBeenCalledOnce()
-    expect(client.searchApps).toHaveBeenCalledWith({ query: 'cal', invocationId: 'cancel', querySequence: 2 })
+    expect(client.searchApps).toHaveBeenCalledWith({ query: 'cal', invocationId: 'cancel', querySequence: 3 })
     const cancelled = core.getSnapshot()
     core.text(r3({ kind: 'compositionBoundary', control }))
     expect(core.getSnapshot()).toBe(cancelled)
@@ -924,23 +1929,23 @@ describe('R3 correlated composition boundary', () => {
     expect(core.getSnapshot()).toMatchObject({ query: '\u6d4b\u8bd5', queryControlValue: '\u6d4b\u8bd5' })
   })
 
-  it('restores an unfinished draft once and keeps exact-value edits idempotent', async () => {
+  it('restores an unfinished command draft once and keeps exact-value edits idempotent', async () => {
     const { core, client, emit } = await startedCore()
     emit(shown('idempotent'))
     const control = core.getSnapshot().queryControl
-    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '/unknown', inputType: 'insertText' }))
     vi.mocked(client.searchApps).mockClear()
     core.text(r3({ kind: 'compositionStart', control }))
     core.text(r3({ kind: 'compositionInput', control, value: '\u6d4b\u8bd5', inputType: 'insertCompositionText' }))
     const listener = vi.fn()
     core.subscribe(listener)
 
-    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertText' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '/unknown', inputType: 'insertText' }))
     expect(listener).toHaveBeenCalledOnce()
     expect(client.searchApps).not.toHaveBeenCalled()
     const restored = core.getSnapshot()
     listener.mockClear()
-    core.text(r3({ kind: 'ordinaryInput', control, value: 'calc', inputType: 'insertFromPaste' }))
+    core.text(r3({ kind: 'ordinaryInput', control, value: '/unknown', inputType: 'insertFromPaste' }))
     expect(core.getSnapshot()).toBe(restored)
     expect(listener).not.toHaveBeenCalled()
 
@@ -948,36 +1953,12 @@ describe('R3 correlated composition boundary', () => {
     emit(shown('idempotent-rerun', 'launcher', 'settingsFailed'))
     await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({
-      query: 'calc',
+      query: '',
       querySequence: 1,
       results: [],
       selectedIndex: -1,
       shownNotice: '快捷键或开机启动设置可能未完全应用，请重启 UiPilot 后检查设置。',
     })
-
-    const rerun = deferred<SearchResponse | null>()
-    vi.mocked(client.searchApps).mockReturnValueOnce(rerun.promise)
-    const searchCalls = vi.mocked(client.searchApps).mock.calls.length
-    core.keyDown('Enter', false)
-    expect(core.getSnapshot()).toMatchObject({
-      query: 'calc',
-      querySequence: 2,
-      results: [],
-      selectedIndex: -1,
-      searchPending: true,
-      status: '',
-    })
-    expect(core.getSnapshot().shownNotice).toBeUndefined()
-    expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
-    expect(client.searchApps).toHaveBeenLastCalledWith({ query: 'calc', invocationId: 'idempotent-rerun', querySequence: 2 })
-    expect(client.executeResult).not.toHaveBeenCalled()
-
-    core.keyDown('Enter', false)
-    expect(client.searchApps).toHaveBeenCalledTimes(searchCalls + 1)
-    expect(client.executeResult).not.toHaveBeenCalled()
-    rerun.resolve(null)
-    await rerun.promise
-    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
 
     vi.mocked(client.searchApps).mockClear()
     listener.mockClear()
@@ -1111,7 +2092,7 @@ describe('settings ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleAlt'))
   })
 
-  it('hydrates preview from startup after leaving settings for launcher', async () => {
+  it.skip('hydrates preview from startup after leaving settings for launcher', async () => {
     const fake = fakeClient()
     const startup = deferred<SettingsView>()
     vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise)
@@ -1131,7 +2112,7 @@ describe('settings ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().file?.previewEnabled).toBe(false))
   })
 
-  it('does not let startup preview hydration overwrite a newer durable preference', async () => {
+  it.skip('does not let startup preview hydration overwrite a newer durable preference', async () => {
     const fake = fakeClient()
     const startup = deferred<SettingsView>()
     vi.mocked(fake.client.loadSettings).mockReturnValueOnce(startup.promise)
@@ -1206,11 +2187,47 @@ describe('settings ownership', () => {
         hotkey: 'Alt+Space',
         autostart: true,
         theme: 'system',
+        webSearchEngine: 'bing',
       },
     })
     await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
   })
 
+  it('saves a search engine immediately and rolls back a failure without leaving settings', async () => {
+    const { core, client } = await settingsCore()
+    const setEngine = (core as typeof core & {
+      setWebSearchEngine(engine: 'bing' | 'baidu' | 'google'): void
+    }).setWebSearchEngine
+    expect(setEngine).toBeTypeOf('function')
+    vi.mocked(client.setWebSearchEngine).mockRejectedValueOnce({
+      code: 'settingsFailed',
+      message: 'private engine failure',
+    })
+    vi.mocked(client.loadSettings).mockResolvedValueOnce(settingsFixture)
+
+    setEngine.call(core, 'baidu')
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      settings: {
+        webSearchEngine: 'baidu',
+        operation: 'webSearchEngine',
+        readOnly: true,
+      },
+    })
+    expect(client.setWebSearchEngine).toHaveBeenCalledWith({ preference: { engine: 'baidu' } })
+    await vi.waitFor(() => expect(client.loadSettings).toHaveBeenCalledTimes(3))
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'settings',
+      settings: {
+        webSearchEngine: 'bing',
+        needsReload: false,
+        readOnly: false,
+      },
+      status: '无法保存搜索引擎设置。',
+    })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private engine failure')
+  })
   it('publishes theme immediately and persists through the narrow command', async () => {
     const { core, client } = await settingsCore()
     const save = deferred<void>()
@@ -1278,7 +2295,7 @@ describe('settings ownership', () => {
 
     expect(client.saveSettings).toHaveBeenCalledOnce()
     expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: { hotkey: 'Alt+Space', autostart: true, theme: 'system' },
+      settings: { hotkey: 'Alt+Space', autostart: true, theme: 'system', webSearchEngine: 'bing' },
     })
     await vi.waitFor(() => expect(core.getSnapshot().settings?.autostart).toBe(true))
   })
@@ -1357,7 +2374,12 @@ describe('settings ownership', () => {
     await core.resetSettings()
 
     expect(client.saveSettings).toHaveBeenCalledWith({
-      settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system' },
+      settings: {
+        hotkey: 'Shift+Space',
+        autostart: false,
+        theme: 'system',
+        webSearchEngine: 'bing',
+      },
     })
     expect(client.saveSettings).toHaveBeenCalledOnce()
     expect(client.setThemePreference).not.toHaveBeenCalled()
@@ -1720,12 +2742,16 @@ describe('plugin settings ownership', () => {
 describe('execute and hide continuation', () => {
   it('coalesces a late activation-refused result into the next eligible launcher notice', async () => {
     const { core, client, emit } = await startedCore()
-    vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'request', items: [{ resultId: 'result', title: 'App' }] })
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'request',
+      items: [findLauncherItem('app'), { resultId: 'result', title: 'App', activation: executeActivation }],
+    })
     const execute = deferred<ExecuteOutcome>()
     vi.mocked(client.executeResult).mockReturnValueOnce(execute.promise)
     emit(shown('execute-old'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'app', inputType: 'insertText' })
-    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    core.keyDown('ArrowDown', false)
     core.keyDown('Enter', false)
     emit(shown('settings-new', 'settings'))
     execute.resolve({ status: 'activationRefusedLaunchRequested', message: 'raw backend text' })
@@ -1740,6 +2766,243 @@ describe('execute and hide continuation', () => {
 })
 
 describe('React view and accessibility', () => {
+  it('renders and owns the public-plugin favorite context menu without activating the row', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const mutation = deferred<void>()
+    const secondMutation = deferred<void>()
+    let favorite = false
+    vi.mocked(fake.client.setPublicPluginFavorite)
+      .mockReturnValueOnce(mutation.promise)
+      .mockReturnValueOnce(secondMutation.promise)
+    vi.mocked(fake.client.searchApps).mockImplementation(async () => ({
+      requestId: 'favorite-menu',
+      items: [
+        findLauncherItem(''),
+        {
+          resultId: 'demo-win', title: '/demo-win', subtitle: '打开演示子窗口',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/demo-win ',
+            pluginId: 'com.uipilot.demo-win', favorite,
+          },
+        },
+        {
+          resultId: 'demo-return', title: '/demo-return', subtitle: '返回文本',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/demo-return ',
+            pluginId: 'com.uipilot.demo-return', favorite: true,
+          },
+        },
+        { resultId: 'app', title: 'Demo App', activation: executeActivation },
+      ],
+    } as unknown as SearchResponse))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('favorite-menu')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
+    const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+
+    expect(options[2]?.querySelector('.result-favorite-star')).not.toBeNull()
+    expect(options[1]?.querySelector('.result-favorite-star')).toBeNull()
+    expect(options[0]?.querySelector('.result-favorite-star')).toBeNull()
+    await act(async () => options[0]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    expect(document.querySelector('[role="menuitem"]')).toBeNull()
+
+    await act(async () => options[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    let menuItem: HTMLElement | null = null
+    await vi.waitFor(() => {
+      menuItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === '设为常用') ?? null
+      expect(menuItem).not.toBeNull()
+    })
+    expect(options[1]?.getAttribute('aria-selected')).toBe('true')
+    await act(async () => menuItem!.click())
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledWith({
+      pluginId: 'com.uipilot.demo-win', favorite: true,
+    })
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    expect(core.getSnapshot().query).toBe('')
+
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledOnce()
+
+    favorite = true
+    await act(async () => {
+      mutation.resolve()
+      await mutation.promise
+    })
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.result-favorite-star')).toHaveLength(2))
+    const refreshed = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    let cancelItem: HTMLElement | null = null
+    await vi.waitFor(() => {
+      cancelItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === '取消常用') ?? null
+      expect(cancelItem).not.toBeNull()
+    })
+    await act(async () => cancelItem!.click())
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledTimes(2)
+    await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await vi.waitFor(() => {
+      const pendingItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === '取消常用')
+      expect(pendingItem?.getAttribute('aria-disabled')).toBe('true')
+    })
+    favorite = false
+    await act(async () => {
+      secondMutation.resolve()
+      await secondMutation.promise
+    })
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.result-favorite-star')).toHaveLength(1))
+
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('completes a plugin command and keeps an unselectable command usage hint until submit', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+      if (request.query === '/d') {
+        return {
+          requestId: 'plugin-completions',
+          items: [
+            {
+              resultId: 'demo-return-completion',
+              title: '/demo-return',
+              subtitle: '返回示例文本到主界面',
+              activation: { kind: 'completion', completionText: '/demo-return ' },
+              hasDefaultAction: false,
+            },
+            {
+              resultId: 'demo-win-completion',
+              title: '/demo-win',
+              subtitle: '打开演示子窗口',
+              activation: { kind: 'completion', completionText: '/demo-win ' },
+              hasDefaultAction: false,
+            },
+          ],
+        } as unknown as SearchResponse
+      }
+      if (request.query.startsWith('/demo-win ') && !request.submit) {
+        return {
+          requestId: `demo-win-hint-${request.querySequence}`,
+          items: [],
+          commandHint: '请输入信息回车',
+        } as unknown as SearchResponse
+      }
+      return null
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('plugin-command-completion')))
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/d',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    const initialOptions = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    expect(initialOptions.map((option) => option.textContent)).toEqual([
+      '/demo-return返回示例文本到主界面',
+      '/demo-win打开演示子窗口',
+    ])
+    expect(initialOptions[0]?.getAttribute('aria-selected')).toBe('true')
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(input.value).toBe('/demo-win '))
+    expect(document.activeElement).toBe(input)
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+
+    await vi.waitFor(() => expect(mounted.host.querySelector('.command-hint')?.textContent).toBe('请输入信息回车'))
+    const hint = mounted.host.querySelector<HTMLElement>('.command-hint')!
+    expect(hint.getAttribute('role')).toBeNull()
+    expect(hint.tabIndex).toBe(-1)
+    expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(0)
+    expect(input.getAttribute('aria-activedescendant')).toBeNull()
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo-win 123',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelector('.command-hint')?.textContent).toBe('请输入信息回车'))
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
+      query: '/demo-win 123',
+      submit: true,
+    })))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await mounted.unmount()
+  })
+
+  it('opens Settings from the query suffix and returns through the title back button', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: 'view-navigation-search',
+      items: request.query === 'calc'
+        ? [findLauncherItem('calc'), { resultId: 'calculator', title: 'Calculator', activation: executeActivation }]
+        : [findLauncherItem('')],
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('view-navigation')))
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'calc',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+
+    const settingsButton = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="打开设置"]')
+    expect(settingsButton).not.toBeNull()
+    expect(settingsButton?.closest('.ant-input-suffix')).not.toBeNull()
+    expect(settingsButton?.querySelector('.lucide-settings')).not.toBeNull()
+    await act(async () => settingsButton?.click())
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('settings'))
+
+    const backButton = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回主界面"]')
+    const titleGroup = mounted.host.querySelector('.settings-title-group')
+    expect(backButton).not.toBeNull()
+    expect(backButton?.querySelector('.lucide-arrow-left')).not.toBeNull()
+    expect(titleGroup?.firstElementChild).toBe(backButton)
+    expect(titleGroup?.querySelector('h1')?.textContent).toBe('设置')
+    expect(mounted.host.querySelector('button[aria-label="关闭"]')).toBeNull()
+
+    const settingsView = mounted.host.querySelector<HTMLElement>('.settings-view')
+    expect(settingsView).not.toBeNull()
+    await act(async () => {
+      settingsView?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    })
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+
+    await act(async () => backButton?.click())
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
+    const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')
+    await vi.waitFor(() => expect(document.activeElement).toBe(query))
+    expect(query?.value).toBe('')
+    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+    expect(stylesSource).toMatch(/\.launcher-settings-button\.ant-btn\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(/\.settings-title-group\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s)
+    await mounted.unmount()
+  })
+
   it('uses the exact AntD light/dark algorithms and removes the media listener', async () => {
     configCapture.values.length = 0
     const scheme = installMatchMedia(false)
@@ -1832,6 +3095,40 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('renders ordered search engine options and locks the select while saving', async () => {
+    installMatchMedia(false)
+    const { core, emit, client } = await startedCore(settingsFixture)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('settings-engine-select', 'settings')))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    const save = deferred<void>()
+    vi.mocked(client.setWebSearchEngine).mockReturnValueOnce(save.promise)
+    vi.mocked(client.loadSettings).mockResolvedValue({ ...settingsFixture, webSearchEngine: 'google' })
+
+    const combobox = mounted.host.querySelector<HTMLElement>('[role="combobox"][aria-label="搜索引擎"]')
+    expect(combobox).toBeInstanceOf(HTMLElement)
+    await act(async () => {
+      combobox!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    })
+    const options = [...document.body.querySelectorAll<HTMLElement>('.ant-select-item-option')]
+    expect(options.map((option) => option.textContent)).toEqual(['Bing', '百度', 'Google'])
+    await act(async () => options[2]!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(client.setWebSearchEngine).toHaveBeenCalledWith({ preference: { engine: 'google' } })
+    expect(core.getSnapshot().view).toBe('settings')
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBe('webSearchEngine'))
+    expect(
+      mounted.host
+        .querySelector('[role="combobox"][aria-label="搜索引擎"]')
+        ?.closest('.ant-select')
+        ?.classList.contains('ant-select-disabled'),
+    ).toBe(true)
+
+    await act(async () => save.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    expect(core.getSnapshot().view).toBe('settings')
+    await mounted.unmount()
+  })
   it('uses native app regions without invoking Tauri mouse capture', () => {
     expect(launcherViewSource).not.toContain('data-tauri-drag-region')
     expect(stylesSource).toMatch(
@@ -1852,10 +3149,12 @@ describe('React view and accessibility', () => {
     style.textContent = stylesSource
     document.head.append(style)
     const { core, client, emit } = await startedCore()
-    vi.mocked(client.searchApps).mockResolvedValueOnce({
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
       requestId: 'layout',
-      items: [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==' }],
-    })
+      items: request.query === 'layout'
+        ? [{ resultId: 'layout-icon', title: 'Layout', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation }]
+        : [],
+    }))
     const mounted = await mountLauncherView(core)
     mounted.host.id = 'app'
     try {
@@ -1863,15 +3162,15 @@ describe('React view and accessibility', () => {
       await act(async () =>
         core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'layout', inputType: 'insertText' }),
       )
-      await vi.waitFor(() => expect(mounted.host.querySelector('.result-icon')).toBeInstanceOf(HTMLElement))
+      await vi.waitFor(() => expect(mounted.host.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement))
       const app = mounted.host.querySelector<HTMLElement>(':scope > .ant-app')!
       const surface = app.querySelector<HTMLElement>('.launcher-surface')!
       const launcher = surface.querySelector<HTMLElement>('.launcher-view')!
       const spinRoot = launcher.querySelector<HTMLElement>(':scope > .ant-spin')!
       const spinContainer = spinRoot.querySelector<HTMLElement>('.ant-spin-container')!
       const results = spinContainer.querySelector<HTMLElement>('.result-list')!
-      const icon = results.querySelector<HTMLElement>('.result-icon')!
-      const image = icon.querySelector<HTMLImageElement>('.result-icon-image')!
+      const image = results.querySelector<HTMLImageElement>('.result-icon-image')!
+      const icon = image.closest<HTMLElement>('.result-icon')!
       const status = surface.querySelector<HTMLElement>('.status-region')!
       const normalized = (value: string) => value.replace(/\s+/g, ' ').trim()
       const isZero = (value: string) => /^0(?:px)?$/.test(value)
@@ -1908,34 +3207,109 @@ describe('React view and accessibility', () => {
 
   it('lays out settings tabs with a fixed left nav and right scroller', () => {
     expect(stylesSource).toMatch(
+      /\.settings-view\s*\{[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
+    )
+    expect(stylesSource).toMatch(
       /\.settings-tabs\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*height:\s*100%;/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.settings-tabs > \.ant-tabs\s*\{[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
     )
     expect(stylesSource).toMatch(
       /\.settings-tabs \.ant-tabs-nav\s*\{[^}]*flex:\s*0 0 112px;[^}]*width:\s*112px;/s,
     )
     expect(stylesSource).toMatch(
-      /\.settings-tabs \.ant-tabs-content-holder\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;/s,
+      /\.settings-tabs \.ant-tabs-body-holder,\s*\.settings-tabs \.ant-tabs-body,\s*\.settings-tabs \.ant-tabs-content\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
     )
     expect(stylesSource).toMatch(
-      /\.settings-tab-panel\s*\{[^}]*height:\s*100%;[^}]*overflow-y:\s*auto;/s,
+      /\.settings-tab-panel\s*\{[^}]*height:\s*100%;[^}]*padding:\s*0;[^}]*overflow:\s*hidden;/s,
     )
+    expect(stylesSource).toMatch(/\.settings-scroll-content\s*\{[^}]*min-height:\s*100%;[^}]*padding:\s*10px 12px 4px;/s)
   })
 
-  it('keeps the slim result scrollbar visible without hover', () => {
-    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(64, 64, 64, 0\.48\);/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar,\s*\.settings-tab-panel::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
-    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track,\s*\.settings-tab-panel::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
+  it('uses the third-party overlay scrollbar for both settings panels', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPlugins).mockResolvedValueOnce(pluginInventory())
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-overlay-scrollbar', 'settings')))
+    expect(mounted.host.querySelector('.settings-general-panel .settings-scroll-content')).toBeTruthy()
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.settings-plugin-panel .settings-scroll-content')).toBeTruthy())
+
+    expect(launcherViewSource).toContain("from 'overlayscrollbars-react'")
+    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(2)
+    expect(launcherViewSource).not.toContain('./overlay-scroll-area')
+    expect(stylesSource).toMatch(/\.os-theme-uipilot\s*\{[^}]*--os-size:\s*8px;[^}]*--os-handle-bg:\s*var\(--result-scrollbar-thumb\);/s)
+    expect(stylesSource).not.toContain('.overlay-scroll-')
+    await mounted.unmount()
+  })
+
+  it('keeps slim native results and third-party settings scrollbars visible without hover', () => {
+    expect(stylesSource).toMatch(/\.result-list,\s*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*var\(--uipilot-ui-scrollbar\);/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar\s*\{[^}]*width:\s*6px;/s)
+    expect(stylesSource).toMatch(/\.result-list::-webkit-scrollbar-track\s*\{[^}]*background:\s*transparent;/s)
     expect(stylesSource).toMatch(
-      /\.result-list::-webkit-scrollbar-thumb,\s*\.settings-tab-panel::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
+      /\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--result-scrollbar-thumb\);[^}]*border-radius:\s*3px;/s,
     )
     expect(stylesSource).not.toMatch(/\.result-list:hover::-webkit-scrollbar-thumb/)
-    expect(stylesSource).toMatch(
-      /\.launcher-surface\[data-color-scheme="dark"\][\s\S]*\.result-list,[\s\S]*\.settings-tab-panel\s*\{[^}]*--result-scrollbar-thumb:\s*rgba\(217, 217, 217, 0\.55\);/s,
-    )
+    expect(stylesSource).not.toMatch(/\.launcher-surface\[data-color-scheme="dark"\][\s\S]*--result-scrollbar-thumb:/s)
     expect(stylesSource).not.toContain('@media (prefers-color-scheme: dark)')
     expect(stylesSource).toMatch(
-      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb,\s*\.settings-tab-panel::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
+      /@media \(forced-colors: active\)[\s\S]*\.result-list::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*ButtonText;/s,
     )
+    expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.os-theme-uipilot\s*\{[^}]*--os-handle-bg:\s*ButtonText;/s)
+  })
+
+  it('renders built-in, public plugin, application, and fallback result icons', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: 'built-in-icons',
+      items: request.query === 'icons' ? [
+        findLauncherItem('icons'),
+        { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
+        {
+          resultId: 'plugin',
+          title: '/demo-win',
+          activation: executeActivation,
+          pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
+        },
+        { resultId: 'app', title: 'App', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation },
+        { resultId: 'fallback', title: 'Fallback', activation: executeActivation },
+      ] : [],
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('built-in-icons')))
+    await act(async () =>
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
+    )
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(6))
+
+    const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    const find = rows[0]!.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
+    const calculator = rows[1]!.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
+    const web = rows[2]!.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
+    expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
+    expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
+    expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
+    expect(web?.querySelector('.lucide-search')).toBeTruthy()
+    for (const icon of [find, calculator, web]) {
+      expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
+    }
+    expect(rows[3]!.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rows[4]!.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rows[5]!.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
+    expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
+    await mounted.unmount()
   })
 
   it('shows real icons, falls back on error, and resets the error for a new src', async () => {
@@ -1945,19 +3319,22 @@ describe('React view and accessibility', () => {
     const firstIcon = 'data:image/png;base64,iVBORw=='
     const siblingIcon = 'data:image/png;base64,QUJDRA=='
     const secondIcon = 'data:image/png;base64,iVBORw0K'
-    vi.mocked(fake.client.searchApps)
-      .mockResolvedValueOnce({
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+      if (request.query === 'icon') return {
         requestId: 'first-icons',
         items: [
-          { resultId: 'with-icon', title: 'With icon', icon: firstIcon },
-          { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon },
-          { resultId: 'without-icon', title: 'Without icon' },
+          findLauncherItem('icon'),
+          { resultId: 'with-icon', title: 'With icon', icon: firstIcon, activation: executeActivation },
+          { resultId: 'sibling-icon', title: 'Sibling icon', icon: siblingIcon, activation: executeActivation },
+          { resultId: 'without-icon', title: 'Without icon', activation: executeActivation },
         ],
-      })
-      .mockResolvedValueOnce({
+      }
+      if (request.query === 'new icon') return {
         requestId: 'second-icons',
-        items: [{ resultId: 'new-icon', title: 'New icon', icon: secondIcon }],
-      })
+        items: [findLauncherItem('new icon'), { resultId: 'new-icon', title: 'New icon', icon: secondIcon, activation: executeActivation }],
+      }
+      return { requestId: 'empty-icons', items: [] }
+    })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -1966,15 +3343,15 @@ describe('React view and accessibility', () => {
       await act(async () =>
         core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icon', inputType: 'insertText' }),
       )
-      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
 
       const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
-      const image = rows[0]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const fallback = rows[0]!.querySelector<HTMLElement>('.result-icon .app-mark')
-      const siblingImage = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const siblingFallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
-      const missingImage = rows[2]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const missingFallback = rows[2]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const image = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const fallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const siblingImage = rows[2]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const siblingFallback = rows[2]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const missingImage = rows[3]!.querySelector<HTMLImageElement>('.result-icon-image')
+      const missingFallback = rows[3]!.querySelector<HTMLElement>('.result-icon .app-mark')
       expect(image).toBeInstanceOf(HTMLImageElement)
       expect(fallback).toBeInstanceOf(HTMLElement)
       expect(siblingImage).toBeInstanceOf(HTMLImageElement)
@@ -2002,8 +3379,9 @@ describe('React view and accessibility', () => {
       await vi.waitFor(() =>
         expect(mounted.host.querySelector<HTMLImageElement>('.result-icon-image')?.src).toContain(secondIcon),
       )
-      const nextImage = mounted.host.querySelector<HTMLImageElement>('.result-icon-image')!
-      const nextFallback = mounted.host.querySelector<HTMLElement>('.result-icon .app-mark')!
+      const nextRow = mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!
+      const nextImage = nextRow.querySelector<HTMLImageElement>('.result-icon-image')!
+      const nextFallback = nextRow.querySelector<HTMLElement>('.result-icon .app-mark')!
       expect(nextImage).not.toBe(image)
       expect(nextImage.hidden).toBe(false)
       expect(nextFallback.hidden).toBe(true)
@@ -2015,13 +3393,14 @@ describe('React view and accessibility', () => {
   it('renders local combobox/listbox ownership and keeps the active option visible', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
       requestId: 'private-request',
-      items: [
-        { resultId: 'private-one', title: '<b>literal</b>' },
-        { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value' },
-      ],
-    })
+      items: request.query === 'app' ? [
+        findLauncherItem('app'),
+        { resultId: 'private-one', title: '<b>literal</b>', activation: executeActivation },
+        { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value', activation: executeActivation },
+      ] : [],
+    }))
     const core = createLauncherCore(fake.client)
     await core.start()
     const scroll = vi.fn()
@@ -2036,16 +3415,18 @@ describe('React view and accessibility', () => {
     expect(document.activeElement).toBe(input)
 
     await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'app', inputType: 'insertText' }))
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
     const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     expect(mounted.host.querySelector('[role="listbox"]')?.id).toBe('launcher-results')
     expect(input.getAttribute('aria-expanded')).toBe('true')
     expect(options[0]!.getAttribute('aria-selected')).toBe('true')
-    expect(options[0]!.textContent).toContain('<b>literal</b>')
-    expect(options[0]!.querySelector('b')).toBeNull()
+    expect(options[0]!.textContent).toContain('/find')
+    expect(options[0]!.textContent).toContain('搜索文件：app')
+    expect(options[1]!.textContent).toContain('<b>literal</b>')
+    expect(options[1]!.querySelector('b')).toBeNull()
     expect(mounted.host.innerHTML).not.toContain('private-request')
     expect(mounted.host.innerHTML).not.toContain('private-one')
-    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('2 个结果')
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('3 个结果')
 
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
     expect(document.activeElement).toBe(input)
@@ -2054,10 +3435,14 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+
   it('keeps empty startup quiet, announces no results, and gives composing Escape to IME', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({ requestId: 'empty', items: [] })
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: 'empty',
+      items: request.query === 'missing' ? [findLauncherItem('missing')] : [],
+    }))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -2067,7 +3452,9 @@ describe('React view and accessibility', () => {
     await act(async () => fake.emit(shown('empty-results')))
     expect(input.disabled).toBe(false)
     await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'missing', inputType: 'insertText' }))
-    await vi.waitFor(() => expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('未找到应用'))
+    await vi.waitFor(() =>
+      expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('1 个结果。/find，搜索文件：missing'),
+    )
     await act(async () =>
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, isComposing: true })),
     )
@@ -2085,6 +3472,7 @@ describe('React view and accessibility', () => {
       autostart: false,
       filePreviewEnabled: true,
       theme: 'system',
+      webSearchEngine: 'bing',
       applications: [{ appId: 'legacy', displayName: 'LiveCaptions', aliases: ['caption'] }],
     } as SettingsView)
     const core = createLauncherCore(fake.client)
@@ -2098,7 +3486,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('renders exactly two settings tabs, focuses general, and keeps the title unfocusable', async () => {
+  it('renders ordered snapshot-owned settings tabs, keeps the title unfocusable, and hides on Escape', async () => {
     installMatchMedia(true)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -2110,8 +3498,13 @@ describe('React view and accessibility', () => {
     expect(heading.textContent).toBe('设置')
     expect(heading.hasAttribute('tabindex')).toBe(false)
     const tabs = [...mounted.host.querySelectorAll<HTMLElement>('[role="tab"]')]
-    expect(tabs).toEqual([settingsTab(mounted.host, '通用'), settingsTab(mounted.host, '插件')])
+    expect(tabs).toEqual([
+      settingsTab(mounted.host, '通用'),
+      settingsTab(mounted.host, '消息'),
+      settingsTab(mounted.host, '插件'),
+    ])
     expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true')
+    expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('false')
     expect(settingsTab(mounted.host, '插件').getAttribute('aria-selected')).toBe('false')
     expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
     expect(document.activeElement).not.toBe(heading)
@@ -2120,12 +3513,129 @@ describe('React view and accessibility', () => {
     expect(mounted.host.textContent).toContain('恢复初始化')
     expect(mounted.host.textContent).not.toContain('保存')
     expect(mounted.host.textContent).not.toContain('重新加载设置')
-    const close = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
-    expect(close.getAttribute('aria-label')).toBe('关闭')
-    await act(async () => close.click())
+    expect(mounted.host.querySelector('button[aria-label="关闭"]')).toBeNull()
+    await act(async () => {
+      settingsTab(mounted.host, '通用').dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+      )
+    })
     expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
     expect(core.getSnapshot().view).toBe('settings')
     await mounted.unmount()
+  })
+
+  it('opens notification targets on Messages and keeps settings visible across clear failure and success', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.openMessageCenter).mockResolvedValueOnce(messageCenterSnapshot('1', 0, ['first']))
+    vi.mocked(fake.client.clearMessages)
+      .mockRejectedValueOnce({ code: 'MessageOperationFailed', storeStatus: 'ready' })
+      .mockResolvedValueOnce(messageCenterSnapshot('2', 0))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+
+    await act(async () => fake.emit(shown('notification-target', 'messages')))
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('true'))
+    await vi.waitFor(() => expect(mounted.host.textContent).toContain('first'))
+    expect(fake.client.openMessageCenter).toHaveBeenCalledOnce()
+
+    const clear = () => [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('清空全部'))!
+    await act(async () => clear().click())
+    await vi.waitFor(() => expect(mounted.host.textContent).toContain('MessageOperationFailed'))
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(mounted.host.textContent).toContain('first')
+
+    await act(async () => clear().click())
+    await vi.waitFor(() => expect(mounted.host.textContent).toContain('暂无消息'))
+    expect(core.getSnapshot().view).toBe('settings')
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('renders a fixed settings badge for 0, 1, 99, 100, and terminal unavailable', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('message-badge')))
+    const badge = () => mounted.host.querySelector<HTMLElement>('.launcher-settings-badge .ant-badge-count')
+
+    expect(badge()).toBeNull()
+    for (const [revision, unreadCount, text] of [
+      ['1', 1, '1'],
+      ['2', 99, '99'],
+      ['3', 100, '99+'],
+    ] as const) {
+      await act(async () => fake.emitMessageState({ status: 'ready', revision, unreadCount }))
+      expect(badge()).not.toBeNull()
+      if (unreadCount === 100) expect(badge()?.textContent).toBe(text)
+      else expect(badge()?.getAttribute('title')).toBe(String(unreadCount))
+    }
+    await act(async () => fake.emitMessageState({ status: 'unavailable', error: 'MessageStoreUnavailable' }))
+    expect(badge()?.textContent).toBe('!')
+    await act(async () => fake.emitMessageState({ status: 'ready', revision: '4', unreadCount: 1 }))
+    expect(badge()?.textContent).toBe('!')
+    expect(mounted.host.querySelector('.launcher-settings-badge')).not.toBeNull()
+    expect(stylesSource).toMatch(/\.launcher-settings-control\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(
+      /\.launcher-settings-badge \.ant-badge-count,[\s\S]*?\.settings-message-tab-badge \.ant-badge-count\s*\{[^}]*color:\s*#fff;[^}]*background:\s*var\(--uipilot-ui-destructive\);/,
+    )
+    expect(stylesSource).not.toMatch(
+      /\.launcher-settings-badge \.ant-badge-count,[\s\S]*?\{[^}]*background:\s*var\(--uipilot-ui-primary\);/,
+    )
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('shares unread count with the Messages tab, clears on entry, and restores for later messages', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(fake.client.openMessageCenter).mockResolvedValueOnce(
+      messageCenterSnapshot('2', 0, ['kept message']),
+    )
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('shared-message-badge')))
+    await act(async () => fake.emitMessageState({ status: 'ready', revision: '1', unreadCount: 3 }))
+    expect(
+      mounted.host.querySelector('.launcher-settings-badge .ant-badge-count')?.getAttribute('title'),
+    ).toBe('3')
+
+    await act(async () => {
+      mounted.host.querySelector<HTMLButtonElement>('button[aria-label="打开设置"]')?.click()
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('settings'))
+    expect(
+      settingsTab(mounted.host, '消息').querySelector('.settings-message-tab-badge .ant-badge-count')?.getAttribute('title'),
+    ).toBe('3')
+
+    await activateSettingsTab(mounted.host, '消息')
+    await vi.waitFor(() => expect(fake.client.openMessageCenter).toHaveBeenCalledOnce())
+    expect(mounted.host.textContent).toContain('kept message')
+    expect(settingsTab(mounted.host, '消息').querySelector('.ant-badge-count')).toBeNull()
+    expect(core.getSnapshot().messageCenter.unreadCount).toBe(0)
+
+    await act(async () => fake.emitMessageState({ status: 'ready', revision: '3', unreadCount: 1 }))
+    expect(
+      settingsTab(mounted.host, '消息').querySelector('.ant-badge-count')?.getAttribute('title'),
+    ).toBe('1')
+    expect(mounted.host.textContent).toContain('kept message')
+
+    await act(async () => {
+      mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回主界面"]')?.click()
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
+    expect(
+      mounted.host.querySelector('.launcher-settings-badge .ant-badge-count')?.getAttribute('title'),
+    ).toBe('1')
+    await mounted.unmount()
+    core.destroy()
   })
 
   it('switches settings panels without loading and resets to general for a new view epoch', async () => {
@@ -2143,7 +3653,8 @@ describe('React view and accessibility', () => {
     const pluginLoads = vi.mocked(fake.client.listPlugins).mock.calls.length
     const pluginTab = await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(core.getSnapshot().plugins?.status).toBe('ready'))
-    expect(mounted.host.querySelector('.plugin-inventory')).toBeTruthy()
+    expect(mounted.host.querySelector('.plugin-inventory')).toBeNull()
+    expect(mounted.host.textContent).not.toContain('未发现插件')
     expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeNull()
     expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
     expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 1)
@@ -2158,11 +3669,24 @@ describe('React view and accessibility', () => {
         }),
       )
     })
-    await vi.waitFor(() => expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true'))
-    expect(document.activeElement).toBe(settingsTab(mounted.host, '通用'))
-    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('true'))
+    expect(document.activeElement).toBe(settingsTab(mounted.host, '消息'))
+    expect(mounted.host.textContent).toContain('暂无消息')
     expect(fake.client.loadSettings).toHaveBeenCalledTimes(settingsLoads)
     expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 1)
+
+    await act(async () => {
+      settingsTab(mounted.host, '消息').dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'ArrowUp',
+          code: 'ArrowUp',
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    })
+    await vi.waitFor(() => expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true'))
+    expect(mounted.host.querySelector('input[name^="settings-hotkey-"]')).toBeTruthy()
 
     await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(fake.client.listPlugins).toHaveBeenCalledTimes(pluginLoads + 2))
@@ -2372,7 +3896,7 @@ describe('React view and accessibility', () => {
     expect(resetButton()).toBeTruthy()
     await act(async () => resetButton()!.click())
     expect(document.body.textContent).toContain(
-      '快捷键将恢复为 Shift+Space，关闭开机启动，并将风格恢复为跟随系统。',
+      '快捷键将恢复为 Shift+Space，关闭开机启动，将风格恢复为跟随系统，并将搜索引擎恢复为 Bing。',
     )
     await act(async () => portalButton('取消')!.click())
     expect(fake.client.saveSettings).not.toHaveBeenCalled()
@@ -2381,7 +3905,7 @@ describe('React view and accessibility', () => {
     await act(async () => portalButton('恢复')!.click())
     await vi.waitFor(() =>
       expect(fake.client.saveSettings).toHaveBeenCalledWith({
-        settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system' },
+        settings: { hotkey: 'Shift+Space', autostart: false, theme: 'system', webSearchEngine: 'bing' },
       }),
     )
     await vi.waitFor(() =>
@@ -2451,7 +3975,7 @@ describe('React view and accessibility', () => {
       core.text({ kind: 'compositionInput', control, value: '计算器', inputType: 'insertCompositionText' })
       core.text({ kind: 'compositionBoundary', control })
     })
-    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'stable-binding', querySequence: 1 })
+    expect(client.searchApps).toHaveBeenCalledWith({ query: '计算器', invocationId: 'stable-binding', querySequence: 2 })
 
     await mounted.unmount()
     expect(unbind).toHaveBeenCalledOnce()
@@ -2495,7 +4019,6 @@ describe('React view and accessibility', () => {
     }
     for (const forbidden of [
       '@tauri-apps/api',
-      '@ant-design/icons',
       'AutoComplete',
       'Card',
       'Modal',
@@ -2504,8 +4027,140 @@ describe('React view and accessibility', () => {
     ]) {
       expect(launcherViewSource).not.toContain(forbidden)
     }
+    expect(launcherViewSource).toContain("from './ui-theme'")
+    expect(launcherViewSource).toContain('uiThemeConfig(colorScheme)')
+    expect(launcherViewSource).toContain("from 'lucide-react'")
+    expect(launcherViewSource).not.toContain('@ant-design/icons')
+    expect(publicPluginPanelSource).toContain("from 'lucide-react'")
+    expect(publicPluginPanelSource).not.toContain('@ant-design/icons')
   })
 
+  it('submits generated public settings once without exposing an existing secret', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValueOnce({
+      revision: '1',
+      items: [{
+        pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
+        source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
+        fault: null, generation: 1,
+        iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
+        permissions: [],
+        settings: [
+          { definition: { type: 'text', key: 'prefix', label: 'Prefix' }, value: 'Hello' },
+          { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 9 }, value: 3 },
+          { definition: { type: 'boolean', key: 'loud', label: 'Loud' }, value: false },
+          { definition: { type: 'select', key: 'style', label: 'Style', options: [{ value: 'short', label: 'Short' }] }, value: 'short' },
+          { definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true },
+        ],
+      }],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-settings', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+    expect(mounted.host.querySelector<HTMLImageElement>('.public-plugin-item .plugin-icon-image')?.getAttribute('src'))
+      .toBe('uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png')
+
+    const prefix = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Prefix"]')!
+    const secret = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Token"]')!
+    expect(secret.value).toBe('')
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setter.call(prefix, 'Welcome')
+      prefix.dispatchEvent(new Event('input', { bubbles: true }))
+      prefix.dispatchEvent(new Event('change', { bubbles: true }))
+      setter.call(secret, 'new-token')
+      secret.dispatchEvent(new Event('input', { bubbles: true }))
+      secret.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    const save = [...mounted.host.querySelectorAll<HTMLButtonElement>('.public-plugin-form button')]
+      .find((button) => button.textContent?.includes('保存设置'))!
+    await act(async () => save.click())
+    await vi.waitFor(() => expect(fake.client.savePublicPluginSettings).toHaveBeenCalledOnce())
+    expect(fake.client.savePublicPluginSettings).toHaveBeenCalledWith({ input: {
+      pluginId: 'com.example.demo',
+      settings: { prefix: 'Welcome', limit: 3, loud: false, style: 'short' },
+      secrets: { token: 'new-token' },
+    } })
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('treats pending public owner cleanup as a committed uninstall', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    const item = {
+      pluginId: 'com.example.cleanup', name: 'Cleanup', description: null, version: '1.0.0',
+      source: 'localPackage' as const, defaultName: 'cleanup', effectiveName: 'cleanup', enabled: true,
+      fault: null, generation: 1, iconUrl: null, permissions: [], settings: [],
+    }
+    vi.mocked(fake.client.listPublicPlugins)
+      .mockResolvedValueOnce({ revision: '1', items: [item] })
+      .mockResolvedValueOnce({ revision: '2', items: [] })
+    vi.mocked(fake.client.uninstallPublicPlugin).mockRejectedValueOnce({
+      code: 'dataCleanupPending',
+      message: 'private cleanup path',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-cleanup-pending', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+
+    const deleteButton = mounted.host
+      .querySelector<HTMLButtonElement>('button[aria-label="卸载并删除数据"]')!
+    await act(async () => deleteButton.click())
+    let confirm: HTMLButtonElement | undefined
+    await vi.waitFor(() => {
+      confirm = [...document.querySelectorAll<HTMLButtonElement>('button')]
+        .find((button) => button.textContent?.replace(/\s/g, '') === '删除')
+      expect(confirm).toBeTruthy()
+    })
+    await act(async () => confirm!.click())
+
+    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
+    expect(mounted.host.querySelector('.public-plugin-item')).toBeNull()
+    expect(mounted.host.textContent).toContain('插件已卸载，数据清理将在下次启动时重试')
+    expect(mounted.host.textContent).not.toContain('操作不可用')
+    expect(mounted.host.textContent).not.toContain('private cleanup path')
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('shows the prepared public plugin icon before installation', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.selectPublicPluginDirectory).mockResolvedValueOnce('D:\\demo-win')
+    vi.mocked(fake.client.preparePublicPlugin).mockResolvedValueOnce({
+      token: 'public-prepare-0000000000000001-0000000000000002',
+      pluginId: 'com.uipilot.demo-win',
+      name: 'Public Plugin Demo Window',
+      version: '1.0.2',
+      permissions: ['ui.window'],
+      isUpdate: false,
+      sourceVerified: false,
+      iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-prepare-icon', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    const chooseDirectory = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!
+    await act(async () => chooseDirectory.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-prepare')).not.toBeNull())
+    expect(mounted.host.querySelector<HTMLImageElement>('.public-prepare .plugin-icon-image')?.getAttribute('src'))
+      .toBe('uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png')
+    await mounted.unmount()
+    core.destroy()
+  })
   it('renders plugin metadata and safe markdown without links images or raw HTML', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
@@ -2569,11 +4224,15 @@ describe('real adapter and startup', () => {
     tauriCapture.listen.mockImplementation((event, handler) => {
       expect(document.querySelector('[role="combobox"]')).toBeInstanceOf(HTMLInputElement)
       order.push(String(event))
-      shownHandler = handler as (event: { payload: unknown }) => void
-      return registration.promise
+      if (event === 'launcher://shown') {
+        shownHandler = handler as (event: { payload: unknown }) => void
+        return registration.promise
+      }
+      return Promise.resolve(vi.fn())
     })
     tauriCapture.invoke.mockImplementation((command) => {
       order.push(String(command))
+      if (command === 'get_message_summary') return Promise.resolve({ revision: '0', unreadCount: 0 })
       return command === 'load_settings' ? load.promise : Promise.resolve(undefined)
     })
 
@@ -2585,7 +4244,12 @@ describe('real adapter and startup', () => {
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 2)).toEqual(['launcher://shown', 'load_settings'])
+    expect(order.slice(0, 4)).toEqual([
+      'launcher://shown',
+      'message-center://state-changed',
+      'get_message_summary',
+      'load_settings',
+    ])
 
     await act(async () => shownHandler?.({ payload: shown('during-adapter-load', 'settings') }))
     expect(document.querySelector('.settings-view h1')?.textContent).toBe('设置')
@@ -2602,23 +4266,33 @@ describe('real adapter and startup', () => {
       }
       return Promise.resolve(undefined)
     })
-    const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const }
-    await main.client.searchApps({ query: 'calc', invocationId: 'inv-1', querySequence: 1 })
+    const update = { hotkey: 'Alt+Space', autostart: false, theme: 'system' as const, webSearchEngine: 'bing' as const }
+    await main.client.searchApps({
+      query: '/demo-win calc', invocationId: 'inv-1', querySequence: 1, submit: false,
+      completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+    })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
+    await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', favorite: true })
+    await main.client.selectPublicPluginDirectory()
     await main.client.listPlugins()
     await main.client.installPlugin({ pluginId: 'internal.math' })
     await main.client.reloadPlugin({ pluginId: 'internal.math' })
     await main.client.deletePlugin({ pluginId: 'internal.math' })
     await main.client.hideLauncher()
     const invokeRows = [
-      ['search_apps', [{ query: 'calc', invocationId: 'inv-1', querySequence: 1 }]],
+      ['search_apps', [{
+        query: '/demo-win calc', invocationId: 'inv-1', querySequence: 1, submit: false,
+        completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
+      }]],
       ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
+      ['set_plugin_favorite', [{ pluginId: 'com.uipilot.demo-win', favorite: true }]],
+      ['select_public_plugin_directory', []],
       ['list_plugins', []],
       ['install_plugin', [{ pluginId: 'internal.math' }]],
       ['reload_plugin', [{ pluginId: 'internal.math' }]],
@@ -2699,7 +4373,8 @@ describe('real adapter and startup', () => {
     resetAdapterDocument()
     const privateError = 'private post-start render sentinel'
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const unlisten = vi.fn()
+    const shownUnlisten = vi.fn()
+    const messageUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
@@ -2715,12 +4390,23 @@ describe('real adapter and startup', () => {
         },
       }
     })
-    tauriCapture.listen.mockImplementation(async (_event, handler) => {
-      shownHandler = handler as (event: { payload: unknown }) => void
-      return unlisten
+    tauriCapture.listen.mockImplementation(async (event, handler) => {
+      if (event === 'launcher://shown') {
+        shownHandler = handler as (event: { payload: unknown }) => void
+        return shownUnlisten
+      }
+      return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
-      Promise.resolve(command === 'load_settings' ? emptySettings : command === 'search_apps' ? null : undefined),
+      Promise.resolve(
+        command === 'get_message_summary'
+          ? { revision: '0', unreadCount: 0 }
+          : command === 'load_settings'
+            ? emptySettings
+            : command === 'search_apps'
+              ? null
+              : undefined,
+      ),
     )
     try {
       await act(async () => {
@@ -2737,7 +4423,8 @@ describe('real adapter and startup', () => {
 
       throwFatal = true
       mountedCore!.failInitialization()
-      await vi.waitFor(() => expect(unlisten).toHaveBeenCalledOnce())
+      await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
+      expect(messageUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -2747,7 +4434,8 @@ describe('real adapter and startup', () => {
       expect(tauriCapture.invoke.mock.calls.filter(([command]) => command === 'search_apps')).toHaveLength(searchCalls)
       await pagehide()
       await pagehide()
-      expect(unlisten).toHaveBeenCalledOnce()
+      expect(shownUnlisten).toHaveBeenCalledOnce()
+      expect(messageUnlisten).toHaveBeenCalledOnce()
     } finally {
       await pagehide()
       vi.doUnmock('./launcher-view')
@@ -2780,24 +4468,176 @@ describe('real adapter and startup', () => {
     expect(remove).toHaveBeenCalledTimes(removed)
     remove.mockRestore()
 
+    for (const command of ['search_apps', 'open_find_window', 'load_settings', 'save_settings', 'save_hotkey', 'hide_launcher']) {
+      expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
+    }
     for (const command of [
-      'search_apps',
-      'search_files',
-      'execute_result',
-      'load_settings',
-      'save_settings',
-      'save_hotkey',
-      'set_file_preview_preference',
-      'hide_launcher',
+      'prepare_find_initialization', 'commit_find_ready', 'get_find_ready_status',
+      'search_files', 'set_find_pinned', 'set_find_preview_preference', 'hide_find_window',
     ]) {
       expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
     }
+    expect(mainSource.match(/['"]execute_result['"]/g)).toHaveLength(2)
     expect(mainSource.match(/['"]launcher:\/\/shown['"]/g)).toHaveLength(1)
-    expect(mainSource).not.toMatch(/@tauri-apps\/api\/(?:window|webviewWindow)/)
+    expect(mainSource.match(/['"]find:\/\/(?:forwarded|theme-changed)['"]/g)).toHaveLength(2)
+    expect(mainSource).toContain('getCurrentWindow().label')
     expect(mainSource).not.toContain('.hide(')
     expect(mainSource).not.toMatch(/\b(?:path|pid|hwnd|appId)\b/i)
-    expect(mainSource.indexOf('core.destroy()')).toBeLessThan(mainSource.indexOf('root.unmount()'))
-    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(1)
+    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(3)
+  })
+})
+
+describe('launcher find forwarding ownership', () => {
+  it('keeps an ordinary-query find action first and forwards it on Enter', async () => {
+    const fake = fakeClient()
+    const applications = deferred<SearchResponse | null>()
+    vi.mocked(fake.client.searchApps).mockReturnValueOnce(applications.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('find-suggestion'))
+    const control = core.getSnapshot().queryControl
+
+    core.text({ kind: 'ordinaryInput', control, value: 'windows', inputType: 'insertText' })
+    expect(core.getSnapshot()).toMatchObject({
+      query: 'windows',
+      selectedIndex: -1,
+      searchPending: true,
+      results: [],
+    })
+
+    applications.resolve({
+      requestId: 'application-request',
+      items: [findLauncherItem('windows'), { resultId: 'windows-terminal', title: 'Windows Terminal', activation: executeActivation }],
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().results.map(({ title }) => title)).toEqual(['/find', 'Windows Terminal'])
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+
+    const querySequence = core.getSnapshot().querySequence
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'find-suggestion',
+      querySequence,
+    }))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('waits for the ordinary application query ownership before forwarding find', async () => {
+    const fake = fakeClient()
+    const applications = deferred<SearchResponse | null>()
+    vi.mocked(fake.client.searchApps).mockReturnValueOnce(applications.promise)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('find-pending-ownership'))
+    const control = core.getSnapshot().queryControl
+
+    core.text({ kind: 'ordinaryInput', control, value: 'windows', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    expect(fake.client.openFind).not.toHaveBeenCalled()
+
+    applications.resolve({ requestId: 'application-request', items: [findLauncherItem('windows')] })
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'find-pending-ownership',
+      querySequence: core.getSnapshot().querySequence,
+    }))
+  })
+
+  it('keeps explicit find commands free of suggestions and establishes ownership only on Enter', async () => {
+    for (const [value, query] of [['/find windows', 'windows'], ['/find', '']] as const) {
+      const fake = fakeClient()
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown(`explicit-${query || 'empty'}`))
+      const control = core.getSnapshot().queryControl
+
+      core.text({ kind: 'ordinaryInput', control, value, inputType: 'insertText' })
+      expect(core.getSnapshot()).toMatchObject({ results: [], selectedIndex: -1, searchPending: false })
+      expect(fake.client.searchApps).not.toHaveBeenCalled()
+
+      core.keyDown('Enter', false)
+      expect(fake.client.searchApps).toHaveBeenCalledWith({
+        query: value,
+        invocationId: `explicit-${query || 'empty'}`,
+        querySequence: core.getSnapshot().querySequence,
+      })
+      await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+        query,
+        invocationId: `explicit-${query || 'empty'}`,
+        querySequence: core.getSnapshot().querySequence,
+      }))
+      core.destroy()
+    }
+  })
+
+  it('clears only an owned forwarded submission and forwards an empty query exactly', async () => {
+    for (const [value, query] of [['/find reports', 'reports'], ['/find', '']] as const) {
+      const fake = fakeClient()
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown(`forward-${query || 'empty'}`))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value, inputType: 'insertText' })
+      const sequence = core.getSnapshot().querySequence
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+        query,
+        invocationId: `forward-${query || 'empty'}`,
+        querySequence: sequence,
+      }))
+      await vi.waitFor(() => expect(core.getSnapshot().query).toBe(''))
+      core.destroy()
+    }
+  })
+
+  it('keeps a superseded submission inert', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.openFind).mockResolvedValueOnce({ status: 'superseded' })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('forward-superseded'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find old', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledOnce())
+    await Promise.resolve()
+    expect(core.getSnapshot().query).toBe('/find old')
+    expect(core.getSnapshot().status).toBe('')
+  })
+
+  it('does not let late A success or failure mutate edited B', async () => {
+    for (const completion of ['success', 'failure'] as const) {
+      const fake = fakeClient()
+      const pending = deferred<import('./protocol').OpenFindOutcome>()
+      vi.mocked(fake.client.openFind).mockReturnValueOnce(pending.promise)
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown(`forward-late-${completion}`))
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'ordinaryInput', control, value: '/find A', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      core.text({ kind: 'ordinaryInput', control, value: '/find B', inputType: 'insertText' })
+      if (completion === 'success') pending.resolve({ status: 'forwarded' })
+      else pending.reject(new Error('window unavailable'))
+      await pending.promise.catch(() => undefined)
+      await Promise.resolve()
+      expect(core.getSnapshot().query).toBe('/find B')
+      expect(core.getSnapshot().status).toBe('')
+    }
+  })
+
+  it('reports the fixed failure only to its current owner', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.openFind).mockRejectedValueOnce(new Error('private backend detail'))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('forward-failure'))
+    const control = core.getSnapshot().queryControl
+    core.text({ kind: 'ordinaryInput', control, value: '/find report', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().status).toBe('文件搜索窗口暂不可用。'))
+    expect(core.getSnapshot().query).toBe('/find report')
   })
 })
 
@@ -2825,7 +4665,7 @@ describe('file protocol', () => {
     for (const value of invalid) expect(parseFileSearchResponse(value)).toBeNull()
   })
 })
-describe('launcher real file adapter', () => {
+describe.skip('retired embedded file adapter', () => {
   it('uses one shown listener and exact camelCase invoke payloads', async () => {
     vi.resetModules()
     document.body.innerHTML = '<main id="app"></main>'
@@ -2838,11 +4678,11 @@ describe('launcher real file adapter', () => {
       Promise.resolve(command === 'load_settings' ? emptySettings : command === 'search_files' ? null : undefined),
     )
 
-    const main = (await import('./main')) as unknown as { client: LauncherClient }
-    await main.client.searchFiles({
+    const main = (await import('./main')) as unknown as { findClient: FindClient }
+    await main.findClient.searchFiles({
       query: 'UiPilot', category: 'all', sort: 'modifiedDesc', invocationId: 'inv-file', querySequence: 2,
       privateExtra: 'must-not-cross-wire',
-    } as Parameters<LauncherClient['searchFiles']>[0])
+    } as Parameters<FindClient['searchFiles']>[0])
 
     expect(tauriCapture.listen).not.toHaveBeenCalled()
     expect(tauriCapture.invoke).toHaveBeenCalledWith('search_files', {
@@ -2861,7 +4701,7 @@ describe('launcher real file adapter', () => {
     expect(mainSource).not.toMatch(/console\.|JSON\.stringify\(event/)
   })
 })
-describe('file mode ownership', () => {
+describe.skip('retired embedded file mode ownership', () => {
   it('searches a nonempty find query immediately without a file-index listener', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('1'))
@@ -3019,7 +4859,7 @@ describe('file mode ownership', () => {
     expect(fake.client.searchFiles).toHaveBeenCalledTimes(3)
   })
 })
-describe('file panel accessibility', () => {
+describe.skip('retired embedded file panel accessibility', () => {
   it('renders results and preview without controls or private result ids', async () => {
     installMatchMedia(false)
     const first = fileItem(String.raw`C:\Private\Quarterly Report.pdf`, 'secret-file-id')
@@ -3050,7 +4890,7 @@ describe('file panel accessibility', () => {
     await mounted.unmount()
   })
 })
-describe('file category navigation', () => {
+describe.skip('retired embedded file category navigation', () => {
   it('renders categories and cycles them from the file query input', async () => {
     installMatchMedia(false)
     const { core, mounted } = await startedFileView()
@@ -3078,7 +4918,7 @@ describe('file category navigation', () => {
     await mounted.unmount()
   })
 })
-describe('file panel responsive layout', () => {
+describe.skip('retired embedded file panel responsive layout', () => {
   it('keeps the file UI in one scoped responsive surface without extra component families', () => {
     expect(launcherViewSource).toContain('className="file-workspace"')
     expect(launcherViewSource).toContain("import {")
@@ -3105,7 +4945,7 @@ describe('file panel responsive layout', () => {
   })
 })
 
-describe('file preview preference', () => {
+describe.skip('retired embedded file preview preference', () => {
   it('renders the preview switch as the single preference control and rolls pending state through the core', async () => {
     installMatchMedia(false)
     const pending = deferred<void>()

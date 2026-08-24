@@ -2,6 +2,10 @@ import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 
 export default defineConfig(({ mode }) => ({
+  test: {
+    include: ['src/**/*.test.{ts,tsx}', 'examples/plugins/**/*.test.js'],
+    exclude: ['**/.worktrees/**'],
+  },
   server: {
     host: '127.0.0.1',
     port: 14321,

@@ -1,0 +1,32 @@
+import type {
+  PluginHandler,
+  PluginInvocation,
+  PluginWindowUpdate,
+  UiPilotPluginWindowApiV1,
+} from '../../../../docs/plugin-sdk/uipilot-plugin-api-v1'
+
+const windowHandler: PluginHandler = async (invocation, api) => {
+  const previous = await api.storage.get('lastInput')
+  await api.storage.set('lastInput', invocation.input)
+  await api.notifications.schedule({ content: invocation.input, delayMs: 10_000 })
+  return {
+    requestId: invocation.requestId,
+    data: { previous, current: invocation.input },
+  }
+}
+
+const immediateMessageHandler: PluginHandler = async (invocation, api) => {
+  await api.notifications.publish({ content: invocation.input })
+  return { requestId: invocation.requestId, data: null }
+}
+
+const consumeWindowApi = (api: Readonly<UiPilotPluginWindowApiV1>) =>
+  api.onUpdate((update: Readonly<PluginWindowUpdate>) => {
+    const instance: 1 = update.instanceNumber
+    void instance
+  })
+
+declare const invocation: Readonly<PluginInvocation>
+void windowHandler(invocation, {} as never)
+void immediateMessageHandler(invocation, {} as never)
+void consumeWindowApi

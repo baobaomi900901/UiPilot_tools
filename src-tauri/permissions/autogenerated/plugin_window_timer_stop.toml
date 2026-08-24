@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-window-timer-stop"
+description = "Enables the plugin_window_timer_stop command without any pre-configured scope."
+commands.allow = ["plugin_window_timer_stop"]
+
+[[permission]]
+identifier = "deny-plugin-window-timer-stop"
+description = "Denies the plugin_window_timer_stop command without any pre-configured scope."
+commands.deny = ["plugin_window_timer_stop"]

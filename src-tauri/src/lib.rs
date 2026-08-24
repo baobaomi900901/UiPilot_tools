@@ -5,6 +5,8 @@ use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+use find_window::{FocusEffect, WindowLabel};
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 use lifecycle::ShowTarget;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -14,7 +16,19 @@ use plugins::{PluginManager, Version};
 mod atomic_file;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod message_center;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod native_attention;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod commands;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod calculator;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod web_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod apps;
@@ -24,6 +38,12 @@ mod model;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod result_registry;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod public_plugins;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod find_window;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod settings;
@@ -46,7 +66,18 @@ mod file_index;
 mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod plugin_window;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugins;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod window_transfer;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+#[doc(hidden)]
+pub fn public_plugin_manifest_schema() -> serde_json::Value {
+    serde_json::to_value(public_plugins::public_manifest_v1_schema())
+        .expect("public plugin schema must serialize")
+}
 
 #[cfg(all(not(test), feature = "test-instrumentation"))]
 mod security_probe;
@@ -69,10 +100,15 @@ fn setup_production_lifecycle(
     app_cache: &Arc<apps::AppCache>,
     coordinator: &Arc<lifecycle::LifecycleCoordinator>,
     plugin_manager: &Arc<PluginManager>,
+    public_plugin_service: &Arc<public_plugins::PublicPluginService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
     plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;
     plugin_manager.create_runtimes(app, &app_data_dir)?;
+    let message_center = Arc::new(message_center::MessageCenterService::load(&app_data_dir));
+    if !app.manage(Arc::clone(&message_center)) {
+        return Err(lifecycle_setup_error().into());
+    }
     let settings = load_settings_store(&app_data_dir)?;
     let persisted_settings = settings.snapshot();
     if !app.manage(settings) {
@@ -87,17 +123,71 @@ fn setup_production_lifecycle(
     let event_coordinator = Arc::clone(coordinator);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
-            let registry = event_app.state::<result_registry::ResultRegistry>();
-            let _ = event_coordinator.handle_focus_event_with(*focused, || {
-                commands::clear_and_hide(&registry, &event_window).map_err(|_| ())
-            });
+            event_app
+                .state::<Arc<message_center::MessageCenterService>>()
+                .observe_main_focus(*focused);
+            let transfers =
+                event_app.state::<Arc<window_transfer::MainWindowTransferCoordinator>>();
+            let expected_blur = !*focused && transfers.consume_expected_main_blur();
+            if expected_blur {
+                return;
+            }
+            let registries = event_app.state::<result_registry::ResultRegistries>();
+            let controller = event_app.state::<Arc<find_window::FindWindowController>>();
+            let effect = controller.observe_focus(WindowLabel::Main, *focused);
+            if effect == FocusEffect::ClearAndHideMain {
+                let _ = event_coordinator.handle_focus_event_with(*focused, || {
+                    commands::clear_and_hide(registries.main(), &event_window).map_err(|_| ())
+                });
+            } else {
+                let _ = lifecycle::handle_find_focus_effect(
+                    &event_app,
+                    controller.inner().as_ref(),
+                    &registries,
+                    effect,
+                );
+            }
         }
         tauri::WindowEvent::CloseRequested { api, .. }
             if event_coordinator.should_prevent_close() =>
         {
             api.prevent_close();
-            let registry = event_app.state::<result_registry::ResultRegistry>();
-            let _ = commands::clear_and_hide(&registry, &event_window);
+            let registries = event_app.state::<result_registry::ResultRegistries>();
+            let _ = commands::clear_and_hide(registries.main(), &event_window);
+        }
+        _ => {}
+    });
+
+    let find = app
+        .get_webview_window("find")
+        .ok_or_else(lifecycle_setup_error)?;
+    let find_app = app.handle().clone();
+    let find_window = find.clone();
+    let find_coordinator = Arc::clone(coordinator);
+    find.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(focused) => {
+            let registries = find_app.state::<result_registry::ResultRegistries>();
+            let controller = find_app.state::<Arc<find_window::FindWindowController>>();
+            let effect = controller.observe_focus(WindowLabel::Find, *focused);
+            let _ = lifecycle::handle_find_focus_effect(
+                &find_app,
+                controller.inner().as_ref(),
+                &registries,
+                effect,
+            );
+        }
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            if find_coordinator.should_prevent_close() {
+                api.prevent_close();
+                let registries = find_app.state::<result_registry::ResultRegistries>();
+                let controller = find_app.state::<Arc<find_window::FindWindowController>>();
+                if let Some(invocation_id) = controller.current_invocation() {
+                    let hidden = find_window.hide().is_ok();
+                    controller.finish_explicit_hide(&invocation_id, hidden, &registries);
+                } else {
+                    let _ = find_window.hide();
+                }
+            }
         }
         _ => {}
     });
@@ -126,10 +216,11 @@ fn setup_production_lifecycle(
     let icon = app
         .default_window_icon()
         .cloned()
+        .map(tauri::image::Image::to_owned)
         .ok_or_else(lifecycle_setup_error)?;
     let tray_coordinator = Arc::clone(coordinator);
-    tauri::tray::TrayIconBuilder::new()
-        .icon(icon)
+    let tray = tauri::tray::TrayIconBuilder::new()
+        .icon(icon.clone())
         .menu(&menu)
         .on_menu_event(
             move |app, event| match lifecycle::tray_action(event.id().as_ref()) {
@@ -143,7 +234,35 @@ fn setup_production_lifecycle(
         .build(app)
         .map_err(|_| lifecycle_setup_error())?;
 
+    let notification_app = app.handle().clone();
+    let notification_coordinator = Arc::clone(coordinator);
+    let route_messages: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = notification_coordinator.request_show(&notification_app, ShowTarget::Messages);
+    });
+    let toast = native_attention::windows_toast();
+    let tray_attention = native_attention::tauri_tray(tray, icon);
+    let message_sound = app
+        .path()
+        .resolve(
+            "resources/sounds/message-notification.wav",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|_| lifecycle_setup_error())?;
+    let attention_audio = native_attention::windows_audio(message_sound);
+    message_center
+        .install_native_effects(toast, tray_attention, attention_audio)
+        .map_err(|_| lifecycle_setup_error())?;
+    public_plugin_service.initialize(
+        app.handle(),
+        &app_data_dir,
+        ["find".into(), "math".into(), "web-search".into()],
+        Arc::clone(&message_center),
+        native_attention::attention_route(route_messages),
+    )?;
+
     lifecycle::install_session_end_hook(app.handle(), &window)
+        .map_err(|_| lifecycle_setup_error())?;
+    lifecycle::install_find_position_hook(app.handle(), &find)
         .map_err(|_| lifecycle_setup_error())?;
     let hwnd = window.hwnd().map_err(|_| lifecycle_setup_error())?;
     app.state::<Arc<file_index::FileIndex>>()
@@ -157,6 +276,11 @@ fn setup_production_lifecycle(
     Ok(())
 }
 
+pub fn prepare_windows_identity() {
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    native_attention::prepare_process_identity();
+}
+
 pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let app_cache = Arc::new(apps::AppCache::new());
@@ -165,12 +289,21 @@ pub fn run() {
     let coordinator = Arc::new(lifecycle::LifecycleCoordinator::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
-    let result_registry = result_registry::ResultRegistry::default();
+    let result_registries = result_registry::ResultRegistries::default();
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let find_controller = Arc::new(find_window::FindWindowController::default());
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let plugin_window_controller = Arc::new(plugin_window::PluginWindowController::default());
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let main_window_transfers = Arc::new(window_transfer::MainWindowTransferCoordinator::default());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let file_index = Arc::new(file_index::FileIndex::new(
         Arc::clone(&coordinator),
-        result_registry.clone(),
+        result_registries.find().clone(),
     ));
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -178,6 +311,9 @@ pub fn run() {
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let plugin_manager = Arc::new(PluginManager::new());
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());
 
     let builder = tauri::Builder::default();
 
@@ -205,19 +341,71 @@ pub fn run() {
         )
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
         .manage(everything_search)
         .manage(Arc::clone(&plugin_manager))
+        .register_uri_scheme_protocol("uipilot-public-plugin", {
+            let public_plugin_service = Arc::clone(&public_plugin_service);
+            move |ctx, request| {
+                public_plugin_service.asset_response(
+                    ctx.webview_label(),
+                    request.uri().path(),
+                    request.uri().query(),
+                )
+            }
+        })
+        .manage(Arc::clone(&public_plugin_service))
         .register_uri_scheme_protocol("uipilot-plugin", {
             let plugin_manager = Arc::clone(&plugin_manager);
             move |ctx, request| {
                 plugin_manager.asset_response(ctx.webview_label(), request.uri().path())
             }
         })
-        .manage(result_registry)
+        .manage(result_registries)
+        .manage(Arc::clone(&find_controller))
+        .manage(Arc::clone(&plugin_window_controller))
+        .manage(Arc::clone(&main_window_transfers))
         .invoke_handler(tauri::generate_handler![
+            commands::open_find_window,
+            commands::prepare_find_initialization,
+            commands::commit_find_ready,
+            commands::get_find_ready_status,
+            commands::set_find_pinned,
+            commands::set_find_preview_preference,
+            commands::hide_find_window,
+            commands::select_public_plugin_directory,
+            commands::list_public_plugins,
+            commands::prepare_public_plugin_install,
+            commands::commit_public_plugin_install,
+            commands::cancel_public_plugin_install,
+            commands::set_plugin_enabled,
+            commands::set_plugin_favorite,
+            commands::set_plugin_effective_name,
+            commands::save_plugin_settings,
+            commands::uninstall_plugin,
+            commands::plugin_api_call,
+            commands::complete_plugin_command,
+            commands::plugin_window_content_ready,
+            commands::plugin_window_content_ack,
+            commands::plugin_window_content_close,
+            commands::plugin_window_storage_get,
+            commands::plugin_window_storage_set,
+            commands::plugin_window_storage_remove,
+            commands::plugin_window_timer_get_state,
+            commands::plugin_window_timer_start,
+            commands::plugin_window_timer_stop,
+            commands::plugin_window_timer_reset,
+            commands::commit_plugin_window_transfer,
+            commands::get_public_plugin_window_identity,
+            commands::set_plugin_window_pinned,
+            commands::close_plugin_window,
+            commands::get_message_summary,
+            commands::open_message_center,
+            commands::read_message_center,
+            commands::clear_messages,
             commands::search_apps,
             commands::publish_plugin_results,
             commands::search_files,
@@ -231,6 +419,7 @@ pub fn run() {
             commands::save_hotkey,
             commands::set_file_preview_preference,
             commands::set_theme_preference,
+            commands::set_web_search_engine,
             commands::hide_launcher,
         ]);
 
@@ -243,13 +432,25 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let run_file_index = Arc::clone(&file_index);
 
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let run_find_controller = Arc::clone(&find_controller);
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let run_public_plugin_service = Arc::clone(&public_plugin_service);
+
     let app = builder
         .setup(move |_app| {
             #[cfg(all(not(test), feature = "test-instrumentation"))]
             security_probe::setup(_app)?;
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
-            setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;
+            setup_production_lifecycle(
+                _app,
+                &app_cache,
+                &coordinator,
+                &plugin_manager,
+                &public_plugin_service,
+            )?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -262,6 +463,10 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                run_public_plugin_service.shutdown();
+                _app.state::<Arc<message_center::MessageCenterService>>()
+                    .shutdown();
+                run_find_controller.shutdown();
                 run_file_index.enter_terminal();
                 run_coordinator.uninstall_hook_for_exit();
                 run_coordinator.observe_run_exit();
@@ -431,8 +636,45 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 14);
+        assert_eq!(production.matches("commands::").count(), 51);
         for command in [
+            "open_find_window",
+            "prepare_find_initialization",
+            "commit_find_ready",
+            "get_find_ready_status",
+            "set_find_pinned",
+            "set_find_preview_preference",
+            "hide_find_window",
+            "select_public_plugin_directory",
+            "list_public_plugins",
+            "prepare_public_plugin_install",
+            "commit_public_plugin_install",
+            "cancel_public_plugin_install",
+            "set_plugin_enabled",
+            "set_plugin_favorite",
+            "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
+            "plugin_api_call",
+            "complete_plugin_command",
+            "plugin_window_content_ready",
+            "plugin_window_content_ack",
+            "plugin_window_content_close",
+            "plugin_window_storage_get",
+            "plugin_window_storage_set",
+            "plugin_window_storage_remove",
+            "plugin_window_timer_get_state",
+            "plugin_window_timer_start",
+            "plugin_window_timer_stop",
+            "plugin_window_timer_reset",
+            "commit_plugin_window_transfer",
+            "get_public_plugin_window_identity",
+            "set_plugin_window_pinned",
+            "close_plugin_window",
+            "get_message_summary",
+            "open_message_center",
+            "read_message_center",
+            "clear_messages",
             "search_apps",
             "publish_plugin_results",
             "search_files",
@@ -446,6 +688,7 @@ mod tests {
             "save_hotkey",
             "set_file_preview_preference",
             "set_theme_preference",
+            "set_web_search_engine",
             "hide_launcher",
         ] {
             assert!(production.contains(&format!("commands::{command}")));
@@ -456,23 +699,19 @@ mod tests {
             .expect("test module marker is missing");
         assert_eq!(
             production_root
-                .matches("result_registry::ResultRegistry::default()")
+                .matches("result_registry::ResultRegistries::default()")
                 .count(),
             1
         );
-        assert_eq!(
-            production_root
-                .matches("manage(result_registry::ResultRegistry::default())")
-                .count(),
-            0
-        );
         assert!(production_root
-            .contains("let result_registry = result_registry::ResultRegistry::default();"));
+            .contains("let result_registries = result_registry::ResultRegistries::default();"));
         assert!(production_root.contains(
-            "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registry.clone(),\n    ));"
+            "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registries.find().clone(),\n    ));"
         ));
         assert_eq!(
-            production_root.matches(".manage(result_registry)").count(),
+            production_root
+                .matches(".manage(result_registries)")
+                .count(),
             1
         );
 
@@ -508,6 +747,80 @@ mod tests {
     }
 
     #[test]
+    fn public_plugin_commands_have_non_overlapping_exact_capabilities() {
+        let build = include_str!("../build.rs");
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        let shell = include_str!("../capabilities/plugin-window-shell.json");
+        let content = include_str!("../capabilities/plugin-window-content.json");
+        for command in [
+            "list_public_plugins",
+            "prepare_public_plugin_install",
+            "commit_public_plugin_install",
+            "cancel_public_plugin_install",
+            "set_plugin_enabled",
+            "set_plugin_favorite",
+            "set_plugin_effective_name",
+            "save_plugin_settings",
+            "uninstall_plugin",
+        ] {
+            assert!(build.contains(&format!("\"{command}\",")));
+            let permission = format!("\"allow-{}\"", command.replace('_', "-"));
+            assert!(main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+        }
+        for command in ["plugin_api_call", "complete_plugin_command"] {
+            assert!(build.contains(&format!("\"{command}\",")));
+            let permission = format!("\"allow-{}\"", command.replace('_', "-"));
+            assert!(runtime.contains(&permission));
+            assert!(!main.contains(&permission));
+        }
+        assert!(main.contains("allow-commit-plugin-window-transfer"));
+        assert!(!shell.contains("commit-plugin-window-transfer"));
+        assert!(!content.contains("commit-plugin-window-transfer"));
+        assert!(shell.contains("\"webviews\": [\"plugin-shell-*\"]"));
+        for command in [
+            "get_public_plugin_window_identity",
+            "set_plugin_window_pinned",
+            "close_plugin_window",
+        ] {
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")));
+            assert!(shell.contains(&permission));
+            assert!(!main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+            assert!(!content.contains(&permission));
+        }
+        assert!(content.contains("\"webviews\": [\"plugin-content-*\"]"));
+        for command in [
+            "plugin_window_content_ready",
+            "plugin_window_content_ack",
+            "plugin_window_content_close",
+            "plugin_window_storage_get",
+            "plugin_window_storage_set",
+            "plugin_window_storage_remove",
+            "plugin_window_timer_get_state",
+            "plugin_window_timer_start",
+            "plugin_window_timer_stop",
+            "plugin_window_timer_reset",
+        ] {
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")));
+            assert!(content.contains(&permission));
+            assert!(!main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+            assert!(!shell.contains(&permission));
+        }
+        for capability in [main, runtime, shell, content] {
+            assert!(!capability.contains("\"shell:"));
+        }
+        assert!(runtime.contains("\"windows\": [\"plugin-runtime-*\"]"));
+        assert!(!runtime.contains("\"plugin-*\""));
+        assert!(!runtime.contains("plugin-shell-"));
+        assert!(!runtime.contains("plugin-content-"));
+    }
+
+    #[test]
     fn production_lifecycle_wires_one_coordinator_and_exact_event_sources() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let production = source
@@ -533,10 +846,21 @@ mod tests {
             "move |app, _args, _cwd|",
             "tauri_plugin_global_shortcut::Builder::new()",
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
-            "setup_production_lifecycle(_app, &app_cache, &coordinator, &plugin_manager)?;",
+            "setup_production_lifecycle(",
+            "&public_plugin_service,",
+            "let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());",
+            "let plugin_window_controller = Arc::new(plugin_window::PluginWindowController::default());",
+            "window_transfer::MainWindowTransferCoordinator::default()",
+            ".manage(Arc::clone(&plugin_window_controller))",
+            ".manage(Arc::clone(&main_window_transfers))",
+            "transfers.consume_expected_main_blur()",
+            "public_plugin_service.initialize(",
+            ".register_uri_scheme_protocol(\"uipilot-public-plugin\"",
+            ".manage(Arc::clone(&public_plugin_service))",
             "plugin_manager.load(&app_data_dir, Version::new(0, 2, 0))?;",
             "plugin_manager.create_runtimes(app, &app_data_dir)?;",
             "lifecycle::install_session_end_hook",
+            "lifecycle::install_find_position_hook",
             "tauri::tray::TrayIconBuilder::new()",
             "tauri::WindowEvent::Focused(focused)",
             "handle_focus_event_with(",
@@ -572,6 +896,157 @@ mod tests {
         assert!(production.contains("lifecycle::TRAY_OPEN_SETTINGS"));
     }
 
+    #[test]
+    fn public_plugin_cleanup_recovery_precedes_activation() {
+        let lifecycle = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = lifecycle
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let settings = production
+            .find("let settings = load_settings_store(&app_data_dir)?;")
+            .expect("settings must load before public plugins");
+        let initialize = production
+            .find("public_plugin_service.initialize(")
+            .expect("public plugin initialization is missing");
+        assert!(settings < initialize);
+
+        let service = include_str!("public_plugins.rs").replace("\r\n", "\n");
+        let initialize_body = service
+            .split("pub(crate) fn initialize(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn manager(").next())
+            .expect("public plugin initialize body is missing");
+        let recovery = initialize_body
+            .find("retry_pending_owner_cleanup(")
+            .expect("owner cleanup recovery is missing");
+        let manager_load = initialize_body
+            .find("PublicPluginManager::load(")
+            .expect("manager load is missing");
+        assert!(recovery < manager_load);
+    }
+
+    #[test]
+    fn process_identity_is_prepared_before_tauri_builder() {
+        let main = include_str!("main.rs");
+        let prepare = main
+            .find("uipilot_lib::prepare_windows_identity()")
+            .expect("process identity preparation is missing");
+        let run = main
+            .find("uipilot_lib::run()")
+            .expect("application run call is missing");
+        assert!(prepare < run);
+
+        let library = include_str!("lib.rs");
+        let identity = library
+            .find("native_attention::prepare_process_identity()")
+            .expect("native identity call is missing");
+        let builder = library
+            .find("let builder = tauri::Builder::default();")
+            .expect("Tauri builder is missing");
+        assert!(identity < builder);
+    }
+
+    #[test]
+    fn delayed_plugin_messages_start_with_app_and_stop_before_native_effects() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        assert!(production.contains(
+            "public_plugin_service.initialize(\n        app.handle(),\n        &app_data_dir,"
+        ));
+        assert!(production
+            .contains("let run_public_plugin_service = Arc::clone(&public_plugin_service);"));
+        let run_exit = production
+            .split("tauri::RunEvent::Exit => {")
+            .nth(1)
+            .and_then(|tail| tail.split("_ => {}").next())
+            .expect("run exit branch is missing");
+        let delayed_shutdown = run_exit
+            .find("run_public_plugin_service.shutdown();")
+            .expect("delayed scheduler shutdown is missing");
+        let native_shutdown = run_exit
+            .find("_app.state::<Arc<message_center::MessageCenterService>>()")
+            .expect("message center shutdown is missing");
+        assert!(delayed_shutdown < native_shutdown);
+    }
+
+    #[test]
+    fn main_focus_reaches_tray_attention_before_expected_blur_can_return() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let focused_branch = production
+            .split("tauri::WindowEvent::Focused(focused) => {")
+            .nth(1)
+            .and_then(|tail| tail.split("tauri::WindowEvent::CloseRequested").next())
+            .expect("main focused branch is missing");
+        let observe = focused_branch
+            .find("observe_main_focus(*focused)")
+            .expect("tray attention focus observation is missing");
+        let consume = focused_branch
+            .find("consume_expected_main_blur()")
+            .expect("expected main blur handling is missing");
+        let early_return = focused_branch
+            .find("if expected_blur")
+            .expect("expected blur early return is missing");
+
+        assert!(observe < consume && consume < early_return);
+    }
+
+    #[test]
+    fn startup_public_plugin_runtime_waits_for_main_frontend_ready() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
+        let commands = commands_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
+        let public_source = include_str!("public_plugins.rs").replace("\r\n", "\n");
+        let starter = public_source
+            .split("pub(crate) fn start_enabled_runtimes(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    pub(crate) fn ").next())
+            .expect("public plugin frontend-ready starter is missing");
+        let setup = production
+            .split("fn setup_production_lifecycle(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn run() {").next())
+            .expect("production setup markers are missing");
+        let load_settings = commands
+            .split("pub(crate) fn load_settings(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("load_settings command is missing");
+        let ready = load_settings
+            .find("mark_frontend_ready")
+            .expect("main frontend ready signal is missing");
+        let start = load_settings
+            .find("start_enabled_runtimes")
+            .expect("public Runtime startup must follow main frontend readiness");
+        let claim = starter
+            .find("compare_exchange")
+            .expect("public Runtime startup must be one-shot");
+        let spawn = starter
+            .find("tauri::async_runtime::spawn_blocking")
+            .expect("public Runtime readiness must leave the command thread");
+        let create = starter
+            .find(".create_runtime(")
+            .expect("public Runtime startup creation is missing");
+
+        assert!(ready < start);
+        assert!(claim < spawn && spawn < create);
+        assert!(!setup.contains("start_enabled_runtimes"));
+        assert!(!setup.contains(".create_runtime("));
+    }
     #[test]
     fn tray_show_does_not_wait_for_application_discovery() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
@@ -714,6 +1189,7 @@ mod tests {
             "commands",
             "model",
             "result_registry",
+            "find_window",
             "settings",
             "hotkey",
             "double_tap",
@@ -785,6 +1261,7 @@ mod tests {
             ("file_search/windows/path_auth.rs", path_auth.as_str()),
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
+            ("find_window.rs", include_str!("find_window.rs")),
             ("settings.rs", include_str!("settings.rs")),
             ("plugins.rs", include_str!("plugins.rs")),
         ];
@@ -828,33 +1305,43 @@ mod tests {
     }
 
     #[test]
-    fn host_source_has_no_builtin_math_plugin() {
-        for (name, source) in [
-            ("lib.rs", include_str!("lib.rs")),
-            ("plugins.rs", include_str!("plugins.rs")),
-        ] {
-            for forbidden in [
-                ["/", "math"].concat(),
-                ["internal", ".", "math"].concat(),
-                ["Expr", "ession"].concat(),
-                ["calculate", "("].concat(),
-            ] {
-                assert!(
-                    !source.contains(&forbidden),
-                    "host source contains {forbidden}: {name}"
-                );
-            }
+    fn host_uses_builtin_calculator_without_legacy_math_command() {
+        let lib_source = include_str!("lib.rs").replace("\r\n", "\n");
+        let product_lib = lib_source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(product_lib.contains("mod calculator;"));
+        let plugin_source = include_str!("plugins.rs");
+        assert!(plugin_source.contains("fn retired_plugin_id("));
+        let forbidden_command = ["/", "math"].concat();
+        for source in [product_lib, plugin_source] {
+            assert!(!source.contains(&forbidden_command));
         }
+
+        let legacy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples")
+            .join("plugins")
+            .join("internal.math");
+        assert!(!legacy.exists());
     }
 
     #[test]
     fn plugin_runtime_capability_is_narrow() {
         let capability = include_str!("../capabilities/plugin-runtime.json");
-        assert!(capability.contains("\"windows\": [\"plugin-*\"]"));
-        assert!(capability.contains("\"allow-publish-plugin-results\""));
+        assert!(capability.contains("\"windows\": [\"plugin-runtime-*\"]"));
+        assert!(capability.contains("\"allow-plugin-api-call\""));
+        assert!(capability.contains("\"allow-complete-plugin-command\""));
         assert!(capability.contains("\"core:event:allow-listen\""));
         assert!(capability.contains("\"core:event:allow-unlisten\""));
-        for forbidden in ["\"*\"", "clipboard", "allow-search-apps", "main"] {
+        for forbidden in [
+            "\"*\"",
+            "clipboard",
+            "allow-search-apps",
+            "allow-publish-plugin-results",
+            "plugin-shell-",
+            "plugin-content-",
+            "main",
+        ] {
             assert!(!capability.contains(forbidden));
         }
     }
@@ -934,7 +1421,7 @@ mod lib {
                 1
             );
             assert!(production.contains(
-                "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registry.clone(),\n    ));"
+                "let file_index = Arc::new(file_index::FileIndex::new(\n        Arc::clone(&coordinator),\n        result_registries.find().clone(),\n    ));"
             ));
             assert_eq!(
                 production
@@ -977,24 +1464,27 @@ mod lib {
                         .unwrap()
             );
 
-            let capability = include_str!("../capabilities/main.json");
+            let main_capability = include_str!("../capabilities/main.json");
+            let find_capability = include_str!("../capabilities/find.json");
             let build = include_str!("../build.rs");
-            assert!(capability.contains("\"allow-search-files\""));
-            assert!(capability.contains("\"allow-execute-result\""));
+            assert!(!main_capability.contains("\"allow-search-files\""));
+            assert!(find_capability.contains("\"allow-search-files\""));
+            assert!(main_capability.contains("\"allow-execute-result\""));
+            assert!(find_capability.contains("\"allow-execute-result\""));
             assert_eq!(production.matches("commands::search_files,").count(), 1);
             assert_eq!(production.matches("commands::execute_result,").count(), 1);
             for forbidden in ["refresh_files", "refresh-files"] {
                 assert!(!production.contains(forbidden));
                 assert!(!build.contains(forbidden));
-                assert!(!capability.contains(forbidden));
+                assert!(!main_capability.contains(forbidden));
             }
             let autogenerated = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("permissions")
                 .join("autogenerated")
                 .join("refresh_files.toml");
             assert!(!autogenerated.exists());
-            assert!(!capability.contains("\"core:window:allow-start-dragging\""));
-            assert!(!capability.contains("\"core:window:default\""));
+            assert!(!main_capability.contains("\"core:window:allow-start-dragging\""));
+            assert!(!find_capability.contains("\"core:window:default\""));
             let probe_load_settings = ["security_probe", "::", "load_settings"].concat();
             assert_eq!(source.matches(&probe_load_settings).count(), 3);
             let probe_search_files = ["security_probe", "::", "search_files"].concat();

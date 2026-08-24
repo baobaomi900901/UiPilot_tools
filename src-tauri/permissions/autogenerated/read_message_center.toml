@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-message-center"
+description = "Enables the read_message_center command without any pre-configured scope."
+commands.allow = ["read_message_center"]
+
+[[permission]]
+identifier = "deny-read-message-center"
+description = "Denies the read_message_center command without any pre-configured scope."
+commands.deny = ["read_message_center"]

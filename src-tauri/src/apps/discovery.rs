@@ -26,7 +26,10 @@ use super::{
     Application, ApplicationEntryKind, ApplicationLaunchTarget, DiscoveryDiagnostics,
     DiscoveryError, DiscoverySnapshot, RootKind, StartMenuRoot,
 };
-use crate::{model::ResultItem, result_registry::ResultAction};
+use crate::{
+    model::{LauncherResultActivation, ResultItem},
+    result_registry::ResultAction,
+};
 
 #[link(name = "shell32")]
 unsafe extern "system" {
@@ -375,6 +378,7 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
     (
         ResultItem {
             result_id: String::new(),
+            activation: LauncherResultActivation::ExecuteResult,
             title: application.display_name.clone(),
             subtitle: Some(
                 match application.entry_kind() {
@@ -384,6 +388,10 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
                 .into(),
             ),
             icon: application.icon.clone(),
+            plugin_icon_url: None,
+            icon_kind: None,
+            detail: None,
+            has_default_action: true,
         },
         ResultAction::LaunchApplication {
             app_id: application.app_id.clone(),

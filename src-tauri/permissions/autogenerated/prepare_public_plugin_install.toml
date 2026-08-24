@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prepare-public-plugin-install"
+description = "Enables the prepare_public_plugin_install command without any pre-configured scope."
+commands.allow = ["prepare_public_plugin_install"]
+
+[[permission]]
+identifier = "deny-prepare-public-plugin-install"
+description = "Denies the prepare_public_plugin_install command without any pre-configured scope."
+commands.deny = ["prepare_public_plugin_install"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prepare-find-initialization"
+description = "Enables the prepare_find_initialization command without any pre-configured scope."
+commands.allow = ["prepare_find_initialization"]
+
+[[permission]]
+identifier = "deny-prepare-find-initialization"
+description = "Denies the prepare_find_initialization command without any pre-configured scope."
+commands.deny = ["prepare_find_initialization"]

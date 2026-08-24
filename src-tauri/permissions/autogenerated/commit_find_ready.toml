@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-commit-find-ready"
+description = "Enables the commit_find_ready command without any pre-configured scope."
+commands.allow = ["commit_find_ready"]
+
+[[permission]]
+identifier = "deny-commit-find-ready"
+description = "Denies the commit_find_ready command without any pre-configured scope."
+commands.deny = ["commit_find_ready"]

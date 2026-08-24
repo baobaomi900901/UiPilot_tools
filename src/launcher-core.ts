@@ -12,20 +12,31 @@ import {
   type FileResultView,
   type FileSearchResponse,
   type FileSort,
+  type FindClient,
   type LauncherClient,
+  type LauncherResultActivation,
   type LauncherSnapshot,
+  type MessageCenterStateSnapshot,
   type PluginInventoryView,
   type PluginListStatus,
   type PluginMutationKind,
   type ResultItem,
+  type ResultIconKind,
+  type SearchResponse,
+  type SettingsTabKey,
+  type ShowTarget,
   type SettingsLoadStatus,
   type SettingsView,
   type ThemePreference,
   type UserSettingsUpdate,
   type ViewResult,
+  type WebSearchEngine,
 } from './protocol'
+import { createMessageCenterCore } from './message-center-core'
+import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export interface LauncherCore {
+  readonly client: LauncherClient
   readonly getSnapshot: () => LauncherSnapshot
   readonly subscribe: (listener: () => void) => () => void
   readonly start: () => Promise<void>
@@ -34,11 +45,19 @@ export interface LauncherCore {
   readonly text: (record: ClassifiedTextRecord) => void
   readonly retireControl: (control: ControlKey) => void
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
+  readonly navigate: (target: ShowTarget) => void
+  readonly selectSettingsTab: (key: SettingsTabKey) => void
   readonly requestHide: () => Promise<void>
+  readonly activateResult: (index: number) => void
+  readonly openPluginContextMenu: (index: number) => void
+  readonly closePluginContextMenu: () => void
+  readonly setPluginFavorite: (index: number, favorite: boolean) => void
   readonly setAutostart: (checked: boolean) => void
   readonly setThemePreference: (theme: ThemePreference) => void
+  readonly setWebSearchEngine: (engine: WebSearchEngine) => void
   readonly setHotkeyCanonical: (value: string) => void
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
+  readonly clearMessages: () => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
   readonly cycleFileCategory: (direction: 'next' | 'previous') => void
   readonly setFileSort: (sort: FileSort) => void
@@ -54,9 +73,13 @@ export interface LauncherCore {
   readonly destroy: () => void
 }
 
-interface PrivateResult extends ViewResult {
+interface PrivateApplicationResult extends ViewResult {
+  kind: 'application'
   resultId: string
+  activation: LauncherResultActivation
 }
+
+type PrivateResult = PrivateApplicationResult
 
 interface PrivateFileResult {
   resultId: string
@@ -78,6 +101,8 @@ interface PrivateFileState {
 
 interface Model {
   view: 'launcher' | 'settings'
+  settingsTab: SettingsTabKey
+  messageCenter: MessageCenterStateSnapshot
   launcherMode: 'applications' | 'files'
   viewEpoch: number
   theme: ThemePreference
@@ -92,7 +117,9 @@ interface Model {
   searchPending: boolean
   executePending: boolean
   hidePending: boolean
+  favoriteMutationPending: boolean
   shownNotice?: string
+  commandHint?: string
   status: string
   settings?: PrivateSettings
   settingsOperation?: SettingsOperationKind
@@ -131,6 +158,7 @@ interface TextControl {
 interface PrivateSettings {
   hotkey: TextControl
   autostart: boolean
+  webSearchEngine: WebSearchEngine
 }
 
 interface FileSearchOwner {
@@ -148,7 +176,7 @@ interface PreviewPreferenceOwner {
   enabled: boolean
 }
 
-type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme'
+type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
 
 interface SettingsOperation {
   token: number
@@ -188,12 +216,56 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   searchUnavailable: '搜索暂不可用。',
   fileNotFound: '文件已不存在。',
   fileOpenFailed: '无法在资源管理器中打开。',
+  webSearchFailed: '操作不可用，请重试。',
   clipboardWriteFailed: '无法复制到剪贴板。',
   pluginPermissionDenied: '插件无权写入剪贴板。',
   pluginListFailed: '无法加载插件清单。',
   pluginInstallFailed: '无法安装插件。',
   pluginReloadFailed: '无法重新加载插件。',
   pluginDeleteFailed: '无法删除插件。',
+  dataCleanupPending: '插件已卸载，数据清理将在下次启动时重试',
+}
+
+interface CompletionOriginOwner {
+  token: number
+  phase: 'armed' | 'committing' | 'consumed'
+  epoch: number
+  invocationId: string
+  control: ControlKey
+  querySequence: number
+  value: string
+  resultKey: number
+  pluginId: string
+  command: string
+}
+
+interface ApplicationSearchOwner {
+  token: number
+  epoch: number
+  invocationId: string
+  sequence: number
+  query: string
+  submit: boolean
+  completionOrigin?: {
+    token: number
+    phase: 'preview' | 'commit'
+    pluginId: string
+  }
+}
+
+interface FavoriteInteractionOwner {
+  token: number
+  epoch: number
+  invocationId: string
+  control: ControlKey
+  querySequence: number
+  value: string
+  resultKey: number
+  pluginId: string
+}
+
+interface FavoriteMutationOwner extends FavoriteInteractionOwner {
+  favorite: boolean
 }
 
 const NOTICE_TEXT = {
@@ -204,6 +276,7 @@ const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
 const FALLBACK_ERROR = '操作不可用，请重试。'
 const FILE_PREVIEW_ERROR = '无法保存文件预览设置。'
 const THEME_PREFERENCE_ERROR = '无法保存风格设置。'
+const WEB_SEARCH_ENGINE_ERROR = '无法保存搜索引擎设置。'
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
 const ICON_PREFIX = 'data:image/png;base64,'
 const MAX_ICON_LENGTH = 65_536
@@ -220,11 +293,74 @@ export const FILE_CATEGORY_ORDER: readonly FileCategory[] = [
   'archive',
 ]
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+const LAUNCHER_COMMAND = /^[a-z][a-z0-9-]{0,31}$/
+const UNICODE_CONTROL = /[\p{Cc}\u2028\u2029\uD800-\uDFFF]/u
+const OUTER_UNICODE_WHITESPACE = /^(?:\p{White_Space})|(?:\p{White_Space})$/u
+const UTF8_ENCODER = new TextEncoder()
+const PUBLIC_PLUGIN_ID = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
+const QUERY_SEQUENCE_EXHAUSTED = '查询次数已达上限，请重新打开主界面。'
 
 function safeApplicationIcon(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length > MAX_ICON_LENGTH || !value.startsWith(ICON_PREFIX)) return undefined
   const payload = value.slice(ICON_PREFIX.length)
   return payload.length > 0 && BASE64.test(payload) ? value : undefined
+}
+
+function safeResultIconKind(value: unknown): ResultIconKind | undefined {
+  return value === 'find' || value === 'calculator' || value === 'webSearch' ? value : undefined
+}
+
+function validLauncherCompletion(value: string): boolean {
+  if (UTF8_ENCODER.encode(value).byteLength > 65_536 || !value.startsWith('/')) return false
+  const separator = value.indexOf(' ')
+  if (separator < 2 || !LAUNCHER_COMMAND.test(value.slice(1, separator))) return false
+  const argument = value.slice(separator + 1)
+  return argument.length === 0 || (!OUTER_UNICODE_WHITESPACE.test(argument) && !UNICODE_CONTROL.test(argument))
+}
+
+function exactPlainRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Object.getPrototypeOf(value) !== Object.prototype) return undefined
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  const expected = [...expectedKeys].sort()
+  return keys.length === expected.length && keys.every((key, index) => key === expected[index]) ? record : undefined
+}
+
+export function safeLauncherActivation(value: unknown): LauncherResultActivation | undefined {
+  const candidate = typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : undefined
+  if (candidate?.kind === 'executeResult') {
+    return exactPlainRecord(value, ['kind']) ? { kind: 'executeResult' } : undefined
+  }
+  if (candidate?.kind === 'openFind') {
+    const record = exactPlainRecord(value, ['kind', 'query'])
+    return record && typeof record.query === 'string' ? { kind: 'openFind', query: record.query } : undefined
+  }
+  if (candidate?.kind === 'completion') {
+    const record = exactPlainRecord(value, ['completionText', 'kind'])
+    return record && typeof record.completionText === 'string' && validLauncherCompletion(record.completionText)
+      ? { kind: 'completion', completionText: record.completionText }
+      : undefined
+  }
+  if (candidate?.kind === 'pluginCompletion') {
+    const record = exactPlainRecord(value, ['completionText', 'favorite', 'kind', 'pluginId'])
+    return record && typeof record.completionText === 'string' && validLauncherCompletion(record.completionText) &&
+        typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.favorite === 'boolean'
+      ? {
+          kind: 'pluginCompletion',
+          completionText: record.completionText,
+          pluginId: record.pluginId,
+          favorite: record.favorite,
+        }
+      : undefined
+  }
+  return undefined
+}
+
+function safeCommandHint(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function errorText(value: unknown): string {
@@ -235,12 +371,19 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon }) =>
+    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, hasDefaultAction, activation }) =>
       Object.freeze({
         key,
         title,
         ...(subtitle === undefined ? {} : { subtitle }),
         ...(icon === undefined ? {} : { icon }),
+        ...(pluginIconUrl === undefined ? {} : { pluginIconUrl }),
+        ...(iconKind === undefined ? {} : { iconKind }),
+        ...(detail === undefined ? {} : { detail }),
+        ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
+        ...(activation.kind === 'pluginCompletion'
+          ? { pluginCompletion: Object.freeze({ pluginId: activation.pluginId, favorite: activation.favorite }) }
+          : {}),
       }),
     ),
   )
@@ -249,6 +392,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
         autostart: model.settings.autostart,
         theme: model.theme,
+        webSearchEngine: model.settings.webSearchEngine,
         loadStatus: model.settingsLoadStatus,
         readOnly:
           model.settingsUncertain || model.settingsLoadStatus !== 'ready' || model.settingsOperation !== undefined,
@@ -293,6 +437,8 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   })
   return Object.freeze({
     view: model.view,
+    settingsTab: model.settingsTab,
+    messageCenter: model.messageCenter,
     viewEpoch: model.viewEpoch,
     theme: model.theme,
     ...(model.invocationId === undefined ? {} : { invocationId: model.invocationId }),
@@ -305,7 +451,9 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     searchPending: model.searchPending,
     executePending: model.executePending,
     hidePending: model.hidePending,
+    favoriteMutationPending: model.favoriteMutationPending,
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
+    ...(model.commandHint === undefined ? {} : { commandHint: model.commandHint }),
     status:
       model.view === 'settings' && model.settingsUncertain
         ? NOTICE_TEXT.settingsFailed
@@ -319,8 +467,11 @@ function projectSnapshot(model: Model): LauncherSnapshot {
 }
 
 export function createLauncherCore(client: LauncherClient, maximumQuerySequence = Number.MAX_SAFE_INTEGER): LauncherCore {
+  const messageCenter = createMessageCenterCore(client)
   const model: Model = {
     view: 'launcher',
+    settingsTab: 'general',
+    messageCenter: messageCenter.getSnapshot(),
     launcherMode: 'applications',
     viewEpoch: 0,
     theme: 'system',
@@ -333,6 +484,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     searchPending: false,
     executePending: false,
     hidePending: false,
+    favoriteMutationPending: false,
     status: '',
     settingsUncertain: false,
     settingsLoadStatus: 'loading',
@@ -343,14 +495,17 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let destroyed = false
   let started = false
   let unlisten: (() => void) | undefined
+  let unsubscribeMessages: (() => void) | undefined
   let previewPreferenceToken = 0
   let previewPreferencePending: PreviewPreferenceOwner | undefined
   let previewPreferenceDurableGeneration = 0
   let lastLoadedFilePreviewEnabled = true
   let themeDurableGeneration = 0
   let durableTheme: ThemePreference = 'system'
+  let durableWebSearchEngine: WebSearchEngine = 'bing'
   let token = 0
   let searchToken = 0
+  let slashSearchTimer: ReturnType<typeof setTimeout> | undefined
   let executeToken = 0
   let hideToken = 0
   let resultKey = 1
@@ -365,6 +520,28 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   const pluginMutationErrors = new Map<string, string>()
   let highestPluginRevision = '0'
   let pluginInventoryActive = false
+  const legacyFindClient = client as unknown as Pick<FindClient, 'searchFiles' | 'setPreviewPreference'>
+  let findSubmissionToken = 0
+  let applicationSearch: {
+    invocationId: string
+    sequence: number
+    query: string
+    completion: Promise<SearchResponse | null>
+  } | undefined
+  let pendingDefaultActivation: {
+    epoch: number
+    invocationId: string
+    sequence: number
+    query: string
+  } | undefined
+  let completionOrigin: CompletionOriginOwner | undefined
+  let completionOriginToken = 0
+  let sequenceExhausted = false
+  let favoriteInteractionToken = 0
+  let favoriteInteraction: FavoriteInteractionOwner | undefined
+  let favoriteMutation: FavoriteMutationOwner | undefined
+  let favoriteMenuConsumed = false
+
 
   function publish(mutated: boolean): void {
     if (!mutated) return
@@ -403,6 +580,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       durableTheme = view.theme
       model.theme = view.theme
     }
+    durableWebSearchEngine = view.webSearchEngine
   }
 
   function replaceSettingsView(view: SettingsView): void {
@@ -412,6 +590,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.settings = {
       hotkey: newTextControl(view.hotkey),
       autostart: view.autostart,
+      webSearchEngine: view.webSearchEngine,
     }
   }
 
@@ -447,9 +626,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function commitControl(control: ControlKey, value: string): void {
     if (control === model.queryControl) {
-      const visibleChanged = setControlDraft(control, value)
       if (model.query === value) {
-        publish(visibleChanged)
+        publish(setControlDraft(control, value))
         return
       }
       applyEdit(value)
@@ -480,6 +658,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.requestId = undefined
     model.results = []
     model.selectedIndex = -1
+    model.commandHint = undefined
   }
 
 
@@ -498,6 +677,77 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return value.startsWith('/find ') ? value.slice(6) : null
   }
 
+  function submitFind(query: string): void {
+    const invocationId = model.invocationId
+    if (!invocationId || model.view !== 'launcher' || model.executePending) return
+    const owner = {
+      token: ++findSubmissionToken,
+      epoch: model.viewEpoch,
+      control: model.queryControl,
+      value: model.queryControlValue,
+      invocationId,
+      querySequence: model.querySequence,
+    }
+    model.status = ''
+    model.shownNotice = undefined
+    publish(true)
+    const ownsSubmission = () =>
+      !destroyed && owner.token === findSubmissionToken && owner.epoch === model.viewEpoch &&
+      owner.control === model.queryControl && owner.value === model.queryControlValue &&
+      owner.invocationId === model.invocationId && owner.querySequence === model.querySequence
+    const fail = () => {
+      if (!ownsSubmission()) return
+      model.status = '文件搜索窗口暂不可用。'
+      publish(true)
+    }
+    const matchingSearch = applicationSearch?.invocationId === invocationId &&
+      applicationSearch.sequence === owner.querySequence && applicationSearch.query === owner.value
+      ? applicationSearch.completion
+      : undefined
+    let ownership = matchingSearch
+    if (!ownership) {
+      try {
+        ownership = client.searchApps({
+          query: owner.value,
+          invocationId,
+          querySequence: owner.querySequence,
+        })
+      } catch (error) {
+        ownership = Promise.reject(error)
+      }
+      applicationSearch = {
+        invocationId,
+        sequence: owner.querySequence,
+        query: owner.value,
+        completion: ownership,
+      }
+    }
+    void ownership.then(
+      () => {
+        if (!ownsSubmission()) return
+        let pending
+        try {
+          pending = client.openFind({ query, invocationId, querySequence: owner.querySequence })
+        } catch (error) {
+          pending = Promise.reject(error)
+        }
+        void pending.then(
+          (outcome) => {
+            if (!ownsSubmission() || outcome.status !== 'forwarded') return
+            searchToken = ++token
+            model.searchPending = false
+            model.query = ''
+            model.queryControlValue = ''
+            model.status = ''
+            clearResults()
+            publish(true)
+          },
+          fail,
+        )
+      },
+      fail,
+    )
+  }
   function fileStatusText(status: FileIndexStatus, hasResults = true): string {
     if (status === 'building') return '正在索引。'
     if (status === 'partial') return '部分位置无法访问。'
@@ -555,7 +805,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<FileSearchResponse | null>
     try {
-      pending = client.searchFiles({
+      pending = legacyFindClient.searchFiles({
         query: owner.query,
         category: owner.category,
         sort: owner.sort,
@@ -658,32 +908,206 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     beginFileSearch()
   }
 
-  function beginSearch(): void {
+  function cancelSlashSearch(): void {
+    if (slashSearchTimer === undefined) return
+    clearTimeout(slashSearchTimer)
+    slashSearchTimer = undefined
+  }
+
+  function completionCommand(value: string): string | undefined {
+    if (!validLauncherCompletion(value)) return undefined
+    return value.slice(1, value.indexOf(' '))
+  }
+
+  function ownsCompletionOrigin(owner: CompletionOriginOwner | undefined): owner is CompletionOriginOwner {
+    return owner !== undefined &&
+      owner.epoch === model.viewEpoch &&
+      owner.invocationId === model.invocationId &&
+      owner.control === model.queryControl &&
+      owner.querySequence === model.querySequence &&
+      owner.value === model.query &&
+      owner.value === model.queryControlValue
+  }
+
+  function replaceCompletionOrigin(
+    source: Pick<CompletionOriginOwner, 'resultKey' | 'pluginId' | 'command'>,
+    phase: CompletionOriginOwner['phase'],
+  ): void {
     const invocationId = model.invocationId
-    if (!invocationId || model.query === '') return
-    const captured = {
+    if (!invocationId) {
+      completionOrigin = undefined
+      return
+    }
+    completionOrigin = {
+      token: ++completionOriginToken,
+      phase,
+      epoch: model.viewEpoch,
+      invocationId,
+      control: model.queryControl,
+      querySequence: model.querySequence,
+      value: model.query,
+      resultKey: source.resultKey,
+      pluginId: source.pluginId,
+      command: source.command,
+    }
+  }
+
+  function enterSequenceExhausted(): void {
+    sequenceExhausted = true
+    cancelSlashSearch()
+    searchToken = ++token
+    model.searchPending = false
+    pendingDefaultActivation = undefined
+    if (ownsCompletionOrigin(completionOrigin)) {
+      completionOrigin = { ...completionOrigin, phase: 'consumed' }
+    } else {
+      completionOrigin = undefined
+    }
+    clearResults()
+    model.status = QUERY_SEQUENCE_EXHAUSTED
+    publish(true)
+  }
+
+  function advanceApplicationSequence(): boolean {
+    if (sequenceExhausted) return false
+    if (model.querySequence >= maximumQuerySequence) {
+      enterSequenceExhausted()
+      return false
+    }
+    model.querySequence += 1
+    return true
+  }
+
+  function invalidateFavoriteInteraction(): void {
+    favoriteInteractionToken += 1
+    favoriteInteraction = undefined
+    favoriteMenuConsumed = false
+  }
+
+  function ownsFavoriteInteraction(owner: FavoriteInteractionOwner): boolean {
+    if (
+      destroyed ||
+      owner.token !== favoriteInteractionToken ||
+      favoriteInteraction?.token !== owner.token ||
+      model.view !== 'launcher' ||
+      model.launcherMode !== 'applications' ||
+      owner.epoch !== model.viewEpoch ||
+      owner.invocationId !== model.invocationId ||
+      owner.control !== model.queryControl ||
+      owner.querySequence !== model.querySequence ||
+      owner.value !== model.query ||
+      owner.value !== model.queryControlValue
+    ) return false
+    const selected = model.results[model.selectedIndex]
+    return selected?.key === owner.resultKey &&
+      selected.activation.kind === 'pluginCompletion' &&
+      selected.activation.pluginId === owner.pluginId
+  }
+
+  unsubscribeMessages = messageCenter.subscribe(() => {
+    model.messageCenter = messageCenter.getSnapshot()
+    publish(true)
+  })
+
+  function beginSearch(submit = false): void {
+    const invocationId = model.invocationId
+    if (!invocationId || fileCommand(model.query) !== null || sequenceExhausted) return
+    let ownedOrigin: ApplicationSearchOwner['completionOrigin']
+    if (ownsCompletionOrigin(completionOrigin)) {
+      if (!submit && completionOrigin.phase === 'armed') {
+        ownedOrigin = { token: completionOrigin.token, phase: 'preview', pluginId: completionOrigin.pluginId }
+      } else if (submit && completionOrigin.phase === 'committing') {
+        ownedOrigin = { token: completionOrigin.token, phase: 'commit', pluginId: completionOrigin.pluginId }
+      } else {
+        return
+      }
+    }
+    const captured: ApplicationSearchOwner = {
       token: ++token,
       epoch: model.viewEpoch,
       invocationId,
       sequence: model.querySequence,
       query: model.query,
+      submit,
+      ...(ownedOrigin === undefined ? {} : { completionOrigin: ownedOrigin }),
     }
     searchToken = captured.token
     model.searchPending = true
-    let pending: Promise<import('./protocol').SearchResponse | null>
+    let pending: Promise<SearchResponse | null>
     try {
-      pending = client.searchApps({ query: captured.query, invocationId, querySequence: captured.sequence })
+      pending = client.searchApps({
+        query: captured.query,
+        invocationId,
+        querySequence: captured.sequence,
+        ...(captured.query.startsWith('/') ? { submit } : {}),
+        ...(captured.completionOrigin === undefined
+          ? {}
+          : {
+              completionOrigin: {
+                phase: captured.completionOrigin.phase,
+                pluginId: captured.completionOrigin.pluginId,
+              },
+            }),
+      })
     } catch (error) {
       pending = Promise.reject(error)
+    }
+    if (!captured.query.startsWith('/')) {
+      applicationSearch = {
+        invocationId,
+        sequence: captured.sequence,
+        query: captured.query,
+        completion: pending,
+      }
     }
     void pending.then(
       (response) => finishSearch(captured, response),
       (error: unknown) => failSearch(captured, error),
     )
   }
-
-  function ownsSearch(captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string }): boolean {
-    return (
+  function scheduleSearch(): void {
+    cancelSlashSearch()
+    if (!model.query.startsWith('/')) {
+      beginSearch()
+      return
+    }
+    const epoch = model.viewEpoch
+    const invocationId = model.invocationId
+    const sequence = model.querySequence
+    const query = model.query
+    slashSearchTimer = setTimeout(() => {
+      slashSearchTimer = undefined
+      if (
+        destroyed ||
+        epoch !== model.viewEpoch ||
+        invocationId !== model.invocationId ||
+        sequence !== model.querySequence ||
+        query !== model.query ||
+        query !== model.queryControlValue
+      ) return
+      beginSearch(false)
+      publish(true)
+    }, 150)
+  }
+  function deferCurrentSearch(): void {
+    const owner = {
+      epoch: model.viewEpoch,
+      invocationId: model.invocationId,
+      sequence: model.querySequence,
+      query: model.query,
+    }
+    setTimeout(() => {
+      if (
+        destroyed || model.view !== 'launcher' || owner.epoch !== model.viewEpoch ||
+        owner.invocationId !== model.invocationId || owner.sequence !== model.querySequence ||
+        owner.query !== model.query || owner.query !== model.queryControlValue
+      ) return
+      beginSearch()
+      publish(true)
+    }, 0)
+  }
+  function ownsSearch(captured: ApplicationSearchOwner): boolean {
+    const ownsBase = (
       !destroyed &&
       captured.token === searchToken &&
       captured.epoch === model.viewEpoch &&
@@ -692,56 +1116,148 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       captured.query === model.query &&
       captured.query === model.queryControlValue
     )
+    if (!ownsBase || captured.completionOrigin === undefined) return ownsBase
+    if (!ownsCompletionOrigin(completionOrigin) || completionOrigin.token !== captured.completionOrigin.token) return false
+    return captured.completionOrigin.phase === 'preview'
+      ? completionOrigin.phase === 'armed'
+      : completionOrigin.phase === 'committing' || completionOrigin.phase === 'consumed'
+  }
+
+  function settleCompletionCommit(captured: ApplicationSearchOwner): void {
+    if (
+      captured.completionOrigin?.phase === 'commit' &&
+      ownsCompletionOrigin(completionOrigin) &&
+      completionOrigin.token === captured.completionOrigin.token &&
+      completionOrigin.phase === 'committing'
+    ) {
+      completionOrigin = { ...completionOrigin, phase: 'consumed' }
+    }
   }
 
   function finishSearch(
-    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string },
+    captured: ApplicationSearchOwner,
     response: import('./protocol').SearchResponse | null,
   ): void {
     if (!ownsSearch(captured)) return
+    settleCompletionCommit(captured)
+    const transferToken = response?.windowTransferToken
+    if (transferToken !== undefined) {
+      let pending: Promise<void>
+      try {
+        pending = client.commitPluginWindowTransfer({ transferToken })
+      } catch (error) {
+        pending = Promise.reject(error)
+      }
+      void pending.then(
+        () => {
+          if (!ownsSearch(captured)) return
+          model.searchPending = false
+          model.query = ''
+          model.queryControlValue = ''
+          model.requestId = undefined
+          model.status = ''
+          clearResults()
+          publish(true)
+        },
+        (error: unknown) => {
+          if (!ownsSearch(captured)) return
+          model.searchPending = false
+          model.status = errorText(error)
+          publish(true)
+        },
+      )
+      publish(true)
+      return
+    }
     model.searchPending = false
     if (response !== null) {
       model.requestId = response.requestId
-      model.results = response.items.map((item: ResultItem) => {
+      model.commandHint = safeCommandHint(response.commandHint)
+      const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
+        const activation = safeLauncherActivation(item.activation)
+        if (activation === undefined || typeof item.resultId !== 'string' ||
+            (activation.kind === 'executeResult' && item.resultId.length === 0)) return []
         const icon = safeApplicationIcon(item.icon)
-        return {
+        const pluginIconUrl = safePublicPluginIconUrl(item.pluginIconUrl)
+        const iconKind = safeResultIconKind(item.iconKind)
+        return [{
+          kind: 'application',
           key: resultKey++,
           resultId: item.resultId,
+          activation,
           title: item.title,
           ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
           ...(icon === undefined ? {} : { icon }),
-        }
+          ...(pluginIconUrl === undefined ? {} : { pluginIconUrl }),
+          ...(iconKind === undefined ? {} : { iconKind }),
+          ...(item.detail === undefined ? {} : { detail: item.detail }),
+          ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
+        }]
       })
+      model.results = applications
       model.selectedIndex = model.results.length ? 0 : -1
-      model.status = model.results.length || fileCommand(captured.query) !== null ? '' : '未找到应用'
+      model.status = model.results.length || model.commandHint ? '' : '未找到应用'
+      const activateDefault =
+        pendingDefaultActivation?.epoch === captured.epoch &&
+        pendingDefaultActivation.invocationId === captured.invocationId &&
+        pendingDefaultActivation.sequence === captured.sequence &&
+        pendingDefaultActivation.query === captured.query
+      if (activateDefault) pendingDefaultActivation = undefined
+      publish(true)
+      if (
+        captured.submit &&
+        /^\/web-search\s+\S/u.test(captured.query.trim()) &&
+        applications.length === 1 &&
+        applications[0]?.activation.kind === 'executeResult' &&
+        applications[0]?.hasDefaultAction !== false
+      ) {
+        executeSelection()
+      } else if (activateDefault && applications.length > 0) {
+        executeSelection()
+      }
+      return
     }
     publish(true)
   }
 
   function failSearch(
-    captured: { token: number; epoch: number; invocationId: string; sequence: number; query: string },
+    captured: ApplicationSearchOwner,
     error: unknown,
   ): void {
     if (!ownsSearch(captured)) return
+    settleCompletionCommit(captured)
     model.searchPending = false
     model.status = errorText(error)
     publish(true)
   }
 
   function applyEdit(value: string): void {
+    invalidateFavoriteInteraction()
     if (model.launcherMode === 'files') {
       applyFileEdit(value)
       return
     }
+    if (sequenceExhausted) {
+      const changed = model.query !== value || model.queryControlValue !== value
+      model.query = value
+      model.queryControlValue = value
+      publish(changed)
+      return
+    }
+    const previousOrigin = ownsCompletionOrigin(completionOrigin) ? completionOrigin : undefined
+    const retainsOrigin = previousOrigin !== undefined &&
+      completionCommand(value) === previousOrigin.command
+    if (!advanceApplicationSequence()) return
     model.shownNotice = undefined
     model.query = value
     model.queryControlValue = value
-    model.querySequence += 1
+    if (retainsOrigin) replaceCompletionOrigin(previousOrigin, 'armed')
+    else completionOrigin = undefined
     searchToken = ++token
     model.searchPending = false
     model.status = ''
     clearResults()
-    if (value !== '') beginSearch()
+    scheduleSearch()
     publish(true)
   }
 
@@ -893,20 +1409,32 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     await mutatePlugin(pluginId, 'delete', () => client.deletePlugin({ pluginId }))
   }
 
-  function shown(payload: unknown): void {
-    if (destroyed) return
-    const event = parseLauncherShown(payload)
-    if (!event) return
-    if (event.notice === 'settingsFailed') model.settingsUncertain = true
+  function transitionView(
+    target: ShowTarget,
+    invocationId: string,
+    notice: import('./protocol').LifecycleNotice | null,
+    source: 'native' | 'local',
+  ): void {
+    invalidateFavoriteInteraction()
+    const nextView = target === 'launcher' ? 'launcher' : 'settings'
+    const nextSettingsTab: SettingsTabKey =
+      target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
+    messageCenter.leave()
+    if (notice === 'settingsFailed') model.settingsUncertain = true
     if (composition) restoreControl(composition.control)
     composition = undefined
     leaveFileMode()
     model.viewEpoch += 1
-    model.invocationId = event.invocationId
-    model.view = event.target
+    model.invocationId = invocationId
+    model.view = nextView
+    model.settingsTab = nextSettingsTab
     pluginInventoryActive = false
-    model.queryControlValue = model.query
-    model.querySequence = 0
+    completionOrigin = undefined
+    if (source === 'native') {
+      model.querySequence = 0
+      sequenceExhausted = false
+    }
+    cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
@@ -915,21 +1443,55 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.hidePending = false
     model.status = ''
     clearResults()
-    model.shownNotice = event.notice === null ? undefined : NOTICE_TEXT[event.notice]
-    if (event.target === 'launcher') pendingSettingsLoadEpoch = undefined
+    model.shownNotice = notice === null ? undefined : NOTICE_TEXT[notice]
+    if (nextView === 'launcher') pendingSettingsLoadEpoch = undefined
     else queueSettingsLoad()
-    if (event.target === 'launcher' && event.notice === null && activationNoticePending) {
+    if (nextView === 'launcher' && notice === null && activationNoticePending) {
       activationNoticePending = false
       model.shownNotice = REFUSED_NOTICE
     }
-    if (event.target === 'launcher' && model.query !== '') {
-      model.querySequence = 1
-      beginSearch()
+    if (nextView === 'launcher') {
+      model.query = ''
+      model.queryControlValue = ''
+      model.querySequence = source === 'native' ? 1 : model.querySequence + 1
+      deferCurrentSearch()
+    } else {
+      model.queryControlValue = model.query
     }
     publish(true)
-    if (event.target === 'settings') {
+    if (nextView === 'settings') {
       void drainSettingsLoad()
     }
+    if (target === 'messages') void messageCenter.enter()
+  }
+
+  function shown(payload: unknown): void {
+    if (destroyed) return
+    const event = parseLauncherShown(payload)
+    if (!event) return
+    transitionView(event.target, event.invocationId, event.notice, 'native')
+    void messageCenter.refresh()
+  }
+
+  function navigate(target: ShowTarget): void {
+    const nextView = target === 'launcher' ? 'launcher' : 'settings'
+    const nextTab = target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
+    if (
+      destroyed ||
+      model.invocationId === undefined ||
+      (model.view === nextView && (nextView === 'launcher' || model.settingsTab === nextTab))
+    ) {
+      return
+    }
+    transitionView(target, model.invocationId, null, 'local')
+  }
+
+  function selectSettingsTab(key: SettingsTabKey): void {
+    if (destroyed || model.view !== 'settings' || model.settingsTab === key) return
+    messageCenter.leave()
+    model.settingsTab = key
+    publish(true)
+    if (key === 'messages') void messageCenter.enter()
   }
 
   function text(record: ClassifiedTextRecord): void {
@@ -1032,6 +1594,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function setWebSearchEngine(engine: WebSearchEngine): void {
+    if (!settingsEditable() || model.settings?.webSearchEngine === engine) return
+    const operation = startSettingsOperation('webSearchEngine')
+    if (!operation) return
+    model.settings!.webSearchEngine = engine
+    model.status = ''
+    publish(true)
+
+    let pending: Promise<void>
+    try {
+      pending = client.setWebSearchEngine({ preference: { engine } })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      () => finishWebSearchEngineMutation(operation, engine, false),
+      () => finishWebSearchEngineMutation(operation, engine, true),
+    )
+  }
+
   function setHotkeyCanonical(value: string): void {
     if (!settingsEditable() || !model.settings) return
     const field = model.settings.hotkey
@@ -1082,6 +1664,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hotkey: settings.hotkey.value,
       autostart: settings.autostart,
       theme: model.theme,
+      webSearchEngine: settings.webSearchEngine,
     }
   }
 
@@ -1192,6 +1775,31 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     })
   }
 
+  function finishWebSearchEngineMutation(
+    operation: SettingsOperation,
+    engine: WebSearchEngine,
+    failed: boolean,
+  ): void {
+    if (!ownsSettingsOperation(operation)) return
+    if (model.settings) {
+      model.settings.webSearchEngine = failed ? durableWebSearchEngine : engine
+    }
+    if (!failed) durableWebSearchEngine = engine
+    releaseSettingsOperation(operation)
+    if (model.view !== 'settings') {
+      if (failed) model.status = WEB_SEARCH_ENGINE_ERROR
+      publish(true)
+      return
+    }
+    const reconciliation = requestSettingsLoad()
+    if (!failed) return
+    void reconciliation?.then(() => {
+      if (destroyed) return
+      model.status = WEB_SEARCH_ENGINE_ERROR
+      publish(true)
+    })
+  }
+
   async function persistSettings(operation: SettingsOperation, update: UserSettingsUpdate): Promise<void> {
     try {
       await client.saveSettings({ settings: update })
@@ -1209,6 +1817,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setControlDraft(model.settings.hotkey.key, 'Shift+Space')
     model.settings.hotkey.value = 'Shift+Space'
     model.settings.autostart = false
+    model.settings.webSearchEngine = 'bing'
     model.theme = 'system'
     model.shownNotice = undefined
     publish(true)
@@ -1216,6 +1825,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hotkey: 'Shift+Space',
       autostart: false,
       theme: 'system',
+      webSearchEngine: 'bing',
     })
   }
 
@@ -1236,11 +1846,68 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     finishSettingsMutation(operation, false)
   }
 
+  function applyPluginCompletion(result: PrivateApplicationResult): void {
+    if (sequenceExhausted || result.activation.kind !== 'pluginCompletion') return
+    const command = completionCommand(result.activation.completionText)
+    if (command === undefined || !advanceApplicationSequence()) return
+    model.shownNotice = undefined
+    model.query = result.activation.completionText
+    model.queryControlValue = result.activation.completionText
+    model.status = ''
+    searchToken = ++token
+    model.searchPending = false
+    clearResults()
+    replaceCompletionOrigin({
+      resultKey: result.key,
+      pluginId: result.activation.pluginId,
+      command,
+    }, 'armed')
+    scheduleSearch()
+    publish(true)
+  }
+
+  function commitArmedPluginCompletion(): boolean {
+    if (!ownsCompletionOrigin(completionOrigin)) return false
+    if (completionOrigin.phase === 'committing' || completionOrigin.phase === 'consumed') return true
+    const previous = completionOrigin
+    cancelSlashSearch()
+    searchToken = ++token
+    model.searchPending = false
+    if (!advanceApplicationSequence()) return true
+    replaceCompletionOrigin(previous, 'committing')
+    model.shownNotice = undefined
+    model.status = ''
+    clearResults()
+    beginSearch(true)
+    publish(true)
+    return true
+  }
+
   function executeSelection(): void {
-    if (model.view !== 'launcher' || model.executePending || !model.requestId) return
-    const selected =
-      model.launcherMode === 'files' ? model.file?.results[model.file.selectedIndex] : model.results[model.selectedIndex]
-    if (!selected) return
+    if (model.view !== 'launcher' || model.executePending) return
+    invalidateFavoriteInteraction()
+    let resultId: string | undefined
+    if (model.launcherMode === 'applications') {
+      const selected = model.results[model.selectedIndex]
+      if (!selected) return
+      if (selected.activation.kind === 'completion') {
+        applyEdit(selected.activation.completionText)
+        return
+      }
+      if (selected.activation.kind === 'pluginCompletion') {
+        applyPluginCompletion(selected)
+        return
+      }
+      if (selected.activation.kind === 'openFind') {
+        submitFind(selected.activation.query)
+        return
+      }
+      if (selected.hasDefaultAction === false) return
+      resultId = selected.resultId
+    } else {
+      resultId = model.file?.results[model.file.selectedIndex]?.resultId
+    }
+    if (!model.requestId || resultId === undefined) return
     model.shownNotice = undefined
     model.status = ''
     model.executePending = true
@@ -1250,7 +1917,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<ExecuteOutcome>
     try {
-      pending = client.executeResult({ requestId, resultId: selected.resultId })
+      pending = client.executeResult({ requestId, resultId })
     } catch (error) {
       pending = Promise.reject(error)
     }
@@ -1270,11 +1937,119 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function activateResult(index: number): void {
+    if (
+      sequenceExhausted ||
+      model.view !== 'launcher' ||
+      model.launcherMode !== 'applications' ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= model.results.length
+    ) return
+    invalidateFavoriteInteraction()
+    model.selectedIndex = index
+    publish(true)
+    executeSelection()
+  }
+
+  function openPluginContextMenu(index: number): void {
+    if (
+      destroyed ||
+      sequenceExhausted ||
+      model.view !== 'launcher' ||
+      model.launcherMode !== 'applications' ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= model.results.length
+    ) return
+    const result = model.results[index]
+    if (result?.activation.kind !== 'pluginCompletion' || !model.invocationId) return
+    if (
+      favoriteInteraction &&
+      ownsFavoriteInteraction(favoriteInteraction) &&
+      favoriteInteraction.resultKey === result.key &&
+      favoriteInteraction.pluginId === result.activation.pluginId
+    ) {
+      favoriteMenuConsumed = false
+      publish(false)
+      return
+    }
+    invalidateFavoriteInteraction()
+    model.selectedIndex = index
+    favoriteInteraction = {
+      token: favoriteInteractionToken,
+      epoch: model.viewEpoch,
+      invocationId: model.invocationId,
+      control: model.queryControl,
+      querySequence: model.querySequence,
+      value: model.queryControlValue,
+      resultKey: result.key,
+      pluginId: result.activation.pluginId,
+    }
+    publish(true)
+  }
+
+  function closePluginContextMenu(): void {
+    if (favoriteMenuConsumed) {
+      favoriteMenuConsumed = false
+      return
+    }
+    invalidateFavoriteInteraction()
+  }
+
+  function setPluginFavorite(index: number, favorite: boolean): void {
+    if (model.favoriteMutationPending || !Number.isInteger(index)) return
+    const result = model.results[index]
+    const interaction = favoriteInteraction
+    if (
+      !interaction ||
+      !ownsFavoriteInteraction(interaction) ||
+      result?.key !== interaction.resultKey ||
+      result.activation.kind !== 'pluginCompletion' ||
+      result.activation.pluginId !== interaction.pluginId ||
+      result.activation.favorite === favorite
+    ) return
+    const owner: FavoriteMutationOwner = { ...interaction, favorite }
+    favoriteMutation = owner
+    favoriteMenuConsumed = true
+    model.favoriteMutationPending = true
+    model.status = ''
+    publish(true)
+    let pending: Promise<void>
+    try {
+      pending = client.setPublicPluginFavorite({ pluginId: owner.pluginId, favorite })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.then(
+      () => finishFavoriteMutation(owner, false),
+      () => finishFavoriteMutation(owner, true),
+    )
+  }
+
+  function finishFavoriteMutation(owner: FavoriteMutationOwner, failed: boolean): void {
+    if (favoriteMutation?.token !== owner.token || favoriteMutation.pluginId !== owner.pluginId) return
+    favoriteMutation = undefined
+    model.favoriteMutationPending = false
+    if (!ownsFavoriteInteraction(owner)) {
+      publish(true)
+      return
+    }
+    if (failed) {
+      model.status = FALLBACK_ERROR
+      publish(true)
+      return
+    }
+    applyEdit(owner.value)
+  }
+
   async function requestHide(): Promise<void> {
     if (destroyed || model.hidePending) return
     model.shownNotice = undefined
     model.status = ''
     model.hidePending = true
+    completionOrigin = undefined
+    invalidateFavoriteInteraction()
     leaveFileMode()
     const captured = { token: ++token, epoch: model.viewEpoch }
     hideToken = captured.token
@@ -1299,26 +2074,59 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     if (key === 'Enter') {
+      if (sequenceExhausted) return
+      if (
+        model.view === 'launcher' &&
+        model.launcherMode === 'applications' &&
+        model.selectedIndex >= 0 &&
+        model.selectedIndex < model.results.length
+      ) {
+        executeSelection()
+        return
+      }
+      if (model.view === 'launcher' && model.launcherMode === 'applications' && commitArmedPluginCompletion()) {
+        return
+      }
       const fileQuery = model.launcherMode === 'applications' ? fileCommand(model.query) : null
       if (model.view === 'launcher' && fileQuery !== null && model.queryControlValue === model.query) {
-        void enterFileMode(fileQuery)
+        submitFind(fileQuery)
+        return
+      }
+      if (
+        model.launcherMode === 'applications' && model.view === 'launcher' && model.searchPending &&
+        !model.executePending && !model.results.length && model.query !== '' &&
+        !model.query.startsWith('/') && model.queryControlValue === model.query && model.invocationId
+      ) {
+        pendingDefaultActivation = {
+          epoch: model.viewEpoch,
+          invocationId: model.invocationId,
+          sequence: model.querySequence,
+          query: model.query,
+        }
         return
       }
       if (
         model.launcherMode === 'applications' &&
         model.view === 'launcher' &&
-        !model.searchPending &&
         !model.executePending &&
         !model.results.length &&
         model.query !== '' &&
-        model.queryControlValue === model.query
+        model.queryControlValue === model.query &&
+        (!model.searchPending || model.query.startsWith('/'))
       ) {
-        applyEdit(model.query)
+        model.shownNotice = undefined
+        cancelSlashSearch()
+        if (model.query.startsWith('/')) {
+          model.querySequence += 1
+          beginSearch(true)
+        } else applyEdit(model.query)
+        publish(true)
         return
       }
       executeSelection()
       return
     }
+    if (sequenceExhausted) return
     if (model.launcherMode === 'files') {
       const file = model.file
       if (!file?.results.length) return
@@ -1326,6 +2134,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const offset = key === 'ArrowDown' ? 1 : -1
       const selectedIndex = (file.selectedIndex + offset + file.results.length) % file.results.length
       if (selectedIndex === file.selectedIndex) return
+      invalidateFavoriteInteraction()
       file.selectedIndex = selectedIndex
       publish(true)
       return
@@ -1333,7 +2142,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!model.results.length) return
     model.shownNotice = undefined
     const offset = key === 'ArrowDown' ? 1 : -1
-    model.selectedIndex = (model.selectedIndex + offset + model.results.length) % model.results.length
+    const selectedIndex = (model.selectedIndex + offset + model.results.length) % model.results.length
+    if (selectedIndex === model.selectedIndex) return
+    invalidateFavoriteInteraction()
+    model.selectedIndex = selectedIndex
     publish(true)
   }
 
@@ -1358,6 +2170,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     unlisten = registered
+    await messageCenter.start()
+    if (destroyed) return
     const operation = startSettingsOperation('load', {
       scope: 'startup',
       previewGeneration: previewPreferenceDurableGeneration,
@@ -1390,13 +2204,21 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function destroy(): void {
     if (destroyed) return
     destroyed = true
+    cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
     hideToken = ++token
+    completionOrigin = undefined
+    favoriteMutation = undefined
+    model.favoriteMutationPending = false
+    invalidateFavoriteInteraction()
     settingsOperation = undefined
     pendingSettingsLoadEpoch = undefined
     pluginListOwner = undefined
     pluginMutationOwners.clear()
+    unsubscribeMessages?.()
+    unsubscribeMessages = undefined
+    messageCenter.destroy()
     unlisten?.()
     unlisten = undefined
     listeners.clear()
@@ -1451,7 +2273,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<void>
     try {
-      pending = client.setFilePreviewPreference({ preference: { enabled } })
+      pending = legacyFindClient.setPreviewPreference({ preference: { enabled } }).then(() => undefined)
     } catch (error) {
       pending = Promise.reject(error)
     }
@@ -1485,7 +2307,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  async function clearMessages(): Promise<void> {
+    await messageCenter.clear()
+  }
+
   return {
+    client,
     getSnapshot,
     subscribe,
     start,
@@ -1494,11 +2321,19 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     text,
     retireControl,
     keyDown,
+    navigate,
+    selectSettingsTab,
     requestHide,
+    activateResult,
+    openPluginContextMenu,
+    closePluginContextMenu,
+    setPluginFavorite,
     setAutostart,
     setThemePreference,
+    setWebSearchEngine,
     setHotkeyCanonical,
     saveHotkeyCanonical,
+    clearMessages,
     setFileCategory,
     cycleFileCategory,
     setFileSort,

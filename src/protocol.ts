@@ -1,28 +1,61 @@
+import { safePublicPluginIconUrl } from './plugin-icon-url'
+
+export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
+
+export type LauncherResultActivation =
+  | { kind: 'completion'; completionText: string }
+  | { kind: 'pluginCompletion'; completionText: string; pluginId: string; favorite: boolean }
+  | { kind: 'openFind'; query: string }
+  | { kind: 'executeResult' }
+
+export type CompletionOrigin = Readonly<{
+  phase: 'preview' | 'commit'
+  pluginId: string
+}>
+
+export interface SearchAppsInput {
+  query: string
+  invocationId: string
+  querySequence: number
+  submit?: boolean
+  completionOrigin?: CompletionOrigin
+}
+
 export interface ResultItem {
   resultId: string
+  activation: LauncherResultActivation
   title: string
   subtitle?: string
   icon?: string
+  pluginIconUrl?: string
+  iconKind?: ResultIconKind
+  detail?: string
+  hasDefaultAction?: boolean
 }
-
 export interface SearchResponse {
   requestId: string
   items: ResultItem[]
+  windowTransferToken?: string
+  replaceLocalResults?: boolean
+  commandHint?: string
 }
 
 export type ThemePreference = 'system' | 'dark' | 'light'
+export type WebSearchEngine = 'bing' | 'baidu' | 'google'
 
 export interface SettingsView {
   hotkey: string
   autostart: boolean
   filePreviewEnabled: boolean
   theme: ThemePreference
+  webSearchEngine: WebSearchEngine
 }
 
 export interface UserSettingsUpdate {
   hotkey: string
   autostart: boolean
   theme: ThemePreference
+  webSearchEngine: WebSearchEngine
 }
 
 export interface HotkeySettingsUpdate {
@@ -61,6 +94,73 @@ export interface PluginInventorySnapshot {
   items: PluginInventoryView[]
 }
 
+export type PublicPluginFault = 'runtimeUnavailable' | 'consecutiveFailures'
+export type PublicPermission =
+  | 'ui.window'
+  | 'clipboard.write'
+  | 'clipboard.read'
+  | 'network.https'
+  | 'files.userSelected'
+  | 'files.index.readAll'
+  | 'notifications.publish'
+  | 'timer.control'
+  | 'background.schedule'
+
+export interface PublicPermissionView {
+  permission: PublicPermission
+  supported: boolean
+  granted: boolean
+}
+
+export type PublicSettingDefinition =
+  | { type: 'text'; key: string; label: string; default?: string }
+  | { type: 'secret'; key: string; label: string }
+  | { type: 'number'; key: string; label: string; default?: number; min?: number; max?: number; step?: number }
+  | { type: 'boolean'; key: string; label: string; default?: boolean }
+  | { type: 'select'; key: string; label: string; options: readonly { value: string; label: string }[]; default?: string }
+
+export interface PublicSettingView {
+  definition: PublicSettingDefinition
+  value?: string | number | boolean
+  secretConfigured?: boolean
+}
+
+export interface PublicPluginInventoryItem {
+  pluginId: string
+  name: string
+  description: string | null
+  version: string
+  source: 'localPackage'
+  defaultName: string
+  effectiveName: string
+  enabled: boolean
+  fault: PublicPluginFault | null
+  generation: number
+  iconUrl: string | null
+  permissions: readonly PublicPermissionView[]
+  settings: readonly PublicSettingView[]
+}
+
+export interface PublicPluginInventory {
+  revision: string
+  items: readonly PublicPluginInventoryItem[]
+}
+
+export interface PublicPluginPrepareSummary {
+  token: string
+  pluginId: string
+  name: string
+  version: string
+  permissions: readonly PublicPermission[]
+  isUpdate: boolean
+  sourceVerified: boolean
+  iconUrl: string | null
+}
+
+export interface PublicPluginWindowIdentity {
+  name: string
+  iconUrl: string | null
+}
 export interface PluginMutationOutcome {
   revision: string
 }
@@ -89,15 +189,17 @@ export type CommandErrorCode =
   | 'pluginInstallFailed'
   | 'pluginReloadFailed'
   | 'pluginDeleteFailed'
+  | 'dataCleanupPending'
   | 'fileNotFound'
   | 'fileOpenFailed'
+  | 'webSearchFailed'
 
 export interface CommandError {
   code: CommandErrorCode
   message: string
 }
 
-export type ShowTarget = 'launcher' | 'settings'
+export type ShowTarget = 'launcher' | 'settings' | 'messages'
 export type LifecycleNotice = 'settingsFailed'
 
 export interface LauncherShown {
@@ -105,6 +207,33 @@ export interface LauncherShown {
   target: ShowTarget
   notice: LifecycleNotice | null
 }
+
+export interface MessageSummary {
+  revision: U64Decimal
+  unreadCount: number
+}
+
+export interface MessageView {
+  id: U64Decimal
+  pluginId: string
+  pluginNameSnapshot: string
+  pluginIconUrl: string | null
+  createdAt: string
+  content: string
+  readAt: string | null
+}
+
+export interface MessageCenterSnapshot extends MessageSummary {
+  messages: readonly MessageView[]
+}
+
+export type MessageHostStateChanged =
+  | { status: 'ready'; revision: U64Decimal; unreadCount: number }
+  | { status: 'unavailable'; error: 'MessageStoreUnavailable' }
+
+export type MessageHostCommandError =
+  | { code: 'MessageOperationFailed'; storeStatus: 'ready' }
+  | { code: 'MessageStoreUnavailable'; storeStatus: 'unavailable' }
 
 export type ControlKey = number
 
@@ -116,7 +245,100 @@ export type ClassifiedTextRecord =
 
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
-  searchApps(input: { query: string; invocationId: string; querySequence: number }): Promise<SearchResponse | null>
+  listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
+  getMessageSummary(): Promise<unknown>
+  openMessageCenter(): Promise<unknown>
+  readMessageCenter(): Promise<unknown>
+  clearMessages(): Promise<unknown>
+  searchApps(input: SearchAppsInput): Promise<SearchResponse | null>
+  openFind(input: OpenFindInput): Promise<OpenFindOutcome>
+  executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
+  listPublicPlugins(): Promise<PublicPluginInventory>
+  selectPublicPluginArchive(): Promise<string | null>
+  selectPublicPluginDirectory(): Promise<string | null>
+  preparePublicPlugin(input: { source: { kind: 'archive' | 'developmentDirectory'; path: string } }): Promise<PublicPluginPrepareSummary>
+  commitPublicPlugin(input: { input: { token: string; permissionGrants: readonly PublicPermission[] } }): Promise<void>
+  cancelPublicPlugin(input: { token: string }): Promise<void>
+  setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
+  setPublicPluginFavorite(input: { pluginId: string; favorite: boolean }): Promise<void>
+  setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
+  savePublicPluginSettings(input: { input: { pluginId: string; settings: Readonly<Record<string, string | number | boolean>>; secrets: Readonly<Record<string, string | null>> } }): Promise<void>
+  uninstallPublicPlugin(input: { pluginId: string; retainData: boolean }): Promise<void>
+  listPlugins(): Promise<PluginInventorySnapshot>
+  installPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
+  reloadPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
+  deletePlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
+  loadSettings(): Promise<SettingsView>
+  saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
+  saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
+  setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
+  setWebSearchEngine(input: { preference: { engine: WebSearchEngine } }): Promise<void>
+  hideLauncher(): Promise<void>
+}
+
+export interface PluginWindowClient {
+  getIdentity(): Promise<PublicPluginWindowIdentity>
+  setPinned(input: { pinned: boolean }): Promise<{ pinned: boolean }>
+  close(): Promise<void>
+}
+export type U64Decimal = string & { readonly __u64Decimal: unique symbol }
+export type PluginTimerPhase = 'idle' | 'running' | 'paused' | 'fired'
+export interface PluginTimerStartInput {
+  readonly durationMs: number
+  readonly completionMessage: string
+}
+export type PluginTimerState =
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'idle'
+      durationMs: number | null
+      remainingMs: number | null
+    }>
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'running' | 'paused'
+      durationMs: number
+      remainingMs: number
+    }>
+  | Readonly<{
+      timerRevision: U64Decimal
+      phase: 'fired'
+      durationMs: number
+      remainingMs: 0
+    }>
+export type PluginTimerErrorName =
+  | 'InvalidCaller'
+  | 'PermissionDenied'
+  | 'ExpiredWindowSessionError'
+  | 'InvalidTimerInput'
+  | 'TimerInputRequired'
+  | 'TimerInputNotAllowed'
+  | 'MessageStoreUnavailable'
+  | 'TimerUnavailable'
+export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string }
+export type OpenFindOutcome = { status: 'forwarded' } | { status: 'superseded' }
+export interface OpenFindInput { query: string; invocationId: string; querySequence: number }
+export interface FindInitializationPrepared {
+  initializationToken: string
+  themeRevision: U64Decimal
+  theme: ThemePreference
+  filePreviewRevision: U64Decimal
+  filePreviewEnabled: boolean
+  pinned: boolean
+}
+export type FindReadyOutcome =
+  | { status: 'prepared'; initialization: FindInitializationPrepared }
+  | { status: 'ready'; initializationToken: string }
+  | { status: 'superseded' }
+export interface FindPreviewPreferenceResult { filePreviewRevision: U64Decimal; filePreviewEnabled: boolean }
+export interface FindThemeChanged { themeRevision: U64Decimal; theme: ThemePreference }
+export interface FindClient {
+  listenForward(handler: (payload: unknown) => void): Promise<() => void>
+  listenThemeChanged(handler: (payload: unknown) => void): Promise<() => void>
+  prepareInitialization(): Promise<unknown>
+  commitReady(input: { initializationToken: string }): Promise<unknown>
+  getReadyStatus(input: { initializationToken: string }): Promise<unknown>
   searchFiles(input: {
     query: string
     category: FileCategory
@@ -125,16 +347,9 @@ export interface LauncherClient {
     querySequence: number
   }): Promise<FileSearchResponse | null>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
-  listPlugins(): Promise<PluginInventorySnapshot>
-  installPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
-  reloadPlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
-  deletePlugin(input: { pluginId: string }): Promise<PluginMutationOutcome>
-  loadSettings(): Promise<SettingsView>
-  saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
-  saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
-  setFilePreviewPreference(input: { preference: { enabled: boolean } }): Promise<void>
-  setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
-  hideLauncher(): Promise<void>
+  setPinned(input: { invocationId: string; pinned: boolean }): Promise<{ pinned: boolean }>
+  setPreviewPreference(input: { preference: { enabled: boolean } }): Promise<unknown>
+  hide(input: { invocationId: string; force: boolean }): Promise<void>
 }
 
 export interface ViewResult {
@@ -142,8 +357,12 @@ export interface ViewResult {
   title: string
   subtitle?: string
   icon?: string
+  pluginIconUrl?: string
+  iconKind?: ResultIconKind
+  detail?: string
+  hasDefaultAction?: boolean
+  pluginCompletion?: Readonly<{ pluginId: string; favorite: boolean }>
 }
-
 export interface TextControlView {
   key: ControlKey
   value: string
@@ -155,9 +374,10 @@ export interface SettingsSnapshot {
   hotkey: TextControlView
   autostart: boolean
   theme: ThemePreference
+  webSearchEngine: WebSearchEngine
   loadStatus: SettingsLoadStatus
   readOnly: boolean
-  operation?: 'load' | 'save' | 'hotkey' | 'theme'
+  operation?: 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
   needsReload: boolean
 }
 
@@ -218,8 +438,22 @@ export interface FileSnapshot {
   selected?: FileResultView
 }
 
+export type SettingsTabKey = 'general' | 'plugins' | 'messages'
+
+export interface MessageCenterStateSnapshot {
+  readonly status: 'unknown' | 'ready' | 'unavailable'
+  readonly unreadCount?: number
+  readonly summaryRevision?: U64Decimal
+  readonly snapshotRevision?: U64Decimal
+  readonly messages: readonly MessageView[]
+  readonly clearPending: boolean
+  readonly operationError: boolean
+}
+
 export interface LauncherSnapshot {
   view: 'launcher' | 'settings'
+  settingsTab: SettingsTabKey
+  messageCenter: MessageCenterStateSnapshot
   viewEpoch: number
   theme: ThemePreference
   invocationId?: string
@@ -232,11 +466,14 @@ export interface LauncherSnapshot {
   searchPending: boolean
   executePending: boolean
   hidePending: boolean
+  favoriteMutationPending: boolean
   shownNotice?: string
+  commandHint?: string
   status: string
   settingsLoadStatus?: SettingsLoadStatus
   settings?: SettingsSnapshot
   plugins?: PluginListSnapshot
+  publicPlugins?: PublicPluginInventory
   file?: FileSnapshot
 }
 
@@ -250,7 +487,7 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
   const keys = Object.keys(candidate).sort()
   if (keys.length !== shownKeys.length || keys.some((key, index) => key !== shownKeys[index])) return null
   if (typeof candidate.invocationId !== 'string') return null
-  if (candidate.target !== 'launcher' && candidate.target !== 'settings') return null
+  if (candidate.target !== 'launcher' && candidate.target !== 'settings' && candidate.target !== 'messages') return null
   if (candidate.notice !== null && candidate.notice !== 'settingsFailed') return null
   return candidate as unknown as LauncherShown
 }
@@ -377,6 +614,94 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
   return { revision: snapshot.revision, items }
 }
 
+const publicPermissions = new Set<PublicPermission>([
+  'ui.window', 'clipboard.write', 'clipboard.read', 'network.https',
+  'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
+])
+const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])
+
+function parsePublicSettingDefinition(value: unknown): PublicSettingDefinition | null {
+  const setting = plainRecord(value)
+  if (!setting || typeof setting.type !== 'string' || typeof setting.key !== 'string' || setting.key.length === 0 || typeof setting.label !== 'string') return null
+  const optional = (key: string, type: 'string' | 'number' | 'boolean') => setting[key] === undefined || typeof setting[key] === type
+  if (setting.type === 'text' && exactKeys(setting, setting.default === undefined ? ['key', 'label', 'type'] : ['default', 'key', 'label', 'type']) && optional('default', 'string')) return setting as unknown as PublicSettingDefinition
+  if (setting.type === 'secret' && exactKeys(setting, ['key', 'label', 'type'])) return setting as unknown as PublicSettingDefinition
+  if (setting.type === 'boolean' && exactKeys(setting, setting.default === undefined ? ['key', 'label', 'type'] : ['default', 'key', 'label', 'type']) && optional('default', 'boolean')) return setting as unknown as PublicSettingDefinition
+  if (setting.type === 'number') {
+    const keys = ['key', 'label', 'type', ...['default', 'min', 'max', 'step'].filter((key) => setting[key] !== undefined)].sort()
+    if (!exactKeys(setting, keys) || !['default', 'min', 'max', 'step'].every((key) => optional(key, 'number'))) return null
+    if (['default', 'min', 'max', 'step'].some((key) => typeof setting[key] === 'number' && !Number.isFinite(setting[key]))) return null
+    return setting as unknown as PublicSettingDefinition
+  }
+  if (setting.type === 'select') {
+    const keys = setting.default === undefined ? ['key', 'label', 'options', 'type'] : ['default', 'key', 'label', 'options', 'type']
+    if (!exactKeys(setting, keys) || !optional('default', 'string') || !Array.isArray(setting.options) || !exactDenseArray(setting.options)) return null
+    const seen = new Set<string>()
+    for (const option of setting.options) {
+      const record = plainRecord(option)
+      if (!record || !exactKeys(record, ['label', 'value']) || typeof record.value !== 'string' || typeof record.label !== 'string' || !seen.add(record.value)) return null
+    }
+    return setting as unknown as PublicSettingDefinition
+  }
+  return null
+}
+
+function parsePublicSettingView(value: unknown): PublicSettingView | null {
+  const view = plainRecord(value)
+  if (!view || !Object.prototype.hasOwnProperty.call(view, 'definition')) return null
+  const definition = parsePublicSettingDefinition(view.definition)
+  if (!definition) return null
+  if (definition.type === 'secret') {
+    if (!exactKeys(view, ['definition', 'secretConfigured']) || typeof view.secretConfigured !== 'boolean') return null
+    return { definition, secretConfigured: view.secretConfigured }
+  }
+  const expected = view.value === undefined ? ['definition'] : ['definition', 'value']
+  if (!exactKeys(view, expected)) return null
+  const valueType = definition.type === 'text' || definition.type === 'select' ? 'string' : definition.type
+  if (view.value !== undefined && (typeof view.value !== valueType || (valueType === 'number' && !Number.isFinite(view.value)))) return null
+  return view.value === undefined ? { definition } : { definition, value: view.value as string | number | boolean }
+}
+
+function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null {
+  const item = plainRecord(value)
+  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'permissions', 'pluginId', 'settings', 'source', 'version']
+  if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.defaultName !== 'string' || typeof item.effectiveName !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.iconUrl !== null && safePublicPluginIconUrl(item.iconUrl) === undefined) || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
+  if (!Array.isArray(item.permissions) || !exactDenseArray(item.permissions) || !Array.isArray(item.settings) || !exactDenseArray(item.settings)) return null
+  const permissions: PublicPermissionView[] = []
+  for (const valuePermission of item.permissions) {
+    const permission = plainRecord(valuePermission)
+    if (!permission || !exactKeys(permission, ['granted', 'permission', 'supported']) || typeof permission.permission !== 'string' || !publicPermissions.has(permission.permission as PublicPermission) || typeof permission.supported !== 'boolean' || typeof permission.granted !== 'boolean') return null
+    permissions.push(permission as unknown as PublicPermissionView)
+  }
+  const settings: PublicSettingView[] = []
+  const settingKeys = new Set<string>()
+  for (const valueSetting of item.settings) {
+    const setting = parsePublicSettingView(valueSetting)
+    if (!setting || !settingKeys.add(setting.definition.key)) return null
+    settings.push(setting)
+  }
+  return { ...(item as unknown as PublicPluginInventoryItem), permissions, settings }
+}
+
+export function parsePublicPluginInventory(value: unknown): PublicPluginInventory | null {
+  const inventory = plainRecord(value)
+  if (!inventory || !exactKeys(inventory, ['items', 'revision']) || !canonicalU64(inventory.revision) || !Array.isArray(inventory.items) || !exactDenseArray(inventory.items)) return null
+  const items: PublicPluginInventoryItem[] = []
+  const ids = new Set<string>()
+  for (const valueItem of inventory.items) {
+    const item = parsePublicPluginItem(valueItem)
+    if (!item || !ids.add(item.pluginId)) return null
+    items.push(item)
+  }
+  return { revision: inventory.revision, items }
+}
+
+export function parsePublicPluginWindowIdentity(value: unknown): PublicPluginWindowIdentity | null {
+  const identity = plainRecord(value)
+  if (!identity || !exactKeys(identity, ['iconUrl', 'name']) || typeof identity.name !== 'string' || identity.name.length === 0) return null
+  if (identity.iconUrl !== null && safePublicPluginIconUrl(identity.iconUrl) === undefined) return null
+  return identity as unknown as PublicPluginWindowIdentity
+}
 export function parsePluginMutationOutcome(value: unknown): PluginMutationOutcome | null {
   const outcome = plainRecord(value)
   return outcome && exactKeys(outcome, ['revision']) && canonicalU64(outcome.revision)
@@ -384,15 +709,231 @@ export function parsePluginMutationOutcome(value: unknown): PluginMutationOutcom
     : null
 }
 
-export function compareDecimalRevision(left: string, right: string): -1 | 0 | 1 {
+export function compareU64Decimal(left: string, right: string): -1 | 0 | 1 {
   if (!canonicalU64(left) || !canonicalU64(right)) throw new TypeError('invalid decimal revision')
   if (left.length !== right.length) return left.length < right.length ? -1 : 1
   return left === right ? 0 : left < right ? -1 : 1
 }
 
+export const compareDecimalRevision = compareU64Decimal
+
+export function parseU64Decimal(value: unknown): U64Decimal | null {
+  if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return null
+  return BigInt(value) <= U64_MAX ? value as U64Decimal : null
+}
+
+function validTimerDuration(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1_000 && value <= 86_400_000
+}
+
+function validTimerMessage(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim().length === 0) return false
+  let scalars = 0
+  for (const character of value) {
+    const point = character.codePointAt(0)
+    if (point === undefined || (point >= 0xd800 && point <= 0xdfff) || point <= 0x1f || (point >= 0x7f && point <= 0x9f)) {
+      return false
+    }
+    scalars += 1
+    if (scalars > 500) return false
+  }
+  return true
+}
+
+export function parsePluginTimerStartInput(value: unknown): PluginTimerStartInput | null {
+  const input = plainRecord(value)
+  if (
+    !input ||
+    !exactKeys(input, ['completionMessage', 'durationMs']) ||
+    !validTimerDuration(input.durationMs) ||
+    !validTimerMessage(input.completionMessage)
+  ) {
+    return null
+  }
+  return { durationMs: input.durationMs, completionMessage: input.completionMessage }
+}
+
+export function parsePluginTimerState(value: unknown): PluginTimerState | null {
+  const state = plainRecord(value)
+  if (!state || !exactKeys(state, ['durationMs', 'phase', 'remainingMs', 'timerRevision'])) return null
+  const timerRevision = parseU64Decimal(state.timerRevision)
+  if (!timerRevision || !['idle', 'running', 'paused', 'fired'].includes(String(state.phase))) return null
+
+  if (state.phase === 'idle') {
+    if (state.durationMs === null && state.remainingMs === null) {
+      return { timerRevision, phase: 'idle', durationMs: null, remainingMs: null }
+    }
+    if (!validTimerDuration(state.durationMs) || state.remainingMs !== state.durationMs) return null
+    return { timerRevision, phase: 'idle', durationMs: state.durationMs, remainingMs: state.remainingMs }
+  }
+
+  if (!validTimerDuration(state.durationMs) || !Number.isSafeInteger(state.remainingMs)) return null
+  if (typeof state.remainingMs !== 'number' || state.remainingMs < 0 || state.remainingMs > state.durationMs) return null
+  if (state.phase === 'fired') {
+    return state.remainingMs === 0
+      ? { timerRevision, phase: 'fired', durationMs: state.durationMs, remainingMs: 0 }
+      : null
+  }
+  return {
+    timerRevision,
+    phase: state.phase as 'running' | 'paused',
+    durationMs: state.durationMs,
+    remainingMs: state.remainingMs,
+  }
+}
+
 function canonicalU64(value: unknown): value is string {
-  if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return false
-  return BigInt(value) <= U64_MAX
+  return parseU64Decimal(value) !== null
+}
+
+function validUnreadCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100
+}
+
+export function parseMessageSummary(value: unknown): MessageSummary | null {
+  const summary = plainRecord(value)
+  const revision = summary ? parseU64Decimal(summary.revision) : null
+  if (!summary || !revision || !exactKeys(summary, ['revision', 'unreadCount']) || !validUnreadCount(summary.unreadCount)) {
+    return null
+  }
+  return { revision, unreadCount: summary.unreadCount }
+}
+
+export function parseMessageView(value: unknown): MessageView | null {
+  const message = plainRecord(value)
+  const id = message ? parseU64Decimal(message.id) : null
+  if (
+    !message ||
+    !id ||
+    !exactKeys(message, [
+      'content', 'createdAt', 'id', 'pluginIconUrl', 'pluginId', 'pluginNameSnapshot', 'readAt',
+    ]) ||
+    typeof message.pluginId !== 'string' ||
+    message.pluginId.length === 0 ||
+    typeof message.pluginNameSnapshot !== 'string' ||
+    message.pluginNameSnapshot.length === 0 ||
+    (message.pluginIconUrl !== null &&
+      (typeof message.pluginIconUrl !== 'string' || message.pluginIconUrl.length === 0)) ||
+    typeof message.createdAt !== 'string' ||
+    !strictUtcRfc3339(message.createdAt) ||
+    typeof message.content !== 'string' ||
+    message.content.length === 0 ||
+    (message.readAt !== null && (typeof message.readAt !== 'string' || !strictUtcRfc3339(message.readAt)))
+  ) {
+    return null
+  }
+  return {
+    id,
+    pluginId: message.pluginId,
+    pluginNameSnapshot: message.pluginNameSnapshot,
+    pluginIconUrl: message.pluginIconUrl,
+    createdAt: message.createdAt,
+    content: message.content,
+    readAt: message.readAt,
+  }
+}
+
+export function parseMessageCenterSnapshot(value: unknown): MessageCenterSnapshot | null {
+  const snapshot = plainRecord(value)
+  const revision = snapshot ? parseU64Decimal(snapshot.revision) : null
+  if (
+    !snapshot ||
+    !revision ||
+    !exactKeys(snapshot, ['messages', 'revision', 'unreadCount']) ||
+    !validUnreadCount(snapshot.unreadCount) ||
+    !Array.isArray(snapshot.messages) ||
+    Object.getPrototypeOf(snapshot.messages) !== Array.prototype ||
+    !exactDenseArray(snapshot.messages)
+  ) {
+    return null
+  }
+  const ids = new Set<string>()
+  const messages: MessageView[] = []
+  for (const valueMessage of snapshot.messages) {
+    const message = parseMessageView(valueMessage)
+    if (!message || ids.has(message.id)) return null
+    ids.add(message.id)
+    messages.push(message)
+  }
+  return { revision, unreadCount: snapshot.unreadCount, messages }
+}
+
+export function parseMessageHostStateChanged(value: unknown): MessageHostStateChanged | null {
+  const event = plainRecord(value)
+  if (!event || typeof event.status !== 'string') return null
+  if (event.status === 'unavailable') {
+    return exactKeys(event, ['error', 'status']) && event.error === 'MessageStoreUnavailable'
+      ? { status: 'unavailable', error: 'MessageStoreUnavailable' }
+      : null
+  }
+  const revision = parseU64Decimal(event.revision)
+  return event.status === 'ready' &&
+    revision !== null &&
+    exactKeys(event, ['revision', 'status', 'unreadCount']) &&
+    validUnreadCount(event.unreadCount)
+    ? { status: 'ready', revision, unreadCount: event.unreadCount }
+    : null
+}
+
+export function parseMessageHostCommandError(value: unknown): MessageHostCommandError | null {
+  const error = plainRecord(value)
+  if (!error || !exactKeys(error, ['code', 'storeStatus'])) return null
+  if (error.code === 'MessageOperationFailed' && error.storeStatus === 'ready') {
+    return { code: 'MessageOperationFailed', storeStatus: 'ready' }
+  }
+  if (error.code === 'MessageStoreUnavailable' && error.storeStatus === 'unavailable') {
+    return { code: 'MessageStoreUnavailable', storeStatus: 'unavailable' }
+  }
+  return null
+}
+
+export function parseFindForwardPayload(value: unknown): FindForwardPayload | null {
+  const payload = plainRecord(value)
+  const forwardSequence = payload ? parseU64Decimal(payload.forwardSequence) : null
+  if (!payload || !exactKeys(payload, ['forwardSequence', 'invocationId', 'query']) ||
+      typeof payload.invocationId !== 'string' || payload.invocationId.length === 0 ||
+      typeof payload.query !== 'string' || !forwardSequence) return null
+  return { invocationId: payload.invocationId, forwardSequence, query: payload.query }
+}
+
+export function parseFindReadyOutcome(value: unknown): FindReadyOutcome | null {
+  const outcome = plainRecord(value)
+  if (!outcome || typeof outcome.status !== 'string') return null
+  if (outcome.status === 'superseded') return exactKeys(outcome, ['status']) ? { status: 'superseded' } : null
+  if (outcome.status === 'ready') {
+    return exactKeys(outcome, ['initializationToken', 'status']) &&
+      typeof outcome.initializationToken === 'string' && outcome.initializationToken.length > 0
+      ? { status: 'ready', initializationToken: outcome.initializationToken } : null
+  }
+  if (outcome.status !== 'prepared' || !exactKeys(outcome, ['initialization', 'status'])) return null
+  const initialization = plainRecord(outcome.initialization)
+  if (!initialization || !exactKeys(initialization, ['filePreviewEnabled', 'filePreviewRevision', 'initializationToken', 'pinned', 'theme', 'themeRevision'])) return null
+  const themeRevision = parseU64Decimal(initialization.themeRevision)
+  const filePreviewRevision = parseU64Decimal(initialization.filePreviewRevision)
+  if (typeof initialization.initializationToken !== 'string' || initialization.initializationToken.length === 0 ||
+      (initialization.theme !== 'system' && initialization.theme !== 'dark' && initialization.theme !== 'light') ||
+      typeof initialization.filePreviewEnabled !== 'boolean' || typeof initialization.pinned !== 'boolean' ||
+      !themeRevision || !filePreviewRevision) return null
+  return { status: 'prepared', initialization: {
+    initializationToken: initialization.initializationToken, themeRevision, theme: initialization.theme,
+    filePreviewRevision, filePreviewEnabled: initialization.filePreviewEnabled, pinned: initialization.pinned,
+  } }
+}
+
+export function parseFindThemeChanged(value: unknown): FindThemeChanged | null {
+  const event = plainRecord(value)
+  const themeRevision = event ? parseU64Decimal(event.themeRevision) : null
+  if (!event || !exactKeys(event, ['theme', 'themeRevision']) || !themeRevision ||
+      (event.theme !== 'system' && event.theme !== 'dark' && event.theme !== 'light')) return null
+  return { themeRevision, theme: event.theme }
+}
+
+export function parseFindPreviewPreferenceResult(value: unknown): FindPreviewPreferenceResult | null {
+  const result = plainRecord(value)
+  const filePreviewRevision = result ? parseU64Decimal(result.filePreviewRevision) : null
+  if (!result || !exactKeys(result, ['filePreviewEnabled', 'filePreviewRevision']) ||
+      !filePreviewRevision || typeof result.filePreviewEnabled !== 'boolean') return null
+  return { filePreviewRevision, filePreviewEnabled: result.filePreviewEnabled }
 }
 
 function fileStatus(value: unknown): value is FileIndexStatus {

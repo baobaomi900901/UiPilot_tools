@@ -1,0 +1,8 @@
+UiPilot Plugin CLI includes or derives data/code from these third-party projects:
+
+- Ajv, MIT License, used only at build time to generate the standalone JSON Schema validator.
+- esbuild, MIT License, used only at build time to create the ESM bundle.
+- pngjs, MIT License, bundled for complete PNG pixel decoding.
+- Unicode Character Database 15.1.0, Unicode Data Files and Software License v3.
+
+The corresponding package/source distributions contain their complete license texts and attribution details.

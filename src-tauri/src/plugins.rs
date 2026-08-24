@@ -21,7 +21,7 @@ use unicode_normalization::is_nfc;
 
 use crate::{
     atomic_file::replace_current,
-    model::{ResultItem, SearchResponse},
+    model::{LauncherResultActivation, ResultItem, SearchResponse},
     result_registry::{QueryDomain, QueryToken, ResultAction, ResultRegistry},
 };
 
@@ -321,12 +321,17 @@ impl PluginManager {
                 .get()
                 .and_then(|state| state.read().ok().map(|state| state.inventory_revision))
                 .ok_or(PluginManagementError::Unavailable)?;
-            let snapshot = scan_inventory(
+            let mut snapshot = scan_inventory(
                 &config.plugin_root,
                 config.development_root.as_deref(),
                 config.host_version,
                 revision,
             )?;
+            snapshot.items.retain(|item| {
+                item.id
+                    .as_deref()
+                    .is_none_or(|plugin_id| !retired_plugin_id(plugin_id))
+            });
             let current_revision = self
                 .state
                 .get()
@@ -396,6 +401,9 @@ impl PluginManager {
                         item
                     })
                     .collect(),
+                command_hint: None,
+                window_transfer_token: None,
+                replace_local_results: false,
             },
         )
     }
@@ -1632,9 +1640,14 @@ impl PluginManager {
             items.push((
                 ResultItem {
                     result_id: String::new(),
+                    activation: LauncherResultActivation::ExecuteResult,
                     title: item.title,
                     subtitle: item.subtitle,
                     icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: None,
+                    detail: None,
+                    has_default_action: true,
                 },
                 action,
             ));
@@ -4388,6 +4401,11 @@ fn move_cleanup_directory(
 }
 
 impl PluginCatalog {
+    #[cfg(test)]
+    pub(crate) fn entry_count_for_test(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(crate) fn load(root: &Path, host_version: Version) -> Result<Self, PluginSetupError> {
         let mut candidates = Vec::new();
         let children = match fs::read_dir(root) {
@@ -4427,7 +4445,8 @@ impl PluginCatalog {
                 .map(|entry| entry.feature.trigger.as_str()),
         );
         candidates.retain(|entry| {
-            !duplicate_ids.contains(entry.id.as_str())
+            !retired_plugin_id(&entry.id)
+                && !duplicate_ids.contains(entry.id.as_str())
                 && !duplicate_triggers.contains(entry.feature.trigger.as_str())
         });
         Ok(Self {
@@ -4798,6 +4817,8 @@ fn manifest_from_snapshot(
         || !valid_id(&manifest.id)
         || !valid_id(&manifest.feature.id)
         || !valid_trigger(&manifest.feature.trigger)
+        || retired_plugin_id(&manifest.id)
+        || retired_plugin_trigger(&manifest.feature.trigger)
         || manifest.runtime.contains(['/', '\\'])
         || Path::new(&manifest.runtime)
             .extension()
@@ -4896,6 +4917,8 @@ fn load_entry(root: &Path, host_version: Version) -> Option<PluginCatalogEntry> 
         || !valid_id(&manifest.id)
         || !valid_id(&manifest.feature.id)
         || !valid_trigger(&manifest.feature.trigger)
+        || retired_plugin_id(&manifest.id)
+        || retired_plugin_trigger(&manifest.feature.trigger)
         || manifest.runtime.contains(['/', '\\'])
         || Path::new(&manifest.runtime)
             .extension()
@@ -5152,6 +5175,14 @@ fn read_description(snapshot: &GenerationAssetSnapshot) -> Option<String> {
         return None;
     }
     String::from_utf8(bytes.clone()).ok()
+}
+
+fn retired_plugin_id(plugin_id: &str) -> bool {
+    plugin_id == "internal.math"
+}
+
+fn retired_plugin_trigger(trigger: &str) -> bool {
+    trigger == concat!("/", "math")
 }
 
 fn valid_id(id: &str) -> bool {
@@ -5548,7 +5579,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{parse_active_state, scan_package_snapshot, PluginCatalog, Version};
+    use super::{
+        parse_active_state, retired_plugin_id, retired_plugin_trigger, scan_package_snapshot,
+        PluginCatalog, Version,
+    };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -5590,11 +5624,11 @@ mod tests {
     }
 
     fn package_id() -> String {
-        ["internal", "math"].join(".")
+        ["internal", "sample"].join(".")
     }
 
     fn trigger() -> String {
-        ["/", "math"].concat()
+        ["/", "sample"].concat()
     }
 
     fn valid_manifest(plugin_id: &str, trigger: &str) -> String {
@@ -5613,6 +5647,14 @@ mod tests {
 
     fn load(root: &TestRoot) -> PluginCatalog {
         PluginCatalog::load(&root.path, Version::new(0, 2, 0)).unwrap()
+    }
+
+    #[test]
+    fn legacy_math_plugin_id_is_retired_without_retiring_other_plugins() {
+        assert!(retired_plugin_id(&["internal", "math"].join(".")));
+        assert!(!retired_plugin_id(&package_id()));
+        assert!(retired_plugin_trigger(&["/", "math"].concat()));
+        assert!(!retired_plugin_trigger(&trigger()));
     }
 
     mod package_state {
@@ -5657,21 +5699,21 @@ mod tests {
         fn active_state_enforces_empty_and_non_empty_invariants() {
             let empty = br#"{
                 "schema":1,
-                "pluginId":"internal\u002emath",
+                "pluginId":"internal\u002esample",
                 "activeVersion":null,
                 "packages":[]
             }"#;
-            let parsed = parse_active_state(empty, "internal\u{2e}math").unwrap();
+            let parsed = parse_active_state(empty, "internal\u{2e}sample").unwrap();
             assert!(parsed.active_version.is_none());
             assert!(parsed.packages.is_empty());
 
             for invalid in [
                 br#"{"schema":1,"pluginId":"other","activeVersion":null,"packages":[]}"#.as_slice(),
-                br#"{"schema":1,"pluginId":"internal\u002emath","activeVersion":"1.0.0","packages":[]}"#.as_slice(),
-                br#"{"schema":1,"pluginId":"internal\u002emath","activeVersion":null,"packages":[{"version":"1.0.0","identity":{"algorithm":"sha256-tree-v1","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","volumeSerial":1,"fileId":"0000000000000001"}}]}"#.as_slice(),
-                br#"{"schema":2,"pluginId":"internal\u002emath","activeVersion":null,"packages":[]}"#.as_slice(),
+                br#"{"schema":1,"pluginId":"internal\u002esample","activeVersion":"1.0.0","packages":[]}"#.as_slice(),
+                br#"{"schema":1,"pluginId":"internal\u002esample","activeVersion":null,"packages":[{"version":"1.0.0","identity":{"algorithm":"sha256-tree-v1","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","volumeSerial":1,"fileId":"0000000000000001"}}]}"#.as_slice(),
+                br#"{"schema":2,"pluginId":"internal\u002esample","activeVersion":null,"packages":[]}"#.as_slice(),
             ] {
-                assert!(parse_active_state(invalid, "internal\u{2e}math").is_err());
+                assert!(parse_active_state(invalid, "internal\u{2e}sample").is_err());
             }
         }
 
@@ -5744,7 +5786,7 @@ mod tests {
             fs::create_dir(&package).unwrap();
             fs::write(
                 package.join("plugin.json"),
-                valid_manifest(plugin_id, "/\u{6d}ath").replace(
+                valid_manifest(plugin_id, "/\u{73}ample").replace(
                     r#""version":"1.0.0""#,
                     format!(r#""version":"{version}""#).as_str(),
                 ),
@@ -5790,13 +5832,13 @@ mod tests {
             let installed = TestRoot::new();
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             fs::write(
                 development
                     .path
-                    .join("internal\u{2e}math")
+                    .join("internal\u{2e}sample")
                     .join("README.md"),
                 "# Development math",
             )
@@ -5814,11 +5856,11 @@ mod tests {
                 serde_json::json!({
                     "revision":"7",
                     "items":[{
-                        "key":"plugin:696e7465726e616c2e6d617468",
-                        "id":"internal\u{2e}math",
-                        "displayName":"internal\u{2e}math",
+                        "key":"plugin:696e7465726e616c2e73616d706c65",
+                        "id":"internal\u{2e}sample",
+                        "displayName":"internal\u{2e}sample",
                         "installed":{"state":"absent"},
-                        "development":{"state":"valid","version":"1.0.0","trigger":"/\u{6d}ath"},
+                        "development":{"state":"valid","version":"1.0.0","trigger":"/\u{73}ample"},
                         "description":{"state":"available","source":"development","markdown":"# Development math"}
                     }]
                 })
@@ -5830,7 +5872,7 @@ mod tests {
             let installed = TestRoot::new();
             write_installed(
                 &installed.path,
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
                 "0.2.0",
                 &[("0.1.0", "old"), ("0.2.0", "# Installed math")],
             );
@@ -5858,16 +5900,16 @@ mod tests {
             let installed = TestRoot::new();
             write_installed(
                 &installed.path,
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
                 "0.2.0",
                 &[("0.1.0", "old"), ("0.2.0", "active")],
             );
 
             let catalog = PluginCatalog::load(&installed.path, Version::new(0, 2, 0)).unwrap();
             assert_eq!(catalog.views().len(), 1);
-            assert_eq!(catalog.views()[0].id, "internal\u{2e}math");
+            assert_eq!(catalog.views()[0].id, "internal\u{2e}sample");
             assert_eq!(catalog.views()[0].version, "0.2.0");
-            assert!(catalog.route("/\u{6d}ath 1+1").is_some());
+            assert!(catalog.route("/\u{73}ample 1+1").is_some());
         }
 
         #[test]
@@ -5903,19 +5945,19 @@ mod tests {
             let development = TestRoot::new();
             write_installed(
                 &installed.path,
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
                 "1.0.0",
                 &[("1.0.0", "installed")],
             );
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath")
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample")
                     .replace(r#""version":"1.0.0""#, r#""version":"2.0.0""#),
             );
             fs::write(
                 development
                     .path
-                    .join("internal\u{2e}math")
+                    .join("internal\u{2e}sample")
                     .join("README.md"),
                 "development update",
             )
@@ -5988,7 +6030,7 @@ mod tests {
                 "schema":1,
                 "transactionId":"11111111111111111111111111111111",
                 "operation":"delete-last",
-                "pluginId":"internal\u{2e}math",
+                "pluginId":"internal\u{2e}sample",
                 "phase":phase,
                 "oldState":{"kind":"active-state-v1","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
                 "newState":{"kind":"active-state-v1","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
@@ -5997,7 +6039,7 @@ mod tests {
                     "deletedPackage":{
                         "role":"deleted-package",
                         "identity":{"volumeSerial":1,"fileId":"0000000000000001","packageDigest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-                        "location":{"root":"plugin-root","relativePath":"internal\u{2e}math/1.0.0"}
+                        "location":{"root":"plugin-root","relativePath":"internal\u{2e}sample/1.0.0"}
                     },
                     "previousRuntimeData":null
                 },
@@ -6018,13 +6060,13 @@ mod tests {
                 "schema":1,
                 "receiptId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "originOperationId":"11111111111111111111111111111111",
-                "pluginId":"internal\u{2e}math",
+                "pluginId":"internal\u{2e}sample",
                 "operation":"delete-last-version",
                 "phase":"pending",
                 "source":{
                     "role":"deleted-package",
                     "root":"plugin-root",
-                    "relativePath":"internal\u{2e}math/1.0.0",
+                    "relativePath":"internal\u{2e}sample/1.0.0",
                     "volumeSerial":1,
                     "fileId":"0000000000000001",
                     "packageDigest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
@@ -6115,7 +6157,7 @@ mod tests {
             fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
             fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
             let identity = super::super::RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-runtime".into(),
                 generation: 7,
             };
@@ -6127,7 +6169,7 @@ mod tests {
 
             let receipt_path = stage_runtime_cleanup_receipt(
                 &app_data.path,
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
                 &identity,
                 "11111111111111111111111111111111",
                 "22222222222222222222222222222222",
@@ -6194,7 +6236,7 @@ mod tests {
             let source = app_data
                 .path
                 .join("plugins")
-                .join("internal\u{2e}math")
+                .join("internal\u{2e}sample")
                 .join("1.0.0");
             fs::create_dir_all(&source).unwrap();
             fs::write(source.join("plugin.json"), "{}").unwrap();
@@ -6244,7 +6286,7 @@ mod tests {
             fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
             fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
             let identity = super::super::RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-runtime".into(),
                 generation: 7,
             };
@@ -6253,7 +6295,7 @@ mod tests {
             fs::write(source.join("WebView.lock"), "in use").unwrap();
             let receipt_path = stage_runtime_cleanup_receipt(
                 &app_data.path,
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
                 &identity,
                 "11111111111111111111111111111111",
                 "22222222222222222222222222222222",
@@ -6280,7 +6322,7 @@ mod tests {
             fs::create_dir_all(app_data.path.join("plugin-transactions").join("receipts")).unwrap();
             fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
             let identity = super::super::RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-runtime".into(),
                 generation: 8,
             };
@@ -6289,7 +6331,7 @@ mod tests {
             fs::write(source.join("WebView.lock"), "in use").unwrap();
             let receipt_path = stage_runtime_cleanup_receipt(
                 &app_data.path,
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
                 &identity,
                 "33333333333333333333333333333333",
                 "44444444444444444444444444444444",
@@ -6317,7 +6359,7 @@ mod tests {
             let source = app_data
                 .path
                 .join("plugins")
-                .join("internal\u{2e}math")
+                .join("internal\u{2e}sample")
                 .join("1.0.0");
             fs::create_dir_all(&source).unwrap();
             fs::write(source.join("plugin.json"), "{}").unwrap();
@@ -6366,7 +6408,7 @@ mod tests {
             let source = app_data
                 .path
                 .join("plugins")
-                .join("internal\u{2e}math")
+                .join("internal\u{2e}sample")
                 .join("1.0.0");
             fs::create_dir_all(&source).unwrap();
             fs::write(source.join("plugin.json"), "{}").unwrap();
@@ -6653,26 +6695,26 @@ mod tests {
         fn development_install_uses_version_directory_and_commits_registered_identity() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let installed = TestRoot::new();
 
             let prepared = prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &installed.path,
                 &installed.path.join("plugin-transactions"),
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .unwrap();
             assert_eq!(
                 prepared.candidate.root,
-                installed.path.join("internal\u{2e}math").join("1.0.0")
+                installed.path.join("internal\u{2e}sample").join("1.0.0")
             );
             assert!(!installed
                 .path
-                .join("internal\u{2e}math")
+                .join("internal\u{2e}sample")
                 .join("active.json")
                 .exists());
 
@@ -6680,11 +6722,11 @@ mod tests {
             let state_bytes = fs::read(
                 installed
                     .path
-                    .join("internal\u{2e}math")
+                    .join("internal\u{2e}sample")
                     .join("active.json"),
             )
             .unwrap();
-            let state = parse_active_state(&state_bytes, "internal\u{2e}math").unwrap();
+            let state = parse_active_state(&state_bytes, "internal\u{2e}sample").unwrap();
             assert_eq!(state.active_version.as_deref(), Some("1.0.0"));
             assert_eq!(state.packages.len(), 1);
             assert_eq!(
@@ -6697,18 +6739,18 @@ mod tests {
         fn development_install_is_staged_before_the_durable_journal_commit() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let installed = TestRoot::new();
             let transaction_root = installed.path.join("plugin-transactions");
 
             let prepared = prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &installed.path,
                 &transaction_root,
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .unwrap();
 
@@ -6718,7 +6760,7 @@ mod tests {
                 .is_some_and(|root| root.starts_with(transaction_root.join("staging"))));
             assert!(!installed
                 .path
-                .join("internal\u{2e}math")
+                .join("internal\u{2e}sample")
                 .join("1.0.0")
                 .exists());
         }
@@ -6727,21 +6769,21 @@ mod tests {
         fn new_version_install_transaction_owns_staging_and_candidate_runtime_before_commit() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let app_data = TestRoot::new();
             let transaction_root = app_data.path.join("plugin-transactions");
             let prepared = prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &app_data.path.join("plugins"),
                 &transaction_root,
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .unwrap();
             let runtime = RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-test".into(),
                 generation: 1,
             };
@@ -6800,26 +6842,26 @@ mod tests {
         fn update_transaction_owns_previous_runtime_cleanup_after_commit() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let app_data = TestRoot::new();
             let transaction_root = app_data.path.join("plugin-transactions");
             let prepared = prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &app_data.path.join("plugins"),
                 &transaction_root,
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .unwrap();
             let candidate = RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-candidate".into(),
                 generation: 2,
             };
             let previous = RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-previous".into(),
                 generation: 1,
             };
@@ -6860,8 +6902,8 @@ mod tests {
         fn committed_update_hands_previous_runtime_to_a_durable_receipt() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let app_data = TestRoot::new();
             let transaction_root = app_data.path.join("plugin-transactions");
@@ -6869,20 +6911,20 @@ mod tests {
             fs::create_dir_all(transaction_root.join("receipts")).unwrap();
             fs::create_dir_all(app_data.path.join("plugin-quarantine")).unwrap();
             let prepared = prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &app_data.path.join("plugins"),
                 &transaction_root,
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .unwrap();
             let candidate = RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-candidate".into(),
                 generation: 2,
             };
             let previous = RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-previous".into(),
                 generation: 1,
             };
@@ -7047,22 +7089,22 @@ mod tests {
         fn install_transaction_records_package_placement_before_state_commit() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let app_data = TestRoot::new();
             let transaction_root = app_data.path.join("plugin-transactions");
             fs::create_dir_all(transaction_root.join("active")).unwrap();
             let prepared = prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &app_data.path.join("plugins"),
                 &transaction_root,
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .unwrap();
             let runtime = RuntimeIdentity {
-                plugin_id: "internal\u{2e}math".into(),
+                plugin_id: "internal\u{2e}sample".into(),
                 window_label: "plugin-test".into(),
                 generation: 1,
             };
@@ -7098,7 +7140,7 @@ mod tests {
             assert_eq!(
                 parse_active_state(
                     &fs::read(&prepared.state_path).unwrap(),
-                    "internal\u{2e}math"
+                    "internal\u{2e}sample"
                 )
                 .unwrap()
                 .active_version
@@ -7280,20 +7322,20 @@ mod tests {
         fn existing_version_content_is_never_overwritten() {
             let development = TestRoot::new();
             development.write_plugin(
-                "internal\u{2e}math",
-                valid_manifest("internal\u{2e}math", "/\u{6d}ath"),
+                "internal\u{2e}sample",
+                valid_manifest("internal\u{2e}sample", "/\u{73}ample"),
             );
             let installed = TestRoot::new();
-            let version_root = installed.path.join("internal\u{2e}math").join("1.0.0");
+            let version_root = installed.path.join("internal\u{2e}sample").join("1.0.0");
             fs::create_dir_all(&version_root).unwrap();
             fs::write(version_root.join("marker.txt"), "keep").unwrap();
 
             assert!(prepare_development_install(
-                &development.path.join("internal\u{2e}math"),
+                &development.path.join("internal\u{2e}sample"),
                 &installed.path,
                 &installed.path.join("plugin-transactions"),
                 Version::new(0, 2, 0),
-                "internal\u{2e}math",
+                "internal\u{2e}sample",
             )
             .is_err());
             assert_eq!(
@@ -7456,9 +7498,14 @@ mod tests {
                     vec![(
                         ResultItem {
                             result_id: String::new(),
+                            activation: crate::model::LauncherResultActivation::ExecuteResult,
                             title: "late".into(),
                             subtitle: None,
                             icon: None,
+                            plugin_icon_url: None,
+                            icon_kind: None,
+                            detail: None,
+                            has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
                             plugin_id: "plugin".into(),
@@ -7534,9 +7581,14 @@ mod tests {
                     vec![(
                         ResultItem {
                             result_id: String::new(),
+                            activation: crate::model::LauncherResultActivation::ExecuteResult,
                             title: "2".into(),
                             subtitle: None,
                             icon: None,
+                            plugin_icon_url: None,
+                            icon_kind: None,
+                            detail: None,
+                            has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
                             plugin_id: "plugin".into(),
@@ -7681,7 +7733,12 @@ mod tests {
                 .unwrap()
                 .contains(&promoted.window_label));
             assert!(registry
-                .publish_if_latest(old_token, Vec::<((), _)>::new(), || true, |_, _| ())
+                .publish_if_latest(
+                    old_token,
+                    Vec::<((), crate::result_registry::ResultAction)>::new(),
+                    || true,
+                    |_, _| ()
+                )
                 .is_none());
         }
 

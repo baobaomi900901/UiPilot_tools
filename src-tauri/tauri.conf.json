@@ -1,6 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "UiPilot",
+  "productName": "UiPilot_tools",
+  "mainBinaryName": "UiPilot_tools",
   "version": "0.2.0",
   "identifier": "com.uipilot.launcher",
   "build": {
@@ -14,17 +15,31 @@
     "windows": [
       {
         "label": "main",
-        "title": "UiPilot",
+        "title": "UiPilot_tools",
         "width": 720,
         "height": 420,
         "visible": false,
         "decorations": false,
         "resizable": false,
+        "maximizable": false,
         "fullscreen": false
+      },
+      {
+        "label": "find",
+        "title": "UiPilot_tools Find",
+        "width": 900,
+        "height": 600,
+        "minWidth": 720,
+        "minHeight": 420,
+        "visible": false,
+        "decorations": false,
+        "resizable": true,
+        "fullscreen": false,
+        "alwaysOnTop": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: uipilot-public-plugin: http://uipilot-public-plugin.localhost; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'"
     }
   },
   "bundle": {
@@ -32,14 +47,17 @@
     "resources": [
       "resources/everything/Everything.exe",
       "resources/everything/LICENSE.txt",
-      "resources/everything/everything.lock.json"
+      "resources/everything/everything.lock.json",
+      "resources/sounds/message-notification.wav"
     ],
     "targets": "all",
     "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
+      "icons/icon16.png",
+      "icons/icon32.png",
+      "icons/icon48.png",
+      "icons/icon64.png",
+      "icons/icon128.png",
+      "icons/icon256.png",
       "icons/icon.ico"
     ],
     "android": {

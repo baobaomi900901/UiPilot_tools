@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.pomodoro",
+  "version": "1.2.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.2.0",
+  "name": "Pomodoro Timer",
+  "description": "Host-owned Pomodoro timer reference plugin.",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "pomodoro",
+    "summary": "打开番茄钟",
+    "activationMode": "submit",
+    "outputMode": "window",
+    "inputRequired": false,
+    "inputPlaceholder": "可选：输入完成提醒内容"
+  },
+  "runtime": {
+    "entry": "dist/runtime.js"
+  },
+  "window": {
+    "entry": "dist/window.html"
+  },
+  "permissions": ["ui.window", "notifications.publish", "timer.control"],
+  "settings": []
+}

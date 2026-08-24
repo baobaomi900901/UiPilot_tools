@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clear-messages"
+description = "Enables the clear_messages command without any pre-configured scope."
+commands.allow = ["clear_messages"]
+
+[[permission]]
+identifier = "deny-clear-messages"
+description = "Denies the clear_messages command without any pre-configured scope."
+commands.deny = ["clear_messages"]

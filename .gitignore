@@ -11,6 +11,10 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+!/examples/public-plugins/com.uipilot.demo-win/package/dist/
+!/examples/public-plugins/com.uipilot.demo-win/package/dist/**
+!/examples/public-plugins/com.uipilot.note/package/dist/
+!/examples/public-plugins/com.uipilot.note/package/dist/**
 downloads/
 eggs/
 .eggs/
@@ -226,3 +230,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local tooling / agent artifacts (machine-specific; do not commit)
+.codegraph/
+.codex-*
+.superpowers/
+
+# Public plugin install packages (built from package/; source stays in repo)
+*.uipilot-plugin
+
+# Everything runtime data (bundled exe + lock file are tracked)
+/src-tauri/resources/everything/Everything.db
+/src-tauri/resources/everything/Everything.ini

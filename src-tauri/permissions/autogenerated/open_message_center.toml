@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-message-center"
+description = "Enables the open_message_center command without any pre-configured scope."
+commands.allow = ["open_message_center"]
+
+[[permission]]
+identifier = "deny-open-message-center"
+description = "Denies the open_message_center command without any pre-configured scope."
+commands.deny = ["open_message_center"]

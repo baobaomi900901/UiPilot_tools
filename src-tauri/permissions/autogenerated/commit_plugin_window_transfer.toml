@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-commit-plugin-window-transfer"
+description = "Enables the commit_plugin_window_transfer command without any pre-configured scope."
+commands.allow = ["commit_plugin_window_transfer"]
+
+[[permission]]
+identifier = "deny-commit-plugin-window-transfer"
+description = "Denies the commit_plugin_window_transfer command without any pre-configured scope."
+commands.deny = ["commit_plugin_window_transfer"]
