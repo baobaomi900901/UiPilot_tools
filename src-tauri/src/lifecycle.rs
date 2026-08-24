@@ -17,8 +17,8 @@ use windows::Win32::{
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GetForegroundWindow, WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
-            WM_QUERYENDSESSION,
+            GetForegroundWindow, GetWindowThreadProcessId, WM_ENDSESSION, WM_ENTERSIZEMOVE,
+            WM_EXITSIZEMOVE, WM_NCDESTROY, WM_QUERYENDSESSION,
         },
     },
 };
@@ -1622,22 +1622,21 @@ fn normalize_native_focus_snapshot(
     }
 }
 
-pub(crate) fn normalize_main_focus_event(
-    focused: bool,
-    panel_live: bool,
-    main_foreground: bool,
-) -> bool {
-    focused || (panel_live && main_foreground)
+pub(crate) fn normalize_main_focus_event(focused: bool, foreground_belongs_to_app: bool) -> bool {
+    focused || foreground_belongs_to_app
 }
 
-pub(crate) fn main_window_is_foreground(app: &AppHandle) -> bool {
-    let Some(main) = app.get_webview_window("main") else {
+pub(crate) fn foreground_belongs_to_current_process() -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
         return false;
-    };
-    let Ok(main_hwnd) = main.hwnd() else {
+    }
+    let mut process_id = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(foreground, Some(&mut process_id)) };
+    if thread_id == 0 {
         return false;
-    };
-    unsafe { GetForegroundWindow() == main_hwnd }
+    }
+    process_id == std::process::id()
 }
 
 fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, LifecycleError> {
@@ -1956,15 +1955,14 @@ mod tests {
     }
 
     #[test]
-    fn panel_child_focus_keeps_main_active_only_while_main_is_foreground() {
-        for (focused, panel_live, main_foreground, expected) in [
-            (true, false, false, true),
-            (false, false, true, false),
-            (false, true, false, false),
-            (false, true, true, true),
+    fn app_owned_webview_focus_keeps_main_active() {
+        for (focused, foreground_belongs_to_app, expected) in [
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
         ] {
             assert_eq!(
-                normalize_main_focus_event(focused, panel_live, main_foreground),
+                normalize_main_focus_event(focused, foreground_belongs_to_app),
                 expected
             );
         }

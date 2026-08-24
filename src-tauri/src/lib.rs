@@ -134,15 +134,10 @@ fn setup_production_lifecycle(
             if expected_blur {
                 return;
             }
-            let panel_live = event_app
-                .state::<Arc<plugin_panel::PluginPanelController>>()
-                .live_identity()
-                .is_some();
             if !*focused
                 && lifecycle::normalize_main_focus_event(
                     *focused,
-                    panel_live,
-                    lifecycle::main_window_is_foreground(&event_app),
+                    lifecycle::foreground_belongs_to_current_process(),
                 )
             {
                 return;
@@ -1080,8 +1075,7 @@ mod tests {
             .find("commands::clear_and_hide(")
             .expect("main hide dispatch is missing");
 
-        assert!(focused_branch.contains("live_identity()"));
-        assert!(focused_branch.contains("main_window_is_foreground(&event_app)"));
+        assert!(focused_branch.contains("foreground_belongs_to_current_process()"));
         assert!(expected_blur < panel_focus);
         assert!(panel_focus < hide);
     }
