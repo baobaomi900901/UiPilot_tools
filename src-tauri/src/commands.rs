@@ -976,19 +976,23 @@ pub(crate) async fn delete_plugin(
     })
 }
 
-fn select_public_plugin_source_with<S>(
+fn select_public_plugin_source_with<S, F>(
     label: &str,
     coordinator: &Arc<LifecycleCoordinator>,
     select: S,
+    restore_focus: F,
 ) -> Result<Option<PathBuf>, CommandError>
 where
     S: FnOnce() -> Option<PathBuf>,
+    F: FnOnce() -> Result<(), ()>,
 {
     require_main_label(label)?;
     let _focus = coordinator
         .suppress_transient_focus_loss()
         .map_err(|_| CommandError::plugin_install_failed())?;
-    Ok(select())
+    let selected = select();
+    restore_focus().map_err(|_| CommandError::plugin_install_failed())?;
+    Ok(selected)
 }
 
 #[tauri::command]
@@ -997,14 +1001,22 @@ pub(crate) async fn select_public_plugin_directory(
     app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
 ) -> Result<Option<PathBuf>, CommandError> {
-    select_public_plugin_source_with(window.label(), coordinator.inner(), || {
-        app.dialog()
-            .file()
-            .set_parent(&window)
-            .set_title("选择插件开发目录")
-            .blocking_pick_folder()
-            .and_then(|path| path.into_path().ok())
-    })
+    select_public_plugin_source_with(
+        window.label(),
+        coordinator.inner(),
+        || {
+            app.dialog()
+                .file()
+                .set_parent(&window)
+                .set_title("选择插件开发目录")
+                .blocking_pick_folder()
+                .and_then(|path| path.into_path().ok())
+        },
+        || {
+            window.set_focus().map_err(|_| ())?;
+            window.as_ref().set_focus().map_err(|_| ())
+        },
+    )
 }
 
 #[tauri::command]
@@ -4780,20 +4792,33 @@ mod tests {
     }
 
     #[test]
-    fn public_plugin_picker_suppresses_focus_loss_only_while_the_dialog_is_open() {
+    fn public_plugin_picker_suppresses_focus_loss_through_focus_restore_then_releases() {
         let coordinator = Arc::new(LifecycleCoordinator::default());
         let hides = Cell::new(0);
         let expected = PathBuf::from(r"C:\Plugins\demo");
 
-        let selected = select_public_plugin_source_with("main", &coordinator, || {
-            coordinator
-                .handle_focus_event_with(false, || {
-                    hides.set(hides.get() + 1);
-                    Ok(())
-                })
-                .unwrap();
-            Some(expected.clone())
-        });
+        let selected = select_public_plugin_source_with(
+            "main",
+            &coordinator,
+            || {
+                coordinator
+                    .handle_focus_event_with(false, || {
+                        hides.set(hides.get() + 1);
+                        Ok(())
+                    })
+                    .unwrap();
+                Some(expected.clone())
+            },
+            || {
+                coordinator
+                    .handle_focus_event_with(false, || {
+                        hides.set(hides.get() + 1);
+                        Ok(())
+                    })
+                    .unwrap();
+                Ok(())
+            },
+        );
 
         assert_eq!(selected, Ok(Some(expected)));
         assert_eq!(hides.get(), 0);
