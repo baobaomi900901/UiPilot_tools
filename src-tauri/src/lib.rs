@@ -806,6 +806,7 @@ mod tests {
         let shell = include_str!("../capabilities/plugin-window-shell.json");
         let content = include_str!("../capabilities/plugin-window-content.json");
         let panel = include_str!("../capabilities/plugin-panel-content.json");
+        let find = include_str!("../capabilities/find.json");
         for command in [
             "list_public_plugins",
             "prepare_public_plugin_install",
@@ -886,6 +887,7 @@ mod tests {
             assert!(!runtime.contains(&permission));
             assert!(!shell.contains(&permission));
             assert!(!content.contains(&permission));
+            assert!(!find.contains(&permission));
         }
         let focus_ack = ["allow", "-plugin-panel-focus-host-input-ack"].concat();
         assert!(main.contains(&focus_ack));
@@ -893,9 +895,10 @@ mod tests {
         assert!(!shell.contains(&focus_ack));
         assert!(!content.contains(&focus_ack));
         assert!(!panel.contains(&focus_ack));
+        assert!(!find.contains(&focus_ack));
         assert!(main.contains("\"webviews\": [\"main\"]"));
         assert!(!main.contains("\"windows\":"));
-        for capability in [main, runtime, shell, content, panel] {
+        for capability in [main, runtime, shell, content, panel, find] {
             assert!(!capability.contains("\"shell:"));
         }
         assert!(runtime.contains("\"windows\": [\"plugin-runtime-*\"]"));

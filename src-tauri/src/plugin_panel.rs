@@ -1949,8 +1949,9 @@ mod tests {
     fn host_input_focus_old_ack_and_timeout_cannot_touch_replacement_session() {
         let controller = PluginPanelController::default();
         let first = controller.open_session(owner("a")).unwrap();
+        let first_deadline = focus_deadline();
         let request = controller
-            .prepare_host_input_focus(&first.content_label, first.session_epoch, focus_deadline())
+            .prepare_host_input_focus(&first.content_label, first.session_epoch, first_deadline)
             .unwrap()
             .unwrap();
         assert_focus_advanced(controller.claim_host_input_focus(request));
@@ -1959,13 +1960,30 @@ mod tests {
             .teardown_session(Some(first.session_epoch))
             .is_some());
         let second = controller.open_session(owner("b")).unwrap();
+        let replacement = controller
+            .prepare_host_input_focus(
+                &second.content_label,
+                second.session_epoch,
+                focus_deadline(),
+            )
+            .unwrap()
+            .unwrap();
 
         assert!(!controller
-            .ack_host_input_focus_at(request, true, focus_deadline())
+            .ack_host_input_focus_at(request, true, first_deadline)
             .unwrap());
         assert_eq!(
             controller.wait_host_input_focus(request),
             Ok(HostInputFocusOutcome::Noop)
+        );
+        assert_focus_advanced(controller.claim_host_input_focus(replacement));
+        assert_focus_advanced(
+            controller.confirm_native_host_input_focus(replacement, Instant::now()),
+        );
+        assert!(controller.ack_host_input_focus(replacement, true).unwrap());
+        assert_eq!(
+            controller.wait_host_input_focus(replacement),
+            Ok(HostInputFocusOutcome::Focused)
         );
         assert_eq!(controller.live_identity(), Some(second));
     }
@@ -2949,6 +2967,30 @@ mod tests {
     #[test]
     fn panel_bootstrap_exposes_focus_update_and_storage_only() {
         let bootstrap = panel_bootstrap(42);
+        let api_body = bootstrap
+            .split("const api = deepFreeze({\n")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("\n  });\n  Object.defineProperty(window, 'uipilotPluginPanel'")
+                    .next()
+            })
+            .expect("public panel API object is missing");
+        let public_members = api_body
+            .lines()
+            .filter_map(|line| {
+                let member = line.strip_prefix("    ")?;
+                (!member.starts_with(' ') && !member.starts_with('}') && !member.is_empty())
+                    .then_some(member)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            public_members,
+            vec![
+                "onUpdate(next) {",
+                "async focusHostInput() {",
+                "get storage() { return storageSession ? storageSession.storage : expiredStorage; },",
+            ]
+        );
         for required in [
             "uipilotPluginPanel",
             "onUpdate(next)",
