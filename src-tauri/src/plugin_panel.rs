@@ -227,6 +227,10 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       void sendReady();
       return () => { if (handler === next) handler = null; };
     },
+    async focusHostInput() {
+      if (!invoke) throw new Error('ExpiredWindowSessionError');
+      await invoke('plugin_panel_focus_host_input', { sessionEpoch: '__SESSION_EPOCH__' });
+    },
     get storage() { return storageSession ? storageSession.storage : expiredStorage; },
   });
   Object.defineProperty(window, 'uipilotPluginPanel', { value: api, configurable: false });
@@ -2886,11 +2890,14 @@ mod tests {
     }
 
     #[test]
-    fn panel_bootstrap_exposes_update_and_storage_only() {
+    fn panel_bootstrap_exposes_focus_update_and_storage_only() {
         let bootstrap = panel_bootstrap(42);
         for required in [
             "uipilotPluginPanel",
             "onUpdate(next)",
+            "async focusHostInput()",
+            "plugin_panel_focus_host_input",
+            "sessionEpoch: '42'",
             "plugin_panel_content_ready",
             "sessionEpoch: '42'",
             "plugin_panel_content_ack",

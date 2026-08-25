@@ -42,6 +42,8 @@ export const client: LauncherClient = {
     listen('uipilot-plugin-panel-error', (event) => handler(event.payload)),
   listenPluginPanelReset: (handler) =>
     listen('uipilot-plugin-panel-reset', (event) => handler(event.payload)),
+  listenPluginPanelFocusHostInput: (handler) =>
+    listen('uipilot-plugin-panel-focus-host-input', (event) => handler(event.payload)),
   getMessageSummary: async () => {
     const value = await invoke<unknown>('get_message_summary')
     const summary = parseMessageSummary(value)
@@ -82,6 +84,9 @@ export const client: LauncherClient = {
     return result
   },
   closePluginPanel: async (input) => { await invoke('close_plugin_panel', { input }) },
+  acknowledgePluginPanelFocusHostInput: async (input) => {
+    await invoke('plugin_panel_focus_host_input_ack', { ...input })
+  },
   commitPluginWindowTransfer: (input) => invoke<void>('commit_plugin_window_transfer', input),
   listPublicPlugins: async () => {
     const value = await invoke<unknown>('list_public_plugins')
@@ -195,6 +200,7 @@ if (!host) throw new Error('Missing application root')
 const label = currentWindowLabel()
 if (label === 'main') {
 const core = createLauncherCore(client)
+const panelFocusListenerReady = core.preparePanelHostInputFocusListener()
 let settleReady!: (result: 'ready' | 'failed') => void
 const viewReady = new Promise<'ready' | 'failed'>((resolve) => {
   settleReady = resolve
@@ -243,6 +249,12 @@ void (async () => {
   if (tornDown) return
   if (result === 'failed') {
     core.failInitialization()
+    core.destroy()
+    return
+  }
+  if (!await panelFocusListenerReady) {
+    core.failInitialization()
+    core.destroy()
     return
   }
   await core.start()

@@ -3,6 +3,7 @@ import {
   parseFileSearchResponse,
   parseLauncherShown,
   parsePluginPanelErrorEvent,
+  parsePluginPanelFocusHostInputEvent,
   type ClassifiedTextRecord,
   type CommandErrorCode,
   type ControlKey,
@@ -21,6 +22,7 @@ import {
   type PluginInventoryView,
   type PluginListStatus,
   type PluginMutationKind,
+  type PluginPanelFocusHostInputEvent,
   type ResultItem,
   type ResultIconKind,
   type SearchResponse,
@@ -42,6 +44,7 @@ export interface LauncherCore {
   readonly getSnapshot: () => LauncherSnapshot
   readonly subscribe: (listener: () => void) => () => void
   readonly start: () => Promise<void>
+  readonly preparePanelHostInputFocusListener: () => Promise<boolean>
   readonly failInitialization: () => void
   readonly shown: (payload: unknown) => void
   readonly text: (record: ClassifiedTextRecord) => void
@@ -51,6 +54,7 @@ export interface LauncherCore {
   readonly selectSettingsTab: (key: SettingsTabKey) => void
   readonly requestHide: () => Promise<void>
   readonly closePanel: () => Promise<void>
+  readonly settlePanelHostInputFocus: (input: PluginPanelFocusHostInputEvent & { focused: boolean }) => void
   readonly activateResult: (index: number) => void
   readonly openPluginContextMenu: (index: number) => void
   readonly closePluginContextMenu: () => void
@@ -109,6 +113,7 @@ interface PrivatePanelState {
   suffix: TextControl
   submitPending: boolean
   closePending: boolean
+  focusRequestId?: U64Decimal
 }
 
 interface Model {
@@ -479,6 +484,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         suffix: model.panel.suffix.draft,
         submitPending: model.panel.submitPending,
         closePending: model.panel.closePending,
+        ...(model.panel.focusRequestId === undefined ? {} : { focusRequestId: model.panel.focusRequestId }),
       })
     : undefined
   const plugins = Object.freeze({
@@ -553,6 +559,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let unlisten: (() => void) | undefined
   let unlistenPanelError: (() => void) | undefined
   let unlistenPanelReset: (() => void) | undefined
+  let unlistenPanelFocusHostInput: (() => void) | undefined
+  let panelFocusListenerRegistration: Promise<boolean> | undefined
+  let pendingPanelFocusRequest: PluginPanelFocusHostInputEvent | undefined
   let unsubscribeMessages: (() => void) | undefined
   let previewPreferenceToken = 0
   let previewPreferencePending: PreviewPreferenceOwner | undefined
@@ -1944,6 +1953,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function discardPanelUi(): boolean {
+    pendingPanelFocusRequest = undefined
     if (!model.panel) return false
     if (composition?.control === model.panel?.suffix.key) composition = undefined
     panelActionToken += 1
@@ -1971,6 +1981,64 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     panel: PrivatePanelState,
   ): boolean {
     return value.pluginId === panel.pluginId && value.sessionEpoch === panel.sessionEpoch
+  }
+
+  function applyPanelFocusRequest(event: PluginPanelFocusHostInputEvent): boolean {
+    const panel = model.panel
+    if (!panel || event.sessionEpoch !== panel.sessionEpoch) return false
+    if (
+      panel.focusRequestId !== undefined &&
+      compareDecimalRevision(event.focusRequestId, panel.focusRequestId) <= 0
+    ) return false
+    panel.focusRequestId = event.focusRequestId
+    return true
+  }
+
+  function handlePanelFocusHostInput(payload: unknown): void {
+    if (destroyed) return
+    const event = parsePluginPanelFocusHostInputEvent(payload)
+    if (!event) return
+    if (model.panel) {
+      publish(applyPanelFocusRequest(event))
+      return
+    }
+    const pending = pendingPanelFocusRequest
+    if (
+      !pending ||
+      compareDecimalRevision(event.sessionEpoch, pending.sessionEpoch) > 0 ||
+      (event.sessionEpoch === pending.sessionEpoch &&
+        compareDecimalRevision(event.focusRequestId, pending.focusRequestId) > 0)
+    ) pendingPanelFocusRequest = event
+  }
+
+  function settlePanelHostInputFocus(
+    input: PluginPanelFocusHostInputEvent & { focused: boolean },
+  ): void {
+    const panel = model.panel
+    if (
+      destroyed || !panel || panel.sessionEpoch !== input.sessionEpoch ||
+      panel.focusRequestId !== input.focusRequestId
+    ) return
+    void client.acknowledgePluginPanelFocusHostInput(input).catch(() => undefined)
+  }
+
+  function preparePanelHostInputFocusListener(): Promise<boolean> {
+    if (panelFocusListenerRegistration) return panelFocusListenerRegistration
+    panelFocusListenerRegistration = (async () => {
+      let registered: (() => void) | undefined
+      try {
+        registered = await client.listenPluginPanelFocusHostInput(handlePanelFocusHostInput)
+      } catch {
+        return false
+      }
+      if (destroyed) {
+        registered()
+        return false
+      }
+      unlistenPanelFocusHostInput = registered
+      return true
+    })()
+    return panelFocusListenerRegistration
   }
 
   function submitPanel(argument: string): void {
@@ -2086,6 +2154,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           submitPending: false,
           closePending: false,
         }
+        if (pendingPanelFocusRequest?.sessionEpoch === identity.sessionEpoch) {
+          applyPanelFocusRequest(pendingPanelFocusRequest)
+        }
+        pendingPanelFocusRequest = undefined
         publish(true)
         submitPanel(owner.argument)
       },
@@ -2475,6 +2547,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   async function start(): Promise<void> {
     if (started || destroyed) return
     started = true
+    if (!await preparePanelHostInputFocusListener()) {
+      failInitialization()
+      return
+    }
     let registered: (() => void) | undefined
     let panelErrorsRegistered: (() => void) | undefined
     let panelResetsRegistered: (() => void) | undefined
@@ -2486,6 +2562,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       registered?.()
       panelErrorsRegistered?.()
       panelResetsRegistered?.()
+      unlistenPanelFocusHostInput?.()
+      unlistenPanelFocusHostInput = undefined
       failInitialization()
       return
     }
@@ -2553,6 +2631,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlistenPanelError = undefined
     unlistenPanelReset?.()
     unlistenPanelReset = undefined
+    unlistenPanelFocusHostInput?.()
+    unlistenPanelFocusHostInput = undefined
+    pendingPanelFocusRequest = undefined
     listeners.clear()
   }
 
@@ -2648,6 +2729,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     getSnapshot,
     subscribe,
     start,
+    preparePanelHostInputFocusListener,
     failInitialization,
     shown,
     text,
@@ -2657,6 +2739,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     selectSettingsTab,
     requestHide,
     closePanel,
+    settlePanelHostInputFocus,
     activateResult,
     openPluginContextMenu,
     closePluginContextMenu,

@@ -26,6 +26,7 @@ import {
   parsePluginInventorySnapshot,
   parsePluginPanelCommandResult,
   parsePluginPanelErrorEvent,
+  parsePluginPanelFocusHostInputEvent,
   parsePluginMutationOutcome,
   parseU64Decimal,
   parsePublicPluginInventory,
@@ -161,6 +162,16 @@ describe('plugin protocol', () => {
       { ...identity, extra: true },
     ]) expect(parsePluginPanelCommandResult(invalid)).toBeNull()
     expect(parsePluginPanelErrorEvent({ sessionEpoch: '9', extra: true })).toBeNull()
+    expect(parsePluginPanelFocusHostInputEvent({ sessionEpoch: '9', focusRequestId: '10' })).toEqual({
+      sessionEpoch: '9',
+      focusRequestId: '10',
+    })
+    for (const invalid of [
+      { sessionEpoch: '0', focusRequestId: '10' },
+      { sessionEpoch: '9', focusRequestId: '0' },
+      { sessionEpoch: '9', focusRequestId: '01' },
+      { sessionEpoch: '9', focusRequestId: '10', extra: true },
+    ]) expect(parsePluginPanelFocusHostInputEvent(invalid)).toBeNull()
   })
 })
 
@@ -230,6 +241,7 @@ function fakeClient() {
   let messageStateHandler: ((payload: unknown) => void) | undefined
   let panelErrorHandler: ((payload: unknown) => void) | undefined
   let panelResetHandler: ((payload: unknown) => void) | undefined
+  let panelFocusHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
@@ -246,6 +258,10 @@ function fakeClient() {
     }),
     listenPluginPanelReset: vi.fn(async (handler) => {
       panelResetHandler = handler
+      return vi.fn()
+    }),
+    listenPluginPanelFocusHostInput: vi.fn(async (handler) => {
+      panelFocusHandler = handler
       return vi.fn()
     }),
     getMessageSummary: vi.fn(async () => ({ revision: '0', unreadCount: 0 })),
@@ -271,6 +287,7 @@ function fakeClient() {
       commandLabel: 'demo-panel',
     })),
     closePluginPanel: vi.fn(async () => undefined),
+    acknowledgePluginPanelFocusHostInput: vi.fn(async () => undefined),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
     selectPublicPluginArchive: vi.fn(async () => null),
     selectPublicPluginDirectory: vi.fn(async () => null),
@@ -307,6 +324,10 @@ function fakeClient() {
     emitPanelReset(payload: unknown) {
       if (!panelResetHandler) throw new Error('panel reset listener is not installed')
       panelResetHandler(payload)
+    },
+    emitPanelFocus(payload: unknown) {
+      if (!panelFocusHandler) throw new Error('panel focus listener is not installed')
+      panelFocusHandler(payload)
     },
     unlisten,
   }
@@ -643,7 +664,7 @@ describe('startup ownership', () => {
   it('unlistens a late registration after destroy and never loads', async () => {
     const fake = fakeClient()
     const registration = deferred<() => void>()
-    vi.mocked(fake.client.listenShown).mockReturnValueOnce(registration.promise)
+    vi.mocked(fake.client.listenPluginPanelFocusHostInput).mockReturnValueOnce(registration.promise)
     const lateUnlisten = vi.fn()
     const core = createLauncherCore(fake.client)
     const start = core.start()
@@ -1513,6 +1534,64 @@ describe('shown and search ownership', () => {
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
     await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
     await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+    await mounted.unmount()
+  })
+
+  it('focuses only the current tagged panel input and acknowledges the exact ordered request', async () => {
+    const { core, client, emit, emitPanelFocus } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-focus-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('panel-focus-entry')))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'hello', inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('1'))
+
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+    const outside = document.createElement('button')
+    document.body.append(outside)
+    input.setSelectionRange(2, 2)
+    outside.focus()
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '10' }))
+    await vi.waitFor(() => expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledWith({
+      sessionEpoch: '1', focusRequestId: '10', focused: true,
+    }))
+    expect(document.activeElement).toBe(input)
+    expect(input.value).toBe('hello')
+    expect([input.selectionStart, input.selectionEnd]).toEqual([2, 2])
+    expect(core.getSnapshot().panel).toMatchObject({ sessionEpoch: '1', suffix: 'hello' })
+
+    outside.focus()
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '10' }))
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '9' }))
+    expect(document.activeElement).toBe(outside)
+    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(1)
+
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '11' }))
+    await vi.waitFor(() => expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(2))
+    expect(document.activeElement).toBe(input)
+    outside.focus()
+    await act(async () => emitPanelFocus({ sessionEpoch: '2', focusRequestId: '12' }))
+    expect(document.activeElement).toBe(outside)
+    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(2)
+
+    const focus = vi.spyOn(input, 'focus').mockImplementationOnce(() => undefined)
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '12' }))
+    await vi.waitFor(() => expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenLastCalledWith({
+      sessionEpoch: '1', focusRequestId: '12', focused: false,
+    }))
+    expect(document.activeElement).toBe(outside)
+    focus.mockRestore()
+    outside.remove()
     await mounted.unmount()
   })
 
@@ -4630,7 +4709,11 @@ describe('real adapter and startup', () => {
     const order: string[] = []
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     tauriCapture.listen.mockImplementation((event, handler) => {
-      expect(document.querySelector('[role="combobox"]')).toBeInstanceOf(HTMLInputElement)
+      if (event === 'uipilot-plugin-panel-focus-host-input') {
+        expect(document.querySelector('[role="combobox"]')).toBeNull()
+      } else {
+        expect(document.querySelector('[role="combobox"]')).toBeInstanceOf(HTMLInputElement)
+      }
       order.push(String(event))
       if (event === 'launcher://shown') {
         shownHandler = handler as (event: { payload: unknown }) => void
@@ -4652,7 +4735,8 @@ describe('real adapter and startup', () => {
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 6)).toEqual([
+    expect(order.slice(0, 7)).toEqual([
+      'uipilot-plugin-panel-focus-host-input',
       'launcher://shown',
       'uipilot-plugin-panel-error',
       'uipilot-plugin-panel-reset',
@@ -4692,6 +4776,9 @@ describe('real adapter and startup', () => {
     await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
     await main.client.closePluginPanel({ sessionEpoch: u64('7') })
+    await main.client.acknowledgePluginPanelFocusHostInput({
+      sessionEpoch: u64('7'), focusRequestId: u64('9'), focused: true,
+    })
     await main.client.selectPublicPluginDirectory()
     await main.client.listPlugins()
     await main.client.installPlugin({ pluginId: 'internal.math' })
@@ -4711,6 +4798,7 @@ describe('real adapter and startup', () => {
       ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
       ['close_plugin_panel', [{ input: { sessionEpoch: '7' } }]],
+      ['plugin_panel_focus_host_input_ack', [{ sessionEpoch: '7', focusRequestId: '9', focused: true }]],
       ['select_public_plugin_directory', []],
       ['list_plugins', []],
       ['install_plugin', [{ pluginId: 'internal.math' }]],
@@ -4724,6 +4812,8 @@ describe('real adapter and startup', () => {
 
   it('fails locally and never listens or loads when native input binding fails', async () => {
     resetAdapterDocument()
+    const focusUnlisten = vi.fn()
+    tauriCapture.listen.mockResolvedValue(focusUnlisten)
     const originalAdd = HTMLInputElement.prototype.addEventListener
     HTMLInputElement.prototype.addEventListener = function (
       this: HTMLInputElement,
@@ -4740,7 +4830,9 @@ describe('real adapter and startup', () => {
       })
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain('private')
-      expect(tauriCapture.listen).not.toHaveBeenCalled()
+      expect(tauriCapture.listen).toHaveBeenCalledOnce()
+      expect(tauriCapture.listen).toHaveBeenCalledWith('uipilot-plugin-panel-focus-host-input', expect.any(Function))
+      await vi.waitFor(() => expect(focusUnlisten).toHaveBeenCalledOnce())
       expect(tauriCapture.invoke).not.toHaveBeenCalled()
     } finally {
       HTMLInputElement.prototype.addEventListener = originalAdd
@@ -4762,6 +4854,8 @@ describe('real adapter and startup', () => {
 
   it('shows only fixed local status when React reports a render-phase mount failure', async () => {
     resetAdapterDocument()
+    const focusUnlisten = vi.fn()
+    tauriCapture.listen.mockResolvedValue(focusUnlisten)
     const privateError = 'private render-phase sentinel'
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.doMock('./launcher-view', () => ({
@@ -4774,7 +4868,9 @@ describe('real adapter and startup', () => {
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
-      expect(tauriCapture.listen).not.toHaveBeenCalled()
+      expect(tauriCapture.listen).toHaveBeenCalledOnce()
+      expect(tauriCapture.listen).toHaveBeenCalledWith('uipilot-plugin-panel-focus-host-input', expect.any(Function))
+      expect(focusUnlisten).toHaveBeenCalledOnce()
       expect(tauriCapture.invoke).not.toHaveBeenCalled()
       await pagehide()
       expect(document.querySelector('#app')?.childElementCount).toBe(0)
@@ -4796,6 +4892,7 @@ describe('real adapter and startup', () => {
     const messageUnlisten = vi.fn()
     const panelUnlisten = vi.fn()
     const panelResetUnlisten = vi.fn()
+    const panelFocusUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
@@ -4818,6 +4915,7 @@ describe('real adapter and startup', () => {
       }
       if (event === 'uipilot-plugin-panel-error') return panelUnlisten
       if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
+      if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
       return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
@@ -4850,6 +4948,7 @@ describe('real adapter and startup', () => {
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
+      expect(panelFocusUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -4863,6 +4962,7 @@ describe('real adapter and startup', () => {
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
+      expect(panelFocusUnlisten).toHaveBeenCalledOnce()
     } finally {
       await pagehide()
       vi.doUnmock('./launcher-view')
@@ -4873,8 +4973,8 @@ describe('real adapter and startup', () => {
 
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
-    const unlisten = vi.fn()
-    tauriCapture.listen.mockResolvedValueOnce(unlisten)
+    const unlistens = Array.from({ length: 5 }, () => vi.fn())
+    tauriCapture.listen.mockImplementation(async (_event, _handler) => unlistens[tauriCapture.listen.mock.calls.length - 1]!)
     tauriCapture.invoke.mockImplementation((command) =>
       Promise.resolve(command === 'load_settings' ? emptySettings : undefined),
     )
@@ -4885,13 +4985,13 @@ describe('real adapter and startup', () => {
     const remove = vi.spyOn(HTMLInputElement.prototype, 'removeEventListener')
     await pagehide()
     const removed = remove.mock.calls.length
-    expect(unlisten).toHaveBeenCalledOnce()
+    for (const unlisten of unlistens) expect(unlisten).toHaveBeenCalledOnce()
     expect(remove.mock.calls.map(([event]) => event)).toEqual(
       expect.arrayContaining(['compositionstart', 'input', 'compositionend']),
     )
     expect(document.querySelector('#app')?.childElementCount).toBe(0)
     await pagehide()
-    expect(unlisten).toHaveBeenCalledOnce()
+    for (const unlisten of unlistens) expect(unlisten).toHaveBeenCalledOnce()
     expect(remove).toHaveBeenCalledTimes(removed)
     remove.mockRestore()
 
@@ -4905,6 +5005,7 @@ describe('real adapter and startup', () => {
       expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
     }
     expect(mainSource.match(/['"]execute_result['"]/g)).toHaveLength(2)
+    expect(mainSource.match(/['"]plugin_panel_focus_host_input_ack['"]/g)).toHaveLength(1)
     expect(mainSource.match(/['"]launcher:\/\/shown['"]/g)).toHaveLength(1)
     expect(mainSource.match(/['"]find:\/\/(?:forwarded|theme-changed)['"]/g)).toHaveLength(2)
     expect(mainSource).toContain('getCurrentWindow().label')

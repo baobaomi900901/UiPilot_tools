@@ -250,6 +250,7 @@ export interface LauncherClient {
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelError(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelReset(handler: (payload: unknown) => void): Promise<() => void>
+  listenPluginPanelFocusHostInput(handler: (payload: unknown) => void): Promise<() => void>
   getMessageSummary(): Promise<unknown>
   openMessageCenter(): Promise<unknown>
   readMessageCenter(): Promise<unknown>
@@ -264,6 +265,7 @@ export interface LauncherClient {
     uiIntentEpoch: number
   }): Promise<PluginPanelCommandResult>
   closePluginPanel(input: { sessionEpoch: U64Decimal }): Promise<void>
+  acknowledgePluginPanelFocusHostInput(input: PluginPanelFocusHostInputEvent & { focused: boolean }): Promise<void>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
@@ -386,6 +388,11 @@ export interface PluginPanelErrorEvent {
   sessionEpoch: U64Decimal
 }
 
+export interface PluginPanelFocusHostInputEvent {
+  sessionEpoch: U64Decimal
+  focusRequestId: U64Decimal
+}
+
 export interface PluginPanelSnapshot {
   pluginId: string
   commandLabel: string
@@ -394,6 +401,7 @@ export interface PluginPanelSnapshot {
   suffix: string
   submitPending: boolean
   closePending: boolean
+  focusRequestId?: U64Decimal
 }
 export interface TextControlView {
   key: ControlKey
@@ -777,6 +785,16 @@ export function parsePluginPanelErrorEvent(value: unknown): PluginPanelErrorEven
   if (!record || !exactKeys(record, ['sessionEpoch'])) return null
   const sessionEpoch = parseU64Decimal(record.sessionEpoch)
   return sessionEpoch === null || sessionEpoch === '0' ? null : { sessionEpoch }
+}
+
+export function parsePluginPanelFocusHostInputEvent(value: unknown): PluginPanelFocusHostInputEvent | null {
+  const record = plainRecord(value)
+  if (!record || !exactKeys(record, ['focusRequestId', 'sessionEpoch'])) return null
+  const sessionEpoch = parseU64Decimal(record.sessionEpoch)
+  const focusRequestId = parseU64Decimal(record.focusRequestId)
+  return sessionEpoch === null || sessionEpoch === '0' || focusRequestId === null || focusRequestId === '0'
+    ? null
+    : { sessionEpoch, focusRequestId }
 }
 
 function validTimerDuration(value: unknown): value is number {

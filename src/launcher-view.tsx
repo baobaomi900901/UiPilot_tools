@@ -59,11 +59,12 @@ interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
   core: LauncherCore
   control: ControlKey
   value: string
-  onBound?: () => void
+  onBound?: (input: HTMLInputElement) => void
+  onUnbound?: (input: HTMLInputElement) => void
   onBindingFailed?: () => void
 }
 
-function BoundInput({ core, control, value, onBound, onBindingFailed, ...props }: BoundInputProps) {
+function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed, ...props }: BoundInputProps) {
   const ref = useRef<InputRef>(null)
   useLayoutEffect(() => {
     const input = ref.current?.input
@@ -73,8 +74,9 @@ function BoundInput({ core, control, value, onBound, onBindingFailed, ...props }
     }
     try {
       const unbind = bindNativeTextInput(input, control, core.text)
-      onBound?.()
+      onBound?.(input)
       return () => {
+        onUnbound?.(input)
         unbind()
         core.retireControl(control)
       }
@@ -82,7 +84,7 @@ function BoundInput({ core, control, value, onBound, onBindingFailed, ...props }
       onBindingFailed?.()
       return () => core.retireControl(control)
     }
-  }, [control, core, onBindingFailed, onBound])
+  }, [control, core, onBindingFailed, onBound, onUnbound])
   return <Input {...props} ref={ref} value={value} onChange={() => {}} />
 }
 
@@ -294,22 +296,37 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     ready.current = true
     onReady('failed')
   }, [onReady])
-  const reportQueryBound = useCallback(() => {
-    queryRef.current = document.getElementById(`launcher-query-${snapshot.queryControl}`) as HTMLInputElement | null
+  const reportQueryBound = useCallback((input: HTMLInputElement) => {
+    queryRef.current = input
     if (snapshot.view === 'launcher' && snapshot.invocationId) queryRef.current?.focus()
     reportReady()
   }, [reportReady, snapshot.invocationId, snapshot.queryControl, snapshot.view])
 
   const panel = snapshot.panel
-  const reportPanelBound = useCallback(() => {
-    if (!panel) return
-    panelInputRef.current = document.getElementById(`launcher-panel-suffix-${panel.suffixControl}`) as HTMLInputElement | null
-    const input = panelInputRef.current
-    if (!input) return
+  const reportPanelBound = useCallback((input: HTMLInputElement) => {
+    panelInputRef.current = input
     input.focus()
     const caret = input.value.length
     input.setSelectionRange(caret, caret)
   }, [panel?.sessionEpoch, panel?.suffixControl])
+  const reportPanelUnbound = useCallback((input: HTMLInputElement) => {
+    if (panelInputRef.current === input) panelInputRef.current = null
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!panel?.focusRequestId) return
+    const input = panelInputRef.current
+    let focused = false
+    if (input?.isConnected) {
+      input.focus()
+      focused = document.activeElement === input
+    }
+    core.settlePanelHostInputFocus({
+      sessionEpoch: panel.sessionEpoch,
+      focusRequestId: panel.focusRequestId,
+      focused,
+    })
+  }, [core, panel?.focusRequestId, panel?.sessionEpoch, panel?.suffixControl])
 
   useLayoutEffect(() => {
     if (!snapshot.invocationId) return
@@ -697,6 +714,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           disabled={!snapshot.invocationId || panel.closePending}
           onKeyDown={panelKeyDown}
           onBound={reportPanelBound}
+          onUnbound={reportPanelUnbound}
           onBindingFailed={reportFailed}
         />
       </div>
