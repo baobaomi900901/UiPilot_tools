@@ -1632,6 +1632,30 @@ fn normalize_native_focus_snapshot(
     }
 }
 
+pub(crate) fn should_ignore_main_focus_loss(
+    focused: bool,
+    expected_transfer_blur: bool,
+    main_owns_native_foreground: bool,
+) -> bool {
+    !focused && !expected_transfer_blur && main_owns_native_foreground
+}
+
+#[cfg(windows)]
+pub(crate) fn main_window_owns_native_foreground(app: &AppHandle) -> bool {
+    let Some(main) = app.get_webview_window("main") else {
+        return false;
+    };
+    let Ok(main_hwnd) = main.hwnd() else {
+        return false;
+    };
+    unsafe { GetForegroundWindow() == main_hwnd }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn main_window_owns_native_foreground(_app: &AppHandle) -> bool {
+    false
+}
+
 fn find_native_snapshot(app: &AppHandle) -> Result<NativeFocusSnapshot, LifecycleError> {
     let main = app
         .get_webview_window("main")
@@ -2200,6 +2224,14 @@ mod tests {
             .find(".main_content_got_focus()")
             .expect("main content focus ownership confirmation is missing");
         assert!(window_focus < webview_focus && webview_focus < focus_ownership);
+    }
+
+    #[test]
+    fn stale_main_blur_is_ignored_while_main_still_owns_native_foreground() {
+        assert!(should_ignore_main_focus_loss(false, false, true));
+        assert!(!should_ignore_main_focus_loss(false, false, false));
+        assert!(!should_ignore_main_focus_loss(true, false, true));
+        assert!(!should_ignore_main_focus_loss(false, true, true));
     }
 
     #[test]

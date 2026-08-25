@@ -137,12 +137,21 @@ fn setup_production_lifecycle(
     let event_panel_controller = Arc::clone(&panel_controller);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
-            event_app
-                .state::<Arc<message_center::MessageCenterService>>()
-                .observe_main_focus(*focused);
             let transfers =
                 event_app.state::<Arc<window_transfer::MainWindowTransferCoordinator>>();
             let expected_blur = !*focused && transfers.consume_expected_main_blur();
+            let main_owns_native_foreground =
+                !*focused && lifecycle::main_window_owns_native_foreground(&event_app);
+            if lifecycle::should_ignore_main_focus_loss(
+                *focused,
+                expected_blur,
+                main_owns_native_foreground,
+            ) {
+                return;
+            }
+            event_app
+                .state::<Arc<message_center::MessageCenterService>>()
+                .observe_main_focus(*focused);
             if expected_blur {
                 return;
             }
@@ -1042,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn main_focus_reaches_tray_attention_before_expected_blur_can_return() {
+    fn main_focus_filters_spurious_blur_before_attention_and_expected_return() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let production = source
             .split("#[cfg(test)]\nmod tests")
@@ -1059,11 +1068,14 @@ mod tests {
         let consume = focused_branch
             .find("consume_expected_main_blur()")
             .expect("expected main blur handling is missing");
+        let filter = focused_branch
+            .find("should_ignore_main_focus_loss(")
+            .expect("spurious main blur filter is missing");
         let early_return = focused_branch
             .find("if expected_blur")
             .expect("expected blur early return is missing");
 
-        assert!(observe < consume && consume < early_return);
+        assert!(consume < filter && filter < observe && observe < early_return);
     }
 
     #[test]
