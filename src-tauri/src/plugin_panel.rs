@@ -1914,6 +1914,63 @@ mod tests {
     }
 
     #[test]
+    fn host_input_focus_claim_then_teardown_makes_late_confirm_and_ack_stale() {
+        let controller = PluginPanelController::default();
+        let session = controller.open_session(owner("a")).unwrap();
+        assert!(controller.main_content_got_focus());
+        let blur = controller.main_content_lost_focus(false).unwrap();
+        let request = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_focus_advanced(controller.claim_host_input_focus(request));
+
+        assert!(controller
+            .teardown_session(Some(session.session_epoch))
+            .is_some());
+        assert_eq!(
+            controller.confirm_native_host_input_focus(request, Instant::now()),
+            Ok(HostInputFocusAdvance::Noop)
+        );
+        assert!(!controller.ack_host_input_focus(request, true).unwrap());
+        assert_eq!(
+            controller.wait_host_input_focus(request),
+            Ok(HostInputFocusOutcome::Noop)
+        );
+        assert!(controller.live_identity().is_none());
+        assert!(!controller.confirm_app_blur(&blur));
+    }
+
+    #[test]
+    fn host_input_focus_old_ack_and_timeout_cannot_touch_replacement_session() {
+        let controller = PluginPanelController::default();
+        let first = controller.open_session(owner("a")).unwrap();
+        let request = controller
+            .prepare_host_input_focus(&first.content_label, first.session_epoch, focus_deadline())
+            .unwrap()
+            .unwrap();
+        assert_focus_advanced(controller.claim_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request, Instant::now()));
+        assert!(controller
+            .teardown_session(Some(first.session_epoch))
+            .is_some());
+        let second = controller.open_session(owner("b")).unwrap();
+
+        assert!(!controller
+            .ack_host_input_focus_at(request, true, focus_deadline())
+            .unwrap());
+        assert_eq!(
+            controller.wait_host_input_focus(request),
+            Ok(HostInputFocusOutcome::Noop)
+        );
+        assert_eq!(controller.live_identity(), Some(second));
+    }
+
+    #[test]
     fn host_input_focus_true_ack_after_real_blur_cannot_cancel_hide() {
         let controller = PluginPanelController::default();
         let session = controller.open_session(owner("a")).unwrap();

@@ -5483,6 +5483,38 @@ mod tests {
         assert_eq!(native_calls.get(), 3);
         assert_eq!(event_calls.get(), 0);
         assert!(!controller.confirm_app_blur(&in_flight_blur));
+
+        let session = controller.open_session(panel_focus_owner()).unwrap();
+        let teardown_during_native = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            start_host_input_focus(
+                &controller,
+                teardown_during_native,
+                || {
+                    native_calls.set(native_calls.get() + 1);
+                    assert!(controller
+                        .teardown_session(Some(session.session_epoch))
+                        .is_some());
+                    true
+                },
+                std::time::Instant::now,
+                || {
+                    event_calls.set(event_calls.get() + 1);
+                    true
+                },
+            ),
+            HostInputFocusStart::Noop
+        );
+        assert_eq!(native_calls.get(), 4);
+        assert_eq!(event_calls.get(), 0);
+        assert!(controller.live_identity().is_none());
     }
 
     #[test]

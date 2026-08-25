@@ -1651,6 +1651,50 @@ describe('shown and search ownership', () => {
     core.destroy()
   })
 
+  it('rejects old focus events and settlements after a real panel epoch replacement', async () => {
+    const { core, client, emit, emitPanelFocus, emitPanelReset } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-focus-replacement-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel)
+      .mockResolvedValueOnce({
+        sessionEpoch: u64('1'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      })
+      .mockResolvedValueOnce({
+        sessionEpoch: u64('2'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      })
+
+    const openFromQuery = async (invocationId: string) => {
+      emit(shown(invocationId))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'hello', inputType: 'insertText',
+      })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+    }
+
+    await openFromQuery('panel-focus-first')
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('1'))
+    emitPanelFocus({ sessionEpoch: '1', focusRequestId: '5' })
+    expect(core.getSnapshot().panel?.focusRequestId).toBe('5')
+    emitPanelReset({ sessionEpoch: '1' })
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+
+    await openFromQuery('panel-focus-second')
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('2'))
+    emitPanelFocus({ sessionEpoch: '1', focusRequestId: '99' })
+    core.settlePanelHostInputFocus({ sessionEpoch: u64('1'), focusRequestId: u64('99'), focused: true })
+    expect(core.getSnapshot().panel?.focusRequestId).toBeUndefined()
+    expect(client.acknowledgePluginPanelFocusHostInput).not.toHaveBeenCalled()
+
+    emitPanelFocus({ sessionEpoch: '2', focusRequestId: '1' })
+    expect(core.getSnapshot().panel?.focusRequestId).toBe('1')
+    core.destroy()
+  })
+
   it('removes native input listeners when the panel bound callback fails', async () => {
     const { core, client, emit } = await startedCore()
     installMatchMedia(false)
