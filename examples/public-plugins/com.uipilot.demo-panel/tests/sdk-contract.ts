@@ -17,5 +17,12 @@ const consumePanelApi = (api: Readonly<UiPilotPluginPanelApiV1>) => api.onUpdate
   },
 )
 
+const focusTaggedInput = async (api: Readonly<UiPilotPluginPanelApiV1>) => {
+  await api.focusHostInput()
+  // @ts-expect-error focusHostInput does not expose session or request identifiers.
+  await api.focusHostInput('1')
+}
+
 void handler
 void consumePanelApi
+void focusTaggedInput

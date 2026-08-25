@@ -158,6 +158,7 @@ export interface UiPilotPluginPanelApiV1 {
   onUpdate(
     handler: (update: Readonly<PluginPanelUpdate>) => void | Promise<void>,
   ): () => void
+  focusHostInput(): Promise<void>
   readonly storage: Readonly<UiPilotPluginPanelStorageApiV1>
 }
 

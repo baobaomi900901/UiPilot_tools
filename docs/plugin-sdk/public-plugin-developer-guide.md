@@ -497,9 +497,18 @@ window.uipilotPluginPanel.onUpdate(async (update) => {
   document.querySelector('#result').textContent = String(update.data.echo ?? '')
   await window.uipilotPluginPanel.storage.set('last-input', update.input)
 })
+
+window.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+    event.preventDefault()
+    void window.uipilotPluginPanel.focusHostInput()
+  }
+})
 ```
 
-面板桥没有 `close()`、计时器或通知接口，也不能调用 Tauri `invoke`、网络或 Shell。宿主拥有命令 tag 和参数输入框：第一次 Enter 打开面板，后续 Enter 提交当前参数；× 或参数光标位于 0 时的 Backspace 退出。Escape、失焦隐藏、插件停用、卸载或升级都会销毁当前面板，下次打开主界面从空白启动器开始。
+`focusHostInput()` 不接收参数，只把焦点交回当前会话带命令 tag 的参数输入框；它不会关闭面板、删除 tag、提交或改写参数与选择区。输入框已经聚焦时可以重复调用。会话已经隐藏、替换或销毁时调用会安静地无操作完成；当前会话的宿主聚焦失败会拒绝 Promise。
+
+面板桥没有 `close()`、计时器或通知接口，也不能调用 Tauri `invoke`、网络或 Shell。宿主拥有命令 tag 和参数输入框：第一次 Enter 打开面板，后续 Enter 提交当前参数，并仅在提交后通过 `onUpdate.input` 把新参数交给面板；`focusHostInput()` 不提供实时按键流。× 或参数光标位于 0 时的 Backspace 退出。Escape、失焦隐藏、插件停用、卸载或升级都会销毁当前面板，下次打开主界面从空白启动器开始。
 
 完整实现见 [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)。
 
@@ -775,7 +784,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `timer.control` 包只包含唯一的 `assets/sounds/timer-alarm.wav`，且 WAV 满足固定 PCM、大小与时长限制。
 - [ ] 内部空格不会被插件意外压缩。
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
-- [ ] 面板内容只通过 `uipilotPluginPanel.onUpdate` 与 `storage`，隐藏/停用/卸载/升级后不保留会话。
+- [ ] 面板内容只通过 `uipilotPluginPanel.onUpdate`、`storage` 与可选的 `focusHostInput()`，隐藏/停用/卸载/升级后不保留会话。
 - [ ] `icon.png` 满足固定规则。
 - [ ] Runtime 测试通过。
 - [ ] 开发目录和最终 `.uipilot-plugin` 均通过 `uipilot-plugin validate`。
