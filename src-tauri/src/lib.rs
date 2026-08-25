@@ -124,7 +124,7 @@ fn setup_production_lifecycle(
         app.state::<Arc<plugin_panel::PluginPanelController>>()
             .inner(),
     );
-    plugin_panel::register_main_focus_events(&window, Arc::clone(&panel_controller))
+    plugin_panel::register_main_focus_events(app.handle(), &window, Arc::clone(&panel_controller))
         .map_err(|_| lifecycle_setup_error())?;
     let event_app = app.handle().clone();
     let event_window = window.clone();
@@ -142,7 +142,7 @@ fn setup_production_lifecycle(
                 return;
             }
             if *focused {
-                let _ = event_panel_controller.observe_main_content_focus(true);
+                let _ = event_panel_controller.main_content_got_focus();
             } else if event_panel_controller.consume_internal_main_blur(std::time::Instant::now()) {
                 return;
             }
