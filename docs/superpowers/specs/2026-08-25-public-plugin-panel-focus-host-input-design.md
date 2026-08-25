@@ -88,15 +88,21 @@ current session:
    lock is held across native focus or event emission.
 4. Rust focuses the main WebView, changes the ticket to `AwaitingAck`, and emits a
    private event to `main` carrying `{ sessionEpoch, focusRequestId }`.
+   After native focus succeeds, the controller records the currently observed
+   main-focus revision on that exact ticket. A synchronous/asynchronous main
+   `GotFocus` for the same ticket may refresh this recorded revision; a later
+   `LostFocus` advances the controller revision without refreshing it.
 5. Launcher code accepts the event only when the current panel UI epoch matches,
    focuses the tagged argument `<input>`, and checks
    `document.activeElement === input`.
 6. Launcher invokes the main-only acknowledgement command with
    `{ sessionEpoch, focusRequestId, focused }`.
-7. A matching `focused: true` acknowledgement establishes main-content focus,
-   invalidates pending panel blur tickets by advancing `focusRevision`, and
-   resolves the original Promise. Matching `focused: false` rejects the current
-   request with `windowFailed`.
+7. A matching `focused: true` acknowledgement resolves only when the controller
+   still observes `mainContentFocused = true`, panel content is not focused, and
+   the ticket's recorded main-focus revision equals the current `focusRevision`.
+   The ack does not advance `focusRevision` or re-establish focus ownership.
+   Matching `focused: false`, a missing recorded main-focus revision, or a
+   revision mismatch rejects the still-current request with `windowFailed`.
 
 The event is an internal invalidation-safe request, not a public plugin event. A
 late event for a previous epoch is ignored and may send `focused: false`; the Rust
@@ -116,8 +122,9 @@ Panel-to-main transfer remains inside the same top-level UiPilot window.
   happens after the claim, the focus request owns that linearized main-thread
   operation; teardown still makes its later event/ack stale so it cannot revive UI.
 - Panel `LostFocus` may create the existing delayed application-blur ticket. Main
-  `GotFocus` or a successful frontend acknowledgement advances `focusRevision`,
-  invalidating that blur ticket before it can hide the launcher.
+  native focus confirmation or `GotFocus` advances `focusRevision`, invalidating
+  that blur ticket before it can hide the launcher. The frontend ack only verifies
+  the recorded revision; it cannot invalidate a later genuine `LostFocus`.
 - The main window remains visible and the panel session remains live.
 - A later genuine application focus loss still tears down and hides through the
   existing panel lifecycle.
@@ -127,11 +134,22 @@ Panel-to-main transfer remains inside the same top-level UiPilot window.
 
 ## 7. Frontend Behavior
 
-The launcher owns the argument input ref. The private focus event is routed to the
-active panel UI and checked against both ticket identifiers. On acceptance it
-calls `focus()` on that exact input, verifies `document.activeElement`, and always
-acknowledges the matching request. Event registration occurs before launcher
-readiness is reported so a valid request cannot be lost during frontend startup.
+The launcher owns the argument input ref. For each session it stores the greatest
+accepted canonical-decimal `focusRequestId`, compared as unsigned `u64` by length
+then lexicographically (never as JavaScript `number`). The private focus event is
+accepted only when:
+
+- `sessionEpoch` equals the active panel UI epoch;
+- `focusRequestId` is canonical non-zero decimal `u64`; and
+- it is strictly greater than the greatest ID already accepted for that session.
+
+On acceptance, the launcher records the ID before focusing, calls `focus()` on the
+exact argument input, verifies `document.activeElement`, and acknowledges the
+matching request. A duplicate ID is ignored without a second ack; a lower ID is
+ignored and may send `focused: false` because Rust must already classify it stale.
+The stored greatest ID resets when the panel session epoch changes or tears down.
+Event registration occurs before launcher readiness is reported so a valid
+request cannot be lost during frontend startup.
 
 The handler must not:
 
@@ -172,12 +190,17 @@ Automated coverage must prove:
 - A late frontend event for an old epoch cannot focus a new session's input.
 - `focusRequestId` binds event, ack, waiter, and settlement; concurrent calls use
   latest-wins and the superseded Promise resolves as a no-op.
+- Ordered event race: request B supersedes A, B's higher event arrives first, then
+  A's lower event arrives; A cannot refocus the input or affect B's settlement.
 - Ordered race: prepare A -> teardown before main-thread claim -> A resolves no-op
   with zero native focus/event side effects.
 - Ordered race: claim A -> teardown -> late event/ack -> no session revival and A
   resolves no-op once staleness is observed.
 - Current request timeout and negative ack reject `windowFailed`; stale timeout or
   stale ack does not affect a newer session.
+- Ordered focus race: claim -> native main focus -> genuine main `LostFocus` -> DOM
+  still reports the argument input active -> `focused: true` ack; the revision CAS
+  rejects the current focus request and the genuine blur ticket remains valid.
 - Panel-to-main focus transfer does not hide the launcher; a later real blur still
   hides it.
 - Capability tests prove only panel-content labels can invoke the command.
