@@ -124,8 +124,13 @@ fn setup_production_lifecycle(
         app.state::<Arc<plugin_panel::PluginPanelController>>()
             .inner(),
     );
-    plugin_panel::register_main_focus_events(app.handle(), &window, Arc::clone(&panel_controller))
-        .map_err(|_| lifecycle_setup_error())?;
+    plugin_panel::register_main_focus_events(
+        app.handle(),
+        &window,
+        Arc::clone(&panel_controller),
+        Arc::clone(coordinator),
+    )
+    .map_err(|_| lifecycle_setup_error())?;
     let event_app = app.handle().clone();
     let event_window = window.clone();
     let event_coordinator = Arc::clone(coordinator);

@@ -603,6 +603,10 @@ impl LifecycleCoordinator {
         })
     }
 
+    pub(crate) fn transient_focus_loss_suppressed(&self) -> bool {
+        self.transient_focus_suppressions.load(Ordering::Acquire) > 0
+    }
+
     pub(crate) fn file_index_phase(&self) -> FileIndexPhase {
         match self.lifecycle_phase.load(Ordering::Acquire) {
             0 => FileIndexPhase::Running,
@@ -948,7 +952,7 @@ impl LifecycleCoordinator {
     {
         if !focused
             && (self.window_move_active.load(Ordering::Acquire)
-                || self.transient_focus_suppressions.load(Ordering::Acquire) > 0)
+                || self.transient_focus_loss_suppressed())
         {
             return Ok(());
         }
@@ -3537,6 +3541,7 @@ mod tests {
         let coordinator = coordinator_for_test();
         let hides = Cell::new(0);
         let guard = coordinator.suppress_transient_focus_loss().unwrap();
+        assert!(coordinator.transient_focus_loss_suppressed());
 
         coordinator
             .handle_focus_event_with(false, || {
@@ -3550,6 +3555,7 @@ mod tests {
         assert_eq!(hides.get(), 0);
 
         drop(guard);
+        assert!(!coordinator.transient_focus_loss_suppressed());
         coordinator
             .handle_focus_event_with(false, || {
                 hides.set(hides.get() + 1);

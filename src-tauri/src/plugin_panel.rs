@@ -996,6 +996,7 @@ pub(crate) fn register_main_focus_events(
     app: &AppHandle,
     main: &WebviewWindow,
     controller: Arc<PluginPanelController>,
+    lifecycle: Arc<crate::lifecycle::LifecycleCoordinator>,
 ) -> Result<(), ()> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let got_controller = Arc::clone(&controller);
@@ -1009,7 +1010,10 @@ pub(crate) fn register_main_focus_events(
             let transfers =
                 lost_app.state::<Arc<crate::window_transfer::MainWindowTransferCoordinator>>();
             let expected_transfer_blur = transfers.consume_expected_main_webview_blur();
-            if let Some(ticket) = controller.main_content_lost_focus(expected_transfer_blur) {
+            let transient_focus_suppressed = lifecycle.transient_focus_loss_suppressed();
+            if let Some(ticket) = controller
+                .main_content_lost_focus(expected_transfer_blur || transient_focus_suppressed)
+            {
                 schedule_app_blur(lost_app.clone(), Arc::clone(&controller), ticket);
             }
             Ok(())
@@ -1036,6 +1040,7 @@ pub(crate) fn register_main_focus_events(
     _app: &AppHandle,
     _main: &WebviewWindow,
     _controller: Arc<PluginPanelController>,
+    _lifecycle: Arc<crate::lifecycle::LifecycleCoordinator>,
 ) -> Result<(), ()> {
     Ok(())
 }
@@ -1320,6 +1325,27 @@ mod tests {
         assert_eq!(ticket.session_epoch, Some(identity.session_epoch));
         assert!(controller.consume_internal_main_blur(Instant::now()));
         assert!(controller.confirm_app_blur(&ticket));
+    }
+
+    #[test]
+    fn main_webview_blur_honors_transient_focus_suppression_before_scheduling_hide() {
+        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
+        let callback = source
+            .split("pub(crate) fn register_main_focus_events(")
+            .nth(1)
+            .and_then(|tail| tail.split("#[cfg(not(windows))]").next())
+            .expect("Windows main focus registration is missing");
+        let suppression = callback
+            .find("lifecycle.transient_focus_loss_suppressed()")
+            .expect("transient focus suppression check is missing");
+        let ticket = callback
+            .find("main_content_lost_focus(expected_transfer_blur || transient_focus_suppressed)")
+            .expect("main content blur must receive the combined suppression decision");
+        let schedule = callback
+            .find("schedule_app_blur(")
+            .expect("main content blur scheduling is missing");
+
+        assert!(suppression < ticket && ticket < schedule);
     }
 
     #[test]
