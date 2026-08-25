@@ -36,6 +36,8 @@ fn main() {
             "plugin_window_timer_reset",
             "plugin_panel_content_ready",
             "plugin_panel_content_ack",
+            "plugin_panel_focus_host_input",
+            "plugin_panel_focus_host_input_ack",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",

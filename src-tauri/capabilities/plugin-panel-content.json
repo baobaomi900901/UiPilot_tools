@@ -6,6 +6,7 @@
   "permissions": [
     "allow-plugin-panel-content-ready",
     "allow-plugin-panel-content-ack",
+    "allow-plugin-panel-focus-host-input",
     "allow-plugin-panel-storage-get",
     "allow-plugin-panel-storage-set",
     "allow-plugin-panel-storage-remove"

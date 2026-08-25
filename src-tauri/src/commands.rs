@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
-    sync::Arc,
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
@@ -32,9 +32,9 @@ use crate::{
     },
     model::{LauncherResultActivation, ResultIconKind, SearchResponse},
     plugin_panel::{
-        self, PanelAdmissionError, PanelCallError, PanelOwner, PanelSessionIdentity,
-        PanelSettlementError, PendingDispatch, PluginPanelController, PluginPanelUpdate,
-        QueueDispatchOutcome,
+        self, HostInputFocusIdentity, HostInputFocusOutcome, PanelAdmissionError, PanelCallError,
+        PanelOwner, PanelSessionIdentity, PanelSettlementError, PendingDispatch,
+        PluginPanelController, PluginPanelUpdate, QueueDispatchOutcome, HOST_INPUT_FOCUS_TIMEOUT,
     },
     plugin_window::{
         self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
@@ -122,7 +122,7 @@ pub(crate) struct OpenFindInput {
     query_sequence: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub(crate) enum OpenFindOutcome {
     Forwarded,
@@ -549,6 +549,22 @@ pub(crate) struct PluginPanelCommandResult {
 pub(crate) struct PluginPanelErrorEvent {
     session_epoch: String,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginPanelFocusHostInputEvent {
+    session_epoch: String,
+    focus_request_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostInputFocusStart {
+    AwaitingAck,
+    Noop,
+    Failed,
+}
+
+const PLUGIN_PANEL_FOCUS_HOST_INPUT_EVENT: &str = "uipilot-plugin-panel-focus-host-input";
 
 fn reset_plugin_panel(app: &AppHandle, controller: &PluginPanelController, plugin_id: &str) {
     let Some(identity) = plugin_panel::teardown_plugin(app, controller, plugin_id) else {
@@ -1452,6 +1468,155 @@ pub(crate) fn plugin_panel_content_ack(
     )
     .then_some(())
     .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+fn parse_panel_focus_u64(value: &str) -> Option<u64> {
+    if value == "0"
+        || value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn host_input_focus_failure(
+    controller: &PluginPanelController,
+    identity: HostInputFocusIdentity,
+) -> Result<(), CommandError> {
+    match controller.cancel_host_input_focus(identity) {
+        Ok(true) | Err(_) => Err(CommandError::window_failed()),
+        Ok(false) => Ok(()),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn plugin_panel_focus_host_input(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+) -> Result<(), CommandError> {
+    let Some(session_epoch) = parse_panel_focus_u64(&session_epoch) else {
+        return Ok(());
+    };
+    let controller = Arc::clone(controller.inner());
+    let Some(identity) = controller
+        .prepare_host_input_focus(webview.label(), session_epoch)
+        .map_err(|_| CommandError::window_failed())?
+    else {
+        return Ok(());
+    };
+    let deadline = Instant::now()
+        .checked_add(HOST_INPUT_FOCUS_TIMEOUT)
+        .ok_or_else(CommandError::window_failed)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let focus_app = app.clone();
+    let focus_controller = Arc::clone(&controller);
+    if app
+        .run_on_main_thread(move || {
+            let outcome = match focus_controller.claim_host_input_focus(identity) {
+                Ok(false) => HostInputFocusStart::Noop,
+                Err(_) => {
+                    let _ = focus_controller.cancel_host_input_focus(identity);
+                    HostInputFocusStart::Failed
+                }
+                Ok(true) => {
+                    let native_focused = focus_app
+                        .get_webview_window("main")
+                        .is_some_and(|main| main.as_ref().set_focus().is_ok());
+                    if !native_focused {
+                        match focus_controller.cancel_host_input_focus(identity) {
+                            Ok(false) => HostInputFocusStart::Noop,
+                            Ok(true) | Err(_) => HostInputFocusStart::Failed,
+                        }
+                    } else {
+                        match focus_controller.confirm_native_host_input_focus(identity) {
+                            Ok(false) => HostInputFocusStart::Noop,
+                            Err(_) => {
+                                let _ = focus_controller.cancel_host_input_focus(identity);
+                                HostInputFocusStart::Failed
+                            }
+                            Ok(true) => {
+                                let payload = PluginPanelFocusHostInputEvent {
+                                    session_epoch: identity.session_epoch.to_string(),
+                                    focus_request_id: identity.focus_request_id.to_string(),
+                                };
+                                if focus_app
+                                    .emit_to("main", PLUGIN_PANEL_FOCUS_HOST_INPUT_EVENT, payload)
+                                    .is_err()
+                                {
+                                    match focus_controller.cancel_host_input_focus(identity) {
+                                        Ok(false) => HostInputFocusStart::Noop,
+                                        Ok(true) | Err(_) => HostInputFocusStart::Failed,
+                                    }
+                                } else {
+                                    HostInputFocusStart::AwaitingAck
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let _ = sender.send(outcome);
+        })
+        .is_err()
+    {
+        return host_input_focus_failure(&controller, identity);
+    }
+
+    let start = tauri::async_runtime::spawn_blocking(move || {
+        receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    })
+    .await;
+    match start {
+        Ok(Ok(HostInputFocusStart::Noop)) => Ok(()),
+        Ok(Ok(HostInputFocusStart::Failed)) => Err(CommandError::window_failed()),
+        Ok(Ok(HostInputFocusStart::AwaitingAck)) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_controller = Arc::clone(&controller);
+            let settled = tauri::async_runtime::spawn_blocking(move || {
+                wait_controller.wait_host_input_focus(identity, remaining)
+            })
+            .await;
+            match settled {
+                Ok(Ok(HostInputFocusOutcome::Focused | HostInputFocusOutcome::Noop)) => Ok(()),
+                Ok(Ok(HostInputFocusOutcome::Failed)) | Ok(Err(_)) => {
+                    Err(CommandError::window_failed())
+                }
+                Err(_) => host_input_focus_failure(&controller, identity),
+            }
+        }
+        Ok(Err(_)) | Err(_) => host_input_focus_failure(&controller, identity),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_focus_host_input_ack(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    focus_request_id: String,
+    focused: bool,
+) -> Result<(), CommandError> {
+    require_main_label(webview.label())?;
+    let (Some(session_epoch), Some(focus_request_id)) = (
+        parse_panel_focus_u64(&session_epoch),
+        parse_panel_focus_u64(&focus_request_id),
+    ) else {
+        return Ok(());
+    };
+    controller
+        .ack_host_input_focus(
+            HostInputFocusIdentity {
+                session_epoch,
+                focus_request_id,
+            },
+            focused,
+        )
+        .map_err(|_| CommandError::window_failed())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -5138,6 +5303,44 @@ mod tests {
         assert!(!capability.contains("timer"));
         assert!(!capability.contains("plugin-window-"));
         assert!(!capability.contains("close"));
+    }
+
+    #[test]
+    fn plugin_panel_focus_commands_split_content_request_and_main_ack_capabilities() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
+        let request = production
+            .split("pub(crate) async fn plugin_panel_focus_host_input(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("panel focus request command is missing");
+        assert!(request.contains("webview: tauri::Webview"));
+        assert!(request.contains("webview.label()"));
+        assert!(request.contains("session_epoch: String"));
+        assert!(!request.contains("plugin_id: String"));
+
+        let ack = production
+            .split("pub(crate) fn plugin_panel_focus_host_input_ack(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("panel focus acknowledgement command is missing");
+        let guard = ack
+            .find("require_main_label(webview.label())?")
+            .expect("main caller guard is missing");
+        let settlement = ack
+            .find("ack_host_input_focus(")
+            .expect("focus acknowledgement settlement is missing");
+        assert!(guard < settlement);
+
+        let content = include_str!("../capabilities/plugin-panel-content.json");
+        assert!(content.contains("allow-plugin-panel-focus-host-input"));
+        assert!(!content.contains("allow-plugin-panel-focus-host-input-ack"));
+        let main = include_str!("../capabilities/main.json");
+        assert!(main.contains("allow-plugin-panel-focus-host-input-ack"));
+        assert!(!main.contains("allow-plugin-panel-focus-host-input\""));
     }
 
     #[test]

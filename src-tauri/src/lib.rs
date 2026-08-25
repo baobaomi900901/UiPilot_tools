@@ -432,6 +432,8 @@ pub fn run() {
             commands::plugin_window_timer_reset,
             commands::plugin_panel_content_ready,
             commands::plugin_panel_content_ack,
+            commands::plugin_panel_focus_host_input,
+            commands::plugin_panel_focus_host_input_ack,
             commands::plugin_panel_storage_get,
             commands::plugin_panel_storage_set,
             commands::plugin_panel_storage_remove,
