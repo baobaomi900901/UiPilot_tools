@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
   "description": "Exact permissions for the local launcher WebView",
-  "windows": ["main"],
+  "webviews": ["main"],
   "permissions": [
     "dialog:allow-open",
     "allow-open-find-window",

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{mpsc, Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -113,7 +114,6 @@ enum HostInputFocusPhase {
     Prepared,
     NativeClaimed,
     AwaitingAck,
-    Acknowledged(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +121,7 @@ struct HostInputFocusTicket {
     identity: HostInputFocusIdentity,
     phase: HostInputFocusPhase,
     confirmed_main_focus_revision: Option<u64>,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +129,13 @@ pub(crate) enum HostInputFocusOutcome {
     Focused,
     Noop,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostInputFocusAdvance {
+    Advanced,
+    Noop,
+    Expired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +159,7 @@ struct ControllerCore {
     next_focus_request_id: u64,
     session: Option<LiveSession>,
     host_input_focus: Option<HostInputFocusTicket>,
+    host_input_focus_settlements: BTreeMap<u64, HostInputFocusOutcome>,
     focus_revision: u64,
     main_content_focused: bool,
     internal_blur_until: Option<Instant>,
@@ -343,6 +352,7 @@ impl PluginPanelController {
         &self,
         caller_label: &str,
         session_epoch: u64,
+        deadline: Instant,
     ) -> Result<Option<HostInputFocusIdentity>, PanelSettlementError> {
         let mut core = self
             .core
@@ -368,6 +378,7 @@ impl PluginPanelController {
             identity,
             phase: HostInputFocusPhase::Prepared,
             confirmed_main_focus_revision: None,
+            deadline,
         });
         self.changed.notify_all();
         Ok(Some(identity))
@@ -376,7 +387,7 @@ impl PluginPanelController {
     pub(crate) fn claim_host_input_focus(
         &self,
         identity: HostInputFocusIdentity,
-    ) -> Result<bool, PanelSettlementError> {
+    ) -> Result<HostInputFocusAdvance, PanelSettlementError> {
         let mut core = self
             .core
             .lock()
@@ -386,22 +397,27 @@ impl PluginPanelController {
             .as_ref()
             .is_some_and(|session| session.identity.session_epoch == identity.session_epoch);
         let Some(ticket) = core.host_input_focus.as_mut() else {
-            return Ok(false);
+            return Ok(HostInputFocusAdvance::Noop);
         };
         if !session_matches
             || ticket.identity != identity
             || ticket.phase != HostInputFocusPhase::Prepared
         {
-            return Ok(false);
+            return Ok(HostInputFocusAdvance::Noop);
+        }
+        if Instant::now() >= ticket.deadline {
+            core.host_input_focus = None;
+            self.changed.notify_all();
+            return Ok(HostInputFocusAdvance::Expired);
         }
         ticket.phase = HostInputFocusPhase::NativeClaimed;
-        Ok(true)
+        Ok(HostInputFocusAdvance::Advanced)
     }
 
     pub(crate) fn confirm_native_host_input_focus(
         &self,
         identity: HostInputFocusIdentity,
-    ) -> Result<bool, PanelSettlementError> {
+    ) -> Result<HostInputFocusAdvance, PanelSettlementError> {
         let mut core = self
             .core
             .lock()
@@ -414,7 +430,16 @@ impl PluginPanelController {
                 ticket.identity == identity && ticket.phase == HostInputFocusPhase::NativeClaimed
             });
         if !current {
-            return Ok(false);
+            return Ok(HostInputFocusAdvance::Noop);
+        }
+        if core
+            .host_input_focus
+            .as_ref()
+            .is_some_and(|ticket| Instant::now() >= ticket.deadline)
+        {
+            core.host_input_focus = None;
+            self.changed.notify_all();
+            return Ok(HostInputFocusAdvance::Expired);
         }
         let revision = core
             .focus_revision
@@ -433,13 +458,22 @@ impl PluginPanelController {
         ticket.confirmed_main_focus_revision = Some(revision);
         ticket.phase = HostInputFocusPhase::AwaitingAck;
         self.changed.notify_all();
-        Ok(true)
+        Ok(HostInputFocusAdvance::Advanced)
     }
 
     pub(crate) fn ack_host_input_focus(
         &self,
         identity: HostInputFocusIdentity,
         focused: bool,
+    ) -> Result<bool, PanelSettlementError> {
+        self.ack_host_input_focus_at(identity, focused, Instant::now())
+    }
+
+    fn ack_host_input_focus_at(
+        &self,
+        identity: HostInputFocusIdentity,
+        focused: bool,
+        now: Instant,
     ) -> Result<bool, PanelSettlementError> {
         let mut core = self
             .core
@@ -457,11 +491,16 @@ impl PluginPanelController {
         let accepted = focused
             && session_is_current
             && core.main_content_focused
-            && ticket.confirmed_main_focus_revision == Some(core.focus_revision);
-        core.host_input_focus
-            .as_mut()
-            .expect("validated host input focus ticket")
-            .phase = HostInputFocusPhase::Acknowledged(accepted);
+            && ticket.confirmed_main_focus_revision == Some(core.focus_revision)
+            && now < ticket.deadline;
+        let outcome = if accepted {
+            HostInputFocusOutcome::Focused
+        } else {
+            HostInputFocusOutcome::Failed
+        };
+        core.host_input_focus = None;
+        core.host_input_focus_settlements
+            .insert(identity.focus_request_id, outcome);
         self.changed.notify_all();
         Ok(true)
     }
@@ -489,30 +528,25 @@ impl PluginPanelController {
     pub(crate) fn wait_host_input_focus(
         &self,
         identity: HostInputFocusIdentity,
-        timeout: Duration,
     ) -> Result<HostInputFocusOutcome, PanelSettlementError> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(PanelSettlementError::Unavailable)?;
         let mut core = self
             .core
             .lock()
             .map_err(|_| PanelSettlementError::Unavailable)?;
         loop {
+            if let Some(outcome) = core
+                .host_input_focus_settlements
+                .remove(&identity.focus_request_id)
+            {
+                return Ok(outcome);
+            }
             let Some(ticket) = core.host_input_focus.as_ref() else {
                 return Ok(HostInputFocusOutcome::Noop);
             };
             if ticket.identity != identity {
                 return Ok(HostInputFocusOutcome::Noop);
             }
-            if let HostInputFocusPhase::Acknowledged(focused) = ticket.phase {
-                core.host_input_focus = None;
-                return Ok(if focused {
-                    HostInputFocusOutcome::Focused
-                } else {
-                    HostInputFocusOutcome::Failed
-                });
-            }
+            let deadline = ticket.deadline;
             let now = Instant::now();
             if now >= deadline {
                 core.host_input_focus = None;
@@ -1465,6 +1499,14 @@ mod tests {
         }
     }
 
+    fn focus_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(1)
+    }
+
+    fn assert_focus_advanced(result: Result<HostInputFocusAdvance, PanelSettlementError>) {
+        assert_eq!(result, Ok(HostInputFocusAdvance::Advanced));
+    }
+
     #[test]
     fn panel_labels_are_hex_encoded_and_round_trip() {
         let label = plugin_panel_content_label("com.uipilot.demo-panel", 42).unwrap();
@@ -1630,14 +1672,18 @@ mod tests {
         assert!(controller.content_got_focus(&session.content_label, session.session_epoch));
 
         let request = controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
             .unwrap()
             .unwrap();
-        assert!(controller.claim_host_input_focus(request).unwrap());
-        assert!(controller.confirm_native_host_input_focus(request).unwrap());
+        assert_focus_advanced(controller.claim_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request));
         assert!(controller.ack_host_input_focus(request, true).unwrap());
         assert_eq!(
-            controller.wait_host_input_focus(request, Duration::from_millis(1)),
+            controller.wait_host_input_focus(request),
             Ok(HostInputFocusOutcome::Focused)
         );
         assert_eq!(controller.live_identity(), Some(session));
@@ -1649,21 +1695,136 @@ mod tests {
         let session = controller.open_session(owner("a")).unwrap();
 
         let first = controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
             .unwrap()
             .unwrap();
         let second = controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
             .unwrap()
             .unwrap();
 
         assert!(second.focus_request_id > first.focus_request_id);
         assert_eq!(
-            controller.wait_host_input_focus(first, Duration::from_millis(1)),
+            controller.wait_host_input_focus(first),
             Ok(HostInputFocusOutcome::Noop)
         );
-        assert!(!controller.claim_host_input_focus(first).unwrap());
-        assert!(controller.claim_host_input_focus(second).unwrap());
+        assert_eq!(
+            controller.claim_host_input_focus(first),
+            Ok(HostInputFocusAdvance::Noop)
+        );
+        assert_focus_advanced(controller.claim_host_input_focus(second));
+    }
+
+    #[test]
+    fn host_input_focus_current_timeout_fails_but_stale_timeout_is_a_noop() {
+        let controller = PluginPanelController::default();
+        let session = controller.open_session(owner("a")).unwrap();
+        let current = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                Instant::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            controller.wait_host_input_focus(current),
+            Ok(HostInputFocusOutcome::Failed)
+        );
+
+        let stale = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                Instant::now(),
+            )
+            .unwrap()
+            .unwrap();
+        let replacement = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            controller.wait_host_input_focus(stale),
+            Ok(HostInputFocusOutcome::Noop)
+        );
+        assert_focus_advanced(controller.claim_host_input_focus(replacement));
+    }
+
+    #[test]
+    fn host_input_focus_terminal_ack_survives_a_newer_prepare() {
+        for (focused, lose_focus, expired, expected) in [
+            (false, false, false, HostInputFocusOutcome::Failed),
+            (true, true, false, HostInputFocusOutcome::Failed),
+            (true, false, true, HostInputFocusOutcome::Failed),
+            (true, false, false, HostInputFocusOutcome::Focused),
+        ] {
+            let controller = PluginPanelController::default();
+            let session = controller.open_session(owner("a")).unwrap();
+            assert!(controller.content_got_focus(&session.content_label, session.session_epoch));
+            let deadline = focus_deadline();
+            let first = controller
+                .prepare_host_input_focus(&session.content_label, session.session_epoch, deadline)
+                .unwrap()
+                .unwrap();
+            assert_focus_advanced(controller.claim_host_input_focus(first));
+            assert_focus_advanced(controller.confirm_native_host_input_focus(first));
+            let blur = lose_focus.then(|| controller.main_content_lost_focus(false).unwrap());
+            let ack_time = if expired { deadline } else { Instant::now() };
+            assert!(controller
+                .ack_host_input_focus_at(first, focused, ack_time)
+                .unwrap());
+
+            let second = controller
+                .prepare_host_input_focus(
+                    &session.content_label,
+                    session.session_epoch,
+                    focus_deadline(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(controller.wait_host_input_focus(first), Ok(expected));
+            assert_focus_advanced(controller.claim_host_input_focus(second));
+            if let Some(blur) = blur {
+                assert!(controller.confirm_app_blur(&blur));
+            }
+        }
+    }
+
+    #[test]
+    fn host_input_focus_terminal_ack_survives_session_teardown() {
+        let controller = PluginPanelController::default();
+        let session = controller.open_session(owner("a")).unwrap();
+        let request = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_focus_advanced(controller.claim_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request));
+        assert!(controller.ack_host_input_focus(request, false).unwrap());
+        assert!(controller
+            .teardown_session(Some(session.session_epoch))
+            .is_some());
+        assert_eq!(
+            controller.wait_host_input_focus(request),
+            Ok(HostInputFocusOutcome::Failed)
+        );
     }
 
     #[test]
@@ -1674,25 +1835,37 @@ mod tests {
         assert!(controller
             .prepare_host_input_focus(
                 "plugin-panel-content-forged-s0000000000000001",
-                session.session_epoch
+                session.session_epoch,
+                focus_deadline(),
             )
             .unwrap()
             .is_none());
         assert!(controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch + 1)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch + 1,
+                focus_deadline(),
+            )
             .unwrap()
             .is_none());
 
         let request = controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
             .unwrap()
             .unwrap();
         assert!(controller
             .teardown_session(Some(session.session_epoch))
             .is_some());
-        assert!(!controller.claim_host_input_focus(request).unwrap());
         assert_eq!(
-            controller.wait_host_input_focus(request, Duration::from_millis(1)),
+            controller.claim_host_input_focus(request),
+            Ok(HostInputFocusAdvance::Noop)
+        );
+        assert_eq!(
+            controller.wait_host_input_focus(request),
             Ok(HostInputFocusOutcome::Noop)
         );
     }
@@ -1703,16 +1876,20 @@ mod tests {
         let session = controller.open_session(owner("a")).unwrap();
         assert!(controller.content_got_focus(&session.content_label, session.session_epoch));
         let request = controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
             .unwrap()
             .unwrap();
-        assert!(controller.claim_host_input_focus(request).unwrap());
-        assert!(controller.confirm_native_host_input_focus(request).unwrap());
+        assert_focus_advanced(controller.claim_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request));
 
         let blur = controller.main_content_lost_focus(false).unwrap();
         assert!(controller.ack_host_input_focus(request, true).unwrap());
         assert_eq!(
-            controller.wait_host_input_focus(request, Duration::from_millis(1)),
+            controller.wait_host_input_focus(request),
             Ok(HostInputFocusOutcome::Failed)
         );
         assert!(controller.confirm_app_blur(&blur));
@@ -1726,10 +1903,14 @@ mod tests {
         let blur = controller.main_content_lost_focus(false).unwrap();
 
         let request = controller
-            .prepare_host_input_focus(&session.content_label, session.session_epoch)
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                focus_deadline(),
+            )
             .unwrap()
             .unwrap();
-        assert!(controller.claim_host_input_focus(request).unwrap());
+        assert_focus_advanced(controller.claim_host_input_focus(request));
         assert!(controller.cancel_host_input_focus(request).unwrap());
 
         assert!(controller.confirm_app_blur(&blur));

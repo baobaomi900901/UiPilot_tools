@@ -678,7 +678,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 60);
+        assert_eq!(production.matches("commands::").count(), 62);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -714,6 +714,8 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_focus_host_input",
+            "plugin_panel_focus_host_input_ack",
             "open_plugin_panel",
             "submit_plugin_panel",
             "close_plugin_panel",
@@ -875,8 +877,9 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_focus_host_input",
         ] {
-            let permission = format!("allow-{}", command.replace('_', "-"));
+            let permission = format!("\"allow-{}\"", command.replace('_', "-"));
             assert!(build.contains(&format!("\"{command}\",")));
             assert!(panel.contains(&permission));
             assert!(!main.contains(&permission));
@@ -884,6 +887,14 @@ mod tests {
             assert!(!shell.contains(&permission));
             assert!(!content.contains(&permission));
         }
+        let focus_ack = ["allow", "-plugin-panel-focus-host-input-ack"].concat();
+        assert!(main.contains(&focus_ack));
+        assert!(!runtime.contains(&focus_ack));
+        assert!(!shell.contains(&focus_ack));
+        assert!(!content.contains(&focus_ack));
+        assert!(!panel.contains(&focus_ack));
+        assert!(main.contains("\"webviews\": [\"main\"]"));
+        assert!(!main.contains("\"windows\":"));
         for capability in [main, runtime, shell, content, panel] {
             assert!(!capability.contains("\"shell:"));
         }
