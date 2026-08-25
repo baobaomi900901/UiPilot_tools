@@ -1528,43 +1528,47 @@ describe('shown and search ownership', () => {
       items: [panelItem('')],
     } as unknown as SearchResponse)
     const mounted = await mountLauncherView(core)
-    await act(async () => emit(shown('panel-shell-entry')))
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    await act(async () => core.text({
-      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
-      value: '/demo-panel', inputType: 'insertText',
-    }))
-    await act(async () => core.keyDown('Enter', false))
-    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
+    try {
+      await act(async () => emit(shown('panel-shell-entry')))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/demo-panel', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
 
-    const tag = mounted.host.querySelector<HTMLElement>('[aria-label="command demo-panel"]')
-    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')
-    const shell = tag?.parentElement ?? null
-    expect(shell).toContain(tag)
-    expect(shell).toContain(input)
-    const declaredProperty = (element: Element, property: string) => {
-      let value = ''
-      for (const rule of Array.from(style.sheet?.cssRules ?? [])) {
-        if (!(rule instanceof CSSStyleRule)) continue
-        try {
-          if (element.matches(rule.selectorText)) value = rule.style.getPropertyValue(property) || value
-        } catch {
-          // Pseudo-element selectors are not matchable against an Element.
+      const tag = mounted.host.querySelector<HTMLElement>('[aria-label="command demo-panel"]')
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')
+      const shell = tag?.parentElement ?? null
+      expect(shell).toContain(tag)
+      expect(shell).toContain(input)
+      const declaredProperty = (element: Element, property: string) => {
+        let value = ''
+        for (const rule of Array.from(style.sheet?.cssRules ?? [])) {
+          if (!(rule instanceof CSSStyleRule)) continue
+          try {
+            if (element.matches(rule.selectorText)) value = rule.style.getPropertyValue(property) || value
+          } catch {
+            // Pseudo-element selectors are not matchable against an Element.
+          }
         }
+        return value.trim()
       }
-      return value.trim()
-    }
-    expect(declaredProperty(shell!, 'border')).toContain('1px solid')
-    expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
-    expect(declaredProperty(input!, 'background')).toBe('transparent')
+      expect(declaredProperty(shell!, 'border')).toContain('1px solid')
+      expect(declaredProperty(tag!, 'border')).toMatch(/^0(?:px)?$/)
+      expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
+      expect(declaredProperty(input!, 'background')).toBe('transparent')
 
-    const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
-    await act(async () => close.click())
-    await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
-    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
-    expect(core.getSnapshot()).toMatchObject({ view: 'launcher', query: '' })
-    style.remove()
-    await mounted.unmount()
+      const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
+      await act(async () => close.click())
+      await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
+      await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+      expect(core.getSnapshot()).toMatchObject({ view: 'launcher', query: '' })
+    } finally {
+      style.remove()
+      await mounted.unmount()
+    }
   })
 
   it('arms a host plugin completion, commits once, and lets a returned action execute', async () => {
