@@ -490,7 +490,7 @@ export async function onCommand(invocation) {
 }
 ```
 
-`panel.js` 必须尽早注册独立面板桥；它只能接收更新和访问插件私有存储：
+`panel.js` 必须尽早注册独立面板桥；它可以接收更新、访问插件私有存储，并请求聚焦宿主参数输入框：
 
 ```js
 window.uipilotPluginPanel.onUpdate(async (update) => {
