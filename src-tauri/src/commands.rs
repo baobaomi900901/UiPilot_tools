@@ -454,30 +454,23 @@ impl From<WindowStorageError> for CommandError {
     }
 }
 
-fn parse_timer_session_generation(value: &str) -> Result<u64, TimerError> {
+fn parse_canonical_nonzero_u64(value: &str) -> Option<u64> {
     if value == "0"
         || value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
         || !value.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return Err(TimerError::ExpiredWindowSessionError);
+        return None;
     }
-    value
-        .parse::<u64>()
-        .map_err(|_| TimerError::ExpiredWindowSessionError)
+    value.parse().ok()
+}
+
+fn parse_timer_session_generation(value: &str) -> Result<u64, TimerError> {
+    parse_canonical_nonzero_u64(value).ok_or(TimerError::ExpiredWindowSessionError)
 }
 
 fn parse_window_storage_session_generation(value: &str) -> Result<u64, WindowStorageError> {
-    if value == "0"
-        || value.is_empty()
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(WindowStorageError::ExpiredWindowSessionError);
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| WindowStorageError::ExpiredWindowSessionError)
+    parse_canonical_nonzero_u64(value).ok_or(WindowStorageError::ExpiredWindowSessionError)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1421,16 +1414,7 @@ fn map_storage_window_call_error(error: PluginWindowCallError) -> WindowStorageE
 }
 
 fn parse_panel_storage_session_epoch(value: &str) -> Result<u64, WindowStorageError> {
-    if value == "0"
-        || value.is_empty()
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(WindowStorageError::ExpiredWindowSessionError);
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| WindowStorageError::ExpiredWindowSessionError)
+    parse_canonical_nonzero_u64(value).ok_or(WindowStorageError::ExpiredWindowSessionError)
 }
 
 fn map_storage_panel_call_error(error: PanelCallError) -> WindowStorageError {
@@ -1469,17 +1453,6 @@ pub(crate) fn plugin_panel_content_ack(
     )
     .then_some(())
     .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
-}
-
-fn parse_panel_focus_u64(value: &str) -> Option<u64> {
-    if value == "0"
-        || value.is_empty()
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    value.parse().ok()
 }
 
 fn host_input_focus_failure(
@@ -1539,7 +1512,7 @@ pub(crate) async fn plugin_panel_focus_host_input(
     controller: State<'_, Arc<PluginPanelController>>,
     session_epoch: String,
 ) -> Result<(), CommandError> {
-    let Some(session_epoch) = parse_panel_focus_u64(&session_epoch) else {
+    let Some(session_epoch) = parse_canonical_nonzero_u64(&session_epoch) else {
         return Ok(());
     };
     let deadline = Instant::now()
@@ -1621,8 +1594,8 @@ pub(crate) fn plugin_panel_focus_host_input_ack(
 ) -> Result<(), CommandError> {
     require_main_label(webview.label())?;
     let (Some(session_epoch), Some(focus_request_id)) = (
-        parse_panel_focus_u64(&session_epoch),
-        parse_panel_focus_u64(&focus_request_id),
+        parse_canonical_nonzero_u64(&session_epoch),
+        parse_canonical_nonzero_u64(&focus_request_id),
     ) else {
         return Ok(());
     };
@@ -1951,16 +1924,7 @@ pub(crate) fn close_plugin_panel(
 }
 
 fn parse_panel_session_epoch(value: &str) -> Result<u64, CommandError> {
-    if value.is_empty()
-        || value == "0"
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(CommandError::plugin_query_failed());
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| CommandError::plugin_query_failed())
+    parse_canonical_nonzero_u64(value).ok_or_else(CommandError::plugin_query_failed)
 }
 
 fn panel_route_matches_identity(
