@@ -78,20 +78,25 @@ current session:
 
 1. The panel bootstrap calls the private Tauri command with its captured epoch.
 2. Under the panel-controller lock, Rust revalidates caller/session, allocates
-   `focusRequestId`, increments `focusRevision`, and installs
-   `HostInputFocusTicket { sessionEpoch, focusRequestId, focusRevision }` in the
-   `Prepared` phase. Installing a newer ticket supersedes the prior ticket and
-   wakes its waiter.
+   `focusRequestId`, and installs
+   `HostInputFocusTicket { sessionEpoch, focusRequestId,
+   confirmedMainFocusRevision: None }` in the `Prepared` phase. Request
+   latest-wins/CAS uses `focusRequestId`; preparing or claiming a request does not
+   change the global `focusRevision`. Installing a newer ticket supersedes the
+   prior ticket and wakes its waiter.
 3. On the Tauri main thread, Rust performs a CAS-style claim of that exact ticket.
    If teardown, replacement, or a newer request won first, the command resolves as
    a no-op. A successful claim changes the phase to `NativeClaimed`; no controller
    lock is held across native focus or event emission.
-4. Rust focuses the main WebView, changes the ticket to `AwaitingAck`, and emits a
-   private event to `main` carrying `{ sessionEpoch, focusRequestId }`.
-   After native focus succeeds, the controller records the currently observed
-   main-focus revision on that exact ticket. A synchronous/asynchronous main
-   `GotFocus` for the same ticket may refresh this recorded revision; a later
-   `LostFocus` advances the controller revision without refreshing it.
+4. Rust focuses the main WebView. Only after native focus succeeds, the controller
+   advances global `focusRevision`, marks main content focused, records the new
+   revision in `confirmedMainFocusRevision` on that exact ticket, changes the
+   ticket to `AwaitingAck`, and emits a private event to `main` carrying
+   `{ sessionEpoch, focusRequestId }`. A synchronous/asynchronous main `GotFocus`
+   for the same ticket may advance and refresh this recorded revision; a later
+   `LostFocus` advances the controller revision without refreshing it. Native
+   focus failure cancels the request without changing global focus ownership or
+   revision.
 5. Launcher code accepts the event only when the current panel UI epoch matches,
    focuses the tagged argument `<input>`, and checks
    `document.activeElement === input`.
@@ -131,6 +136,9 @@ Panel-to-main transfer remains inside the same top-level UiPilot window.
 - Native-focus, emit, negative-ack, and timeout failure cancel the exact focus
   ticket and wake its waiter. Cancellation cannot leave a reusable suppression
   token that masks a later genuine blur.
+- Preparing, claiming, superseding, or cancelling before successful native focus
+  never changes global `focusRevision`; therefore an already-issued genuine blur
+  ticket remains confirmable when native focus fails.
 
 ## 7. Frontend Behavior
 
@@ -196,6 +204,9 @@ Automated coverage must prove:
   with zero native focus/event side effects.
 - Ordered race: claim A -> teardown -> late event/ack -> no session revival and A
   resolves no-op once staleness is observed.
+- Ordered failure: a genuine blur ticket exists -> prepare/claim focus request ->
+  native focus fails -> request cancels; the original blur ticket remains current
+  and can still hide the launcher.
 - Current request timeout and negative ack reject `windowFailed`; stale timeout or
   stale ack does not affect a newer session.
 - Ordered focus race: claim -> native main focus -> genuine main `LostFocus` -> DOM
