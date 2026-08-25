@@ -1985,7 +1985,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function applyPanelFocusRequest(event: PluginPanelFocusHostInputEvent): boolean {
     const panel = model.panel
-    if (!panel || event.sessionEpoch !== panel.sessionEpoch) return false
+    if (!panel || panel.closePending || event.sessionEpoch !== panel.sessionEpoch) return false
     if (
       panel.focusRequestId !== undefined &&
       compareDecimalRevision(event.focusRequestId, panel.focusRequestId) <= 0
@@ -2017,7 +2017,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const panel = model.panel
     if (
       destroyed || !panel || panel.sessionEpoch !== input.sessionEpoch ||
-      panel.focusRequestId !== input.focusRequestId
+      panel.closePending || panel.focusRequestId !== input.focusRequestId
     ) return
     void client.acknowledgePluginPanelFocusHostInput(input).catch(() => undefined)
   }
@@ -2184,6 +2184,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       suffixControl: panel.suffix.key,
     }
     panel.closePending = true
+    panel.focusRequestId = undefined
     publish(true)
     try {
       await client.closePluginPanel({ sessionEpoch: owner.sessionEpoch })

@@ -72,17 +72,31 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
       onBindingFailed?.()
       return () => core.retireControl(control)
     }
-    try {
-      const unbind = bindNativeTextInput(input, control, core.text)
-      onBound?.(input)
-      return () => {
+    let unbind: (() => void) | undefined
+    let cleaned = false
+    const cleanup = () => {
+      if (cleaned) return
+      cleaned = true
+      try {
         onUnbound?.(input)
-        unbind()
-        core.retireControl(control)
+      } finally {
+        try {
+          unbind?.()
+        } finally {
+          core.retireControl(control)
+        }
       }
+    }
+    try {
+      unbind = bindNativeTextInput(input, control, core.text)
+      onBound?.(input)
+      return cleanup
     } catch {
+      try {
+        cleanup()
+      } catch { /* failure reporting below remains authoritative */ }
       onBindingFailed?.()
-      return () => core.retireControl(control)
+      return () => undefined
     }
   }, [control, core, onBindingFailed, onBound, onUnbound])
   return <Input {...props} ref={ref} value={value} onChange={() => {}} />
@@ -314,7 +328,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }, [])
 
   useLayoutEffect(() => {
-    if (!panel?.focusRequestId) return
+    if (!panel?.focusRequestId || panel.closePending) return
     const input = panelInputRef.current
     let focused = false
     if (input?.isConnected) {
@@ -326,7 +340,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       focusRequestId: panel.focusRequestId,
       focused,
     })
-  }, [core, panel?.focusRequestId, panel?.sessionEpoch, panel?.suffixControl])
+  }, [core, panel?.closePending, panel?.focusRequestId, panel?.sessionEpoch, panel?.suffixControl])
 
   useLayoutEffect(() => {
     if (!snapshot.invocationId) return

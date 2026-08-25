@@ -1579,20 +1579,121 @@ describe('shown and search ownership', () => {
     await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '11' }))
     await vi.waitFor(() => expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(2))
     expect(document.activeElement).toBe(input)
+    input.setSelectionRange(3, 3)
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '20' }))
+    await vi.waitFor(() => expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(3))
+    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenLastCalledWith({
+      sessionEpoch: '1', focusRequestId: '20', focused: true,
+    })
+    expect(document.activeElement).toBe(input)
+    expect([input.selectionStart, input.selectionEnd]).toEqual([3, 3])
+
     outside.focus()
-    await act(async () => emitPanelFocus({ sessionEpoch: '2', focusRequestId: '12' }))
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '19' }))
     expect(document.activeElement).toBe(outside)
-    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(2)
+    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(3)
+    await act(async () => emitPanelFocus({ sessionEpoch: '2', focusRequestId: '21' }))
+    expect(document.activeElement).toBe(outside)
+    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(3)
 
     const focus = vi.spyOn(input, 'focus').mockImplementationOnce(() => undefined)
-    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '12' }))
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '21' }))
     await vi.waitFor(() => expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenLastCalledWith({
-      sessionEpoch: '1', focusRequestId: '12', focused: false,
+      sessionEpoch: '1', focusRequestId: '21', focused: false,
     }))
     expect(document.activeElement).toBe(outside)
     focus.mockRestore()
+
+    const closed = deferred<void>()
+    vi.mocked(client.closePluginPanel).mockReturnValueOnce(closed.promise)
+    let closing!: Promise<void>
+    await act(async () => {
+      closing = core.closePanel()
+      await Promise.resolve()
+    })
+    expect(core.getSnapshot().panel?.closePending).toBe(true)
+    await act(async () => emitPanelFocus({ sessionEpoch: '1', focusRequestId: '22' }))
+    expect(document.activeElement).toBe(outside)
+    expect(client.acknowledgePluginPanelFocusHostInput).toHaveBeenCalledTimes(4)
+    closed.resolve()
+    await act(async () => closing)
     outside.remove()
     await mounted.unmount()
+  })
+
+  it('buffers only the newest focus event until the matching panel identity is installed', async () => {
+    const { core, client, emit, emitPanelFocus } = await startedCore()
+    const opened = deferred<PluginPanelCommandResult>()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-early-focus-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockReturnValueOnce(opened.promise)
+
+    emit(shown('panel-early-focus'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'hello', inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(client.openPluginPanel).toHaveBeenCalledOnce())
+    emitPanelFocus({ sessionEpoch: '1', focusRequestId: '8' })
+    emitPanelFocus({ sessionEpoch: '1', focusRequestId: '9' })
+    expect(core.getSnapshot().panel).toBeUndefined()
+
+    opened.resolve({
+      sessionEpoch: u64('1'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.focusRequestId).toBe('9'))
+    expect(client.acknowledgePluginPanelFocusHostInput).not.toHaveBeenCalled()
+    core.destroy()
+  })
+
+  it('removes native input listeners when the panel bound callback fails', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-bind-failure-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('panel-bind-failure')))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'hello', inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    const originalSetSelectionRange = HTMLInputElement.prototype.setSelectionRange
+    const remove = vi.spyOn(HTMLInputElement.prototype, 'removeEventListener')
+    const selection = vi.spyOn(HTMLInputElement.prototype, 'setSelectionRange').mockImplementation(function (
+      this: HTMLInputElement,
+      start: number | null,
+      end: number | null,
+      direction?: 'forward' | 'backward' | 'none',
+    ) {
+      if (this.getAttribute('aria-label') === 'demo-panel argument') throw new Error('private panel bind failure')
+      return originalSetSelectionRange.call(this, start, end, direction)
+    })
+    try {
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('1'))
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+      await vi.waitFor(() => {
+        const removedEvents = remove.mock.calls.flatMap((args, index) =>
+          remove.mock.instances[index] === input ? [args[0]] : [],
+        )
+        expect(removedEvents).toEqual(expect.arrayContaining(['compositionstart', 'input', 'compositionend']))
+      })
+    } finally {
+      selection.mockRestore()
+      remove.mockRestore()
+      await mounted.unmount()
+    }
   })
 
   it('renders the panel tag inside one input shell and closes to a fresh launcher', async () => {
@@ -4700,6 +4801,37 @@ describe('real adapter and startup', () => {
   async function pagehide() {
     await act(async () => window.dispatchEvent(new Event('pagehide')))
   }
+
+  it('renders but does not report startup readiness until the focus listener is installed', async () => {
+    resetAdapterDocument()
+    const focusRegistration = deferred<() => void>()
+    const focusUnlisten = vi.fn()
+    tauriCapture.listen.mockImplementation((event) =>
+      event === 'uipilot-plugin-panel-focus-host-input'
+        ? focusRegistration.promise
+        : Promise.resolve(vi.fn()),
+    )
+    tauriCapture.invoke.mockImplementation((command) =>
+      Promise.resolve(
+        command === 'get_message_summary'
+          ? { revision: '0', unreadCount: 0 }
+          : command === 'load_settings'
+            ? emptySettings
+            : undefined,
+      ),
+    )
+
+    await act(async () => {
+      await import('./main')
+    })
+    expect(document.querySelector('[role="combobox"]')).toBeInstanceOf(HTMLInputElement)
+    expect(tauriCapture.invoke).not.toHaveBeenCalled()
+
+    focusRegistration.resolve(focusUnlisten)
+    await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+    await pagehide()
+    expect(focusUnlisten).toHaveBeenCalledOnce()
+  })
 
   it('mounts and resolves the shown listener before loading, then uses the exact invoke table', async () => {
     resetAdapterDocument()
