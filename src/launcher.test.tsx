@@ -1520,6 +1520,9 @@ describe('shown and search ownership', () => {
     const { core, client, emit } = await startedCore()
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const style = document.createElement('style')
+    style.textContent = stylesSource
+    document.head.append(style)
     vi.mocked(client.searchApps).mockResolvedValue({
       requestId: 'panel-shell-result',
       items: [panelItem('')],
@@ -1534,18 +1537,33 @@ describe('shown and search ownership', () => {
     await act(async () => core.keyDown('Enter', false))
     await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
 
-    const shell = mounted.host.querySelector<HTMLElement>('.panel-input-shell')
-    const tag = mounted.host.querySelector<HTMLElement>('.panel-command-tag')
+    const tag = mounted.host.querySelector<HTMLElement>('[aria-label="command demo-panel"]')
     const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')
-    expect(shell).not.toBeNull()
+    const shell = tag?.parentElement ?? null
     expect(shell).toContain(tag)
     expect(shell).toContain(input)
+    const declaredProperty = (element: Element, property: string) => {
+      let value = ''
+      for (const rule of Array.from(style.sheet?.cssRules ?? [])) {
+        if (!(rule instanceof CSSStyleRule)) continue
+        try {
+          if (element.matches(rule.selectorText)) value = rule.style.getPropertyValue(property) || value
+        } catch {
+          // Pseudo-element selectors are not matchable against an Element.
+        }
+      }
+      return value.trim()
+    }
+    expect(declaredProperty(shell!, 'border')).toContain('1px solid')
+    expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
+    expect(declaredProperty(input!, 'background')).toBe('transparent')
 
     const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
     await act(async () => close.click())
     await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
     await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
     expect(core.getSnapshot()).toMatchObject({ view: 'launcher', query: '' })
+    style.remove()
     await mounted.unmount()
   })
 
