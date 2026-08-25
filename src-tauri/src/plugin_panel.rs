@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{mpsc, Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -160,6 +160,7 @@ struct ControllerCore {
     session: Option<LiveSession>,
     host_input_focus: Option<HostInputFocusTicket>,
     host_input_focus_settlements: BTreeMap<u64, HostInputFocusOutcome>,
+    native_host_input_focus_claims: BTreeSet<u64>,
     focus_revision: u64,
     main_content_focused: bool,
     internal_blur_until: Option<Instant>,
@@ -411,7 +412,29 @@ impl PluginPanelController {
             return Ok(HostInputFocusAdvance::Expired);
         }
         ticket.phase = HostInputFocusPhase::NativeClaimed;
+        core.native_host_input_focus_claims
+            .insert(identity.focus_request_id);
         Ok(HostInputFocusAdvance::Advanced)
+    }
+
+    pub(crate) fn fail_native_host_input_focus(
+        &self,
+        identity: HostInputFocusIdentity,
+    ) -> Result<bool, PanelSettlementError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelSettlementError::Unavailable)?;
+        core.native_host_input_focus_claims
+            .remove(&identity.focus_request_id);
+        let current = core.host_input_focus.as_ref().is_some_and(|ticket| {
+            ticket.identity == identity && ticket.phase == HostInputFocusPhase::NativeClaimed
+        });
+        if current {
+            core.host_input_focus = None;
+            self.changed.notify_all();
+        }
+        Ok(current)
     }
 
     pub(crate) fn confirm_native_host_input_focus(
@@ -423,6 +446,12 @@ impl PluginPanelController {
             .core
             .lock()
             .map_err(|_| PanelSettlementError::Unavailable)?;
+        if !core
+            .native_host_input_focus_claims
+            .remove(&identity.focus_request_id)
+        {
+            return Ok(HostInputFocusAdvance::Noop);
+        }
         let current = core
             .session
             .as_ref()
@@ -430,30 +459,29 @@ impl PluginPanelController {
             && core.host_input_focus.as_ref().is_some_and(|ticket| {
                 ticket.identity == identity && ticket.phase == HostInputFocusPhase::NativeClaimed
             });
-        if !current {
-            return Ok(HostInputFocusAdvance::Noop);
-        }
-        let expired = core
-            .host_input_focus
-            .as_ref()
-            .is_some_and(|ticket| now >= ticket.deadline);
         let revision = core
             .focus_revision
             .checked_add(1)
             .ok_or(PanelSettlementError::Unavailable)?;
         core.focus_revision = revision;
         core.main_content_focused = true;
-        core.session
-            .as_mut()
-            .expect("validated host input focus session")
-            .content_focused = false;
+        if let Some(session) = core.session.as_mut() {
+            session.content_focused = false;
+        }
+        if !current {
+            self.changed.notify_all();
+            return Ok(HostInputFocusAdvance::Noop);
+        }
         let ticket = core
             .host_input_focus
             .as_mut()
             .expect("validated host input focus ticket");
+        let expired = now >= ticket.deadline;
         ticket.confirmed_main_focus_revision = Some(revision);
         if expired {
             core.host_input_focus = None;
+            core.host_input_focus_settlements
+                .insert(identity.focus_request_id, HostInputFocusOutcome::Failed);
             self.changed.notify_all();
             return Ok(HostInputFocusAdvance::Expired);
         }
@@ -514,6 +542,14 @@ impl PluginPanelController {
             .core
             .lock()
             .map_err(|_| PanelSettlementError::Unavailable)?;
+        if core
+            .host_input_focus_settlements
+            .remove(&identity.focus_request_id)
+            .is_some()
+        {
+            self.changed.notify_all();
+            return Ok(true);
+        }
         if core
             .host_input_focus
             .as_ref()
@@ -1914,7 +1950,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_focus_advanced(controller.claim_host_input_focus(request));
-        assert!(controller.cancel_host_input_focus(request).unwrap());
+        assert!(controller.fail_native_host_input_focus(request).unwrap());
 
         assert!(controller.confirm_app_blur(&blur));
     }

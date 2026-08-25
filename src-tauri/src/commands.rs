@@ -1507,7 +1507,7 @@ fn start_host_input_focus(
             HostInputFocusStart::Failed
         }
         Ok(HostInputFocusAdvance::Advanced) if !native_focus() => {
-            match controller.cancel_host_input_focus(identity) {
+            match controller.fail_native_host_input_focus(identity) {
                 Ok(false) => HostInputFocusStart::Noop,
                 Ok(true) | Err(_) => HostInputFocusStart::Failed,
             }
@@ -1589,7 +1589,10 @@ pub(crate) async fn plugin_panel_focus_host_input(
     .await;
     match start {
         Ok(Ok(HostInputFocusStart::Noop)) => Ok(()),
-        Ok(Ok(HostInputFocusStart::Failed)) => Err(CommandError::window_failed()),
+        Ok(Ok(HostInputFocusStart::Failed)) => {
+            let _ = controller.cancel_host_input_focus(identity);
+            Err(CommandError::window_failed())
+        }
         Ok(Ok(HostInputFocusStart::AwaitingAck)) => {
             let wait_controller = Arc::clone(&controller);
             let settled = tauri::async_runtime::spawn_blocking(move || {
@@ -3989,9 +3992,9 @@ mod tests {
 
     use super::{
         clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
-        execute_result_with, load_settings_core, load_settings_ready_with,
-        map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
-        map_theme_preference_worker_result, panel_route_matches_identity,
+        execute_result_with, host_input_focus_failure, load_settings_core,
+        load_settings_ready_with, map_everything_search_error, map_file_preview_worker_result,
+        map_save_worker_result, map_theme_preference_worker_result, panel_route_matches_identity,
         parse_panel_session_epoch, parse_timer_session_generation,
         parse_window_storage_session_generation, plugin_discovery_prefix, prepare_file_query,
         prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
@@ -5447,7 +5450,39 @@ mod tests {
         );
         assert_eq!(native_calls.get(), 2);
         assert_eq!(event_calls.get(), 0);
+        assert!(host_input_focus_failure(&controller, late).is_err());
         assert!(!controller.confirm_app_blur(&late_blur));
+
+        assert!(controller.main_content_got_focus());
+        let in_flight_blur = controller.main_content_lost_focus(false).unwrap();
+        let in_flight = controller
+            .prepare_host_input_focus(
+                &session.content_label,
+                session.session_epoch,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            start_host_input_focus(
+                &controller,
+                in_flight,
+                || {
+                    native_calls.set(native_calls.get() + 1);
+                    assert!(host_input_focus_failure(&controller, in_flight).is_err());
+                    true
+                },
+                std::time::Instant::now,
+                || {
+                    event_calls.set(event_calls.get() + 1);
+                    true
+                },
+            ),
+            HostInputFocusStart::Noop
+        );
+        assert_eq!(native_calls.get(), 3);
+        assert_eq!(event_calls.get(), 0);
+        assert!(!controller.confirm_app_blur(&in_flight_blur));
     }
 
     #[test]
