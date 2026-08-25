@@ -417,6 +417,7 @@ impl PluginPanelController {
     pub(crate) fn confirm_native_host_input_focus(
         &self,
         identity: HostInputFocusIdentity,
+        now: Instant,
     ) -> Result<HostInputFocusAdvance, PanelSettlementError> {
         let mut core = self
             .core
@@ -432,15 +433,10 @@ impl PluginPanelController {
         if !current {
             return Ok(HostInputFocusAdvance::Noop);
         }
-        if core
+        let expired = core
             .host_input_focus
             .as_ref()
-            .is_some_and(|ticket| Instant::now() >= ticket.deadline)
-        {
-            core.host_input_focus = None;
-            self.changed.notify_all();
-            return Ok(HostInputFocusAdvance::Expired);
-        }
+            .is_some_and(|ticket| now >= ticket.deadline);
         let revision = core
             .focus_revision
             .checked_add(1)
@@ -456,6 +452,11 @@ impl PluginPanelController {
             .as_mut()
             .expect("validated host input focus ticket");
         ticket.confirmed_main_focus_revision = Some(revision);
+        if expired {
+            core.host_input_focus = None;
+            self.changed.notify_all();
+            return Ok(HostInputFocusAdvance::Expired);
+        }
         ticket.phase = HostInputFocusPhase::AwaitingAck;
         self.changed.notify_all();
         Ok(HostInputFocusAdvance::Advanced)
@@ -1680,7 +1681,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_focus_advanced(controller.claim_host_input_focus(request));
-        assert_focus_advanced(controller.confirm_native_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request, Instant::now()));
         assert!(controller.ack_host_input_focus(request, true).unwrap());
         assert_eq!(
             controller.wait_host_input_focus(request),
@@ -1780,7 +1781,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_focus_advanced(controller.claim_host_input_focus(first));
-            assert_focus_advanced(controller.confirm_native_host_input_focus(first));
+            assert_focus_advanced(
+                controller.confirm_native_host_input_focus(first, Instant::now()),
+            );
             let blur = lose_focus.then(|| controller.main_content_lost_focus(false).unwrap());
             let ack_time = if expired { deadline } else { Instant::now() };
             assert!(controller
@@ -1816,7 +1819,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_focus_advanced(controller.claim_host_input_focus(request));
-        assert_focus_advanced(controller.confirm_native_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request, Instant::now()));
         assert!(controller.ack_host_input_focus(request, false).unwrap());
         assert!(controller
             .teardown_session(Some(session.session_epoch))
@@ -1884,7 +1887,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_focus_advanced(controller.claim_host_input_focus(request));
-        assert_focus_advanced(controller.confirm_native_host_input_focus(request));
+        assert_focus_advanced(controller.confirm_native_host_input_focus(request, Instant::now()));
 
         let blur = controller.main_content_lost_focus(false).unwrap();
         assert!(controller.ack_host_input_focus(request, true).unwrap());

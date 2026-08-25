@@ -1496,6 +1496,7 @@ fn start_host_input_focus(
     controller: &PluginPanelController,
     identity: HostInputFocusIdentity,
     native_focus: impl FnOnce() -> bool,
+    confirmation_time: impl FnOnce() -> Instant,
     emit_request: impl FnOnce() -> bool,
 ) -> HostInputFocusStart {
     match controller.claim_host_input_focus(identity) {
@@ -1512,7 +1513,7 @@ fn start_host_input_focus(
             }
         }
         Ok(HostInputFocusAdvance::Advanced) => {
-            match controller.confirm_native_host_input_focus(identity) {
+            match controller.confirm_native_host_input_focus(identity, confirmation_time()) {
                 Ok(HostInputFocusAdvance::Noop) => HostInputFocusStart::Noop,
                 Ok(HostInputFocusAdvance::Expired) => HostInputFocusStart::Failed,
                 Err(_) => {
@@ -1564,6 +1565,7 @@ pub(crate) async fn plugin_panel_focus_host_input(
                         .get_webview_window("main")
                         .is_some_and(|main| main.as_ref().set_focus().is_ok())
                 },
+                Instant::now,
                 || {
                     let payload = PluginPanelFocusHostInputEvent {
                         session_epoch: identity.session_epoch.to_string(),
@@ -5355,6 +5357,7 @@ mod tests {
                     native_calls.set(native_calls.get() + 1);
                     true
                 },
+                std::time::Instant::now,
                 || {
                     event_calls.set(event_calls.get() + 1);
                     true
@@ -5380,6 +5383,7 @@ mod tests {
                     native_calls.set(native_calls.get() + 1);
                     false
                 },
+                std::time::Instant::now,
                 || {
                     event_calls.set(event_calls.get() + 1);
                     true
@@ -5407,6 +5411,7 @@ mod tests {
                     native_calls.set(native_calls.get() + 1);
                     true
                 },
+                std::time::Instant::now,
                 || {
                     event_calls.set(event_calls.get() + 1);
                     true
@@ -5416,6 +5421,33 @@ mod tests {
         );
         assert_eq!(native_calls.get(), 1);
         assert_eq!(event_calls.get(), 0);
+
+        assert!(controller.main_content_got_focus());
+        let late_blur = controller.main_content_lost_focus(false).unwrap();
+        let late_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let late = controller
+            .prepare_host_input_focus(&session.content_label, session.session_epoch, late_deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            start_host_input_focus(
+                &controller,
+                late,
+                || {
+                    native_calls.set(native_calls.get() + 1);
+                    true
+                },
+                || late_deadline,
+                || {
+                    event_calls.set(event_calls.get() + 1);
+                    true
+                },
+            ),
+            HostInputFocusStart::Failed
+        );
+        assert_eq!(native_calls.get(), 2);
+        assert_eq!(event_calls.get(), 0);
+        assert!(!controller.confirm_app_blur(&late_blur));
     }
 
     #[test]
