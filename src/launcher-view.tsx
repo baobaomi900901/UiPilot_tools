@@ -666,7 +666,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   ) : null
   const panelLauncher = panel ? (
     <section className="panel-launcher" aria-label={`${panel.commandLabel} 面板`}>
-      <div className="panel-input-row">
+      <div className="panel-input-row panel-input-shell">
         <div className="panel-command-tag" role="group" aria-label={`command ${panel.commandLabel}`}>
           <span>/{panel.commandLabel}</span>
           <Tooltip title="退出面板">
@@ -685,6 +685,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           {panel.commandLabel} argument
         </label>
         <BoundInput
+          className="panel-suffix-input"
           core={core}
           control={panel.suffixControl}
           value={panel.suffix}

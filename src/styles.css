@@ -98,15 +98,42 @@ label,
 
 .panel-input-row {
   display: flex;
-  align-items: stretch;
-  gap: 6px;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
   height: 44px;
+  padding: 4px 6px;
+  background: var(--uipilot-ui-surface);
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: var(--uipilot-ui-radius-sm);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
-.panel-input-row > .ant-input {
+.panel-input-row:hover {
+  border-color: var(--uipilot-ui-ring);
+}
+
+.panel-input-row:focus-within {
+  border-color: var(--uipilot-ui-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--uipilot-ui-ring) 20%, transparent);
+}
+
+.panel-input-row > .panel-suffix-input.ant-input {
+  flex: 1 1 auto;
   min-width: 0;
-  height: 44px;
+  height: 34px;
+  padding-inline: 6px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.panel-input-row > .panel-suffix-input.ant-input:hover,
+.panel-input-row > .panel-suffix-input.ant-input:focus {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
 }
 
 .panel-command-tag {
@@ -115,12 +142,12 @@ label,
   align-items: center;
   gap: 4px;
   max-width: 220px;
-  height: 44px;
-  padding-inline: 10px 4px;
+  height: 30px;
+  padding-inline: 8px 2px;
   overflow: hidden;
   color: var(--uipilot-ui-foreground);
   background: var(--uipilot-ui-muted);
-  border: 1px solid var(--uipilot-ui-border);
+  border: 0;
   border-radius: var(--uipilot-ui-radius-sm);
 }
 

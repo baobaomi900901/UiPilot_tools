@@ -1516,6 +1516,39 @@ describe('shown and search ownership', () => {
     await mounted.unmount()
   })
 
+  it('renders the panel tag inside one input shell and closes to a fresh launcher', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-shell-result',
+      items: [panelItem('')],
+    } as unknown as SearchResponse)
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('panel-shell-entry')))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '/demo-panel', inputType: 'insertText',
+    }))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
+
+    const shell = mounted.host.querySelector<HTMLElement>('.panel-input-shell')
+    const tag = mounted.host.querySelector<HTMLElement>('.panel-command-tag')
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')
+    expect(shell).not.toBeNull()
+    expect(shell).toContain(tag)
+    expect(shell).toContain(input)
+
+    const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
+    await act(async () => close.click())
+    await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+    expect(core.getSnapshot()).toMatchObject({ view: 'launcher', query: '' })
+    await mounted.unmount()
+  })
+
   it('arms a host plugin completion, commits once, and lets a returned action execute', async () => {
     const { core, client, emit } = await startedCore()
     vi.useFakeTimers()
