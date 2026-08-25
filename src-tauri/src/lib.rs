@@ -141,9 +141,9 @@ fn setup_production_lifecycle(
             if expected_blur {
                 return;
             }
-            if *focused {
-                let _ = event_panel_controller.main_content_got_focus();
-            } else if event_panel_controller.consume_internal_main_blur(std::time::Instant::now()) {
+            if !*focused
+                && event_panel_controller.consume_internal_main_blur(std::time::Instant::now())
+            {
                 return;
             }
             let registries = event_app.state::<result_registry::ResultRegistries>();
@@ -1081,6 +1081,7 @@ mod tests {
 
         assert!(expected_blur < panel_focus);
         assert!(panel_focus < hide);
+        assert!(!focused_branch.contains("main_content_got_focus()"));
     }
 
     #[test]
