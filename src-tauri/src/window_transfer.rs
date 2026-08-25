@@ -34,12 +34,14 @@ struct TransferCore {
     next_epoch: u64,
     current: Option<ActiveTransfer>,
     pending_main_blurs: usize,
+    pending_main_webview_blurs: usize,
 }
 
 struct ActiveTransfer {
     lease: TransferLease,
     snapshot: MainWindowSnapshot,
     expected_main_blur: bool,
+    expected_main_webview_blur: bool,
 }
 
 impl MainWindowTransferCoordinator {
@@ -59,6 +61,7 @@ impl MainWindowTransferCoordinator {
             lease: lease.clone(),
             snapshot,
             expected_main_blur,
+            expected_main_webview_blur: expected_main_blur,
         });
         Some(lease)
     }
@@ -96,6 +99,22 @@ impl MainWindowTransferCoordinator {
             false
         }
     }
+    pub(crate) fn consume_expected_main_webview_blur(&self) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        if let Some(current) = core.current.as_mut() {
+            if std::mem::take(&mut current.expected_main_webview_blur) {
+                return true;
+            }
+        }
+        if core.pending_main_webview_blurs > 0 {
+            core.pending_main_webview_blurs -= 1;
+            true
+        } else {
+            false
+        }
+    }
     pub(crate) fn commit(&self, lease: &TransferLease) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
@@ -108,6 +127,9 @@ impl MainWindowTransferCoordinator {
             let current = core.current.take().expect("validated current transfer");
             if current.expected_main_blur {
                 core.pending_main_blurs = core.pending_main_blurs.saturating_add(1);
+            }
+            if current.expected_main_webview_blur {
+                core.pending_main_webview_blurs = core.pending_main_webview_blurs.saturating_add(1);
             }
             true
         } else {
@@ -153,6 +175,8 @@ mod tests {
         assert!(coordinator.is_current(&plugin));
         assert!(coordinator.consume_expected_main_blur());
         assert!(!coordinator.consume_expected_main_blur());
+        assert!(coordinator.consume_expected_main_webview_blur());
+        assert!(!coordinator.consume_expected_main_webview_blur());
 
         let find = coordinator
             .begin(TransferTarget::Find { transfer_id: 7 }, snapshot(false))
@@ -182,5 +206,7 @@ mod tests {
         assert!(!coordinator.is_current(&second));
         assert!(coordinator.consume_expected_main_blur());
         assert!(!coordinator.consume_expected_main_blur());
+        assert!(coordinator.consume_expected_main_webview_blur());
+        assert!(!coordinator.consume_expected_main_webview_blur());
     }
 }

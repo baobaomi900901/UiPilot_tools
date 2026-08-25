@@ -322,15 +322,19 @@ impl PluginPanelController {
         true
     }
 
-    pub(crate) fn main_content_lost_focus(&self) -> Option<AppFocusLossTicket> {
+    pub(crate) fn main_content_lost_focus(
+        &self,
+        expected_transfer_blur: bool,
+    ) -> Option<AppFocusLossTicket> {
         let mut core = self.core.lock().ok()?;
         let revision = core.focus_revision.checked_add(1)?;
         core.focus_revision = revision;
         core.main_content_focused = false;
-        if core
-            .session
-            .as_ref()
-            .is_some_and(|session| session.content_focused)
+        if expected_transfer_blur
+            || core
+                .session
+                .as_ref()
+                .is_some_and(|session| session.content_focused)
         {
             return None;
         }
@@ -1002,7 +1006,10 @@ pub(crate) fn register_main_focus_events(
             Ok(())
         }));
         let lost = FocusChangedEventHandler::create(Box::new(move |_, _| {
-            if let Some(ticket) = controller.main_content_lost_focus() {
+            let transfers =
+                lost_app.state::<Arc<crate::window_transfer::MainWindowTransferCoordinator>>();
+            let expected_transfer_blur = transfers.consume_expected_main_webview_blur();
+            if let Some(ticket) = controller.main_content_lost_focus(expected_transfer_blur) {
                 schedule_app_blur(lost_app.clone(), Arc::clone(&controller), ticket);
             }
             Ok(())
@@ -1297,7 +1304,7 @@ mod tests {
         assert!(controller.main_content_got_focus());
         assert!(controller.consume_internal_main_blur(now));
         assert!(controller.consume_internal_main_blur(now));
-        let ticket = controller.main_content_lost_focus().unwrap();
+        let ticket = controller.main_content_lost_focus(false).unwrap();
         assert!(!controller.consume_internal_main_blur(now));
         assert!(controller.confirm_app_blur(&ticket));
     }
@@ -1308,7 +1315,7 @@ mod tests {
         let identity = controller.open_session(owner("a")).unwrap();
 
         assert!(controller.main_content_got_focus());
-        let ticket = controller.main_content_lost_focus().unwrap();
+        let ticket = controller.main_content_lost_focus(false).unwrap();
 
         assert_eq!(ticket.session_epoch, Some(identity.session_epoch));
         assert!(controller.consume_internal_main_blur(Instant::now()));
@@ -1321,10 +1328,20 @@ mod tests {
         let identity = controller.open_session(owner("a")).unwrap();
 
         assert!(controller.main_content_got_focus());
-        let ticket = controller.main_content_lost_focus().unwrap();
+        let ticket = controller.main_content_lost_focus(false).unwrap();
         assert!(controller.content_got_focus(&identity.content_label, identity.session_epoch));
 
         assert!(!controller.confirm_app_blur(&ticket));
+    }
+
+    #[test]
+    fn expected_window_transfer_blur_does_not_create_app_hide_ticket() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+
+        assert!(controller.main_content_got_focus());
+        assert!(controller.main_content_lost_focus(true).is_none());
+        assert_eq!(controller.live_identity(), Some(identity));
     }
 
     #[test]
