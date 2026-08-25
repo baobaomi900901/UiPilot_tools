@@ -1561,7 +1561,7 @@ describe('shown and search ownership', () => {
       expect(declaredProperty(input!, 'background')).toBe('transparent')
 
       const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
-      await act(async () => close.click())
+      await act(async () => close.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })))
       await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
       await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
       expect(core.getSnapshot()).toMatchObject({ view: 'launcher', query: '' })
