@@ -33,6 +33,7 @@ use crate::{
     hotkey::{DoubleTapModifier, HotkeyKind},
     hotkey_hook::HotkeyHook,
     message_center::MessageCenterService,
+    plugin_panel::PluginPanelController,
     plugin_window::{self, PluginWindowController},
     public_plugins::PublicPluginService,
     result_registry::ResultRegistries,
@@ -990,12 +991,17 @@ impl LifecycleCoordinator {
         };
 
         let saved_position = app.state::<SettingsStore>().window_position();
+        let panel_controller = Arc::clone(app.state::<Arc<PluginPanelController>>().inner());
         let mut place_window = || place_main_window(&window, saved_position);
         let mut always_on_top = || window.set_always_on_top(true).map_err(|_| ());
         let mut show = || window.show().map_err(|_| ());
         let mut focus = || {
             window.set_focus().map_err(|_| ())?;
-            window.as_ref().set_focus().map_err(|_| ())
+            window.as_ref().set_focus().map_err(|_| ())?;
+            panel_controller
+                .main_content_got_focus()
+                .then_some(())
+                .ok_or(())
         };
         let mut registry_on_show = |invocation_id| registry.on_show(invocation_id);
         let mut emit =
@@ -2190,7 +2196,10 @@ mod tests {
         let webview_focus = show_main
             .find("window.as_ref().set_focus()")
             .expect("main webview focus is missing");
-        assert!(window_focus < webview_focus);
+        let focus_ownership = show_main
+            .find(".main_content_got_focus()")
+            .expect("main content focus ownership confirmation is missing");
+        assert!(window_focus < webview_focus && webview_focus < focus_ownership);
     }
 
     #[test]
