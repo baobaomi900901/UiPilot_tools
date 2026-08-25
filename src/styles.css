@@ -109,11 +109,6 @@ label,
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
-.panel-input-row,
-.panel-input-row * {
-  app-region: no-drag;
-}
-
 .panel-input-row:hover {
   border-color: var(--uipilot-ui-ring);
 }

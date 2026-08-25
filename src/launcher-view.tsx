@@ -674,10 +674,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               aria-label={`退出 ${panel.commandLabel} 面板`}
               disabled={panel.closePending}
               icon={<X aria-hidden size={14} strokeWidth={2} />}
-              onMouseDown={(event) => {
-                event.preventDefault()
-                void core.closePanel()
-              }}
+              onMouseDown={(event) => event.preventDefault()}
               onClick={() => void core.closePanel()}
               size="small"
               type="text"

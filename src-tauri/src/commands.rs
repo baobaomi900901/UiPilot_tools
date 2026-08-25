@@ -1730,25 +1730,25 @@ pub(crate) async fn open_plugin_panel(
 
 #[tauri::command]
 pub(crate) async fn submit_plugin_panel(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     public: State<'_, Arc<PublicPluginService>>,
     controller: State<'_, Arc<PluginPanelController>>,
     settings: State<'_, SettingsStore>,
     input: SubmitPluginPanelInput,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
-    require_main_window(&window)?;
+    require_main_label(webview.label())?;
     submit_plugin_panel_impl(app, public, controller, settings, input).await
 }
 
 #[tauri::command]
 pub(crate) fn close_plugin_panel(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     controller: State<'_, Arc<PluginPanelController>>,
     input: ClosePluginPanelInput,
 ) -> Result<(), CommandError> {
-    require_main_window(&window)?;
+    require_main_label(webview.label())?;
     let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
     plugin_panel::teardown(&app, controller.inner().as_ref(), Some(session_epoch));
     Ok(())
@@ -3712,16 +3712,23 @@ where
 
 #[tauri::command]
 pub(crate) fn hide_launcher(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     registries: State<'_, ResultRegistries>,
 ) -> Result<(), CommandError> {
-    require_main_window(&window)?;
-    clear_and_hide(registries.main(), &window)
+    require_main_label(webview.label())?;
+    clear_and_hide_window(registries.main(), &webview.window())
 }
 
 pub(crate) fn clear_and_hide(
     registry: &ResultRegistry,
     window: &WebviewWindow,
+) -> Result<(), CommandError> {
+    clear_and_hide_window(registry, &window.as_ref().window())
+}
+
+fn clear_and_hide_window(
+    registry: &ResultRegistry,
+    window: &tauri::Window,
 ) -> Result<(), CommandError> {
     let settings = window.state::<SettingsStore>();
     let app = window.app_handle().clone();
@@ -4575,27 +4582,42 @@ mod tests {
         }
 
         let source = include_str!("commands.rs").replace("\r\n", "\n");
-        for command in ["open_plugin_panel", "submit_plugin_panel"] {
-            let body = source
-                .split(&format!("pub(crate) async fn {command}("))
-                .nth(1)
-                .and_then(|tail| tail.split("\n#[tauri::command]").next())
-                .unwrap_or_else(|| panic!("missing {command}"));
-            let statements = body.split_once("{\n").unwrap().1;
-            let guard = statements.find("require_main_window(&window)?;").unwrap();
-            let state_access = statements.find("public").unwrap();
-            assert!(
-                guard < state_access,
-                "{command} must guard before state access"
-            );
-        }
+        let open = source
+            .split("pub(crate) async fn open_plugin_panel(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("missing open_plugin_panel");
+        assert!(open.contains("window: WebviewWindow"));
+        let open_statements = open.split_once("{\n").unwrap().1;
+        let open_guard = open_statements
+            .find("require_main_window(&window)?;")
+            .unwrap();
+        assert!(open_guard < open_statements.find("public").unwrap());
+
+        let submit = source
+            .split("pub(crate) async fn submit_plugin_panel(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("missing submit_plugin_panel");
+        assert!(submit.contains("webview: tauri::Webview"));
+        assert!(!submit.contains("window: WebviewWindow"));
+        let submit_statements = submit.split_once("{\n").unwrap().1;
+        let submit_guard = submit_statements
+            .find("require_main_label(webview.label())?;")
+            .unwrap();
+        assert!(submit_guard < submit_statements.find("public").unwrap());
+
         let close = source
             .split("pub(crate) fn close_plugin_panel(")
             .nth(1)
             .and_then(|tail| tail.split("\n#[tauri::command]").next())
             .expect("missing close_plugin_panel");
+        assert!(close.contains("webview: tauri::Webview"));
+        assert!(!close.contains("window: WebviewWindow"));
         let statements = close.split_once("{\n").unwrap().1;
-        let guard = statements.find("require_main_window(&window)?;").unwrap();
+        let guard = statements
+            .find("require_main_label(webview.label())?;")
+            .unwrap();
         let state_access = statements.find("controller.inner()").unwrap();
         assert!(guard < state_access);
         assert!(close.contains("Some(session_epoch)"));
@@ -6078,7 +6100,12 @@ mod tests",
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         let start = source.find("fn hide_launcher(").unwrap();
         let body = &source[start..source[start..].find("\n}\n").unwrap() + start + 3];
-        assert!(body.contains("clear_and_hide(registries.main(), &window)"));
+        assert!(body.contains("webview: tauri::Webview"));
+        assert!(!body.contains("window: WebviewWindow"));
+        assert!(body.contains("require_main_label(webview.label())?;"));
+        let first_statement = body[body.find('{').unwrap() + 1..].trim_start();
+        assert!(first_statement.starts_with("require_main_label(webview.label())?;"));
+        assert!(body.contains("clear_and_hide_window(registries.main(), &webview.window())"));
         assert!(!body.contains("registry.hide_and_clear"));
         assert!(!body.contains("window.hide()"));
     }
@@ -6097,12 +6124,7 @@ mod tests",
     #[test]
     fn maintenance_wrappers_guard_before_their_first_body_statement() {
         let source = include_str!("commands.rs");
-        for command in [
-            "search_apps",
-            "load_settings",
-            "save_settings",
-            "hide_launcher",
-        ] {
+        for command in ["search_apps", "load_settings", "save_settings"] {
             let start = source
                 .find(&format!("fn {command}("))
                 .unwrap_or_else(|| panic!("missing command wrapper: {command}"));

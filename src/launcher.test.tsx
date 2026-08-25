@@ -1559,12 +1559,9 @@ describe('shown and search ownership', () => {
       expect(declaredProperty(tag!, 'border')).toMatch(/^0(?:px)?$/)
       expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
       expect(declaredProperty(input!, 'background')).toBe('transparent')
-      expect(stylesSource).toMatch(
-        /\.panel-input-row,\s*\.panel-input-row \*\s*\{\s*app-region: no-drag;/,
-      )
 
       const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
-      await act(async () => close.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })))
+      await act(async () => close.click())
       await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
       await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
       expect(core.getSnapshot()).toMatchObject({ view: 'launcher', query: '' })
