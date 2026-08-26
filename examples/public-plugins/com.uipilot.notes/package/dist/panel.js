@@ -387,23 +387,24 @@ async function deleteNote(noteId) {
   clearStatusLater('已删除')
 }
 
-function copyEditorContent({ onSuccess } = {}) {
+function copyEditorContent({ onSuccess, preferSync = false } = {}) {
   const note = getSelectedNote()
   if (!note) {
     return false
   }
   const text = editorContent.value
-  try {
-    if (window.navigator.clipboard?.writeText) {
-      void window.navigator.clipboard.writeText(text).then(
-        () => {
-          clearStatusLater('已复制')
-          onSuccess?.()
-        },
-        () => setStatus('复制失败'),
-      )
-      return true
+
+  function finishCopy(success) {
+    if (success) {
+      clearStatusLater('已复制')
+      onSuccess?.()
+    } else {
+      setStatus('复制失败')
     }
+    return success
+  }
+
+  function copyWithExecCommand() {
     const helper = document.createElement('textarea')
     helper.value = text
     helper.setAttribute('readonly', 'true')
@@ -411,14 +412,25 @@ function copyEditorContent({ onSuccess } = {}) {
     helper.style.left = '-9999px'
     document.body.append(helper)
     helper.select()
-    document.execCommand('copy')
+    const copied = document.execCommand('copy')
     helper.remove()
-    clearStatusLater('已复制')
-    onSuccess?.()
-    return true
+    return copied
+  }
+
+  try {
+    if (preferSync) {
+      return finishCopy(copyWithExecCommand())
+    }
+    if (window.navigator.clipboard?.writeText) {
+      void window.navigator.clipboard.writeText(text).then(
+        () => finishCopy(true),
+        () => finishCopy(copyWithExecCommand()),
+      )
+      return true
+    }
+    return finishCopy(copyWithExecCommand())
   } catch {
-    setStatus('复制失败')
-    return false
+    return finishCopy(false)
   }
 }
 
@@ -461,6 +473,7 @@ function tryCopyFromList(event) {
   event.preventDefault()
   event.stopPropagation()
   copyEditorContent({
+    preferSync: true,
     onSuccess: () => {
       void window.uipilotPluginPanel.requestHide()
     },
@@ -728,7 +741,8 @@ noteListViewport.addEventListener('click', async (event) => {
   const selectButton = target.closest('[data-note-id].note-select')
   if (selectButton instanceof HTMLButtonElement) {
     listHasFocus = true
-    await selectNote(selectButton.dataset.noteId)
+    await selectNote(selectButton.dataset.noteId, { focusEditor: false })
+    focusNoteList()
   }
 })
 

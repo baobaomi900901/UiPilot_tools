@@ -70,14 +70,7 @@ async function loadPanel({ notes = sampleNotes } = {}) {
     return 1
   }
   dom.window.cancelAnimationFrame = () => {}
-  Object.defineProperty(dom.window.navigator, 'clipboard', {
-    configurable: true,
-    value: {
-      writeText() {
-        return Promise.resolve()
-      },
-    },
-  })
+  dom.window.document.execCommand = () => true
 
   dom.window.uipilotPluginPanel = {
     onHostKey(handler) {
@@ -123,6 +116,7 @@ async function loadPanel({ notes = sampleNotes } = {}) {
   globalThis.window = dom.window
   globalThis.document = dom.window.document
   globalThis.HTMLElement = dom.window.HTMLElement
+  globalThis.HTMLButtonElement = dom.window.HTMLButtonElement
   globalThis.Element = dom.window.Element
   globalThis.Node = dom.window.Node
 
@@ -159,6 +153,7 @@ async function loadPanel({ notes = sampleNotes } = {}) {
       delete globalThis.window
       delete globalThis.document
       delete globalThis.HTMLElement
+      delete globalThis.HTMLButtonElement
       delete globalThis.Element
       delete globalThis.Node
     },
@@ -577,8 +572,26 @@ test('list Enter copies content then requests hide once', async (t) => {
   })
   panel.document.dispatchEvent(enter)
   await panel.flush()
-  await Promise.resolve()
-  await Promise.resolve()
+  assert.equal(panel.requestHideCalls(), 1)
+})
+
+test('clicking a list item keeps list focus so Enter copies and hides', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  const selectButton = panel.document.querySelector('[data-note-id].note-select')
+  assert.ok(selectButton)
+  selectButton.dispatchEvent(new panel.window.MouseEvent('click', { bubbles: true }))
+  await panel.flush()
+  assert.equal(panel.document.activeElement?.id, 'note-list')
+
+  const enter = new panel.window.KeyboardEvent('keydown', {
+    key: 'Enter',
+    bubbles: true,
+    cancelable: true,
+  })
+  panel.document.dispatchEvent(enter)
   await panel.flush()
   assert.equal(panel.requestHideCalls(), 1)
 })
