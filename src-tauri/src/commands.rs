@@ -566,7 +566,11 @@ pub(crate) enum PluginPanelHostKeyEnqueueResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase")]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum PanelHideAdmitResult {
     Admitted { hide_ticket_id: String },
     Noop,
@@ -4301,6 +4305,24 @@ mod tests {
                 "outcome": "enqueued",
                 "routeSequence": "1"
             })
+        );
+    }
+
+    #[test]
+    fn panel_hide_admit_result_matches_bootstrap_contract() {
+        assert_eq!(
+            serde_json::to_value(super::PanelHideAdmitResult::Admitted {
+                hide_ticket_id: "42".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "outcome": "admitted",
+                "hideTicketId": "42"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(super::PanelHideAdmitResult::Noop).unwrap(),
+            serde_json::json!({ "outcome": "noop" })
         );
     }
 
