@@ -1440,12 +1440,28 @@ impl PluginPanelController {
         ticket: &HostKeyDeliveryTicket,
         ack_deadline: Instant,
     ) -> bool {
-        self.advance_host_key_phase(
-            ticket,
-            HostKeyDeliveryPhase::NativeFocused,
-            HostKeyDeliveryPhase::DeliveredAwaitingAck,
-            Some(ack_deadline),
-        )
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(session) = core.session.as_mut() else {
+            return false;
+        };
+        let Some(in_flight) = session.host_key_route.in_flight.as_mut() else {
+            return false;
+        };
+        if in_flight.ticket != *ticket {
+            return false;
+        }
+        match in_flight.phase {
+            HostKeyDeliveryPhase::NativeFocused => {
+                in_flight.phase = HostKeyDeliveryPhase::DeliveredAwaitingAck;
+                in_flight.ack_deadline = Some(ack_deadline);
+                self.changed.notify_all();
+                true
+            }
+            HostKeyDeliveryPhase::Accomplished => true,
+            _ => false,
+        }
     }
 
     fn advance_host_key_phase(
@@ -1494,7 +1510,10 @@ impl PluginPanelController {
             return false;
         };
         if in_flight.ticket.route_sequence != route_sequence
-            || in_flight.phase != HostKeyDeliveryPhase::DeliveredAwaitingAck
+            || !matches!(
+                in_flight.phase,
+                HostKeyDeliveryPhase::NativeFocused | HostKeyDeliveryPhase::DeliveredAwaitingAck
+            )
         {
             return false;
         }
@@ -3012,6 +3031,28 @@ mod tests {
             .unwrap();
         assert_eq!(reordered.outcome, HostKeyEnqueueOutcome::ProtocolViolation);
         assert!(reordered.terminate_session);
+    }
+
+    #[test]
+    fn host_key_ack_before_eval_returns_is_buffered() {
+        let controller = PluginPanelController::default();
+        let identity = host_key_session(&controller);
+        controller
+            .enqueue_host_key(identity.session_epoch, host_key_input(1))
+            .unwrap();
+        let ticket = controller.claim_next_host_key().unwrap();
+        assert!(controller.mark_host_key_native_focused(&ticket));
+
+        assert!(controller.ack_host_key(
+            &identity.content_label,
+            identity.session_epoch,
+            ticket.route_sequence,
+        ));
+        assert!(controller.mark_host_key_delivered(&ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
+        assert_eq!(
+            controller.finish_host_key_ack(&ticket, Instant::now()),
+            HostKeyAckOutcome::Acknowledged,
+        );
     }
 
     #[test]
