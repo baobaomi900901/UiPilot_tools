@@ -18,8 +18,7 @@ const noteListViewport = document.querySelector('#note-list-viewport')
 const emptyState = document.querySelector('#empty-state')
 const editorPanel = document.querySelector('#editor-panel')
 const editorContent = document.querySelector('#editor-content')
-const copyBtn = document.querySelector('#copy-btn')
-const saveBtn = document.querySelector('#save-btn')
+const copyBtn = document.querySelector('#editor-copy-btn')
 const editorStatus = document.querySelector('#editor-status')
 
 const newDialog = document.querySelector('#new-dialog')
@@ -74,12 +73,17 @@ function filteredNotes() {
   return filterNotes(notes, searchQuery)
 }
 
-function setStatus(message) {
+function setStatus(message, tone = '') {
   editorStatus.textContent = message
+  if (message && tone) {
+    editorStatus.dataset.tone = tone
+  } else {
+    delete editorStatus.dataset.tone
+  }
 }
 
 function clearStatusLater(message, delayMs = 2000) {
-  setStatus(message)
+  setStatus(message, 'success')
   window.setTimeout(() => {
     if (editorStatus.textContent === message) {
       setStatus('')
@@ -237,7 +241,7 @@ async function persistNotes(token) {
     if (isSessionError(error)) {
       return false
     }
-    setStatus('保存失败')
+    setStatus('保存失败', 'error')
     return false
   }
 }
@@ -266,13 +270,13 @@ async function loadNotes(token) {
     notes = []
     selectedId = null
     render()
-    setStatus('读取笔记失败')
+    setStatus('读取笔记失败', 'error')
   }
 }
 
 function openNewDialog() {
   newTitleInput.value = ''
-  newSaveBtn.disabled = true
+  newSaveBtn.setAttribute('aria-disabled', 'true')
   newDialog.showModal()
   newTitleInput.focus()
 }
@@ -280,7 +284,7 @@ function openNewDialog() {
 function closeNewDialog() {
   newDialog.close()
   newTitleInput.value = ''
-  newSaveBtn.disabled = true
+  newSaveBtn.setAttribute('aria-disabled', 'true')
 }
 
 async function createNote(title) {
@@ -358,6 +362,7 @@ async function saveCurrentNote() {
     return false
   }
   clearStatusLater('已保存')
+  focusNoteList()
   return true
 }
 
@@ -389,7 +394,7 @@ async function deleteNote(noteId) {
 
 function hidePanelAfterListCopy() {
   void window.uipilotPluginPanel.requestHide().catch(() => {
-    setStatus('复制成功，但无法隐藏窗口')
+    setStatus('复制成功，但无法隐藏窗口', 'error')
   })
 }
 
@@ -405,7 +410,7 @@ function copyEditorContent({ onSuccess, preferSync = false } = {}) {
       clearStatusLater('已复制')
       onSuccess?.()
     } else {
-      setStatus('复制失败')
+      setStatus('复制失败', 'error')
     }
     return success
   }
@@ -462,6 +467,23 @@ function isListFocused() {
   return active === noteList || noteList.contains(active)
 }
 
+function isListInteractionContext() {
+  if (isDialogOpen() || !getSelectedNote()) {
+    return false
+  }
+  if (isListFocused() || listHasFocus) {
+    return true
+  }
+  const active = document.activeElement
+  if (!(active instanceof HTMLElement)) {
+    return false
+  }
+  if (isFocusInEditor(active)) {
+    return false
+  }
+  return noteList.contains(active)
+}
+
 function isEnterKey(event) {
   return event.key === 'Enter' || event.key === 'NumpadEnter'
 }
@@ -470,14 +492,12 @@ function tryCopyFromList(event) {
   if (!isEnterKey(event)) {
     return false
   }
-  if (!isListFocused() && !listHasFocus) {
-    return false
-  }
-  if (!getSelectedNote()) {
+  if (!isListInteractionContext()) {
     return false
   }
   event.preventDefault()
   event.stopPropagation()
+  focusNoteList()
   if (copyEditorContent({ preferSync: true })) {
     hidePanelAfterListCopy()
   }
@@ -588,6 +608,14 @@ function handleShortcut(event) {
   }
 
   const key = event.key.toLowerCase()
+  if (key === 's') {
+    if (isDialogOpen() || !isFocusInEditor(event.target)) {
+      return
+    }
+    event.preventDefault()
+    void saveCurrentNote()
+    return
+  }
   if (key === 'n') {
     if (isDialogOpen()) {
       return
@@ -632,7 +660,7 @@ async function finishEscapeUnsaved(decision) {
   }
   escapeHideInFlight = false
   void window.uipilotPluginPanel.requestHide().catch(() => {
-    setStatus('无法隐藏窗口')
+    setStatus('无法隐藏窗口', 'error')
   })
 }
 
@@ -702,6 +730,10 @@ noteList.addEventListener('focus', () => {
   renderList()
 })
 
+noteList.addEventListener('keydown', (event) => {
+  tryCopyFromList(event)
+}, true)
+
 noteList.addEventListener('blur', () => {
   listHasFocus = false
   renderList()
@@ -716,7 +748,7 @@ newBtn.addEventListener('click', () => {
 })
 
 newTitleInput.addEventListener('input', () => {
-  newSaveBtn.disabled = newTitleInput.value.trim().length === 0
+  newSaveBtn.setAttribute('aria-disabled', String(newTitleInput.value.trim().length === 0))
 })
 
 newCancelBtn.addEventListener('click', () => {
@@ -783,10 +815,6 @@ unsavedForm.addEventListener('submit', (event) => {
   unsavedDialog.close()
   unsavedResolver?.('save')
   unsavedResolver = null
-})
-
-saveBtn.addEventListener('click', async () => {
-  await saveCurrentNote()
 })
 
 copyBtn.addEventListener('click', () => {

@@ -35,7 +35,7 @@ button {
     transform var(--note-transition);
 }
 
-button:not(:disabled):active {
+button:not(:disabled):not([aria-disabled='true']):active {
   transform: translateY(1px);
 }
 
@@ -59,25 +59,36 @@ button:not(:disabled):active {
 .toolbar {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
   padding: 12px;
   flex: 0 0 auto;
   border-bottom: 1px solid var(--uipilot-color-border);
 }
 
-.new-btn {
-  flex: 0 0 auto;
+.toolbar-title {
+  margin: 0;
+  color: var(--uipilot-color-text);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.4;
 }
 
-.toolbar-hint {
-  margin: 0;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--uipilot-color-text-muted);
-  font-size: 12px;
-  line-height: 1.4;
+.btn.new-btn {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: #fff;
+  line-height: 0;
+}
+
+.new-btn svg {
+  display: block;
+  width: 16px;
+  height: 16px;
 }
 
 .text-input,
@@ -113,12 +124,13 @@ button:not(:disabled):active {
   white-space: nowrap;
 }
 
-.btn:disabled {
+.btn:disabled,
+.btn[aria-disabled='true'] {
   opacity: 0.42;
   cursor: not-allowed;
 }
 
-.btn:not(:disabled):hover {
+.btn:not(:disabled):not([aria-disabled='true']):hover {
   border-color: color-mix(in srgb, var(--uipilot-color-accent) 45%, var(--uipilot-color-border));
 }
 
@@ -128,7 +140,7 @@ button:not(:disabled):active {
   border-color: var(--uipilot-color-accent);
 }
 
-.btn-primary:not(:disabled):hover {
+.btn-primary:not(:disabled):not([aria-disabled='true']):hover {
   filter: brightness(1.06);
   border-color: var(--uipilot-color-accent);
 }
@@ -137,7 +149,7 @@ button:not(:disabled):active {
   background: transparent;
 }
 
-.btn-ghost:not(:disabled):hover {
+.btn-ghost:not(:disabled):not([aria-disabled='true']):hover {
   background: color-mix(in srgb, var(--uipilot-color-text) 6%, transparent);
 }
 
@@ -147,7 +159,7 @@ button:not(:disabled):active {
   border-color: var(--uipilot-color-danger);
 }
 
-.btn-danger:not(:disabled):hover {
+.btn-danger:not(:disabled):not([aria-disabled='true']):hover {
   filter: brightness(1.06);
   border-color: var(--uipilot-color-danger);
 }
@@ -167,10 +179,14 @@ button:not(:disabled):active {
 
 html[data-theme='light'] {
   --note-scrollbar-thumb: rgba(115, 115, 115, 0.42);
+  --note-success: #137333;
+  --note-success-surface: #e6f4ea;
 }
 
 html[data-theme='dark'] {
   --note-scrollbar-thumb: rgba(163, 163, 163, 0.48);
+  --note-success: #81c995;
+  --note-success-surface: #16351f;
 }
 
 .note-list::-webkit-scrollbar {
@@ -380,15 +396,17 @@ html[data-theme='dark'] {
 }
 
 .editor-panel {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   padding: 18px 20px 16px;
-  gap: 12px;
+  gap: 0;
 }
 
 .editor-surface {
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
   padding: 1px;
@@ -401,7 +419,7 @@ html[data-theme='dark'] {
   display: block;
   height: 100%;
   min-height: 0;
-  padding: 14px 16px;
+  padding: 14px 48px 48px 16px;
   border: none;
   border-radius: calc(var(--note-radius) - 1px);
   resize: none;
@@ -418,31 +436,82 @@ html[data-theme='dark'] {
   box-shadow: none;
 }
 
-.editor-actions {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding-top: 2px;
+.editor-copy-button {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--uipilot-color-text-muted);
+  background: color-mix(in srgb, var(--uipilot-color-surface) 92%, transparent);
+  border: 1px solid var(--uipilot-color-border);
+  border-radius: 6px;
+  cursor: pointer;
 }
 
-.action-group {
-  display: flex;
-  gap: 8px;
+.editor-copy-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.editor-copy-button:hover {
+  color: var(--uipilot-color-accent);
+  border-color: color-mix(in srgb, var(--uipilot-color-accent) 50%, var(--uipilot-color-border));
+  background: color-mix(in srgb, var(--uipilot-color-accent) 8%, var(--uipilot-color-surface));
+}
+
+.editor-copy-button:focus-visible {
+  outline: 2px solid var(--uipilot-color-accent);
+  outline-offset: 2px;
 }
 
 .editor-status {
-  margin-left: auto;
-  min-height: 18px;
-  color: var(--uipilot-color-text-muted);
+  position: absolute;
+  top: 28px;
+  left: 50%;
+  z-index: 2;
+  max-width: calc(100% - 64px);
+  padding: 0;
+  overflow: hidden;
+  color: var(--uipilot-color-text);
   font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  transform: translate(-50%, -4px);
+  transition:
+    opacity var(--note-transition),
+    transform var(--note-transition),
+    visibility var(--note-transition);
 }
 
 .editor-status:not(:empty) {
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--uipilot-color-accent) 10%, transparent);
-  color: color-mix(in srgb, var(--uipilot-color-accent) 85%, var(--uipilot-color-text));
+  padding: 6px 10px;
+  visibility: visible;
+  opacity: 1;
+  transform: translate(-50%, 0);
+  border: 1px solid var(--uipilot-color-border);
+  border-radius: 6px;
+  background: var(--uipilot-color-surface);
+  box-shadow: 0 8px 20px color-mix(in srgb, #000 20%, transparent);
+}
+
+.editor-status[data-tone='success'] {
+  color: var(--note-success);
+  border-color: color-mix(in srgb, var(--note-success) 35%, var(--uipilot-color-border));
+  background: var(--note-success-surface);
+}
+
+.editor-status[data-tone='error'] {
+  color: var(--uipilot-color-danger);
+  border-color: color-mix(in srgb, var(--uipilot-color-danger) 35%, var(--uipilot-color-border));
+  background: color-mix(in srgb, var(--uipilot-color-danger) 10%, var(--uipilot-color-surface));
 }
 
 .dialog {
@@ -473,18 +542,11 @@ html[data-theme='dark'] {
   font-weight: 650;
 }
 
-.dialog-hint,
 .dialog-message {
   margin: 0;
   color: var(--uipilot-color-text-muted);
   font-size: 13px;
   line-height: 1.55;
-}
-
-.field-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--uipilot-color-text-muted);
 }
 
 .dialog-actions {

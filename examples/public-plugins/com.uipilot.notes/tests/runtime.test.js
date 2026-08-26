@@ -175,7 +175,7 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel notes contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.notes')
-  assert.equal(manifest.version, '1.1.1')
+  assert.equal(manifest.version, '1.1.10')
   assert.equal(manifest.minimumHostVersion, '0.3.1')
   assert.equal(manifest.command.defaultName, 'notes')
   assert.equal(manifest.command.activationMode, 'submit')
@@ -298,6 +298,35 @@ test('panel has no in-panel search box and uses host input for filtering', async
   assert.match(source, /update\.theme/)
 })
 
+test('sidebar toolbar renders a directory title and icon-only new action', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  const toolbar = panel.document.querySelector('.toolbar')
+  assert.equal(toolbar.textContent.includes('主输入框搜索'), false)
+  assert.equal(toolbar.querySelector('.toolbar-hint'), null)
+  assert.equal(toolbar.querySelector('.toolbar-title')?.textContent, '目录')
+
+  const newButton = toolbar.querySelector('#new-btn')
+  assert.equal(newButton.getAttribute('aria-label'), '新建笔记')
+  assert.equal(newButton.textContent.trim(), '')
+  assert.ok(newButton.querySelector('svg[aria-hidden="true"]'))
+
+  const css = await readFile(new URL('../package/dist/panel.css', import.meta.url), 'utf8')
+  const style = panel.document.createElement('style')
+  style.textContent = css
+  panel.document.head.append(style)
+  const newButtonStyle = panel.window.getComputedStyle(newButton)
+  const newButtonIconStyle = panel.window.getComputedStyle(newButton.querySelector('svg'))
+
+  assert.match(css, /\.toolbar\s*\{[\s\S]*justify-content:\s*space-between;/)
+  assert.equal(newButtonStyle.color, 'rgb(255, 255, 255)')
+  assert.equal(newButtonStyle.padding, '0px')
+  assert.equal(newButtonStyle.lineHeight, '0')
+  assert.equal(newButtonIconStyle.display, 'block')
+})
+
 test('panel content uses only the panel bridge APIs', async () => {
   const source = await readFile(new URL('../package/dist/panel.js', import.meta.url), 'utf8')
   for (const required of [
@@ -396,6 +425,39 @@ test('registers exactly one onHostKey handler and routes host keys', async (t) =
   await panel.flush()
   assert.equal(panel.selectedId(), '1')
   assert.equal(panel.dialogOpen('#new-dialog'), true)
+})
+
+test('new-note dialog is concise and tabs from input to save before cancel', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  panel.hostKey({
+    key: 'n',
+    ctrlKey: true,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  await panel.flush()
+
+  const dialog = panel.document.querySelector('#new-dialog')
+  const input = panel.document.querySelector('#new-title-input')
+  assert.equal(panel.document.activeElement, input)
+  assert.equal(dialog.textContent.includes('为这条笔记起一个目录名'), false)
+  assert.equal(dialog.querySelector('label[for="new-title-input"]'), null)
+  assert.equal(input.getAttribute('aria-label'), '笔记名称')
+
+  const actions = [...dialog.querySelectorAll('.dialog-actions button')]
+  assert.deepEqual(actions.map((button) => button.id), ['new-save-btn', 'new-cancel-btn'])
+  assert.equal(actions[0].disabled, false)
+  assert.equal(actions[0].getAttribute('aria-disabled'), 'true')
+
+  input.value = 'Meeting notes'
+  input.dispatchEvent(new panel.window.Event('input', { bubbles: true }))
+  assert.equal(actions[0].getAttribute('aria-disabled'), 'false')
 })
 
 test('host key handler settles before unsaved dialog completes', async (t) => {
@@ -596,4 +658,85 @@ test('clicking a list item keeps list focus so Enter copies and hides', async (t
   panel.document.dispatchEvent(enter)
   await panel.flush()
   assert.equal(panel.requestHideCalls(), 1)
+})
+
+test('editor removes text actions and exposes a bottom-right copy icon', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  assert.equal(panel.document.querySelector('#copy-btn'), null)
+  assert.equal(panel.document.querySelector('#save-btn'), null)
+  const copyButton = panel.document.querySelector('#editor-copy-btn')
+  assert.ok(copyButton)
+  assert.equal(copyButton.getAttribute('aria-label'), '复制正文')
+  assert.ok(copyButton.querySelector('svg[aria-hidden="true"]'))
+  const status = panel.document.querySelector('#editor-status')
+  assert.equal(status.closest('footer'), null)
+  assert.equal(status.getAttribute('role'), 'status')
+  assert.equal(status.getAttribute('aria-atomic'), 'true')
+  assert.equal(panel.document.querySelector('.editor-actions'), null)
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  await panel.flush()
+  copyButton.click()
+  await panel.flush()
+  assert.equal(status.textContent, '已复制')
+  assert.equal(status.dataset.tone, 'success')
+  assert.equal(panel.requestHideCalls(), 0)
+
+  panel.document.execCommand = () => false
+  copyButton.click()
+  await panel.flush()
+  assert.equal(status.textContent, '复制失败')
+  assert.equal(status.dataset.tone, 'error')
+
+  const css = await readFile(new URL('../package/dist/panel.css', import.meta.url), 'utf8')
+  assert.match(css, /\.editor-copy-button\s*\{[\s\S]*position:\s*absolute;[\s\S]*right:[^;]+;[\s\S]*bottom:[^;]+;/)
+  assert.match(css, /\.editor-status\s*\{[\s\S]*position:\s*absolute;[\s\S]*top:[^;]+;[\s\S]*left:\s*50%;[\s\S]*pointer-events:\s*none;/)
+  assert.match(css, /\.editor-status\[data-tone='success'\]/)
+  assert.match(css, /\.editor-status\[data-tone='error'\]/)
+  assert.match(css, /\.editor-panel\s*\{[\s\S]*gap:\s*0;/)
+})
+
+test('Ctrl+S in the editor saves and restores the selected list item context', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  const selectButton = panel.document.querySelector('[data-note-id="2"].note-select')
+  assert.ok(selectButton)
+  selectButton.dispatchEvent(new panel.window.MouseEvent('click', { bubbles: true }))
+  await panel.flush()
+
+  const noteList = panel.document.querySelector('#note-list')
+  const right = new panel.window.KeyboardEvent('keydown', {
+    key: 'ArrowRight',
+    bubbles: true,
+    cancelable: true,
+  })
+  noteList.dispatchEvent(right)
+  assert.equal(panel.document.activeElement?.id, 'editor-content')
+
+  panel.editor().value = 'saved from shortcut'
+  const save = new panel.window.KeyboardEvent('keydown', {
+    key: 's',
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  })
+  panel.editor().dispatchEvent(save)
+  assert.equal(save.defaultPrevented, true)
+  await panel.flush()
+
+  assert.equal(panel.document.activeElement?.id, 'note-list')
+  assert.equal(noteList.getAttribute('aria-activedescendant'), 'note-option-2')
 })
