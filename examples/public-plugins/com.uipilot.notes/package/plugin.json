@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.notes",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.3.0",
+  "name": "Notes",
+  "description": "在启动器面板中记录、搜索和管理笔记。",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "notes",
+    "summary": "打开笔记面板",
+    "activationMode": "submit",
+    "outputMode": "panel",
+    "inputRequired": false,
+    "inputPlaceholder": "输入关键词后按 Enter 搜索"
+  },
+  "runtime": {
+    "entry": "dist/runtime.js"
+  },
+  "panel": {
+    "entry": "dist/panel.html"
+  },
+  "permissions": ["ui.panel"],
+  "settings": []
+}
