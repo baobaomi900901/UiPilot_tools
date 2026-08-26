@@ -432,6 +432,11 @@ pub fn run() {
             commands::plugin_window_timer_reset,
             commands::plugin_panel_content_ready,
             commands::plugin_panel_content_ack,
+            commands::plugin_panel_host_key_enqueue,
+            commands::plugin_panel_host_key_ack,
+            commands::plugin_panel_request_hide_admit,
+            commands::plugin_panel_request_hide_admit_observed,
+            commands::plugin_panel_request_hide_commit,
             commands::plugin_panel_focus_host_input,
             commands::plugin_panel_focus_host_input_ack,
             commands::plugin_panel_storage_get,
@@ -678,7 +683,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 62);
+        assert_eq!(production.matches("commands::").count(), 67);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -711,6 +716,11 @@ mod tests {
             "plugin_window_timer_reset",
             "plugin_panel_content_ready",
             "plugin_panel_content_ack",
+            "plugin_panel_host_key_enqueue",
+            "plugin_panel_host_key_ack",
+            "plugin_panel_request_hide_admit",
+            "plugin_panel_request_hide_admit_observed",
+            "plugin_panel_request_hide_commit",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -875,6 +885,10 @@ mod tests {
         for command in [
             "plugin_panel_content_ready",
             "plugin_panel_content_ack",
+            "plugin_panel_host_key_ack",
+            "plugin_panel_request_hide_admit",
+            "plugin_panel_request_hide_admit_observed",
+            "plugin_panel_request_hide_commit",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -889,6 +903,12 @@ mod tests {
             assert!(!content.contains(&permission));
             assert!(!find.contains(&permission));
         }
+        let host_key_enqueue = "allow-plugin-panel-host-key-enqueue";
+        assert!(main.contains(host_key_enqueue));
+        assert!(!panel.contains(host_key_enqueue));
+        let host_key_ack = "allow-plugin-panel-host-key-ack";
+        assert!(panel.contains(host_key_ack));
+        assert!(!main.contains(host_key_ack));
         let focus_ack = ["allow", "-plugin-panel-focus-host-input-ack"].concat();
         assert!(main.contains(&focus_ack));
         assert!(!runtime.contains(&focus_ack));

@@ -6,6 +6,10 @@
   "permissions": [
     "allow-plugin-panel-content-ready",
     "allow-plugin-panel-content-ack",
+    "allow-plugin-panel-host-key-ack",
+    "allow-plugin-panel-request-hide-admit",
+    "allow-plugin-panel-request-hide-admit-observed",
+    "allow-plugin-panel-request-hide-commit",
     "allow-plugin-panel-focus-host-input",
     "allow-plugin-panel-storage-get",
     "allow-plugin-panel-storage-set",

@@ -19,6 +19,7 @@
     "allow-open-plugin-panel",
     "allow-submit-plugin-panel",
     "allow-close-plugin-panel",
+    "allow-plugin-panel-host-key-enqueue",
     "allow-plugin-panel-focus-host-input-ack",
     "allow-commit-plugin-window-transfer",
     "allow-get-message-summary",

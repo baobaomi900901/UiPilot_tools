@@ -1,4 +1,5 @@
 use std::{
+    ffi::c_void,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
@@ -14,10 +15,12 @@ use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    System::Threading::GetCurrentProcessId,
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GetForegroundWindow, WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
+            GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
+            SetForegroundWindow, WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
             WM_QUERYENDSESSION,
         },
     },
@@ -82,6 +85,27 @@ struct LauncherShown {
     invocation_id: String,
     target: ShowTarget,
     notice: Option<LifecycleNotice>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForegroundCapture {
+    show_generation: u64,
+    hwnd: isize,
+    pid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundObservation {
+    UiPilot,
+    Shell,
+    External { hwnd: isize, pid: u32 },
+    Missing,
+}
+
+#[derive(Default, Debug)]
+struct ForegroundCaptureState {
+    show_generation: u64,
+    capture: Option<ForegroundCapture>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -425,6 +449,7 @@ pub(crate) struct LifecycleCoordinator {
     pending_notice: Mutex<Option<LifecycleNotice>>,
     runtime_settings: Mutex<RuntimeSettings>,
     hotkey_hook: Mutex<Option<HotkeyHook>>,
+    foreground_capture: Mutex<ForegroundCaptureState>,
 }
 
 impl Default for LifecycleCoordinator {
@@ -441,6 +466,7 @@ impl Default for LifecycleCoordinator {
             pending_notice: Mutex::new(None),
             runtime_settings: Mutex::new(RuntimeSettings::default()),
             hotkey_hook: Mutex::new(None),
+            foreground_capture: Mutex::new(ForegroundCaptureState::default()),
         }
     }
 }
@@ -590,7 +616,113 @@ impl Drop for CriticalReservation {
     }
 }
 
+fn observe_foreground_window() -> ForegroundObservation {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return ForegroundObservation::Missing;
+    }
+    let mut pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) } == 0 || pid == 0 {
+        return ForegroundObservation::Missing;
+    }
+    if pid == unsafe { GetCurrentProcessId() } {
+        return ForegroundObservation::UiPilot;
+    }
+    let mut class_name = [0_u16; 128];
+    let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    let class_name = usize::try_from(length)
+        .ok()
+        .and_then(|length| String::from_utf16(&class_name[..length]).ok())
+        .unwrap_or_default();
+    if matches!(
+        class_name.as_str(),
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW"
+    ) {
+        ForegroundObservation::Shell
+    } else {
+        ForegroundObservation::External {
+            hwnd: hwnd.0 as isize,
+            pid,
+        }
+    }
+}
+
+fn restore_capture_matches(
+    capture: ForegroundCapture,
+    is_window: bool,
+    observed_pid: u32,
+    current_pid: u32,
+) -> bool {
+    is_window && observed_pid == capture.pid && observed_pid != current_pid
+}
+
+fn restore_foreground_capture(capture: ForegroundCapture) -> bool {
+    let hwnd = HWND(capture.hwnd as *mut c_void);
+    let is_window = unsafe { IsWindow(Some(hwnd)).as_bool() };
+    let mut observed_pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut observed_pid)) } == 0 {
+        return false;
+    }
+    if !restore_capture_matches(capture, is_window, observed_pid, unsafe {
+        GetCurrentProcessId()
+    }) {
+        return false;
+    }
+    unsafe { SetForegroundWindow(hwnd).as_bool() }
+}
+
 impl LifecycleCoordinator {
+    fn capture_foreground_for_show_with(
+        &self,
+        window_was_visible: bool,
+        observation: ForegroundObservation,
+    ) {
+        let Ok(mut state) = self.foreground_capture.lock() else {
+            return;
+        };
+        let Some(show_generation) = state.show_generation.checked_add(1) else {
+            state.capture = None;
+            return;
+        };
+        state.show_generation = show_generation;
+        match observation {
+            ForegroundObservation::External { hwnd, pid } => {
+                state.capture = Some(ForegroundCapture {
+                    show_generation,
+                    hwnd,
+                    pid,
+                });
+            }
+            ForegroundObservation::UiPilot if window_was_visible => {}
+            ForegroundObservation::UiPilot
+            | ForegroundObservation::Shell
+            | ForegroundObservation::Missing => state.capture = None,
+        }
+    }
+
+    fn capture_foreground_for_show(&self, window_was_visible: bool) {
+        self.capture_foreground_for_show_with(window_was_visible, observe_foreground_window());
+    }
+
+    pub(crate) fn restore_foreground_after_explicit_return(&self) {
+        let capture = self
+            .foreground_capture
+            .lock()
+            .ok()
+            .and_then(|mut state| state.capture.take());
+        if let Some(capture) = capture {
+            let _ = restore_foreground_capture(capture);
+        }
+    }
+
+    #[cfg(test)]
+    fn foreground_capture_for_test(&self) -> Option<ForegroundCapture> {
+        self.foreground_capture
+            .lock()
+            .ok()
+            .and_then(|state| state.capture)
+    }
+
     pub(crate) fn suppress_transient_focus_loss(
         self: &Arc<Self>,
     ) -> Result<TransientFocusSuppression, ReservationError> {
@@ -990,6 +1122,7 @@ impl LifecycleCoordinator {
             return Ok(ShowOutcome::Ignored);
         };
 
+        self.capture_foreground_for_show(window.is_visible().unwrap_or(false));
         let saved_position = app.state::<SettingsStore>().window_position();
         let panel_controller = Arc::clone(app.state::<Arc<PluginPanelController>>().inner());
         let mut place_window = || place_main_window(&window, saved_position);
@@ -2776,6 +2909,49 @@ mod tests {
 
     fn coordinator_for_test() -> Arc<LifecycleCoordinator> {
         Arc::new(LifecycleCoordinator::default())
+    }
+
+    #[test]
+    fn foreground_capture_policy_replaces_clears_and_keeps_only_visible_uipilot_repeat() {
+        let coordinator = coordinator_for_test();
+        coordinator.capture_foreground_for_show_with(
+            false,
+            ForegroundObservation::External { hwnd: 11, pid: 101 },
+        );
+        let captured = coordinator.foreground_capture_for_test().unwrap();
+        assert_eq!((captured.hwnd, captured.pid), (11, 101));
+
+        coordinator.capture_foreground_for_show_with(true, ForegroundObservation::UiPilot);
+        assert_eq!(coordinator.foreground_capture_for_test(), Some(captured));
+
+        coordinator.capture_foreground_for_show_with(true, ForegroundObservation::Shell);
+        assert_eq!(coordinator.foreground_capture_for_test(), None);
+
+        coordinator.capture_foreground_for_show_with(
+            true,
+            ForegroundObservation::External { hwnd: 22, pid: 202 },
+        );
+        assert_eq!(
+            coordinator
+                .foreground_capture_for_test()
+                .map(|value| (value.hwnd, value.pid)),
+            Some((22, 202)),
+        );
+        coordinator.capture_foreground_for_show_with(false, ForegroundObservation::UiPilot);
+        assert_eq!(coordinator.foreground_capture_for_test(), None);
+    }
+
+    #[test]
+    fn foreground_restore_requires_live_matching_hwnd_pid_and_non_uipilot_owner() {
+        let capture = ForegroundCapture {
+            show_generation: 1,
+            hwnd: 44,
+            pid: 404,
+        };
+        assert!(restore_capture_matches(capture, true, 404, 505));
+        assert!(!restore_capture_matches(capture, false, 404, 505));
+        assert!(!restore_capture_matches(capture, true, 405, 505));
+        assert!(!restore_capture_matches(capture, true, 404, 404));
     }
 
     fn exit_snapshot(coordinator: &LifecycleCoordinator) -> (ExitState, usize, CleanAttempt) {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-panel-request-hide-admit"
+description = "Enables the plugin_panel_request_hide_admit command without any pre-configured scope."
+commands.allow = ["plugin_panel_request_hide_admit"]
+
+[[permission]]
+identifier = "deny-plugin-panel-request-hide-admit"
+description = "Denies the plugin_panel_request_hide_admit command without any pre-configured scope."
+commands.deny = ["plugin_panel_request_hide_admit"]

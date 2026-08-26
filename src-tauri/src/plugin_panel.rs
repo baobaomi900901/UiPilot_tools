@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{mpsc, Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{
     webview::{NewWindowResponse, WebviewBuilder},
@@ -24,6 +24,8 @@ const CONTENT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const HOST_INPUT_FOCUS_TIMEOUT: Duration = Duration::from_secs(2);
 const INTERNAL_BLUR_GRACE: Duration = Duration::from_millis(250);
 const CONTENT_BLUR_RECHECK_DELAY: Duration = Duration::from_millis(50);
+const HOST_KEY_QUEUE_CAPACITY: usize = 8;
+pub(crate) const HOST_KEY_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 // Mirrors the fixed launcher slot: 12px outer padding, 44px input, 8px gap,
 // and a 24px status row above the 12px bottom padding.
 const PANEL_HORIZONTAL_INSET: f64 = 12.0;
@@ -146,6 +148,151 @@ pub(crate) enum QueueDispatchOutcome {
     Ready,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum PluginPanelHostKey {
+    ArrowDown,
+    ArrowUp,
+    #[serde(rename = "n")]
+    N,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HostKeyEnqueueInput {
+    pub(crate) client_sequence: u64,
+    pub(crate) declaration: PanelHostKeyDeclaration,
+    pub(crate) key: PluginPanelHostKey,
+    pub(crate) ctrl_key: bool,
+    pub(crate) meta_key: bool,
+    pub(crate) shift_key: bool,
+    pub(crate) alt_key: bool,
+}
+
+impl HostKeyEnqueueInput {
+    pub(crate) fn valid_chord(self) -> bool {
+        match self.declaration {
+            PanelHostKeyDeclaration::ArrowDown => {
+                self.key == PluginPanelHostKey::ArrowDown
+                    && !self.ctrl_key
+                    && !self.meta_key
+                    && !self.shift_key
+                    && !self.alt_key
+            }
+            PanelHostKeyDeclaration::ArrowUp => {
+                self.key == PluginPanelHostKey::ArrowUp
+                    && !self.ctrl_key
+                    && !self.meta_key
+                    && !self.shift_key
+                    && !self.alt_key
+            }
+            PanelHostKeyDeclaration::PrimaryN => {
+                self.key == PluginPanelHostKey::N
+                    && !self.shift_key
+                    && !self.alt_key
+                    && if cfg!(target_os = "macos") {
+                        self.meta_key && !self.ctrl_key
+                    } else {
+                        self.ctrl_key && !self.meta_key
+                    }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostKeyEnqueueOutcome {
+    Enqueued { route_sequence: u64 },
+    DroppedQueueFull,
+    Noop,
+    ProtocolViolation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostKeyEnqueueDecision {
+    pub(crate) outcome: HostKeyEnqueueOutcome,
+    pub(crate) start_pump: bool,
+    pub(crate) terminate_session: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostKeyDeliveryPhase {
+    Prepared,
+    NativeFocused,
+    DeliveredAwaitingAck,
+    Accomplished,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostKeyDeliveryTicket {
+    pub(crate) session_epoch: u64,
+    pub(crate) content_label: String,
+    pub(crate) route_sequence: u64,
+    pub(crate) declaration: PanelHostKeyDeclaration,
+    pub(crate) key: PluginPanelHostKey,
+    pub(crate) ctrl_key: bool,
+    pub(crate) meta_key: bool,
+    pub(crate) shift_key: bool,
+    pub(crate) alt_key: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HostKeyInFlight {
+    ticket: HostKeyDeliveryTicket,
+    phase: HostKeyDeliveryPhase,
+    ack_deadline: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct HostKeyRouteState {
+    next_route_sequence: u64,
+    next_expected_client_sequence: u64,
+    receiver_armed: bool,
+    queue: VecDeque<HostKeyDeliveryTicket>,
+    in_flight: Option<HostKeyInFlight>,
+    pump_running: bool,
+}
+
+impl Default for HostKeyRouteState {
+    fn default() -> Self {
+        Self {
+            next_route_sequence: 1,
+            next_expected_client_sequence: 1,
+            receiver_armed: false,
+            queue: VecDeque::new(),
+            in_flight: None,
+            pump_running: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostKeyAckOutcome {
+    Pending,
+    Acknowledged,
+    TimedOut,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PanelHideTicketIdentity {
+    pub(crate) session_epoch: u64,
+    pub(crate) hide_ticket_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PanelHideTicketPhase {
+    Admitted,
+    Observed,
+    Committed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PanelHideTicket {
+    identity: PanelHideTicketIdentity,
+    phase: PanelHideTicketPhase,
+}
+
 struct LiveSession {
     identity: PanelSessionIdentity,
     phase: PanelPhase,
@@ -153,13 +300,16 @@ struct LiveSession {
     current_submission_token: String,
     pending: Option<PendingDispatch>,
     content_focused: bool,
+    host_key_route: HostKeyRouteState,
 }
 
 #[derive(Default)]
 struct ControllerCore {
     next_epoch: u64,
     next_focus_request_id: u64,
+    next_hide_ticket_id: u64,
     session: Option<LiveSession>,
+    hide_ticket: Option<PanelHideTicket>,
     host_input_focus: Option<HostInputFocusTicket>,
     host_input_focus_settlements: BTreeMap<u64, HostInputFocusOutcome>,
     native_host_input_focus_claims: BTreeSet<u64>,
@@ -190,9 +340,12 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 (() => {
   'use strict';
   let handler = null;
+  let hostKeyHandler = null;
+  let hostKeyRegistrationViolation = false;
   let invoke = null;
   let readySent = false;
   let storageSession = null;
+  const hostKeys = deepFreeze(__HOST_KEYS__);
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
     seen.add(value);
@@ -218,9 +371,36 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     return session;
   };
   const sendReady = async () => {
-    if (!invoke || !handler || readySent) return;
+    if (!invoke || !handler || readySent || (hostKeys.length > 0 && !hostKeyHandler)) return;
     readySent = true;
-    await invoke('plugin_panel_content_ready', { sessionEpoch: '__SESSION_EPOCH__' });
+    await invoke('plugin_panel_content_ready', {
+      sessionEpoch: '__SESSION_EPOCH__',
+      hostKeyReceiverRegistered: hostKeyHandler !== null,
+      hostKeyRegistrationViolation,
+    });
+  };
+  const requestPanelHide = () => {
+    if (!invoke) return Promise.reject(new Error('ExpiredWindowSessionError'));
+    return invoke('plugin_panel_request_hide_admit', { sessionEpoch: '__SESSION_EPOCH__' }).then((result) => {
+      if (result?.outcome === 'noop') return;
+      if (
+        result?.outcome !== 'admitted' || typeof result.hideTicketId !== 'string' ||
+        !/^[1-9][0-9]*$/.test(result.hideTicketId)
+      ) throw new Error('windowFailed');
+      return new Promise((resolve) => {
+        resolve();
+        void invoke('plugin_panel_request_hide_admit_observed', {
+          sessionEpoch: '__SESSION_EPOCH__',
+          hideTicketId: result.hideTicketId,
+        }).catch(() => undefined);
+        setTimeout(() => {
+          void invoke('plugin_panel_request_hide_commit', {
+            sessionEpoch: '__SESSION_EPOCH__',
+            hideTicketId: result.hideTicketId,
+          }).catch(() => undefined);
+        }, 0);
+      });
+    });
   };
   const api = deepFreeze({
     onUpdate(next) {
@@ -229,10 +409,26 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       void sendReady();
       return () => { if (handler === next) handler = null; };
     },
+    onHostKey(next) {
+      if (hostKeyHandler || typeof next !== 'function') throw new TypeError('one onHostKey handler required');
+      if (hostKeys.length === 0) {
+        hostKeyRegistrationViolation = true;
+        void sendReady();
+        throw new TypeError('onHostKey requires panel.hostKeys');
+      }
+      hostKeyHandler = next;
+      void sendReady();
+      return () => {
+        if (hostKeyHandler !== next) return;
+        hostKeyHandler = null;
+        void api.requestHide();
+      };
+    },
     async focusHostInput() {
       if (!invoke) throw new Error('ExpiredWindowSessionError');
       await invoke('plugin_panel_focus_host_input', { sessionEpoch: '__SESSION_EPOCH__' });
     },
+    requestHide() { return requestPanelHide(); },
     get storage() { return storageSession ? storageSession.storage : expiredStorage; },
   });
   Object.defineProperty(window, 'uipilotPluginPanel', { value: api, configurable: false });
@@ -265,6 +461,30 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       });
     },
   });
+  Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_HOST_KEY__', {
+    configurable: false,
+    value: async (event) => {
+      if (!hostKeyHandler || !invoke) throw new Error('Host-key receiver unavailable');
+      try {
+        await hostKeyHandler(deepFreeze(event));
+      } finally {
+        await invoke('plugin_panel_host_key_ack', {
+          sessionEpoch: event.sessionEpoch,
+          routeSequence: event.routeSequence,
+        });
+      }
+    },
+  });
+  document.addEventListener('keydown', (event) => {
+    const isComposing = event.isComposing;
+    const hadOpenDialog = document.querySelector('dialog[open]') !== null;
+    const keyIsEscape = event.key === 'Escape';
+    queueMicrotask(() => {
+      if (keyIsEscape && !isComposing && !hadOpenDialog && !event.defaultPrevented) {
+        void requestPanelHide();
+      }
+    });
+  }, { capture: true });
   const wait = () => {
     const internals = window.__TAURI_INTERNALS__;
     if (!internals) return setTimeout(wait, 0);
@@ -276,8 +496,13 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 })();
 "#;
 
-fn panel_bootstrap(session_epoch: u64) -> String {
-    PUBLIC_PANEL_BOOTSTRAP_TEMPLATE.replace("__SESSION_EPOCH__", &session_epoch.to_string())
+fn panel_bootstrap(session_epoch: u64, host_keys: &[PanelHostKeyDeclaration]) -> String {
+    PUBLIC_PANEL_BOOTSTRAP_TEMPLATE
+        .replace("__SESSION_EPOCH__", &session_epoch.to_string())
+        .replace(
+            "__HOST_KEYS__",
+            &serde_json::to_string(host_keys).expect("Host-key declarations serialize"),
+        )
 }
 
 fn label_component(plugin_id: &str) -> Option<String> {
@@ -317,6 +542,56 @@ pub(crate) fn plugin_id_from_panel_content_label(label: &str) -> Option<String> 
     decode_label_component(plugin_id)
 }
 
+fn disarm_host_key_route(route: &mut HostKeyRouteState) {
+    route.receiver_armed = false;
+    route.queue.clear();
+    route.pump_running = false;
+    if let Some(in_flight) = route.in_flight.as_mut() {
+        in_flight.phase = HostKeyDeliveryPhase::Cancelled;
+    }
+}
+
+fn finish_host_key_ack_locked(
+    core: &mut ControllerCore,
+    ticket: &HostKeyDeliveryTicket,
+    now: Instant,
+    changed: &Condvar,
+) -> HostKeyAckOutcome {
+    let Some(session) = core
+        .session
+        .as_mut()
+        .filter(|session| session.identity.session_epoch == ticket.session_epoch)
+    else {
+        return HostKeyAckOutcome::Stale;
+    };
+    let Some(in_flight) = session.host_key_route.in_flight.as_ref() else {
+        return HostKeyAckOutcome::Stale;
+    };
+    if in_flight.ticket != *ticket {
+        return HostKeyAckOutcome::Stale;
+    }
+    if in_flight.phase == HostKeyDeliveryPhase::Accomplished {
+        session.host_key_route.in_flight = None;
+        changed.notify_all();
+        return HostKeyAckOutcome::Acknowledged;
+    }
+    if in_flight.phase != HostKeyDeliveryPhase::DeliveredAwaitingAck {
+        return HostKeyAckOutcome::Stale;
+    }
+    let Some(deadline) = in_flight.ack_deadline else {
+        return HostKeyAckOutcome::Stale;
+    };
+    if now < deadline {
+        return HostKeyAckOutcome::Pending;
+    }
+    if let Some(in_flight) = session.host_key_route.in_flight.as_mut() {
+        in_flight.phase = HostKeyDeliveryPhase::Cancelled;
+    }
+    disarm_host_key_route(&mut session.host_key_route);
+    changed.notify_all();
+    HostKeyAckOutcome::TimedOut
+}
+
 impl PluginPanelController {
     pub(crate) fn live_identity(&self) -> Option<PanelSessionIdentity> {
         self.core
@@ -349,11 +624,109 @@ impl PluginPanelController {
             current_submission_token: owner.submission_token,
             pending: None,
             content_focused: false,
+            host_key_route: HostKeyRouteState::default(),
         });
+        core.hide_ticket = None;
         core.host_input_focus = None;
         core.internal_blur_until = None;
         self.changed.notify_all();
         Some(identity)
+    }
+
+    pub(crate) fn admit_hide(
+        &self,
+        caller_label: &str,
+        session_epoch: u64,
+    ) -> Result<Option<PanelHideTicketIdentity>, PanelSettlementError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelSettlementError::Unavailable)?;
+        let current = core.session.as_ref().is_some_and(|session| {
+            session.identity.content_label == caller_label
+                && session.identity.session_epoch == session_epoch
+        });
+        if !current || core.hide_ticket.is_some() {
+            return Ok(None);
+        }
+        let hide_ticket_id = core
+            .next_hide_ticket_id
+            .checked_add(1)
+            .ok_or(PanelSettlementError::Unavailable)?;
+        core.next_hide_ticket_id = hide_ticket_id;
+        let identity = PanelHideTicketIdentity {
+            session_epoch,
+            hide_ticket_id,
+        };
+        core.hide_ticket = Some(PanelHideTicket {
+            identity,
+            phase: PanelHideTicketPhase::Admitted,
+        });
+        Ok(Some(identity))
+    }
+
+    pub(crate) fn observe_hide(&self, identity: PanelHideTicketIdentity) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(ticket) = core.hide_ticket.as_mut() else {
+            return false;
+        };
+        if ticket.identity != identity || ticket.phase != PanelHideTicketPhase::Admitted {
+            return false;
+        }
+        ticket.phase = PanelHideTicketPhase::Observed;
+        true
+    }
+
+    pub(crate) fn claim_hide_commit(
+        &self,
+        identity: PanelHideTicketIdentity,
+    ) -> Option<PanelSessionIdentity> {
+        let mut core = self.core.lock().ok()?;
+        let session_identity = core.session.as_ref()?.identity.clone();
+        if session_identity.session_epoch != identity.session_epoch {
+            return None;
+        }
+        let ticket = core.hide_ticket.as_mut()?;
+        if ticket.identity != identity
+            || !matches!(
+                ticket.phase,
+                PanelHideTicketPhase::Admitted | PanelHideTicketPhase::Observed
+            )
+        {
+            return None;
+        }
+        ticket.phase = PanelHideTicketPhase::Committed;
+        Some(session_identity)
+    }
+
+    pub(crate) fn claim_hide_fallback(
+        &self,
+        identity: PanelHideTicketIdentity,
+        expected_phase: PanelHideTicketPhase,
+    ) -> Option<PanelSessionIdentity> {
+        if expected_phase == PanelHideTicketPhase::Committed {
+            return None;
+        }
+        let mut core = self.core.lock().ok()?;
+        let session_identity = core.session.as_ref()?.identity.clone();
+        if session_identity.session_epoch != identity.session_epoch {
+            return None;
+        }
+        let ticket = core.hide_ticket.as_mut()?;
+        if ticket.identity != identity || ticket.phase != expected_phase {
+            return None;
+        }
+        ticket.phase = PanelHideTicketPhase::Committed;
+        Some(session_identity)
+    }
+
+    #[cfg(test)]
+    fn set_next_hide_ticket_id(&self, value: u64) {
+        if let Ok(mut core) = self.core.lock() {
+            core.next_hide_ticket_id = value;
+        }
     }
 
     pub(crate) fn prepare_host_input_focus(
@@ -741,6 +1114,7 @@ impl PluginPanelController {
         core.main_content_focused = false;
         core.internal_blur_until = None;
         core.session = None;
+        core.hide_ticket = None;
         core.host_input_focus = None;
         self.changed.notify_all();
     }
@@ -925,7 +1299,171 @@ impl PluginPanelController {
         }
     }
 
-    pub(crate) fn mark_ready(&self, content_label: &str, session_epoch: u64) -> bool {
+    pub(crate) fn enqueue_host_key(
+        &self,
+        session_epoch: u64,
+        input: HostKeyEnqueueInput,
+    ) -> Result<HostKeyEnqueueDecision, PanelSettlementError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelSettlementError::Unavailable)?;
+        let Some(session) = core
+            .session
+            .as_mut()
+            .filter(|session| session.identity.session_epoch == session_epoch)
+        else {
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::Noop,
+                start_pump: false,
+                terminate_session: false,
+            });
+        };
+        let route = &mut session.host_key_route;
+        if session.phase != PanelPhase::Ready
+            || !route.receiver_armed
+            || !session.identity.host_keys.contains(&input.declaration)
+            || !input.valid_chord()
+        {
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::Noop,
+                start_pump: false,
+                terminate_session: false,
+            });
+        }
+        if input.client_sequence < route.next_expected_client_sequence {
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::Noop,
+                start_pump: false,
+                terminate_session: false,
+            });
+        }
+        if input.client_sequence > route.next_expected_client_sequence {
+            disarm_host_key_route(route);
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::ProtocolViolation,
+                start_pump: false,
+                terminate_session: true,
+            });
+        }
+        let Some(next_expected) = route.next_expected_client_sequence.checked_add(1) else {
+            disarm_host_key_route(route);
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::ProtocolViolation,
+                start_pump: false,
+                terminate_session: true,
+            });
+        };
+        route.next_expected_client_sequence = next_expected;
+        if route.queue.len() >= HOST_KEY_QUEUE_CAPACITY {
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::DroppedQueueFull,
+                start_pump: false,
+                terminate_session: false,
+            });
+        }
+        let Some(next_route_sequence) = route.next_route_sequence.checked_add(1) else {
+            disarm_host_key_route(route);
+            return Ok(HostKeyEnqueueDecision {
+                outcome: HostKeyEnqueueOutcome::ProtocolViolation,
+                start_pump: false,
+                terminate_session: true,
+            });
+        };
+        let route_sequence = route.next_route_sequence;
+        route.next_route_sequence = next_route_sequence;
+        route.queue.push_back(HostKeyDeliveryTicket {
+            session_epoch,
+            content_label: session.identity.content_label.clone(),
+            route_sequence,
+            declaration: input.declaration,
+            key: input.key,
+            ctrl_key: input.ctrl_key,
+            meta_key: input.meta_key,
+            shift_key: input.shift_key,
+            alt_key: input.alt_key,
+        });
+        let start_pump = !route.pump_running;
+        route.pump_running = true;
+        Ok(HostKeyEnqueueDecision {
+            outcome: HostKeyEnqueueOutcome::Enqueued { route_sequence },
+            start_pump,
+            terminate_session: false,
+        })
+    }
+
+    pub(crate) fn claim_next_host_key(&self) -> Option<HostKeyDeliveryTicket> {
+        let mut core = self.core.lock().ok()?;
+        let session = core.session.as_mut()?;
+        let route = &mut session.host_key_route;
+        if !route.receiver_armed || route.in_flight.is_some() {
+            return None;
+        }
+        let Some(ticket) = route.queue.pop_front() else {
+            route.pump_running = false;
+            return None;
+        };
+        route.in_flight = Some(HostKeyInFlight {
+            ticket: ticket.clone(),
+            phase: HostKeyDeliveryPhase::Prepared,
+            ack_deadline: None,
+        });
+        Some(ticket)
+    }
+
+    pub(crate) fn mark_host_key_native_focused(&self, ticket: &HostKeyDeliveryTicket) -> bool {
+        self.advance_host_key_phase(
+            ticket,
+            HostKeyDeliveryPhase::Prepared,
+            HostKeyDeliveryPhase::NativeFocused,
+            None,
+        )
+    }
+
+    pub(crate) fn mark_host_key_delivered(
+        &self,
+        ticket: &HostKeyDeliveryTicket,
+        ack_deadline: Instant,
+    ) -> bool {
+        self.advance_host_key_phase(
+            ticket,
+            HostKeyDeliveryPhase::NativeFocused,
+            HostKeyDeliveryPhase::DeliveredAwaitingAck,
+            Some(ack_deadline),
+        )
+    }
+
+    fn advance_host_key_phase(
+        &self,
+        ticket: &HostKeyDeliveryTicket,
+        expected: HostKeyDeliveryPhase,
+        next: HostKeyDeliveryPhase,
+        ack_deadline: Option<Instant>,
+    ) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(session) = core.session.as_mut() else {
+            return false;
+        };
+        let Some(in_flight) = session.host_key_route.in_flight.as_mut() else {
+            return false;
+        };
+        if in_flight.ticket != *ticket || in_flight.phase != expected {
+            return false;
+        }
+        in_flight.phase = next;
+        in_flight.ack_deadline = ack_deadline;
+        self.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn ack_host_key(
+        &self,
+        content_label: &str,
+        session_epoch: u64,
+        route_sequence: u64,
+    ) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
         };
@@ -937,10 +1475,109 @@ impl PluginPanelController {
         {
             return false;
         }
+        let Some(in_flight) = session.host_key_route.in_flight.as_mut() else {
+            return false;
+        };
+        if in_flight.ticket.route_sequence != route_sequence
+            || in_flight.phase != HostKeyDeliveryPhase::DeliveredAwaitingAck
+        {
+            return false;
+        }
+        in_flight.phase = HostKeyDeliveryPhase::Accomplished;
+        self.changed.notify_all();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_host_key_ack(
+        &self,
+        ticket: &HostKeyDeliveryTicket,
+        now: Instant,
+    ) -> HostKeyAckOutcome {
+        let Ok(mut core) = self.core.lock() else {
+            return HostKeyAckOutcome::Stale;
+        };
+        finish_host_key_ack_locked(&mut core, ticket, now, &self.changed)
+    }
+
+    pub(crate) fn wait_host_key_ack(&self, ticket: &HostKeyDeliveryTicket) -> HostKeyAckOutcome {
+        let Ok(mut core) = self.core.lock() else {
+            return HostKeyAckOutcome::Stale;
+        };
+        loop {
+            let outcome =
+                finish_host_key_ack_locked(&mut core, ticket, Instant::now(), &self.changed);
+            if outcome != HostKeyAckOutcome::Pending {
+                return outcome;
+            }
+            let Some(deadline) = core
+                .session
+                .as_ref()
+                .and_then(|session| session.host_key_route.in_flight.as_ref())
+                .and_then(|in_flight| in_flight.ack_deadline)
+            else {
+                return HostKeyAckOutcome::Stale;
+            };
+            let Ok((next, _)) = self
+                .changed
+                .wait_timeout(core, deadline.saturating_duration_since(Instant::now()))
+            else {
+                return HostKeyAckOutcome::Stale;
+            };
+            core = next;
+        }
+    }
+
+    pub(crate) fn fail_host_key_delivery(
+        &self,
+        ticket: &HostKeyDeliveryTicket,
+    ) -> Option<PanelSessionIdentity> {
+        let mut core = self.core.lock().ok()?;
+        let session = core.session.as_mut()?;
+        if session.identity.session_epoch != ticket.session_epoch
+            || session
+                .host_key_route
+                .in_flight
+                .as_ref()
+                .is_none_or(|in_flight| in_flight.ticket != *ticket)
+        {
+            return None;
+        }
+        if let Some(in_flight) = session.host_key_route.in_flight.as_mut() {
+            in_flight.phase = HostKeyDeliveryPhase::Cancelled;
+        }
+        disarm_host_key_route(&mut session.host_key_route);
+        self.changed.notify_all();
+        Some(session.identity.clone())
+    }
+
+    pub(crate) fn mark_ready(
+        &self,
+        content_label: &str,
+        session_epoch: u64,
+        host_key_receiver_registered: bool,
+        host_key_registration_violation: bool,
+    ) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(session) = core.session.as_mut() else {
+            return false;
+        };
+        if session.identity.content_label != content_label
+            || session.identity.session_epoch != session_epoch
+        {
+            return false;
+        }
+        let host_keys_required = !session.identity.host_keys.is_empty();
+        if host_key_registration_violation || host_keys_required != host_key_receiver_registered {
+            return false;
+        }
         if session.phase != PanelPhase::AwaitingReady {
             return session.phase == PanelPhase::Ready;
         }
         session.phase = PanelPhase::Ready;
+        session.host_key_route.receiver_armed = host_keys_required;
         self.changed.notify_all();
         true
     }
@@ -1091,6 +1728,7 @@ impl PluginPanelController {
         }
         core.internal_blur_until = Instant::now().checked_add(INTERNAL_BLUR_GRACE);
         core.host_input_focus = None;
+        core.hide_ticket = None;
         self.changed.notify_all();
         Some(session.identity)
     }
@@ -1107,6 +1745,7 @@ impl PluginPanelController {
         let identity = core.session.take()?.identity;
         core.internal_blur_until = Instant::now().checked_add(INTERNAL_BLUR_GRACE);
         core.host_input_focus = None;
+        core.hide_ticket = None;
         self.changed.notify_all();
         Some(identity)
     }
@@ -1129,6 +1768,7 @@ impl PluginPanelController {
         let identity = core.session.take()?.identity;
         core.internal_blur_until = Instant::now().checked_add(INTERNAL_BLUR_GRACE);
         core.host_input_focus = None;
+        core.hide_ticket = None;
         self.changed.notify_all();
         Some(identity)
     }
@@ -1147,14 +1787,52 @@ impl PluginPanelController {
                 && session.current_submission_token == submission_token
         })
     }
+
+    #[cfg(test)]
+    fn set_host_key_sequences(
+        &self,
+        session_epoch: u64,
+        next_expected_client_sequence: u64,
+        next_route_sequence: u64,
+    ) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(session) = core
+            .session
+            .as_mut()
+            .filter(|session| session.identity.session_epoch == session_epoch)
+        else {
+            return false;
+        };
+        session.host_key_route.next_expected_client_sequence = next_expected_client_sequence;
+        session.host_key_route.next_route_sequence = next_route_sequence;
+        true
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn content_ready(
     controller: &PluginPanelController,
     label: &str,
     session_epoch: u64,
 ) -> bool {
-    controller.mark_ready(label, session_epoch)
+    controller.mark_ready(label, session_epoch, false, false)
+}
+
+pub(crate) fn content_ready_with_host_keys(
+    controller: &PluginPanelController,
+    label: &str,
+    session_epoch: u64,
+    host_key_receiver_registered: bool,
+    host_key_registration_violation: bool,
+) -> bool {
+    controller.mark_ready(
+        label,
+        session_epoch,
+        host_key_receiver_registered,
+        host_key_registration_violation,
+    )
 }
 
 pub(crate) fn content_ack(
@@ -1293,7 +1971,7 @@ fn mount_webview(
             plugin_id: identity.plugin_id.clone(),
             session_generation: identity.session_epoch,
         },
-        panel_bootstrap(identity.session_epoch),
+        panel_bootstrap(identity.session_epoch, &identity.host_keys),
         content_url,
         on_unmuted,
         CONTENT_READY_TIMEOUT,
@@ -1433,7 +2111,11 @@ fn schedule_app_blur(
                 return;
             };
             let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
-            let _ = crate::commands::clear_and_hide(registries.main(), &window);
+            let _ = crate::commands::clear_and_hide_reason(
+                registries.main(),
+                &window,
+                crate::commands::HideReason::Blur,
+            );
         });
     });
 }
@@ -1517,6 +2199,116 @@ pub(crate) fn deliver_panel_update(
     deliver_update(app, controller, identity, &ticket, update)
 }
 
+pub(crate) fn start_host_key_pump(app: AppHandle, controller: Arc<PluginPanelController>) {
+    std::thread::spawn(move || {
+        while let Some(ticket) = controller.claim_next_host_key() {
+            let delivered = (|| {
+                let content = app.get_webview(&ticket.content_label).ok_or(())?;
+                content.set_focus().map_err(|_| ())?;
+                if !controller.mark_host_key_native_focused(&ticket) {
+                    return Err(());
+                }
+                let payload = serde_json::to_string(&serde_json::json!({
+                    "key": ticket.key,
+                    "ctrlKey": ticket.ctrl_key,
+                    "metaKey": ticket.meta_key,
+                    "shiftKey": ticket.shift_key,
+                    "altKey": ticket.alt_key,
+                    "sessionEpoch": ticket.session_epoch.to_string(),
+                    "routeSequence": ticket.route_sequence.to_string(),
+                }))
+                .map_err(|_| ())?;
+                content
+                    .eval(format!(
+                        "window.__UIPILOT_PLUGIN_PANEL_HOST_KEY__({payload});"
+                    ))
+                    .map_err(|_| ())?;
+                let deadline = Instant::now().checked_add(HOST_KEY_ACK_TIMEOUT).ok_or(())?;
+                controller
+                    .mark_host_key_delivered(&ticket, deadline)
+                    .then_some(())
+                    .ok_or(())
+            })();
+            if delivered.is_err() {
+                if controller.fail_host_key_delivery(&ticket).is_some() {
+                    schedule_host_key_terminal_hide(app.clone());
+                }
+                return;
+            }
+            match controller.wait_host_key_ack(&ticket) {
+                HostKeyAckOutcome::Acknowledged => {}
+                HostKeyAckOutcome::TimedOut => {
+                    if controller.fail_host_key_delivery(&ticket).is_some() {
+                        schedule_host_key_terminal_hide(app.clone());
+                    }
+                    return;
+                }
+                HostKeyAckOutcome::Pending | HostKeyAckOutcome::Stale => return,
+            }
+        }
+    });
+}
+
+fn schedule_host_key_terminal_hide(app: AppHandle) {
+    let dispatch_app = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(window) = dispatch_app.get_webview_window("main") else {
+            return;
+        };
+        let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
+        let _ = crate::commands::clear_and_hide_reason(
+            registries.main(),
+            &window,
+            crate::commands::HideReason::ExplicitReturn,
+        );
+    });
+}
+
+pub(crate) fn commit_panel_hide(
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    identity: PanelHideTicketIdentity,
+) -> Result<bool, ()> {
+    if controller.claim_hide_commit(identity).is_none() {
+        return Ok(false);
+    }
+    schedule_committed_panel_hide(app.clone()).map(|()| true)
+}
+
+pub(crate) fn schedule_panel_hide_fallback(
+    app: AppHandle,
+    controller: Arc<PluginPanelController>,
+    identity: PanelHideTicketIdentity,
+    expected_phase: PanelHideTicketPhase,
+    delay: Duration,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        if controller
+            .claim_hide_fallback(identity, expected_phase)
+            .is_some()
+        {
+            let _ = schedule_committed_panel_hide(app);
+        }
+    });
+}
+
+fn schedule_committed_panel_hide(app: AppHandle) -> Result<(), ()> {
+    let dispatch_app = app.clone();
+    app.run_on_main_thread(move || {
+        let Some(window) = dispatch_app.get_webview_window("main") else {
+            return;
+        };
+        let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
+        let _ = crate::commands::clear_and_hide_reason(
+            registries.main(),
+            &window,
+            crate::commands::HideReason::ExplicitReturn,
+        );
+    })
+    .map_err(|_| ())
+}
+
 pub(crate) fn queue_dispatch(
     controller: &PluginPanelController,
     session_epoch: u64,
@@ -1587,7 +2379,6 @@ mod tests {
         assert!(controller
             .teardown_session(Some(second.session_epoch))
             .is_some());
-        assert!(controller.live_identity().is_none());
     }
 
     #[test]
@@ -2074,6 +2865,312 @@ mod tests {
             identity.session_epoch,
         ));
         identity
+    }
+
+    fn host_key_session(controller: &PluginPanelController) -> PanelSessionIdentity {
+        let mut panel_owner = owner("host-key");
+        panel_owner.host_keys = vec![
+            PanelHostKeyDeclaration::ArrowDown,
+            PanelHostKeyDeclaration::ArrowUp,
+        ];
+        let identity = controller.open_session(panel_owner).unwrap();
+        assert!(controller.mark_ready(
+            &identity.content_label,
+            identity.session_epoch,
+            true,
+            false,
+        ));
+        identity
+    }
+
+    fn host_key_input(client_sequence: u64) -> HostKeyEnqueueInput {
+        HostKeyEnqueueInput {
+            client_sequence,
+            declaration: PanelHostKeyDeclaration::ArrowDown,
+            key: PluginPanelHostKey::ArrowDown,
+            ctrl_key: false,
+            meta_key: false,
+            shift_key: false,
+            alt_key: false,
+        }
+    }
+
+    #[test]
+    fn host_key_ready_gate_rejects_missing_receiver_and_sticky_empty_registration() {
+        let controller = PluginPanelController::default();
+        let mut required_owner = owner("required");
+        required_owner.host_keys = vec![PanelHostKeyDeclaration::ArrowDown];
+        let required = controller.open_session(required_owner).unwrap();
+        assert!(!controller.mark_ready(
+            &required.content_label,
+            required.session_epoch,
+            false,
+            false,
+        ));
+
+        let empty = controller.open_session(owner("empty")).unwrap();
+        assert!(!controller.mark_ready(&empty.content_label, empty.session_epoch, false, true,));
+    }
+
+    #[test]
+    fn host_key_queue_is_expected_only_serial_and_queue_full_consumes_sequences() {
+        let controller = PluginPanelController::default();
+        let identity = host_key_session(&controller);
+        let first = controller
+            .enqueue_host_key(identity.session_epoch, host_key_input(1))
+            .unwrap();
+        assert_eq!(
+            first.outcome,
+            HostKeyEnqueueOutcome::Enqueued { route_sequence: 1 }
+        );
+        assert!(first.start_pump);
+        let first_ticket = controller.claim_next_host_key().unwrap();
+        assert!(controller.claim_next_host_key().is_none());
+        assert!(controller.mark_host_key_native_focused(&first_ticket));
+        assert!(controller
+            .mark_host_key_delivered(&first_ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
+
+        for sequence in 2..=9 {
+            assert!(matches!(
+                controller
+                    .enqueue_host_key(identity.session_epoch, host_key_input(sequence))
+                    .unwrap()
+                    .outcome,
+                HostKeyEnqueueOutcome::Enqueued { .. }
+            ));
+        }
+        for sequence in [10, 11] {
+            assert_eq!(
+                controller
+                    .enqueue_host_key(identity.session_epoch, host_key_input(sequence))
+                    .unwrap()
+                    .outcome,
+                HostKeyEnqueueOutcome::DroppedQueueFull,
+            );
+        }
+        assert_eq!(
+            controller
+                .enqueue_host_key(identity.session_epoch, host_key_input(9))
+                .unwrap()
+                .outcome,
+            HostKeyEnqueueOutcome::Noop,
+        );
+        assert!(controller.ack_host_key(
+            &identity.content_label,
+            identity.session_epoch,
+            first_ticket.route_sequence,
+        ));
+        assert_eq!(
+            controller.finish_host_key_ack(&first_ticket, Instant::now()),
+            HostKeyAckOutcome::Acknowledged,
+        );
+        assert!(controller.claim_next_host_key().is_some());
+        assert!(matches!(
+            controller
+                .enqueue_host_key(identity.session_epoch, host_key_input(12))
+                .unwrap()
+                .outcome,
+            HostKeyEnqueueOutcome::Enqueued { .. }
+        ));
+
+        let reordered = controller
+            .enqueue_host_key(identity.session_epoch, host_key_input(14))
+            .unwrap();
+        assert_eq!(reordered.outcome, HostKeyEnqueueOutcome::ProtocolViolation);
+        assert!(reordered.terminate_session);
+    }
+
+    #[test]
+    fn host_key_ack_timeout_disarms_without_overlapping_the_next_delivery() {
+        let controller = PluginPanelController::default();
+        let identity = host_key_session(&controller);
+        controller
+            .enqueue_host_key(identity.session_epoch, host_key_input(1))
+            .unwrap();
+        controller
+            .enqueue_host_key(identity.session_epoch, host_key_input(2))
+            .unwrap();
+        let ticket = controller.claim_next_host_key().unwrap();
+        assert!(controller.mark_host_key_native_focused(&ticket));
+        assert!(controller.mark_host_key_delivered(&ticket, Instant::now()));
+        assert_eq!(
+            controller.finish_host_key_ack(&ticket, Instant::now()),
+            HostKeyAckOutcome::TimedOut,
+        );
+        assert!(controller.claim_next_host_key().is_none());
+        assert_eq!(
+            controller
+                .enqueue_host_key(identity.session_epoch, host_key_input(3))
+                .unwrap()
+                .outcome,
+            HostKeyEnqueueOutcome::Noop,
+        );
+    }
+
+    #[test]
+    fn host_key_counters_and_stale_sessions_fail_closed_without_wrap() {
+        let controller = PluginPanelController::default();
+        let first = host_key_session(&controller);
+        assert!(controller.set_host_key_sequences(first.session_epoch, u64::MAX, 1));
+        let exhausted_client = controller
+            .enqueue_host_key(first.session_epoch, host_key_input(u64::MAX))
+            .unwrap();
+        assert_eq!(
+            exhausted_client.outcome,
+            HostKeyEnqueueOutcome::ProtocolViolation
+        );
+        assert!(exhausted_client.terminate_session);
+
+        let second = host_key_session(&controller);
+        assert_eq!(
+            controller
+                .enqueue_host_key(first.session_epoch, host_key_input(1))
+                .unwrap()
+                .outcome,
+            HostKeyEnqueueOutcome::Noop,
+        );
+        assert!(controller.set_host_key_sequences(second.session_epoch, 1, u64::MAX));
+        let exhausted_route = controller
+            .enqueue_host_key(second.session_epoch, host_key_input(1))
+            .unwrap();
+        assert_eq!(
+            exhausted_route.outcome,
+            HostKeyEnqueueOutcome::ProtocolViolation
+        );
+        assert!(exhausted_route.terminate_session);
+    }
+
+    #[test]
+    fn panel_bootstrap_registers_one_host_key_handler_and_acks_after_settlement() {
+        let bootstrap = PUBLIC_PANEL_BOOTSTRAP_TEMPLATE.replace("\r\n", "\n");
+        for required in [
+            "onHostKey(next)",
+            "hostKeyRegistrationViolation = true",
+            "__UIPILOT_PLUGIN_PANEL_HOST_KEY__",
+            "await hostKeyHandler(deepFreeze(event))",
+            "finally",
+            "plugin_panel_host_key_ack",
+        ] {
+            assert!(
+                bootstrap.contains(required),
+                "missing bootstrap fragment: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_hide_ticket_observed_and_commit_orders_hide_exactly_once() {
+        let controller = PluginPanelController::default();
+        let observed_session = content_ready_session(&controller);
+        let observed = controller
+            .admit_hide(
+                &observed_session.content_label,
+                observed_session.session_epoch,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(controller.observe_hide(observed));
+        assert!(controller.claim_hide_commit(observed).is_some());
+        assert!(controller.claim_hide_commit(observed).is_none());
+        assert!(!controller.observe_hide(observed));
+
+        let commit_first_session = content_ready_session(&controller);
+        let commit_first = controller
+            .admit_hide(
+                &commit_first_session.content_label,
+                commit_first_session.session_epoch,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(controller.claim_hide_commit(commit_first).is_some());
+        assert!(!controller.observe_hide(commit_first));
+        assert!(controller.claim_hide_commit(commit_first).is_none());
+    }
+
+    #[test]
+    fn panel_hide_fallback_is_phase_specific_and_stale_after_new_session() {
+        let controller = PluginPanelController::default();
+        let admitted_session = content_ready_session(&controller);
+        let admitted = controller
+            .admit_hide(
+                &admitted_session.content_label,
+                admitted_session.session_epoch,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(controller
+            .claim_hide_fallback(admitted, PanelHideTicketPhase::Observed)
+            .is_none());
+        assert!(controller
+            .claim_hide_fallback(admitted, PanelHideTicketPhase::Admitted)
+            .is_some());
+
+        let observed_session = content_ready_session(&controller);
+        let observed = controller
+            .admit_hide(
+                &observed_session.content_label,
+                observed_session.session_epoch,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(controller.observe_hide(observed));
+        assert!(controller
+            .claim_hide_fallback(observed, PanelHideTicketPhase::Admitted)
+            .is_none());
+        assert!(controller
+            .claim_hide_fallback(observed, PanelHideTicketPhase::Observed)
+            .is_some());
+
+        let stale_session = content_ready_session(&controller);
+        let stale = controller
+            .admit_hide(&stale_session.content_label, stale_session.session_epoch)
+            .unwrap()
+            .unwrap();
+        let replacement = content_ready_session(&controller);
+        assert_ne!(stale.session_epoch, replacement.session_epoch);
+        assert!(controller
+            .claim_hide_fallback(stale, PanelHideTicketPhase::Admitted)
+            .is_none());
+    }
+
+    #[test]
+    fn panel_hide_ticket_exhaustion_fails_closed_without_reuse() {
+        let controller = PluginPanelController::default();
+        let session = content_ready_session(&controller);
+        controller.set_next_hide_ticket_id(u64::MAX);
+        assert_eq!(
+            controller.admit_hide(&session.content_label, session.session_epoch),
+            Err(PanelSettlementError::Unavailable),
+        );
+    }
+
+    #[test]
+    fn panel_bootstrap_hide_and_escape_follow_the_frozen_ordering() {
+        let bootstrap = PUBLIC_PANEL_BOOTSTRAP_TEMPLATE.replace("\r\n", "\n");
+        let resolve = bootstrap
+            .find("resolve();")
+            .expect("hide Promise resolve is missing");
+        let observed = bootstrap
+            .find("plugin_panel_request_hide_admit_observed")
+            .expect("observed invoke is missing");
+        let commit = bootstrap
+            .find("setTimeout(() =>")
+            .expect("next-macrotask commit is missing");
+        assert!(resolve < observed && observed < commit);
+        for required in [
+            "plugin_panel_request_hide_admit",
+            "plugin_panel_request_hide_commit",
+            "addEventListener('keydown'",
+            "queueMicrotask(() =>",
+            "dialog[open]",
+            "event.defaultPrevented",
+            "capture: true",
+        ] {
+            assert!(
+                bootstrap.contains(required),
+                "missing hide fragment: {required}"
+            );
+        }
     }
 
     #[test]
@@ -2969,8 +4066,8 @@ mod tests {
     }
 
     #[test]
-    fn panel_bootstrap_exposes_focus_update_and_storage_only() {
-        let bootstrap = panel_bootstrap(42);
+    fn panel_bootstrap_exposes_host_keys_focus_update_and_storage() {
+        let bootstrap = panel_bootstrap(42, &[PanelHostKeyDeclaration::ArrowDown]);
         let api_body = bootstrap
             .split("const api = deepFreeze({\n")
             .nth(1)
@@ -2991,13 +4088,16 @@ mod tests {
             public_members,
             vec![
                 "onUpdate(next) {",
+                "onHostKey(next) {",
                 "async focusHostInput() {",
+                "requestHide() { return requestPanelHide(); },",
                 "get storage() { return storageSession ? storageSession.storage : expiredStorage; },",
             ]
         );
         for required in [
             "uipilotPluginPanel",
             "onUpdate(next)",
+            "onHostKey(next)",
             "async focusHostInput()",
             "plugin_panel_focus_host_input",
             "sessionEpoch: '42'",
@@ -3060,7 +4160,8 @@ mod tests {
             .next()
             .expect("plugin panel test module marker is missing");
         assert!(!production.contains("Box::leak"));
-        assert!(production.contains("fn panel_bootstrap(session_epoch: u64) -> String"));
+        assert!(production.contains("fn panel_bootstrap("));
+        assert!(production.contains("host_keys: &[PanelHostKeyDeclaration]"));
     }
 
     #[test]

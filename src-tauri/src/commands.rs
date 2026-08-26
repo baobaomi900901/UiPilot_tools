@@ -33,9 +33,10 @@ use crate::{
     model::{LauncherResultActivation, ResultIconKind, SearchResponse},
     plugin_panel::{
         self, HostInputFocusAdvance, HostInputFocusIdentity, HostInputFocusOutcome,
-        PanelAdmissionError, PanelCallError, PanelOwner, PanelSessionIdentity,
-        PanelSettlementError, PendingDispatch, PluginPanelController, PluginPanelUpdate,
-        QueueDispatchOutcome, HOST_INPUT_FOCUS_TIMEOUT,
+        HostKeyEnqueueInput, HostKeyEnqueueOutcome, PanelAdmissionError, PanelCallError,
+        PanelHideTicketIdentity, PanelHideTicketPhase, PanelOwner, PanelSessionIdentity,
+        PanelSettlementError, PendingDispatch, PluginPanelController, PluginPanelHostKey,
+        PluginPanelUpdate, QueueDispatchOutcome, HOST_INPUT_FOCUS_TIMEOUT,
     },
     plugin_window::{
         self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
@@ -65,6 +66,14 @@ use crate::{
 };
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HideReason {
+    ExplicitReturn,
+    Blur,
+    LaunchHandoff,
+    Other,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -528,6 +537,35 @@ pub(crate) struct SubmitPluginPanelInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ClosePluginPanelInput {
     session_epoch: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PluginPanelHostKeyEnqueueInput {
+    session_epoch: String,
+    client_sequence: String,
+    declaration: crate::public_plugins::PanelHostKeyDeclaration,
+    key: PluginPanelHostKey,
+    ctrl_key: bool,
+    meta_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub(crate) enum PluginPanelHostKeyEnqueueResult {
+    Enqueued { route_sequence: String },
+    DroppedQueueFull,
+    Noop,
+    ProtocolViolation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub(crate) enum PanelHideAdmitResult {
+    Admitted { hide_ticket_id: String },
+    Noop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1431,11 +1469,19 @@ pub(crate) fn plugin_panel_content_ready(
     webview: tauri::Webview,
     controller: State<'_, Arc<PluginPanelController>>,
     session_epoch: String,
+    host_key_receiver_registered: bool,
+    host_key_registration_violation: bool,
 ) -> Result<(), CommandError> {
     let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
-    plugin_panel::content_ready(controller.inner().as_ref(), webview.label(), session_epoch)
-        .then_some(())
-        .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+    plugin_panel::content_ready_with_host_keys(
+        controller.inner().as_ref(),
+        webview.label(),
+        session_epoch,
+        host_key_receiver_registered,
+        host_key_registration_violation,
+    )
+    .then_some(())
+    .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
 }
 
 #[tauri::command]
@@ -1454,6 +1500,153 @@ pub(crate) fn plugin_panel_content_ack(
     )
     .then_some(())
     .ok_or_else(|| PublicPluginManagementError::InvalidCaller.into())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_host_key_enqueue(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    input: PluginPanelHostKeyEnqueueInput,
+) -> Result<PluginPanelHostKeyEnqueueResult, CommandError> {
+    require_main_label(webview.label())?;
+    let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
+    let client_sequence = parse_panel_session_epoch(&input.client_sequence)?;
+    let decision = controller
+        .enqueue_host_key(
+            session_epoch,
+            HostKeyEnqueueInput {
+                client_sequence,
+                declaration: input.declaration,
+                key: input.key,
+                ctrl_key: input.ctrl_key,
+                meta_key: input.meta_key,
+                shift_key: input.shift_key,
+                alt_key: input.alt_key,
+            },
+        )
+        .map_err(|_| CommandError::window_failed())?;
+    let result = match decision.outcome {
+        HostKeyEnqueueOutcome::Enqueued { route_sequence } => {
+            PluginPanelHostKeyEnqueueResult::Enqueued {
+                route_sequence: route_sequence.to_string(),
+            }
+        }
+        HostKeyEnqueueOutcome::DroppedQueueFull => {
+            PluginPanelHostKeyEnqueueResult::DroppedQueueFull
+        }
+        HostKeyEnqueueOutcome::Noop => PluginPanelHostKeyEnqueueResult::Noop,
+        HostKeyEnqueueOutcome::ProtocolViolation => {
+            PluginPanelHostKeyEnqueueResult::ProtocolViolation
+        }
+    };
+    if decision.terminate_session {
+        let registries = app.state::<ResultRegistries>();
+        let _ = clear_and_hide_window(
+            registries.main(),
+            &webview.window(),
+            HideReason::ExplicitReturn,
+        );
+    } else if decision.start_pump {
+        plugin_panel::start_host_key_pump(app, Arc::clone(controller.inner()));
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_host_key_ack(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    route_sequence: String,
+) -> Result<(), CommandError> {
+    let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    let route_sequence = parse_panel_storage_session_epoch(&route_sequence)?;
+    let _ = controller.ack_host_key(webview.label(), session_epoch, route_sequence);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_request_hide_admit(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+) -> Result<PanelHideAdmitResult, CommandError> {
+    let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    let Some(identity) = controller
+        .admit_hide(webview.label(), session_epoch)
+        .map_err(|_| CommandError::window_failed())?
+    else {
+        return Ok(PanelHideAdmitResult::Noop);
+    };
+    plugin_panel::schedule_panel_hide_fallback(
+        app,
+        Arc::clone(controller.inner()),
+        identity,
+        PanelHideTicketPhase::Admitted,
+        Duration::from_secs(30),
+    );
+    Ok(PanelHideAdmitResult::Admitted {
+        hide_ticket_id: identity.hide_ticket_id.to_string(),
+    })
+}
+
+fn parse_panel_hide_ticket(
+    session_epoch: &str,
+    hide_ticket_id: &str,
+) -> Result<PanelHideTicketIdentity, CommandError> {
+    Ok(PanelHideTicketIdentity {
+        session_epoch: parse_panel_session_epoch(session_epoch)?,
+        hide_ticket_id: parse_panel_session_epoch(hide_ticket_id)?,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_request_hide_admit_observed(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    hide_ticket_id: String,
+) -> Result<(), CommandError> {
+    let identity = parse_panel_hide_ticket(&session_epoch, &hide_ticket_id)?;
+    if controller
+        .live_identity()
+        .is_none_or(|session| session.content_label != webview.label())
+    {
+        return Ok(());
+    }
+    if controller.observe_hide(identity) {
+        plugin_panel::schedule_panel_hide_fallback(
+            app,
+            Arc::clone(controller.inner()),
+            identity,
+            PanelHideTicketPhase::Observed,
+            Duration::from_millis(500),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_request_hide_commit(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    hide_ticket_id: String,
+) -> Result<(), CommandError> {
+    let identity = parse_panel_hide_ticket(&session_epoch, &hide_ticket_id)?;
+    if controller
+        .live_identity()
+        .is_none_or(|session| session.content_label != webview.label())
+    {
+        return Ok(());
+    }
+    plugin_panel::commit_panel_hide(&app, controller.inner().as_ref(), identity)
+        .map(|_| ())
+        .map_err(|_| CommandError::window_failed())
 }
 
 fn host_input_focus_failure(
@@ -3707,7 +3900,7 @@ pub(crate) async fn execute_result(
                     app.clipboard().write_text(text.to_owned()).map_err(|_| ())
                 })
             },
-            clear_and_hide: || clear_and_hide(registry, &window),
+            clear_and_hide: || clear_and_hide_reason(registry, &window, HideReason::LaunchHandoff),
             increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
         },
     )
@@ -3943,24 +4136,38 @@ pub(crate) fn hide_launcher(
     registries: State<'_, ResultRegistries>,
 ) -> Result<(), CommandError> {
     require_main_label(webview.label())?;
-    clear_and_hide_window(registries.main(), &webview.window())
+    clear_and_hide_window(
+        registries.main(),
+        &webview.window(),
+        HideReason::ExplicitReturn,
+    )
 }
 
 pub(crate) fn clear_and_hide(
     registry: &ResultRegistry,
     window: &WebviewWindow,
 ) -> Result<(), CommandError> {
-    clear_and_hide_window(registry, &window.as_ref().window())
+    clear_and_hide_reason(registry, window, HideReason::Other)
+}
+
+pub(crate) fn clear_and_hide_reason(
+    registry: &ResultRegistry,
+    window: &WebviewWindow,
+    reason: HideReason,
+) -> Result<(), CommandError> {
+    clear_and_hide_window(registry, &window.as_ref().window(), reason)
 }
 
 fn clear_and_hide_window(
     registry: &ResultRegistry,
     window: &tauri::Window,
+    reason: HideReason,
 ) -> Result<(), CommandError> {
     let settings = window.state::<SettingsStore>();
+    let lifecycle = Arc::clone(window.state::<Arc<LifecycleCoordinator>>().inner());
     let app = window.app_handle().clone();
     let panel_controller = Arc::clone(window.state::<Arc<PluginPanelController>>().inner());
-    clear_and_hide_with(
+    let result = clear_and_hide_with(
         || {
             if !window.is_visible().map_err(|_| ())? {
                 return Err(());
@@ -3980,7 +4187,11 @@ fn clear_and_hide_window(
             panel_controller.host_hidden();
         },
         |position| settings.set_window_position(position).map_err(|_| ()),
-    )
+    );
+    if result.is_ok() && reason == HideReason::ExplicitReturn {
+        lifecycle.restore_foreground_after_explicit_return();
+    }
+    result
 }
 
 fn clear_and_hide_with<P, C, H, T, S>(
@@ -5329,6 +5540,10 @@ mod tests {
         for command in [
             "plugin_panel_content_ready",
             "plugin_panel_content_ack",
+            "plugin_panel_host_key_ack",
+            "plugin_panel_request_hide_admit",
+            "plugin_panel_request_hide_admit_observed",
+            "plugin_panel_request_hide_commit",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -5349,9 +5564,10 @@ mod tests {
         }
         let ready = command_body("plugin_panel_content_ready");
         assert!(ready.contains("session_epoch: String"));
-        assert!(ready.contains(
-            "content_ready(controller.inner().as_ref(), webview.label(), session_epoch)"
-        ));
+        assert!(ready.contains("content_ready_with_host_keys("));
+        assert!(ready.contains("webview.label(),"));
+        assert!(ready.contains("host_key_receiver_registered,"));
+        assert!(ready.contains("host_key_registration_violation,"));
         let ack = command_body("plugin_panel_content_ack");
         assert!(ack.contains("session_epoch: String"));
         assert!(ack.contains("content_ack("));
@@ -5361,6 +5577,10 @@ mod tests {
         for command in [
             "plugin_panel_content_ready",
             "plugin_panel_content_ack",
+            "plugin_panel_host_key_ack",
+            "plugin_panel_request_hide_admit",
+            "plugin_panel_request_hide_admit_observed",
+            "plugin_panel_request_hide_commit",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -5375,6 +5595,12 @@ mod tests {
         assert!(!capability.contains("timer"));
         assert!(!capability.contains("plugin-window-"));
         assert!(!capability.contains("close"));
+        let enqueue = command_body("plugin_panel_host_key_enqueue");
+        assert!(enqueue.find("require_main_label(webview.label())?").unwrap()
+            < enqueue.find("enqueue_host_key(").unwrap());
+        let main_capability = include_str!("../capabilities/main.json");
+        assert!(main_capability.contains("allow-plugin-panel-host-key-enqueue"));
+        assert!(!capability.contains("allow-plugin-panel-host-key-enqueue"));
     }
 
     fn panel_focus_owner() -> PanelOwner {
@@ -6668,7 +6894,8 @@ mod tests",
         assert!(body.contains("require_main_label(webview.label())?;"));
         let first_statement = body[body.find('{').unwrap() + 1..].trim_start();
         assert!(first_statement.starts_with("require_main_label(webview.label())?;"));
-        assert!(body.contains("clear_and_hide_window(registries.main(), &webview.window())"));
+        assert!(body.contains("clear_and_hide_window("));
+        assert!(body.contains("HideReason::ExplicitReturn"));
         assert!(!body.contains("registry.hide_and_clear"));
         assert!(!body.contains("window.hide()"));
     }
