@@ -1,7 +1,7 @@
 # Public Plugin Panel Key Routing And Hide Design
 
 **Date:** 2026-08-26  
-**Status:** Draft — awaiting review (revision 3; closes review round 3 P1/P2)  
+**Status:** Draft — awaiting review (revision 4; closes review round 4 P1/P2)  
 **Related:**  
 `docs/superpowers/specs/2026-08-24-public-plugin-panel-mode-design.md`,  
 `docs/superpowers/specs/2026-08-25-public-plugin-panel-focus-host-input-design.md`,  
@@ -40,6 +40,8 @@ is the standard-element check `dialog[open]` used only for Escape arbitration
 - Restoring a prior foreground app after blur-hide or launch-handoff hide.
 - Claiming “strict serial handler execution” while allowing timed-out handlers
   to keep running alongside a newer delivery (forbidden; see §6.3).
+- Treating Rust immediate auto-commit after hide admit as the primary
+  observability path (forbidden; see §3.2).
 
 ## 3. Public API
 
@@ -91,11 +93,11 @@ window.uipilotPluginPanel.requestHide(): Promise<void>
 ```
 
 Tauri command return alone does **not** guarantee the content JS Promise
-continuation has run before WebView destruction. Freeze an explicit protocol:
+continuation has run before WebView destruction. Freeze:
 
 #### Phase A — Admit (observable to content)
 
-Private panel-content command, e.g. `plugin_panel_request_hide_admit`:
+Frozen command name: **`plugin_panel_request_hide_admit`**.
 
 Input (bootstrap-supplied): `{ sessionEpoch }`  
 Output:
@@ -108,41 +110,60 @@ type PanelHideAdmitResult =
 
 - Capability: **panel-content only**.
 - Live matching epoch → allocate monotonic `hideTicketId`, install
-  `PanelHideTicket { sessionEpoch, hideTicketId, phase: Admitted }`, return
-  `admitted`. Bootstrap resolves the public Promise **only after** this
-  command result is applied in JS (continuation scheduled).
+  `PanelHideTicket { sessionEpoch, hideTicketId, phase: Admitted,
+  admittedAtHostMs }`, return `admitted`.
+- Bootstrap applies the admit result in JS, then **resolves** the public
+  Promise. Plugin `await requestHide()` continuations are therefore scheduled
+  as microtasks while the WebView is still alive.
 - Stale / wrong epoch / in-pattern unauthorized → `{ outcome: 'noop' }`;
   Promise resolves; no ticket; no hide.
 - Cannot admit (hide owner conflict that must fail closed before terminal
   work) → command error → Promise rejects `windowFailed`.
 
-#### Phase B — Commit (host terminal; content may already be gone)
+#### Phase B — Commit (bootstrap-primary; Rust delayed fallback only)
 
-After admit returns to content:
+Frozen command name: **`plugin_panel_request_hide_commit`**.
 
-1. Bootstrap immediately invokes private panel-content command
-   `plugin_panel_request_hide_commit` with
-   `{ sessionEpoch, hideTicketId }` **while the WebView is still alive**,
-   or Host schedules commit from Rust when admit succeeds **without** waiting
-   for a second content round-trip—**frozen choice: Rust auto-commits on the
-   host timeline after a successful admit**, using the ticket installed in
-   phase A. Content must not be required to survive until hide completes.
-2. Commit performs shared launcher hide with `HideReason::ExplicitReturn`,
+**Primary path (required):** After admit succeeds and the public Promise has
+been resolved, bootstrap schedules commit on the **next macrotask**
+(`setTimeout(0)` or equivalent):
+
+```text
+admit result applied
+  → resolve public Promise          // schedules plugin microtask continuations
+  → setTimeout(0) → invoke
+       plugin_panel_request_hide_commit({ sessionEpoch, hideTicketId })
+```
+
+This ordering guarantees plugin Promise continuations run before commit’s
+terminal hide/teardown destroys the WebView. Content invokes commit while
+still alive; commit does not wait on further plugin work.
+
+**Rust delayed fallback (not the happy-path driver):** If a ticket remains
+`Admitted` for **500ms** after `admittedAtHostMs` with no successful commit,
+Host auto-commits that ticket. Fallback exists only for crashed/hung
+bootstrap after admit; it must **not** run immediately on admit success and
+must **not** race ahead of the bootstrap next-macrotask commit on the happy
+path (idempotent commit: first wins).
+
+Commit semantics:
+
+1. Commit performs shared launcher hide with `HideReason::ExplicitReturn`,
    then teardown. Ticket phase → `Committed`.
-3. Duplicate commit / stale ticket → no-op.
-4. Admit success then Host crash before commit → session may linger until
-   next hide/show; not plugin-visible. Tests cover admit-then-commit ordering
-   on the happy path.
+2. Duplicate commit / stale ticket → no-op.
+3. Admit success then Host crash before either commit path → session may
+   linger until next hide/show; not plugin-visible.
 
 **Duplicate `requestHide` after admit for the same epoch:** Promise resolves
 `noop` (or admit returns `noop`); no second ticket.
 
-**Timeout:** there is no content-side wait for commit. Public Promise never
-waits on teardown. If admit command itself exceeds the normal invoke path,
-existing invoke failure mapping applies (`windowFailed`).
+**Timeout:** Public Promise never waits on teardown. If admit command itself
+exceeds the normal invoke path, existing invoke failure mapping applies
+(`windowFailed`).
 
 Public docs state: after `await requestHide()` resolves with admission, the
-panel document may be destroyed at any moment; do not touch DOM afterward.
+panel document may be destroyed on the next macrotask (or shortly after via
+fallback); do not touch DOM afterward beyond that continuation.
 
 ### 3.3 Manifest `hostKeys`
 
@@ -218,20 +239,26 @@ If content calls `onHostKey` when `hostKeys` is empty/omitted:
 
 ### 6.1 Commands and capabilities
 
-| Command (names illustrative; freeze in impl) | Caller | Role |
+Command names below are **frozen** for permissions, capability generation, and
+SDK contract (not illustrative).
+
+| Command | Caller | Role |
 |---|---|---|
 | `plugin_panel_host_key_enqueue` | **main only** | Enqueue one physical key match |
-| `plugin_panel_host_key_deliver` (internal event or main→Rust→eval path) | Host-internal | Deliver DTO into content bootstrap |
+| `plugin_panel_host_key_deliver` | Host-internal | Deliver DTO into content bootstrap (event or eval path; not a public plugin invoke) |
 | `plugin_panel_host_key_ack` | **panel-content only** | Ack `routeSequence` after handler settle |
+| `plugin_panel_request_hide_admit` | **panel-content only** | Hide phase A |
+| `plugin_panel_request_hide_commit` | **panel-content only** | Hide phase B (bootstrap primary) |
 
-Main must never accept host-key ack. Panel-content must never accept enqueue.
+Main must never accept host-key ack or hide admit/commit. Panel-content must
+never accept enqueue.
 
 ### 6.2 Enqueue DTO (main → Rust)
 
 ```ts
 interface PluginPanelHostKeyEnqueueInput {
   sessionEpoch: U64Decimal
-  /** Physical press order within this UI turn; see §6.2.1 */
+  /** Physical press order within this UI epoch; see §6.2.1 */
   clientSequence: U64Decimal
   declaration: PanelHostKeyDeclaration
   /** Normalized bits mirrored into PluginPanelHostKeyEvent */
@@ -244,38 +271,76 @@ interface PluginPanelHostKeyEnqueueInput {
 
 type PluginPanelHostKeyEnqueueResult =
   | { outcome: 'enqueued'; routeSequence: U64Decimal }
+  | { outcome: 'heldOutOfOrder' }  // accepted into hold; not yet deliverable
   | { outcome: 'droppedQueueFull' }
-  | { outcome: 'noop' }  // stale epoch / unarmed / teardown
+  | { outcome: 'noop' }  // stale epoch / unarmed / teardown / duplicate seq
 ```
 
 Guards: `require_main_label`; live epoch must match; `receiverArmed`;
 declaration ∈ current session `hostKeys`.
 
-#### 6.2.1 Physical key order
+#### 6.2.1 Physical key order and `clientSequence`
 
-Launcher assigns monotonic `clientSequence` per panel UI epoch on each
-matching keydown **in the order the main WebView receives keydown events**.
-Rust enqueues in `clientSequence` order (not arrival-reorder across awaits):
-if enqueue N+1 is processed before N completes, Rust still inserts by
-`clientSequence` so delivery order equals physical press order. Duplicate
-`clientSequence` → no-op. Gap after drop-on-full is allowed (dropped presses
-never appear).
+**Launcher (required):** Assign monotonic `clientSequence` per panel UI epoch
+on each matching keydown in the order the main WebView receives those
+keydown events. **Serialize enqueue invokes**: at most one in-flight
+`plugin_panel_host_key_enqueue` per epoch; later presses wait until the prior
+enqueue returns before sending the next. This is the primary guard against
+invoke reordering.
+
+**Rust (required, even with serialized launcher):** Maintain
+
+```text
+nextExpectedClientSequence: U64  // starts at 1 each armed epoch
+hold: Map<clientSequence, EnqueuedItem>  // out-of-order arrivals
+```
+
+Rules:
+
+1. Duplicate `clientSequence` → `noop`.
+2. Arrival with `clientSequence == nextExpected` → append to delivery queue,
+   advance `nextExpected`, then flush any contiguous held sequences
+   (`nextExpected`, `nextExpected+1`, …) into the delivery queue in order.
+3. Arrival with `clientSequence > nextExpected` → store in `hold`, return
+   `heldOutOfOrder`. **Do not** deliver or pump that item yet (fixes empty-queue
+   N+1-first race).
+4. Arrival with `clientSequence < nextExpected` → `noop` (already advanced
+   past; duplicate or late after gap skip).
+5. **Gap timeout 100ms** (host timer from first hold entry or from last
+   advance that left a hole): if `hold` is non-empty and
+   `nextExpected` is still missing, **skip** the missing sequence (treat as
+   dropped; never delivered), advance `nextExpected` by one, flush contiguous
+   hold, repeat until hold empty or next gap wait. Skipping does **not**
+   teardown the session.
+6. Hold + delivery queue combined depth still capped at **8** unmatched
+   presses; overflow of a new arrival → `droppedQueueFull` (after main
+   preventDefault); do not coalesce.
+
+`routeSequence` is assigned only when an item enters the **delivery** queue
+(not when merely held).
+
+#### 6.2.2 `clientSequence` exhaustion
+
+`clientSequence` increments from 1 as `u64`. On overflow (next value would
+wrap): disarm routing and run **ExplicitReturn** teardown for the epoch; do
+**not** wrap. Same class as `routeSequence` exhaustion (§6.6).
 
 ### 6.3 Queue, serial delivery, ack timeout = session end
 
 ```text
 HostKeyRouteState {
-  sessionEpoch, nextRouteSequence, receiverArmed,
-  queue: ordered by (clientSequence → routeSequence),
+  sessionEpoch, nextRouteSequence, nextExpectedClientSequence, receiverArmed,
+  hold: Map<clientSequence, item>,
+  queue: delivery order (clientSequence ascending),
   inFlight: Option<ticket>,
 }
 
 ticket phases: Prepared | NativeFocused | DeliveredAwaitingAck | Accomplished | Cancelled
 ```
 
-- Max queue depth **8**; overflow → `droppedQueueFull` after preventDefault on
-  main; no coalescing.
-- Pump delivers **one** inFlight at a time.
+- Max unmatched depth **8** (hold + delivery queue); overflow →
+  `droppedQueueFull` after preventDefault on main; no coalescing.
+- Pump delivers **one** inFlight at a time from the delivery queue only.
 - After DTO delivery, content bootstrap awaits handler (sync or Promise), then
   calls `plugin_panel_host_key_ack { sessionEpoch, routeSequence }`.
 - Handler throw/reject still acks (no retry).
@@ -286,7 +351,7 @@ ticket phases: Prepared | NativeFocused | DeliveredAwaitingAck | Accomplished | 
   serial execution. Strict serial ⇒ hang ends the session rather than overlap.
 - Matching ack → accomplish → pump next only if still armed.
 - Stale ack → no-op.
-- Teardown cancels queue + inFlight.
+- Teardown cancels hold + queue + inFlight.
 
 ### 6.4 Delivery into content
 
@@ -295,7 +360,7 @@ Host delivers by private bootstrap hook (e.g. eval
 keydown. Delivery includes frozen `PluginPanelHostKeyEvent` with host-assigned
 `routeSequence` (not `clientSequence`).
 
-Native focus child WebView once per ticket before delivery (§ prior revision).
+Native focus child WebView once per ticket before delivery.
 
 ### 6.5 Unsubscribe
 
@@ -319,24 +384,37 @@ Increment from 1; overflow → disarm + ExplicitReturn teardown; no wrap.
 
 ## 7. Escape arbitration (single implementation)
 
-**Only algorithm:**
+**Only algorithm** (sync cancel only):
 
 1. Bootstrap registers **one capture-phase** `keydown` listener that records
-   `{ isComposing, hadOpenDialog, keyIsEscape }` and does not hide.
-2. Event continues through target and bubble so plugins may synchronously
-   `preventDefault()`.
-3. Capture listener schedules **exactly one** `setTimeout(0)` **macrotask**
-   (not a microtask; not a bubble listener) that:
+   `{ isComposing, hadOpenDialog, keyIsEscape }` on the event object and
+   schedules **exactly one** `queueMicrotask` (not `setTimeout(0)`, not a
+   bubble listener).
+2. Synchronous target/bubble listeners may call `preventDefault()` during the
+   same event dispatch.
+3. The microtask runs **after** the current event dispatch finishes (all sync
+   listeners done) and **before** any macrotask. It also runs **before**
+   Promise/`await` continuations that plugin handlers schedule from this
+   turn—those continuations are queued later than the Escape microtask if the
+   plugin only `await`s after the sync handler returns. Freeze the contract:
+   - **In-sync** `preventDefault()` during dispatch → hide suppressed.
+   - **`preventDefault()` after `await` / later microtask** → **does not**
+     cancel hide (may race after Host already decided). Plugins that need to
+     cancel Escape must do so synchronously in their keydown handler.
+4. Microtask body:
    - Returns if recorded key was not Escape, or `isComposing`, or
      `hadOpenDialog`.
    - Returns if `event.defaultPrevented === true` (same event object).
-   - Otherwise admits ExplicitReturn hide (auto-commit path shared with
-     `requestHide`).
-4. No alternate bubble-order scheme. Bootstrap may load before plugin scripts;
-   capture + `setTimeout(0)` does not depend on listener registration order
-   relative to plugins.
+   - Otherwise runs hide admit; commit follows §3.2 (bootstrap next-macrotask
+     commit + Rust delayed fallback).
+5. No alternate bubble-order or `setTimeout(0)` Escape scheme. Capture +
+   `queueMicrotask` does not depend on plugin listener registration order
+   relative to bootstrap.
 
-Async `preventDefault` after `await` cannot cancel hide.
+Rationale vs revision 3: `setTimeout(0)` allowed plugin `await` microtasks to
+run first and flip `defaultPrevented`, contradicting “async preventDefault
+无效”. `queueMicrotask` from capture is enqueued during dispatch, before those
+async continuations, while still observing sync `preventDefault` after bubble.
 
 ## 8. Windows foreground restore
 
@@ -347,24 +425,26 @@ may restore. `Blur`, `LaunchHandoff`, `Other` must not.
 
 ### 8.2 Capture replacement policy
 
-`ForegroundCapture { showGeneration, hwnd, pid }` is replaced **only when**:
+`ForegroundCapture { showGeneration, hwnd, pid }` updates by **show scenario**:
 
-1. The main window transitions **hidden → shown** (true show), **or**
-2. UiPilot was already visible but an explicit show entry runs and the
-   **current foreground HWND is not UiPilot-owned** (user gained external
-   focus then re-invoked—rare; still safe to refresh).
+| Show scenario | Capture action |
+|---|---|
+| **Hidden → shown**, and current foreground is a restorable external HWND (non-UiPilot, non-Shell) | **Replace** with `{hwnd, pid}` for that foreground |
+| **Hidden → shown**, and current foreground is Shell / taskbar / desktop / non-restorable | **Clear** capture to empty (do **not** keep a prior Notepad/etc. target) |
+| Already visible, foreground is **UiPilot-owned** (repeat hotkey / tray while focused) | **Keep** existing capture unchanged; do not bump a clearing generation; do not store UiPilot HWND |
+| Already visible, explicit show entry, current foreground is **external restorable** (non-UiPilot, non-Shell) | **Replace** with that external capture |
+| Already visible, explicit show entry (e.g. tray), current foreground is **Shell / taskbar / desktop** | **Clear** capture to empty — do **not** leave a stale prior external capture that would wrongly restore later |
 
-If already visible and foreground is UiPilot-owned (repeat hotkey / tray while
-focused): **keep the existing capture**; do **not** bump a generation that
-clears the prior Notepad (etc.) target; do **not** store UiPilot HWND.
-
-Tray show while foreground is Shell/taskbar/desktop → leave capture empty /
-unchanged per non-restorable rules; do not write Shell as restore target.
+“Empty” means restore is skipped on the next ExplicitReturn. Prefer clear over
+“unchanged” whenever the show entry’s foreground is Shell-class, so tray
+re-show cannot resurrect an old Notepad target after the user left that
+context.
 
 ### 8.3 Restore
 
-On ExplicitReturn hide commit: re-validate HWND + **PID match**, non-UiPilot,
-then normal foreground APIs; failure does not affect hide admission.
+On ExplicitReturn hide commit: if capture empty → skip restore. Else
+re-validate HWND + **PID match**, non-UiPilot, then normal foreground APIs;
+failure does not affect hide admission.
 
 ## 9. Timing diagrams
 
@@ -373,8 +453,9 @@ then normal foreground APIs; failure does not affect hide admission.
 ```text
 main keydown (declared, physical order)
   → preventDefault
+  → await prior enqueue (serialized)
   → plugin_panel_host_key_enqueue(clientSequence, …)  // main-only
-  → Rust queue by clientSequence
+  → Rust: hold until nextExpected, then delivery queue
   → native focus child WV
   → deliver DTO to bootstrap
   → onHostKey handler
@@ -387,55 +468,75 @@ main keydown (declared, physical order)
 ```text
 content requestHide()
   → plugin_panel_request_hide_admit → { admitted, hideTicketId } | noop
-  → bootstrap resolves Promise
-  → Rust auto-commit ticket → hide + teardown
+  → bootstrap resolves Promise          // plugin microtasks may run
+  → setTimeout(0) → plugin_panel_request_hide_commit
+  → hide + teardown
+  // parallel safety net: Rust auto-commit only if still Admitted after 500ms
 ```
 
-## 10. Testing matrix (additions for revision 3)
+### Escape
+
+```text
+capture keydown record + queueMicrotask
+  → sync target/bubble (optional preventDefault)
+  → microtask: if Escape && !defaultPrevented && !dialog && !composing
+       → hide admit → (§3.2 commit)
+```
+
+## 10. Testing matrix (additions for revision 4)
 
 - Main-only enqueue; panel-content-only ack; crossed callers denied.
-- Two rapid ArrowDown: two enqueues with increasing `clientSequence`; delivery
-  order matches physical order even if invoke ordering races.
+- Frozen command names present in capabilities / permissions generation.
+- Serialized launcher enqueue: two rapid ArrowDown never send overlapping
+  enqueue invokes.
+- Out-of-order: N+1 arrives before N while delivery empty → N+1 held; N then
+  delivers N then N+1; gap timeout skips missing N and then delivers held N+1.
+- `clientSequence` / `routeSequence` overflow → ExplicitReturn teardown.
 - Ack timeout → session teardown; **no** overlapping second handler start.
-- `requestHide` admit result observed in content before teardown; commit does
-  not require surviving Promise after destroy.
-- Duplicate requestHide after admit → noop.
-- Escape: only capture + `setTimeout(0)` path; plugin bubble preventDefault
-  blocks hide; no Host bubble-order dependency.
+- `requestHide`: Promise continuation observes resolution before WebView
+  destroy on happy path; bootstrap commit is next macrotask after resolve;
+  Rust 500ms fallback commits only if bootstrap commit omitted; duplicate
+  admit → noop.
+- Escape: only capture + `queueMicrotask`; sync bubble `preventDefault`
+  blocks hide; `preventDefault` after `await` does **not** block hide.
 - Empty hostKeys + caught TypeError on onHostKey → ready still fails
   (violation sticky).
-- Windows Primary+N ignores Meta+N; macOS ignores Ctrl+N (platform tests /
-  conditional).
+- Windows Primary+N ignores Meta+N; macOS ignores Ctrl+N.
 - Repeat hotkey while already focused UiPilot preserves prior capture.
-- Hidden→shown replaces capture; Blur hide does not restore.
+- Hidden→shown with external app replaces capture; Hidden→shown / tray show
+  with Shell foreground **clears** capture (does not keep stale Notepad);
+  Blur hide does not restore.
 
 Retain prior matrix items (parser, stale epoch hostKeys, queue full, dialog
 open, PID check, capabilities, manual Notepad ExplicitReturn).
 
 ## 11. Implementation touch list
 
-Unchanged in spirit from revision 2, plus: freeze command names in
-permissions/capabilities; main enqueue + content ack; hide admit ticket +
-Rust auto-commit; sticky registration violation; capture replacement policy.
+Freeze command names in permissions/capabilities; main serialized enqueue +
+content ack; `nextExpectedClientSequence` hold + 100ms gap skip; hide admit +
+bootstrap next-macrotask commit + 500ms Rust fallback; Escape
+`queueMicrotask`; sticky registration violation; capture clear-on-Shell-show
+policy.
 
 ## 12. Out of scope
 
 Notes business; guaranteed foreground restore; live search streaming;
 concurrent host-key handlers.
 
-## 13. Decisions closed in revision 3
+## 13. Decisions closed in revision 4
 
 | Topic | Decision |
 |---|---|
-| Cross-WV protocol | main-only enqueue + panel-content-only ack; ordered by clientSequence |
+| Cross-WV protocol | Frozen names; main-only enqueue + panel-content-only ack |
+| clientSequence order | Serialized launcher enqueue **and** Rust `nextExpected` + hold + 100ms gap skip; exhaustion → teardown |
 | Ack timeout | Disarm + ExplicitReturn teardown (no concurrent next handler) |
-| requestHide observability | Admit command result → resolve Promise; Rust auto-commit after |
-| Escape | Capture record + single `setTimeout(0)` macrotask only |
+| requestHide observability | Admit → resolve Promise → next-macrotask commit; Rust 500ms auto-commit **fallback only** |
+| Escape | Capture record + single `queueMicrotask`; sync preventDefault only |
 | Primary+N | Platform-specific Ctrl **xor** Meta |
 | Illegal onHostKey | Sticky violation; ready always fails |
-| Repeat show capture | Replace only on hidden→shown or external foreground re-show |
+| Repeat / Shell show capture | Keep if UiPilot-focused repeat; **clear** on Shell-class show; replace on restorable external |
 
 ## 14. Approval
 
-Status remains **Draft** until review accepts revision 3. Do not implement
+Status remains **Draft** until review accepts revision 4. Do not implement
 until Status is **Approved**.
