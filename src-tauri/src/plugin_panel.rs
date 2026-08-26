@@ -345,13 +345,13 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   let invoke = null;
   let readySent = false;
   let storageSession = null;
-  const hostKeys = deepFreeze(__HOST_KEYS__);
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
     seen.add(value);
     for (const key of Reflect.ownKeys(value)) deepFreeze(value[key], seen);
     return Object.freeze(value);
   };
+  const hostKeys = deepFreeze(__HOST_KEYS__);
   const expiredStorage = deepFreeze({
     get: async () => { throw new Error('ExpiredWindowSessionError'); },
     set: async () => { throw new Error('ExpiredWindowSessionError'); },
