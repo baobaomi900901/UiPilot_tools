@@ -1,7 +1,7 @@
 # Public Plugin Panel Key Routing And Hide Design
 
 **Date:** 2026-08-26  
-**Status:** Draft — awaiting review  
+**Status:** Draft — awaiting review (revision 2; closes review P1/P2)  
 **Related:**  
 `docs/superpowers/specs/2026-08-24-public-plugin-panel-mode-design.md`,  
 `docs/superpowers/specs/2026-08-25-public-plugin-panel-focus-host-input-design.md`,  
@@ -12,18 +12,21 @@
 Extend the host-owned public `panel` contract so a live panel session can:
 
 1. Receive a **small, declared** set of host-originated keys while the tagged
-   argument input owns keyboard focus (ArrowDown / ArrowUp / Ctrl+N / Meta+N).
+   argument input owns keyboard focus (ArrowDown / ArrowUp / Primary+N).
 2. Request launcher hide and session discard from panel content
    (`requestHide()`).
 3. Have **Escape** in the panel child WebView match Escape in the tagged
    argument input (hide + discard), subject to modal / `preventDefault`
    arbitration.
-4. On hide, **best-effort** restore the foreground window that owned focus when
-   UiPilot was shown, without failing an already-successful hide.
+4. On **explicit return hides**, **best-effort** restore the foreground window
+   captured when UiPilot was shown, without failing an already-successful hide
+   admission.
 
-Host remains DOM-agnostic: it never names plugin widgets such as “list” or
-“editor”, never queries plugin DOM, and never synthesizes DOM `KeyboardEvent`s
-into the child WebView.
+Host remains DOM-agnostic for plugin widgets: it never names “list” or
+“editor”, never queries plugin-authored selectors, and never synthesizes DOM
+`KeyboardEvent`s into the child WebView. The **sole** Host DOM probe in content
+is the standard-element check `dialog[open]` used only for Escape arbitration
+(§8)—an explicit exception, not a general DOM API.
 
 ## 2. Non-goals
 
@@ -38,8 +41,8 @@ into the child WebView.
 - Guaranteeing Windows `SetForegroundWindow` success in every environment.
 - Letting panel content call `hide_launcher`, Tauri `invoke`, or main-DOM APIs
   directly.
-- Changing Escape / hide semantics for non-panel launcher modes beyond sharing
-  the existing hide pipeline and foreground-restore capture.
+- Restoring a prior foreground app after **blur-hide** or after hide caused by
+  launching another app from a result (would steal the user’s new focus).
 
 ## 3. Public API
 
@@ -57,9 +60,9 @@ export interface PluginPanelHostKeyEvent {
   metaKey: boolean
   shiftKey: boolean
   altKey: boolean
-  /** Canonical decimal session epoch for the delivery that produced this event. */
+  /** Canonical decimal session epoch for this delivery. */
   sessionEpoch: U64Decimal
-  /** Monotonic route sequence for this session; latest-wins / stale discard. */
+  /** Monotonic per-session route sequence; at-most-once + serial ack. */
   routeSequence: U64Decimal
 }
 
@@ -81,384 +84,480 @@ Rules for `onHostKey`:
 - Exactly **one** handler may be registered per content document lifetime
   (same posture as `onUpdate`: second registration throws `TypeError`).
 - Content that declares a non-empty `panel.hostKeys` **must** register
-  `onHostKey` before content-ready is accepted (see §5).
+  `onHostKey` before content-ready is accepted (§5).
 - Content that declares empty / omitted `hostKeys` **must not** register
-  `onHostKey` (registration throws `TypeError`) so unused plugins stay
-  unchanged.
-- The handler receives a **frozen DTO** only. Host must not dispatch synthetic
-  DOM `keydown` / `keyup` into the child document (`isTrusted` synthesis is
-  out of contract).
-- Handler return / thrown errors do not retry delivery; host logging is
-  optional and must not surface plugin internals to other plugins.
+  `onHostKey` (registration throws `TypeError`).
+- The handler receives a **frozen DTO** only—no synthetic DOM keydown.
+- Unsubscribe behavior is frozen in §6.5 (not a silent detach).
 
-### 3.2 `requestHide()`
+### 3.2 `requestHide()` — admission Promise (not post-teardown settlement)
 
 ```ts
 window.uipilotPluginPanel.requestHide(): Promise<void>
 ```
 
-- No arguments; bootstrap privately supplies `sessionEpoch`.
-- Authorized only for the live panel-content caller matching that epoch.
-- Success runs the **shared** launcher hide pipeline (same teardown class as
-  Escape / blur-hide / tray hide for a live panel): clear result registry as
-  today, hide the main window, destroy the panel child WebView, clear tag /
-  session UI, bump/drop session so in-flight work cannot revive it.
-- Does not modify clipboard, argument text, or plugin storage.
-- Idempotent for a still-current session that is already hiding / torn down
-  after a successful hide commit (second call resolves as no-op).
+**Problem this freezes:** resolving “after hide + teardown” is not observable:
+teardown destroys the child WebView that owns the Promise microtask queue.
 
-### 3.3 Manifest field
+**Frozen contract:**
+
+- `requestHide()` is a **hide-admission** Promise.
+- It resolves when the Host has **accepted and linearized** a hide request for
+  the caller’s live `sessionEpoch` into the shared launcher hide owner (same
+  owner as Escape on main)—**before** destroying the panel content WebView.
+- After resolve, hide + teardown + optional foreground restore continue as a
+  **terminal host operation**. The plugin must treat the call as fire-and-forget
+  after admission; it must not await further settlement from the dying document.
+- Reject `windowFailed` only if admission fails (cannot acquire hide owner /
+  session already racing to a conflicting visible state) **before** the
+  terminal path starts.
+- Stale / wrong epoch / unauthorized-in-pattern caller → resolve no-op without
+  starting hide.
+- Does not modify clipboard, argument text, or plugin storage.
+- Idempotent: a second admission after the first accepted hide for that epoch
+  resolves no-op.
+
+Internal Escape-in-content uses the same admission + terminal path; it does not
+expose a Promise to plugin code.
+
+### 3.3 Manifest `hostKeys`
 
 ```json
 {
   "panel": {
     "entry": "dist/panel.html",
-    "hostKeys": ["ArrowDown", "ArrowUp", "Ctrl+N"]
+    "hostKeys": ["ArrowDown", "ArrowUp", "Primary+N"]
   }
 }
 ```
 
-`PublicPanelV1` gains optional `hostKeys`:
+`PublicPanelV1` gains optional `hostKeys: PanelHostKeyDeclaration[]`.
 
-```ts
-hostKeys?: ReadonlyArray<PanelHostKeyDeclaration>
-```
+Frozen declaration grammar (deny unknown; unique; max length small, e.g. ≤ 8):
 
-Frozen declaration grammar (string enum, deny unknown):
-
-| Declaration | Matches when tagged input receives |
+| Declaration | Matches tagged-input keydown when |
 |---|---|
-| `"ArrowDown"` | `key === 'ArrowDown'`, no Ctrl/Meta/Alt required; Shift ignored for matching |
-| `"ArrowUp"` | `key === 'ArrowUp'`, same modifier rule |
-| `"Ctrl+N"` | `key` is `n`/`N`, `ctrlKey === true`, `metaKey === false`, `altKey === false` |
+| `"ArrowDown"` | `key === 'ArrowDown'`, `ctrlKey === false`, `metaKey === false`, `altKey === false`, **`shiftKey === false`** |
+| `"ArrowUp"` | same for `ArrowUp` |
+| `"Primary+N"` | `key` is `n`/`N`, `altKey === false`, **`shiftKey === false`**, and exactly one of (`ctrlKey && !metaKey`) or (`metaKey && !ctrlKey`) |
 
 Matching rules:
 
-- `hostKeys` omitted or `[]` → Host intercepts **no** keys for panel routing
-  (today’s behavior).
-- Declarations are unique; duplicates are a package validation error.
-- Only the table above is valid. No `"Meta+N"` token: on platforms where the
-  host maps Command to `metaKey`, **`"Ctrl+N"` also matches**
-  `metaKey === true && ctrlKey === false && key n/N && !altKey` so one
-  declaration covers Windows Ctrl and macOS Command without a second token.
-  Delivery DTO still reports the real `ctrlKey` / `metaKey` bits.
-- Ordinary character keys, IME composition keys, and undeclared chords are
+- Omitted or `[]` → Host intercepts **no** keys for panel routing.
+- Extended chords (e.g. Shift+Arrow, Ctrl+Shift+N) require **future explicit
+  declarations**; this design does **not** route them under the base tokens.
+- Ordinary characters, IME composing (`isComposing`), and undeclared chords are
   never routed.
-- Shift+Arrow and Shift+Ctrl+N are **not** distinct declarations; if the base
-  declaration is present, Host still routes and sets `shiftKey` in the DTO.
-  Plugins that dislike Shift may ignore the event.
+- Delivery DTO reports the real modifier bits of the physical keydown.
 
-Schema, Rust `PublicPanelV1`, CLI package policy, SDK d.ts, and developer
-docs must stay aligned.
+`"Primary+N"` is the platform-primary accelerator for New (Ctrl on Windows,
+Command on macOS). Separate `"Ctrl+N"` / `"Meta+N"` tokens are **not** in v1;
+they may be added later without redefining `"Primary+N"`.
+
+### 3.4 Launcher data path for `hostKeys` (frozen)
+
+Tagged input cannot `preventDefault` correctly unless the main WebView knows the
+live session’s declarations. Path:
+
+1. **Rust** reads `hostKeys` from the installed/prepared manifest when opening
+   or submitting a panel session (bound to that plugin generation).
+2. **`PluginPanelCommandResult`** (open + submit responses) gains:
+   ```ts
+   export interface PluginPanelCommandResult {
+     sessionEpoch: U64Decimal
+     pluginId: string
+     commandLabel: string
+     /** Canonical sorted copy of manifest panel.hostKeys; empty array if none. */
+     hostKeys: readonly PanelHostKeyDeclaration[]
+   }
+   ```
+   Exact key set for parsers:  
+   `['commandLabel', 'hostKeys', 'pluginId', 'sessionEpoch']`  
+   (`hostKeys` always present; use `[]` when undeclared).
+3. **TS parser** (`parsePluginPanelCommandResult`) validates each declaration
+   against the frozen enum, rejects unknown strings, rejects duplicates, and
+   rejects non-arrays.
+4. **`launcher-core`** stores `model.panel.hostKeys` only when installing /
+   refreshing panel UI for a matching `sessionEpoch` + `pluginId`. Stale
+   command results (epoch ≠ live UI epoch, or pluginId mismatch) must not
+   overwrite `hostKeys`.
+5. **`panelKeyDown`** matches keydown against `snapshot`/`model.panel.hostKeys`
+   for the **current** epoch only. If `hostKeys` is empty, behavior matches
+   pre-0.3.1 intercept set (Enter / Escape / Backspace-at-0 only).
+
+Submit responses must carry the same `hostKeys` snapshot as open (manifest
+immutable for a generation) so UI refresh cannot drop declarations.
+
+Private events that disable routing (§6.5) must clear or replace launcher
+`hostKeys` under the same epoch guard.
 
 ## 4. Host version and compatibility
 
 | Field | Decision |
 |---|---|
-| Host release | Bump to **`0.3.1`** (Cargo / app version / CLI `PLUGIN_CLI_HOST_VERSION` / `PublicPluginHost::current`). |
-| Plugin `minimumHostVersion` | Plugins that set non-empty `hostKeys`, or that call `onHostKey` / `requestHide` in shipped content, **must** declare `minimumHostVersion >= "0.3.1"`. |
-| `schemaVersion` | Remains **`1`**. Additive optional `panel.hostKeys`; unknown keys still denied by `deny_unknown_fields`. |
-| `apiVersion` | Remains **`1`**. New panel bridge methods are additive for hosts that advertise 0.3.1+; old hosts reject packages that require 0.3.1 via the existing minimum-host gate before install/activation. |
+| Host release | **`0.3.1`** |
+| Plugin `minimumHostVersion` | Non-empty `hostKeys`, or shipped use of `onHostKey` / `requestHide`, requires `>= 0.3.1` |
+| `schemaVersion` / `apiVersion` | Remain **`1`** (additive optional field + bridge methods; floor via host version) |
 
-Compatibility argument:
-
-- Old panel packages without `hostKeys` validate and run on 0.3.1 with
-  **identical** keyboard and hide behavior aside from shared Escape-in-content
-  handling (see §8), which is a host HCI fix required by the 2026-08-24 panel
-  design §3.5 and applies to all panel sessions.
-- New APIs are unused unless the plugin opts in via manifest and/or calls them.
-- Keeping `apiVersion: 1` avoids forcing a parallel runtime module ABI; the
-  host version floor carries the capability boundary.
+Old packages without `hostKeys` keep prior routing. Content Escape hide (§8) is
+a host HCI fix for all panels on 0.3.1+ (2026-08-24 §3.5).
 
 ## 5. Ready gate for `hostKeys`
 
-Content ready handshake (existing `plugin_panel_content_ready`) gains an
-additional host-side check when `hostKeys` is non-empty:
+When `hostKeys` is non-empty:
 
 1. Bootstrap exposes `onHostKey` before ready may succeed.
-2. Content must call `onHostKey(handler)` exactly once **before** invoking
-   ready (same ordering expectation as `onUpdate` today).
-3. If ready arrives with non-empty declared `hostKeys` and no handler
-   installed → ready fails → session rolls back (destroy content, clear tag,
-   surface existing runtime-not-ready / open failure path).
-4. If `hostKeys` is empty/omitted and content calls `onHostKey` → throw in
-   bootstrap; ready must not succeed with a forbidden handler.
+2. Content must register exactly one `onHostKey` handler **before** ready.
+3. Ready without handler → fail + session rollback.
+4. Empty/omitted `hostKeys` + `onHostKey` call → bootstrap `TypeError`; ready
+   must fail if somehow invoked.
 
-This prevents “declared routing with a deaf panel” and keeps opt-in explicit.
+Bootstrap privately notifies Rust that the host-key receiver is **armed** for
+this epoch (part of ready success). Launcher may only intercept declared keys
+after the panel UI epoch is live **and** (if `hostKeys` non-empty) content
+ready has armed the receiver.
 
-## 6. Key routing ownership and sequence
+## 6. Key routing: serial at-most-once delivery
 
-### 6.1 Route ticket
+### 6.1 Why not latest-wins
 
-Under the panel controller lock, Host maintains at most one current
-`HostKeyRouteTicket` per live session:
+ArrowDown is not idempotent focus-transfer: dropping an intermediate press
+loses a navigation step. Host-key routes are therefore **queued and serial**,
+not focus-style latest-wins.
+
+### 6.2 Route ticket and queue
+
+Per live session:
 
 ```text
+HostKeyRouteState {
+  sessionEpoch: u64
+  nextSequence: u64          // starts at 1; see exhaustion §6.6
+  receiverArmed: bool
+  queue: VecDeque<HostKeyRouteTicket>  // bounded, see below
+  inFlight: Option<HostKeyRouteTicket>
+}
+
 HostKeyRouteTicket {
-  sessionEpoch: u64,
-  routeSequence: u64,   // monotonic per session, non-zero
-  declaration: PanelHostKeyDeclaration,
-  phase: Prepared | NativeFocused | Delivered | Cancelled,
+  sessionEpoch: u64
+  routeSequence: u64
+  declaration: PanelHostKeyDeclaration
+  phase: Prepared | NativeFocused | DeliveredAwaitingAck | Accomplished | Cancelled
 }
 ```
 
-Latest-wins: a newer route supersedes an older undelivered ticket; the older
-path becomes stale and must not deliver.
+Bounds:
 
-### 6.2 Tagged-input intercept order
+- Max queue depth **8**. If full when a new declared key arrives:  
+  `preventDefault` still runs (key must not type into the suffix), but the new
+  press is **dropped** (at-most-once; no coalescing into a single “jump”).
+  Optional host metric; no plugin-visible error.
+- Only **one** `inFlight` delivery at a time.
 
-When the tagged argument `<input>` receives a keydown that matches a declared
-`hostKeys` entry and IME `isComposing === false`:
+### 6.3 Delivery + ack protocol
 
-1. Confirm live panel UI/`sessionEpoch` still matches the mounted session.
-2. `preventDefault()` (and `stopPropagation()` as needed) so the suffix input
-   does not insert text or move caret for that chord.
-3. Allocate / install a route ticket `{ sessionEpoch, routeSequence++ }` bound
-   to the matched declaration.
-4. Move **native** keyboard focus to the current panel child WebView (Host
-   focuses the WebView itself only—not a plugin CSS selector).
-5. Re-validate ticket + session still current after native focus returns.
-6. Deliver `PluginPanelHostKeyEvent` through the panel bridge private update
-   channel (bootstrap invokes the registered `onHostKey` handler with a frozen
-   DTO). Delivery must not use synthesized DOM keyboard events.
-7. Plugin handler decides focus inside its own document (list, dialog, etc.).
+Tagged-input keydown matching a declaration (`isComposing === false`):
 
-Stale epoch, teardown, session replacement, superseded `routeSequence`, or
-native-focus failure after ticket install → **silent discard** (no handler
-call). Failures that occur before hide/teardown must not leave a reusable
-blur-suppression token (same discipline as `focusHostInput`).
+1. Confirm live UI epoch / identity and `receiverArmed`.
+2. `preventDefault` (+ stopPropagation as needed).
+3. Enqueue ticket with `routeSequence = nextSequence++` (if queue not full).
+4. If no `inFlight`, start pump (§6.4).
 
-Enter while focus is on the tagged input remains **submit**, never a host-key
-route, even if a plugin wished otherwise.
+Pump for head / `inFlight`:
 
-### 6.3 Key routing table (tagged argument input)
+1. Phase `Prepared` → native-focus the panel child WebView (WebView only).
+2. Re-validate epoch + ticket still head/`inFlight`.
+3. Deliver frozen `PluginPanelHostKeyEvent` via bootstrap → `onHostKey`.
+4. Phase `DeliveredAwaitingAck`.
+5. Bootstrap **must** ack after the handler settles:
+   - Sync return → ack immediately.
+   - Returned Promise → ack on fulfill **or** reject (errors still ack;
+     no retry).
+   - Ack command carries `{ sessionEpoch, routeSequence }` (main or
+     panel-content capability as implementation chooses; prefer
+     panel-content private command parallel to storage, with bootstrap
+     holding invoke).
+6. Ack timeout: **2 seconds**. On timeout Host acks as cancelled for that
+   sequence (clears `inFlight`) and continues the queue—**does not** teardown
+   solely for handler hang.
+7. Matching ack → `Accomplished`, clear `inFlight`, pump next.
+
+Stale ack (wrong epoch / sequence / no in-flight match) → no-op.
+
+Teardown / epoch bump → cancel queue + in-flight; no further deliveries.
+
+### 6.4 Native focus during serial pump
+
+Native focus to the child WebView runs **once per ticket** before that ticket’s
+DTO delivery. If the child already has focus, focus call is still allowed and
+must be cheap/success no-op. Blur-hide tickets must compose with
+`focusHostInput` rules so routing does not spuriously hide.
+
+### 6.5 Unsubscribe / disarm (frozen)
+
+`onHostKey` returns an unsubscribe function. **Silent unsubscribe that leaves
+Host intercepting keys into a dead receiver is forbidden.**
+
+Frozen behavior when `hostKeys` was non-empty and a handler was armed:
+
+- Calling unsubscribe **disarms** the receiver for this epoch and **starts the
+  same terminal hide/teardown path as `requestHide` admission** for that epoch
+  (panel session cannot remain “declared keys, no listener”).
+- Unsubscribe after teardown → no-op.
+- Host notifies main (private event or command result side channel) so
+  `model.panel.hostKeys` is cleared / panel discarded under epoch guard
+  **before or as** intercept stops—never leave a live tagged input still
+  swallowing ArrowDown with nowhere to deliver.
+
+Rationale: a panel that drops its only host-key handler has broken the ready
+invariant; recovering by continuing to eat keys is worse than ending the
+session.
+
+### 6.6 `routeSequence` exhaustion
+
+- `nextSequence` is `u64`, starts at `1`, increments by 1 per accepted enqueue.
+- If `nextSequence` would overflow `u64::MAX`, Host **disarms routing** and
+  runs requestHide-equivalent teardown for the epoch (pathological; must be
+  tested as a unit branch). No wrap-around reuse within an epoch.
+
+### 6.7 Key routing table (tagged argument input)
 
 | Key / chord | Declared? | Host action |
 |---|---|---|
-| ArrowDown / ArrowUp | yes | Route per §6.2 |
-| ArrowDown / ArrowUp | no | No intercept; default input behavior (typically no-op in empty/single-line) |
-| Ctrl+N / Meta+N (as §3.3) | yes | Route per §6.2 |
-| Ctrl+N / Meta+N | no | No intercept |
-| Enter | n/a | Submit panel argument (unchanged) |
-| Escape | n/a | Hide + discard (unchanged on main) |
+| ArrowDown / ArrowUp (no Ctrl/Meta/Alt/Shift) | yes | Enqueue + serial deliver |
+| ArrowDown / ArrowUp | no | No intercept |
+| Primary+N (Ctrl xor Meta, no Shift/Alt) | yes | Enqueue + serial deliver |
+| Primary+N | no | No intercept |
+| Shift+Arrow / Ctrl+Shift+N / etc. | n/a in v1 | Never routed under base declarations |
+| Enter | n/a | Submit (unchanged) |
+| Escape | n/a | Hide admission (unchanged on main) |
 | Backspace at caret 0 | n/a | Close tag (unchanged) |
-| Other keys / IME composing | n/a | Never routed |
-| Ordinary characters | n/a | Never routed |
+| IME composing / ordinary characters | n/a | Never routed |
 
-### 6.4 Why not synthetic DOM keydown
+## 7. `requestHide` authorization
 
-Synthetic events are `isTrusted: false`, inconsistently handled by browsers and
-assistive tech, and couple Host to plugin key-listener style. An explicit
-`onHostKey` DTO is deterministic, testable, and versioned.
+1. Capability: `plugin-panel-content-*` only.
+2. Label → plugin id; compare with live identity + bootstrap epoch.
+3. In-pattern stale → resolve no-op.
+4. Outside capability → capability denial.
+5. Live match → **admit** hide (resolve Promise) then terminal shared hide
+   pipeline (§3.2).
 
-## 7. `requestHide` authorization and outcomes
+| Condition | Promise | Terminal hide? |
+|---|---|---|
+| Live admit success | Resolve | Yes |
+| Stale / no session | Resolve no-op | No |
+| Admit failure before terminal start | Reject `windowFailed` | No |
+| Foreground restore fails after admit | Already resolved | Restore best-effort only |
+| Second call after admit | Resolve no-op | No duplicate hide owner |
 
-Authorization order (fail closed):
-
-1. Capability: only `plugin-panel-content-*`.
-2. Parse panel-content label → plugin id.
-3. Compare label, plugin id, and bootstrap `sessionEpoch` to live
-   `PanelSessionIdentity`.
-4. Mismatch after capability pattern match → **resolve Ok no-op** (do not leak
-   whether another session exists)—same privacy posture as
-   `focusHostInput` stale callers.
-5. Callers outside the capability pattern → capability denial.
-
-Outcome table:
-
-| Condition | Result |
-|---|---|
-| Live authorized session, hide pipeline succeeds | Resolve after hide committed |
-| No live session / wrong epoch / stale content caller in-pattern | Resolve, no-op |
-| Hide pipeline fails **before** hide is committed | Reject `windowFailed`; session remains unless an independent teardown raced |
-| Hide committed; foreground restore fails | **Still resolve**; restore is best-effort (§9) |
-| Concurrent second `requestHide` after commit | Resolve, no-op |
-| Main / find / plugin-window caller | Capability rejection |
-
-Hide commit boundary: once the shared hide function has successfully hidden the
-main window (or observed it already hidden as part of the same linearized hide
-owner) and panel teardown for this epoch has been requested, the Promise must
-not reject solely because foreground restore failed.
-
-Do not teardown the panel **before** hide ownership is acquired if that would
-leave the user with a torn panel while the window stays visible; follow the
-existing single hide-owner pattern in launcher-core / `hide_launcher`.
+Do not destroy content **before** Promise admission resolve is scheduled on the
+content side (implementation: resolve/ack to bootstrap first, then teardown on
+main/host timeline).
 
 ## 8. Escape in panel content
 
-Bootstrap installs a capture-or-bubble listener on the content document for
-`keydown` Escape with frozen arbitration:
+**DOM exception:** Host may read **only** `document.querySelector('dialog[open]')`
+(standard HTML dialog). No other plugin DOM inspection.
 
-1. If `event.isComposing === true` → ignore.
-2. If `document.querySelector('dialog[open]')` is non-null at keydown time →
-   **Host does not hide**. Content / UA closes or keeps the dialog.
-3. After the event finishes propagating through content handlers, if
-   `event.defaultPrevented === true` → **Host does not hide** (plugin opted
-   out synchronously via `preventDefault()`).
-4. Otherwise Host invokes the **same internal hide path** as `requestHide()`
-   (shared pipeline; not a second semantics).
-5. Repeated Escape while hide is in flight is idempotent.
+Listener discipline (order matters):
 
-Notes:
+1. Bootstrap registers a **capture-phase** `keydown` listener that runs first
+   among Host listeners and **records**:
+   - `isComposing`
+   - `hadOpenDialog = Boolean(document.querySelector('dialog[open]'))`
+   - It does **not** hide in capture.
+2. Event propagates through target/bubble so plugin handlers may call
+   synchronous `preventDefault()`.
+3. Bootstrap registers a **bubble-phase** (or `setTimeout(0)` microtask **only if**
+   equivalent to “after listeners of this turn”—prefer bubble on `window` /
+   `document` with Host listener registered to run **after** plugin bubble
+   handlers via registration order documented in bootstrap) that:
+   - Ignores if recorded `isComposing`.
+   - Ignores if recorded `hadOpenDialog` (dialog state sampled at capture,
+     not re-queried after plugins close it mid-event—closing on this Escape
+     is content’s job; a subsequent Escape hides).
+   - Ignores if `event.defaultPrevented`.
+   - Otherwise admits the shared hide path (same as `requestHide` terminal).
 
-- Async `preventDefault` after an `await` cannot cancel hide; only synchronous
-  prevention during the keydown turn counts.
-- Multiple open dialogs: any `dialog[open]` suppresses Host hide.
-- Closing the last dialog and pressing Escape again hides.
-- Teardown races: Escape after epoch replacement is a no-op.
+This prevents “Host capture hides before plugin `preventDefault`” races.
 
-This closes the HCI gap in 2026-08-24 §3.5 where Escape was only wired on the
-main WebView React tree.
+Async `preventDefault` after `await` cannot cancel hide.
 
-## 9. Windows foreground restore (best-effort, shared)
+## 9. Windows foreground restore
 
-### 9.1 Capture
-
-On each **explicit show** of the main launcher (hotkey, tray, or other
-host-owned show entry—not accidental focus), native code captures
-`GetForegroundWindow()` **before** UiPilot becomes foreground, bound to that
-show’s invocation / generation id.
-
-Do **not** store:
-
-- UiPilot main / find / panel-content HWNDs
-- NULL / invalid handles
-- Handles that fail a recoverability check at capture time (optional early drop)
-
-A newer show generation invalidates older captures.
-
-### 9.2 Restore
-
-After a successful hide commit and panel teardown for a hide that should return
-to the prior app (Escape, `requestHide`, blur-hide, tray hide—**shared**
-lifecycle, not Notes-only):
-
-1. Load capture for the show generation being dismissed.
-2. Re-check: handle still valid, window visible (or iconically acceptable per
-   existing Win32 norms chosen in implementation), not owned by UiPilot.
-3. Call normal foreground APIs only (`SetForegroundWindow` / related allow
-   calls already used elsewhere). **No** synthesized keyboard or mouse input.
-4. If the system rejects foreground switch → record a downgraded result
-   (log/metric); **do not retry**; **do not** affect hide Promise success.
-
-### 9.3 Contract boundary
-
-Foreground restore is **best-effort**. Design and docs must state that some
-Windows focus policies can deny restoration; hide success is independent.
-Manual acceptance includes the common Notepad → hotkey → hide path but does
-not claim universality.
-
-## 10. Event timing diagram (host key)
+### 9.1 `HideReason`
 
 ```text
-Tagged input keydown (declared)
-  → launcher preventDefault
-  → install HostKeyRouteTicket(epoch, seq)
-  → native focus panel child WebView
-  → re-check ticket current
-  → bootstrap onHostKey(DTO)
-  → plugin focuses its own controls / opens dialogs
+enum HideReason {
+  ExplicitReturn,   // Escape (main or content), requestHide, unsubscribe-teardown
+  Blur,             // app focus loss hide
+  LaunchHandoff,    // hide because another app/result was launched
+  Other,            // tray-only dismiss without return intent, etc.
+}
+```
 
-Meanwhile: teardown / newer seq / epoch bump
-  → ticket Cancelled
-  → no DTO delivery
+**Restore prior capture only for `ExplicitReturn`.**  
+`Blur` and `LaunchHandoff` **must not** restore—the user’s newly focused app
+(or launched target) already owns the foreground.
+
+### 9.2 Capture (show generation)
+
+On each explicit show (hotkey, tray, …), before UiPilot takes foreground,
+capture:
+
+```text
+ForegroundCapture {
+  showGeneration: u64,
+  hwnd: HWND,
+  pid: u32,           // process id at capture time
+}
+```
+
+Rules:
+
+- Skip UiPilot-owned HWNDs, NULL, and failed recoverability checks.
+- **Tray show:** if foreground at capture is Shell / taskbar / desktop class
+  (implementation allowlist of non-restorable owners), store **no** capture
+  (restore becomes no-op) rather than restoring Explorer spuriously.
+- Hotkey show from an ordinary app (e.g. Notepad) stores that HWND+PID.
+- Newer `showGeneration` invalidates older captures.
+
+### 9.3 Restore
+
+After terminal hide with `HideReason::ExplicitReturn`:
+
+1. Load capture for the show generation being dismissed.
+2. Re-validate: HWND still valid; **PID still matches** the captured pid for
+   that HWND (mitigate HWND reuse); not UiPilot-owned; suitable visibility.
+3. Normal foreground APIs only—no input synthesis.
+4. Denial → log/metric; **no retry**; never fails hide admission already
+   resolved.
+
+## 10. Timing diagrams
+
+### Host key
+
+```text
+keydown (declared) on tagged input
+  → preventDefault
+  → enqueue ticket(seq)
+  → pump: native focus child WV
+  → onHostKey(DTO)
+  → handler settle
+  → ack(epoch, seq)
+  → pump next
+
+unsubscribe(onHostKey)
+  → disarm + ExplicitReturn hide admit
+  → launcher clears panel/hostKeys under epoch guard
+```
+
+### requestHide
+
+```text
+content requestHide()
+  → authorize
+  → admit (Promise resolve)     // still in live content WV
+  → terminal hide (HideReason::ExplicitReturn)
+  → teardown content WV
+  → optional foreground restore
 ```
 
 ## 11. Relationship to `focusHostInput`
 
 | Direction | API |
 |---|---|
-| Panel content → tagged input | `focusHostInput()` (2026-08-25) |
-| Tagged input → panel content (declared keys only) | `onHostKey` + native WebView focus (this design) |
-| Panel content → hide launcher | `requestHide()` / content Escape (this design) |
-
-`focusHostInput` remains unchanged. Host-key routing must compose with existing
-focus-revision / blur-hide tickets so panel↔main focus transfers do not spuriously
-hide during routing.
+| Content → tagged input | `focusHostInput()` (2026-08-25) |
+| Tagged input → content (declared) | `onHostKey` + serial ack (this design) |
+| Content → hide | `requestHide` admission / Escape (this design) |
 
 ## 12. Testing matrix (frozen)
 
-### Manifest / package
+### Launcher `hostKeys` path
 
-- Omitting `hostKeys` validates; Host intercepts nothing new for routing.
-- Empty `hostKeys: []` same as omit.
-- Valid `["ArrowDown","ArrowUp","Ctrl+N"]` accepted.
-- Unknown declaration, duplicates, or `hostKeys` on non-panel packages rejected.
-- CLI / schema / Rust manifest / d.ts agree.
+- Open/submit `PluginPanelCommandResult` includes validated `hostKeys`.
+- Parser rejects unknown declarations / wrong shapes.
+- Stale epoch or pluginId result cannot overwrite live `model.panel.hostKeys`.
+- Empty `hostKeys` → no ArrowDown intercept.
 
-### Ready gate
+### Serial routing
 
-- Non-empty `hostKeys` without `onHostKey` before ready → ready failure + rollback.
-- Empty `hostKeys` + `onHostKey` registration → bootstrap error; ready fails.
-- Non-empty + single `onHostKey` + `onUpdate` → ready succeeds.
+- Two quick ArrowDown presses → two deliveries with consecutive sequences when
+  handler acks promptly; no dropped middle press while queue has capacity.
+- Queue full → preventDefault but no enqueue; prior items still drain.
+- Handler throw / reject → still ack; next item pumps.
+- Ack timeout clears inFlight and continues.
+- Stale ack no-op.
+- `routeSequence` exhaustion branch tears down (unit).
 
-### Routing
+### Unsubscribe
 
-- Undeclared ArrowDown/Ctrl+N not intercepted.
-- Declared ArrowDown: focus moves to child WebView, then exactly one DTO with
-  matching `sessionEpoch` / increasing `routeSequence`.
-- Declared Ctrl+N and Meta+N produce precise modifier bits; no double delivery
-  for one physical keydown.
-- IME composing keydown never routes.
-- Ordinary characters never route.
-- Stale epoch, teardown, replacement, superseded route sequence → no delivery.
-- Enter still submits; never routed as host key.
+- Unsubscribe with live non-empty `hostKeys` → session teardown; tagged input
+  no longer swallows keys; launcher panel identity cleared.
 
-### `requestHide` / Escape
+### requestHide
 
-- Caller / session guards per §7.
-- Successful hide clears tag, session, and child WebView.
-- Hide failure before commit does not teardown early.
-- Foreground restore failure does not reject hide.
-- Escape + `dialog[open]` does not hide.
-- Escape + sync `preventDefault` does not hide.
-- Escape + composing ignored.
-- Repeated Escape / concurrent `requestHide` idempotent.
-- Capability only `plugin-panel-content-*` for content commands; main-only for
-  any ack/private main events if introduced symmetrically.
+- Promise resolves on admission while content WV still alive (test via
+  bootstrap probe / ordering assertion).
+- Teardown follows admission; caller need not observe post-teardown settle.
+- Stale caller no-op resolve.
 
-### Compatibility
+### Escape
 
-- Pre-0.3.1 host rejects packages with `minimumHostVersion: 0.3.1`.
-- Old panel demos without `hostKeys` still stage and run.
+- Capture records `dialog[open]`; plugin bubble `preventDefault` prevents hide.
+- Host does not hide in capture before plugin handlers run.
+- Composing ignored.
+
+### Foreground
+
+- ExplicitReturn restore attempts PID+HWND check.
+- Blur hide does not restore.
+- LaunchHandoff does not restore.
+- Tray capture of Shell → empty capture.
+- Restore failure does not affect hide admission.
+
+### Compatibility / capability
+
+- As revision 1, plus new result field exact-key parsers.
+- Content commands remain panel-content-only.
 
 ### Manual
 
-- User verifies Notepad (or equivalent) foreground restore after hide; agents
-  must not drive the user’s mouse/keyboard.
+- Notepad → hotkey → Notes/panel Escape or requestHide → focus returns when
+  OS allows; agents do not drive user input.
 
-## 13. Documentation and demo updates (implementation phase)
+## 13. Implementation-phase doc/code touch list
 
-When coding (not this draft commit):
+- Manifest / schema / CLI / Rust `PublicPanelV1`
+- `PluginPanelCommandResult` + parsers + launcher model
+- Bootstrap: `onHostKey`, ack, Escape capture/bubble, `requestHide` admit
+- Panel controller: queue, serial pump, disarm
+- Lifecycle: `HideReason`, HWND+PID capture/restore
+- Host `0.3.1`; demo-panel contract only (not Notes)
 
-- Update `uipilot-plugin-api-v1.d.ts`, `uipilot-plugin-v1.schema.json`,
-  `public-plugin-v1.md`, developer guide.
-- Optionally extend `com.uipilot.demo-panel` with empty or minimal `hostKeys`
-  contract tests—**not** Notes business.
-- Host version `0.3.1` everywhere the floor is pinned.
+## 14. Out of scope
 
-## 14. Explicitly out of scope for implementation follow-ups of this design
+- Notes business behavior.
+- Guaranteed foreground restore.
+- Live search streaming / arbitrary host keys.
+- Redefining Enter submit.
 
-- Notes list/editor behavior, storage, or Ctrl+F beyond existing
-  `focusHostInput`.
-- Forwarding arbitrary shortcuts or building a plugin-defined keybinding UI in
-  Host.
-- Guaranteeing foreground restore under every Windows focus-stealing rule.
-- Changing R1 submit semantics or adding live search streaming.
-
-## 15. Open points resolved by this draft
+## 15. Decisions closed in revision 2
 
 | Topic | Decision |
 |---|---|
-| `focusPanelContent('list')` | Rejected |
-| Synthetic DOM keydown | Rejected; use `onHostKey` DTO |
-| `hostKeys` opt-in | Required; default empty |
-| Meta vs Ctrl for New | One declaration `Ctrl+N` matches Ctrl **or** Meta |
-| `requestHide` vs restore failure | Hide success independent of restore |
-| Escape vs dialog | Any `dialog[open]` blocks Host hide |
-| Version | Host `0.3.1`; `schemaVersion`/`apiVersion` stay 1 |
+| Launcher knowledge of `hostKeys` | Via `PluginPanelCommandResult.hostKeys` + epoch-guarded model |
+| Key delivery | Serial queue, at-most-once, ack, not latest-wins |
+| Unsubscribe | Disarm + ExplicitReturn teardown |
+| `requestHide` Promise | Admission resolve; terminal hide after |
+| Blur-hide restore | Forbidden; only `ExplicitReturn` |
+| Tray capture | Skip non-restorable Shell/desktop owners |
+| Escape vs DOM-agnostic | Sole `dialog[open]` exception; capture record + post-bubble check |
+| New shortcut token | `Primary+N`; Shift=false required |
+| HWND reuse | Persist HWND+PID; revalidate PID on restore |
 
 ## 16. Approval
 
-This document is the source of truth for subsequent implementation planning.
-Do not implement until Status is set to **Approved** after review.
+Status remains **Draft** until review accepts revision 2. Do not implement
+until Status is **Approved**.
