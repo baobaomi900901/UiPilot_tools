@@ -509,6 +509,8 @@ window.addEventListener('keydown', (event) => {
 })
 ```
 
+Panel 首次打开成功后，宿主会自动把光标放到命令 tag 后的参数输入框；插件不需要在启动时调用 `focusHostInput()`。当用户点击列表、编辑器等 Panel 内容后，插件可在 Ctrl+F 等明确交互中调用该方法，把键盘焦点交还给参数输入框。
+
 `focusHostInput()` 不接收参数，只把焦点交回当前会话带命令 tag 的参数输入框；它不会关闭面板、删除 tag、提交或改写参数与选择区。输入框已经聚焦时可以重复调用。会话已经隐藏、替换或销毁时调用会安静地无操作完成；当前会话的宿主聚焦失败会拒绝 Promise。
 
 非空 `panel.hostKeys` 要求页面在 ready 前恰好注册一次 `onHostKey(handler)`。声明只允许 `ArrowDown`、`ArrowUp`、`Primary+N`，并按该顺序规范化。方向键只匹配无修饰键；Windows 的 `Primary+N` 只匹配 Ctrl+N，macOS 只匹配 Meta+N。IME、Shift 变体、未声明按键和普通字符不会路由。handler 串行执行；抛错或拒绝会 ack 但不重试，超过 2 秒未完成会隐藏并销毁会话。调用 unsubscribe 也会结束会话。
