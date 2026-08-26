@@ -2162,11 +2162,11 @@ fn schedule_app_blur(
             if !controller.confirm_app_blur(&ticket) {
                 return;
             }
-            let Some(window) = dispatch_app.get_webview_window("main") else {
+            let Some(window) = dispatch_app.get_window("main") else {
                 return;
             };
             let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
-            let _ = crate::commands::clear_and_hide_reason(
+            let _ = crate::commands::clear_and_hide_window(
                 registries.main(),
                 &window,
                 crate::commands::HideReason::Blur,
@@ -2307,11 +2307,11 @@ pub(crate) fn start_host_key_pump(app: AppHandle, controller: Arc<PluginPanelCon
 fn schedule_host_key_terminal_hide(app: AppHandle) {
     let dispatch_app = app.clone();
     let _ = app.run_on_main_thread(move || {
-        let Some(window) = dispatch_app.get_webview_window("main") else {
+        let Some(window) = dispatch_app.get_window("main") else {
             return;
         };
         let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
-        let _ = crate::commands::clear_and_hide_reason(
+        let _ = crate::commands::clear_and_hide_window(
             registries.main(),
             &window,
             crate::commands::HideReason::ExplicitReturn,
@@ -2369,22 +2369,28 @@ fn schedule_committed_panel_hide(
     let scheduled = app
         .run_on_main_thread(move || {
             let result = (|| {
-                let window = dispatch_app.get_webview_window("main").ok_or(())?;
+                let Some(window) = dispatch_app.get_window("main") else {
+                    eprintln!(
+                        "[plugin-panel] committed hide failed for session {}; stage=main-window-missing",
+                        identity.session_epoch
+                    );
+                    return Err(());
+                };
                 let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
-                crate::commands::clear_and_hide_reason(
+                let result = crate::commands::clear_and_hide_window(
                     registries.main(),
                     &window,
                     crate::commands::HideReason::ExplicitReturn,
-                )
-                .map_err(|_| ())
-            })();
-            if finish_committed_panel_hide(dispatch_controller.as_ref(), identity, result).is_err()
-            {
-                eprintln!(
-                    "[plugin-panel] committed hide failed for session {}; ticket released",
-                    identity.session_epoch
                 );
-            }
+                if let Err(error) = &result {
+                    eprintln!(
+                        "[plugin-panel] committed hide failed for session {}; stage=shared-hide error={error:?}",
+                        identity.session_epoch
+                    );
+                }
+                result.map_err(|_| ())
+            })();
+            finish_committed_panel_hide(dispatch_controller.as_ref(), identity, result).ok();
         })
         .map_err(|_| ());
     if finish_committed_panel_hide(controller.as_ref(), identity, scheduled).is_err() {
@@ -3243,6 +3249,24 @@ mod tests {
             .unwrap();
         assert!(!controller.fail_hide_commit(retry));
         assert!(controller.claim_hide_commit(replacement_ticket).is_some());
+    }
+
+    #[test]
+    fn panel_hide_paths_use_the_native_main_window_registry() {
+        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
+        for function_name in [
+            "fn schedule_app_blur(",
+            "fn schedule_host_key_terminal_hide(",
+            "fn schedule_committed_panel_hide(",
+        ] {
+            let body = source
+                .split(function_name)
+                .nth(1)
+                .and_then(|tail| tail.split("\n}\n").next())
+                .expect("panel hide function must exist");
+            assert!(body.contains("get_window(\"main\")"));
+            assert!(!body.contains("get_webview_window(\"main\")"));
+        }
     }
 
     #[test]

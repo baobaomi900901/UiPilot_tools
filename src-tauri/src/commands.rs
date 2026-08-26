@@ -4166,7 +4166,7 @@ pub(crate) fn clear_and_hide_reason(
     clear_and_hide_window(registry, &window.as_ref().window(), reason)
 }
 
-fn clear_and_hide_window(
+pub(crate) fn clear_and_hide_window(
     registry: &ResultRegistry,
     window: &tauri::Window,
     reason: HideReason,
@@ -4189,7 +4189,14 @@ fn clear_and_hide_window(
                 .map_err(|_| ())
         },
         || registry.hide_and_clear(),
-        || window.hide().map_err(|_| ()),
+        || {
+            window.hide().map_err(|error| {
+                eprintln!(
+                    "[launcher-hide] window.hide failed label={} error={error}",
+                    window.label()
+                );
+            })
+        },
         || {
             plugin_panel::teardown(&app, panel_controller.as_ref(), None);
             panel_controller.host_hidden();
