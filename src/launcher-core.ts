@@ -2529,7 +2529,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function keyDown(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean): void {
     if (destroyed || isComposing) return
     if (key === 'Escape') {
-      void requestHide()
+      if (model.view === 'settings') navigate('launcher')
+      else void requestHide()
       return
     }
     if (key === 'Enter') {

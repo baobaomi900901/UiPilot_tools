@@ -1037,7 +1037,7 @@ describe('shown and search ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
     expect(fake.client.loadSettings).toHaveBeenCalledOnce()
 
-    navigationCore.navigate('launcher')
+    core.keyDown('Escape', false)
 
     expect(core.getSnapshot()).toMatchObject({
       view: 'launcher',
@@ -3687,7 +3687,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('opens Settings from the query suffix and returns through the title back button', async () => {
+  it('opens Settings from the query suffix and returns through Escape', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -3730,14 +3730,11 @@ describe('React view and accessibility', () => {
     await act(async () => {
       settingsView?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
     })
-    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
-
-    await act(async () => backButton?.click())
     await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
     const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')
     await vi.waitFor(() => expect(document.activeElement).toBe(query))
     expect(query?.value).toBe('')
-    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
     expect(stylesSource).toMatch(/\.launcher-settings-button\.ant-btn\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(/\.settings-title-group\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s)
     await mounted.unmount()
@@ -4226,7 +4223,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('renders ordered snapshot-owned settings tabs, keeps the title unfocusable, and hides on Escape', async () => {
+  it('renders ordered snapshot-owned settings tabs, keeps the title unfocusable, and returns on Escape', async () => {
     installMatchMedia(true)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -4259,8 +4256,11 @@ describe('React view and accessibility', () => {
         new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
       )
     })
-    expect(fake.client.hideLauncher).toHaveBeenCalledOnce()
-    expect(core.getSnapshot().view).toBe('settings')
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    expect(core.getSnapshot().view).toBe('launcher')
+    await vi.waitFor(() => expect(document.activeElement).toBe(
+      mounted.host.querySelector<HTMLInputElement>('[role="combobox"]'),
+    ))
     await mounted.unmount()
   })
 
