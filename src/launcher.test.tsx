@@ -1893,6 +1893,7 @@ describe('shown and search ownership', () => {
       expect(declaredProperty(input!, 'background')).toBe('transparent')
 
       const close = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-panel 面板"]')!
+      expect(close.tabIndex).toBe(-1)
       await act(async () => close.click())
       await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
       await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
@@ -4873,7 +4874,7 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
-  it('shows the prepared public plugin icon before installation', async () => {
+  it('shows the prepared public plugin icon and restores focus after installation', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -4898,6 +4899,14 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-prepare')).not.toBeNull())
     expect(mounted.host.querySelector<HTMLImageElement>('.public-prepare .plugin-icon-image')?.getAttribute('src'))
       .toBe('uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png')
+    const confirm = [...mounted.host.querySelectorAll<HTMLButtonElement>('.public-prepare button')]
+      .find((button) => button.textContent?.includes('确认安装'))!
+    await act(async () => {
+      confirm.focus()
+      confirm.click()
+    })
+    await vi.waitFor(() => expect(fake.client.commitPublicPlugin).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(document.activeElement).toBe(chooseDirectory))
     await mounted.unmount()
     core.destroy()
   })

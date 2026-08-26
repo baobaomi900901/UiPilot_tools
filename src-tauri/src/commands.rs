@@ -1152,6 +1152,7 @@ pub(crate) async fn commit_public_plugin_install(
                 panel_controller.inner().as_ref(),
                 &commit.mutation.plugin_id,
             );
+            let _ = focus_main_window_content_now(&app);
             Ok(commit.mutation)
         }
         Err(error) => {
@@ -5342,6 +5343,10 @@ mod tests {
             .find("commit_with_readiness(")
             .expect("commit readiness call is missing");
         assert!(suppression < runtime);
+        let restore = body
+            .find("focus_main_window_content_now(&app)")
+            .expect("commit must restore main window and webview focus");
+        assert!(runtime < restore);
     }
 
     #[test]

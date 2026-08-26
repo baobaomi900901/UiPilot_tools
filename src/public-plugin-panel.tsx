@@ -204,6 +204,15 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
   const [notice, setNotice] = useState('')
   const [prepared, setPrepared] = useState<PublicPluginPrepareSummary | null>(null)
   const [busy, setBusy] = useState(false)
+  const preparedOrigin = useRef<HTMLElement | null>(null)
+  const restorePreparedOrigin = useRef(false)
+
+  useEffect(() => {
+    if (busy || prepared || !restorePreparedOrigin.current) return
+    restorePreparedOrigin.current = false
+    const origin = preparedOrigin.current
+    if (origin?.isConnected) origin.focus()
+  }, [busy, prepared])
 
   const reload = useCallback(async () => {
     const owner = ++epoch.current
@@ -231,8 +240,9 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
     return () => { epoch.current += 1 }
   }, [reload])
 
-  const prepare = async (kind: 'archive' | 'developmentDirectory') => {
+  const prepare = async (kind: 'archive' | 'developmentDirectory', origin: HTMLElement) => {
     if (busy) return
+    preparedOrigin.current = origin
     setBusy(true)
     setError('')
     try {
@@ -261,6 +271,7 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
     setError('')
     try {
       await client.commitPublicPlugin({ input: { token: prepared.token, permissionGrants: prepared.permissions as PublicPermission[] } })
+      restorePreparedOrigin.current = true
       setPrepared(null)
       await reload()
     } catch {
@@ -275,8 +286,8 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
       <div className="plugin-inventory-header">
         <h2 id="public-plugin-title">公开插件</h2>
         <div className="public-install-actions">
-          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void prepare('archive')} /></Tooltip>
-          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void prepare('developmentDirectory')} /></Tooltip>
+          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)} /></Tooltip>
+          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)} /></Tooltip>
           <Button disabled={busy || loading} onClick={() => void reload()}>刷新</Button>
         </div>
       </div>
