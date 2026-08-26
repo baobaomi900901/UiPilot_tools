@@ -1505,6 +1505,63 @@ fn start_host_input_focus(
     }
 }
 
+fn focus_main_window_content_now(app: &AppHandle) -> bool {
+    let Some(main_window) = app.get_window("main") else {
+        return false;
+    };
+    let Some(main_webview) = app.get_webview("main") else {
+        return false;
+    };
+    main_window.set_focus().is_ok() && main_webview.set_focus().is_ok()
+}
+
+fn focus_live_panel_host_content(
+    controller: &PluginPanelController,
+    session_epoch: u64,
+    native_focus: impl FnOnce() -> bool,
+) -> bool {
+    if controller
+        .live_identity()
+        .is_none_or(|identity| identity.session_epoch != session_epoch)
+    {
+        return false;
+    }
+    native_focus()
+        && controller
+            .live_identity()
+            .is_some_and(|identity| identity.session_epoch == session_epoch)
+}
+
+async fn focus_main_window_content(
+    app: &AppHandle,
+    controller: Arc<PluginPanelController>,
+    session_epoch: u64,
+) -> bool {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let focus_app = app.clone();
+    let focus_controller = Arc::clone(&controller);
+    if app
+        .run_on_main_thread(move || {
+            let focused = focus_live_panel_host_content(&focus_controller, session_epoch, || {
+                focus_main_window_content_now(&focus_app)
+            });
+            let _ = sender.send(focused);
+        })
+        .is_err()
+    {
+        return false;
+    }
+    matches!(
+        tauri::async_runtime::spawn_blocking(move || {
+            receiver.recv_timeout(HOST_INPUT_FOCUS_TIMEOUT)
+        })
+        .await,
+        Ok(Ok(true))
+    ) && controller
+        .live_identity()
+        .is_some_and(|identity| identity.session_epoch == session_epoch)
+}
+
 #[tauri::command]
 pub(crate) async fn plugin_panel_focus_host_input(
     webview: tauri::Webview,
@@ -1533,15 +1590,7 @@ pub(crate) async fn plugin_panel_focus_host_input(
             let outcome = start_host_input_focus(
                 &focus_controller,
                 identity,
-                || {
-                    let Some(main_window) = focus_app.get_window("main") else {
-                        return false;
-                    };
-                    let Some(main_webview) = focus_app.get_webview("main") else {
-                        return false;
-                    };
-                    main_window.set_focus().is_ok() && main_webview.set_focus().is_ok()
-                },
+                || focus_main_window_content_now(&focus_app),
                 Instant::now,
                 || {
                     let payload = PluginPanelFocusHostInputEvent {
@@ -2303,6 +2352,16 @@ async fn open_plugin_panel_impl(
     })
     .await
     .map_err(|_| CommandError::plugin_query_failed())??;
+    if !focus_main_window_content(&app, Arc::clone(controller.inner()), identity.session_epoch)
+        .await
+    {
+        plugin_panel::teardown(
+            &app,
+            controller.inner().as_ref(),
+            Some(identity.session_epoch),
+        );
+        return Err(CommandError::window_failed());
+    }
     Ok(Some(panel_command_result(&identity)))
 }
 
@@ -3960,10 +4019,10 @@ mod tests {
 
     use super::{
         clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
-        execute_result_with, host_input_focus_failure, load_settings_core,
-        load_settings_ready_with, map_everything_search_error, map_file_preview_worker_result,
-        map_save_worker_result, map_theme_preference_worker_result, panel_route_matches_identity,
-        parse_panel_session_epoch, parse_timer_session_generation,
+        execute_result_with, focus_live_panel_host_content, host_input_focus_failure,
+        load_settings_core, load_settings_ready_with, map_everything_search_error,
+        map_file_preview_worker_result, map_save_worker_result, map_theme_preference_worker_result,
+        panel_route_matches_identity, parse_panel_session_epoch, parse_timer_session_generation,
         parse_window_storage_session_generation, plugin_discovery_prefix, prepare_file_query,
         prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
         public_plugin_search_decision, publish_everything_search,
@@ -4833,8 +4892,13 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("async fn submit_plugin_panel_impl").next())
             .unwrap();
-        assert!(open.contains("plugin_panel::mount("));
-        assert!(open.contains("Ok(Some(panel_command_result(&identity)))"));
+        let mount = open.find("plugin_panel::mount(").unwrap();
+        let focus = open.find("focus_main_window_content(").unwrap();
+        let returned = open
+            .find("Ok(Some(panel_command_result(&identity)))")
+            .unwrap();
+        assert!(mount < focus && focus < returned);
+        assert!(open.contains("plugin_panel::teardown("));
         assert!(!open.contains("prepare_command("));
         assert!(!open.contains("spawn_panel_submission("));
 
@@ -5307,6 +5371,51 @@ mod tests {
     }
 
     #[test]
+    fn initial_panel_host_focus_is_epoch_bound_before_and_after_native_effect() {
+        let controller = PluginPanelController::default();
+        let stale = controller.open_session(panel_focus_owner()).unwrap();
+        assert!(controller
+            .teardown_session(Some(stale.session_epoch))
+            .is_some());
+        let native_calls = Cell::new(0);
+        assert!(!focus_live_panel_host_content(
+            &controller,
+            stale.session_epoch,
+            || {
+                native_calls.set(native_calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(native_calls.get(), 0);
+
+        let replaced = controller.open_session(panel_focus_owner()).unwrap();
+        let current = controller.open_session(panel_focus_owner()).unwrap();
+        assert!(!focus_live_panel_host_content(
+            &controller,
+            replaced.session_epoch,
+            || {
+                native_calls.set(native_calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(native_calls.get(), 0);
+
+        assert!(!focus_live_panel_host_content(
+            &controller,
+            current.session_epoch,
+            || {
+                native_calls.set(native_calls.get() + 1);
+                assert!(controller
+                    .teardown_session(Some(current.session_epoch))
+                    .is_some());
+                true
+            },
+        ));
+        assert_eq!(native_calls.get(), 1);
+        assert!(controller.live_identity().is_none());
+    }
+
+    #[test]
     fn plugin_panel_focus_main_thread_effects_run_only_after_a_current_claim() {
         let controller = PluginPanelController::default();
         let session = controller.open_session(panel_focus_owner()).unwrap();
@@ -5501,16 +5610,23 @@ mod tests {
         assert!(request.contains("webview.label()"));
         assert!(request.contains("session_epoch: String"));
         assert!(!request.contains("plugin_id: String"));
-        let window_lookup = request
+        assert!(request.contains("focus_main_window_content_now(&focus_app)"));
+
+        let native_focus = production
+            .split("fn focus_main_window_content_now(")
+            .nth(1)
+            .and_then(|tail| tail.split("\nasync fn focus_main_window_content").next())
+            .expect("main content focus helper is missing");
+        let window_lookup = native_focus
             .find("get_window(\"main\")")
             .expect("main window lookup is missing");
-        let webview_lookup = request
+        let webview_lookup = native_focus
             .find("get_webview(\"main\")")
             .expect("main webview lookup is missing");
-        let window_focus = request
+        let window_focus = native_focus
             .find("main_window.set_focus()")
             .expect("main window focus request is missing");
-        let webview_focus = request
+        let webview_focus = native_focus
             .find("main_webview.set_focus()")
             .expect("main webview focus request is missing");
         assert!(window_lookup < webview_lookup && webview_lookup < window_focus);
