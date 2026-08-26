@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "pluginId": "com.uipilot.demo-panel",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "apiVersion": 1,
-  "minimumHostVersion": "0.3.0",
+  "minimumHostVersion": "0.3.1",
   "name": "Public Plugin Demo Panel",
   "description": "UiPilot public plugin embedded-panel reference.",
   "supportedPlatforms": ["windows"],
@@ -19,7 +19,8 @@
     "entry": "dist/runtime.js"
   },
   "panel": {
-    "entry": "dist/panel.html"
+    "entry": "dist/panel.html",
+    "hostKeys": ["ArrowDown", "ArrowUp", "Primary+N"]
   },
   "permissions": ["ui.panel"],
   "settings": []

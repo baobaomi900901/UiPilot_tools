@@ -15,7 +15,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{
     activation::{PublicPluginInstallSource, PublicPluginManager},
-    manifest::{PublicOutputMode, PublicPermission},
+    manifest::{PanelHostKeyDeclaration, PublicOutputMode, PublicPermission},
     package, stage_public_package,
     webview_audio_guard::{INERT_DOCUMENT, INERT_PATH},
     PluginRuntimeError, PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost,
@@ -1146,9 +1146,30 @@ fn repository_demo_panel_stages_with_the_panel_only_contract() {
         prepared.manifest.permissions,
         vec![PublicPermission::UiPanel]
     );
-    assert!(prepared.manifest.panel.is_some());
+    assert_eq!(
+        prepared.manifest.panel.as_ref().unwrap().host_keys,
+        vec![
+            PanelHostKeyDeclaration::ArrowDown,
+            PanelHostKeyDeclaration::ArrowUp,
+            PanelHostKeyDeclaration::PrimaryN,
+        ]
+    );
     assert!(prepared.manifest.window.is_none());
-    assert_eq!(prepared.resources.len(), 5);
+    assert_eq!(
+        prepared
+            .resources
+            .keys()
+            .filter(|path| path.as_str() != "icon.png")
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "dist/panel.css",
+            "dist/panel.html",
+            "dist/panel.js",
+            "dist/runtime.js",
+            "plugin.json",
+        ]
+    );
 }
 
 #[cfg(windows)]

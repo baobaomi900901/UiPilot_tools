@@ -39,7 +39,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `command.summary` is an optional one-line discovery hint. It is limited to 512 Unicode scalar values; when omitted, the launcher uses `name`.
 - `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
 - `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
-- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages must set `minimumHostVersion` to at least `0.3.0`.
+- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`.
 
 Installation and reload use staging. Static validation and Runtime readiness must succeed before the generation becomes active. A failed upgrade leaves the previous generation usable.
 
@@ -74,9 +74,27 @@ Both notification methods are request-bound. `publish()` resolves at the atomic 
 
 `window` returns `{ requestId, data }`. The host creates or reuses one window for that plugin and sends a `PluginWindowUpdate` through `window.uipilotPluginWindow.onUpdate`. Content receives input, platform, theme, invocation time, singleton instance `1`, and plugin data. It cannot invoke commands or own pin, close, drag, focus, theme, or position behavior.
 
-`panel` returns `{ requestId, data }`. The host mounts one launcher panel session for that plugin and sends a `PluginPanelUpdate` through `window.uipilotPluginPanel.onUpdate`. Panel content receives input, platform, theme, invocation time, session epoch, and plugin data. Its bridge exposes private storage and the narrow no-argument `focusHostInput()` method; it cannot close itself, own timers, or publish notifications. Panel packages require host `0.3.0+`.
+`panel` returns `{ requestId, data }`. The host mounts one launcher panel session for that plugin and sends a `PluginPanelUpdate` through `window.uipilotPluginPanel.onUpdate`. Panel content receives input, platform, theme, invocation time, session epoch, and plugin data. Its bridge exposes private storage plus `onHostKey(handler)`, `focusHostInput()`, and `requestHide()`; it cannot own timers or publish notifications. The base panel contract requires host `0.3.0+`; the three `0.3.1` methods require `minimumHostVersion >= 0.3.1` when used.
 
 `window.uipilotPluginPanel.focusHostInput()` moves keyboard focus to the live panel session's tagged launcher argument input. It preserves the panel, command tag, argument text, selection, and submission state. Repeated calls while that input is already focused succeed. Missing, replaced, torn-down, or stale sessions resolve without side effects; a current native-focus, event, acknowledgement, or timeout failure rejects with `windowFailed`. The method does not stream edits to panel content: argument changes reach `onUpdate.input` only after the user presses Enter.
+
+### Panel Host Keys And Return
+
+`panel.hostKeys` is optional, contains at most eight unique declarations, and accepts only `ArrowDown`, `ArrowUp`, and `Primary+N`. Validators reject unknown values, duplicates, non-arrays, wrong element types, and extra panel properties. Canonical order is `ArrowDown < ArrowUp < Primary+N`.
+
+| Declaration | Launcher input match | Delivered `event.key` |
+| --- | --- | --- |
+| `ArrowDown` | no modifiers | `ArrowDown` |
+| `ArrowUp` | no modifiers | `ArrowUp` |
+| `Primary+N` | Windows Ctrl-only+N; macOS Meta-only+N; no Alt/Shift | `n` |
+
+IME composition, undeclared keys, ordinary characters, and extended chords are never routed. The launcher consumes a matching physical key before enqueue. Host delivery is strictly serial with a queue depth of eight and a two-second acknowledgement timeout. Queue-full presses remain consumed but are not delivered. A handler throw/rejection is acknowledged without retry; a hung handler, unsubscribe, sequence violation, or counter exhaustion ends the exact panel session instead of overlapping handlers.
+
+When `hostKeys` is non-empty, content must register exactly one `onHostKey(handler)` before ready. A second registration throws `TypeError`. Calling `onHostKey` with omitted/empty `hostKeys` throws `TypeError` and permanently fails ready for that document even if plugin code catches it. The handler receives a deeply frozen event containing real modifier bits plus canonical-decimal `sessionEpoch` and `routeSequence`. Unsubscribe ends and hides the session.
+
+`requestHide(): Promise<void>` takes no arguments. A current session resolves after hide admission and before teardown; the document may be destroyed on the next macrotask, so the resolving continuation must not start later DOM work. Missing, stale, replaced, or in-pattern unauthorized sessions resolve as no-ops. Admission failure rejects with `windowFailed`. If the renderer hangs or crashes before observing admission, the Promise may never settle; Host reclaims an unobserved admission after 30 seconds. Once observed, a 500 ms fallback protects the normal next-macrotask commit.
+
+Escape in panel content uses capture-phase arbitration. A synchronous `preventDefault()`, active `dialog[open]`, or composition suppresses hide; `preventDefault()` after an `await` is too late. Explicit-return hides best-effort restore the external HWND+PID captured when UiPilot was shown. Blur and launch-handoff hides never restore, and foreground restore failure does not turn a successful hide into an error.
 
 Every plugin content window also sees the frozen `window.uipilotPluginWindow.timer` facade. Calls require the Windows-only `timer.control` permission together with `ui.window` and `notifications.publish`; unpermitted callers receive `PermissionDenied`. The host owns one process-local timer per active plugin generation, continues it while the window is hidden, and discards it on process exit.
 

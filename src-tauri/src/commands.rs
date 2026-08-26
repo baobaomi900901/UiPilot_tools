@@ -5596,8 +5596,12 @@ mod tests {
         assert!(!capability.contains("plugin-window-"));
         assert!(!capability.contains("close"));
         let enqueue = command_body("plugin_panel_host_key_enqueue");
-        assert!(enqueue.find("require_main_label(webview.label())?").unwrap()
-            < enqueue.find("enqueue_host_key(").unwrap());
+        assert!(
+            enqueue
+                .find("require_main_label(webview.label())?")
+                .unwrap()
+                < enqueue.find("enqueue_host_key(").unwrap()
+        );
         let main_capability = include_str!("../capabilities/main.json");
         assert!(main_capability.contains("allow-plugin-panel-host-key-enqueue"));
         assert!(!capability.contains("allow-plugin-panel-host-key-enqueue"));
