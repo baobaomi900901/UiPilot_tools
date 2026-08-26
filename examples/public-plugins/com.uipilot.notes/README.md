@@ -7,7 +7,7 @@
 - `activationMode`: `submit`
 - `outputMode`: `panel`
 - 权限: `ui.panel`
-- `version`: `1.1.0`
+- `version`: `1.1.1`
 - `minimumHostVersion`: `0.3.1`
 - `panel.hostKeys`: `ArrowDown`, `ArrowUp`, `Primary+N`
 - 业务参考: `com.uipilot.note`
@@ -19,6 +19,8 @@
 2. 选择本目录下的 `package` 文件夹。
 3. 确认 `ui.panel` 权限。
 4. 在主界面输入 `/notes` 并回车。
+
+开发目录安装会把 `package` **复制**到本地插件库；修改 `panel.js` 后需在设置里**卸载并重新选择 `package` 目录安装**，确认版本显示为 **1.1.1** 后再测。
 
 ### 交互说明
 

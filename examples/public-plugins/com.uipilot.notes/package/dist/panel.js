@@ -387,6 +387,12 @@ async function deleteNote(noteId) {
   clearStatusLater('已删除')
 }
 
+function hidePanelAfterListCopy() {
+  void window.uipilotPluginPanel.requestHide().catch(() => {
+    setStatus('复制成功，但无法隐藏窗口')
+  })
+}
+
 function copyEditorContent({ onSuccess, preferSync = false } = {}) {
   const note = getSelectedNote()
   if (!note) {
@@ -464,7 +470,7 @@ function tryCopyFromList(event) {
   if (!isEnterKey(event)) {
     return false
   }
-  if (!isListFocused()) {
+  if (!isListFocused() && !listHasFocus) {
     return false
   }
   if (!getSelectedNote()) {
@@ -472,12 +478,9 @@ function tryCopyFromList(event) {
   }
   event.preventDefault()
   event.stopPropagation()
-  copyEditorContent({
-    preferSync: true,
-    onSuccess: () => {
-      void window.uipilotPluginPanel.requestHide()
-    },
-  })
+  if (copyEditorContent({ preferSync: true })) {
+    hidePanelAfterListCopy()
+  }
   return true
 }
 
@@ -628,7 +631,9 @@ async function finishEscapeUnsaved(decision) {
     }
   }
   escapeHideInFlight = false
-  void window.uipilotPluginPanel.requestHide()
+  void window.uipilotPluginPanel.requestHide().catch(() => {
+    setStatus('无法隐藏窗口')
+  })
 }
 
 function handleEscapeKeydown(event) {
