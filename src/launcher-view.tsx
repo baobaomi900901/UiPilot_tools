@@ -106,6 +106,15 @@ function composing(event: ReactKeyboardEvent): boolean {
   return event.nativeEvent.isComposing
 }
 
+function preventBrowserFind(event: ReactKeyboardEvent<HTMLElement>): void {
+  if (
+    event.key.toLowerCase() === 'f' &&
+    event.ctrlKey !== event.metaKey &&
+    !event.shiftKey &&
+    !event.altKey
+  ) event.preventDefault()
+}
+
 function BuiltInResultIcon({ kind }: { kind: ResultIconKind }) {
   if (kind === 'calculator') {
     return (
@@ -1032,7 +1041,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   return (
     <ConfigProvider theme={uiThemeConfig(colorScheme)}>
       <App>
-        <main className="launcher-surface" data-color-scheme={colorScheme}>
+        <main
+          className="launcher-surface"
+          data-color-scheme={colorScheme}
+          onKeyDownCapture={preventBrowserFind}
+        >
           {snapshot.view === 'launcher' ? (panelLauncher ?? filePanel ?? launcher) : settingsView}
           <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
             {status}

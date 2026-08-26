@@ -1620,6 +1620,31 @@ describe('shown and search ownership', () => {
     await mounted.unmount()
   })
 
+  it('prevents native browser find across the main surface without stopping key propagation', async () => {
+    const { core, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('browser-find-guard')))
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const bubbled = vi.fn()
+    input.addEventListener('keydown', bubbled)
+    const browserFind = new KeyboardEvent('keydown', {
+      key: 'f', ctrlKey: true, bubbles: true, cancelable: true,
+    })
+    const shiftedFind = new KeyboardEvent('keydown', {
+      key: 'f', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true,
+    })
+
+    input.dispatchEvent(browserFind)
+    input.dispatchEvent(shiftedFind)
+
+    expect(browserFind.defaultPrevented).toBe(true)
+    expect(shiftedFind.defaultPrevented).toBe(false)
+    expect(bubbled).toHaveBeenCalledTimes(2)
+    await mounted.unmount()
+  })
+
   it('focuses only the current tagged panel input and acknowledges the exact ordered request', async () => {
     const { core, client, emit, emitPanelFocus } = await startedCore()
     installMatchMedia(false)

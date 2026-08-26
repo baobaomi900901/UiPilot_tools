@@ -478,6 +478,10 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     },
   });
   document.addEventListener('keydown', (event) => {
+    if (
+      event.key.toLowerCase() === 'f' && event.ctrlKey !== event.metaKey &&
+      !event.shiftKey && !event.altKey
+    ) event.preventDefault();
     const isComposing = event.isComposing;
     const hadOpenDialog = document.querySelector('dialog[open]') !== null;
     const keyIsEscape = event.key === 'Escape';

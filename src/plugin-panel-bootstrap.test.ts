@@ -17,27 +17,28 @@ function panelBootstrapSource(): string {
     .replace('__HOST_KEYS__', '["ArrowDown"]')
 }
 
+function executePanelBootstrap() {
+  const invoke = vi.fn(async () => undefined)
+  const hostWindow: Record<string, unknown> = {
+    __TAURI_INTERNALS__: { invoke },
+  }
+  const document = {
+    documentElement: { style: { setProperty: vi.fn() } },
+    addEventListener: vi.fn(),
+    querySelector: vi.fn(() => null),
+  }
+  vm.runInNewContext(panelBootstrapSource(), {
+    document,
+    queueMicrotask,
+    setTimeout,
+    window: hostWindow,
+  })
+  return { document, hostWindow, invoke }
+}
+
 describe('public plugin panel bootstrap', () => {
   it('executes the generated Host-key bridge and reaches content ready', async () => {
-    const invoke = vi.fn(async () => undefined)
-    const hostWindow: Record<string, unknown> = {
-      __TAURI_INTERNALS__: { invoke },
-    }
-    const documentElement = {
-      style: { setProperty: vi.fn() },
-    }
-    const document = {
-      documentElement,
-      addEventListener: vi.fn(),
-      querySelector: vi.fn(() => null),
-    }
-
-    vm.runInNewContext(panelBootstrapSource(), {
-      document,
-      queueMicrotask,
-      setTimeout,
-      window: hostWindow,
-    })
+    const { hostWindow, invoke } = executePanelBootstrap()
 
     const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
     expect(api).toBeDefined()
@@ -48,5 +49,27 @@ describe('public plugin panel bootstrap', () => {
       hostKeyReceiverRegistered: true,
       hostKeyRegistrationViolation: false,
     }))
+  })
+
+  it('prevents native browser find without stopping plugin key handlers', () => {
+    const { document } = executePanelBootstrap()
+    const keydown = document.addEventListener.mock.calls.find(([type]) => type === 'keydown')?.[1]
+    const preventDefault = vi.fn()
+    const stopPropagation = vi.fn()
+
+    keydown({
+      key: 'f',
+      ctrlKey: true,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      isComposing: false,
+      defaultPrevented: false,
+      preventDefault,
+      stopPropagation,
+    })
+
+    expect(preventDefault).toHaveBeenCalledOnce()
+    expect(stopPropagation).not.toHaveBeenCalled()
   })
 })
