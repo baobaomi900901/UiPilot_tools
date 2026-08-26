@@ -1,7 +1,7 @@
 # Public Plugin Panel Key Routing And Hide Design
 
 **Date:** 2026-08-26  
-**Status:** Draft — awaiting review (revision 5; closes review round 5 P1/P2)  
+**Status:** Draft — awaiting review (revision 6; closes review round 6 P2/P3)  
 **Related:**  
 `docs/superpowers/specs/2026-08-24-public-plugin-panel-mode-design.md`,  
 `docs/superpowers/specs/2026-08-25-public-plugin-panel-focus-host-input-design.md`,  
@@ -111,9 +111,14 @@ type PanelHideAdmitResult =
 ```
 
 - Capability: **panel-content only**.
-- Live matching epoch → allocate monotonic `hideTicketId`, install
+- Live matching epoch → allocate monotonic `hideTicketId` (`u64`, starts at 1
+  per host process or per panel controller — implementation-local, but
+  monotonic and never reused after commit/teardown for that id). Install
   `PanelHideTicket { sessionEpoch, hideTicketId, phase: Admitted }`, return
   `admitted`. **Do not** start the short commit fallback on admit.
+- **`hideTicketId` exhaustion:** if the next id would wrap `u64`, admit
+  **fail-closes** (command error → Promise rejects `windowFailed`); do **not**
+  wrap. Same class as `routeSequence` / `clientSequence` overflow.
 - Bootstrap applies the admit result in JS, then **resolves** the public
   Promise. Plugin `await requestHide()` continuations are therefore scheduled
   as microtasks while the WebView is still alive.
@@ -122,7 +127,7 @@ type PanelHideAdmitResult =
 - Cannot admit (hide owner conflict that must fail closed before terminal
   work) → command error → Promise rejects `windowFailed`.
 
-#### Phase A′ — Admit observed (private; gates short fallback)
+#### Phase A′ — Admit observed (private; gates short fallback only)
 
 Frozen command name: **`plugin_panel_request_hide_admit_observed`**.
 
@@ -130,42 +135,60 @@ Input: `{ sessionEpoch, hideTicketId }`
 Capability: **panel-content only**.
 
 After applying admit and resolving the public Promise, bootstrap **must**
-invoke this command (same turn as apply, before scheduling commit). Rust marks
-the ticket `Observed`. Only an `Observed` (or already-committing) ticket may
-start the **short** commit fallback.
+fire this command in the same turn (**fire-and-forget**: do **not** `await`
+its settle before scheduling commit; ignore reject/timeout for control flow).
+On success, Rust marks the ticket `Observed`. Only an `Observed` ticket may
+arm the **500ms** short commit fallback.
 
-Until `Observed`, Host **must not** destroy the content WebView via hide
-fallback. A main-thread stall that delays JS receipt of admit therefore cannot
-lose observability to a 500ms admit-time timer.
+`admit_observed` success/failure **only** chooses which Rust fallback timer
+applies (500ms after Observed vs 30s while still Admitted). It must **not**
+gate the bootstrap commit path.
+
+Until `Observed`, Host **must not** destroy the content WebView via the
+**short** hide fallback. A main-thread stall that delays JS receipt of admit
+therefore cannot lose observability to a 500ms admit-time timer.
 
 #### Phase B — Commit (bootstrap-primary; timers as below)
 
 Frozen command name: **`plugin_panel_request_hide_commit`**.
 
-**Primary path (required):** After admit succeeds, public Promise resolved, and
-`admit_observed` invoked, bootstrap schedules commit on the **next macrotask**
-(`setTimeout(0)` or equivalent):
+**Primary path (required):** After admit succeeds and the public Promise has
+been resolved, bootstrap **always** schedules commit on the **next macrotask**
+(`setTimeout(0)` or equivalent), **whether or not** `admit_observed` succeeds,
+rejects, or times out:
 
 ```text
 admit result applied
   → resolve public Promise
-  → plugin_panel_request_hide_admit_observed({ sessionEpoch, hideTicketId })
+  → fire-and-forget plugin_panel_request_hide_admit_observed(…)
   → setTimeout(0) → plugin_panel_request_hide_commit({ sessionEpoch, hideTicketId })
+       // scheduled in the same turn as resolve; NOT gated on observed settle
 ```
+
+If an implementation `await`s observed before scheduling commit, a rejected or
+hung observed invoke would leave an already-resolved `requestHide()` waiting
+for the 30s unrecovered path — **forbidden**.
 
 **Timers (frozen):**
 
 | Condition | Timer | Action |
 |---|---|---|
-| Ticket `Observed`, no commit yet | **500ms** from observation | Rust auto-commit (bootstrap hung after observe) |
-| Ticket still `Admitted` (never observed) | **30s** from admit | Fault reclaim: auto-commit; treat as renderer hung/crash / lost invoke |
+| Ticket `Observed`, no commit yet | **500ms** from observation | Attempt Rust auto-commit |
+| Ticket still `Admitted` (never observed) | **30s** from admit | Fault reclaim auto-commit |
+
+**Timer / commit ownership (CAS):** Every delayed callback and every commit
+attempt (bootstrap or Rust) commits **only if** a compare-and-swap still
+matches `(sessionEpoch, hideTicketId, expectedPhase)` where `expectedPhase` is
+`Admitted` or `Observed` as appropriate for that timer. On mismatch (teardown,
+epoch bump, already `Committed`, different ticket) → **no-op**. Teardown,
+epoch update, or successful commit invalidate all older timers for that ticket.
 
 **SDK / public contract for the 30s path:** If the content document never
 observes admit (hung/crashed renderer), the public `requestHide()` Promise
 **may never settle**. Document this as a hung-renderer exception in
 `docs/plugin-sdk` and cover with Host tests (observe-before-short-fallback;
-admit-blocked-30s-reclaim). Happy-path and ordinary main-thread work must still
-observe admit and settle the Promise before teardown.
+admit-blocked-30s-reclaim; stale-timer-after-new-session). Happy-path work must
+still observe admit and settle the Promise before teardown.
 
 Short fallback must **not** start at admit time. Idempotent commit: first wins.
 
@@ -173,7 +196,7 @@ Commit semantics:
 
 1. Commit performs shared launcher hide with `HideReason::ExplicitReturn`,
    then teardown. Ticket phase → `Committed`.
-2. Duplicate commit / stale ticket → no-op.
+2. Duplicate commit / stale ticket / failed CAS → no-op.
 3. Admit success then Host crash before commit → session may linger until next
    hide/show; not plugin-visible.
 
@@ -258,8 +281,16 @@ length > 8.
 
 ### 3.4 Launcher `hostKeys` path
 
-1. Rust copies manifest `hostKeys` into panel open/submit results (canonical
-   sorted copy; `[]` if none).
+1. Rust copies manifest `hostKeys` into panel open/submit results as a
+   **canonical sorted** copy (`[]` if none). Frozen total order (enum ordinal,
+   not locale/string sort):
+
+   ```text
+   ArrowDown < ArrowUp < Primary+N
+   ```
+
+   Rust, CLI normalize, and TS parsers **must** use this same order so snapshots
+   compare equal across surfaces.
 2. `PluginPanelCommandResult`:
    ```ts
    {
@@ -510,10 +541,9 @@ main keydown (declared, physical order)
 content requestHide()
   → plugin_panel_request_hide_admit → { admitted, hideTicketId } | noop
   → bootstrap resolves Promise
-  → plugin_panel_request_hide_admit_observed
-       // arms 500ms short fallback; 30s unrecovered path remains for never-observed
-  → setTimeout(0) → plugin_panel_request_hide_commit
-  → hide + teardown
+  → fire-and-forget admit_observed   // success → 500ms timer; else stay on 30s
+  → setTimeout(0) → commit           // always scheduled; not gated on observed
+  → hide + teardown (CAS-guarded)
 ```
 
 ### Escape
@@ -525,22 +555,26 @@ capture keydown record + queueMicrotask
        → hide admit → observed → commit (§3.2)
 ```
 
-## 10. Testing matrix (additions for revision 5)
+## 10. Testing matrix (additions for revision 6)
 
 - Frozen command names including `admit_observed` in capabilities.
 - Serialized launcher enqueue; out-of-order `clientSequence > nextExpected` →
   `protocolViolation` + ExplicitReturn teardown (no hold / no gap skip).
 - `droppedQueueFull` on expected sequence advances `nextExpected`; next press
   with next sequence enqueues (no false protocolViolation).
-- `clientSequence` / `routeSequence` overflow → ExplicitReturn teardown.
+- `clientSequence` / `routeSequence` / `hideTicketId` overflow → fail closed
+  (teardown or admit reject); no wrap.
 - Ack timeout → session teardown; no overlapping second handler.
-- `requestHide`: Promise settles before destroy on happy path; short 500ms
-  fallback starts only after `admit_observed`; blocked/hung before observe does
-  not short-fallback within 500ms; 30s unrecovered reclaim; SDK docs note Promise
-  may never settle on hung renderer; duplicate admit → noop.
+- `requestHide`: Promise settles before destroy on happy path; observed is
+  fire-and-forget — rejected/hung observed still schedules next-macrotask
+  commit; short 500ms fallback only after successful Observed; 30s unrecovered
+  if never observed; timer CAS no-op after teardown/epoch bump/commit; **old
+  session timer firing during a new session is a no-op**; SDK hung-renderer
+  Promise note; duplicate admit → noop.
 - Escape: capture + `queueMicrotask`; sync preventDefault blocks; post-await
   does not.
 - Manifest/schema/CLI: unknown/duplicate/`hostKeys` length > 8 rejected;
+  canonical sort `ArrowDown < ArrowUp < Primary+N` identical in Rust/CLI/TS;
   Rust `PublicPanelV1` matches schema.
 - Empty hostKeys sticky violation; platform Primary+N; Shell clear capture;
   UiPilot-focused repeat keeps capture; Blur does not restore.
@@ -555,9 +589,9 @@ manual Notepad ExplicitReturn).
   commit)
 - `PluginPanelCommandResult` + parsers + launcher model
 - Bootstrap: `onHostKey`, host-key ack, Escape `queueMicrotask`, hide
-  admit → observed → next-macrotask commit
+  admit → fire-and-forget observed → always next-macrotask commit
 - Panel controller: serialized expected-only enqueue, dropped advances expected,
-  fail-closed reorder, serial pump, ack timeout teardown
+  fail-closed reorder, serial pump, ack timeout teardown, hide-ticket CAS timers
 - Lifecycle: `HideReason`, HWND+PID capture/restore, Shell clear policy
 - Host `0.3.1`; SDK hung-renderer Promise note; demo-panel contract only
   (not Notes) until Approved + planned
@@ -567,7 +601,7 @@ manual Notepad ExplicitReturn).
 Notes business; guaranteed foreground restore; live search streaming;
 concurrent host-key handlers; gap-timer reorder recovery.
 
-## 13. Decisions closed in revision 5
+## 13. Decisions closed in revision 6
 
 | Topic | Decision |
 |---|---|
@@ -575,14 +609,16 @@ concurrent host-key handlers; gap-timer reorder recovery.
 | clientSequence order | Serialized launcher; Rust accept only `== nextExpected`; `>` → teardown; no hold/gap timer |
 | droppedQueueFull | Consume expected sequence (advance `nextExpected`) without delivery |
 | Ack timeout | Disarm + ExplicitReturn teardown |
-| requestHide observability | Admit → resolve → `admit_observed` → next-macrotask commit; short 500ms fallback only after Observed; 30s unrecovered if never observed (Promise may never settle — SDK) |
+| requestHide observability | Admit → resolve → fire-and-forget observed → **always** next-macrotask commit; observed only selects 500ms vs 30s Rust fallback |
+| Hide ticket / timers | `hideTicketId` no wrap (admit fail closed); timer/commit CAS on `(epoch, ticketId, phase)`; stale timers no-op |
 | Escape | Capture + `queueMicrotask`; sync preventDefault only |
 | Primary+N | Platform Ctrl **xor** Meta |
 | Illegal onHostKey | Sticky violation |
 | Shell / repeat capture | Clear on Shell-class show; keep on UiPilot-focused repeat |
 | Manifest contract | Optional `hostKeys` enum; deny unknown/duplicate; ≤8; Schema/CLI/Rust sync |
+| hostKeys sort | Canonical order `ArrowDown < ArrowUp < Primary+N` |
 
 ## 14. Approval
 
-Status remains **Draft** until review accepts revision 5. Do not implement
+Status remains **Draft** until review accepts revision 6. Do not implement
 until Status is **Approved**.
