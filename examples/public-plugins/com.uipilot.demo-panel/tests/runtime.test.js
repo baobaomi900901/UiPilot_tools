@@ -6,6 +6,7 @@ import { JSDOM } from 'jsdom'
 const packageRoot = new URL('../package/', import.meta.url)
 const runtimeUrl = new URL('../package/dist/runtime.js', import.meta.url)
 const panelHtmlUrl = new URL('../package/dist/panel.html', import.meta.url)
+const panelCssUrl = new URL('../package/dist/panel.css', import.meta.url)
 const panelScriptUrl = new URL('../package/dist/panel.js', import.meta.url)
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 let panelModuleSequence = 0
@@ -148,6 +149,23 @@ test('panel diagnostics reflect initial focus and focus transitions', async (t) 
   panel.setFocused(false)
   panel.window.dispatchEvent(new panel.window.Event('blur'))
   assert.equal(panel.text('#focus-state'), 'Not focused')
+})
+
+test('content focus label and value remain on one line', async () => {
+  const [html, css] = await Promise.all([
+    readFile(panelHtmlUrl, 'utf8'),
+    readFile(panelCssUrl, 'utf8'),
+  ])
+  const dom = new JSDOM(html)
+  const style = dom.window.document.createElement('style')
+  style.textContent = css
+  dom.window.document.head.append(style)
+  const label = [...dom.window.document.querySelectorAll('dt')]
+    .find((item) => item.textContent === 'Content focus')
+
+  assert.equal(dom.window.getComputedStyle(label).whiteSpace, 'nowrap')
+  assert.equal(dom.window.getComputedStyle(dom.window.document.querySelector('#focus-state')).whiteSpace, 'nowrap')
+  dom.window.close()
 })
 
 test('panel diagnostics show Host-routed keys and route sequence', async (t) => {
