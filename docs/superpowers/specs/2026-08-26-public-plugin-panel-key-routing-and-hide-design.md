@@ -1,7 +1,8 @@
 # Public Plugin Panel Key Routing And Hide Design
 
 **Date:** 2026-08-26  
-**Status:** Draft — awaiting review (revision 7; closes review round 7 P1)  
+**Status:** Approved — final review passed at `db5296e` (revision 7)
+
 **Related:**  
 `docs/superpowers/specs/2026-08-24-public-plugin-panel-mode-design.md`,  
 `docs/superpowers/specs/2026-08-25-public-plugin-panel-focus-host-input-design.md`,  
@@ -652,5 +653,4 @@ concurrent host-key handlers; gap-timer reorder recovery.
 
 ## 14. Approval
 
-Status remains **Draft** until review accepts revision 7. Do not implement
-until Status is **Approved**.
+Status is **Approved**. Revision 7 is frozen for implementation.
