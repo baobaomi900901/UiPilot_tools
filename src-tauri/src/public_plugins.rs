@@ -51,8 +51,8 @@ pub(crate) use activation::{
 pub(crate) use alarm_asset::AlarmAssetIdentity;
 pub(crate) use alarm_asset::{PreparedAlarmAsset, ValidatedAlarmAsset};
 pub(crate) use manifest::{
-    public_manifest_v1_schema, valid_plugin_id, PublicActivationMode, PublicManifestV1,
-    PublicOutputMode, PublicPermission, PublicPlatform,
+    public_manifest_v1_schema, valid_plugin_id, PanelHostKeyDeclaration, PublicActivationMode,
+    PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
 };
 pub(crate) use runtime::{
     parse_runtime_label, runtime_label, PluginApiExecution, PluginApiRequest,

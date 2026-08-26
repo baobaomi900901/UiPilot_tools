@@ -17,6 +17,7 @@ import {
   parseMessageSummary,
   parsePluginInventorySnapshot,
   parsePluginPanelCommandResult,
+  parsePluginPanelHostKeyEnqueueResult,
   parsePublicPluginInventory,
   parsePublicPluginWindowIdentity,
   parseFindPreviewPreferenceResult,
@@ -81,6 +82,12 @@ export const client: LauncherClient = {
     const value = await invoke<unknown>('submit_plugin_panel', { input })
     const result = parsePluginPanelCommandResult(value)
     if (!result) throw { code: 'windowFailed', message: 'panel submit failed' }
+    return result
+  },
+  enqueuePluginPanelHostKey: async (input) => {
+    const value = await invoke<unknown>('plugin_panel_host_key_enqueue', { input })
+    const result = parsePluginPanelHostKeyEnqueueResult(value)
+    if (!result) throw { code: 'windowFailed', message: 'panel Host-key enqueue failed' }
     return result
   },
   closePluginPanel: async (input) => { await invoke('close_plugin_panel', { input }) },

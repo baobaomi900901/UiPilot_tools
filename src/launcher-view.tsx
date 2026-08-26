@@ -418,6 +418,18 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       }
       return
     }
+    if (core.routePanelHostKey({
+      key: event.key,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      isComposing,
+      platform: navigator.platform.toLowerCase().includes('mac') ? 'macos' : 'windows',
+    })) {
+      event.preventDefault()
+      return
+    }
     if (event.key !== 'Enter' && event.key !== 'Escape') return
     if (!isComposing) event.preventDefault()
     core.keyDown(event.key, isComposing)

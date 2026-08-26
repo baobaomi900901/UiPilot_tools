@@ -23,6 +23,8 @@ import {
   type PluginListStatus,
   type PluginMutationKind,
   type PluginPanelFocusHostInputEvent,
+  type PanelHostKeyDeclaration,
+  type PluginPanelHostKey,
   type ResultItem,
   type ResultIconKind,
   type SearchResponse,
@@ -50,6 +52,7 @@ export interface LauncherCore {
   readonly text: (record: ClassifiedTextRecord) => void
   readonly retireControl: (control: ControlKey) => void
   readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
+  readonly routePanelHostKey: (input: PluginPanelHostKeyPhysicalInput) => boolean
   readonly navigate: (target: ShowTarget) => void
   readonly selectSettingsTab: (key: SettingsTabKey) => void
   readonly requestHide: () => Promise<void>
@@ -106,10 +109,21 @@ interface PrivateFileState {
   selectedIndex: number
 }
 
+export interface PluginPanelHostKeyPhysicalInput {
+  key: string
+  ctrlKey: boolean
+  metaKey: boolean
+  shiftKey: boolean
+  altKey: boolean
+  isComposing: boolean
+  platform: 'windows' | 'macos'
+}
+
 interface PrivatePanelState {
   pluginId: string
   commandLabel: string
   sessionEpoch: U64Decimal
+  hostKeys: readonly PanelHostKeyDeclaration[]
   suffix: TextControl
   submitPending: boolean
   closePending: boolean
@@ -480,6 +494,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         pluginId: model.panel.pluginId,
         commandLabel: model.panel.commandLabel,
         sessionEpoch: model.panel.sessionEpoch,
+        hostKeys: Object.freeze([...model.panel.hostKeys]),
         suffixControl: model.panel.suffix.key,
         suffix: model.panel.suffix.draft,
         submitPending: model.panel.submitPending,
@@ -610,6 +625,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let favoriteMenuConsumed = false
   let panelActionToken = 0
   let panelSubmissionToken = 0
+  let panelHostKeyEpoch: U64Decimal | undefined
+  let nextPanelHostKeyClientSequence = 1n
+  let panelHostKeyEnqueueTail: Promise<void> = Promise.resolve()
 
 
   function publish(mutated: boolean): void {
@@ -1954,6 +1972,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function discardPanelUi(): boolean {
     pendingPanelFocusRequest = undefined
+    panelHostKeyEpoch = undefined
+    nextPanelHostKeyClientSequence = 1n
+    panelHostKeyEnqueueTail = Promise.resolve()
     if (!model.panel) return false
     if (composition?.control === model.panel?.suffix.key) composition = undefined
     panelActionToken += 1
@@ -2079,6 +2100,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           void closePanelWithError()
           return
         }
+        model.panel!.hostKeys = Object.freeze([...result.hostKeys])
         model.panel!.submitPending = false
         publish(true)
       },
@@ -2150,10 +2172,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           pluginId: identity.pluginId,
           commandLabel: identity.commandLabel,
           sessionEpoch: identity.sessionEpoch,
+          hostKeys: Object.freeze([...identity.hostKeys]),
           suffix: newTextControl(owner.argument),
           submitPending: false,
           closePending: false,
         }
+        panelHostKeyEpoch = identity.sessionEpoch
+        nextPanelHostKeyClientSequence = 1n
+        panelHostKeyEnqueueTail = Promise.resolve()
         if (pendingPanelFocusRequest?.sessionEpoch === identity.sessionEpoch) {
           applyPanelFocusRequest(pendingPanelFocusRequest)
         }
@@ -2451,6 +2477,55 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
   }
 
+  function routePanelHostKey(input: PluginPanelHostKeyPhysicalInput): boolean {
+    const panel = model.panel
+    if (destroyed || input.isComposing || !panel || panel.closePending || panelHostKeyEpoch !== panel.sessionEpoch) {
+      return false
+    }
+    let declaration: PanelHostKeyDeclaration | undefined
+    let key: PluginPanelHostKey | undefined
+    if (!input.ctrlKey && !input.metaKey && !input.shiftKey && !input.altKey) {
+      if (input.key === 'ArrowDown') declaration = key = 'ArrowDown'
+      else if (input.key === 'ArrowUp') declaration = key = 'ArrowUp'
+    } else if (
+      input.key.toLowerCase() === 'n' && !input.shiftKey && !input.altKey &&
+      (input.platform === 'windows'
+        ? input.ctrlKey && !input.metaKey
+        : input.metaKey && !input.ctrlKey)
+    ) {
+      declaration = 'Primary+N'
+      key = 'n'
+    }
+    if (!declaration || !key || !panel.hostKeys.includes(declaration)) return false
+
+    const maxU64 = (1n << 64n) - 1n
+    if (nextPanelHostKeyClientSequence > maxU64) {
+      void requestHide()
+      return true
+    }
+    const owner = {
+      sessionEpoch: panel.sessionEpoch,
+      clientSequence: String(nextPanelHostKeyClientSequence) as U64Decimal,
+      declaration,
+      key,
+      ctrlKey: input.ctrlKey,
+      metaKey: input.metaKey,
+      shiftKey: input.shiftKey,
+      altKey: input.altKey,
+    }
+    nextPanelHostKeyClientSequence += 1n
+    panelHostKeyEnqueueTail = panelHostKeyEnqueueTail.then(async () => {
+      if (destroyed || model.panel?.sessionEpoch !== owner.sessionEpoch || panelHostKeyEpoch !== owner.sessionEpoch) return
+      try {
+        const result = await client.enqueuePluginPanelHostKey(owner)
+        if (result.outcome === 'protocolViolation') await requestHide()
+      } catch {
+        await requestHide()
+      }
+    })
+    return true
+  }
+
   function keyDown(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean): void {
     if (destroyed || isComposing) return
     if (key === 'Escape') {
@@ -2736,6 +2811,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     text,
     retireControl,
     keyDown,
+    routePanelHostKey,
     navigate,
     selectSettingsTab,
     requestHide,

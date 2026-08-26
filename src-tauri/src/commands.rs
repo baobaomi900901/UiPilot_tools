@@ -536,6 +536,7 @@ pub(crate) struct PluginPanelCommandResult {
     session_epoch: String,
     plugin_id: String,
     command_label: String,
+    host_keys: Vec<crate::public_plugins::PanelHostKeyDeclaration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1991,6 +1992,7 @@ fn panel_route_matches_identity(
         && route.admission_epoch == identity.admission_epoch
         && route.command_label == identity.command_label
         && route.panel_entry.is_some()
+        && route.host_keys == identity.host_keys
 }
 
 fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandResult {
@@ -1998,6 +2000,7 @@ fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandRe
         session_epoch: identity.session_epoch.to_string(),
         plugin_id: identity.plugin_id.clone(),
         command_label: identity.command_label.clone(),
+        host_keys: identity.host_keys.clone(),
     }
 }
 
@@ -2344,6 +2347,7 @@ async fn open_plugin_panel_impl(
         request_id: String::new(),
         submission_token: String::new(),
         argument: input.argument.clone(),
+        host_keys: route.host_keys.clone(),
     };
     let mount_app = app.clone();
     let mount_controller = Arc::clone(controller.inner());
@@ -4217,6 +4221,7 @@ mod tests {
             input_placeholder: Some("请输入信息回车".into()),
             window_entry: None,
             panel_entry: None,
+            host_keys: Vec::new(),
             icon_url: None,
         };
         assert_eq!(
@@ -4272,6 +4277,7 @@ mod tests {
             input_placeholder: Some("请输入信息回车".into()),
             window_entry: None,
             panel_entry: None,
+            host_keys: Vec::new(),
             icon_url: None,
         };
         let preview = CompletionOriginInput {
@@ -4858,6 +4864,10 @@ mod tests {
             command_label: "panel".into(),
             content_label:
                 "plugin-panel-content-636f6d2e6578616d706c652e70616e656c-s0000000000000007".into(),
+            host_keys: vec![
+                crate::public_plugins::PanelHostKeyDeclaration::ArrowDown,
+                crate::public_plugins::PanelHostKeyDeclaration::PrimaryN,
+            ],
         };
         let mut route = PublicPluginRoute {
             plugin_id: identity.plugin_id.clone(),
@@ -4874,9 +4884,19 @@ mod tests {
             input_placeholder: None,
             window_entry: None,
             panel_entry: Some("dist/panel.html".into()),
+            host_keys: identity.host_keys.clone(),
             icon_url: None,
         };
         assert!(panel_route_matches_identity(&route, &identity));
+        assert_eq!(
+            serde_json::to_value(super::panel_command_result(&identity)).unwrap()["hostKeys"],
+            serde_json::json!(["ArrowDown", "Primary+N"])
+        );
+        route
+            .host_keys
+            .push(crate::public_plugins::PanelHostKeyDeclaration::ArrowUp);
+        assert!(!panel_route_matches_identity(&route, &identity));
+        route.host_keys.clear();
         route.generation += 1;
         assert!(!panel_route_matches_identity(&route, &identity));
         route.generation = identity.generation;
@@ -5367,6 +5387,7 @@ mod tests {
             request_id: "request-a".into(),
             submission_token: "token-a".into(),
             argument: "query".into(),
+            host_keys: Vec::new(),
         }
     }
 

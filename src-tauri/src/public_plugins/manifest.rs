@@ -114,6 +114,14 @@ fn panel_host_keys_schema(generator: &mut SchemaGenerator) -> Schema {
     schema
 }
 
+impl PublicPanelV1 {
+    pub(crate) fn canonical_host_keys(&self) -> Vec<PanelHostKeyDeclaration> {
+        let mut keys = self.host_keys.clone();
+        keys.sort_unstable();
+        keys
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum PublicSettingV1 {

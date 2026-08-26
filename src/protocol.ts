@@ -264,6 +264,7 @@ export interface LauncherClient {
     argument: string
     uiIntentEpoch: number
   }): Promise<PluginPanelCommandResult>
+  enqueuePluginPanelHostKey(input: PluginPanelHostKeyEnqueueInput): Promise<PluginPanelHostKeyEnqueueResult>
   closePluginPanel(input: { sessionEpoch: U64Decimal }): Promise<void>
   acknowledgePluginPanelFocusHostInput(input: PluginPanelFocusHostInputEvent & { focused: boolean }): Promise<void>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
@@ -382,7 +383,26 @@ export interface PluginPanelCommandResult {
   sessionEpoch: U64Decimal
   pluginId: string
   commandLabel: string
+  hostKeys: readonly PanelHostKeyDeclaration[]
 }
+
+export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N'
+export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n'
+
+export interface PluginPanelHostKeyEnqueueInput {
+  sessionEpoch: U64Decimal
+  clientSequence: U64Decimal
+  declaration: PanelHostKeyDeclaration
+  key: PluginPanelHostKey
+  ctrlKey: boolean
+  metaKey: boolean
+  shiftKey: boolean
+  altKey: boolean
+}
+
+export type PluginPanelHostKeyEnqueueResult =
+  | { outcome: 'enqueued'; routeSequence: U64Decimal }
+  | { outcome: 'droppedQueueFull' | 'noop' | 'protocolViolation' }
 
 export interface PluginPanelErrorEvent {
   sessionEpoch: U64Decimal
@@ -397,6 +417,7 @@ export interface PluginPanelSnapshot {
   pluginId: string
   commandLabel: string
   sessionEpoch: U64Decimal
+  hostKeys: readonly PanelHostKeyDeclaration[]
   suffixControl: ControlKey
   suffix: string
   submitPending: boolean
@@ -766,8 +787,23 @@ export function parseU64Decimal(value: unknown): U64Decimal | null {
 
 export function parsePluginPanelCommandResult(value: unknown): PluginPanelCommandResult | null {
   const record = plainRecord(value)
-  if (!record || !exactKeys(record, ['commandLabel', 'pluginId', 'sessionEpoch'])) return null
+  if (!record || !exactKeys(record, ['commandLabel', 'hostKeys', 'pluginId', 'sessionEpoch'])) return null
   const sessionEpoch = parseU64Decimal(record.sessionEpoch)
+  if (!Array.isArray(record.hostKeys) || !exactDenseArray(record.hostKeys)) return null
+  const order: Readonly<Record<PanelHostKeyDeclaration, number>> = {
+    ArrowDown: 0,
+    ArrowUp: 1,
+    'Primary+N': 2,
+  }
+  const hostKeys: PanelHostKeyDeclaration[] = []
+  const seen = new Set<PanelHostKeyDeclaration>()
+  for (const key of record.hostKeys) {
+    if (typeof key !== 'string' || !(key in order)) return null
+    const declaration = key as PanelHostKeyDeclaration
+    if (seen.has(declaration)) return null
+    seen.add(declaration)
+    hostKeys.push(declaration)
+  }
   if (
     sessionEpoch === null ||
     sessionEpoch === '0' ||
@@ -777,7 +813,22 @@ export function parsePluginPanelCommandResult(value: unknown): PluginPanelComman
     typeof record.commandLabel !== 'string' ||
     !/^[a-z][a-z0-9-]{0,31}$/u.test(record.commandLabel)
   ) return null
-  return { sessionEpoch, pluginId: record.pluginId, commandLabel: record.commandLabel }
+  hostKeys.sort((left, right) => order[left] - order[right])
+  return { sessionEpoch, pluginId: record.pluginId, commandLabel: record.commandLabel, hostKeys }
+}
+
+export function parsePluginPanelHostKeyEnqueueResult(value: unknown): PluginPanelHostKeyEnqueueResult | null {
+  const record = plainRecord(value)
+  if (!record || typeof record.outcome !== 'string') return null
+  if (record.outcome === 'enqueued') {
+    if (!exactKeys(record, ['outcome', 'routeSequence'])) return null
+    const routeSequence = parseU64Decimal(record.routeSequence)
+    return routeSequence === null || routeSequence === '0' ? null : { outcome: 'enqueued', routeSequence }
+  }
+  if (!exactKeys(record, ['outcome'])) return null
+  return ['droppedQueueFull', 'noop', 'protocolViolation'].includes(record.outcome)
+    ? { outcome: record.outcome as 'droppedQueueFull' | 'noop' | 'protocolViolation' }
+    : null
 }
 
 export function parsePluginPanelErrorEvent(value: unknown): PluginPanelErrorEvent | null {

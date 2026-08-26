@@ -151,14 +151,21 @@ describe('plugin protocol', () => {
       sessionEpoch: '18446744073709551615',
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      hostKeys: ['Primary+N', 'ArrowUp', 'ArrowDown'],
     }
-    expect(parsePluginPanelCommandResult(identity)).toEqual(identity)
+    expect(parsePluginPanelCommandResult(identity)).toEqual({
+      ...identity,
+      hostKeys: ['ArrowDown', 'ArrowUp', 'Primary+N'],
+    })
     expect(parsePluginPanelErrorEvent({ sessionEpoch: '9' })).toEqual({ sessionEpoch: '9' })
     for (const invalid of [
       { ...identity, sessionEpoch: '0' },
       { ...identity, sessionEpoch: '01' },
       { ...identity, pluginId: 'Invalid Plugin' },
       { ...identity, commandLabel: '/demo-panel' },
+      { ...identity, hostKeys: 'ArrowDown' },
+      { ...identity, hostKeys: ['Enter'] },
+      { ...identity, hostKeys: ['ArrowDown', 'ArrowDown'] },
       { ...identity, extra: true },
     ]) expect(parsePluginPanelCommandResult(invalid)).toBeNull()
     expect(parsePluginPanelErrorEvent({ sessionEpoch: '9', extra: true })).toBeNull()
@@ -280,12 +287,15 @@ function fakeClient() {
       sessionEpoch: '1',
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      hostKeys: [],
     })),
     submitPluginPanel: vi.fn(async (input: { sessionEpoch: string }) => ({
       sessionEpoch: input.sessionEpoch,
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      hostKeys: [],
     })),
+    enqueuePluginPanelHostKey: vi.fn(async () => ({ outcome: 'enqueued', routeSequence: '1' })),
     closePluginPanel: vi.fn(async () => undefined),
     acknowledgePluginPanelFocusHostInput: vi.fn(async () => undefined),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
@@ -1273,6 +1283,7 @@ describe('shown and search ownership', () => {
       sessionEpoch: u64('7'),
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      hostKeys: [],
     })
     vi.mocked(client.submitPluginPanel).mockImplementationOnce(async (input) => {
       expect(core.getSnapshot().panel).toMatchObject({
@@ -1284,6 +1295,7 @@ describe('shown and search ownership', () => {
         sessionEpoch: input.sessionEpoch,
         pluginId: 'com.uipilot.demo-panel',
         commandLabel: 'demo-panel',
+        hostKeys: [],
       }
     })
 
@@ -1340,7 +1352,7 @@ describe('shown and search ownership', () => {
       })
       if (outcome === 'success') {
         opened.resolve({
-          sessionEpoch: u64('8'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+          sessionEpoch: u64('8'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
         })
       } else {
         opened.reject({ code: 'windowFailed' })
@@ -1368,12 +1380,14 @@ describe('shown and search ownership', () => {
       sessionEpoch: u64('9'),
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      hostKeys: [],
     })
     vi.mocked(client.submitPluginPanel)
       .mockResolvedValueOnce({
         sessionEpoch: u64('9'),
         pluginId: 'com.uipilot.demo-panel',
         commandLabel: 'demo-panel',
+        hostKeys: [],
       })
       .mockReturnValueOnce(submitA.promise)
       .mockReturnValueOnce(submitB.promise)
@@ -1406,7 +1420,7 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().panel).toMatchObject({ sessionEpoch: '9', suffix: 'B' })
     expect(core.getSnapshot().status).toBe('')
     submitB.resolve({
-      sessionEpoch: u64('9'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      sessionEpoch: u64('9'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
     })
     await submitB.promise
     await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
@@ -1422,6 +1436,7 @@ describe('shown and search ownership', () => {
       sessionEpoch: u64('12'),
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      hostKeys: [],
     })
     emit(shown('panel-error-entry'))
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -1446,7 +1461,7 @@ describe('shown and search ownership', () => {
       items: [panelItem('hello')],
     } as unknown as SearchResponse)
     vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
-      sessionEpoch: u64('21'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      sessionEpoch: u64('21'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
     })
     emit(shown('panel-hide-entry'))
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -1475,7 +1490,7 @@ describe('shown and search ownership', () => {
       requestId: 'panel-reset-result', items: [panelItem('')],
     } as unknown as SearchResponse)
     vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
-      sessionEpoch: u64('22'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      sessionEpoch: u64('22'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
     })
     emit(shown('panel-reset-entry'))
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -1534,6 +1549,74 @@ describe('shown and search ownership', () => {
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
     await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '1' }))
     await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+    await mounted.unmount()
+  })
+
+  it('serializes declared Host keys and consumes queue-full client sequences', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-host-key-result',
+      items: [panelItem('')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('31'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+      hostKeys: ['ArrowDown', 'Primary+N'],
+    })
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('31'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+      hostKeys: ['ArrowDown', 'Primary+N'],
+    })
+    const first = deferred<{ outcome: 'droppedQueueFull' }>()
+    vi.mocked(client.enqueuePluginPanelHostKey)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ outcome: 'enqueued', routeSequence: u64('1') })
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('panel-host-key-entry')))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'hello', inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('31'))
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+
+    const down = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+    const primaryN = new KeyboardEvent('keydown', { key: 'n', ctrlKey: true, bubbles: true, cancelable: true })
+    input.dispatchEvent(down)
+    input.dispatchEvent(primaryN)
+    expect(down.defaultPrevented).toBe(true)
+    expect(primaryN.defaultPrevented).toBe(true)
+    await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(1))
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenNthCalledWith(1, {
+      sessionEpoch: '31', clientSequence: '1', declaration: 'ArrowDown', key: 'ArrowDown',
+      ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    })
+
+    first.resolve({ outcome: 'droppedQueueFull' })
+    await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(2))
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenNthCalledWith(2, {
+      sessionEpoch: '31', clientSequence: '2', declaration: 'Primary+N', key: 'n',
+      ctrlKey: true, metaKey: false, shiftKey: false, altKey: false,
+    })
+
+    const undeclared = new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
+    const shifted = new KeyboardEvent('keydown', { key: 'ArrowDown', shiftKey: true, bubbles: true, cancelable: true })
+    const composing = new KeyboardEvent('keydown', { key: 'ArrowDown', isComposing: true, bubbles: true, cancelable: true })
+    input.dispatchEvent(undeclared)
+    input.dispatchEvent(shifted)
+    input.dispatchEvent(composing)
+    expect(undeclared.defaultPrevented).toBe(false)
+    expect(shifted.defaultPrevented).toBe(false)
+    expect(composing.defaultPrevented).toBe(false)
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(2)
     await mounted.unmount()
   })
 
@@ -1644,7 +1727,7 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().panel).toBeUndefined()
 
     opened.resolve({
-      sessionEpoch: u64('1'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+      sessionEpoch: u64('1'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
     })
     await vi.waitFor(() => expect(core.getSnapshot().panel?.focusRequestId).toBe('9'))
     expect(client.acknowledgePluginPanelFocusHostInput).not.toHaveBeenCalled()
@@ -1659,10 +1742,10 @@ describe('shown and search ownership', () => {
     } as unknown as SearchResponse)
     vi.mocked(client.openPluginPanel)
       .mockResolvedValueOnce({
-        sessionEpoch: u64('1'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+        sessionEpoch: u64('1'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
       })
       .mockResolvedValueOnce({
-        sessionEpoch: u64('2'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+        sessionEpoch: u64('2'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
       })
 
     const openFromQuery = async (invocationId: string) => {
@@ -4932,8 +5015,9 @@ describe('real adapter and startup', () => {
     tauriCapture.invoke.mockImplementation((command) => {
       if (command === 'list_plugins') return Promise.resolve(pluginInventory([installedPlugin()]))
       if (command === 'open_plugin_panel' || command === 'submit_plugin_panel') return Promise.resolve({
-        sessionEpoch: '7', pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel',
+        sessionEpoch: '7', pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
       })
+      if (command === 'plugin_panel_host_key_enqueue') return Promise.resolve({ outcome: 'droppedQueueFull' })
       if (command === 'install_plugin' || command === 'reload_plugin' || command === 'delete_plugin') {
         return Promise.resolve({ revision: '2' })
       }
@@ -4951,6 +5035,10 @@ describe('real adapter and startup', () => {
     await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', favorite: true })
     await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
+    await main.client.enqueuePluginPanelHostKey({
+      sessionEpoch: u64('7'), clientSequence: u64('1'), declaration: 'ArrowDown', key: 'ArrowDown',
+      ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    })
     await main.client.closePluginPanel({ sessionEpoch: u64('7') })
     await main.client.acknowledgePluginPanelFocusHostInput({
       sessionEpoch: u64('7'), focusRequestId: u64('9'), focused: true,
@@ -4973,6 +5061,10 @@ describe('real adapter and startup', () => {
       ['set_plugin_favorite', [{ pluginId: 'com.uipilot.demo-win', favorite: true }]],
       ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
+      ['plugin_panel_host_key_enqueue', [{ input: {
+        sessionEpoch: '7', clientSequence: '1', declaration: 'ArrowDown', key: 'ArrowDown',
+        ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+      } }]],
       ['close_plugin_panel', [{ input: { sessionEpoch: '7' } }]],
       ['plugin_panel_focus_host_input_ack', [{ sessionEpoch: '7', focusRequestId: '9', focused: true }]],
       ['select_public_plugin_directory', []],

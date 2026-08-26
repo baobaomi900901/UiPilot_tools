@@ -15,8 +15,8 @@ use tauri::{
 use webview2_com::FocusChangedEventHandler;
 
 use crate::public_plugins::{
-    inert_url, prepare_windows_webview, verify_windows_webview_muted, PluginInvocationTheme,
-    PublicPluginManagementError, PublicPluginService, WebViewGuardOwner,
+    inert_url, prepare_windows_webview, verify_windows_webview_muted, PanelHostKeyDeclaration,
+    PluginInvocationTheme, PublicPluginManagementError, PublicPluginService, WebViewGuardOwner,
 };
 
 const CONTENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,6 +39,7 @@ pub(crate) struct PanelSessionIdentity {
     pub(crate) admission_epoch: u64,
     pub(crate) command_label: String,
     pub(crate) content_label: String,
+    pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +52,7 @@ pub(crate) struct PanelOwner {
     pub(crate) request_id: String,
     pub(crate) submission_token: String,
     pub(crate) argument: String,
+    pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,6 +340,7 @@ impl PluginPanelController {
             admission_epoch: owner.admission_epoch,
             command_label: owner.command_label.clone(),
             content_label,
+            host_keys: owner.host_keys.clone(),
         };
         core.session = Some(LiveSession {
             identity: identity.clone(),
@@ -1537,6 +1540,7 @@ mod tests {
             request_id: request.into(),
             submission_token: format!("token-{request}"),
             argument: "hello".into(),
+            host_keys: Vec::new(),
         }
     }
 

@@ -27,7 +27,8 @@ use super::{
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
     manifest::{
-        valid_plugin_id, PublicActivationMode, PublicOutputMode, PublicPermission, PublicSettingV1,
+        valid_plugin_id, PanelHostKeyDeclaration, PublicActivationMode, PublicOutputMode,
+        PublicPermission, PublicSettingV1,
     },
     owner_cleanup::{
         remove_owned_directory, OwnerCleanupError, PluginOwnerCleanupReceipt,
@@ -147,6 +148,7 @@ pub(crate) struct PublicPluginRoute {
     pub(crate) input_placeholder: Option<String>,
     pub(crate) window_entry: Option<String>,
     pub(crate) panel_entry: Option<String>,
+    pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
     pub(crate) icon_url: Option<String>,
 }
 
@@ -1741,6 +1743,12 @@ impl PublicPluginManager {
                     .panel
                     .as_ref()
                     .map(|panel| panel.entry.clone()),
+                host_keys: snapshot
+                    .manifest
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.canonical_host_keys())
+                    .unwrap_or_default(),
                 icon_url: snapshot.icon_url(),
             }));
         }
@@ -1798,6 +1806,12 @@ impl PublicPluginManager {
                     .panel
                     .as_ref()
                     .map(|panel| panel.entry.clone()),
+                host_keys: snapshot
+                    .manifest
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.canonical_host_keys())
+                    .unwrap_or_default(),
                 icon_url: snapshot.icon_url(),
             }));
         }
@@ -4373,6 +4387,7 @@ mod tests {
                 input_placeholder: None,
                 window_entry: None,
                 panel_entry: None,
+                host_keys: Vec::new(),
                 icon_url: None,
             }
         );
