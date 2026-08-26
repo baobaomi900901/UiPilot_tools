@@ -15,7 +15,18 @@
         <div><dt>Theme</dt><dd id="theme"></dd></div>
         <div><dt>Request</dt><dd id="request"></dd></div>
         <div><dt>Stored input</dt><dd id="stored"></dd></div>
+        <div><dt>Content focus</dt><dd><span id="focus-state" class="focus-state">Not focused</span></dd></div>
+        <div><dt>Latest key</dt><dd id="latest-key">None</dd></div>
+        <div><dt>Source</dt><dd id="key-source">None</dd></div>
+        <div><dt>Events</dt><dd id="key-count">0</dd></div>
+        <div><dt>Route sequence</dt><dd id="route-sequence">None</dd></div>
       </dl>
+      <section class="key-history" aria-labelledby="key-history-title">
+        <h2 id="key-history-title">Recent key events</h2>
+        <ol id="key-history" aria-live="polite">
+          <li class="key-history-empty">No key events yet</li>
+        </ol>
+      </section>
     </main>
     <script type="module" src="./panel.js"></script>
   </body>

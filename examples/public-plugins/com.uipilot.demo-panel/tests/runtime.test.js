@@ -1,14 +1,71 @@
 import assert from 'node:assert/strict'
 import { readFile, readdir } from 'node:fs/promises'
 import test from 'node:test'
+import { JSDOM } from 'jsdom'
 
 const packageRoot = new URL('../package/', import.meta.url)
 const runtimeUrl = new URL('../package/dist/runtime.js', import.meta.url)
+const panelHtmlUrl = new URL('../package/dist/panel.html', import.meta.url)
+const panelScriptUrl = new URL('../package/dist/panel.js', import.meta.url)
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+let panelModuleSequence = 0
 
 async function loadRuntime() {
   const source = await readFile(runtimeUrl, 'utf8')
   return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+}
+
+async function loadPanel({ focused = false } = {}) {
+  const [html, source] = await Promise.all([
+    readFile(panelHtmlUrl, 'utf8'),
+    readFile(panelScriptUrl, 'utf8'),
+  ])
+  const dom = new JSDOM(html, { url: 'https://panel.uipilot.invalid/' })
+  let contentFocused = focused
+  let hostKeyHandler
+  let focusHostInputCalls = 0
+  let requestHideCalls = 0
+
+  Object.defineProperty(dom.window.document, 'hasFocus', {
+    configurable: true,
+    value: () => contentFocused,
+  })
+  dom.window.uipilotPluginPanel = {
+    onHostKey(handler) {
+      hostKeyHandler = handler
+      return () => {}
+    },
+    onUpdate() {
+      return () => {}
+    },
+    focusHostInput: async () => { focusHostInputCalls += 1 },
+    requestHide: async () => { requestHideCalls += 1 },
+    storage: {
+      get: async () => undefined,
+      set: async () => {},
+      remove: async () => {},
+    },
+  }
+
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  panelModuleSequence += 1
+  await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}#${panelModuleSequence}`)
+
+  return {
+    window: dom.window,
+    text: (selector) => dom.window.document.querySelector(selector)?.textContent,
+    history: () => [...dom.window.document.querySelectorAll('#key-history li')].map((item) => item.textContent),
+    hostKey: (event) => hostKeyHandler?.(event),
+    setFocused(next) { contentFocused = next },
+    focusHostInputCalls: () => focusHostInputCalls,
+    requestHideCalls: () => requestHideCalls,
+    cleanup() {
+      dom.window.close()
+      delete globalThis.window
+      delete globalThis.document
+    },
+  }
 }
 
 const invocation = Object.freeze({
@@ -78,4 +135,70 @@ test('panel content uses only the panel bridge and isolated storage', async () =
   for (const forbidden of ['invoke(', 'fetch(', 'WebSocket', 'uipilotPluginWindow', 'timer', 'notifications']) {
     assert.doesNotMatch(source, new RegExp(forbidden.replace('(', '\\(')))
   }
+})
+
+test('panel diagnostics reflect initial focus and focus transitions', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+
+  assert.equal(panel.text('#focus-state'), 'Not focused')
+  panel.setFocused(true)
+  panel.window.dispatchEvent(new panel.window.Event('focus'))
+  assert.equal(panel.text('#focus-state'), 'Focused')
+  panel.setFocused(false)
+  panel.window.dispatchEvent(new panel.window.Event('blur'))
+  assert.equal(panel.text('#focus-state'), 'Not focused')
+})
+
+test('panel diagnostics show Host-routed keys and route sequence', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+
+  panel.hostKey({ key: 'ArrowDown', routeSequence: '42' })
+
+  assert.equal(panel.text('#latest-key'), 'ArrowDown')
+  assert.equal(panel.text('#key-source'), 'Host route')
+  assert.equal(panel.text('#key-count'), '1')
+  assert.equal(panel.text('#route-sequence'), '42')
+  assert.deepEqual(panel.history(), ['ArrowDown | Host route | route 42'])
+})
+
+test('panel diagnostics show content keys newest-first and retain five events', async (t) => {
+  const panel = await loadPanel({ focused: true })
+  t.after(panel.cleanup)
+  const content = panel.window.document.querySelector('main')
+  content.addEventListener('keydown', (event) => event.stopPropagation())
+
+  for (const key of ['a', 'b', 'c', 'd', 'e', 'f']) {
+    content.dispatchEvent(new panel.window.KeyboardEvent('keydown', {
+      bubbles: true,
+      key,
+      shiftKey: key === 'f',
+    }))
+  }
+
+  assert.equal(panel.text('#latest-key'), 'Shift+F')
+  assert.equal(panel.text('#key-source'), 'Panel content')
+  assert.equal(panel.text('#key-count'), '6')
+  assert.equal(panel.text('#route-sequence'), 'None')
+  assert.deepEqual(panel.history(), [
+    'Shift+F | Panel content',
+    'E | Panel content',
+    'D | Panel content',
+    'C | Panel content',
+    'B | Panel content',
+  ])
+})
+
+test('panel diagnostics record Ctrl shortcuts before preserving bridge commands', async (t) => {
+  const panel = await loadPanel({ focused: true })
+  t.after(panel.cleanup)
+
+  panel.window.dispatchEvent(new panel.window.KeyboardEvent('keydown', { key: 'f', ctrlKey: true, cancelable: true }))
+  assert.equal(panel.text('#latest-key'), 'Ctrl+F')
+  assert.equal(panel.focusHostInputCalls(), 1)
+
+  panel.window.dispatchEvent(new panel.window.KeyboardEvent('keydown', { key: 'h', ctrlKey: true, cancelable: true }))
+  assert.equal(panel.text('#latest-key'), 'Ctrl+H')
+  assert.equal(panel.requestHideCalls(), 1)
 })
