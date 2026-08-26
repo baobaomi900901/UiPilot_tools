@@ -248,6 +248,7 @@ struct HostKeyRouteState {
     next_route_sequence: u64,
     next_expected_client_sequence: u64,
     receiver_armed: bool,
+    native_focus_blur_expected: bool,
     queue: VecDeque<HostKeyDeliveryTicket>,
     in_flight: Option<HostKeyInFlight>,
     pump_running: bool,
@@ -259,6 +260,7 @@ impl Default for HostKeyRouteState {
             next_route_sequence: 1,
             next_expected_client_sequence: 1,
             receiver_armed: false,
+            native_focus_blur_expected: false,
             queue: VecDeque::new(),
             in_flight: None,
             pump_running: false,
@@ -544,6 +546,7 @@ pub(crate) fn plugin_id_from_panel_content_label(label: &str) -> Option<String> 
 
 fn disarm_host_key_route(route: &mut HostKeyRouteState) {
     route.receiver_armed = false;
+    route.native_focus_blur_expected = false;
     route.queue.clear();
     route.pump_running = false;
     if let Some(in_flight) = route.in_flight.as_mut() {
@@ -571,6 +574,7 @@ fn finish_host_key_ack_locked(
         return HostKeyAckOutcome::Stale;
     }
     if in_flight.phase == HostKeyDeliveryPhase::Accomplished {
+        session.host_key_route.native_focus_blur_expected = false;
         session.host_key_route.in_flight = None;
         changed.notify_all();
         return HostKeyAckOutcome::Acknowledged;
@@ -1015,7 +1019,11 @@ impl PluginPanelController {
         let revision = core.focus_revision.checked_add(1)?;
         core.focus_revision = revision;
         core.main_content_focused = false;
+        let host_key_focus_transfer = core.session.as_mut().is_some_and(|session| {
+            std::mem::take(&mut session.host_key_route.native_focus_blur_expected)
+        });
         if expected_transfer_blur
+            || host_key_focus_transfer
             || core
                 .session
                 .as_ref()
@@ -1047,10 +1055,12 @@ impl PluginPanelController {
         };
         core.focus_revision = revision;
         core.main_content_focused = false;
-        core.session
+        let session = core
+            .session
             .as_mut()
-            .expect("validated panel focus session")
-            .content_focused = true;
+            .expect("validated panel focus session");
+        session.content_focused = true;
+        session.host_key_route.native_focus_blur_expected = false;
         true
     }
 
@@ -1408,6 +1418,7 @@ impl PluginPanelController {
             phase: HostKeyDeliveryPhase::Prepared,
             ack_deadline: None,
         });
+        route.native_focus_blur_expected = true;
         Some(ticket)
     }
 
@@ -2474,6 +2485,25 @@ mod tests {
         assert!(controller.content_got_focus(&identity.content_label, identity.session_epoch));
 
         assert!(!controller.confirm_app_blur(&ticket));
+    }
+
+    #[test]
+    fn host_key_native_focus_transfer_does_not_create_app_blur_ticket() {
+        let controller = PluginPanelController::default();
+        let identity = host_key_session(&controller);
+        assert!(controller.main_content_got_focus());
+        assert!(matches!(
+            controller
+                .enqueue_host_key(identity.session_epoch, host_key_input(1))
+                .unwrap()
+                .outcome,
+            HostKeyEnqueueOutcome::Enqueued { .. }
+        ));
+
+        let ticket = controller.claim_next_host_key().unwrap();
+
+        assert!(controller.main_content_lost_focus(false).is_none());
+        assert!(controller.mark_host_key_native_focused(&ticket));
     }
 
     #[test]
