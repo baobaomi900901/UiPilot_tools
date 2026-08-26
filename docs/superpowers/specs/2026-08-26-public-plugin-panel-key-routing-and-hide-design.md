@@ -1,7 +1,7 @@
 # Public Plugin Panel Key Routing And Hide Design
 
 **Date:** 2026-08-26  
-**Status:** Draft — awaiting review (revision 6; closes review round 6 P2/P3)  
+**Status:** Draft — awaiting review (revision 7; closes review round 7 P1)  
 **Related:**  
 `docs/superpowers/specs/2026-08-24-public-plugin-panel-mode-design.md`,  
 `docs/superpowers/specs/2026-08-25-public-plugin-panel-focus-host-input-design.md`,  
@@ -137,8 +137,9 @@ Capability: **panel-content only**.
 After applying admit and resolving the public Promise, bootstrap **must**
 fire this command in the same turn (**fire-and-forget**: do **not** `await`
 its settle before scheduling commit; ignore reject/timeout for control flow).
-On success, Rust marks the ticket `Observed`. Only an `Observed` ticket may
-arm the **500ms** short commit fallback.
+
+`admit_observed` and primary `commit` are independent invokes and **may arrive
+in either order** at Rust. Phase transitions below freeze both orders.
 
 `admit_observed` success/failure **only** chooses which Rust fallback timer
 applies (500ms after Observed vs 30s while still Admitted). It must **not**
@@ -169,33 +170,60 @@ If an implementation `await`s observed before scheduling commit, a rejected or
 hung observed invoke would leave an already-resolved `requestHide()` waiting
 for the 30s unrecovered path — **forbidden**.
 
-**Timers (frozen):**
+#### Phase transition table (frozen; atomic CAS)
 
-| Condition | Timer | Action |
+Ticket phases: `Admitted` → `Observed` → `Committed` (Observed optional if
+commit wins the race).
+
+| Actor | Accepts when `(sessionEpoch, hideTicketId)` match and phase is | Transition / effect |
 |---|---|---|
-| Ticket `Observed`, no commit yet | **500ms** from observation | Attempt Rust auto-commit |
-| Ticket still `Admitted` (never observed) | **30s** from admit | Fault reclaim auto-commit |
+| **`admit_observed`** | **`Admitted` only** | → `Observed`; arm **500ms** short fallback from this instant |
+| **`admit_observed`** | `Observed` / `Committed` / missing / wrong epoch | **no-op** |
+| **Primary `commit`** (bootstrap) | **`Admitted` \| `Observed`** | → `Committed`; perform hide + teardown **once** |
+| **Primary `commit`** | `Committed` / missing / wrong epoch | **no-op** |
+| **500ms timer** | **`Observed` only** | → `Committed`; hide once |
+| **500ms timer** | `Admitted` / `Committed` / mismatch | **no-op** |
+| **30s timer** | **`Admitted` only** | → `Committed`; hide once (fault reclaim) |
+| **30s timer** | `Observed` / `Committed` / mismatch | **no-op** |
 
-**Timer / commit ownership (CAS):** Every delayed callback and every commit
-attempt (bootstrap or Rust) commits **only if** a compare-and-swap still
-matches `(sessionEpoch, hideTicketId, expectedPhase)` where `expectedPhase` is
-`Admitted` or `Observed` as appropriate for that timer. On mismatch (teardown,
-epoch bump, already `Committed`, different ticket) → **no-op**. Teardown,
-epoch update, or successful commit invalidate all older timers for that ticket.
+Consequences of invoke reorder:
+
+- **observed → commit:** observed arms 500ms; commit accepts `Observed` →
+  immediate single hide; 500ms timer later no-ops.
+- **commit → late observed:** commit accepts `Admitted` → immediate single
+  hide; late observed sees `Committed` → no-op (does not re-arm short
+  fallback meaningfully for a dead ticket).
+
+Primary commit must **not** require `Observed` only (that would no-op when
+commit arrives first and delay hide to fallback). Primary commit must **not**
+accept only `Admitted` (that would no-op after observed won). Accepting
+**`Admitted | Observed → Committed`** is the only correct contract.
+
+**Timers (summary):**
+
+| Condition | Timer | CAS accepts |
+|---|---|---|
+| Became `Observed`, not yet committed | **500ms** from observation | `Observed` only |
+| Still `Admitted` (never observed) | **30s** from admit | `Admitted` only |
+
+Teardown, epoch update, or successful commit invalidate all older timers for
+that ticket (CAS mismatch → no-op).
 
 **SDK / public contract for the 30s path:** If the content document never
 observes admit (hung/crashed renderer), the public `requestHide()` Promise
 **may never settle**. Document this as a hung-renderer exception in
 `docs/plugin-sdk` and cover with Host tests (observe-before-short-fallback;
-admit-blocked-30s-reclaim; stale-timer-after-new-session). Happy-path work must
-still observe admit and settle the Promise before teardown.
+admit-blocked-30s-reclaim; stale-timer-after-new-session;
+observed-then-commit; commit-then-late-observed). Happy-path work must still
+observe admit and settle the Promise before teardown.
 
-Short fallback must **not** start at admit time. Idempotent commit: first wins.
+Short fallback must **not** start at admit time. Idempotent commit: first wins
+(exactly one hide for a ticket).
 
 Commit semantics:
 
-1. Commit performs shared launcher hide with `HideReason::ExplicitReturn`,
-   then teardown. Ticket phase → `Committed`.
+1. Successful primary or timer commit performs shared launcher hide with
+   `HideReason::ExplicitReturn`, then teardown. Ticket phase → `Committed`.
 2. Duplicate commit / stale ticket / failed CAS → no-op.
 3. Admit success then Host crash before commit → session may linger until next
    hide/show; not plugin-visible.
@@ -541,9 +569,9 @@ main keydown (declared, physical order)
 content requestHide()
   → plugin_panel_request_hide_admit → { admitted, hideTicketId } | noop
   → bootstrap resolves Promise
-  → fire-and-forget admit_observed   // success → 500ms timer; else stay on 30s
-  → setTimeout(0) → commit           // always scheduled; not gated on observed
-  → hide + teardown (CAS-guarded)
+  → fire-and-forget admit_observed   // Admitted→Observed if still Admitted
+  → setTimeout(0) → commit           // accepts Admitted|Observed → Committed once
+  // Rust may see observed→commit or commit→late observed; both hide exactly once
 ```
 
 ### Escape
@@ -555,7 +583,7 @@ capture keydown record + queueMicrotask
        → hide admit → observed → commit (§3.2)
 ```
 
-## 10. Testing matrix (additions for revision 6)
+## 10. Testing matrix (additions for revision 7)
 
 - Frozen command names including `admit_observed` in capabilities.
 - Serialized launcher enqueue; out-of-order `clientSequence > nextExpected` →
@@ -567,10 +595,13 @@ capture keydown record + queueMicrotask
 - Ack timeout → session teardown; no overlapping second handler.
 - `requestHide`: Promise settles before destroy on happy path; observed is
   fire-and-forget — rejected/hung observed still schedules next-macrotask
-  commit; short 500ms fallback only after successful Observed; 30s unrecovered
-  if never observed; timer CAS no-op after teardown/epoch bump/commit; **old
-  session timer firing during a new session is a no-op**; SDK hung-renderer
-  Promise note; duplicate admit → noop.
+  commit; **deterministic order A:** observed then commit → exactly one
+  immediate hide; **deterministic order B:** commit then late observed →
+  exactly one immediate hide and late observed no-op; short 500ms fallback
+  only while phase is Observed; 30s unrecovered only while Admitted; timer CAS
+  no-op after teardown/epoch bump/commit; **old session timer firing during a
+  new session is a no-op**; SDK hung-renderer Promise note; duplicate admit →
+  noop.
 - Escape: capture + `queueMicrotask`; sync preventDefault blocks; post-await
   does not.
 - Manifest/schema/CLI: unknown/duplicate/`hostKeys` length > 8 rejected;
@@ -601,7 +632,7 @@ manual Notepad ExplicitReturn).
 Notes business; guaranteed foreground restore; live search streaming;
 concurrent host-key handlers; gap-timer reorder recovery.
 
-## 13. Decisions closed in revision 6
+## 13. Decisions closed in revision 7
 
 | Topic | Decision |
 |---|---|
@@ -609,8 +640,9 @@ concurrent host-key handlers; gap-timer reorder recovery.
 | clientSequence order | Serialized launcher; Rust accept only `== nextExpected`; `>` → teardown; no hold/gap timer |
 | droppedQueueFull | Consume expected sequence (advance `nextExpected`) without delivery |
 | Ack timeout | Disarm + ExplicitReturn teardown |
-| requestHide observability | Admit → resolve → fire-and-forget observed → **always** next-macrotask commit; observed only selects 500ms vs 30s Rust fallback |
-| Hide ticket / timers | `hideTicketId` no wrap (admit fail closed); timer/commit CAS on `(epoch, ticketId, phase)`; stale timers no-op |
+| requestHide observability | Admit → resolve → fire-and-forget observed → **always** next-macrotask commit |
+| observed / commit reorder | Primary commit CAS: `Admitted \| Observed → Committed`; observed: `Admitted → Observed` only (Committed → no-op); 500ms: Observed only; 30s: Admitted only; both invoke orders hide exactly once |
+| Hide ticket / timers | `hideTicketId` no wrap (admit fail closed); stale timers no-op |
 | Escape | Capture + `queueMicrotask`; sync preventDefault only |
 | Primary+N | Platform Ctrl **xor** Meta |
 | Illegal onHostKey | Sticky violation |
@@ -620,5 +652,5 @@ concurrent host-key handlers; gap-timer reorder recovery.
 
 ## 14. Approval
 
-Status remains **Draft** until review accepts revision 6. Do not implement
+Status remains **Draft** until review accepts revision 7. Do not implement
 until Status is **Approved**.
