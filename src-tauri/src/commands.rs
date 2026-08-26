@@ -553,7 +553,11 @@ pub(crate) struct PluginPanelHostKeyEnqueueInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase")]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum PluginPanelHostKeyEnqueueResult {
     Enqueued { route_sequence: String },
     DroppedQueueFull,
@@ -4282,6 +4286,20 @@ mod tests {
             serde_json::json!({
                 "status": "ready",
                 "initializationToken": "find-initialization-1"
+            })
+        );
+    }
+
+    #[test]
+    fn panel_host_key_enqueue_result_uses_camel_case_fields() {
+        assert_eq!(
+            serde_json::to_value(super::PluginPanelHostKeyEnqueueResult::Enqueued {
+                route_sequence: "1".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "outcome": "enqueued",
+                "routeSequence": "1"
             })
         );
     }
