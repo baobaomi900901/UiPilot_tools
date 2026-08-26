@@ -394,8 +394,8 @@ function copyEditorContent({ onSuccess } = {}) {
   }
   const text = editorContent.value
   try {
-    if (navigator.clipboard?.writeText) {
-      void navigator.clipboard.writeText(text).then(
+    if (window.navigator.clipboard?.writeText) {
+      void window.navigator.clipboard.writeText(text).then(
         () => {
           clearStatusLater('已复制')
           onSuccess?.()
@@ -460,7 +460,11 @@ function tryCopyFromList(event) {
   }
   event.preventDefault()
   event.stopPropagation()
-  copyEditorContent()
+  copyEditorContent({
+    onSuccess: () => {
+      void window.uipilotPluginPanel.requestHide()
+    },
+  })
   return true
 }
 

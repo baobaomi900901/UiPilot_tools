@@ -70,6 +70,14 @@ async function loadPanel({ notes = sampleNotes } = {}) {
     return 1
   }
   dom.window.cancelAnimationFrame = () => {}
+  Object.defineProperty(dom.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      writeText() {
+        return Promise.resolve()
+      },
+    },
+  })
 
   dom.window.uipilotPluginPanel = {
     onHostKey(handler) {
@@ -540,6 +548,37 @@ test('Escape save path calls requestHide once after sync preventDefault', async 
   assert.equal(escape.defaultPrevented, true)
   await panel.flush()
   panel.document.querySelector('#unsaved-form').requestSubmit()
+  await panel.flush()
+  assert.equal(panel.requestHideCalls(), 1)
+})
+
+test('list Enter copies content then requests hide once', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  await panel.flush()
+  panel.document.querySelector('#note-list').focus()
+  assert.equal(panel.document.activeElement?.id, 'note-list')
+
+  const enter = new panel.window.KeyboardEvent('keydown', {
+    key: 'Enter',
+    bubbles: true,
+    cancelable: true,
+  })
+  panel.document.dispatchEvent(enter)
+  await panel.flush()
+  await Promise.resolve()
+  await Promise.resolve()
   await panel.flush()
   assert.equal(panel.requestHideCalls(), 1)
 })
