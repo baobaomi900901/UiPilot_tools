@@ -1623,7 +1623,7 @@ pub(crate) fn plugin_panel_request_hide_admit_observed(
         .live_identity()
         .is_none_or(|session| session.content_label != webview.label())
     {
-        return Ok(());
+        return Err(CommandError::window_failed());
     }
     if controller.observe_hide(identity) {
         plugin_panel::schedule_panel_hide_fallback(
@@ -1650,9 +1650,9 @@ pub(crate) fn plugin_panel_request_hide_commit(
         .live_identity()
         .is_none_or(|session| session.content_label != webview.label())
     {
-        return Ok(());
+        return Err(CommandError::window_failed());
     }
-    plugin_panel::commit_panel_hide(&app, controller.inner().as_ref(), identity)
+    plugin_panel::commit_panel_hide(&app, Arc::clone(controller.inner()), identity)
         .map(|_| ())
         .map_err(|_| CommandError::window_failed())
 }

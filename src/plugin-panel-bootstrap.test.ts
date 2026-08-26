@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 interface BootstrapPanelApi {
   onUpdate(handler: (update: unknown) => void): () => void
   onHostKey(handler: (event: unknown) => void): () => void
+  requestHide(): Promise<void>
 }
 
 function panelBootstrapSource(): string {
@@ -17,8 +18,9 @@ function panelBootstrapSource(): string {
     .replace('__HOST_KEYS__', '["ArrowDown"]')
 }
 
-function executePanelBootstrap() {
-  const invoke = vi.fn(async () => undefined)
+function executePanelBootstrap(
+  invoke = vi.fn(async (_command: string, _args?: unknown): Promise<unknown> => undefined),
+) {
   const hostWindow: Record<string, unknown> = {
     __TAURI_INTERNALS__: { invoke },
   }
@@ -71,5 +73,39 @@ describe('public plugin panel bootstrap', () => {
 
     expect(preventDefault).toHaveBeenCalledOnce()
     expect(stopPropagation).not.toHaveBeenCalled()
+  })
+
+  it('uses the prepared live session epoch for the complete hide transaction', async () => {
+    vi.useFakeTimers()
+    try {
+      const invoke = vi.fn(async (command: string): Promise<unknown> => {
+        if (command === 'plugin_panel_request_hide_admit') {
+          return { outcome: 'admitted', hideTicketId: '11' }
+        }
+        return undefined
+      })
+      const { hostWindow } = executePanelBootstrap(invoke)
+      const prepare = hostWindow.__UIPILOT_PLUGIN_PANEL_PREPARE__ as (
+        input: { sessionEpoch: string }
+      ) => void
+      prepare({ sessionEpoch: '8' })
+
+      await (hostWindow.uipilotPluginPanel as BootstrapPanelApi).requestHide()
+
+      expect(invoke).toHaveBeenCalledWith('plugin_panel_request_hide_admit', {
+        sessionEpoch: '8',
+      })
+      expect(invoke).toHaveBeenCalledWith('plugin_panel_request_hide_admit_observed', {
+        sessionEpoch: '8',
+        hideTicketId: '11',
+      })
+      await vi.runAllTimersAsync()
+      expect(invoke).toHaveBeenCalledWith('plugin_panel_request_hide_commit', {
+        sessionEpoch: '8',
+        hideTicketId: '11',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

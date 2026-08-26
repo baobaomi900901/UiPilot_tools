@@ -347,6 +347,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   let invoke = null;
   let readySent = false;
   let storageSession = null;
+  let liveSessionEpoch = '__SESSION_EPOCH__';
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
     seen.add(value);
@@ -383,7 +384,8 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   };
   const requestPanelHide = () => {
     if (!invoke) return Promise.reject(new Error('ExpiredWindowSessionError'));
-    return invoke('plugin_panel_request_hide_admit', { sessionEpoch: '__SESSION_EPOCH__' }).then((result) => {
+    const sessionEpoch = liveSessionEpoch;
+    return invoke('plugin_panel_request_hide_admit', { sessionEpoch }).then((result) => {
       if (result?.outcome === 'noop') return;
       if (
         result?.outcome !== 'admitted' || typeof result.hideTicketId !== 'string' ||
@@ -392,12 +394,12 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       return new Promise((resolve) => {
         resolve();
         void invoke('plugin_panel_request_hide_admit_observed', {
-          sessionEpoch: '__SESSION_EPOCH__',
+          sessionEpoch,
           hideTicketId: result.hideTicketId,
         }).catch(() => undefined);
         setTimeout(() => {
           void invoke('plugin_panel_request_hide_commit', {
-            sessionEpoch: '__SESSION_EPOCH__',
+            sessionEpoch,
             hideTicketId: result.hideTicketId,
           }).catch(() => undefined);
         }, 0);
@@ -441,6 +443,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
         throw new TypeError('invalid session epoch');
       }
       if (storageSession) storageSession.active = false;
+      liveSessionEpoch = sessionEpoch;
       storageSession = createStorageSession(sessionEpoch);
     },
   });
@@ -728,6 +731,24 @@ impl PluginPanelController {
         }
         ticket.phase = PanelHideTicketPhase::Committed;
         Some(session_identity)
+    }
+
+    pub(crate) fn fail_hide_commit(&self, identity: PanelHideTicketIdentity) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        if !core
+            .session
+            .as_ref()
+            .is_some_and(|session| session.identity.session_epoch == identity.session_epoch)
+            || !core.hide_ticket.as_ref().is_some_and(|ticket| {
+                ticket.identity == identity && ticket.phase == PanelHideTicketPhase::Committed
+            })
+        {
+            return false;
+        }
+        core.hide_ticket = None;
+        true
     }
 
     #[cfg(test)]
@@ -2300,13 +2321,13 @@ fn schedule_host_key_terminal_hide(app: AppHandle) {
 
 pub(crate) fn commit_panel_hide(
     app: &AppHandle,
-    controller: &PluginPanelController,
+    controller: Arc<PluginPanelController>,
     identity: PanelHideTicketIdentity,
 ) -> Result<bool, ()> {
     if controller.claim_hide_commit(identity).is_none() {
         return Ok(false);
     }
-    schedule_committed_panel_hide(app.clone()).map(|()| true)
+    schedule_committed_panel_hide(app.clone(), controller, identity).map(|()| true)
 }
 
 pub(crate) fn schedule_panel_hide_fallback(
@@ -2322,25 +2343,58 @@ pub(crate) fn schedule_panel_hide_fallback(
             .claim_hide_fallback(identity, expected_phase)
             .is_some()
         {
-            let _ = schedule_committed_panel_hide(app);
+            let _ = schedule_committed_panel_hide(app, controller, identity);
         }
     });
 }
 
-fn schedule_committed_panel_hide(app: AppHandle) -> Result<(), ()> {
+fn finish_committed_panel_hide(
+    controller: &PluginPanelController,
+    identity: PanelHideTicketIdentity,
+    result: Result<(), ()>,
+) -> Result<(), ()> {
+    if result.is_err() {
+        controller.fail_hide_commit(identity);
+    }
+    result
+}
+
+fn schedule_committed_panel_hide(
+    app: AppHandle,
+    controller: Arc<PluginPanelController>,
+    identity: PanelHideTicketIdentity,
+) -> Result<(), ()> {
     let dispatch_app = app.clone();
-    app.run_on_main_thread(move || {
-        let Some(window) = dispatch_app.get_webview_window("main") else {
-            return;
-        };
-        let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
-        let _ = crate::commands::clear_and_hide_reason(
-            registries.main(),
-            &window,
-            crate::commands::HideReason::ExplicitReturn,
+    let dispatch_controller = Arc::clone(&controller);
+    let scheduled = app
+        .run_on_main_thread(move || {
+            let result = (|| {
+                let window = dispatch_app.get_webview_window("main").ok_or(())?;
+                let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
+                crate::commands::clear_and_hide_reason(
+                    registries.main(),
+                    &window,
+                    crate::commands::HideReason::ExplicitReturn,
+                )
+                .map_err(|_| ())
+            })();
+            if finish_committed_panel_hide(dispatch_controller.as_ref(), identity, result).is_err()
+            {
+                eprintln!(
+                    "[plugin-panel] committed hide failed for session {}; ticket released",
+                    identity.session_epoch
+                );
+            }
+        })
+        .map_err(|_| ());
+    if finish_committed_panel_hide(controller.as_ref(), identity, scheduled).is_err() {
+        eprintln!(
+            "[plugin-panel] committed hide scheduling failed for session {}; ticket released",
+            identity.session_epoch
         );
-    })
-    .map_err(|_| ())
+        return Err(());
+    }
+    Ok(())
 }
 
 pub(crate) fn queue_dispatch(
@@ -3160,6 +3214,35 @@ mod tests {
         assert!(controller.claim_hide_commit(commit_first).is_some());
         assert!(!controller.observe_hide(commit_first));
         assert!(controller.claim_hide_commit(commit_first).is_none());
+    }
+
+    #[test]
+    fn failed_panel_hide_commit_releases_ticket_for_same_session_retry() {
+        let controller = PluginPanelController::default();
+        let session = content_ready_session(&controller);
+        let first = controller
+            .admit_hide(&session.content_label, session.session_epoch)
+            .unwrap()
+            .unwrap();
+        assert!(controller.claim_hide_commit(first).is_some());
+
+        assert_eq!(
+            finish_committed_panel_hide(&controller, first, Err(())),
+            Err(())
+        );
+
+        let retry = controller
+            .admit_hide(&session.content_label, session.session_epoch)
+            .unwrap()
+            .unwrap();
+        assert!(controller.claim_hide_commit(retry).is_some());
+        let replacement = content_ready_session(&controller);
+        let replacement_ticket = controller
+            .admit_hide(&replacement.content_label, replacement.session_epoch)
+            .unwrap()
+            .unwrap();
+        assert!(!controller.fail_hide_commit(retry));
+        assert!(controller.claim_hide_commit(replacement_ticket).is_some());
     }
 
     #[test]
