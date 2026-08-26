@@ -15,6 +15,8 @@ export type PublicPermission =
   | 'timer.control'
   | 'background.schedule'
 
+export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N'
+
 export interface PublicManifestV1 {
   schemaVersion: number
   pluginId: string
@@ -34,7 +36,7 @@ export interface PublicManifestV1 {
   }
   runtime: { entry: string }
   window?: { entry: string } | null
-  panel?: { entry: string } | null
+  panel?: { entry: string; hostKeys?: PanelHostKeyDeclaration[] } | null
   permissions: PublicPermission[]
   settings?: PublicSettingV1[]
 }
@@ -141,6 +143,16 @@ function duplicates(values: readonly unknown[]): boolean {
   return new Set(values).size !== values.length
 }
 
+const panelHostKeyOrder: Readonly<Record<PanelHostKeyDeclaration, number>> = {
+  ArrowDown: 0,
+  ArrowUp: 1,
+  'Primary+N': 2,
+}
+
+function canonicalPanelHostKeys(values: readonly PanelHostKeyDeclaration[]): PanelHostKeyDeclaration[] {
+  return [...values].sort((left, right) => panelHostKeyOrder[left] - panelHostKeyOrder[right])
+}
+
 function validSettingKey(value: string): boolean {
   return /^[a-z][a-z0-9.-]{0,63}$/u.test(value)
 }
@@ -193,6 +205,8 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     !validEntry(manifest.runtime.entry, 'js') ||
     (manifest.window != null && !validEntry(manifest.window.entry, 'html')) ||
     (manifest.panel != null && !validEntry(manifest.panel.entry, 'html')) ||
+    (manifest.panel?.hostKeys != null &&
+      (manifest.panel.hostKeys.length > 8 || duplicates(manifest.panel.hostKeys))) ||
     duplicates(permissions) ||
     settings.some((setting) => !validSetting(setting)) ||
     duplicates(settings.map((setting) => setting.key))
@@ -296,13 +310,16 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 3, 0]) ||
-    (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost))
+    versionGreater(minimumHost, [0, 3, 1]) ||
+    (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
+    ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost))
   ) {
     issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })
   }
   if (manifest.permissions.some((permission) => !permissionAvailable(permission, platform))) {
     issues.push({ code: 'PERMISSION_UNSUPPORTED', message: `Plugin declares a permission unavailable on ${platform}.` })
   }
-  return issues.length > 0 ? { ok: false, manifest, issues } : { ok: true, manifest, issues: [] }
+  if (issues.length > 0) return { ok: false, manifest, issues }
+  if (manifest.panel?.hostKeys) manifest.panel.hostKeys = canonicalPanelHostKeys(manifest.panel.hostKeys)
+  return { ok: true, manifest, issues: [] }
 }

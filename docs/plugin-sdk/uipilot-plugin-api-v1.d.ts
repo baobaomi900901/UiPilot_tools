@@ -154,11 +154,27 @@ export interface UiPilotPluginPanelStorageApiV1 {
   remove(key: string): Promise<void>
 }
 
+export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n'
+
+export interface PluginPanelHostKeyEvent {
+  key: PluginPanelHostKey
+  ctrlKey: boolean
+  metaKey: boolean
+  shiftKey: boolean
+  altKey: boolean
+  sessionEpoch: U64Decimal
+  routeSequence: U64Decimal
+}
+
 export interface UiPilotPluginPanelApiV1 {
   onUpdate(
     handler: (update: Readonly<PluginPanelUpdate>) => void | Promise<void>,
   ): () => void
+  onHostKey(
+    handler: (event: Readonly<PluginPanelHostKeyEvent>) => void | Promise<void>,
+  ): () => void
   focusHostInput(): Promise<void>
+  requestHide(): Promise<void>
   readonly storage: Readonly<UiPilotPluginPanelStorageApiV1>
 }
 

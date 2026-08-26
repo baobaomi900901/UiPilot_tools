@@ -1,5 +1,13 @@
 {
   "$defs": {
+    "PanelHostKeyDeclaration": {
+      "enum": [
+        "ArrowDown",
+        "ArrowUp",
+        "Primary+N"
+      ],
+      "type": "string"
+    },
     "PublicActivationMode": {
       "enum": [
         "live",
@@ -58,6 +66,15 @@
       "properties": {
         "entry": {
           "type": "string"
+        },
+        "hostKeys": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PanelHostKeyDeclaration"
+          },
+          "maxItems": 8,
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [

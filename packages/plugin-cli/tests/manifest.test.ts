@@ -111,6 +111,51 @@ describe('validateManifest', () => {
     })
   })
 
+  it('validates and canonicalizes panel hostKeys with the 0.3.1 version gate', () => {
+    const value = {
+      schemaVersion: 1,
+      pluginId: 'com.example.panel-keys',
+      version: '1.0.0',
+      apiVersion: 1,
+      minimumHostVersion: '0.3.1',
+      name: 'Panel Keys',
+      supportedPlatforms: ['windows'],
+      command: {
+        defaultName: 'panel-keys',
+        activationMode: 'submit',
+        outputMode: 'panel',
+        inputRequired: false,
+      },
+      runtime: { entry: 'dist/runtime.js' },
+      panel: { entry: 'dist/panel.html', hostKeys: ['Primary+N', 'ArrowUp', 'ArrowDown'] },
+      permissions: ['ui.panel'],
+      settings: [],
+    }
+    const result = validate(value)
+    expect(result).toMatchObject({ ok: true })
+    if (result.ok) expect(result.manifest.panel?.hostKeys).toEqual(['ArrowDown', 'ArrowUp', 'Primary+N'])
+
+    for (const hostKeys of [
+      'ArrowDown',
+      ['Enter'],
+      ['ArrowDown', 'ArrowDown'],
+      ['ArrowDown', 'ArrowUp', 'Primary+N', 'ArrowDown', 'ArrowUp', 'Primary+N', 'ArrowDown', 'ArrowUp', 'Primary+N'],
+    ]) {
+      const candidate = structuredClone(value) as any
+      candidate.panel.hostKeys = hostKeys
+      expect(validate(candidate)).toMatchObject({ ok: false })
+    }
+
+    const lowHost = structuredClone(value)
+    lowHost.minimumHostVersion = '0.3.0'
+    expect(validate(lowHost)).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+
+    const empty = structuredClone(value)
+    empty.minimumHostVersion = '0.3.0'
+    empty.panel.hostKeys = []
+    expect(validate(empty)).toMatchObject({ ok: true })
+  })
+
   it('still accepts older non-panel packages that declare minimumHostVersion 0.2.0', () => {
     const value = timerManifest()
     expect(validate(value)).toMatchObject({ ok: true })

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use unicode_normalization::UnicodeNormalization;
@@ -92,6 +92,26 @@ pub(crate) struct PublicWindowV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicPanelV1 {
     pub(crate) entry: String,
+    #[serde(default)]
+    #[schemars(schema_with = "panel_host_keys_schema")]
+    pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub(crate) enum PanelHostKeyDeclaration {
+    ArrowDown,
+    ArrowUp,
+    #[serde(rename = "Primary+N")]
+    PrimaryN,
+}
+
+fn panel_host_keys_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Vec::<PanelHostKeyDeclaration>::json_schema(generator);
+    schema.insert("maxItems".into(), 8.into());
+    schema.insert("uniqueItems".into(), true.into());
+    schema
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -309,6 +329,9 @@ fn validate_manifest(
             .panel
             .as_ref()
             .is_some_and(|panel| !valid_entry(&panel.entry, "html"))
+        || manifest.panel.as_ref().is_some_and(|panel| {
+            panel.host_keys.len() > 8 || has_duplicates(panel.host_keys.iter().copied())
+        })
         || has_duplicates(manifest.permissions.iter().copied())
         || manifest.settings.iter().any(|setting| !setting.validate())
         || has_duplicates(manifest.settings.iter().map(PublicSettingV1::key))
@@ -377,6 +400,14 @@ fn validate_manifest(
         return Err(PublicPackageError::IncompatibleApi);
     }
     if manifest.command.output_mode == PublicOutputMode::Panel && minimum_host < [0, 3, 0] {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest
+        .panel
+        .as_ref()
+        .is_some_and(|panel| !panel.host_keys.is_empty())
+        && minimum_host < [0, 3, 1]
+    {
         return Err(PublicPackageError::IncompatibleApi);
     }
     if manifest
@@ -735,5 +766,62 @@ mod schema_tests {
             ),
             Err(PublicPackageError::IncompatibleApi)
         );
+    }
+
+    #[test]
+    fn panel_host_keys_are_strict_and_require_host_0_3_1_only_when_nonempty() {
+        let mut panel = manifest(None);
+        panel["minimumHostVersion"] = serde_json::json!("0.3.1");
+        panel["command"] = serde_json::json!({
+            "defaultName": "panel",
+            "activationMode": "submit",
+            "outputMode": "panel",
+            "inputRequired": false
+        });
+        panel["panel"] = serde_json::json!({
+            "entry": "dist/panel.html",
+            "hostKeys": ["Primary+N", "ArrowUp", "ArrowDown"]
+        });
+        panel["permissions"] = serde_json::json!(["ui.panel"]);
+
+        let parsed = parse(&panel).expect("known host keys are valid on 0.3.1");
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["panel"]["hostKeys"],
+            serde_json::json!(["Primary+N", "ArrowUp", "ArrowDown"])
+        );
+
+        let mut low_host = panel.clone();
+        low_host["minimumHostVersion"] = serde_json::json!("0.3.0");
+        assert_eq!(parse(&low_host), Err(PublicPackageError::IncompatibleApi));
+
+        low_host["panel"]["hostKeys"] = serde_json::json!([]);
+        assert!(
+            parse(&low_host).is_ok(),
+            "empty routing remains a 0.3.0 panel"
+        );
+
+        for (label, host_keys) in [
+            ("unknown", serde_json::json!(["Enter"])),
+            ("duplicate", serde_json::json!(["ArrowDown", "ArrowDown"])),
+            ("wrong-type", serde_json::json!("ArrowDown")),
+            (
+                "over-limit",
+                serde_json::json!([
+                    "ArrowDown",
+                    "ArrowUp",
+                    "Primary+N",
+                    "ArrowDown",
+                    "ArrowUp",
+                    "Primary+N",
+                    "ArrowDown",
+                    "ArrowUp",
+                    "Primary+N"
+                ]),
+            ),
+        ] {
+            let mut candidate = panel.clone();
+            candidate["panel"]["hostKeys"] = host_keys;
+            assert!(parse(&candidate).is_err(), "{label}");
+        }
     }
 }
