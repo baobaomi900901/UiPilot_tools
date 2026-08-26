@@ -15,3 +15,10 @@ window.uipilotPluginPanel.onUpdate(async (update) => {
   stored.textContent = typeof previous === 'string' ? previous : ''
   await window.uipilotPluginPanel.storage.set('demo-panel.last-input', update.input)
 })
+
+window.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+    event.preventDefault()
+    void window.uipilotPluginPanel.focusHostInput()
+  }
+})

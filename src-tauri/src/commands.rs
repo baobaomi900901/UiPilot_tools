@@ -1534,9 +1534,13 @@ pub(crate) async fn plugin_panel_focus_host_input(
                 &focus_controller,
                 identity,
                 || {
-                    focus_app
-                        .get_webview_window("main")
-                        .is_some_and(|main| main.as_ref().set_focus().is_ok())
+                    let Some(main_window) = focus_app.get_window("main") else {
+                        return false;
+                    };
+                    let Some(main_webview) = focus_app.get_webview("main") else {
+                        return false;
+                    };
+                    main_window.set_focus().is_ok() && main_webview.set_focus().is_ok()
                 },
                 Instant::now,
                 || {
@@ -5497,6 +5501,20 @@ mod tests {
         assert!(request.contains("webview.label()"));
         assert!(request.contains("session_epoch: String"));
         assert!(!request.contains("plugin_id: String"));
+        let window_lookup = request
+            .find("get_window(\"main\")")
+            .expect("main window lookup is missing");
+        let webview_lookup = request
+            .find("get_webview(\"main\")")
+            .expect("main webview lookup is missing");
+        let window_focus = request
+            .find("main_window.set_focus()")
+            .expect("main window focus request is missing");
+        let webview_focus = request
+            .find("main_webview.set_focus()")
+            .expect("main webview focus request is missing");
+        assert!(window_lookup < webview_lookup && webview_lookup < window_focus);
+        assert!(window_focus < webview_focus);
 
         let ack = production
             .split("pub(crate) fn plugin_panel_focus_host_input_ack(")

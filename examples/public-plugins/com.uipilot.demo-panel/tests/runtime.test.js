@@ -4,6 +4,7 @@ import test from 'node:test'
 
 const packageRoot = new URL('../package/', import.meta.url)
 const runtimeUrl = new URL('../package/dist/runtime.js', import.meta.url)
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 async function loadRuntime() {
   const source = await readFile(runtimeUrl, 'utf8')
@@ -24,6 +25,7 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.demo-panel')
+  assert.equal(manifest.version, '1.0.1')
   assert.equal(manifest.minimumHostVersion, '0.3.0')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'panel')
@@ -55,10 +57,14 @@ test('panel content uses only the panel bridge and isolated storage', async () =
     'uipilotPluginPanel.onUpdate',
     'uipilotPluginPanel.storage.get',
     'uipilotPluginPanel.storage.set',
+    'uipilotPluginPanel.focusHostInput()',
+    "event.ctrlKey || event.metaKey",
+    "event.key.toLowerCase() === 'f'",
+    'event.preventDefault()',
     'update.input',
     'update.theme',
   ]) {
-    assert.match(source, new RegExp(required.replaceAll('.', '\\.')))
+    assert.match(source, new RegExp(escapeRegex(required)))
   }
   for (const forbidden of ['invoke(', 'fetch(', 'WebSocket', 'uipilotPluginWindow', 'timer', 'notifications']) {
     assert.doesNotMatch(source, new RegExp(forbidden.replace('(', '\\(')))
