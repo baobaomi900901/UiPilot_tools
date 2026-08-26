@@ -1,27 +1,15 @@
 import assert from 'node:assert/strict'
 import { readFile, readdir } from 'node:fs/promises'
 import test from 'node:test'
+import { JSDOM } from 'jsdom'
 
 const packageRoot = new URL('../package/', import.meta.url)
 const runtimeUrl = new URL('../package/dist/runtime.js', import.meta.url)
 const logicUrl = new URL('../package/dist/notes-logic.js', import.meta.url)
+const panelHtmlUrl = new URL('../package/dist/panel.html', import.meta.url)
+const panelScriptPath = new URL('../package/dist/panel.js', import.meta.url)
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
-async function loadModule(url) {
-  const source = await readFile(url, 'utf8')
-  return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
-}
-
-const invocation = Object.freeze({
-  apiVersion: 1,
-  requestId: 'notes-request-1',
-  input: 'hello',
-  context: Object.freeze({
-    platform: 'windows',
-    theme: 'dark',
-    invokedAt: '2026-08-25T12:00:00Z',
-  }),
-})
+let panelModuleSequence = 0
 
 const sampleNotes = Object.freeze([
   Object.freeze({
@@ -38,18 +26,163 @@ const sampleNotes = Object.freeze([
   }),
 ])
 
+async function loadModule(url) {
+  const source = await readFile(url, 'utf8')
+  return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+}
+
+function installDialogPolyfill(window) {
+  const proto = window.HTMLDialogElement?.prototype
+  if (!proto) {
+    return
+  }
+  if (typeof proto.showModal !== 'function') {
+    proto.showModal = function showModal() {
+      this.open = true
+      this.setAttribute('open', '')
+    }
+  }
+  if (typeof proto.close !== 'function') {
+    proto.close = function close() {
+      this.open = false
+      this.removeAttribute('open')
+    }
+  }
+}
+
+async function loadPanel({ notes = sampleNotes } = {}) {
+  const html = await readFile(panelHtmlUrl, 'utf8')
+  const dom = new JSDOM(html, {
+    url: 'https://notes.uipilot.invalid/',
+    pretendToBeVisual: true,
+  })
+  installDialogPolyfill(dom.window)
+
+  let hostKeyHandler = null
+  let hostKeyRegisterCount = 0
+  let focusHostInputCalls = 0
+  let requestHideCalls = 0
+  let panelReady = Promise.resolve()
+  const store = new Map([['notes.entries', structuredClone(notes)]])
+
+  dom.window.requestAnimationFrame = (callback) => {
+    callback(0)
+    return 1
+  }
+  dom.window.cancelAnimationFrame = () => {}
+
+  dom.window.uipilotPluginPanel = {
+    onHostKey(handler) {
+      hostKeyRegisterCount += 1
+      hostKeyHandler = handler
+      return () => {
+        hostKeyHandler = null
+      }
+    },
+    onUpdate(handler) {
+      panelReady = Promise.resolve().then(() =>
+        handler({
+          requestId: 'notes-request-1',
+          input: '',
+          platform: 'windows',
+          theme: 'dark',
+          invokedAt: '2026-08-26T12:00:00Z',
+          sessionEpoch: '1',
+          data: {},
+        }),
+      )
+      return () => {}
+    },
+    focusHostInput: async () => {
+      focusHostInputCalls += 1
+    },
+    requestHide: async () => {
+      requestHideCalls += 1
+    },
+    storage: {
+      async get(key) {
+        return store.has(key) ? structuredClone(store.get(key)) : null
+      },
+      async set(key, value) {
+        store.set(key, structuredClone(value))
+      },
+      async remove(key) {
+        store.delete(key)
+      },
+    },
+  }
+
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  globalThis.HTMLElement = dom.window.HTMLElement
+  globalThis.Element = dom.window.Element
+  globalThis.Node = dom.window.Node
+
+  panelModuleSequence += 1
+  await import(`${panelScriptPath.href}?seq=${panelModuleSequence}`)
+  await panelReady
+  await new Promise((resolve) => setImmediate(resolve))
+
+  return {
+    window: dom.window,
+    document: dom.window.document,
+    hostKeyRegisterCount: () => hostKeyRegisterCount,
+    hostKey(event) {
+      return hostKeyHandler?.(event)
+    },
+    focusHostInputCalls: () => focusHostInputCalls,
+    requestHideCalls: () => requestHideCalls,
+    selectedId() {
+      const active = dom.window.document.querySelector('.note-card.is-active')
+      return active?.querySelector('[data-note-id]')?.dataset.noteId ?? null
+    },
+    editor() {
+      return dom.window.document.querySelector('#editor-content')
+    },
+    dialogOpen(id) {
+      return Boolean(dom.window.document.querySelector(id)?.open)
+    },
+    async flush() {
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+    cleanup() {
+      dom.window.close()
+      delete globalThis.window
+      delete globalThis.document
+      delete globalThis.HTMLElement
+      delete globalThis.Element
+      delete globalThis.Node
+    },
+  }
+}
+
+const invocation = Object.freeze({
+  apiVersion: 1,
+  requestId: 'notes-request-1',
+  input: 'hello',
+  context: Object.freeze({
+    platform: 'windows',
+    theme: 'dark',
+    invokedAt: '2026-08-25T12:00:00Z',
+  }),
+})
+
 test('manifest declares the fixed panel notes contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.notes')
-  assert.equal(manifest.version, '1.0.0')
-  assert.equal(manifest.minimumHostVersion, '0.3.0')
+  assert.equal(manifest.version, '1.1.0')
+  assert.equal(manifest.minimumHostVersion, '0.3.1')
   assert.equal(manifest.command.defaultName, 'notes')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'panel')
   assert.equal(manifest.command.inputRequired, false)
   assert.deepEqual(manifest.supportedPlatforms, ['windows'])
   assert.deepEqual(manifest.permissions, ['ui.panel'])
-  assert.deepEqual(manifest.panel, { entry: 'dist/panel.html' })
+  assert.deepEqual(manifest.panel, {
+    entry: 'dist/panel.html',
+    hostKeys: ['ArrowDown', 'ArrowUp', 'Primary+N'],
+  })
   assert.equal('window' in manifest, false)
 })
 
@@ -165,8 +298,10 @@ test('panel content uses only the panel bridge APIs', async () => {
   const source = await readFile(new URL('../package/dist/panel.js', import.meta.url), 'utf8')
   for (const required of [
     'uipilotPluginPanel.onUpdate',
+    'uipilotPluginPanel.onHostKey',
     'uipilotPluginPanel.storage',
     'uipilotPluginPanel.focusHostInput()',
+    'uipilotPluginPanel.requestHide()',
     'note-list-viewport',
     'note-card',
     'ArrowUp',
@@ -174,6 +309,8 @@ test('panel content uses only the panel bridge APIs', async () => {
   ]) {
     assert.match(source, new RegExp(escapeRegex(required)))
   }
+  assert.equal([...source.matchAll(/uipilotPluginPanel\.onHostKey/g)].length, 1)
+  assert.doesNotMatch(source, /handleEscapeKeydown[\s\S]*stopPropagation/)
   for (const forbidden of [
     'invoke(',
     'fetch(',
@@ -184,4 +321,225 @@ test('panel content uses only the panel bridge APIs', async () => {
   ]) {
     assert.doesNotMatch(source, new RegExp(forbidden.replace('(', '\\(')))
   }
+})
+
+test('registers exactly one onHostKey handler and routes host keys', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+
+  assert.equal(panel.hostKeyRegisterCount(), 1)
+  await panel.flush()
+
+  const settled = panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  assert.equal(settled, undefined)
+  await panel.flush()
+  assert.equal(panel.selectedId(), '1')
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '2',
+  })
+  await panel.flush()
+  assert.equal(panel.selectedId(), '2')
+
+  panel.hostKey({
+    key: 'ArrowUp',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '3',
+  })
+  await panel.flush()
+  assert.equal(panel.selectedId(), '1')
+
+  panel.hostKey({
+    key: 'n',
+    ctrlKey: true,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '4',
+  })
+  await panel.flush()
+  assert.equal(panel.dialogOpen('#new-dialog'), true)
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '5',
+  })
+  await panel.flush()
+  assert.equal(panel.selectedId(), '1')
+  assert.equal(panel.dialogOpen('#new-dialog'), true)
+})
+
+test('host key handler settles before unsaved dialog completes', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  await panel.flush()
+  panel.editor().value = 'dirty draft'
+  assert.equal(panel.editor().value, 'dirty draft')
+
+  const started = Date.now()
+  const result = panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '2',
+  })
+  assert.equal(result, undefined)
+  assert.ok(Date.now() - started < 50)
+  await panel.flush()
+  assert.equal(panel.dialogOpen('#unsaved-dialog'), true)
+
+  panel.hostKey({
+    key: 'n',
+    ctrlKey: true,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '3',
+  })
+  await panel.flush()
+  assert.equal(panel.dialogOpen('#new-dialog'), false)
+  assert.equal(panel.dialogOpen('#unsaved-dialog'), true)
+})
+
+test('Escape arbitration covers dialogs, unsaved flows, and clean hide handoff', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  panel.document.querySelector('#new-btn').click()
+  await panel.flush()
+  assert.equal(panel.dialogOpen('#new-dialog'), true)
+  const cancelNew = new panel.window.KeyboardEvent('keydown', {
+    key: 'Escape',
+    bubbles: true,
+    cancelable: true,
+  })
+  panel.document.dispatchEvent(cancelNew)
+  assert.equal(cancelNew.defaultPrevented, true)
+  assert.equal(panel.dialogOpen('#new-dialog'), false)
+  assert.equal(panel.requestHideCalls(), 0)
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  await panel.flush()
+  panel.editor().value = 'unsaved body'
+
+  const dirtyEscape = new panel.window.KeyboardEvent('keydown', {
+    key: 'Escape',
+    bubbles: true,
+    cancelable: true,
+  })
+  let preventedBeforeAwait = dirtyEscape.defaultPrevented
+  panel.document.dispatchEvent(dirtyEscape)
+  preventedBeforeAwait = dirtyEscape.defaultPrevented
+  assert.equal(preventedBeforeAwait, true)
+  await panel.flush()
+  assert.equal(panel.dialogOpen('#unsaved-dialog'), true)
+  assert.equal(panel.requestHideCalls(), 0)
+
+  panel.document.querySelector('#unsaved-cancel-btn').click()
+  await panel.flush()
+  assert.equal(panel.dialogOpen('#unsaved-dialog'), false)
+  assert.equal(panel.requestHideCalls(), 0)
+  assert.ok(panel.editor().value.includes('unsaved'))
+
+  const dirtyEscapeAgain = new panel.window.KeyboardEvent('keydown', {
+    key: 'Escape',
+    bubbles: true,
+    cancelable: true,
+  })
+  panel.document.dispatchEvent(dirtyEscapeAgain)
+  assert.equal(dirtyEscapeAgain.defaultPrevented, true)
+  await panel.flush()
+  panel.document.querySelector('#unsaved-discard-btn').click()
+  await panel.flush()
+  assert.equal(panel.requestHideCalls(), 1)
+
+  const cleanPanel = await loadPanel()
+  t.after(cleanPanel.cleanup)
+  await cleanPanel.flush()
+  const cleanEscape = new cleanPanel.window.KeyboardEvent('keydown', {
+    key: 'Escape',
+    bubbles: true,
+    cancelable: true,
+  })
+  cleanPanel.document.dispatchEvent(cleanEscape)
+  assert.equal(cleanEscape.defaultPrevented, false)
+  assert.equal(cleanPanel.requestHideCalls(), 0)
+})
+
+test('Escape save path calls requestHide once after sync preventDefault', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  panel.hostKey({
+    key: 'ArrowDown',
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    altKey: false,
+    sessionEpoch: '1',
+    routeSequence: '1',
+  })
+  await panel.flush()
+  panel.editor().value = 'persist me'
+
+  const escape = new panel.window.KeyboardEvent('keydown', {
+    key: 'Escape',
+    bubbles: true,
+    cancelable: true,
+  })
+  panel.document.dispatchEvent(escape)
+  assert.equal(escape.defaultPrevented, true)
+  await panel.flush()
+  panel.document.querySelector('#unsaved-form').requestSubmit()
+  await panel.flush()
+  assert.equal(panel.requestHideCalls(), 1)
 })

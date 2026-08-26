@@ -49,6 +49,7 @@ let pendingDeleteId = null
 let unsavedResolver = null
 let listScrollFrame = 0
 let listHasFocus = false
+let escapeHideInFlight = false
 
 function isSessionError(error) {
   return (
@@ -576,6 +577,82 @@ function handleShortcut(event) {
   }
 }
 
+function closeOrdinaryDialogsOnEscape() {
+  if (newDialog.open) {
+    closeNewDialog()
+    return true
+  }
+  if (deleteDialog.open) {
+    pendingDeleteId = null
+    deleteDialog.close()
+    return true
+  }
+  if (unsavedDialog.open) {
+    unsavedDialog.close()
+    unsavedResolver?.('cancel')
+    unsavedResolver = null
+    pendingSelectId = null
+    escapeHideInFlight = false
+    return true
+  }
+  return false
+}
+
+async function finishEscapeUnsaved(decision) {
+  if (decision === 'cancel') {
+    escapeHideInFlight = false
+    return
+  }
+  if (decision === 'save') {
+    const saved = await saveCurrentNote()
+    if (!saved) {
+      escapeHideInFlight = false
+      return
+    }
+  }
+  escapeHideInFlight = false
+  void window.uipilotPluginPanel.requestHide()
+}
+
+function handleEscapeKeydown(event) {
+  if (event.key !== 'Escape' || event.isComposing) {
+    return
+  }
+
+  if (closeOrdinaryDialogsOnEscape()) {
+    event.preventDefault()
+    return
+  }
+
+  if (isDirty()) {
+    event.preventDefault()
+    if (escapeHideInFlight) {
+      return
+    }
+    escapeHideInFlight = true
+    void requestUnsavedDecision().then((decision) => finishEscapeUnsaved(decision))
+    return
+  }
+}
+
+function handleHostKey(event) {
+  if (isDialogOpen() || escapeHideInFlight) {
+    return
+  }
+
+  if (event.key === 'n') {
+    openNewDialog()
+    return
+  }
+
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    // Fire-and-forget: never await dialogs inside the Host ack window.
+    void moveListSelection(event.key === 'ArrowDown' ? 1 : -1, { focusList: true })
+  }
+}
+
+window.uipilotPluginPanel.onHostKey(handleHostKey)
+
 window.addEventListener('keydown', (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
     event.preventDefault()
@@ -583,6 +660,7 @@ window.addEventListener('keydown', (event) => {
   }
 })
 
+document.addEventListener('keydown', handleEscapeKeydown)
 document.addEventListener('keydown', handleShortcut)
 document.addEventListener(
   'keydown',

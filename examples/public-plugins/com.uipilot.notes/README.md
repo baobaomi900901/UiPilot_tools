@@ -7,7 +7,9 @@
 - `activationMode`: `submit`
 - `outputMode`: `panel`
 - 权限: `ui.panel`
-- `minimumHostVersion`: `0.3.0`
+- `version`: `1.1.0`
+- `minimumHostVersion`: `0.3.1`
+- `panel.hostKeys`: `ArrowDown`, `ArrowUp`, `Primary+N`
 - 业务参考: `com.uipilot.note`
 - Panel 合同参考: `com.uipilot.demo-panel`
 
@@ -23,14 +25,17 @@
 - 左侧：新建按钮与笔记列表（含删除）；右侧：正文编辑、复制与保存。
 - **不要**在 Panel 内搜索。在 tag 后的主输入框输入关键词并按 Enter 过滤标题/正文（不区分大小写；空串显示全部）。
 - `/notes hello` 首次打开即以 `hello` 过滤。
+- 主输入框聚焦时：**↑/↓** 切换可见笔记，**Ctrl+N**（Windows）打开新建弹窗。
 - Panel 内按 **Ctrl+F** 将焦点交还给主输入框（不关闭 Panel、不删 tag、不提交）。
+- Panel 内容区保留本地方向键、左右键、复制、保存与列表导航。
+- **Escape**：无弹窗且无未保存内容时由 Host 隐藏；有弹窗则取消弹窗；有未保存内容则先确认，取消保持可见，保存或放弃后隐藏。
 - 新建需输入目录名；删除与未保存切换有确认。
 - 数据保存在本插件私有 storage（`notes.entries`），与窗口版 `note` 相互独立。
 
 ## 验证
 
 ```powershell
-node --test examples/public-plugins/com.uipilot.notes/tests/runtime.test.js
+node --test --experimental-test-isolation=none examples/public-plugins/com.uipilot.notes/tests/runtime.test.js
 npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.notes/tests/sdk-contract.ts
 node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.notes/package --platform windows
 ```
