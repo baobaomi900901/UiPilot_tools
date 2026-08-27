@@ -599,7 +599,7 @@ fn validate_response_metadata(
         return Err(PluginNetworkErrorCode::NetworkResponseTooLarge);
     }
     let mut total = 0usize;
-    let mut normalized = Vec::with_capacity(response.headers.len());
+    let mut named = Vec::with_capacity(response.headers.len());
     for (name, value) in &response.headers {
         total = total
             .checked_add(name.as_bytes().len())
@@ -612,28 +612,21 @@ fn validate_response_metadata(
             .map_err(|_| PluginNetworkErrorCode::NetworkResponseInvalid)?
             .as_str()
             .to_owned();
-        let value = String::from_utf8(value.clone())
-            .map_err(|_| PluginNetworkErrorCode::NetworkResponseInvalid)?;
-        normalized.push((name, value));
+        named.push((name, value));
     }
-    for (name, value) in &normalized {
-        if name == "content-encoding"
-            && !value.trim().is_empty()
-            && !value.trim().eq_ignore_ascii_case("identity")
-        {
-            return Err(PluginNetworkErrorCode::NetworkResponseInvalid);
-        }
-    }
-    Ok(normalized)
-}
 
-fn parse_response(
-    response: NativeHttpsResponse,
-    normalized: Vec<(String, String)>,
-) -> Result<PluginNetworkResponse, PluginNetworkErrorCode> {
     let mut connection_headers = BTreeSet::new();
-    for (name, value) in &normalized {
+    for (name, value) in &named {
+        if name == "content-encoding" {
+            let value = std::str::from_utf8(value)
+                .map_err(|_| PluginNetworkErrorCode::NetworkResponseInvalid)?;
+            if !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("identity") {
+                return Err(PluginNetworkErrorCode::NetworkResponseInvalid);
+            }
+        }
         if name == "connection" {
+            let value = std::str::from_utf8(value)
+                .map_err(|_| PluginNetworkErrorCode::NetworkResponseInvalid)?;
             for token in value
                 .split(',')
                 .map(str::trim)
@@ -645,11 +638,25 @@ fn parse_response(
             }
         }
     }
-    let mut headers = BTreeMap::<String, Vec<String>>::new();
-    for (name, value) in normalized {
+
+    let mut normalized = Vec::with_capacity(named.len());
+    for (name, value) in named {
         if protected_response_header(&name) || connection_headers.contains(&name) {
             continue;
         }
+        let value = String::from_utf8(value.clone())
+            .map_err(|_| PluginNetworkErrorCode::NetworkResponseInvalid)?;
+        normalized.push((name, value));
+    }
+    Ok(normalized)
+}
+
+fn parse_response(
+    response: NativeHttpsResponse,
+    normalized: Vec<(String, String)>,
+) -> Result<PluginNetworkResponse, PluginNetworkErrorCode> {
+    let mut headers = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in normalized {
         headers.entry(name).or_default().push(value);
     }
     let body = String::from_utf8(response.body)
@@ -1029,9 +1036,10 @@ mod tests {
             vec![
                 ("x-result", b"one"),
                 ("x-result", b"two"),
-                ("set-cookie", b"secret=1"),
+                ("set-cookie", &[0xff]),
+                ("proxy-authenticate", &[0xfe]),
                 ("connection", b"x-private"),
-                ("x-private", b"hidden"),
+                ("x-private", &[0xfd]),
             ],
             b"later",
         ))]);
@@ -1047,6 +1055,7 @@ mod tests {
         assert_eq!(response.body, "later");
         assert_eq!(response.headers.get("x-result").unwrap(), &["one", "two"]);
         assert!(!response.headers.contains_key("set-cookie"));
+        assert!(!response.headers.contains_key("proxy-authenticate"));
         assert!(!response.headers.contains_key("connection"));
         assert!(!response.headers.contains_key("x-private"));
     }
@@ -1055,10 +1064,19 @@ mod tests {
     async fn plugin_https_broker_rejects_invalid_encoding_utf8_and_oversized_response() {
         let cases = [
             response(200, vec![("content-encoding", b"gzip")], b"ok"),
+            response(
+                200,
+                vec![
+                    ("connection", b"content-encoding"),
+                    ("content-encoding", b"br"),
+                ],
+                b"ok",
+            ),
             response(200, vec![], &[0xff]),
             response(200, vec![], &vec![b'x'; 1024 * 1024 + 1]),
         ];
         let expected = [
+            PluginNetworkErrorCode::NetworkResponseInvalid,
             PluginNetworkErrorCode::NetworkResponseInvalid,
             PluginNetworkErrorCode::NetworkResponseInvalid,
             PluginNetworkErrorCode::NetworkResponseTooLarge,

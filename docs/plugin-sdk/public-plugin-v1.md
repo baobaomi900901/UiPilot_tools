@@ -97,7 +97,7 @@ api.network.request({
 })
 ```
 
-`method` is exactly `GET` or `POST`. GET rejects a body. POST may omit the body or use `{ type: 'json' | 'text' | 'form', value }`; the Host encodes compact UTF-8 JSON, UTF-8 plain text, or sorted `application/x-www-form-urlencoded` data and owns `Content-Type`. JSON rejects cycles, functions, BigInt, undefined object members, prototype keys, and non-finite numbers. Form values must be strings.
+`method` is exactly `GET` or `POST`. GET rejects a body. POST may omit the body or use `{ type: 'json' | 'text' | 'form', value }`; the Host encodes compact UTF-8 JSON, UTF-8 plain text, or sorted `application/x-www-form-urlencoded` data and owns `Content-Type`. JSON rejects cycles, functions, BigInt, undefined object members, and non-finite numbers. Form values must be strings.
 
 Request headers are an optional string map. Custom provider headers including `authorization`, `accept`, and `accept-language` are allowed. The Host rejects protected or connection-sensitive headers, including `host`, `content-length`, `content-type`, cookies, origin/referrer, user-agent, accept-encoding, hop-by-hop headers, proxy headers, every `sec-*`, `forwarded`, `via`, and every `x-forwarded-*`. Header names are case-insensitive and duplicates after lowercase normalization are invalid.
 
