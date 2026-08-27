@@ -105,7 +105,7 @@ describe('public plugin Runtime network bootstrap', () => {
       return { requestId: context.requestId, results: [] }
     })
     await undeclared.dispatch()
-    expect(Object.hasOwn(undeclaredApi!, 'network')).toBe(false)
+    expect(Object.prototype.hasOwnProperty.call(undeclaredApi!, 'network')).toBe(false)
 
     const input = {
       url: 'https://api.example.com/translate',
@@ -269,7 +269,7 @@ describe('public plugin Runtime network bootstrap', () => {
     })
     await vi.waitFor(() => expect(document.title).toBe('uipilot-public-plugin-ready'))
     if (!eventCallback) throw new Error('runtime event callback was not registered')
-    await eventCallback({
+    await (eventCallback as unknown as (message: { payload: unknown }) => Promise<void>)({
       payload: {
         context: {
           pluginId: 'com.example.network',
