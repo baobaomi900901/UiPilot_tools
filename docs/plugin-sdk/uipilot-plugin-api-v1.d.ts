@@ -12,7 +12,41 @@ export interface PluginInvocation {
   }
 }
 
+export type PluginNetworkRequestBody =
+  | Readonly<{ type: 'json'; value: unknown }>
+  | Readonly<{ type: 'text'; value: string }>
+  | Readonly<{ type: 'form'; value: Readonly<Record<string, string>> }>
+
+export interface PluginNetworkRequest {
+  readonly url: string
+  readonly method: 'GET' | 'POST'
+  readonly headers?: Readonly<Record<string, string>>
+  readonly body?: PluginNetworkRequestBody
+}
+
+export interface PluginNetworkResponse {
+  readonly status: number
+  readonly headers: Readonly<Record<string, readonly string[]>>
+  readonly body: string
+}
+
+export interface PluginNetworkApi {
+  request(input: Readonly<PluginNetworkRequest>): Promise<Readonly<PluginNetworkResponse>>
+}
+
+export type PluginNetworkErrorName =
+  | 'InvalidNetworkRequestError'
+  | 'PermissionDeniedError'
+  | 'NetworkTargetDeniedError'
+  | 'NetworkTimeoutError'
+  | 'NetworkFailureError'
+  | 'NetworkResponseTooLargeError'
+  | 'NetworkResponseInvalidError'
+  | 'NetworkLimitExceededError'
+  | 'ExpiredRequestError'
+
 export interface UiPilotPluginApiV1 {
+  readonly network?: Readonly<PluginNetworkApi>
   readonly storage: {
     get(key: string): Promise<JsonValue | null>
     set(key: string, value: JsonValue): Promise<void>

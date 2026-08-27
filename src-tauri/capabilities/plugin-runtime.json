@@ -5,6 +5,7 @@
   "windows": ["plugin-runtime-*"],
   "permissions": [
     "allow-plugin-api-call",
+    "allow-plugin-network-request",
     "allow-complete-plugin-command",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

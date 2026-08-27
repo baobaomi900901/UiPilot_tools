@@ -57,11 +57,14 @@ pub(crate) use manifest::{
     public_manifest_v1_schema, valid_plugin_id, PanelHostKeyDeclaration, PublicActivationMode,
     PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
 };
+pub(crate) use network::{PluginNetworkErrorCode, PluginNetworkResponse};
+#[cfg(test)]
+pub(crate) use network::{PluginNetworkRequest, PluginNetworkRequestMethod};
 pub(crate) use runtime::{
-    parse_runtime_label, runtime_label, PluginApiExecution, PluginApiRequest,
-    PluginCommandCompletion, PluginCommandDispatch, PluginInvocation, PluginInvocationEnvironment,
-    PluginInvocationPlatform, PluginInvocationTheme, PluginRuntimeApi, PluginRuntimeError,
-    PUBLIC_RUNTIME_BOOTSTRAP,
+    parse_runtime_label, public_runtime_bootstrap, runtime_label, validate_plugin_network_caller,
+    PluginApiExecution, PluginApiRequest, PluginCommandCompletion, PluginCommandDispatch,
+    PluginInvocation, PluginInvocationEnvironment, PluginInvocationPlatform, PluginInvocationTheme,
+    PluginNetworkCommandError, PluginNetworkCommandInput, PluginRuntimeApi, PluginRuntimeError,
 };
 pub(crate) use scheduler::{
     PluginCompletionOutcome, PluginContextStatus, PluginRequestCandidate, PluginRequestContext,
@@ -1042,7 +1045,7 @@ impl PublicPluginService {
                 generation: candidate.generation,
                 activation_id: candidate.activation_id,
             },
-            PUBLIC_RUNTIME_BOOTSTRAP.to_string(),
+            public_runtime_bootstrap(candidate.network_https_declared),
             target_url,
             on_unmuted,
             PUBLIC_RUNTIME_READY_TIMEOUT,

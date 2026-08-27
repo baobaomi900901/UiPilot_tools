@@ -728,10 +728,10 @@ mod tests {
         for required in [
             "WebviewUrl::CustomProtocol(inert_url)",
             "prepare_windows_webview(",
-            "PUBLIC_RUNTIME_BOOTSTRAP",
+            "public_runtime_bootstrap(candidate.network_https_declared)",
         ] {
             assert!(production.contains(required), "missing {required}");
         }
-        assert!(!production.contains(".initialization_script(PUBLIC_RUNTIME_BOOTSTRAP)"));
+        assert!(!production.contains(".initialization_script(public_runtime_bootstrap"));
     }
 }

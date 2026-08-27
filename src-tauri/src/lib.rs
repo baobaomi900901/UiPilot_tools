@@ -427,6 +427,7 @@ pub fn run() {
             commands::set_plugin_effective_name,
             commands::save_plugin_settings,
             commands::uninstall_plugin,
+            commands::plugin_network_request,
             commands::plugin_api_call,
             commands::complete_plugin_command,
             commands::plugin_window_content_ready,
@@ -845,11 +846,19 @@ mod tests {
             assert!(main.contains(&permission));
             assert!(!runtime.contains(&permission));
         }
-        for command in ["plugin_api_call", "complete_plugin_command"] {
+        for command in [
+            "plugin_api_call",
+            "plugin_network_request",
+            "complete_plugin_command",
+        ] {
             assert!(build.contains(&format!("\"{command}\",")));
             let permission = format!("\"allow-{}\"", command.replace('_', "-"));
             assert!(runtime.contains(&permission));
             assert!(!main.contains(&permission));
+            assert!(!find.contains(&permission));
+            assert!(!shell.contains(&permission));
+            assert!(!content.contains(&permission));
+            assert!(!panel.contains(&permission));
         }
         assert!(main.contains("allow-commit-plugin-window-transfer"));
         assert!(!shell.contains("commit-plugin-window-transfer"));

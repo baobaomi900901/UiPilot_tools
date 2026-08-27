@@ -6,4 +6,5 @@ mod transport;
 
 pub(super) use authority_gate::{PluginNetworkAuthorityGate, PluginNetworkAuthoritySnapshot};
 #[cfg(test)]
-pub(super) use broker::{PluginNetworkErrorCode, PluginNetworkRequest, PluginNetworkRequestMethod};
+pub(crate) use broker::PluginNetworkRequestMethod;
+pub(crate) use broker::{PluginNetworkErrorCode, PluginNetworkRequest, PluginNetworkResponse};

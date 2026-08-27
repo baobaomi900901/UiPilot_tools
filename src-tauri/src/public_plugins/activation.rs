@@ -30,12 +30,17 @@ use super::{
         valid_plugin_id, PanelHostKeyDeclaration, PublicActivationMode, PublicOutputMode,
         PublicPermission, PublicSettingV1,
     },
-    network::{PluginNetworkAuthorityGate, PluginNetworkAuthoritySnapshot},
+    network::{
+        PluginNetworkAuthorityGate, PluginNetworkAuthoritySnapshot, PluginNetworkErrorCode,
+        PluginNetworkResponse,
+    },
     owner_cleanup::{
         remove_owned_directory, OwnerCleanupError, PluginOwnerCleanupReceipt,
         PluginOwnerCleanupStore,
     },
-    package, runtime_label,
+    package,
+    runtime::{PluginNetworkCommandInput, PluginRuntimeIdentity},
+    runtime_label,
     scheduler::{PluginRuntimeReplacement, PluginScheduleError},
     stage_public_package,
     state::{DurableStateOutcome, PreparedStateCommit},
@@ -219,6 +224,7 @@ pub(crate) struct PublicRuntimeCandidate {
     pub(crate) runtime_recovery_needed: bool,
     pub(crate) label: String,
     pub(crate) runtime_entry: String,
+    pub(crate) network_https_declared: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -409,6 +415,10 @@ impl RuntimeSnapshot {
             runtime_recovery_needed,
             label: self.label.clone(),
             runtime_entry: self.manifest.runtime.entry.clone(),
+            network_https_declared: self
+                .manifest
+                .permissions
+                .contains(&PublicPermission::NetworkHttps),
         }
     }
 
@@ -2931,6 +2941,22 @@ impl PublicPluginManager {
         &self.scheduler
     }
 
+    pub(crate) async fn request_network(
+        &self,
+        caller: PluginRuntimeIdentity,
+        input: PluginNetworkCommandInput,
+    ) -> Result<PluginNetworkResponse, PluginNetworkErrorCode> {
+        self.network_authority
+            .request(
+                &caller.plugin_id,
+                caller.generation,
+                &input.context,
+                Arc::clone(&self.scheduler),
+                input.request,
+            )
+            .await
+    }
+
     pub(crate) fn enqueue_reserved(
         &self,
         request: ReservedPluginRequest,
@@ -4609,7 +4635,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_network_lifecycle_request_and_host_termination_cancel_registered_call() {
+    async fn plugin_network_runtime_lifecycle_request_and_host_termination_cancel_registered_call()
+    {
         for termination in [
             TestedNetworkRequestTermination::Cancel,
             TestedNetworkRequestTermination::Timeout,
@@ -4633,20 +4660,17 @@ mod tests {
                 )
                 .unwrap();
             let scheduled = dispatch_network_scheduled(&manager);
-            let call = manager
-                .network_authority
-                .admit(
-                    "com.example.network",
-                    scheduled.context.plugin_generation,
-                    &scheduled.context,
-                    &manager.scheduler,
-                    network_request(),
-                )
-                .unwrap();
             let pending = tokio::spawn({
-                let network_authority = Arc::clone(&manager.network_authority);
-                let scheduler = Arc::clone(&manager.scheduler);
-                async move { network_authority.execute_for_test(call, scheduler).await }
+                let manager = Arc::clone(&manager);
+                let caller = PluginRuntimeIdentity {
+                    plugin_id: scheduled.context.plugin_id.clone(),
+                    generation: scheduled.context.plugin_generation,
+                };
+                let input = PluginNetworkCommandInput {
+                    context: scheduled.context.clone(),
+                    request: network_request(),
+                };
+                async move { manager.request_network(caller, input).await }
             });
             tokio::time::timeout(Duration::from_millis(500), transport_started.notified())
                 .await

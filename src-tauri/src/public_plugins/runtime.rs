@@ -12,6 +12,7 @@ use super::{
     delayed_messages::{
         DelayedMessageRegistration, DelayedMessageScheduleError, DelayedMessageScheduler,
     },
+    network::{PluginNetworkErrorCode, PluginNetworkRequest},
     scheduler::{PluginContextAccessError, PluginCurrentRequest, PluginRequestScheduler},
     storage::PluginStorageError,
     PluginDataScope, PluginRequestContext, PluginSecretStore, PluginStateStore, PluginStorageStore,
@@ -20,22 +21,173 @@ use super::{
 
 pub(crate) const PUBLIC_RUNTIME_LABEL_PREFIX: &str = "plugin-runtime-";
 
-pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
+pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
 (() => {
   'use strict';
   let handler = null;
   let busy = false;
+  const networkEnabled = __NETWORK_HTTPS__;
+  const uncurryThis = (method) => Function.prototype.call.bind(method);
+  const arrayIsArray = Array.isArray;
+  const arrayPush = uncurryThis(Array.prototype.push);
+  const ErrorConstructor = Error;
+  const NumberConstructor = Number;
+  const numberIsFinite = Number.isFinite;
+  const objectCreate = Object.create;
+  const objectDefineProperty = Object.defineProperty;
+  const objectFreeze = Object.freeze;
+  const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+  const objectGetPrototypeOf = Object.getPrototypeOf;
+  const objectHasOwn = Object.hasOwn;
+  const objectKeys = Object.keys;
+  const objectPrototype = Object.prototype;
+  const objectSetPrototypeOf = Object.setPrototypeOf;
+  const reflectDeleteProperty = Reflect.deleteProperty;
+  const reflectOwnKeys = Reflect.ownKeys;
+  const regexpTest = uncurryThis(RegExp.prototype.test);
+  const SetConstructor = Set;
+  const setHas = uncurryThis(Set.prototype.has);
+  const StringConstructor = String;
+  const WeakSetConstructor = WeakSet;
+  const weakSetAdd = uncurryThis(WeakSet.prototype.add);
+  const weakSetDelete = uncurryThis(WeakSet.prototype.delete);
+  const weakSetHas = uncurryThis(WeakSet.prototype.has);
+  const nullRecord = (value) => {
+    objectSetPrototypeOf(value, null);
+    return value;
+  };
   const waitForInternals = () => new Promise((resolve) => {
     const tick = () => window.__TAURI_INTERNALS__ ? resolve(window.__TAURI_INTERNALS__) : setTimeout(tick, 0);
     tick();
   });
-  const deepFreeze = (value, seen = new WeakSet()) => {
-    if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
-    seen.add(value);
-    for (const key of Reflect.ownKeys(value)) deepFreeze(value[key], seen);
-    return Object.freeze(value);
+  const deepFreeze = (value, seen = new WeakSetConstructor()) => {
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null || weakSetHas(seen, value)) return value;
+    weakSetAdd(seen, value);
+    for (const key of reflectOwnKeys(value)) deepFreeze(value[key], seen);
+    return objectFreeze(value);
   };
-  const fail = (code) => Object.assign(new Error(code), { name: code });
+  const fail = (code) => {
+    const error = new ErrorConstructor(code);
+    objectDefineProperty(error, 'name', {
+      value: code,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    return error;
+  };
+  const invalidNetworkRequest = () => fail('InvalidNetworkRequestError');
+  const isRecord = (value) => {
+    if (value === null || typeof value !== 'object' || arrayIsArray(value)) return false;
+    const prototype = objectGetPrototypeOf(value);
+    return prototype === objectPrototype || prototype === null;
+  };
+  const ownData = (value, allowed) => {
+    if (!isRecord(value)) throw invalidNetworkRequest();
+    const descriptors = objectGetOwnPropertyDescriptors(value);
+    const output = objectCreate(null);
+    for (const key of reflectOwnKeys(descriptors)) {
+      if (typeof key !== 'string' || (allowed && !setHas(allowed, key))) throw invalidNetworkRequest();
+      const descriptor = descriptors[key];
+      if (!descriptor.enumerable || !objectHasOwn(descriptor, 'value')) throw invalidNetworkRequest();
+      objectDefineProperty(output, key, {
+        value: descriptor.value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return output;
+  };
+  const copyStringRecord = (value) => {
+    const source = ownData(value, null);
+    const output = objectCreate(null);
+    for (const key of objectKeys(source)) {
+      if (typeof source[key] !== 'string') throw invalidNetworkRequest();
+      output[key] = source[key];
+    }
+    return output;
+  };
+  const copyJson = (value, ancestors = new WeakSetConstructor()) => {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+      if (!numberIsFinite(value)) throw invalidNetworkRequest();
+      return value;
+    }
+    if (typeof value !== 'object' || weakSetHas(ancestors, value)) throw invalidNetworkRequest();
+    weakSetAdd(ancestors, value);
+    try {
+      if (arrayIsArray(value)) {
+        const descriptors = objectGetOwnPropertyDescriptors(value);
+        const output = [];
+        for (const key of reflectOwnKeys(descriptors)) {
+          if (key === 'length') continue;
+          if (typeof key !== 'string' || !regexpTest(/^(0|[1-9][0-9]*)$/, key)) throw invalidNetworkRequest();
+          const index = NumberConstructor(key);
+          const descriptor = descriptors[key];
+          if (index >= value.length || !descriptor.enumerable || !objectHasOwn(descriptor, 'value')) {
+            throw invalidNetworkRequest();
+          }
+        }
+        for (let index = 0; index < value.length; index += 1) {
+          const key = StringConstructor(index);
+          if (!objectHasOwn(descriptors, key)) throw invalidNetworkRequest();
+          arrayPush(output, copyJson(descriptors[key].value, ancestors));
+        }
+        return output;
+      }
+      const source = ownData(value, null);
+      const output = objectCreate(null);
+      for (const key of objectKeys(source)) output[key] = copyJson(source[key], ancestors);
+      return output;
+    } finally {
+      weakSetDelete(ancestors, value);
+    }
+  };
+  const snapshotNetworkRequest = (input) => {
+    const source = ownData(input, new SetConstructor(['url', 'method', 'headers', 'body']));
+    if (typeof source.url !== 'string' || (source.method !== 'GET' && source.method !== 'POST')) {
+      throw invalidNetworkRequest();
+    }
+    const output = objectCreate(null);
+    output.url = source.url;
+    output.method = source.method;
+    if (objectHasOwn(source, 'headers')) output.headers = copyStringRecord(source.headers);
+    if (objectHasOwn(source, 'body')) {
+      const body = ownData(source.body, new SetConstructor(['type', 'value']));
+      if (!objectHasOwn(body, 'type') || !objectHasOwn(body, 'value')) throw invalidNetworkRequest();
+      if (body.type === 'json') output.body = nullRecord({ type: 'json', value: copyJson(body.value) });
+      else if (body.type === 'text' && typeof body.value === 'string') {
+        output.body = nullRecord({ type: 'text', value: body.value });
+      } else if (body.type === 'form') {
+        output.body = nullRecord({ type: 'form', value: copyStringRecord(body.value) });
+      } else throw invalidNetworkRequest();
+    }
+    return deepFreeze(output);
+  };
+  const networkErrorNames = deepFreeze(nullRecord({
+    invalidNetworkRequest: 'InvalidNetworkRequestError',
+    permissionDenied: 'PermissionDeniedError',
+    networkTargetDenied: 'NetworkTargetDeniedError',
+    networkTimeout: 'NetworkTimeoutError',
+    networkFailure: 'NetworkFailureError',
+    networkResponseTooLarge: 'NetworkResponseTooLargeError',
+    networkResponseInvalid: 'NetworkResponseInvalidError',
+    networkLimitExceeded: 'NetworkLimitExceededError',
+    expiredRequest: 'ExpiredRequestError',
+  }));
+  const mapNetworkError = (error) => {
+    try {
+      const source = ownData(error, new SetConstructor(['code']));
+      if (reflectOwnKeys(source).length !== 1 || typeof source.code !== 'string') {
+        return fail('NetworkFailureError');
+      }
+      const name = networkErrorNames[source.code];
+      return typeof name === 'string' ? fail(name) : fail('NetworkFailureError');
+    } catch (_) {
+      return fail('NetworkFailureError');
+    }
+  };
   waitForInternals().then(async (tauri) => {
     const invoke = tauri.invoke.bind(tauri);
     const listen = (event, callback) => invoke('plugin:event|listen', {
@@ -55,31 +207,54 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
       const operation = (operation, key, value, notification) => invoke('plugin_api_call', {
         request: { context: context(), operation, key, value, notification },
       });
-      const api = deepFreeze({
-        storage: {
+      const apiShape = nullRecord({
+        storage: nullRecord({
           get: (key) => operation('storageGet', key),
           set: (key, value) => operation('storageSet', key, value),
           remove: (key) => operation('storageRemove', key),
-        },
-        settings: {
+        }),
+        settings: nullRecord({
           get: (key) => operation('settingGet', key),
           isSecretConfigured: (key) => operation('secretConfigured', key),
-        },
-        notifications: {
+        }),
+        notifications: nullRecord({
           publish: (input) => {
-            const snapshot = input && typeof input === 'object' && !Array.isArray(input)
+            const snapshot = input && typeof input === 'object' && !arrayIsArray(input)
               ? deepFreeze({ ...input })
               : input;
             return operation('notificationPublish', undefined, undefined, snapshot);
           },
           schedule: (input) => {
-            const snapshot = input && typeof input === 'object' && !Array.isArray(input)
+            const snapshot = input && typeof input === 'object' && !arrayIsArray(input)
               ? deepFreeze({ ...input })
               : input;
             return operation('notificationSchedule', undefined, undefined, snapshot);
           },
-        },
+        }),
       });
+      if (networkEnabled) {
+        apiShape.network = nullRecord({
+          request: async function(input) {
+            if (arguments.length !== 1) throw invalidNetworkRequest();
+            let request;
+            try {
+              request = snapshotNetworkRequest(input);
+            } catch (_) {
+              throw invalidNetworkRequest();
+            }
+            const requestContext = context();
+            try {
+              const response = await invoke('plugin_network_request', {
+                input: { context: requestContext, request },
+              });
+              return deepFreeze(response);
+            } catch (error) {
+              throw mapNetworkError(error);
+            }
+          },
+        });
+      }
+      const api = deepFreeze(apiShape);
       try {
         const response = await handler(deepFreeze(dispatch.invocation), api);
         current = false;
@@ -92,7 +267,7 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
         busy = false;
       }
     });
-    Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
+    reflectDeleteProperty(window, '__TAURI_INTERNALS__');
     const entry = document.documentElement.dataset.runtimeEntry;
     const module = entry ? await import(entry) : null;
     if (!module || typeof module.onCommand !== 'function') throw new TypeError('onCommand export required');
@@ -101,6 +276,46 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP: &str = r#"
   }).catch(() => { document.title = 'uipilot-public-plugin-failed'; });
 })();
 "#;
+
+pub(crate) fn public_runtime_bootstrap(network_https: bool) -> String {
+    PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE.replace(
+        "__NETWORK_HTTPS__",
+        if network_https { "true" } else { "false" },
+    )
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PluginNetworkCommandInput {
+    pub(crate) context: PluginRequestContext,
+    pub(crate) request: PluginNetworkRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginNetworkCommandError {
+    pub(crate) code: PluginNetworkErrorCode,
+}
+
+impl From<PluginNetworkErrorCode> for PluginNetworkCommandError {
+    fn from(code: PluginNetworkErrorCode) -> Self {
+        Self { code }
+    }
+}
+
+pub(crate) fn validate_plugin_network_caller(
+    caller_label: &str,
+    input: &PluginNetworkCommandInput,
+) -> Result<PluginRuntimeIdentity, PluginNetworkErrorCode> {
+    let identity =
+        parse_runtime_label(caller_label).ok_or(PluginNetworkErrorCode::ExpiredRequest)?;
+    if identity.plugin_id != input.context.plugin_id
+        || identity.generation != input.context.plugin_generation
+    {
+        return Err(PluginNetworkErrorCode::ExpiredRequest);
+    }
+    Ok(identity)
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1095,9 +1310,54 @@ mod tests {
         );
         assert!(!label.starts_with("plugin-shell-"));
         assert!(!label.starts_with("plugin-content-"));
-        assert!(PUBLIC_RUNTIME_BOOTSTRAP.contains("deepFreeze"));
-        assert!(PUBLIC_RUNTIME_BOOTSTRAP.contains("onCommand"));
-        assert!(!PUBLIC_RUNTIME_BOOTSTRAP.contains("api.resolve"));
+        assert!(PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE.contains("deepFreeze"));
+        assert!(PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE.contains("onCommand"));
+        assert!(!PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE.contains("api.resolve"));
+        assert!(public_runtime_bootstrap(true).contains("const networkEnabled = true;"));
+        assert!(public_runtime_bootstrap(false).contains("const networkEnabled = false;"));
+    }
+
+    #[test]
+    fn plugin_network_runtime_input_and_wire_error_contracts_are_strict() {
+        let input = serde_json::json!({
+            "context": {
+                "pluginId": "com.example.runtime",
+                "pluginGeneration": 42,
+                "requestId": "public-request-0000000000000001"
+            },
+            "request": {
+                "url": "https://api.example.com/translate",
+                "method": "POST",
+                "body": { "type": "text", "value": "Hello" }
+            }
+        });
+        assert!(serde_json::from_value::<super::PluginNetworkCommandInput>(input.clone()).is_ok());
+        let mut outer_unknown = input.clone();
+        outer_unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), serde_json::json!(true));
+        for invalid in [
+            outer_unknown,
+            serde_json::json!({
+                "context": { "pluginId": "com.example.runtime", "pluginGeneration": 42,
+                    "requestId": "public-request-0000000000000001", "extra": true },
+                "request": input["request"].clone()
+            }),
+            serde_json::json!({
+                "context": input["context"].clone(),
+                "request": { "url": "https://api.example.com/", "method": "GET", "extra": true }
+            }),
+        ] {
+            assert!(serde_json::from_value::<super::PluginNetworkCommandInput>(invalid).is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(super::PluginNetworkCommandError::from(
+                crate::public_plugins::network::PluginNetworkErrorCode::ExpiredRequest
+            ))
+            .unwrap(),
+            serde_json::json!({ "code": "expiredRequest" })
+        );
     }
 
     #[test]

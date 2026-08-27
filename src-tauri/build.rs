@@ -22,6 +22,7 @@ fn main() {
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
+            "plugin_network_request",
             "plugin_api_call",
             "complete_plugin_command",
             "plugin_window_content_ready",

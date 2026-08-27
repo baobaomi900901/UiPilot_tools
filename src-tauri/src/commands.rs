@@ -47,13 +47,14 @@ use crate::{
         PluginMutationOutcome, PluginQueryError, PluginQueryStart,
     },
     public_plugins::{
-        PluginApiRequest, PluginCommandCompletion, PluginInvocationTheme, PluginRequestContext,
-        PluginRuntimeError, PluginTimerStartInput, PluginTimerState, PreparedPublicSubmission,
-        PublicActivationMode, PublicMainResult, PublicOutputMode, PublicPermission,
-        PublicPluginInstallSource, PublicPluginInventory, PublicPluginManagementError,
-        PublicPluginManager, PublicPluginMutation, PublicPluginPrepareSummary,
-        PublicPluginResponse, PublicPluginRoute, PublicPluginService, PublicPluginWindowIdentity,
-        TimerError, WindowStorageError,
+        validate_plugin_network_caller, PluginApiRequest, PluginCommandCompletion,
+        PluginInvocationTheme, PluginNetworkCommandError, PluginNetworkCommandInput,
+        PluginNetworkErrorCode, PluginNetworkResponse, PluginRequestContext, PluginRuntimeError,
+        PluginTimerStartInput, PluginTimerState, PreparedPublicSubmission, PublicActivationMode,
+        PublicMainResult, PublicOutputMode, PublicPermission, PublicPluginInstallSource,
+        PublicPluginInventory, PublicPluginManagementError, PublicPluginManager,
+        PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginRoute,
+        PublicPluginService, PublicPluginWindowIdentity, TimerError, WindowStorageError,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -1303,6 +1304,23 @@ pub(crate) fn uninstall_plugin(
     plugin_window::destroy_current(&app, &plugin_id);
     manager.finish_uninstall_cleanup(&committed, app.state::<SettingsStore>().inner())?;
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn plugin_network_request(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    input: PluginNetworkCommandInput,
+) -> Result<PluginNetworkResponse, PluginNetworkCommandError> {
+    let caller = validate_plugin_network_caller(window.label(), &input)
+        .map_err(PluginNetworkCommandError::from)?;
+    let manager = service
+        .manager()
+        .map_err(|_| PluginNetworkCommandError::from(PluginNetworkErrorCode::NetworkFailure))?;
+    manager
+        .request_network(caller, input)
+        .await
+        .map_err(PluginNetworkCommandError::from)
 }
 
 #[tauri::command]
@@ -4287,6 +4305,60 @@ mod tests {
         settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine},
     };
     use tauri_plugin_global_shortcut::Shortcut;
+
+    #[test]
+    fn plugin_network_command_rejects_non_runtime_and_mismatched_callers() {
+        let input = crate::public_plugins::PluginNetworkCommandInput {
+            context: crate::public_plugins::PluginRequestContext {
+                plugin_id: "com.example.network".into(),
+                plugin_generation: 7,
+                request_id: "public-request-0000000000000001".into(),
+            },
+            request: crate::public_plugins::PluginNetworkRequest {
+                url: "https://api.example.com/".into(),
+                method: crate::public_plugins::PluginNetworkRequestMethod::Get,
+                headers: None,
+                body: None,
+            },
+        };
+        for label in [
+            "main",
+            "find",
+            "plugin-shell-com.example.network",
+            "plugin-content-com.example.network",
+            "plugin-panel-com.example.network",
+            "plugin-window-com.example.network",
+            "plugin-runtime-not-a-valid-label",
+        ] {
+            assert_eq!(
+                super::validate_plugin_network_caller(label, &input),
+                Err(crate::public_plugins::PluginNetworkErrorCode::ExpiredRequest)
+            );
+        }
+        let label = crate::public_plugins::runtime_label("com.example.network", 7).unwrap();
+        assert!(super::validate_plugin_network_caller(&label, &input).is_ok());
+        let wrong_generation =
+            crate::public_plugins::runtime_label("com.example.network", 8).unwrap();
+        assert_eq!(
+            super::validate_plugin_network_caller(&wrong_generation, &input),
+            Err(crate::public_plugins::PluginNetworkErrorCode::ExpiredRequest)
+        );
+    }
+
+    #[test]
+    fn plugin_network_command_checks_caller_before_manager_access() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let start = production
+            .find("pub(crate) async fn plugin_network_request(")
+            .expect("network command is missing");
+        let command = &production[start..];
+        let guard = command
+            .find("validate_plugin_network_caller(window.label(), &input)")
+            .unwrap();
+        let manager = command.find("service.manager()").unwrap();
+        assert!(guard < manager);
+    }
 
     #[test]
     fn find_ready_outcome_uses_camel_case_fields() {

@@ -247,6 +247,28 @@ impl PluginNetworkAuthorityGate {
         pending.deliver()
     }
 
+    pub(crate) async fn request(
+        self: &Arc<Self>,
+        caller_plugin_id: &str,
+        caller_generation: u64,
+        context: &PluginRequestContext,
+        scheduler: Arc<PluginRequestScheduler>,
+        request: PluginNetworkRequest,
+    ) -> Result<PluginNetworkResponse, PluginNetworkErrorCode> {
+        let prepared = self.admit(
+            caller_plugin_id,
+            caller_generation,
+            context,
+            scheduler.as_ref(),
+            request,
+        )?;
+        let pending = self
+            .broker
+            .execute(prepared, self.redirect_authority(Arc::clone(&scheduler)))
+            .await?;
+        self.deliver(pending, scheduler.as_ref())
+    }
+
     pub(crate) fn invalidate_context(&self, context: &PluginRequestContext) -> usize {
         self.begin_transition()
             .map_or(0, |transition| transition.invalidate_context(context))
