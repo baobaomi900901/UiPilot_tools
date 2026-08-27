@@ -66,6 +66,7 @@ export interface LauncherCore {
   readonly setThemePreference: (theme: ThemePreference) => void
   readonly setWebSearchEngine: (engine: WebSearchEngine) => void
   readonly setHotkeyCanonical: (value: string) => void
+  readonly setHotkeyRecordingPhase: (phase: HotkeyRecordingPhase) => void
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly clearMessages: () => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
@@ -108,6 +109,10 @@ interface PrivateFileState {
   results: PrivateFileResult[]
   selectedIndex: number
 }
+
+export type HotkeyRecordingPhase = 'idle' | 'recording' | 'completed'
+
+const HOTKEY_RECORDING_SHOW_GRACE_MS = 1_000
 
 export interface PluginPanelHostKeyPhysicalInput {
   key: string
@@ -596,6 +601,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let compositionGeneration = 0
   let composition: CompositionOwner | undefined
   let settingsOperation: SettingsOperation | undefined
+  let hotkeyRecording = false
+  let hotkeyShowConsumedDuringRecording = false
+  let hotkeyShowGraceUntil = 0
   let pendingSettingsLoadEpoch: number | undefined
   let pluginListOwner: PluginListOwner | undefined
   const pluginMutationOwners = new Map<string, PluginMutationOwner>()
@@ -1586,6 +1594,17 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    if (model.view === 'settings' && event.target === 'launcher') {
+      if (hotkeyRecording) {
+        hotkeyShowConsumedDuringRecording = true
+        return
+      }
+      if (Date.now() <= hotkeyShowGraceUntil) {
+        hotkeyShowGraceUntil = 0
+        return
+      }
+      hotkeyShowGraceUntil = 0
+    }
     const panelSessionEpoch = model.panel?.sessionEpoch
     discardPanelUi()
     if (panelSessionEpoch) {
@@ -1988,6 +2007,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.queryControlValue = ''
     clearResults()
     return true
+  }
+
+  function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): void {
+    if (destroyed) return
+    if (phase === 'recording' && model.view === 'settings') {
+      hotkeyRecording = true
+      hotkeyShowConsumedDuringRecording = false
+      hotkeyShowGraceUntil = 0
+      return
+    }
+    if (phase === 'completed' && hotkeyRecording) {
+      hotkeyRecording = false
+      hotkeyShowGraceUntil = hotkeyShowConsumedDuringRecording
+        ? 0
+        : Date.now() + HOTKEY_RECORDING_SHOW_GRACE_MS
+      return
+    }
+    hotkeyRecording = false
+    hotkeyShowConsumedDuringRecording = false
+    hotkeyShowGraceUntil = 0
   }
 
   function resetPanelUi(status = ''): void {
@@ -2826,6 +2865,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setThemePreference,
     setWebSearchEngine,
     setHotkeyCanonical,
+    setHotkeyRecordingPhase,
     saveHotkeyCanonical,
     clearMessages,
     setFileCategory,

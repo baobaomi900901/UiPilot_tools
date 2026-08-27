@@ -3197,22 +3197,96 @@ describe('settings ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl'))
   })
 
-  it('records DoubleCtrl from the settings hotkey input', async () => {
+  it('records DoubleCtrl only after explicit recording and returns focus to the recorder button', async () => {
     installMatchMedia(false)
-    const { core, client } = await settingsCore()
+    const { core, client, emit } = await settingsCore()
     const mounted = await mountLauncherView(core)
     const settings = core.getSnapshot().settings!
     const input = mounted.host.querySelector<HTMLInputElement>(`input[name="settings-hotkey-${settings.hotkey.key}"]`)
     if (!input) throw new Error('settings hotkey input missing')
+    const recorder = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '重新录制')
+    if (!recorder) throw new Error('settings hotkey recorder button missing')
 
-    await act(async () => input.focus())
+    expect(input.disabled).toBe(true)
+    expect(input.tabIndex).toBe(-1)
+    await act(async () => recorder.click())
+    expect(recorder.textContent?.trim()).toBe('取消录制')
+    expect(input.disabled).toBe(false)
+    expect(document.activeElement).toBe(input)
+
     await act(async () => {
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
       input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft', bubbles: true, cancelable: true }))
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
     })
 
+    expect(client.saveHotkey).not.toHaveBeenCalled()
+    expect(core.getSnapshot().view).toBe('settings')
+    await act(async () => input.dispatchEvent(
+      new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft', bubbles: true, cancelable: true }),
+    ))
     expect(client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } })
+    await vi.waitFor(() => expect(input.disabled).toBe(true))
+    await vi.waitFor(() => expect(recorder.textContent?.trim()).toBe('重新录制'))
+    await vi.waitFor(() => expect(document.activeElement).toBe(recorder))
+    await act(async () => emit(shown('same-hotkey-after-recording', 'launcher')))
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(document.activeElement).toBe(recorder)
+    await act(async () => emit(shown('later-hotkey-after-recording', 'launcher')))
+    expect(core.getSnapshot().view).toBe('launcher')
+    await mounted.unmount()
+  })
+
+  it('completes recording without keyup when the captured hotkey matches the current value', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await settingsCore({ ...settingsFixture, hotkey: 'Shift+Space' })
+    const mounted = await mountLauncherView(core)
+    const input = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
+    if (!input) throw new Error('settings hotkey input missing')
+    const recorder = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '重新录制')
+    if (!recorder) throw new Error('settings hotkey recorder button missing')
+
+    await act(async () => recorder.click())
+    await act(async () => {
+      input.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Shift', code: 'ShiftLeft', shiftKey: true, bubbles: true, cancelable: true,
+      }))
+      input.dispatchEvent(new KeyboardEvent('keydown', {
+        key: ' ', code: 'Space', shiftKey: true, bubbles: true, cancelable: true,
+      }))
+    })
+
+    expect(client.saveHotkey).not.toHaveBeenCalled()
+    expect(input.disabled).toBe(true)
+    expect(recorder.textContent?.trim()).toBe('重新录制')
+    expect(document.activeElement).toBe(recorder)
+    await act(async () => emit(shown('same-hotkey-after-keydown', 'launcher')))
+    expect(core.getSnapshot().view).toBe('settings')
+    await act(async () => emit(shown('normal-hotkey-after-same-recording', 'launcher')))
+    expect(core.getSnapshot().view).toBe('launcher')
+    await mounted.unmount()
+  })
+
+  it('completes recording when Host suppresses the already registered current hotkey', async () => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore({ ...settingsFixture, hotkey: 'Shift+Space' })
+    const mounted = await mountLauncherView(core)
+    const input = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
+    if (!input) throw new Error('settings hotkey input missing')
+    const recorder = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '重新录制')
+    if (!recorder) throw new Error('settings hotkey recorder button missing')
+
+    await act(async () => recorder.click())
+    await act(async () => window.dispatchEvent(new Event('uipilot-hotkey-recording-current')))
+
+    expect(client.saveHotkey).not.toHaveBeenCalled()
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(input.disabled).toBe(true)
+    expect(recorder.textContent?.trim()).toBe('重新录制')
+    expect(document.activeElement).toBe(recorder)
     await mounted.unmount()
   })
 
@@ -3576,6 +3650,13 @@ describe('React view and accessibility', () => {
     })
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('.result-favorite-star')).toHaveLength(2))
     const refreshed = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+    await vi.waitFor(() => expect(document.activeElement).toBe(refreshed[0]))
+    expect(refreshed[0]?.getAttribute('aria-selected')).toBe('true')
+    expect(stylesSource).toMatch(/\.result-row:focus\s*\{[^}]*outline:\s*none;/s)
+    const arrowDown = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+    await act(async () => refreshed[0]?.dispatchEvent(arrowDown))
+    expect(arrowDown.defaultPrevented).toBe(true)
+    await vi.waitFor(() => expect(refreshed[1]?.getAttribute('aria-selected')).toBe('true'))
     await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
     let cancelItem: HTMLElement | null = null
     await vi.waitFor(() => {
@@ -4265,6 +4346,56 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
+  it('routes focus right into the active settings panel and left back to its menu tab', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.openMessageCenter).mockResolvedValueOnce(
+      messageCenterSnapshot('1', 0, ['focus target']),
+    )
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('settings-arrow-focus', 'settings')))
+
+    const generalTab = settingsTab(mounted.host, '通用')
+    expect(document.activeElement).toBe(generalTab)
+    await act(async () => generalTab.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }),
+    ))
+    const recorder = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '重新录制')
+    if (!recorder) throw new Error('settings hotkey recorder button missing')
+    expect(document.activeElement).toBe(recorder)
+
+    await act(async () => recorder.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true }),
+    ))
+    expect(document.activeElement).toBe(generalTab)
+
+    await act(async () => generalTab.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true }),
+    ))
+    const messagesTab = settingsTab(mounted.host, '消息')
+    await vi.waitFor(() => expect(messagesTab.getAttribute('aria-selected')).toBe('true'))
+    expect(document.activeElement).toBe(messagesTab)
+    await vi.waitFor(() => expect(fake.client.openMessageCenter).toHaveBeenCalledOnce())
+    await act(async () => messagesTab.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }),
+    ))
+    const clearMessages = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '清空全部')
+    if (!clearMessages) throw new Error('clear messages button missing')
+    expect(document.activeElement).toBe(clearMessages)
+
+    await act(async () => clearMessages.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true }),
+    ))
+    expect(document.activeElement).toBe(messagesTab)
+    await mounted.unmount()
+    core.destroy()
+  })
+
   it('opens notification targets on Messages and keeps settings visible across clear failure and success', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
@@ -4480,7 +4611,9 @@ describe('React view and accessibility', () => {
 
     const hotkey = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
     expect(hotkey).toBeTruthy()
-    expect(hotkey?.disabled).toBe(false)
+    expect(hotkey?.disabled).toBe(true)
+    expect([...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '重新录制')?.disabled).toBe(false)
     expect(mounted.host.textContent).not.toContain('无法加载插件清单。')
 
     await activateSettingsTab(mounted.host, '插件')
@@ -4489,7 +4622,7 @@ describe('React view and accessibility', () => {
     expect(mounted.host.textContent).not.toContain('private plugin error')
 
     await activateSettingsTab(mounted.host, '通用')
-    expect(mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')?.disabled).toBe(false)
+    expect(mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')?.disabled).toBe(true)
 
     await mounted.unmount()
     core.destroy()
@@ -4660,12 +4793,18 @@ describe('React view and accessibility', () => {
 
     const hotkey = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')
     if (!hotkey) throw new Error('settings hotkey input missing after reset')
+    expect(hotkey.disabled).toBe(true)
+    const recorder = [...mounted.host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === '重新录制')
+    if (!recorder) throw new Error('settings hotkey recorder button missing after reset')
+    await act(async () => recorder.click())
     expect(hotkey.disabled).toBe(false)
-    await act(async () => hotkey.focus())
+    expect(document.activeElement).toBe(hotkey)
     await act(async () => {
       hotkey.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
       hotkey.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft', bubbles: true, cancelable: true }))
       hotkey.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true, cancelable: true }))
+      hotkey.dispatchEvent(new KeyboardEvent('keyup', { key: 'Control', code: 'ControlLeft', bubbles: true, cancelable: true }))
     })
     await vi.waitFor(() => expect(fake.client.saveHotkey).toHaveBeenCalledWith({ hotkey: { hotkey: 'DoubleCtrl' } }))
     await vi.waitFor(() => expect(core.getSnapshot().settings?.hotkey.value).toBe('DoubleCtrl'))
@@ -5028,8 +5167,9 @@ describe('real adapter and startup', () => {
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 7)).toEqual([
+    expect(order.slice(0, 8)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
+      'hotkey-recording://current',
       'launcher://shown',
       'uipilot-plugin-panel-error',
       'uipilot-plugin-panel-reset',
@@ -5195,12 +5335,14 @@ describe('real adapter and startup', () => {
     const panelUnlisten = vi.fn()
     const panelResetUnlisten = vi.fn()
     const panelFocusUnlisten = vi.fn()
+    const hotkeyRecordingUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
     vi.doMock('./launcher-view', async () => {
       const React = await vi.importActual<typeof import('react')>('react')
       return {
+        HOTKEY_RECORDING_CURRENT_DOM_EVENT: 'uipilot-hotkey-recording-current',
         LauncherView: ({ core, onReady }: { core: ReturnType<typeof createLauncherCore>; onReady: (result: 'ready') => void }) => {
           mountedCore = core
           const snapshot = React.useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
@@ -5218,6 +5360,7 @@ describe('real adapter and startup', () => {
       if (event === 'uipilot-plugin-panel-error') return panelUnlisten
       if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
       if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
+      if (event === 'hotkey-recording://current') return hotkeyRecordingUnlisten
       return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
@@ -5251,6 +5394,7 @@ describe('real adapter and startup', () => {
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
       expect(panelFocusUnlisten).toHaveBeenCalledOnce()
+      expect(hotkeyRecordingUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -5265,6 +5409,7 @@ describe('real adapter and startup', () => {
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
       expect(panelFocusUnlisten).toHaveBeenCalledOnce()
+      expect(hotkeyRecordingUnlisten).toHaveBeenCalledOnce()
     } finally {
       await pagehide()
       vi.doUnmock('./launcher-view')
@@ -5275,7 +5420,7 @@ describe('real adapter and startup', () => {
 
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
-    const unlistens = Array.from({ length: 5 }, () => vi.fn())
+    const unlistens = Array.from({ length: 6 }, () => vi.fn())
     tauriCapture.listen.mockImplementation(async (_event, _handler) => unlistens[tauriCapture.listen.mock.calls.length - 1]!)
     tauriCapture.invoke.mockImplementation((command) =>
       Promise.resolve(command === 'load_settings' ? emptySettings : undefined),

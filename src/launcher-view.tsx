@@ -64,6 +64,8 @@ interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
   onBindingFailed?: () => void
 }
 
+export const HOTKEY_RECORDING_CURRENT_DOM_EVENT = 'uipilot-hotkey-recording-current'
+
 function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed, ...props }: BoundInputProps) {
   const ref = useRef<InputRef>(null)
   useLayoutEffect(() => {
@@ -225,60 +227,131 @@ interface HotkeyRecorderInputProps {
 
 function HotkeyRecorderInput({ core, value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
   const [recorderState, setRecorderState] = useState<RecorderState>(() => ({ status: 'idle', baseline: value }))
+  const recorderStateRef = useRef(recorderState)
+  const inputRef = useRef<InputRef>(null)
+  const actionRef = useRef<HTMLButtonElement>(null)
+  const returnFocusToAction = useRef(false)
+  const pendingCommit = useRef<{ canonical: string; finalState: RecorderState } | undefined>(undefined)
+  const recording = recorderState.status === 'recording'
+
+  const updateRecorderState = useCallback((next: RecorderState) => {
+    recorderStateRef.current = next
+    setRecorderState(next)
+  }, [])
 
   useEffect(() => {
-    setRecorderState((current) =>
-      current.status === 'recording' ? current : { status: 'idle', baseline: value, pendingTap: undefined },
-    )
-  }, [value])
+    const current = recorderStateRef.current
+    if (current.status === 'recording') return
+    updateRecorderState({ status: 'idle', baseline: value, pendingTap: undefined })
+  }, [updateRecorderState, value])
+
+  useEffect(() => () => core.setHotkeyRecordingPhase('idle'), [core])
+
+  useEffect(() => {
+    const completeCurrentHotkeyRecording = () => {
+      if (recorderStateRef.current.status !== 'recording') return
+      pendingCommit.current = undefined
+      returnFocusToAction.current = true
+      core.setHotkeyRecordingPhase('idle')
+      updateRecorderState(
+        reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state,
+      )
+    }
+    window.addEventListener(HOTKEY_RECORDING_CURRENT_DOM_EVENT, completeCurrentHotkeyRecording)
+    return () => {
+      window.removeEventListener(HOTKEY_RECORDING_CURRENT_DOM_EVENT, completeCurrentHotkeyRecording)
+    }
+  }, [core, updateRecorderState])
 
   const display =
-    recorderState.status === 'recording' ? '按下快捷键…' : formatHotkeyDisplay(value)
+    recording ? '按下快捷键…' : formatHotkeyDisplay(value)
 
-  const startRecording = useCallback(() => {
+  useLayoutEffect(() => {
+    if (recording) {
+      inputRef.current?.input?.focus()
+      return
+    }
+    if (!disabled && returnFocusToAction.current) {
+      returnFocusToAction.current = false
+      actionRef.current?.focus()
+    }
+  }, [disabled, recording])
+
+  const toggleRecording = useCallback(() => {
     if (disabled) return
-    setRecorderState((current) => reduceHotkeyRecorder(current, { type: 'start', baseline: value }).state)
-  }, [disabled, value])
+    pendingCommit.current = undefined
+    core.setHotkeyRecordingPhase(recording ? 'idle' : 'recording')
+    updateRecorderState(reduceHotkeyRecorder(
+      recorderStateRef.current,
+      recording ? { type: 'cancel' } : { type: 'start', baseline: value },
+    ).state)
+  }, [core, disabled, recording, updateRecorderState, value])
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     event.preventDefault()
+    event.stopPropagation()
     if (event.key === 'Escape') {
-      setRecorderState((current) => reduceHotkeyRecorder(current, { type: 'cancel' }).state)
+      pendingCommit.current = undefined
+      returnFocusToAction.current = true
+      core.setHotkeyRecordingPhase('idle')
+      updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state)
       return
     }
-    setRecorderState((current) => {
-      const result = reduceHotkeyRecorder(current, {
-        type: 'keydown',
-        key: event.key,
-        code: event.code,
-        ctrl: event.ctrlKey,
-        alt: event.altKey,
-        shift: event.shiftKey,
-        meta: event.metaKey,
-        repeat: event.repeat,
-        nowMs: Date.now(),
-      })
-      if (result.commit) void core.saveHotkeyCanonical(result.commit)
-      return result.state
+    if (pendingCommit.current) return
+    const result = reduceHotkeyRecorder(recorderStateRef.current, {
+      type: 'keydown',
+      key: event.key,
+      code: event.code,
+      ctrl: event.ctrlKey,
+      alt: event.altKey,
+      shift: event.shiftKey,
+      meta: event.metaKey,
+      repeat: event.repeat,
+      nowMs: Date.now(),
     })
+    if (result.commit) {
+      if (result.commit === value) {
+        returnFocusToAction.current = true
+        core.setHotkeyRecordingPhase('completed')
+        updateRecorderState(result.state)
+        return
+      }
+      pendingCommit.current = { canonical: result.commit, finalState: result.state }
+      updateRecorderState({ ...result.state, status: 'recording' })
+      return
+    }
+    updateRecorderState(result.state)
   }
 
-  const handleBlur = () => {
-    setRecorderState((current) => reduceHotkeyRecorder(current, { type: 'blur' }).state)
+  const handleKeyUp = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const pending = pendingCommit.current
+    if (!pending) return
+    pendingCommit.current = undefined
+    returnFocusToAction.current = true
+    core.setHotkeyRecordingPhase('completed')
+    updateRecorderState(pending.finalState)
+    void core.saveHotkeyCanonical(pending.canonical)
   }
 
   return (
-    <Input
-      readOnly
-      value={display}
-      id={id}
-      name={name}
-      disabled={disabled}
-      onFocus={startRecording}
-      onClick={startRecording}
-      onKeyDown={handleKeyDown}
-      onBlur={handleBlur}
-    />
+    <div className="settings-hotkey-recorder">
+      <Input
+        ref={inputRef}
+        readOnly
+        value={display}
+        id={id}
+        name={name}
+        disabled={disabled || !recording}
+        tabIndex={recording ? 0 : -1}
+        onKeyDown={handleKeyDown}
+        onKeyUp={handleKeyUp}
+      />
+      <Button ref={actionRef} disabled={disabled} onClick={toggleRecording}>
+        {recording ? '取消录制' : '重新录制'}
+      </Button>
+    </div>
   )
 }
 
@@ -293,6 +366,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const activeSettingsTab = snapshot.settingsTab
   const optionRefs = useRef(new Map<number, HTMLElement>())
+  const favoriteFocusTarget = useRef<{
+    invocationId: string | undefined
+    viewEpoch: number
+    queryControlValue: string
+  } | undefined>(undefined)
   const fileOptionRefs = useRef(new Map<number, HTMLElement>())
   const ready = useRef(false)
 
@@ -368,6 +446,38 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (snapshot.view === 'launcher' && selected) optionRefs.current.get(selected.key)?.scrollIntoView({ block: 'nearest' })
   }, [snapshot.results, snapshot.selectedIndex, snapshot.view])
 
+  useLayoutEffect(() => {
+    const target = favoriteFocusTarget.current
+    if (!target) return
+    if (
+      snapshot.view !== 'launcher' ||
+      snapshot.invocationId !== target.invocationId ||
+      snapshot.viewEpoch !== target.viewEpoch ||
+      snapshot.queryControlValue !== target.queryControlValue
+    ) {
+      favoriteFocusTarget.current = undefined
+      return
+    }
+    if (snapshot.favoriteMutationPending || snapshot.searchPending) return
+    const result = snapshot.results[0]
+    if (!result) return
+    const frame = window.requestAnimationFrame(() => {
+      const option = optionRefs.current.get(result.key)
+      if (!option?.isConnected) return
+      option.focus()
+      if (document.activeElement === option) favoriteFocusTarget.current = undefined
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [
+    snapshot.favoriteMutationPending,
+    snapshot.invocationId,
+    snapshot.queryControlValue,
+    snapshot.results,
+    snapshot.searchPending,
+    snapshot.view,
+    snapshot.viewEpoch,
+  ])
+
   const file = snapshot.file
   const activeFileIndex =
     file?.selected === undefined ? -1 : file.results.findIndex((item) => item.fullPath === file.selected?.fullPath)
@@ -393,7 +503,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       ? snapshot.messageCenter.unreadCount ?? 0
       : 0
 
-  const queryKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+  const queryKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (
       event.key === 'Tab' &&
       snapshot.file &&
@@ -414,7 +524,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     }
     if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
     const isComposing = composing(event)
-    if (event.key === 'Escape' && !isComposing) event.preventDefault()
+    if (!isComposing) event.preventDefault()
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
   }
   const panelKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
@@ -444,10 +554,53 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     core.keyDown(event.key, isComposing)
   }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
-    if (event.key !== 'Escape') return
     const isComposing = composing(event)
-    if (!isComposing) event.preventDefault()
-    core.keyDown('Escape', isComposing)
+    if (event.key === 'Escape') {
+      if (!isComposing) event.preventDefault()
+      core.keyDown('Escape', isComposing)
+      return
+    }
+    if (
+      isComposing ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.metaKey ||
+      event.shiftKey ||
+      (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft')
+    ) {
+      return
+    }
+    const target = event.target
+    if (!(target instanceof HTMLElement)) return
+    const selectedTab = settingsTabsRef.current
+      ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+    if (!selectedTab) return
+    const panelId = selectedTab.getAttribute('aria-controls')
+    const panel = panelId
+      ? [...(settingsTabsRef.current?.querySelectorAll<HTMLElement>('[role="tabpanel"]') ?? [])]
+        .find((candidate) => candidate.id === panelId) ?? null
+      : null
+    if (!panel) return
+
+    if (event.key === 'ArrowRight') {
+      if (target !== selectedTab) return
+      const firstControl = panel.querySelector<HTMLElement>([
+        'button:not([disabled])',
+        'input:not([disabled]):not([type="hidden"])',
+        'select:not([disabled])',
+        'textarea:not([disabled])',
+        'a[href]',
+        '[tabindex]:not([tabindex="-1"])',
+      ].join(','))
+      if (!firstControl || firstControl.getAttribute('aria-disabled') === 'true') return
+      event.preventDefault()
+      firstControl.focus()
+      return
+    }
+
+    if (!panel.contains(target)) return
+    event.preventDefault()
+    selectedTab.focus()
   }
 
   const launcher = (
@@ -504,7 +657,13 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       <Spin spinning={snapshot.searchPending} size="small">
         <div className="launcher-result-surface">
           {snapshot.commandHint ? <div className="command-hint">{snapshot.commandHint}</div> : null}
-          <div id="launcher-results" className="result-list" role="listbox" aria-label="搜索结果">
+          <div
+            id="launcher-results"
+            className="result-list"
+            role="listbox"
+            aria-label="搜索结果"
+            onKeyDown={queryKeyDown}
+          >
             {snapshot.results.map((item, index) => {
               const pluginActivation = item.pluginCompletion ?? item.panelActivation
               const row = (
@@ -514,6 +673,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                 role="option"
                 aria-selected={snapshot.selectedIndex === index}
                 className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
+                tabIndex={-1}
                 onClick={() => core.activateResult(index)}
                 onContextMenu={pluginActivation ? (event) => event.preventDefault() : undefined}
                 ref={(element) => {
@@ -575,7 +735,14 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                       label: pluginActivation.favorite ? '取消常用' : '设为常用',
                       disabled: snapshot.favoriteMutationPending,
                     }],
-                    onClick: () => core.setPluginFavorite(index, !pluginActivation.favorite),
+                    onClick: () => {
+                      favoriteFocusTarget.current = {
+                        invocationId: snapshot.invocationId,
+                        viewEpoch: snapshot.viewEpoch,
+                        queryControlValue: snapshot.queryControlValue,
+                      }
+                      core.setPluginFavorite(index, !pluginActivation.favorite)
+                    },
                   }}
                   onOpenChange={(open) => {
                     if (open) core.openPluginContextMenu(index)

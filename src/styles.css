@@ -384,6 +384,10 @@ label,
   padding: 8px 10px;
 }
 
+.result-row:focus {
+  outline: none;
+}
+
 .result-row.is-selected {
   background: var(--uipilot-ui-accent);
   box-shadow: inset 3px 0 var(--uipilot-ui-primary);
@@ -790,6 +794,22 @@ label,
 
 .settings-basic-form {
   padding-bottom: 14px;
+}
+
+.settings-hotkey-recorder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-hotkey-recorder .ant-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-hotkey-recorder .ant-btn {
+  flex: 0 0 auto;
 }
 
 .public-plugin-inventory {

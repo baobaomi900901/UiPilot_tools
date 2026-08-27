@@ -878,7 +878,13 @@ impl LifecycleCoordinator {
         let app_for_callback = app.clone();
         let coordinator = Arc::clone(coordinator);
         let on_match = Arc::new(move || {
-            let _ = coordinator.request_show(&app_for_callback, ShowTarget::Launcher);
+            let main_foreground = main_window_owns_native_foreground(&app_for_callback);
+            let dispatch = should_dispatch_hotkey_show(main_foreground);
+            if dispatch {
+                let _ = coordinator.request_show(&app_for_callback, ShowTarget::Launcher);
+            } else {
+                let _ = app_for_callback.emit_to("main", crate::HOTKEY_RECORDING_CURRENT_EVENT, ());
+            }
         });
         let hook = HotkeyHook::install(app, modifier, on_match)?;
         *self.hotkey_hook.lock().map_err(|_| ())? = Some(hook);
@@ -1773,6 +1779,10 @@ pub(crate) fn should_ignore_main_focus_loss(
     !focused && !expected_transfer_blur && main_owns_native_foreground
 }
 
+pub(crate) fn should_dispatch_hotkey_show(main_owns_native_foreground: bool) -> bool {
+    !main_owns_native_foreground
+}
+
 #[cfg(windows)]
 pub(crate) fn main_window_owns_native_foreground(app: &AppHandle) -> bool {
     let Some(main) = app.get_webview_window("main") else {
@@ -2061,6 +2071,12 @@ mod tests {
             ReadyOrder::FrontendFirst => [state.mark_frontend_ready(), state.mark_setup_ready()],
         };
         results.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn native_foreground_main_suppresses_hotkey_show_dispatch() {
+        assert!(!should_dispatch_hotkey_show(true));
+        assert!(should_dispatch_hotkey_show(false));
     }
 
     #[test]

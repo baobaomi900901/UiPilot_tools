@@ -8,7 +8,7 @@ import { createRoot } from 'react-dom/client'
 import { createFindCore } from './find-core'
 import { FindView } from './find-view'
 import { createLauncherCore } from './launcher-core'
-import { LauncherView } from './launcher-view'
+import { HOTKEY_RECORDING_CURRENT_DOM_EVENT, LauncherView } from './launcher-view'
 import { createPluginWindowCore } from './plugin-window-core'
 import { PluginWindowView } from './plugin-window-view'
 import {
@@ -219,9 +219,12 @@ const onReady = (result: 'ready' | 'failed') => {
   settleReady(result)
 }
 let mountFailed = false
+let unlistenHotkeyRecordingCurrent: (() => void) | undefined
 const failMount = () => {
   if (mountFailed) return
   mountFailed = true
+  unlistenHotkeyRecordingCurrent?.()
+  unlistenHotkeyRecordingCurrent = undefined
   onReady('failed')
   core.failInitialization()
   core.destroy()
@@ -240,6 +243,8 @@ const teardown = () => {
   if (tornDown) return
   tornDown = true
   window.removeEventListener('pagehide', teardown)
+  unlistenHotkeyRecordingCurrent?.()
+  unlistenHotkeyRecordingCurrent = undefined
   core.destroy()
   root.unmount()
 }
@@ -260,6 +265,20 @@ void (async () => {
     return
   }
   if (!await panelFocusListenerReady) {
+    core.failInitialization()
+    core.destroy()
+    return
+  }
+  try {
+    const unlisten = await listen('hotkey-recording://current', () => {
+      window.dispatchEvent(new Event(HOTKEY_RECORDING_CURRENT_DOM_EVENT))
+    })
+    if (tornDown) {
+      unlisten()
+      return
+    }
+    unlistenHotkeyRecordingCurrent = unlisten
+  } catch {
     core.failInitialization()
     core.destroy()
     return

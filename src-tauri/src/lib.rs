@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 use find_window::{FocusEffect, WindowLabel};
@@ -11,6 +11,9 @@ use lifecycle::ShowTarget;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 use plugins::{PluginManager, Version};
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+const HOTKEY_RECORDING_CURRENT_EVENT: &str = "hotkey-recording://current";
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod atomic_file;
@@ -365,7 +368,13 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, _shortcut, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        let _ = shortcut_coordinator.request_show(app, ShowTarget::Launcher);
+                        let main_foreground = lifecycle::main_window_owns_native_foreground(app);
+                        let dispatch = lifecycle::should_dispatch_hotkey_show(main_foreground);
+                        if dispatch {
+                            let _ = shortcut_coordinator.request_show(app, ShowTarget::Launcher);
+                        } else {
+                            let _ = app.emit_to("main", HOTKEY_RECORDING_CURRENT_EVENT, ());
+                        }
                     }
                 })
                 .build(),
@@ -957,6 +966,8 @@ mod tests {
             "move |app, _args, _cwd|",
             "tauri_plugin_global_shortcut::Builder::new()",
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
+            "lifecycle::main_window_owns_native_foreground(app)",
+            "HOTKEY_RECORDING_CURRENT_EVENT",
             "setup_production_lifecycle(",
             "&public_plugin_service,",
             "let public_plugin_service = Arc::new(public_plugins::PublicPluginService::default());",
