@@ -5,7 +5,7 @@
   --note-radius: 10px;
   --note-radius-sm: 8px;
   --note-transition: 160ms ease;
-  --note-item-height: 52px;
+  --note-item-height: 40px;
 }
 
 * {
@@ -305,7 +305,9 @@ html[data-theme='dark'] {
   background: transparent;
   border: none;
   border-radius: 0;
-  opacity: 0.72;
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .note-more svg {
@@ -315,10 +317,10 @@ html[data-theme='dark'] {
   margin: auto;
 }
 
-.note-card:hover .note-more,
-.note-card:focus-within .note-more,
-.note-more:focus-visible {
+.note-card:hover .note-more {
+  visibility: visible;
   opacity: 1;
+  pointer-events: auto;
 }
 
 .note-more:not(:disabled):hover,

@@ -178,7 +178,7 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel notes contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.notes')
-  assert.equal(manifest.version, '1.2.1')
+  assert.equal(manifest.version, '1.2.2')
   assert.equal(manifest.minimumHostVersion, '0.3.1')
   assert.equal(manifest.command.defaultName, 'notes')
   assert.equal(manifest.command.activationMode, 'submit')

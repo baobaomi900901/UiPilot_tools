@@ -6,7 +6,7 @@ import {
   sortNotes,
 } from './notes-logic.js'
 
-const ITEM_HEIGHT = 52
+const ITEM_HEIGHT = 40
 const LIST_OVERSCAN = 4
 
 const newBtn = document.querySelector('#new-btn')

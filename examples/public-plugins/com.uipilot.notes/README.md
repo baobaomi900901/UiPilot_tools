@@ -7,7 +7,7 @@
 - `activationMode`: `submit`
 - `outputMode`: `panel`
 - 权限: `ui.panel`
-- `version`: `1.2.1`
+- `version`: `1.2.2`
 - `minimumHostVersion`: `0.3.1`
 - `panel.hostKeys`: `ArrowDown`, `ArrowUp`, `Primary+N`
 - 业务参考: `com.uipilot.note`
@@ -20,7 +20,7 @@
 3. 确认 `ui.panel` 权限。
 4. 在主界面输入 `/notes` 并回车。
 
-开发目录安装会把 `package` **复制**到本地插件库；修改 Panel 资源后需在设置里**卸载并重新选择 `package` 目录安装**，确认版本显示为 **1.2.1** 后再测。
+开发目录安装会把 `package` **复制**到本地插件库；修改 Panel 资源后需在设置里**卸载并重新选择 `package` 目录安装**，确认版本显示为 **1.2.2** 后再测。
 
 ### 浏览器预览
 
