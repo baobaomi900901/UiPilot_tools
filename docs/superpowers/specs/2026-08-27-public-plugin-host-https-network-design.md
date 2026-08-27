@@ -1,7 +1,7 @@
 # Public Plugin Host-Managed HTTPS Network Design
 
 **Date:** 2026-08-27
-**Status:** Draft - independent technical and security review passed with no findings; awaiting user approval
+**Status:** Approved - independent technical and security review passed with no findings; approved by the user on 2026-08-27
 
 **Related:**
 `docs/superpowers/specs/2026-08-20-public-plugin-validation-cli-design.md`,
