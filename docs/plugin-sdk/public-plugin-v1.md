@@ -40,14 +40,30 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
 - `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
 - `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`.
+- Windows Runtime HTTPS requires `minimumHostVersion >= 0.3.2`, exact permission `network.https`, and a non-null `network` object containing `httpsHosts`. The permission and object must either both be present or both be absent.
+
+`network.https` declares exact destination hosts, not URLs, origins, wildcard suffixes, or redirect groups:
+
+```json
+{
+  "minimumHostVersion": "0.3.2",
+  "supportedPlatforms": ["windows"],
+  "permissions": ["network.https"],
+  "network": {
+    "httpsHosts": ["api.example.com"]
+  }
+}
+```
+
+`httpsHosts` contains one to eight unique canonical lowercase ASCII DNS hosts and is serialized in ASCII order. Each host is at most 253 bytes, has at least two valid DNS labels, and excludes IP literals, ports, schemes, paths, wildcards, raw Unicode/IDN, `localhost`, `.localhost`, and `.local`. Unknown fields, `network: null`, invalid values, and macOS validation fail closed. Installation shows the complete sorted host list and requires explicit consent. Adding hosts on update requires new consent; removing hosts narrows authority without new consent. Settings can revoke access immediately or regrant it only after confirming the current complete host list.
 
 Installation and reload use staging. Static validation and Runtime readiness must succeed before the generation becomes active. A failed upgrade leaves the previous generation usable.
 
 ## Runtime Contract
 
-The Runtime entry is an ES module exporting `onCommand` with the `PluginHandler` type from [uipilot-plugin-api-v1.d.ts](./uipilot-plugin-api-v1.d.ts). Each invocation and API object is new, deeply frozen, and bound to an immutable plugin ID, generation, and request ID. On Windows, a plugin that declares and receives `notifications.publish` may submit one notification action during that request: immediate `api.notifications.publish({ content })` or delayed `api.notifications.schedule({ content, delayMs })`.
+The Runtime entry is an ES module exporting `onCommand` with the `PluginHandler` type from [uipilot-plugin-api-v1.d.ts](./uipilot-plugin-api-v1.d.ts). Each invocation and API object is new, deeply frozen, and bound to an immutable plugin ID, generation, and request ID. On Windows, a plugin that declares and receives `notifications.publish` may submit one notification action during that request: immediate `api.notifications.publish({ content })` or delayed `api.notifications.schedule({ content, delayMs })`. A Manifest declaring `network.https` receives the optional frozen `api.network` facade; all authority is still revalidated by the Host for every call.
 
-`invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage, reads of declared non-secret settings, and the request-bound Windows message operation when granted; Runtime code cannot access Tauri, Shell, files, network, native input, another plugin, or secret plaintext.
+`invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage, reads of declared non-secret settings, the request-bound Windows message operation when granted, and bounded Host-managed HTTPS when declared and authorized. Runtime code cannot access Tauri, Shell, files, native input, another plugin, secret plaintext, raw sockets, or browser/WebView networking.
 
 Context errors are stable:
 
@@ -67,6 +83,60 @@ Late responses from expired requests are discarded and cannot mutate newer UI or
 Both notification methods are request-bound. `publish()` resolves at the atomic message-file commit. `schedule()` resolves when the host accepts one immutable task; it does not wait for delivery. `delayMs` must be a JavaScript safe integer in `1_000..=86_400_000`, and each plugin may have at most 32 pending tasks. Hiding windows does not cancel accepted tasks. Disabling, uninstalling, or updating the plugin cancels them, and process exit discards them without recovery. Later Windows toast or tray failures do not reject the completed call or remove a saved message.
 
 `schedule()` runs no plugin code after the request. It is not a general timer or background-task API and provides no query, cancellation, repeating, calendar-time, retry, or cross-restart guarantee. Notification content remains plain text; actions, links, markup, and arbitrary payloads are unsupported.
+
+### Host-Managed HTTPS
+
+`api.network?.request(input)` is Windows-only in Host `0.3.2`. It is available only to a Runtime whose Manifest declares `network.https`; the optional TypeScript property lets plugins detect an older or unavailable Host surface. It accepts:
+
+```ts
+api.network.request({
+  url: 'https://api.example.com/translate',
+  method: 'POST',
+  headers: { authorization: 'Bearer test-token' },
+  body: { type: 'json', value: { text: invocation.input } },
+})
+```
+
+`method` is exactly `GET` or `POST`. GET rejects a body. POST may omit the body or use `{ type: 'json' | 'text' | 'form', value }`; the Host encodes compact UTF-8 JSON, UTF-8 plain text, or sorted `application/x-www-form-urlencoded` data and owns `Content-Type`. JSON rejects cycles, functions, BigInt, undefined object members, prototype keys, and non-finite numbers. Form values must be strings.
+
+Request headers are an optional string map. Custom provider headers including `authorization`, `accept`, and `accept-language` are allowed. The Host rejects protected or connection-sensitive headers, including `host`, `content-length`, `content-type`, cookies, origin/referrer, user-agent, accept-encoding, hop-by-hop headers, proxy headers, every `sec-*`, `forwarded`, `via`, and every `x-forwarded-*`. Header names are case-insensitive and duplicates after lowercase normalization are invalid.
+
+The URL must use HTTPS, exact port 443, no credentials or fragment, and one currently granted exact host. HTTP, IP literals, localhost/private/special-use DNS answers, environment/system proxies, and TLS verification bypass are denied. Redirects are manual, limited to three, and must remain on the original exact host even if another host is declared. TLS uses the Windows trust store and TLS 1.2 or newer. The WebView CSP remains network-closed and no generic `fetch` proxy is exposed.
+
+The Promise resolves for every final HTTP status, including 4xx and 5xx, as `{ status, headers, body }`. Header names are lowercase; repeated safe values remain arrays. Cookies, hop-by-hop fields, and other protected response headers are omitted. The body must be strict UTF-8 text; the Host does not parse JSON, cache responses, or retain cookies.
+
+Fixed resource limits are:
+
+| Resource | Limit |
+| --- | ---: |
+| URL | 2048 UTF-8 bytes |
+| Request headers | 32 fields / 16 KiB total |
+| Encoded request body | 64 KiB |
+| Response headers | 64 fields / 32 KiB total |
+| Response body | 1 MiB |
+| Total deadline | 10 seconds |
+| Same-host redirects | 3 |
+| Calls per command context | 8 |
+| Concurrent calls per command context | 2 |
+| Concurrent public-plugin calls Host-wide | 16 |
+
+The Promise rejects with an `Error` whose exact `name` is one of:
+
+| Error name | Meaning |
+| --- | --- |
+| `InvalidNetworkRequestError` | Invalid URL, method, headers, body, encoding, or request-size limit |
+| `PermissionDeniedError` | Permission absent/revoked/unsupported, or no exact durable host grant |
+| `NetworkTargetDeniedError` | Scheme, host, address, port, DNS answer, or redirect target denied |
+| `NetworkTimeoutError` | Total ten-second deadline elapsed |
+| `NetworkFailureError` | DNS, TLS, connect, write, or read failure without a narrower policy error |
+| `NetworkResponseTooLargeError` | Response header or body limit exceeded |
+| `NetworkResponseInvalidError` | Invalid framing, content encoding, header value, or UTF-8 body |
+| `NetworkLimitExceededError` | Per-context call/concurrency or Host-wide concurrency limit exhausted |
+| `ExpiredRequestError` | Request replaced/completed/cancelled or plugin disabled/upgraded/uninstalled/torn down |
+
+Errors are deliberately redacted: they expose no URL, query, request/response headers, body, resolved address, certificate, provider payload, or native-library message. Disabling, uninstalling, upgrading, revoking permission, replacing/expiring the command, Runtime teardown, and Host shutdown cancel matching in-flight requests and discard stale responses. Calls do not survive the command context and cannot be used as background work.
+
+Bundled test credentials are ordinary plugin code and can be inspected. API v1 still exposes only `settings.isSecretConfigured()` for secret settings; it does not let Runtime read or inject secret plaintext into a network request. Production secret consumption is deferred to a later, separately versioned Host contract.
 
 ## Responses
 
@@ -122,6 +192,7 @@ API v1 implements only:
 - `ui.window`: create the host-owned singleton window.
 - `ui.panel`: mount the host-owned launcher panel surface.
 - `clipboard.write`: expose a host-owned `copyText` default action.
+- `network.https`: on Windows Host `0.3.2+`, expose bounded request-scoped Host-managed HTTPS to the exact authorized `network.httpsHosts` set.
 - `notifications.publish`: on Windows only, submit one immediate or host-owned delayed plain-text message and ask the host to show its own notification and tray reminder.
 - `timer.control`: on Windows only, control one host-owned plugin-window timer that can continue after the window hides; requires `ui.window`, `notifications.publish`, and `submit + window`.
 
@@ -129,7 +200,7 @@ Other parsed permission names are reserved and installation fails until the host
 
 ## Unsupported In v1
 
-Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, network, arbitrary files, clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
+Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, browser/WebView networking, raw sockets, arbitrary files, clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. External access is limited to request-scoped Host-managed HTTPS described above. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
 
 The fixed-output reference packages are:
 

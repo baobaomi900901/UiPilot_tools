@@ -6,6 +6,8 @@
 - **单例子窗口型**：处理命令后打开一个由 UiPilot 托管的子窗口。
 - **启动器面板型**：处理命令后在主启动器内挂载插件面板（基础能力需宿主 `0.3.0+`，Host 按键与主动隐藏需 `0.3.1+`）。
 
+三种插件的 Runtime 都可以按需使用 Windows Host `0.3.2+` 提供的受控 HTTPS 能力。网络请求由宿主代理执行，不会向 Runtime 或内容 WebView 开放浏览器 `fetch`。
+
 仓库中的完整参考实现：
 
 - [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：主界面结果与复制。
@@ -23,6 +25,7 @@
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
 | 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（使用 `hostKeys` 时 `minimumHostVersion` ≥ `0.3.1`） | `demo-panel` |
+| 在 Runtime 中请求声明的 HTTPS 服务 | 任意现有模式 | 任意现有输出 | `network.https`（仅 Windows，`minimumHostVersion` ≥ `0.3.2`） | 无独立 Demo |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
 MVP 中每个插件只能注册一个启动名称。用户可以在 UiPilot 设置中修改该名称，所以 Runtime 不应硬编码 `/命令名`。
@@ -83,7 +86,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - `command.defaultName` 不包含 `/`，只能有一个。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `notifications.publish` 和 `timer.control`。
+- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish` 和 `timer.control`。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -185,6 +188,25 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 `panel` 不能与 `window`、`ui.window`、`timer.control` 或 `live` 组合。面板内容由宿主放在独立 child WebView 中，不会注入主界面 DOM。
 
+### 通用能力：声明 HTTPS 目标
+
+需要调用外部服务时，插件必须面向 Windows Host `0.3.2+`，同时声明 `network.https` 和完整的精确目标主机：
+
+```json
+{
+  "minimumHostVersion": "0.3.2",
+  "supportedPlatforms": ["windows"],
+  "permissions": ["clipboard.write", "network.https"],
+  "network": {
+    "httpsHosts": ["api.example.com"]
+  }
+}
+```
+
+`httpsHosts` 只能包含 1-8 个唯一、全小写 ASCII DNS 主机名。它不是 URL：不能填写协议、端口、路径、通配符、IP、`localhost`、`.local`、Unicode/IDN。Manifest 有 `network` 时必须有 `network.https`，反之亦然；`network: null` 也无效。Schema、CLI 和 Host 都会执行同一套校验。
+
+安装时 UiPilot 会显示完整排序后的域名并单独请求网络授权。更新新增域名时必须重新确认；仅移除域名会直接收窄权限。用户可以在设置中立即撤销网络访问，重新开启时必须再次确认当前完整域名列表。授权是全部域名的整体授权，不支持只批准其中一部分。
+
 ## 4. 理解 Runtime 调用
 
 `runtime.js` 是 ES Module，必须导出异步函数 `onCommand`：
@@ -206,6 +228,70 @@ invocation.context.invokedAt // 带本地时区偏移的 RFC 3339 时间
 ```
 
 `invocation` 和 `api` 都由宿主冻结，并且只在当前请求生命周期内有效。不要保存它们供定时器或后续请求使用。
+
+### 4.1 发起 Host 托管的 HTTPS 请求（仅 Windows）
+
+只有声明了 `network.https` 的 Runtime 才会收到可选的 `api.network`。调用前检查一次能力；缺失时返回插件自己的可理解失败结果：
+
+```js
+export async function onCommand(invocation, api) {
+  if (!api.network) {
+    return unavailableResult(invocation.requestId)
+  }
+
+  try {
+    const response = await api.network.request({
+      url: 'https://api.example.com/translate',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer development-only-token',
+        accept: 'application/json',
+      },
+      body: {
+        type: 'json',
+        value: { text: invocation.input },
+      },
+    })
+
+    if (response.status < 200 || response.status >= 300) {
+      return providerErrorResult(invocation.requestId, response.status)
+    }
+    return translatedResult(invocation.requestId, response.body)
+  } catch (error) {
+    return networkErrorResult(invocation.requestId, error?.name)
+  }
+}
+```
+
+示例中的结果构造函数由插件自行实现；Host 不负责翻译、解析供应商 JSON 或解释 4xx/5xx。所有 HTTP 状态都会正常 resolve，插件必须检查 `response.status`。返回值包含最终整数 `status`、按小写名称组织的 `headers: Record<string, string[]>`，以及严格 UTF-8 `body`。
+
+支持的请求只有：
+
+- `GET`，且不能带 body。
+- `POST`，body 可省略，或使用 `{ type: 'json', value }`、`{ type: 'text', value: string }`、`{ type: 'form', value: Record<string, string> }`。
+- 可设置 `authorization`、`accept`、`accept-language` 和供应商自定义请求头。
+
+Host 自己设置 `Host`、`Content-Length`、`Content-Type`、`User-Agent` 和 `Accept-Encoding`，并拒绝 Cookie、Origin/Referer、代理、连接管理、`sec-*`、`forwarded`、`via`、`x-forwarded-*` 等受保护头。目标必须是已授权的精确 HTTPS 域名和 443 端口；即使两个域名都已声明，也不允许跨域重定向。HTTP、IP、localhost、私有/特殊用途地址和宽松 TLS 都会被拒绝。
+
+常用错误名及处理方向：
+
+| `Error.name` | 插件建议处理 |
+| --- | --- |
+| `InvalidNetworkRequestError` | 修正 URL、方法、请求头/body 或请求大小 |
+| `PermissionDeniedError` | 提示用户检查安装授权或设置中的网络开关 |
+| `NetworkTargetDeniedError` | 检查 Manifest 精确域名、HTTPS、DNS 与重定向 |
+| `NetworkTimeoutError` | 提示超时并允许用户重试 |
+| `NetworkFailureError` | 显示一般网络故障，不展示请求密钥或完整请求 |
+| `NetworkResponseTooLargeError` | 供应商响应超过 Host 上限 |
+| `NetworkResponseInvalidError` | 供应商响应不是合法受支持的 UTF-8 HTTP 响应 |
+| `NetworkLimitExceededError` | 本次命令调用过多或并发已满 |
+| `ExpiredRequestError` | 当前命令已被替换、取消，或插件已停用/升级/卸载 |
+
+固定上限为：URL 2048 字节，请求头 32 项/16 KiB，请求体编码后 64 KiB，响应头 64 项/32 KiB，响应体 1 MiB，总时限 10 秒，同域重定向最多 3 次；每次命令最多调用 8 次、最多并发 2 次，全 Host 公共插件最多并发 16 次。达到并发上限时不会排队。
+
+命令过期或被新命令替换，以及权限撤销、停用、升级、卸载、Runtime teardown 和 Host 退出，都会中止尚未完成的请求并丢弃过期响应。不要把它当作后台任务接口。
+
+开发阶段可以暂时把测试凭据打进插件包，但插件包和 Runtime 源码都可被用户检查，不能视为安全存储。当前 `secret` 设置只允许 Runtime 查询 `isSecretConfigured()`，不能读取明文，也不能把 secret 注入网络请求；正式生产密钥消费能力留待后续独立 Host 合同，MVP 不提供变通接口。
 
 ## 5. 分支 A：返回主界面结果
 
@@ -656,13 +742,15 @@ uipilot-plugin validate .\package --platform windows --json
 
 使用 `timer.control` 时，CLI 会检查完整的 Windows `submit + window` 权限组合，以及唯一固定文件 `assets/sounds/timer-alarm.wav`。缺少/多带 WAV、使用其他 WAV 路径、非规范 RIFF/WAVE、错误声道/采样率/位深、超过 2 MiB 或 15 秒都会返回 `RESOURCE_INVALID`。CLI 通过后仍应在目标平台用 UiPilot 做最终安装和交互验收。
 
+使用 `network.https` 时，CLI 只验证 Manifest 的 Windows 平台、`minimumHostVersion >= 0.3.2`、权限配对和精确主机语法；CLI 自身不会联网，也不会验证第三方服务或凭据。
+
 ## 11. 使用开发目录安装
 
 1. 启动 UiPilot。
 2. 打开 **设置 > 插件 > 公开插件**。
 3. 点击“选择开发目录”。
 4. 选择插件的 `package` 目录。
-5. 检查插件名称、版本、图标和权限。
+5. 检查插件名称、版本、图标、权限；网络插件还要逐项检查完整 HTTPS 域名列表。
 6. 点击“确认安装”。
 7. 在主界面输入 `/` 加启动名称测试插件。
 
@@ -770,13 +858,17 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 确认基础 panel 的 `minimumHostVersion` 至少为 `0.3.0`；使用 `hostKeys`、`onHostKey` 或 `requestHide` 时至少为 `0.3.1`。Manifest 使用 `submit + panel + ui.panel`；`panel.js` 尽早注册 `onUpdate`，非空 `hostKeys` 还必须在 ready 前注册一次 `onHostKey`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
 
+### 网络请求被拒绝或没有返回
+
+确认目标系统是 Windows、`minimumHostVersion` 至少为 `0.3.2`，Manifest 同时声明 `network.https` 和精确的 `network.httpsHosts`，并检查设置中的网络访问开关。目标必须是 HTTPS 443 且与授权域名完全相同；子域名不会自动继承授权。查看 `Error.name` 区分权限、目标策略、超时、传输、响应和生命周期错误，不要把凭据、签名参数或完整请求体写入日志。
+
 ## 15. MVP 边界
 
 当前不支持：
 
 - 一个插件注册多个命令或多个窗口。
 - 插件代码长期后台运行、插件自建计时器或任意后台回调；单轮窗口计时必须交给宿主的 `timer.control`，延迟纯文本消息交给 `notifications.schedule()`。
-- 网络、任意文件、原生二进制和 Shell。
+- 浏览器/WebView 网络、原始套接字、任意文件、原生二进制和 Shell；外部访问仅限 Runtime 请求期内的 Host 托管 HTTPS。
 - 输入模拟或控制鼠标键盘。
 - 多动作结果、自定义动作回调、HTML/Markdown 结果。
 - 插件间通信、远程资源、依赖安装、市场发布和自动更新。
@@ -789,6 +881,8 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `version` 已提高，`minimumHostVersion` 合理。
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
 - [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`。
+- [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和九种固定错误名。
+- [ ] 网络插件未记录凭据、签名字段或完整请求体；了解内置测试凭据可被检查，正式 secret 消费尚未开放。
 - [ ] Runtime 始终原样返回 `requestId`。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。
