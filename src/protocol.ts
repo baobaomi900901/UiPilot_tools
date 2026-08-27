@@ -127,6 +127,15 @@ export interface PublicSettingView {
   secretConfigured?: boolean
 }
 
+export interface PublicPluginInventoryNetwork {
+  readonly httpsHosts: readonly string[]
+}
+
+export interface PublicPluginPrepareNetwork extends PublicPluginInventoryNetwork {
+  readonly addedHttpsHosts: readonly string[]
+  readonly requiresNetworkConsent: boolean
+}
+
 export interface PublicPluginInventoryItem {
   pluginId: string
   name: string
@@ -139,6 +148,7 @@ export interface PublicPluginInventoryItem {
   fault: PublicPluginFault | null
   generation: number
   iconUrl: string | null
+  network: PublicPluginInventoryNetwork | null
   permissions: readonly PublicPermissionView[]
   settings: readonly PublicSettingView[]
 }
@@ -157,6 +167,7 @@ export interface PublicPluginPrepareSummary {
   isUpdate: boolean
   sourceVerified: boolean
   iconUrl: string | null
+  network: PublicPluginPrepareNetwork | null
 }
 
 export interface PublicPluginWindowIdentity {
@@ -275,6 +286,7 @@ export interface LauncherClient {
   commitPublicPlugin(input: { input: { token: string; permissionGrants: readonly PublicPermission[] } }): Promise<void>
   cancelPublicPlugin(input: { token: string }): Promise<void>
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
+  setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean }): Promise<void>
   setPublicPluginFavorite(input: { pluginId: string; favorite: boolean }): Promise<void>
   setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
   savePublicPluginSettings(input: { input: { pluginId: string; settings: Readonly<Record<string, string | number | boolean>>; secrets: Readonly<Record<string, string | null>> } }): Promise<void>
@@ -557,6 +569,7 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
 const U64_MAX = 18_446_744_073_709_551_615n
 const DECIMAL_U64 = /^(0|[1-9][0-9]*)$/
 const PUBLIC_PLUGIN_ID = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
+const PUBLIC_HTTPS_HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
 const UTC_RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/
 const fileStatuses = new Set<FileIndexStatus>(['building', 'ready', 'partial', 'rebuilding', 'unavailable'])
 
@@ -727,7 +740,7 @@ function parsePublicSettingView(value: unknown): PublicSettingView | null {
 
 function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null {
   const item = plainRecord(value)
-  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'permissions', 'pluginId', 'settings', 'source', 'version']
+  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'network', 'permissions', 'pluginId', 'settings', 'source', 'version']
   if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.defaultName !== 'string' || typeof item.effectiveName !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.iconUrl !== null && safePublicPluginIconUrl(item.iconUrl) === undefined) || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
   if (!Array.isArray(item.permissions) || !exactDenseArray(item.permissions) || !Array.isArray(item.settings) || !exactDenseArray(item.settings)) return null
   const permissions: PublicPermissionView[] = []
@@ -743,7 +756,11 @@ function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null
     if (!setting || !settingKeys.add(setting.definition.key)) return null
     settings.push(setting)
   }
-  return { ...(item as unknown as PublicPluginInventoryItem), permissions, settings }
+  const network = parseInventoryNetwork(item.network)
+  if (network === undefined) return null
+  const networkPermission = permissions.find(({ permission }) => permission === 'network.https')
+  if ((network === null) !== (networkPermission === undefined)) return null
+  return { ...(item as unknown as PublicPluginInventoryItem), network, permissions, settings }
 }
 
 export function parsePublicPluginInventory(value: unknown): PublicPluginInventory | null {
@@ -757,6 +774,30 @@ export function parsePublicPluginInventory(value: unknown): PublicPluginInventor
     items.push(item)
   }
   return { revision: inventory.revision, items }
+}
+
+export function parsePublicPluginPrepareSummary(value: unknown): PublicPluginPrepareSummary | null {
+  const summary = plainRecord(value)
+  const keys = ['iconUrl', 'isUpdate', 'name', 'network', 'permissions', 'pluginId', 'sourceVerified', 'token', 'version']
+  if (!summary || !exactKeys(summary, keys)) return null
+  if (typeof summary.token !== 'string' || summary.token.length === 0 || typeof summary.pluginId !== 'string' || !PUBLIC_PLUGIN_ID.test(summary.pluginId)) return null
+  if (typeof summary.name !== 'string' || summary.name.length === 0 || !canonicalVersion(summary.version)) return null
+  if (typeof summary.isUpdate !== 'boolean' || typeof summary.sourceVerified !== 'boolean') return null
+  if (summary.iconUrl !== null && safePublicPluginIconUrl(summary.iconUrl) === undefined) return null
+  if (!Array.isArray(summary.permissions) || Object.getPrototypeOf(summary.permissions) !== Array.prototype || !exactDenseArray(summary.permissions)) return null
+  const permissions: PublicPermission[] = []
+  for (const permission of summary.permissions) {
+    if (typeof permission !== 'string' || !publicPermissions.has(permission as PublicPermission) || permissions.includes(permission as PublicPermission)) return null
+    permissions.push(permission as PublicPermission)
+  }
+  const network = parsePrepareNetwork(summary.network)
+  if (network === undefined) return null
+  if ((network === null) !== !permissions.includes('network.https')) return null
+  if (network !== null && !summary.isUpdate) {
+    if (!network.requiresNetworkConsent || network.addedHttpsHosts.length !== network.httpsHosts.length) return null
+    if (network.addedHttpsHosts.some((host, index) => host !== network.httpsHosts[index])) return null
+  }
+  return { ...(summary as unknown as PublicPluginPrepareSummary), network, permissions }
 }
 
 export function parsePublicPluginWindowIdentity(value: unknown): PublicPluginWindowIdentity | null {
@@ -783,6 +824,50 @@ export const compareDecimalRevision = compareU64Decimal
 export function parseU64Decimal(value: unknown): U64Decimal | null {
   if (typeof value !== 'string' || !DECIMAL_U64.test(value)) return null
   return BigInt(value) <= U64_MAX ? value as U64Decimal : null
+}
+
+function canonicalHttpsHost(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 253) return false
+  if (value === 'localhost' || value.endsWith('.localhost') || value.endsWith('.local')) return false
+  const labels = value.split('.')
+  if (labels.length < 2) return false
+  if (labels.some((label) => label.length === 0 || label.length > 63 || label.startsWith('xn--') || !PUBLIC_HTTPS_HOST_LABEL.test(label))) return false
+  if (labels.length === 4 && labels.every((label) => /^\d+$/.test(label))) {
+    const octets = labels.map(Number)
+    if (octets.every((octet) => octet <= 255)) return false
+  }
+  return true
+}
+
+function parseHttpsHosts(value: unknown, allowEmpty = false): string[] | null {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || !exactDenseArray(value)) return null
+  if (value.length > 8 || (!allowEmpty && value.length === 0)) return null
+  const hosts: string[] = []
+  for (const host of value) {
+    if (!canonicalHttpsHost(host) || (hosts.length > 0 && hosts[hosts.length - 1] >= host)) return null
+    hosts.push(host)
+  }
+  return hosts
+}
+
+function parseInventoryNetwork(value: unknown): PublicPluginInventoryNetwork | null | undefined {
+  if (value === null) return null
+  const network = plainRecord(value)
+  if (!network || !exactKeys(network, ['httpsHosts'])) return undefined
+  const httpsHosts = parseHttpsHosts(network.httpsHosts)
+  return httpsHosts ? { httpsHosts } : undefined
+}
+
+function parsePrepareNetwork(value: unknown): PublicPluginPrepareNetwork | null | undefined {
+  if (value === null) return null
+  const network = plainRecord(value)
+  if (!network || !exactKeys(network, ['addedHttpsHosts', 'httpsHosts', 'requiresNetworkConsent'])) return undefined
+  const httpsHosts = parseHttpsHosts(network.httpsHosts)
+  const addedHttpsHosts = parseHttpsHosts(network.addedHttpsHosts, true)
+  if (!httpsHosts || !addedHttpsHosts || typeof network.requiresNetworkConsent !== 'boolean') return undefined
+  if (addedHttpsHosts.some((host) => !httpsHosts.includes(host))) return undefined
+  if (network.requiresNetworkConsent !== (addedHttpsHosts.length > 0)) return undefined
+  return { httpsHosts, addedHttpsHosts, requiresNetworkConsent: network.requiresNetworkConsent }
 }
 
 export function parsePluginPanelCommandResult(value: unknown): PluginPanelCommandResult | null {

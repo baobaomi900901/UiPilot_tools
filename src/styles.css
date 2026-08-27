@@ -845,6 +845,56 @@ label,
   font-size: 0.75rem;
 }
 
+.public-network-access,
+.public-network-consent {
+  margin-top: 10px;
+  color: var(--uipilot-ui-foreground);
+}
+
+.public-network-access-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.public-network-host-list {
+  display: grid;
+  gap: 4px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.public-network-host-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.public-network-host-list code {
+  overflow-wrap: anywhere;
+}
+
+.public-network-added {
+  color: var(--uipilot-ui-primary);
+  font-size: 0.75rem;
+}
+
+.public-network-consent {
+  flex: 1 0 100%;
+}
+
+.public-network-consent p {
+  margin: 8px 0 0;
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 0.75rem;
+}
+
+.public-network-confirm {
+  max-width: 320px;
+}
+
 .public-plugin-form {
   max-width: 560px;
   margin-top: 12px;

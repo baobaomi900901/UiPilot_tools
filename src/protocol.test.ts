@@ -4,6 +4,7 @@ import {
   parsePluginTimerStartInput,
   parsePluginTimerState,
   parsePublicPluginInventory,
+  parsePublicPluginPrepareSummary,
 } from './protocol'
 
 describe('public plugin timer protocol', () => {
@@ -66,6 +67,7 @@ describe('public plugin timer protocol', () => {
         fault: null,
         generation: 1,
         iconUrl: null,
+        network: null,
         permissions: [{ permission: 'timer.control', supported: true, granted: true }],
         settings: [],
       }],
@@ -88,10 +90,77 @@ describe('public plugin timer protocol', () => {
         fault: null,
         generation: 1,
         iconUrl: null,
+        network: null,
         permissions: [{ permission: 'ui.panel', supported: true, granted: true }],
         settings: [],
       }],
     }
     expect(parsePublicPluginInventory(inventory)).toEqual(inventory)
+  })
+
+  it('strictly parses sorted exact HTTPS hosts in inventory and prepare summaries', () => {
+    const item = {
+      pluginId: 'com.example.network',
+      name: 'Network',
+      description: null,
+      version: '1.0.0',
+      source: 'localPackage',
+      defaultName: 'network',
+      effectiveName: 'network',
+      enabled: true,
+      fault: null,
+      generation: 1,
+      iconUrl: null,
+      network: { httpsHosts: ['api.example.com', 'auth.example.com'] },
+      permissions: [{ permission: 'network.https', supported: true, granted: true }],
+      settings: [],
+    }
+    expect(parsePublicPluginInventory({ revision: '1', items: [item] })).toEqual({
+      revision: '1',
+      items: [item],
+    })
+    for (const network of [
+      { httpsHosts: ['auth.example.com', 'api.example.com'] },
+      { httpsHosts: ['api.example.com', 'api.example.com'] },
+      { httpsHosts: ['https://api.example.com'] },
+      { httpsHosts: ['127.0.0.1'] },
+      { httpsHosts: ['xn--bcher-kva.example'] },
+      { httpsHosts: ['api.example.com'], extra: true },
+      { httpsHosts: [] },
+    ]) {
+      expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, network }] })).toBeNull()
+    }
+
+    const prepared = {
+      token: 'public-prepare-0000000000000001-0000000000000002',
+      pluginId: 'com.example.network',
+      name: 'Network',
+      version: '1.1.0',
+      permissions: ['network.https'],
+      isUpdate: true,
+      sourceVerified: false,
+      iconUrl: null,
+      network: {
+        httpsHosts: ['api.example.com', 'auth.example.com'],
+        addedHttpsHosts: ['auth.example.com'],
+        requiresNetworkConsent: true,
+      },
+    }
+    expect(parsePublicPluginPrepareSummary(prepared)).toEqual(prepared)
+    expect(parsePublicPluginPrepareSummary({ ...prepared, permissions: [], network: null })).not.toBeNull()
+    expect(parsePublicPluginPrepareSummary({
+      ...prepared,
+      isUpdate: false,
+      network: { ...prepared.network, addedHttpsHosts: ['auth.example.com'] },
+    })).toBeNull()
+    for (const network of [
+      { ...prepared.network, addedHttpsHosts: ['other.example.com'] },
+      { ...prepared.network, addedHttpsHosts: [], requiresNetworkConsent: true },
+      { ...prepared.network, requiresNetworkConsent: false },
+      { ...prepared.network, httpsHosts: ['auth.example.com', 'api.example.com'] },
+      { ...prepared.network, extra: true },
+    ]) {
+      expect(parsePublicPluginPrepareSummary({ ...prepared, network })).toBeNull()
+    }
   })
 })

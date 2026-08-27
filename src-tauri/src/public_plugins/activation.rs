@@ -1443,7 +1443,6 @@ impl PublicPluginManager {
         Ok(mutation_from_config(&config))
     }
 
-    #[allow(dead_code)] // Registered as a trusted-main command in Task 7.
     pub(crate) fn set_network_access(
         &self,
         plugin_id: &str,
@@ -4302,7 +4301,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_network_grant_prepare_update_revoke_and_regrant_are_authoritative() {
+    fn plugin_network_management_prepare_update_revoke_and_regrant_are_authoritative() {
         let dir = TestDir::new("network-grant-flow");
         let manager = manager(&dir);
         let now = Instant::now();

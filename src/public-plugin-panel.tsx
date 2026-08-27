@@ -55,6 +55,16 @@ function PublicPluginRow({
   )
   const [secrets, setSecrets] = useState<Record<string, string>>({})
   const [clearSecrets, setClearSecrets] = useState<Record<string, boolean>>({})
+  const [networkConfirmOpen, setNetworkConfirmOpen] = useState(false)
+  const networkOrigin = useRef<HTMLElement | null>(null)
+  const restoreNetworkOrigin = useRef(false)
+
+  useEffect(() => {
+    if (busy || !restoreNetworkOrigin.current) return
+    restoreNetworkOrigin.current = false
+    const origin = networkOrigin.current
+    if (origin?.isConnected) origin.focus()
+  }, [busy, plugin])
 
   const mutate = async (operation: () => Promise<void>) => {
     if (busy) return
@@ -79,6 +89,30 @@ function PublicPluginRow({
       else if (secrets[definition.key]) updates[definition.key] = secrets[definition.key]
     }
     return updates
+  }
+  const networkPermission = plugin.permissions.find(({ permission }) => permission === 'network.https')
+  const networkGranted = networkPermission?.supported === true && networkPermission.granted
+  const mutateNetwork = async (granted: boolean) => {
+    if (busy) return
+    setNetworkConfirmOpen(false)
+    setBusy(true)
+    setError('')
+    try {
+      await client.setPublicPluginNetworkAccess({ pluginId: plugin.pluginId, granted })
+    } catch {
+      setError('无法更新网络访问权限，请重试。')
+    } finally {
+      await reload()
+      restoreNetworkOrigin.current = true
+      setBusy(false)
+    }
+  }
+  const restoreNetworkFocus = () => {
+    setNetworkConfirmOpen(false)
+    const origin = networkOrigin.current
+    queueMicrotask(() => {
+      if (origin?.isConnected) origin.focus()
+    })
   }
   const settingControl = ({ definition, secretConfigured }: PublicSettingView) => {
     if (definition.type === 'secret') {
@@ -154,6 +188,44 @@ function PublicPluginRow({
             <span key={permission.permission}>{permission.permission} · {permission.supported ? (permission.granted ? '已授权' : '未授权') : '不支持'}</span>
           ))}
         </div>
+        {plugin.network ? (
+          <section className="public-network-access" aria-label="网络访问范围">
+            <div className="public-network-access-header">
+              <span>网络访问</span>
+              <Popconfirm
+                open={networkConfirmOpen}
+                title={(
+                  <div className="public-network-confirm">
+                    <strong>授权访问以下 HTTPS 主机？</strong>
+                    <ul className="public-network-host-list">
+                      {plugin.network.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}
+                    </ul>
+                  </div>
+                )}
+                okText="授权"
+                cancelText="取消"
+                onConfirm={() => void mutateNetwork(true)}
+                onCancel={restoreNetworkFocus}
+                onOpenChange={(open) => { if (!open) setNetworkConfirmOpen(false) }}
+              >
+                <Switch
+                  aria-label="网络访问"
+                  checked={networkGranted}
+                  disabled={busy || networkPermission?.supported !== true}
+                  onChange={(granted, event) => {
+                    networkOrigin.current = event.currentTarget
+                    if (granted) setNetworkConfirmOpen(true)
+                    else void mutateNetwork(false)
+                  }}
+                />
+              </Popconfirm>
+              <span>{networkPermission?.supported !== true ? '当前平台不支持' : networkGranted ? '已授权' : '未授权'}</span>
+            </div>
+            <ul className="public-network-host-list">
+              {plugin.network.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}
+            </ul>
+          </section>
+        ) : null}
         <Form layout="vertical" size="small" className="public-plugin-form">
           <Form.Item label="启动名称">
             <div className="public-name-control">
@@ -247,10 +319,14 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
     setError('')
     try {
       const path = kind === 'archive' ? await client.selectPublicPluginArchive() : await client.selectPublicPluginDirectory()
-      if (!path) return
+      if (!path) {
+        restorePreparedOrigin.current = true
+        return
+      }
       setPrepared(await client.preparePublicPlugin({ source: { kind, path } }))
     } catch {
       setError('无法准备插件安装。')
+      restorePreparedOrigin.current = true
     } finally {
       setBusy(false)
     }
@@ -260,6 +336,7 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
     if (!prepared || busy) return
     setBusy(true)
     try { await client.cancelPublicPlugin({ token: prepared.token }) } finally {
+      restorePreparedOrigin.current = true
       setPrepared(null)
       setBusy(false)
     }
@@ -295,9 +372,23 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
         <div className="public-prepare" role="status">
           <PluginIcon iconUrl={prepared.iconUrl} size={32} />
           <strong>{prepared.name}</strong><span>{prepared.version}</span>
-          <span>{prepared.permissions.join('、') || '无额外权限'}</span>
-          <Button type="primary" loading={busy} onClick={() => void commitPrepared()}>确认安装</Button>
-          <Button disabled={busy} onClick={() => void cancelPrepared()}>取消</Button>
+          <span>{prepared.permissions.filter((permission) => permission !== 'network.https').join('、') || (prepared.network ? 'network.https' : '无额外权限')}</span>
+          {prepared.network ? (
+            <div className="public-network-consent">
+              <strong>网络访问 · network.https{prepared.network.requiresNetworkConsent ? '（需要确认）' : ''}</strong>
+              <ul className="public-network-host-list">
+                {prepared.network.httpsHosts.map((host) => (
+                  <li key={host}>
+                    <code>{host}</code>
+                    {prepared.network?.addedHttpsHosts.includes(host) ? <span className="public-network-added">新增</span> : null}
+                  </li>
+                ))}
+              </ul>
+              <p>仅允许由 UiPilot Host 代理访问以上 HTTPS 主机，不会开放插件 WebView 的通用网络访问。</p>
+            </div>
+          ) : null}
+          <Button type="primary" loading={busy} onClick={() => void commitPrepared()}>{prepared.isUpdate ? '确认更新' : '确认安装'}</Button>
+          <Button aria-label="取消安装" disabled={busy} onClick={() => void cancelPrepared()}>取消</Button>
         </div>
       ) : null}
       {error ? <div className="plugin-list-state plugin-list-error" role="alert">{error}</div> : null}

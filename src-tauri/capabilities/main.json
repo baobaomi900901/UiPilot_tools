@@ -12,6 +12,7 @@
     "allow-commit-public-plugin-install",
     "allow-cancel-public-plugin-install",
     "allow-set-plugin-enabled",
+    "allow-set-public-plugin-network-access",
     "allow-set-plugin-favorite",
     "allow-set-plugin-effective-name",
     "allow-save-plugin-settings",

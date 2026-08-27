@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-public-plugin-network-access"
+description = "Enables the set_public_plugin_network_access command without any pre-configured scope."
+commands.allow = ["set_public_plugin_network_access"]
+
+[[permission]]
+identifier = "deny-set-public-plugin-network-access"
+description = "Denies the set_public_plugin_network_access command without any pre-configured scope."
+commands.deny = ["set_public_plugin_network_access"]

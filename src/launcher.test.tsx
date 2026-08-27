@@ -122,6 +122,7 @@ describe('plugin protocol', () => {
       source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
       fault: null, generation: 1,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
+      network: null,
       permissions: [{ permission: 'clipboard.write', supported: true, granted: true }],
       settings: [
         { definition: { type: 'text', key: 'prefix', label: 'Prefix', default: 'Hi' }, value: 'Hello' },
@@ -305,6 +306,7 @@ function fakeClient() {
     commitPublicPlugin: vi.fn(async () => undefined),
     cancelPublicPlugin: vi.fn(async () => undefined),
     setPublicPluginEnabled: vi.fn(async () => undefined),
+    setPublicPluginNetworkAccess: vi.fn(async () => undefined),
     setPublicPluginFavorite: vi.fn(async () => undefined),
     setPublicPluginEffectiveName: vi.fn(async () => undefined),
     savePublicPluginSettings: vi.fn(async () => undefined),
@@ -4926,6 +4928,7 @@ describe('React view and accessibility', () => {
         source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
+        network: null,
         permissions: [],
         settings: [
           { definition: { type: 'text', key: 'prefix', label: 'Prefix' }, value: 'Hello' },
@@ -4978,6 +4981,7 @@ describe('React view and accessibility', () => {
       pluginId: 'com.example.cleanup', name: 'Cleanup', description: null, version: '1.0.0',
       source: 'localPackage' as const, defaultName: 'cleanup', effectiveName: 'cleanup', enabled: true,
       fault: null, generation: 1, iconUrl: null, permissions: [], settings: [],
+      network: null,
     }
     vi.mocked(fake.client.listPublicPlugins)
       .mockResolvedValueOnce({ revision: '1', items: [item] })
@@ -5027,6 +5031,7 @@ describe('React view and accessibility', () => {
       isUpdate: false,
       sourceVerified: false,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
+      network: null,
     })
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -5046,6 +5051,207 @@ describe('React view and accessibility', () => {
     })
     await vi.waitFor(() => expect(fake.client.commitPublicPlugin).toHaveBeenCalledOnce())
     await vi.waitFor(() => expect(document.activeElement).toBe(chooseDirectory))
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('shows exact newly requested HTTPS hosts and cancelling consent restores focus without commit', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.selectPublicPluginDirectory).mockResolvedValueOnce('D:\\network-plugin')
+    vi.mocked(fake.client.preparePublicPlugin).mockResolvedValueOnce({
+      token: 'public-prepare-0000000000000003-0000000000000004',
+      pluginId: 'com.example.network',
+      name: 'Network Plugin',
+      version: '1.1.0',
+      permissions: ['network.https'],
+      isUpdate: true,
+      sourceVerified: false,
+      iconUrl: null,
+      network: {
+        httpsHosts: ['api.example.com', 'auth.example.com'],
+        addedHttpsHosts: ['auth.example.com'],
+        requiresNetworkConsent: true,
+      },
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-network-consent', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    const chooseDirectory = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!
+    await act(async () => chooseDirectory.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-network-consent')).not.toBeNull())
+
+    const consent = mounted.host.querySelector('.public-network-consent')!
+    expect(consent.textContent).toContain('api.example.com')
+    expect(consent.textContent).toContain('auth.example.com')
+    expect(consent.textContent).toContain('新增')
+    expect(consent.textContent).toContain('Host 代理')
+    expect(consent.textContent).toContain('不会开放插件 WebView')
+    expect(consent.querySelector('a')).toBeNull()
+
+    const cancel = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="取消安装"]')!
+    await act(async () => cancel.click())
+    await vi.waitFor(() => expect(fake.client.cancelPublicPlugin).toHaveBeenCalledWith({
+      token: 'public-prepare-0000000000000003-0000000000000004',
+    }))
+    expect(fake.client.commitPublicPlugin).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(document.activeElement).toBe(chooseDirectory))
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('marks every fresh-install host as new and does not re-prompt when an update only removes hosts', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.selectPublicPluginDirectory)
+      .mockResolvedValueOnce('D:\\network-fresh')
+      .mockResolvedValueOnce('D:\\network-narrowed')
+    const base = {
+      pluginId: 'com.example.network',
+      name: 'Network Plugin',
+      permissions: ['network.https' as const],
+      sourceVerified: false,
+      iconUrl: null,
+    }
+    vi.mocked(fake.client.preparePublicPlugin)
+      .mockResolvedValueOnce({
+        ...base,
+        token: 'public-prepare-0000000000000005-0000000000000006',
+        version: '1.0.0',
+        isUpdate: false,
+        network: {
+          httpsHosts: ['api.example.com', 'auth.example.com'],
+          addedHttpsHosts: ['api.example.com', 'auth.example.com'],
+          requiresNetworkConsent: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        ...base,
+        token: 'public-prepare-0000000000000007-0000000000000008',
+        version: '1.1.0',
+        isUpdate: true,
+        network: {
+          httpsHosts: ['api.example.com'],
+          addedHttpsHosts: [],
+          requiresNetworkConsent: false,
+        },
+      })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-network-fresh-and-narrowed', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    const chooseDirectory = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!
+
+    await act(async () => chooseDirectory.click())
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.public-network-added')).toHaveLength(2))
+    expect(mounted.host.querySelector('.public-network-consent')?.textContent).toContain('需要确认')
+    await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="取消安装"]')!.click())
+    await vi.waitFor(() => expect(document.activeElement).toBe(chooseDirectory))
+
+    await act(async () => chooseDirectory.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-network-consent')).not.toBeNull())
+    const narrowed = mounted.host.querySelector('.public-network-consent')!
+    expect(narrowed.textContent).toContain('api.example.com')
+    expect(narrowed.textContent).not.toContain('需要确认')
+    expect(narrowed.querySelector('.public-network-added')).toBeNull()
+    await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="取消安装"]')!.click())
+    await vi.waitFor(() => expect(fake.client.cancelPublicPlugin).toHaveBeenCalledTimes(2))
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('revokes immediately, confirms reauthorization, refreshes authority, and restores switch focus', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    const networkItem = (granted: boolean) => ({
+      pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
+      source: 'localPackage' as const, defaultName: 'network', effectiveName: 'network', enabled: true,
+      fault: null, generation: 1, iconUrl: null,
+      network: { httpsHosts: ['api.example.com', 'auth.example.com'] },
+      permissions: [{ permission: 'network.https' as const, supported: true, granted }],
+      settings: [],
+    })
+    vi.mocked(fake.client.listPublicPlugins)
+      .mockResolvedValueOnce({ revision: '1', items: [networkItem(true)] })
+      .mockResolvedValueOnce({ revision: '2', items: [networkItem(false)] })
+      .mockResolvedValueOnce({ revision: '3', items: [networkItem(true)] })
+    let releaseRevoke!: () => void
+    vi.mocked(fake.client.setPublicPluginNetworkAccess)
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseRevoke = resolve }))
+      .mockResolvedValueOnce(undefined)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-network-toggle', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+
+    let networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
+    await act(async () => networkSwitch.click())
+    expect(fake.client.setPublicPluginNetworkAccess).toHaveBeenCalledWith({
+      pluginId: 'com.example.network',
+      granted: false,
+    })
+    expect(networkSwitch.disabled).toBe(true)
+    await act(async () => releaseRevoke())
+    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
+    networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
+    await vi.waitFor(() => expect(document.activeElement).toBe(networkSwitch))
+
+    await act(async () => networkSwitch.click())
+    await vi.waitFor(() => expect(document.body.textContent).toContain('api.example.com'))
+    expect(document.body.textContent).toContain('auth.example.com')
+    expect(fake.client.setPublicPluginNetworkAccess).toHaveBeenCalledTimes(1)
+    const authorize = [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.replace(/\s/g, '') === '授权')!
+    await act(async () => authorize.click())
+    await vi.waitFor(() => expect(fake.client.setPublicPluginNetworkAccess).toHaveBeenLastCalledWith({
+      pluginId: 'com.example.network',
+      granted: true,
+    }))
+    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(3))
+    networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
+    await vi.waitFor(() => expect(document.activeElement).toBe(networkSwitch))
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('uses a fixed network mutation failure, refreshes authority, and restores focus', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    const item = {
+      pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
+      source: 'localPackage' as const, defaultName: 'network', effectiveName: 'network', enabled: true,
+      fault: null, generation: 1, iconUrl: null,
+      network: { httpsHosts: ['api.example.com'] },
+      permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
+      settings: [],
+    }
+    vi.mocked(fake.client.listPublicPlugins)
+      .mockResolvedValueOnce({ revision: '1', items: [item] })
+      .mockResolvedValueOnce({ revision: '1', items: [item] })
+    vi.mocked(fake.client.setPublicPluginNetworkAccess).mockRejectedValueOnce({
+      message: 'private host or storage detail',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-network-failure', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    let networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
+    await act(async () => networkSwitch.click())
+    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
+    expect(mounted.host.textContent).toContain('无法更新网络访问权限，请重试。')
+    expect(mounted.host.textContent).not.toContain('private host or storage detail')
+    networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
+    await vi.waitFor(() => expect(document.activeElement).toBe(networkSwitch))
     await mounted.unmount()
     core.destroy()
   })

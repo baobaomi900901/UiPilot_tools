@@ -19,6 +19,7 @@ import {
   parsePluginPanelCommandResult,
   parsePluginPanelHostKeyEnqueueResult,
   parsePublicPluginInventory,
+  parsePublicPluginPrepareSummary,
   parsePublicPluginWindowIdentity,
   parseFindPreviewPreferenceResult,
   parseFindReadyOutcome,
@@ -106,10 +107,16 @@ export const client: LauncherClient = {
     return typeof selected === 'string' ? selected : null
   },
   selectPublicPluginDirectory: () => invoke<string | null>('select_public_plugin_directory'),
-  preparePublicPlugin: (input) => invoke('prepare_public_plugin_install', input),
+  preparePublicPlugin: async (input) => {
+    const value = await invoke<unknown>('prepare_public_plugin_install', input)
+    const prepared = parsePublicPluginPrepareSummary(value)
+    if (!prepared) throw { code: 'pluginInstallFailed', message: 'public plugin prepare failed' }
+    return prepared
+  },
   commitPublicPlugin: async (input) => { await invoke('commit_public_plugin_install', input) },
   cancelPublicPlugin: async (input) => { await invoke('cancel_public_plugin_install', input) },
   setPublicPluginEnabled: async (input) => { await invoke('set_plugin_enabled', input) },
+  setPublicPluginNetworkAccess: async (input) => { await invoke('set_public_plugin_network_access', input) },
   setPublicPluginFavorite: async (input) => { await invoke('set_plugin_favorite', input) },
   setPublicPluginEffectiveName: async (input) => { await invoke('set_plugin_effective_name', input) },
   savePublicPluginSettings: async (input) => { await invoke('save_plugin_settings', input) },

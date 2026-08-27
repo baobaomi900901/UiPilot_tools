@@ -1213,6 +1213,17 @@ pub(crate) async fn set_plugin_enabled(
 }
 
 #[tauri::command]
+pub(crate) fn set_public_plugin_network_access(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    plugin_id: String,
+    granted: bool,
+) -> Result<PublicPluginMutation, CommandError> {
+    require_main_window(&window)?;
+    Ok(service.manager()?.set_network_access(&plugin_id, granted)?)
+}
+
+#[tauri::command]
 pub(crate) fn set_plugin_favorite(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
@@ -4358,6 +4369,25 @@ mod tests {
             .unwrap();
         let manager = command.find("service.manager()").unwrap();
         assert!(guard < manager);
+    }
+
+    #[test]
+    fn plugin_network_management_command_is_main_only_and_never_accepts_hosts() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let start = production
+            .find("pub(crate) fn set_public_plugin_network_access(")
+            .expect("network access management command is missing");
+        let tail = &production[start..];
+        let end = tail[1..]
+            .find("#[tauri::command]")
+            .map_or(tail.len(), |index| index + 1);
+        let command = &tail[..end];
+        let first = command[command.find('{').unwrap() + 1..].trim_start();
+        assert!(first.starts_with("require_main_window(&window)?;"));
+        assert!(command.contains("set_network_access(&plugin_id, granted)"));
+        assert!(!command.contains("https_hosts"));
+        assert!(!command.contains("httpsHosts"));
     }
 
     #[test]
