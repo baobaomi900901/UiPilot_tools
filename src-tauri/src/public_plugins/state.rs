@@ -15,8 +15,8 @@ use crate::atomic_file::{
 use super::{
     authorize_plugin_scope,
     manifest::{
-        parse_canonical_version, valid_command_name, valid_plugin_id, valid_setting_key,
-        PublicPermission, PublicSettingV1,
+        parse_canonical_version, valid_command_name, valid_https_host, valid_plugin_id,
+        valid_setting_key, PublicPermission, PublicSettingV1,
     },
     valid_json_value, PluginDataScope, PublicManifestV1,
 };
@@ -39,10 +39,50 @@ pub(crate) struct EffectivePluginConfig {
     pub(crate) favorite: bool,
     pub(crate) fault: Option<PublicPluginFault>,
     pub(crate) permission_grants: BTreeSet<PublicPermission>,
+    pub(crate) network_https_hosts_grant: BTreeSet<String>,
     pub(crate) inventory_revision: u64,
     pub(crate) active_generation: u64,
     pub(crate) package_digest: Option<String>,
     pub(crate) settings: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Wired into the authority gate in Task 5.
+pub(crate) struct PluginNetworkGrantSnapshot {
+    pub(crate) plugin_id: String,
+    pub(crate) generation: u64,
+    pub(crate) https_hosts: BTreeSet<String>,
+}
+
+impl EffectivePluginConfig {
+    #[allow(dead_code)] // Wired into the authority gate in Task 5.
+    pub(crate) fn network_grant_snapshot(
+        &self,
+        manifest: &PublicManifestV1,
+    ) -> Option<PluginNetworkGrantSnapshot> {
+        let declared_hosts = manifest
+            .network
+            .as_ref()?
+            .https_hosts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        (self.installed
+            && self.enabled
+            && self.fault.is_none()
+            && self.active_generation != 0
+            && self.plugin_id == manifest.plugin_id
+            && self.version == manifest.version
+            && self
+                .permission_grants
+                .contains(&PublicPermission::NetworkHttps)
+            && self.network_https_hosts_grant == declared_hosts)
+            .then(|| PluginNetworkGrantSnapshot {
+                plugin_id: self.plugin_id.clone(),
+                generation: self.active_generation,
+                https_hosts: declared_hosts,
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +126,8 @@ struct PluginStateDocument {
     favorite: bool,
     fault: Option<PublicPluginFault>,
     permission_grants: BTreeSet<PublicPermission>,
+    #[serde(default)]
+    network_https_hosts_grant: BTreeSet<String>,
     inventory_revision: u64,
     #[serde(default)]
     active_generation: u64,
@@ -110,6 +152,7 @@ impl PluginStateDocument {
             favorite: self.favorite,
             fault: self.fault,
             permission_grants: self.permission_grants.clone(),
+            network_https_hosts_grant: self.network_https_hosts_grant.clone(),
             inventory_revision: self.inventory_revision,
             active_generation: self.active_generation,
             package_digest: self.package_digest.clone(),
@@ -246,14 +289,26 @@ impl PluginStateStore {
         {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let declared = manifest
+        let mut declared = manifest
             .permissions
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        if declared != permission_grants {
+        let mut non_network_grants = permission_grants.clone();
+        let network_granted = non_network_grants.remove(&PublicPermission::NetworkHttps);
+        declared.remove(&PublicPermission::NetworkHttps);
+        if declared != non_network_grants || (network_granted && manifest.network.is_none()) {
             return Err(PluginStateError::InvalidPermissions);
         }
+        let network_https_hosts_grant = if network_granted {
+            manifest
+                .network
+                .as_ref()
+                .map(|network| network.https_hosts.iter().cloned().collect())
+                .ok_or(PluginStateError::InvalidPermissions)?
+        } else {
+            BTreeSet::new()
+        };
         let state = self.lock()?;
         let previous = state.by_plugin.get(&manifest.plugin_id);
         if previous.is_some_and(|stored| generation <= stored.document.active_generation) {
@@ -289,6 +344,7 @@ impl PluginStateStore {
             favorite,
             fault,
             permission_grants,
+            network_https_hosts_grant,
             inventory_revision: revision,
             active_generation: generation,
             package_digest,
@@ -513,6 +569,56 @@ impl PluginStateStore {
         self.prepare_document(&state, plugin_id, document, false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_network_access(
+        &self,
+        plugin_id: &str,
+        declared_hosts: BTreeSet<String>,
+        granted: bool,
+    ) -> Result<EffectivePluginConfig, PluginStateError> {
+        let prepared = self.prepare_set_network_access(plugin_id, declared_hosts, granted)?;
+        if self.persist_prepared(&prepared) != DurableStateOutcome::Committed {
+            return Err(PluginStateError::Storage);
+        }
+        self.publish_prepared(prepared)
+    }
+
+    pub(crate) fn prepare_set_network_access(
+        &self,
+        plugin_id: &str,
+        declared_hosts: BTreeSet<String>,
+        granted: bool,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        if declared_hosts.is_empty()
+            || declared_hosts.len() > 8
+            || declared_hosts.iter().any(|host| !valid_https_host(host))
+        {
+            return Err(PluginStateError::InvalidPermissions);
+        }
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut document = previous.document.clone();
+        if granted {
+            document
+                .permission_grants
+                .insert(PublicPermission::NetworkHttps);
+            document.network_https_hosts_grant = declared_hosts;
+        } else {
+            document
+                .permission_grants
+                .remove(&PublicPermission::NetworkHttps);
+            document.network_https_hosts_grant.clear();
+        }
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, plugin_id, document, false)
+    }
+
     pub(crate) fn prepare_enable_with_generation(
         &self,
         plugin_id: &str,
@@ -623,6 +729,10 @@ impl PluginStateStore {
             document.enabled = false;
             document.favorite = false;
             document.fault = None;
+            document
+                .permission_grants
+                .remove(&PublicPermission::NetworkHttps);
+            document.network_https_hosts_grant.clear();
             document.inventory_revision = revision;
             self.persist_revision(revision)?;
             let stored = self.persist(&document, Some(previous))?;
@@ -653,6 +763,10 @@ impl PluginStateStore {
         document.enabled = false;
         document.favorite = false;
         document.fault = None;
+        document
+            .permission_grants
+            .remove(&PublicPermission::NetworkHttps);
+        document.network_https_hosts_grant.clear();
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, !retain_data)
             .map(Some)
@@ -913,7 +1027,23 @@ fn load_owner(owner: &Path, plugin_id: &str) -> Result<Option<StoredState>, Plug
 }
 
 fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> {
-    let document = serde_json::from_slice::<PluginStateDocument>(bytes).ok()?;
+    let mut document = serde_json::from_slice::<PluginStateDocument>(bytes).ok()?;
+    let network_grant_valid = !document.network_https_hosts_grant.is_empty()
+        && document.network_https_hosts_grant.len() <= 8
+        && document
+            .network_https_hosts_grant
+            .iter()
+            .all(|host| valid_https_host(host));
+    if !(document
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps)
+        && network_grant_valid)
+    {
+        document
+            .permission_grants
+            .remove(&PublicPermission::NetworkHttps);
+        document.network_https_hosts_grant.clear();
+    }
     (document.schema == 1
         && document.plugin_id == plugin_id
         && valid_plugin_id(&document.plugin_id)

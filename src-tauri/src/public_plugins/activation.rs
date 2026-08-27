@@ -79,6 +79,15 @@ pub(crate) struct PublicPluginPrepareSummary {
     pub(crate) is_update: bool,
     pub(crate) source_verified: bool,
     pub(crate) icon_url: Option<String>,
+    pub(crate) network: Option<PublicPluginPrepareNetwork>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPluginPrepareNetwork {
+    pub(crate) https_hosts: Vec<String>,
+    pub(crate) added_https_hosts: Vec<String>,
+    pub(crate) requires_network_consent: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -113,6 +122,13 @@ pub(crate) struct PublicPluginInventoryItem {
     pub(crate) permissions: Vec<PublicPermissionView>,
     pub(crate) settings: Vec<PublicSettingView>,
     pub(crate) icon_url: Option<String>,
+    pub(crate) network: Option<PublicPluginInventoryNetwork>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPluginInventoryNetwork {
+    pub(crate) https_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -435,6 +451,9 @@ struct PendingActivation {
     expires_at: Instant,
     prepared: PreparedPublicPlugin,
     icon: Option<Vec<u8>>,
+    previous_config: Option<EffectivePluginConfig>,
+    previous_declared_https_hosts: BTreeSet<String>,
+    requires_network_consent: bool,
 }
 
 #[derive(Default)]
@@ -538,7 +557,7 @@ impl PublicPluginManager {
         let admission_epochs = AdmissionEpochAllocator::default();
         let bundles = Arc::new(ActivationReservationBook::default());
         let mut active_by_plugin = HashMap::new();
-        for config in state.configs()? {
+        for mut config in state.configs()? {
             if !config.installed || config.active_generation == 0 {
                 continue;
             }
@@ -557,6 +576,21 @@ impl PublicPluginManager {
                     if snapshot.manifest.plugin_id == config.plugin_id
                         && snapshot.manifest.version == config.version =>
                 {
+                    if !network_authorization_matches(&config, &snapshot.manifest) {
+                        let declared_hosts = snapshot.manifest.network.as_ref().map_or_else(
+                            || config.network_https_hosts_grant.clone(),
+                            |network| network.https_hosts.iter().cloned().collect(),
+                        );
+                        let prepared = state.prepare_set_network_access(
+                            &config.plugin_id,
+                            declared_hosts,
+                            false,
+                        )?;
+                        if state.persist_prepared(&prepared) != DurableStateOutcome::Committed {
+                            return Err(PublicPluginManagementError::Unavailable);
+                        }
+                        config = state.publish_prepared(prepared)?;
+                    }
                     let runtime = Arc::new(snapshot);
                     if config.enabled && config.fault.is_none() {
                         let Some(activation_id) = activation_ids.allocate() else {
@@ -681,10 +715,42 @@ impl PublicPluginManager {
         } else {
             None
         };
-        let is_update = self
-            .state
-            .config(&prepared.manifest.plugin_id)?
+        let previous_config = self.state.config(&prepared.manifest.plugin_id)?;
+        let previous_declared_https_hosts = previous_config
+            .as_ref()
+            .filter(|config| config.installed)
+            .map(|config| self.installed_manifest(config))
+            .transpose()?
+            .and_then(|manifest| manifest.network)
+            .map_or_else(BTreeSet::new, |network| {
+                network.https_hosts.into_iter().collect()
+            });
+        let candidate_https_hosts = prepared
+            .manifest
+            .network
+            .as_ref()
+            .map_or_else(BTreeSet::new, |network| {
+                network.https_hosts.iter().cloned().collect()
+            });
+        let added_https_hosts = candidate_https_hosts
+            .difference(&previous_declared_https_hosts)
+            .cloned()
+            .collect::<Vec<_>>();
+        let is_update = previous_config
+            .as_ref()
             .is_some_and(|config| config.installed);
+        let requires_network_consent =
+            !candidate_https_hosts.is_empty() && (!is_update || !added_https_hosts.is_empty());
+        let network =
+            prepared
+                .manifest
+                .network
+                .as_ref()
+                .map(|network| PublicPluginPrepareNetwork {
+                    https_hosts: network.https_hosts.clone(),
+                    added_https_hosts,
+                    requires_network_consent,
+                });
         let token_number = self
             .next_token
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -704,6 +770,7 @@ impl PublicPluginManager {
             is_update,
             source_verified: false,
             icon_url: icon.as_ref().map(|_| icon::prepared_url(&token)),
+            network,
         };
         let expires_at = now
             .checked_add(PREPARE_TTL)
@@ -715,6 +782,9 @@ impl PublicPluginManager {
                 expires_at,
                 prepared,
                 icon,
+                previous_config,
+                previous_declared_https_hosts,
+                requires_network_consent,
             },
         );
         Ok(summary)
@@ -757,6 +827,7 @@ impl PublicPluginManager {
         let (
             pending,
             previous_config,
+            effective_permission_grants,
             candidate,
             runtime,
             previous_runtime_label,
@@ -791,6 +862,34 @@ impl PublicPluginManager {
                 return Err(PublicPluginManagementError::PermissionDenied);
             }
             let previous_config = self.state.config(&pending.prepared.manifest.plugin_id)?;
+            if previous_config != pending.previous_config {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let current_declared_https_hosts = previous_config
+                .as_ref()
+                .map(|config| self.installed_manifest(config))
+                .transpose()?
+                .and_then(|manifest| manifest.network)
+                .map_or_else(BTreeSet::new, |network| {
+                    network.https_hosts.into_iter().collect()
+                });
+            if current_declared_https_hosts != pending.previous_declared_https_hosts {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let previous_network_granted = previous_config.as_ref().is_some_and(|config| {
+                config
+                    .permission_grants
+                    .contains(&PublicPermission::NetworkHttps)
+                    && !pending.previous_declared_https_hosts.is_empty()
+                    && config.network_https_hosts_grant == pending.previous_declared_https_hosts
+            });
+            let mut effective_permission_grants = declared;
+            if pending.prepared.manifest.network.is_some()
+                && !pending.requires_network_consent
+                && !previous_network_granted
+            {
+                effective_permission_grants.remove(&PublicPermission::NetworkHttps);
+            }
             let generation = previous_config
                 .as_ref()
                 .map_or(Some(1), |config| config.active_generation.checked_add(1))
@@ -834,6 +933,7 @@ impl PublicPluginManager {
             (
                 pending,
                 previous_config,
+                effective_permission_grants,
                 candidate,
                 runtime,
                 previous_runtime_label,
@@ -862,7 +962,7 @@ impl PublicPluginManager {
             let reservation = self.bundles.reserve(&runtime.plugin_id)?;
             let prepared_state = self.state.prepare_activation(
                 &candidate.runtime.manifest,
-                permission_grants,
+                effective_permission_grants,
                 runtime.generation,
                 Some(candidate.runtime.digest.clone()),
             )?;
@@ -1232,6 +1332,47 @@ impl PublicPluginManager {
         let _mutation = self.lock_mutation()?;
         let config = self.state.publish_prepared(prepared_state)?;
         reservation.publish(Some(bundle.with_config(config.clone())))?;
+        Ok(mutation_from_config(&config))
+    }
+
+    #[allow(dead_code)] // Registered as a trusted-main command in Task 7.
+    pub(crate) fn set_network_access(
+        &self,
+        plugin_id: &str,
+        granted: bool,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let (bundle, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            let config = self
+                .state
+                .config(plugin_id)?
+                .filter(|config| config.installed)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let manifest = self.installed_manifest(&config)?;
+            let declared_hosts = manifest
+                .network
+                .ok_or(PublicPluginManagementError::PermissionDenied)?
+                .https_hosts
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let currently_granted = config
+                .permission_grants
+                .contains(&PublicPermission::NetworkHttps)
+                && config.network_https_hosts_grant == declared_hosts;
+            if currently_granted == granted {
+                return Ok(mutation_from_config(&config));
+            }
+            let bundle = self.bundles.bundle(plugin_id)?;
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared_state =
+                self.state
+                    .prepare_set_network_access(plugin_id, declared_hosts, granted)?;
+            (bundle, reservation, prepared_state)
+        };
+        self.make_state_durable(&reservation, &prepared_state)?;
+        let _mutation = self.lock_mutation()?;
+        let config = self.state.publish_prepared(prepared_state)?;
+        reservation.publish(bundle.map(|bundle| bundle.with_config(config.clone())))?;
         Ok(mutation_from_config(&config))
     }
 
@@ -1680,6 +1821,11 @@ impl PublicPluginManager {
                     .collect(),
                 settings,
                 icon_url: snapshot.icon_url(),
+                network: snapshot.manifest.network.as_ref().map(|network| {
+                    PublicPluginInventoryNetwork {
+                        https_hosts: network.https_hosts.clone(),
+                    }
+                }),
             });
         }
         items.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
@@ -2867,6 +3013,27 @@ impl PublicPluginManager {
             .ok_or(PublicPluginManagementError::Unavailable)
     }
 
+    fn installed_manifest(
+        &self,
+        config: &EffectivePluginConfig,
+    ) -> Result<PublicManifestV1, PublicPluginManagementError> {
+        let digest = config
+            .package_digest
+            .as_deref()
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let package_root = package_destination(&self.packages_root, &config.plugin_id, digest);
+        let (snapshot, _) =
+            load_runtime_snapshot(&package_root, &self.host, digest, config.active_generation)?;
+        if snapshot.manifest.plugin_id != config.plugin_id
+            || snapshot.manifest.version != config.version
+            || snapshot.generation != config.active_generation
+            || snapshot.digest != digest
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        Ok(snapshot.manifest)
+    }
+
     fn manifest_for_label(&self, label: &str) -> Option<PublicManifestV1> {
         let bundle = self
             .bundles
@@ -2969,6 +3136,32 @@ fn mutation_from_config(config: &EffectivePluginConfig) -> PublicPluginMutation 
         generation: config.active_generation,
         inventory_revision: config.inventory_revision,
         enabled: config.enabled,
+    }
+}
+
+fn network_authorization_matches(
+    config: &EffectivePluginConfig,
+    manifest: &PublicManifestV1,
+) -> bool {
+    let declared_hosts = manifest
+        .network
+        .as_ref()
+        .map(|network| network.https_hosts.iter().cloned().collect::<BTreeSet<_>>());
+    match declared_hosts {
+        Some(declared_hosts)
+            if config
+                .permission_grants
+                .contains(&PublicPermission::NetworkHttps) =>
+        {
+            config.network_https_hosts_grant == declared_hosts
+        }
+        Some(_) => config.network_https_hosts_grant.is_empty(),
+        None => {
+            !config
+                .permission_grants
+                .contains(&PublicPermission::NetworkHttps)
+                && config.network_https_hosts_grant.is_empty()
+        }
     }
 }
 
@@ -3441,6 +3634,38 @@ mod tests {
         .unwrap();
     }
 
+    fn write_network_package(root: &Path, version: &str, hosts: &[&str]) {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "com.example.network",
+                "version": version,
+                "apiVersion": 1,
+                "minimumHostVersion": "0.3.2",
+                "name": "Network",
+                "supportedPlatforms": ["windows"],
+                "command": {
+                    "defaultName": "network",
+                    "activationMode": "live",
+                    "outputMode": "mainResult",
+                    "inputRequired": false
+                },
+                "runtime": { "entry": "dist/runtime.js" },
+                "network": { "httpsHosts": hosts },
+                "permissions": ["network.https"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/runtime.js"),
+            "export async function onCommand() { return { results: [] }; }",
+        )
+        .unwrap();
+    }
+
     fn write_timer_package(root: &Path, version: &str) {
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::create_dir_all(root.join("assets/sounds")).unwrap();
@@ -3669,6 +3894,188 @@ mod tests {
             Err(PublicPluginManagementError::ExpiredToken)
         );
         assert!(staging_is_empty(&manager));
+    }
+
+    #[test]
+    fn plugin_network_grant_prepare_update_revoke_and_regrant_are_authoritative() {
+        let dir = TestDir::new("network-grant-flow");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let grants = BTreeSet::from([PublicPermission::NetworkHttps]);
+
+        write_network_package(
+            &dir.source(),
+            "1.0.0",
+            &["auth.example.com", "api.example.com"],
+        );
+        let cancelled = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert_eq!(
+            cancelled.network,
+            Some(PublicPluginPrepareNetwork {
+                https_hosts: vec!["api.example.com".into(), "auth.example.com".into()],
+                added_https_hosts: vec!["api.example.com".into(), "auth.example.com".into()],
+                requires_network_consent: true,
+            })
+        );
+        manager.cancel("main", &cancelled.token, now).unwrap();
+        assert!(manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .is_none());
+
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, grants.clone(), now, |_| true)
+            .unwrap();
+        let installed = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installed.network_https_hosts_grant,
+            BTreeSet::from(["api.example.com".into(), "auth.example.com".into()])
+        );
+
+        write_network_package(
+            &dir.source(),
+            "1.0.1",
+            &["api.example.com", "auth.example.com"],
+        );
+        let stale = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .set_network_access("com.example.network", false)
+            .unwrap();
+        assert_eq!(
+            manager.commit_with_readiness("main", &stale.token, grants.clone(), now, |_| true,),
+            Err(PublicPluginManagementError::Unavailable)
+        );
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+        write_network_package(&dir.source(), "1.1.0", &["api.example.com"]);
+        let narrowed = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert_eq!(
+            narrowed.network,
+            Some(PublicPluginPrepareNetwork {
+                https_hosts: vec!["api.example.com".into()],
+                added_https_hosts: Vec::new(),
+                requires_network_consent: false,
+            })
+        );
+        manager
+            .commit_with_readiness("main", &narrowed.token, grants.clone(), now, |_| true)
+            .unwrap();
+        let still_revoked = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_revoked.version, "1.1.0");
+        assert!(!still_revoked
+            .permission_grants
+            .contains(&PublicPermission::NetworkHttps));
+        assert!(still_revoked.network_https_hosts_grant.is_empty());
+
+        manager
+            .set_network_access("com.example.network", true)
+            .unwrap();
+        let regranted = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            regranted.network_https_hosts_grant,
+            BTreeSet::from(["api.example.com".into()])
+        );
+        let inventory = manager.inventory().unwrap();
+        assert_eq!(
+            inventory.items[0].network,
+            Some(PublicPluginInventoryNetwork {
+                https_hosts: vec!["api.example.com".into()]
+            })
+        );
+
+        write_network_package(
+            &dir.source(),
+            "1.2.0",
+            &["new.example.com", "api.example.com"],
+        );
+        let expanded = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert_eq!(
+            expanded.network.as_ref().unwrap().added_https_hosts,
+            vec!["new.example.com"]
+        );
+        assert!(expanded.network.as_ref().unwrap().requires_network_consent);
+        manager.cancel("main", &expanded.token, now).unwrap();
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap(),
+            regranted
+        );
+
+        let failed = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert_eq!(
+            manager.commit_with_readiness("main", &failed.token, grants, now, |_| false),
+            Err(PublicPluginManagementError::RuntimeNotReady)
+        );
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap(),
+            regranted
+        );
+    }
+
+    #[test]
+    fn plugin_network_grant_manifest_mismatch_on_restart_fails_closed() {
+        let dir = TestDir::new("network-grant-restart");
+        write_network_package(&dir.source(), "1.0.0", &["api.example.com"]);
+        let now = Instant::now();
+        {
+            let manager = manager(&dir);
+            let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &prepared.token,
+                    BTreeSet::from([PublicPermission::NetworkHttps]),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+        }
+
+        let state_path = dir
+            .path()
+            .join("public-plugins/state/com.example.network/state.json");
+        let mut document: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        document["networkHttpsHostsGrant"] = json!(["other.example.com"]);
+        fs::write(&state_path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let reloaded = manager(&dir);
+        let config = reloaded
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::NetworkHttps));
+        assert!(config.network_https_hosts_grant.is_empty());
     }
 
     #[test]

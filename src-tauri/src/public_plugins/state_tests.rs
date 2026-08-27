@@ -86,6 +86,33 @@ fn timer_manifest(version: &str) -> PublicManifestV1 {
     .unwrap()
 }
 
+fn network_manifest(version: &str, hosts: &[&str]) -> PublicManifestV1 {
+    serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "pluginId": "com.example.network",
+        "version": version,
+        "apiVersion": 1,
+        "minimumHostVersion": "0.3.2",
+        "name": "Network",
+        "supportedPlatforms": ["windows"],
+        "command": {
+            "defaultName": "network",
+            "activationMode": "live",
+            "outputMode": "mainResult",
+            "inputRequired": false
+        },
+        "runtime": { "entry": "runtime.js" },
+        "network": { "httpsHosts": hosts },
+        "permissions": ["network.https"],
+        "settings": []
+    }))
+    .unwrap()
+}
+
+fn network_permission_grants() -> BTreeSet<PublicPermission> {
+    BTreeSet::from([PublicPermission::NetworkHttps])
+}
+
 fn definitions() -> Value {
     json!([
         {
@@ -125,6 +152,184 @@ fn definitions() -> Value {
             "label": "API key"
         }
     ])
+}
+
+#[test]
+fn plugin_network_grant_is_exact_durable_and_can_be_revoked_and_regranted() {
+    let dir = TestDir::new("network-grant");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let plugin = network_manifest("1.0.0", &["api.example.com", "auth.example.com"]);
+    let installed = store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    assert_eq!(
+        installed.network_https_hosts_grant,
+        BTreeSet::from(["api.example.com".into(), "auth.example.com".into()])
+    );
+    assert_eq!(
+        installed.network_grant_snapshot(&plugin),
+        Some(PluginNetworkGrantSnapshot {
+            plugin_id: plugin.plugin_id.clone(),
+            generation: installed.active_generation,
+            https_hosts: installed.network_https_hosts_grant.clone(),
+        })
+    );
+
+    let revoked = store
+        .set_network_access(
+            &plugin.plugin_id,
+            BTreeSet::from(["api.example.com".into(), "auth.example.com".into()]),
+            false,
+        )
+        .unwrap();
+    assert!(!revoked
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert!(revoked.network_https_hosts_grant.is_empty());
+    assert_eq!(revoked.network_grant_snapshot(&plugin), None);
+    assert!(revoked.inventory_revision > installed.inventory_revision);
+
+    let regranted = store
+        .set_network_access(
+            &plugin.plugin_id,
+            BTreeSet::from(["api.example.com".into(), "auth.example.com".into()]),
+            true,
+        )
+        .unwrap();
+    assert!(regranted
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert_eq!(
+        regranted.network_https_hosts_grant,
+        installed.network_https_hosts_grant
+    );
+    assert!(regranted.inventory_revision > revoked.inventory_revision);
+
+    drop(store);
+    assert_eq!(
+        PluginStateStore::load(dir.path(), Vec::<String>::new())
+            .unwrap()
+            .config(&plugin.plugin_id)
+            .unwrap()
+            .unwrap(),
+        regranted
+    );
+}
+
+#[test]
+fn plugin_network_grant_rejects_noncanonical_management_hosts_and_permission_mismatch() {
+    let dir = TestDir::new("network-invalid");
+    let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
+    let plugin = network_manifest("1.0.0", &["api.example.com"]);
+    let installed = store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+
+    assert_eq!(
+        store.set_network_access(
+            &plugin.plugin_id,
+            BTreeSet::from(["API.example.com".into()]),
+            true,
+        ),
+        Err(PluginStateError::InvalidPermissions)
+    );
+    assert_eq!(store.config(&plugin.plugin_id).unwrap(), Some(installed));
+
+    let plain = manifest("com.example.plain", "plain", json!([]));
+    assert!(matches!(
+        store.prepare_activation(&plain, network_permission_grants(), 1, None),
+        Err(PluginStateError::InvalidPermissions)
+    ));
+
+    let mut invalid_grants = BTreeSet::new();
+    let prepared = store.prepare_activation(&plugin, invalid_grants.clone(), 2, None);
+    assert!(prepared.is_ok());
+    invalid_grants.insert(PublicPermission::NetworkHttps);
+    assert!(store
+        .prepare_activation(
+            &network_manifest("1.1.0", &["api.example.com"]),
+            invalid_grants,
+            2,
+            None,
+        )
+        .is_ok());
+}
+
+#[test]
+fn plugin_network_grant_legacy_permission_without_hosts_loads_fail_closed() {
+    let dir = TestDir::new("network-legacy");
+    let plugin_id = "com.example.network";
+    let owner = dir.path().join(plugin_id);
+    fs::create_dir_all(&owner).unwrap();
+    fs::write(
+        owner.join("state.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "pluginId": plugin_id,
+            "version": "1.0.0",
+            "defaultName": "network",
+            "nameOverride": null,
+            "installed": true,
+            "enabled": true,
+            "fault": null,
+            "permissionGrants": ["network.https"],
+            "inventoryRevision": 1,
+            "activeGeneration": 1,
+            "packageDigest": null,
+            "settings": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let config = PluginStateStore::load(dir.path(), Vec::<String>::new())
+        .unwrap()
+        .config(plugin_id)
+        .unwrap()
+        .unwrap();
+    assert!(!config
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert!(config.network_https_hosts_grant.is_empty());
+}
+
+#[test]
+fn plugin_network_grant_invalid_hosts_without_permission_loads_fail_closed() {
+    let dir = TestDir::new("network-invalid-host-grant");
+    let plugin_id = "com.example.network";
+    let owner = dir.path().join(plugin_id);
+    fs::create_dir_all(&owner).unwrap();
+    fs::write(
+        owner.join("state.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "pluginId": plugin_id,
+            "version": "1.0.0",
+            "defaultName": "network",
+            "nameOverride": null,
+            "installed": true,
+            "enabled": true,
+            "fault": null,
+            "permissionGrants": [],
+            "networkHttpsHostsGrant": ["LOCALHOST"],
+            "inventoryRevision": 1,
+            "activeGeneration": 1,
+            "packageDigest": null,
+            "settings": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let config = PluginStateStore::load(dir.path(), Vec::<String>::new())
+        .unwrap()
+        .config(plugin_id)
+        .unwrap()
+        .unwrap();
+    assert!(!config
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert!(config.network_https_hosts_grant.is_empty());
 }
 
 #[test]

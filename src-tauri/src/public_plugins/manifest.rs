@@ -493,7 +493,7 @@ fn validate_manifest(
     Ok(())
 }
 
-fn valid_https_host(value: &str) -> bool {
+pub(super) fn valid_https_host(value: &str) -> bool {
     if value.is_empty()
         || value.len() > 253
         || !value.is_ascii()
