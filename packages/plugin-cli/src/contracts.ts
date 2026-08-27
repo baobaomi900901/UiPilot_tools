@@ -2,7 +2,7 @@ export type PluginPlatform = 'windows' | 'macos'
 export type SourceKind = 'directory' | 'archive' | 'unknown'
 export type PluginOutputMode = 'mainResult' | 'window' | 'panel'
 
-export const PLUGIN_CLI_HOST_VERSION = '0.3.0' as const
+export const PLUGIN_CLI_HOST_VERSION = '0.3.2' as const
 export type PluginCliHostVersion = typeof PLUGIN_CLI_HOST_VERSION
 
 export const PLUGIN_VALIDATION_ISSUE_CODES = [

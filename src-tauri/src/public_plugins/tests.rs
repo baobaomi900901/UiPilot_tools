@@ -731,7 +731,7 @@ fn rejects_incompatible_or_malformed_and_preserves_legacy_loader() {
             "permission",
             "permissions",
             json!(["network.https"]),
-            PublicPackageError::UnsupportedPermission,
+            PublicPackageError::InvalidPackage,
         ),
         (
             "settings",
@@ -793,6 +793,25 @@ fn notifications_publish_permission_is_available_only_on_windows() {
         .map(|_| ());
         assert_eq!(result, expected);
     }
+}
+
+#[test]
+fn plugin_network_manifest_package_stages_only_for_windows_host_0_3_2() {
+    let root = TestRoot::new("network-manifest-package");
+    let source = root.package();
+    let mut candidate = manifest("mainResult");
+    candidate["minimumHostVersion"] = json!("0.3.2");
+    candidate["permissions"] = json!(["network.https"]);
+    candidate["network"] = json!({ "httpsHosts": ["api.example.com"] });
+    write_package(&source, &candidate);
+
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &root.staging(),
+        &PublicPluginHost::current(PublicPlatform::Windows),
+    )
+    .unwrap();
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo");
 }
 
 fn host() -> PublicPluginHost {

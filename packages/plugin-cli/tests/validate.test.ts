@@ -32,7 +32,39 @@ function timerSnapshot(includeAlarm = true) {
   return builder.finish()
 }
 
+function networkSnapshot() {
+  const manifest = {
+    schemaVersion: 1,
+    pluginId: 'com.example.network',
+    version: '1.0.0',
+    apiVersion: 1,
+    minimumHostVersion: '0.3.2',
+    name: 'Network',
+    supportedPlatforms: ['windows'],
+    command: {
+      defaultName: 'network',
+      activationMode: 'live',
+      outputMode: 'mainResult',
+      inputRequired: false,
+    },
+    runtime: { entry: 'dist/runtime.js' },
+    network: { httpsHosts: ['api.example.com'] },
+    permissions: ['network.https'],
+    settings: [],
+  }
+  const builder = new SnapshotBuilder('directory')
+  builder.addFile('plugin.json', Buffer.from(JSON.stringify(manifest)))
+  builder.addFile('dist/runtime.js', Buffer.from('export {}'))
+  return builder.finish()
+}
+
 describe('validateSnapshot', () => {
+  it('reports Host 0.3.2 for a valid network Manifest', () => {
+    const report = validateSnapshot(networkSnapshot(), 'network-package', 'windows')
+    expect(report.valid).toBe(true)
+    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.3.2', apiVersion: 1 })
+  })
+
   it('accepts the complete Timer package on Windows', () => {
     const report = validateSnapshot(timerSnapshot(), 'timer-package', 'windows')
     expect(report.valid).toBe(true)

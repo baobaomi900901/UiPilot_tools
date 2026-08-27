@@ -200,7 +200,7 @@ describe('validateManifest', () => {
 
     const permission = timerManifest()
     ;(permission as any).permissions = ['ui.window', 'network.https']
-    expect(validate(permission)).toMatchObject({ ok: false, issues: [{ code: 'PERMISSION_UNSUPPORTED' }] })
+    expect(validate(permission)).toMatchObject({ ok: false, issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }] })
   })
 
   it('validates numeric and select setting boundaries', () => {
@@ -211,5 +211,78 @@ describe('validateManifest', () => {
     const select = timerManifest()
     ;(select as any).settings = [{ type: 'select', key: 'mode', label: 'Mode', options: [] }]
     expect(validate(select)).toMatchObject({ ok: false, issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }] })
+  })
+
+  it('validates the strict network contract and canonical host order', () => {
+    const value = timerManifest() as any
+    value.minimumHostVersion = '0.3.2'
+    value.permissions = ['network.https']
+    value.command = { defaultName: 'network', activationMode: 'live', outputMode: 'mainResult', inputRequired: false }
+    delete value.window
+    value.network = {
+      httpsHosts: [
+        'h.example.com', 'g.example.com', 'f.example.com', 'e.example.com',
+        'd.example.com', 'c.example.com', 'b.example.com', 'a.example.com',
+      ],
+    }
+    const result = validate(value)
+    expect(result).toMatchObject({ ok: true })
+    if (result.ok) {
+      expect(result.manifest.network?.httpsHosts).toEqual([
+        'a.example.com', 'b.example.com', 'c.example.com', 'd.example.com',
+        'e.example.com', 'f.example.com', 'g.example.com', 'h.example.com',
+      ])
+    }
+
+    for (const mutate of [
+      (candidate: any) => { candidate.permissions = [] },
+      (candidate: any) => { delete candidate.network },
+      (candidate: any) => { candidate.minimumHostVersion = '0.3.1' },
+      (candidate: any) => { candidate.network = null },
+      (candidate: any) => { candidate.network = { httpsHosts: 'api.example.com' } },
+      (candidate: any) => { candidate.network = { httpsHosts: [] } },
+      (candidate: any) => { candidate.network = { httpsHosts: ['api.example.com', 'api.example.com'] } },
+      (candidate: any) => { candidate.network = { httpsHosts: [
+        'a.example.com', 'b.example.com', 'c.example.com', 'd.example.com', 'e.example.com',
+        'f.example.com', 'g.example.com', 'h.example.com', 'i.example.com',
+      ] } },
+      (candidate: any) => { candidate.network.unknown = true },
+    ]) {
+      const candidate = structuredClone(value)
+      mutate(candidate)
+      expect(validate(candidate)).toMatchObject({ ok: false })
+    }
+
+    const macos = structuredClone(value)
+    macos.supportedPlatforms = ['windows', 'macos']
+    expect(validate(macos, 'macos')).toMatchObject({
+      ok: false,
+      issues: [{ code: 'PERMISSION_UNSUPPORTED' }],
+    })
+
+    const explicitNull = timerManifest() as any
+    explicitNull.permissions = []
+    explicitNull.command = { defaultName: 'network', activationMode: 'live', outputMode: 'mainResult', inputRequired: false }
+    delete explicitNull.window
+    explicitNull.network = null
+    expect(validate(explicitNull)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'MANIFEST_SCHEMA_INVALID' }],
+    })
+  })
+
+  it('matches the shared network hostname policy fixtures', async () => {
+    const fixtures = JSON.parse(
+      await readFile(resolve('../../docs/plugin-sdk/tests/network-host-fixtures.json'), 'utf8'),
+    ) as Array<{ name: string; host: string; valid: boolean }>
+    for (const fixture of fixtures) {
+      const value = timerManifest() as any
+      value.minimumHostVersion = '0.3.2'
+      value.permissions = ['network.https']
+      value.command = { defaultName: 'network', activationMode: 'live', outputMode: 'mainResult', inputRequired: false }
+      delete value.window
+      value.network = { httpsHosts: [fixture.host] }
+      expect(validate(value).ok, fixture.name).toBe(fixture.valid)
+    }
   })
 })

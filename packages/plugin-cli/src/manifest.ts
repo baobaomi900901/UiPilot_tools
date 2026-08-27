@@ -17,6 +17,10 @@ export type PublicPermission =
 
 export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N'
 
+export interface PublicNetworkV1 {
+  httpsHosts: string[]
+}
+
 export interface PublicManifestV1 {
   schemaVersion: number
   pluginId: string
@@ -37,6 +41,7 @@ export interface PublicManifestV1 {
   runtime: { entry: string }
   window?: { entry: string } | null
   panel?: { entry: string; hostKeys?: PanelHostKeyDeclaration[] } | null
+  network?: PublicNetworkV1
   permissions: PublicPermission[]
   settings?: PublicSettingV1[]
 }
@@ -153,6 +158,43 @@ function canonicalPanelHostKeys(values: readonly PanelHostKeyDeclaration[]): Pan
   return [...values].sort((left, right) => panelHostKeyOrder[left] - panelHostKeyOrder[right])
 }
 
+function canonicalHttpsHosts(values: readonly string[]): string[] {
+  return [...values].sort((left, right) => Buffer.from(left).compare(Buffer.from(right)))
+}
+
+function isIpv4Literal(value: string): boolean {
+  const labels = value.split('.')
+  return labels.length === 4 && labels.every(
+    (label) => /^[0-9]+$/u.test(label) && Number(label) <= 255,
+  )
+}
+
+function validHttpsHost(value: string): boolean {
+  if (
+    value.length === 0 ||
+    Buffer.byteLength(value, 'utf8') > 253 ||
+    !/^[\x00-\x7f]+$/u.test(value) ||
+    value !== value.toLowerCase() ||
+    !value.includes('.') ||
+    value === 'localhost' ||
+    value.endsWith('.localhost') ||
+    value.endsWith('.local') ||
+    isIpv4Literal(value) ||
+    value.includes(':')
+  ) {
+    return false
+  }
+  return value.split('.').every(
+    (label) =>
+      label.length >= 1 &&
+      Buffer.byteLength(label, 'ascii') <= 63 &&
+      !label.startsWith('-') &&
+      !label.endsWith('-') &&
+      !label.startsWith('xn--') &&
+      /^[a-z0-9-]+$/u.test(label),
+  )
+}
+
 function validSettingKey(value: string): boolean {
   return /^[a-z][a-z0-9.-]{0,63}$/u.test(value)
 }
@@ -207,12 +249,18 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     (manifest.panel != null && !validEntry(manifest.panel.entry, 'html')) ||
     (manifest.panel?.hostKeys != null &&
       (manifest.panel.hostKeys.length > 8 || duplicates(manifest.panel.hostKeys))) ||
+    (manifest.network != null &&
+      (manifest.network.httpsHosts.length === 0 ||
+        manifest.network.httpsHosts.length > 8 ||
+        duplicates(manifest.network.httpsHosts) ||
+        manifest.network.httpsHosts.some((host) => !validHttpsHost(host)))) ||
     duplicates(permissions) ||
     settings.some((setting) => !validSetting(setting)) ||
     duplicates(settings.map((setting) => setting.key))
   ) {
     return false
   }
+  if ((manifest.network != null) !== permissions.includes('network.https')) return false
   if (manifest.command.outputMode === 'window') {
     if (
       manifest.command.activationMode !== 'submit' ||
@@ -270,6 +318,7 @@ function permissionAvailable(permission: PublicPermission, platform: PluginPlatf
     permission === 'ui.window' ||
     permission === 'ui.panel' ||
     permission === 'clipboard.write' ||
+    (permission === 'network.https' && platform === 'windows') ||
     ((permission === 'notifications.publish' || permission === 'timer.control') && platform === 'windows')
   )
 }
@@ -310,9 +359,10 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 3, 1]) ||
+    versionGreater(minimumHost, [0, 3, 2]) ||
     (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
-    ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost))
+    ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost)) ||
+    (manifest.network != null && versionGreater([0, 3, 2], minimumHost))
   ) {
     issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })
   }
@@ -321,5 +371,6 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   }
   if (issues.length > 0) return { ok: false, manifest, issues }
   if (manifest.panel?.hostKeys) manifest.panel.hostKeys = canonicalPanelHostKeys(manifest.panel.hostKeys)
+  if (manifest.network) manifest.network.httpsHosts = canonicalHttpsHosts(manifest.network.httpsHosts)
   return { ok: true, manifest, issues: [] }
 }

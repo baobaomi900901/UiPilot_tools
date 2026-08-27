@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "uipilot"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "everything-ipc-spike",
  "icu_casemap",

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Number, Value};
 use unicode_normalization::UnicodeNormalization;
 
@@ -43,8 +43,10 @@ pub(crate) enum PublicPermission {
 impl PublicPermission {
     pub(super) fn is_available(self, platform: PublicPlatform) -> bool {
         matches!(self, Self::UiWindow | Self::UiPanel | Self::ClipboardWrite)
-            || (matches!(self, Self::NotificationsPublish | Self::TimerControl)
-                && platform == PublicPlatform::Windows)
+            || (matches!(
+                self,
+                Self::NetworkHttps | Self::NotificationsPublish | Self::TimerControl
+            ) && platform == PublicPlatform::Windows)
     }
 }
 
@@ -95,6 +97,39 @@ pub(crate) struct PublicPanelV1 {
     #[serde(default)]
     #[schemars(schema_with = "panel_host_keys_schema")]
     pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PublicNetworkV1 {
+    #[schemars(schema_with = "network_https_hosts_schema")]
+    pub(crate) https_hosts: Vec<String>,
+}
+
+fn deserialize_present_network<'de, D>(deserializer: D) -> Result<Option<PublicNetworkV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    PublicNetworkV1::deserialize(deserializer).map(Some)
+}
+
+fn present_network_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<PublicNetworkV1>()
+}
+
+fn network_https_hosts_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Vec::<String>::json_schema(generator);
+    schema.insert("minItems".into(), 1.into());
+    schema.insert("maxItems".into(), 8.into());
+    schema.insert("uniqueItems".into(), true.into());
+    schema.insert(
+        "items".into(),
+        serde_json::json!({
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"
+        }),
+    );
+    schema
 }
 
 #[derive(
@@ -281,6 +316,13 @@ pub(crate) struct PublicManifestV1 {
     pub(crate) window: Option<PublicWindowV1>,
     #[serde(default)]
     pub(crate) panel: Option<PublicPanelV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_network",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_network_schema")]
+    pub(crate) network: Option<PublicNetworkV1>,
     pub(crate) permissions: Vec<PublicPermission>,
     #[serde(default)]
     pub(crate) settings: Vec<PublicSettingV1>,
@@ -294,9 +336,12 @@ pub(super) fn parse_manifest(
     bytes: &[u8],
     host: &PublicPluginHost,
 ) -> Result<PublicManifestV1, PublicPackageError> {
-    let manifest: PublicManifestV1 =
+    let mut manifest: PublicManifestV1 =
         serde_json::from_slice(bytes).map_err(|_| PublicPackageError::InvalidPackage)?;
     validate_manifest(&manifest, host)?;
+    if let Some(network) = &mut manifest.network {
+        network.https_hosts.sort_unstable();
+    }
     Ok(manifest)
 }
 
@@ -340,9 +385,26 @@ fn validate_manifest(
         || manifest.panel.as_ref().is_some_and(|panel| {
             panel.host_keys.len() > 8 || has_duplicates(panel.host_keys.iter().copied())
         })
+        || manifest.network.as_ref().is_some_and(|network| {
+            network.https_hosts.is_empty()
+                || network.https_hosts.len() > 8
+                || has_duplicates(network.https_hosts.iter().map(String::as_str))
+                || network
+                    .https_hosts
+                    .iter()
+                    .any(|host| !valid_https_host(host))
+        })
         || has_duplicates(manifest.permissions.iter().copied())
         || manifest.settings.iter().any(|setting| !setting.validate())
         || has_duplicates(manifest.settings.iter().map(PublicSettingV1::key))
+    {
+        return Err(PublicPackageError::InvalidPackage);
+    }
+
+    if manifest.network.is_some()
+        != manifest
+            .permissions
+            .contains(&PublicPermission::NetworkHttps)
     {
         return Err(PublicPackageError::InvalidPackage);
     }
@@ -407,6 +469,9 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.network.is_some() && minimum_host < [0, 3, 2] {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.command.output_mode == PublicOutputMode::Panel && minimum_host < [0, 3, 0] {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -426,6 +491,41 @@ fn validate_manifest(
         return Err(PublicPackageError::UnsupportedPermission);
     }
     Ok(())
+}
+
+fn valid_https_host(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 253
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+        || !value.contains('.')
+        || value == "localhost"
+        || value.ends_with(".localhost")
+        || value.ends_with(".local")
+        || is_ipv4_literal(value)
+    {
+        return false;
+    }
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && !label.starts_with("xn--")
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
+}
+
+fn is_ipv4_literal(value: &str) -> bool {
+    let labels = value.split('.').collect::<Vec<_>>();
+    labels.len() == 4
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.bytes().all(|byte| byte.is_ascii_digit())
+                && label.parse::<u8>().is_ok()
+        })
 }
 
 pub(super) fn parse_canonical_version(value: &str) -> Option<[u32; 3]> {
@@ -580,9 +680,11 @@ mod schema_tests {
             "PublicPermission",
             "PublicWindowV1",
             "PublicPanelV1",
+            "PublicNetworkV1",
             "additionalProperties",
             "ui.window",
             "ui.panel",
+            "network.https",
             "clipboard.write",
             "timer.control",
         ] {
@@ -830,6 +932,126 @@ mod schema_tests {
             let mut candidate = panel.clone();
             candidate["panel"]["hostKeys"] = host_keys;
             assert!(parse(&candidate).is_err(), "{label}");
+        }
+    }
+
+    #[test]
+    fn plugin_network_manifest_contract_is_strict_versioned_and_canonical() {
+        let old_serialized = serde_json::to_value(parse(&manifest(None)).unwrap()).unwrap();
+        assert!(old_serialized.get("network").is_none());
+        assert!(parse(&old_serialized).is_ok());
+        let schema = serde_json::to_value(public_manifest_v1_schema()).unwrap();
+        assert!(schema["properties"]["network"].get("default").is_none());
+
+        let mut one_host = manifest(None);
+        one_host["minimumHostVersion"] = serde_json::json!("0.3.2");
+        one_host["permissions"] = serde_json::json!(["network.https"]);
+        one_host["network"] = serde_json::json!({ "httpsHosts": ["api.example.com"] });
+        assert_eq!(
+            serde_json::to_value(parse(&one_host).unwrap()).unwrap()["network"]["httpsHosts"],
+            serde_json::json!(["api.example.com"])
+        );
+
+        let mut eight_hosts = one_host.clone();
+        eight_hosts["network"]["httpsHosts"] = serde_json::json!([
+            "h.example.com",
+            "g.example.com",
+            "f.example.com",
+            "e.example.com",
+            "d.example.com",
+            "c.example.com",
+            "b.example.com",
+            "a.example.com"
+        ]);
+        assert_eq!(
+            serde_json::to_value(parse(&eight_hosts).unwrap()).unwrap()["network"]["httpsHosts"],
+            serde_json::json!([
+                "a.example.com",
+                "b.example.com",
+                "c.example.com",
+                "d.example.com",
+                "e.example.com",
+                "f.example.com",
+                "g.example.com",
+                "h.example.com"
+            ])
+        );
+
+        let mut missing_permission = one_host.clone();
+        missing_permission["permissions"] = serde_json::json!([]);
+        assert_eq!(
+            parse(&missing_permission),
+            Err(PublicPackageError::InvalidPackage)
+        );
+
+        let mut missing_network = one_host.clone();
+        missing_network.as_object_mut().unwrap().remove("network");
+        assert_eq!(
+            parse(&missing_network),
+            Err(PublicPackageError::InvalidPackage)
+        );
+
+        let mut explicit_null = manifest(None);
+        explicit_null["network"] = serde_json::Value::Null;
+        assert_eq!(
+            parse(&explicit_null),
+            Err(PublicPackageError::InvalidPackage)
+        );
+
+        let mut low_host = one_host.clone();
+        low_host["minimumHostVersion"] = serde_json::json!("0.3.1");
+        assert_eq!(parse(&low_host), Err(PublicPackageError::IncompatibleApi));
+
+        for network in [
+            serde_json::Value::Null,
+            serde_json::json!({ "httpsHosts": "api.example.com" }),
+            serde_json::json!({ "httpsHosts": [] }),
+            serde_json::json!({ "httpsHosts": ["api.example.com", "api.example.com"] }),
+            serde_json::json!({ "httpsHosts": [
+                "a.example.com", "b.example.com", "c.example.com", "d.example.com",
+                "e.example.com", "f.example.com", "g.example.com", "h.example.com",
+                "i.example.com"
+            ] }),
+            serde_json::json!({ "httpsHosts": ["api.example.com"], "unknown": true }),
+        ] {
+            let mut candidate = one_host.clone();
+            candidate["network"] = network;
+            assert_eq!(parse(&candidate), Err(PublicPackageError::InvalidPackage));
+        }
+
+        let mut macos = one_host;
+        macos["supportedPlatforms"] = serde_json::json!(["windows", "macos"]);
+        assert_eq!(
+            parse_manifest(
+                &serde_json::to_vec(&macos).unwrap(),
+                &PublicPluginHost::current(PublicPlatform::Macos)
+            ),
+            Err(PublicPackageError::UnsupportedPermission)
+        );
+        assert_eq!(
+            PublicPluginHost::current(PublicPlatform::Windows).version,
+            [0, 3, 2]
+        );
+    }
+
+    #[test]
+    fn plugin_network_manifest_host_policy_matches_shared_fixtures() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../docs/plugin-sdk/tests/network-host-fixtures.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let mut candidate = manifest(None);
+            candidate["minimumHostVersion"] = serde_json::json!("0.3.2");
+            candidate["permissions"] = serde_json::json!(["network.https"]);
+            candidate["network"] =
+                serde_json::json!({ "httpsHosts": [fixture["host"].as_str().unwrap()] });
+            assert_eq!(
+                parse(&candidate).is_ok(),
+                fixture["valid"].as_bool().unwrap(),
+                "fixture {}",
+                fixture["name"].as_str().unwrap()
+            );
         }
     }
 }

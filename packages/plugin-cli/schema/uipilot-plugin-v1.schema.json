@@ -53,6 +53,25 @@
       ],
       "type": "object"
     },
+    "PublicNetworkV1": {
+      "additionalProperties": false,
+      "properties": {
+        "httpsHosts": {
+          "items": {
+            "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$",
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "httpsHosts"
+      ],
+      "type": "object"
+    },
     "PublicOutputMode": {
       "enum": [
         "mainResult",
@@ -337,6 +356,9 @@
     },
     "name": {
       "type": "string"
+    },
+    "network": {
+      "$ref": "#/$defs/PublicNetworkV1"
     },
     "panel": {
       "anyOf": [
