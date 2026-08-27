@@ -91,7 +91,7 @@ impl BoundedDnsResolver {
     }
 
     #[cfg(test)]
-    fn with_lookup(
+    pub(super) fn with_lookup(
         worker_count: usize,
         queue_capacity: usize,
         lookup: impl Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
@@ -165,6 +165,7 @@ pub(super) enum NativeTransportError {
     InvalidRequest,
     Connect,
     Tls,
+    Network,
     Protocol,
     ResponseHeadersTooLarge,
     ResponseBodyTooLarge,
@@ -378,8 +379,12 @@ impl HttpsTransport for DeterministicHttpsTransport {
 fn map_hyper_error(error: hyper::Error) -> NativeTransportError {
     if error.is_parse_too_large() {
         NativeTransportError::ResponseHeadersTooLarge
-    } else {
+    } else if error.is_parse() || error.is_incomplete_message() {
         NativeTransportError::Protocol
+    } else if error.is_user() {
+        NativeTransportError::InvalidRequest
+    } else {
+        NativeTransportError::Network
     }
 }
 
