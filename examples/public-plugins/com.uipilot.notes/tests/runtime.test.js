@@ -135,6 +135,9 @@ async function loadPanel({ notes = sampleNotes } = {}) {
     },
     focusHostInputCalls: () => focusHostInputCalls,
     requestHideCalls: () => requestHideCalls,
+    storedNotes() {
+      return structuredClone(store.get('notes.entries') ?? [])
+    },
     selectedId() {
       const active = dom.window.document.querySelector('.note-card.is-active')
       return active?.querySelector('[data-note-id]')?.dataset.noteId ?? null
@@ -175,7 +178,7 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel notes contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.notes')
-  assert.equal(manifest.version, '1.1.10')
+  assert.equal(manifest.version, '1.2.1')
   assert.equal(manifest.minimumHostVersion, '0.3.1')
   assert.equal(manifest.command.defaultName, 'notes')
   assert.equal(manifest.command.activationMode, 'submit')
@@ -196,6 +199,29 @@ test('strict package root contains only notes panel assets', async () => {
     (await readdir(new URL('dist/', packageRoot))).sort(),
     ['notes-logic.js', 'panel.css', 'panel.html', 'panel.js', 'runtime.js'],
   )
+})
+
+test('browser preview reuses panel assets and provides a local Host bridge', async () => {
+  const [html, source] = await Promise.all([
+    readFile(new URL('../preview.html', import.meta.url), 'utf8'),
+    readFile(new URL('../preview.js', import.meta.url), 'utf8'),
+  ])
+
+  assert.match(html, /<script type="module" src="\.\/preview\.js"><\/script>/)
+  for (const required of [
+    "fetch('./package/dist/panel.html')",
+    "import('./package/dist/panel.js')",
+    "Object.defineProperty(window, 'uipilotPluginPanel'",
+    "'notes.entries'",
+    '--uipilot-color-${name}',
+    'onHostKey',
+    'onUpdate',
+    'focusHostInput',
+    'requestHide',
+    'storage',
+  ]) {
+    assert.match(source, new RegExp(escapeRegex(required)))
+  }
 })
 
 test('runtime returns a panel response and preserves requestId', async () => {
@@ -298,6 +324,23 @@ test('panel has no in-panel search box and uses host input for filtering', async
   assert.match(source, /update\.theme/)
 })
 
+test('sortNotes places most recently pinned notes first and preserves ordinary order', async () => {
+  const { sortNotes } = await loadModule(logicUrl)
+  const sorted = sortNotes([
+    { id: 'ordinary-new', createdAt: '2026-08-27T10:00:00.000Z' },
+    { id: 'pinned-old', createdAt: '2026-08-27T08:00:00.000Z', pinnedAt: '2026-08-27T11:00:00.000Z' },
+    { id: 'ordinary-old', createdAt: '2026-08-27T09:00:00.000Z' },
+    { id: 'pinned-new', createdAt: '2026-08-27T07:00:00.000Z', pinnedAt: '2026-08-27T12:00:00.000Z' },
+  ])
+
+  assert.deepEqual(sorted.map((note) => note.id), [
+    'pinned-new',
+    'pinned-old',
+    'ordinary-new',
+    'ordinary-old',
+  ])
+})
+
 test('sidebar toolbar renders a directory title and icon-only new action', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
@@ -325,6 +368,8 @@ test('sidebar toolbar renders a directory title and icon-only new action', async
   assert.equal(newButtonStyle.padding, '0px')
   assert.equal(newButtonStyle.lineHeight, '0')
   assert.equal(newButtonIconStyle.display, 'block')
+  assert.match(css, /\.note-list\s*\{[^}]*padding:\s*0;/)
+  assert.match(css, /\.note-item\s*\{[^}]*padding:\s*0;/)
 })
 
 test('panel content uses only the panel bridge APIs', async () => {
@@ -458,6 +503,69 @@ test('new-note dialog is concise and tabs from input to save before cancel', asy
   input.value = 'Meeting notes'
   input.dispatchEvent(new panel.window.Event('input', { bubbles: true }))
   assert.equal(actions[0].getAttribute('aria-disabled'), 'false')
+})
+
+test('note item menu renames, pins newest-first, and requires delete confirmation', async (t) => {
+  const panel = await loadPanel({
+    notes: [
+      { id: '1', title: 'First', content: 'one', createdAt: '2026-08-27T10:00:00.000Z' },
+      { id: '2', title: 'Second', content: 'two', createdAt: '2026-08-27T09:00:00.000Z' },
+      { id: '3', title: 'Third', content: 'three', createdAt: '2026-08-27T08:00:00.000Z' },
+    ],
+  })
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  assert.equal(panel.document.querySelector('.note-delete'), null)
+  const moreFor = (noteId) => panel.document.querySelector(`[data-note-id="${noteId}"].note-more`)
+  assert.equal(moreFor('2')?.tabIndex, -1)
+  assert.ok(moreFor('2')?.querySelector('svg[aria-hidden="true"]'))
+
+  panel.document.querySelector('#note-list').focus()
+  const focusedMore = moreFor('2')
+  focusedMore.focus()
+  focusedMore.click()
+  const menu = panel.document.querySelector('#note-actions-menu')
+  assert.equal(menu.hidden, false)
+  assert.deepEqual(
+    [...menu.querySelectorAll('[role="menuitem"]')].map((item) => item.textContent.trim()),
+    ['重命名', '置顶', '删除'],
+  )
+
+  menu.querySelector('[data-note-action="rename"]').click()
+  assert.equal(panel.dialogOpen('#rename-dialog'), true)
+  const renameInput = panel.document.querySelector('#rename-title-input')
+  assert.equal(renameInput.value, 'Second')
+  renameInput.value = 'Renamed'
+  renameInput.dispatchEvent(new panel.window.Event('input', { bubbles: true }))
+  panel.document.querySelector('#rename-form').dispatchEvent(new panel.window.Event('submit', {
+    bubbles: true,
+    cancelable: true,
+  }))
+  await panel.flush()
+  assert.equal(panel.storedNotes().find((note) => note.id === '2')?.title, 'Renamed')
+
+  moreFor('2').click()
+  menu.querySelector('[data-note-action="pin"]').click()
+  await panel.flush()
+  assert.equal(panel.storedNotes()[0]?.id, '2')
+  assert.equal(typeof panel.storedNotes()[0]?.pinnedAt, 'string')
+
+  moreFor('1').click()
+  menu.querySelector('[data-note-action="pin"]').click()
+  await panel.flush()
+  assert.deepEqual(panel.storedNotes().slice(0, 2).map((note) => note.id), ['1', '2'])
+
+  moreFor('2').click()
+  menu.querySelector('[data-note-action="delete"]').click()
+  assert.equal(panel.dialogOpen('#delete-dialog'), true)
+  assert.equal(panel.storedNotes().some((note) => note.id === '2'), true)
+  panel.document.querySelector('#delete-form').dispatchEvent(new panel.window.Event('submit', {
+    bubbles: true,
+    cancelable: true,
+  }))
+  await panel.flush()
+  assert.equal(panel.storedNotes().some((note) => note.id === '2'), false)
 })
 
 test('host key handler settles before unsaved dialog completes', async (t) => {
@@ -671,6 +779,14 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
   assert.ok(copyButton)
   assert.equal(copyButton.getAttribute('aria-label'), '复制正文')
   assert.ok(copyButton.querySelector('svg[aria-hidden="true"]'))
+  const scrollbar = panel.document.querySelector('#editor-scrollbar')
+  assert.ok(scrollbar)
+  assert.equal(scrollbar.getAttribute('aria-hidden'), 'true')
+  assert.ok(scrollbar.querySelector('#editor-scrollbar-thumb'))
+  const listScrollbar = panel.document.querySelector('#note-list-scrollbar')
+  assert.ok(listScrollbar)
+  assert.equal(listScrollbar.getAttribute('aria-hidden'), 'true')
+  assert.ok(listScrollbar.querySelector('#note-list-scrollbar-thumb'))
   const status = panel.document.querySelector('#editor-status')
   assert.equal(status.closest('footer'), null)
   assert.equal(status.getAttribute('role'), 'status')
@@ -704,7 +820,28 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
   assert.match(css, /\.editor-status\s*\{[\s\S]*position:\s*absolute;[\s\S]*top:[^;]+;[\s\S]*left:\s*50%;[\s\S]*pointer-events:\s*none;/)
   assert.match(css, /\.editor-status\[data-tone='success'\]/)
   assert.match(css, /\.editor-status\[data-tone='error'\]/)
-  assert.match(css, /\.editor-panel\s*\{[\s\S]*gap:\s*0;/)
+  assert.match(css, /\.editor-panel\s*\{[^}]*padding:\s*0;[^}]*gap:\s*0;/)
+  assert.match(css, /\.editor-surface\s*\{[^}]*padding:\s*0;[^}]*border:\s*0;[^}]*border-radius:\s*0;/)
+  assert.match(css, /\.editor-content\s*\{[^}]*scrollbar-width:\s*none;/)
+  assert.match(css, /\.editor-content::-webkit-scrollbar\s*\{[^}]*display:\s*none;[^}]*width:\s*0;/)
+  assert.match(css, /\.editor-scrollbar\s*\{[^}]*position:\s*absolute;/)
+  assert.match(css, /\.editor-scrollbar-thumb\s*\{[^}]*position:\s*absolute;/)
+  assert.match(css, /\.note-list\s*\{[^}]*scrollbar-width:\s*none;/)
+  assert.match(css, /\.note-list::-webkit-scrollbar\s*\{[^}]*display:\s*none;[^}]*width:\s*0;/)
+  assert.match(css, /\.note-list-scrollbar\s*\{[^}]*position:\s*absolute;/)
+  assert.match(css, /\.note-list-scrollbar-thumb\s*\{[^}]*position:\s*absolute;/)
+
+  const source = await readFile(new URL('../package/dist/panel.js', import.meta.url), 'utf8')
+  for (const required of [
+    'createVirtualScrollbar',
+    "scrollable.addEventListener('scroll'",
+    "track.addEventListener('pointerdown'",
+    "thumb.addEventListener('pointerdown'",
+    'noteListVirtualScrollbar.schedule',
+    'editorVirtualScrollbar.schedule',
+  ]) {
+    assert.match(source, new RegExp(escapeRegex(required)))
+  }
 })
 
 test('Ctrl+S in the editor saves and restores the selected list item context', async (t) => {

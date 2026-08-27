@@ -25,17 +25,22 @@
           </button>
         </div>
 
-        <div
-          id="note-list"
-          class="note-list"
-          role="listbox"
-          tabindex="0"
-          aria-label="笔记列表"
-        >
-          <div id="list-empty" class="list-empty" hidden>暂无笔记，按 Ctrl+N 新建</div>
-          <div id="note-list-virtual" class="note-list-virtual" hidden>
-            <div id="note-list-spacer" class="note-list-spacer"></div>
-            <ul id="note-list-viewport" class="note-list-viewport"></ul>
+        <div class="note-list-shell">
+          <div
+            id="note-list"
+            class="note-list"
+            role="listbox"
+            tabindex="0"
+            aria-label="笔记列表"
+          >
+            <div id="list-empty" class="list-empty" hidden>暂无笔记，按 Ctrl+N 新建</div>
+            <div id="note-list-virtual" class="note-list-virtual" hidden>
+              <div id="note-list-spacer" class="note-list-spacer"></div>
+              <ul id="note-list-viewport" class="note-list-viewport"></ul>
+            </div>
+          </div>
+          <div id="note-list-scrollbar" class="note-list-scrollbar" aria-hidden="true">
+            <div id="note-list-scrollbar-thumb" class="note-list-scrollbar-thumb"></div>
           </div>
         </div>
       </aside>
@@ -55,6 +60,9 @@
               spellcheck="false"
               placeholder="在此记录笔记或代码片段…"
             ></textarea>
+            <div id="editor-scrollbar" class="editor-scrollbar" aria-hidden="true">
+              <div id="editor-scrollbar-thumb" class="editor-scrollbar-thumb"></div>
+            </div>
             <button
               id="editor-copy-btn"
               class="editor-copy-button"
@@ -73,6 +81,12 @@
       </section>
     </div>
 
+    <div id="note-actions-menu" class="note-actions-menu" role="menu" aria-label="目录操作" hidden>
+      <button class="note-action" type="button" role="menuitem" data-note-action="rename">重命名</button>
+      <button class="note-action" type="button" role="menuitem" data-note-action="pin">置顶</button>
+      <button class="note-action note-action-danger" type="button" role="menuitem" data-note-action="delete">删除</button>
+    </div>
+
     <dialog id="new-dialog" class="dialog">
       <form id="new-form" method="dialog" class="dialog-body">
         <h3 class="dialog-title">新建笔记</h3>
@@ -87,6 +101,23 @@
         <div class="dialog-actions">
           <button id="new-save-btn" class="btn btn-primary" type="submit" aria-disabled="true">保存</button>
           <button id="new-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="rename-dialog" class="dialog">
+      <form id="rename-form" method="dialog" class="dialog-body">
+        <h3 class="dialog-title">重命名目录</h3>
+        <input
+          id="rename-title-input"
+          class="text-input"
+          type="text"
+          aria-label="目录名称"
+          autocomplete="off"
+        />
+        <div class="dialog-actions">
+          <button id="rename-save-btn" class="btn btn-primary" type="submit" aria-disabled="true">保存</button>
+          <button id="rename-cancel-btn" class="btn btn-ghost" type="button">取消</button>
         </div>
       </form>
     </dialog>

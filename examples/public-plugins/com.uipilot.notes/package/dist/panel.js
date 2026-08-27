@@ -10,22 +10,35 @@ const ITEM_HEIGHT = 52
 const LIST_OVERSCAN = 4
 
 const newBtn = document.querySelector('#new-btn')
+const noteListShell = document.querySelector('.note-list-shell')
 const noteList = document.querySelector('#note-list')
+const noteListScrollbar = document.querySelector('#note-list-scrollbar')
+const noteListScrollbarThumb = document.querySelector('#note-list-scrollbar-thumb')
 const listEmpty = document.querySelector('#list-empty')
 const noteListVirtual = document.querySelector('#note-list-virtual')
 const noteListSpacer = document.querySelector('#note-list-spacer')
 const noteListViewport = document.querySelector('#note-list-viewport')
 const emptyState = document.querySelector('#empty-state')
 const editorPanel = document.querySelector('#editor-panel')
+const editorSurface = document.querySelector('.editor-surface')
 const editorContent = document.querySelector('#editor-content')
+const editorScrollbar = document.querySelector('#editor-scrollbar')
+const editorScrollbarThumb = document.querySelector('#editor-scrollbar-thumb')
 const copyBtn = document.querySelector('#editor-copy-btn')
 const editorStatus = document.querySelector('#editor-status')
+const noteActionsMenu = document.querySelector('#note-actions-menu')
 
 const newDialog = document.querySelector('#new-dialog')
 const newForm = document.querySelector('#new-form')
 const newTitleInput = document.querySelector('#new-title-input')
 const newSaveBtn = document.querySelector('#new-save-btn')
 const newCancelBtn = document.querySelector('#new-cancel-btn')
+
+const renameDialog = document.querySelector('#rename-dialog')
+const renameForm = document.querySelector('#rename-form')
+const renameTitleInput = document.querySelector('#rename-title-input')
+const renameSaveBtn = document.querySelector('#rename-save-btn')
+const renameCancelBtn = document.querySelector('#rename-cancel-btn')
 
 const deleteDialog = document.querySelector('#delete-dialog')
 const deleteForm = document.querySelector('#delete-form')
@@ -45,6 +58,9 @@ let savedContent = ''
 let searchQuery = ''
 let pendingSelectId = null
 let pendingDeleteId = null
+let pendingRenameId = null
+let menuNoteId = null
+let menuOrigin = null
 let unsavedResolver = null
 let listScrollFrame = 0
 let listHasFocus = false
@@ -145,16 +161,30 @@ function createNoteListItem(note) {
 
   selectBtn.append(title)
 
-  const deleteBtn = document.createElement('button')
-  deleteBtn.type = 'button'
-  deleteBtn.className = 'btn note-delete'
-  deleteBtn.tabIndex = -1
-  deleteBtn.title = '删除'
-  deleteBtn.setAttribute('aria-label', `删除 ${note.title}`)
-  deleteBtn.textContent = '×'
-  deleteBtn.dataset.noteId = note.id
+  const moreBtn = document.createElement('button')
+  moreBtn.type = 'button'
+  moreBtn.className = 'btn note-more'
+  moreBtn.tabIndex = -1
+  moreBtn.title = '更多'
+  moreBtn.setAttribute('aria-label', `更多 ${note.title}`)
+  moreBtn.setAttribute('aria-haspopup', 'menu')
+  moreBtn.setAttribute('aria-expanded', 'false')
+  moreBtn.dataset.noteId = note.id
 
-  card.append(selectBtn, deleteBtn)
+  const moreIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  moreIcon.setAttribute('aria-hidden', 'true')
+  moreIcon.setAttribute('viewBox', '0 0 24 24')
+  moreIcon.setAttribute('fill', 'currentColor')
+  for (const cx of [5, 12, 19]) {
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+    dot.setAttribute('cx', String(cx))
+    dot.setAttribute('cy', '12')
+    dot.setAttribute('r', '1.7')
+    moreIcon.append(dot)
+  }
+  moreBtn.append(moreIcon)
+
+  card.append(selectBtn, moreBtn)
   item.append(card)
   return item
 }
@@ -203,8 +233,119 @@ function scheduleVirtualListRender() {
   })
 }
 
+function createVirtualScrollbar({ scrollable, surface, track, thumb, hidden = () => false }) {
+  let updateScheduled = false
+  let drag = null
+
+  function update() {
+    const scrollRange = scrollable.scrollHeight - scrollable.clientHeight
+    const trackHeight = track.clientHeight
+    if (hidden() || scrollRange <= 1 || trackHeight <= 0) {
+      surface.classList.remove('is-scrollable')
+      thumb.style.height = ''
+      thumb.style.transform = ''
+      return
+    }
+
+    const thumbHeight = Math.max(24, trackHeight * scrollable.clientHeight / scrollable.scrollHeight)
+    const thumbRange = Math.max(0, trackHeight - thumbHeight)
+    const thumbTop = thumbRange * scrollable.scrollTop / scrollRange
+    thumb.style.height = `${thumbHeight}px`
+    thumb.style.transform = `translateY(${thumbTop}px)`
+    surface.classList.add('is-scrollable')
+  }
+
+  function schedule() {
+    if (updateScheduled) {
+      return
+    }
+    updateScheduled = true
+    window.requestAnimationFrame(() => {
+      updateScheduled = false
+      update()
+    })
+  }
+
+  scrollable.addEventListener('scroll', schedule, { passive: true })
+  track.addEventListener('wheel', (event) => {
+    event.preventDefault()
+    scrollable.scrollTop += event.deltaY
+  }, { passive: false })
+  track.addEventListener('pointerdown', (event) => {
+    if (event.target === thumb) {
+      return
+    }
+    event.preventDefault()
+    const trackRect = track.getBoundingClientRect()
+    const thumbRect = thumb.getBoundingClientRect()
+    const thumbRange = Math.max(0, trackRect.height - thumbRect.height)
+    const scrollRange = Math.max(0, scrollable.scrollHeight - scrollable.clientHeight)
+    if (thumbRange === 0 || scrollRange === 0) {
+      return
+    }
+    const thumbTop = Math.min(
+      thumbRange,
+      Math.max(0, event.clientY - trackRect.top - thumbRect.height / 2),
+    )
+    scrollable.scrollTop = scrollRange * thumbTop / thumbRange
+  })
+  thumb.addEventListener('pointerdown', (event) => {
+    event.preventDefault()
+    drag = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startScrollTop: scrollable.scrollTop,
+    }
+    thumb.classList.add('is-dragging')
+    thumb.setPointerCapture?.(event.pointerId)
+  })
+  thumb.addEventListener('pointermove', (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return
+    }
+    const thumbRange = track.clientHeight - thumb.clientHeight
+    const scrollRange = scrollable.scrollHeight - scrollable.clientHeight
+    if (thumbRange <= 0 || scrollRange <= 0) {
+      return
+    }
+    scrollable.scrollTop = drag.startScrollTop
+      + (event.clientY - drag.startY) * scrollRange / thumbRange
+  })
+
+  function finishDrag(event) {
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return
+    }
+    drag = null
+    thumb.classList.remove('is-dragging')
+    if (event.type !== 'lostpointercapture' && thumb.hasPointerCapture?.(event.pointerId)) {
+      thumb.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  thumb.addEventListener('pointerup', finishDrag)
+  thumb.addEventListener('pointercancel', finishDrag)
+  thumb.addEventListener('lostpointercapture', finishDrag)
+  return Object.freeze({ schedule })
+}
+
+const noteListVirtualScrollbar = createVirtualScrollbar({
+  scrollable: noteList,
+  surface: noteListShell,
+  track: noteListScrollbar,
+  thumb: noteListScrollbarThumb,
+})
+const editorVirtualScrollbar = createVirtualScrollbar({
+  scrollable: editorContent,
+  surface: editorSurface,
+  track: editorScrollbar,
+  thumb: editorScrollbarThumb,
+  hidden: () => editorPanel.hidden,
+})
+
 function renderList() {
   renderVirtualList()
+  noteListVirtualScrollbar.schedule()
 }
 
 function renderEditor() {
@@ -215,6 +356,7 @@ function renderEditor() {
     editorContent.value = ''
     savedContent = ''
     setStatus('')
+    editorVirtualScrollbar.schedule()
     return
   }
 
@@ -223,6 +365,7 @@ function renderEditor() {
   editorContent.value = note.content
   savedContent = note.content
   setStatus('')
+  editorVirtualScrollbar.schedule()
 }
 
 function render() {
@@ -274,7 +417,72 @@ async function loadNotes(token) {
   }
 }
 
+function closeNoteActionsMenu({ restoreFocus = false } = {}) {
+  const origin = menuOrigin
+  noteActionsMenu.hidden = true
+  noteActionsMenu.style.left = ''
+  noteActionsMenu.style.top = ''
+  origin?.setAttribute('aria-expanded', 'false')
+  menuNoteId = null
+  menuOrigin = null
+  if (restoreFocus && origin?.isConnected) {
+    origin.focus()
+  }
+}
+
+function openNoteActionsMenu(origin, noteId) {
+  if (!noteActionsMenu.hidden && menuNoteId === noteId) {
+    closeNoteActionsMenu({ restoreFocus: true })
+    return
+  }
+  closeNoteActionsMenu()
+  const note = notes.find((item) => item.id === noteId)
+  if (!note) {
+    return
+  }
+
+  menuNoteId = noteId
+  menuOrigin = origin
+  origin.setAttribute('aria-expanded', 'true')
+  noteActionsMenu.hidden = false
+  const originRect = origin.getBoundingClientRect()
+  const menuWidth = noteActionsMenu.offsetWidth || 120
+  const menuHeight = noteActionsMenu.offsetHeight || 112
+  const left = Math.min(
+    Math.max(8, originRect.right - menuWidth),
+    Math.max(8, window.innerWidth - menuWidth - 8),
+  )
+  const below = originRect.bottom + 4
+  const top = below + menuHeight <= window.innerHeight - 8
+    ? below
+    : Math.max(8, originRect.top - menuHeight - 4)
+  noteActionsMenu.style.left = `${left}px`
+  noteActionsMenu.style.top = `${top}px`
+  noteActionsMenu.querySelector('[role="menuitem"]')?.focus()
+}
+
+function openRenameDialog(noteId) {
+  const note = notes.find((item) => item.id === noteId)
+  if (!note) {
+    return
+  }
+  pendingRenameId = noteId
+  renameTitleInput.value = note.title
+  renameSaveBtn.setAttribute('aria-disabled', 'false')
+  renameDialog.showModal()
+  renameTitleInput.focus()
+  renameTitleInput.select()
+}
+
+function closeRenameDialog() {
+  pendingRenameId = null
+  renameDialog.close()
+  renameTitleInput.value = ''
+  renameSaveBtn.setAttribute('aria-disabled', 'true')
+}
+
 function openNewDialog() {
+  closeNoteActionsMenu()
   newTitleInput.value = ''
   newSaveBtn.setAttribute('aria-disabled', 'true')
   newDialog.showModal()
@@ -310,6 +518,49 @@ async function createNote(title) {
   }
   editorContent.focus()
   clearStatusLater('已创建')
+}
+
+async function renameNote(noteId, title) {
+  const trimmedTitle = title.trim()
+  if (!trimmedTitle || !notes.some((note) => note.id === noteId)) {
+    return false
+  }
+  const token = sessionToken
+  notes = notes.map((note) => note.id === noteId ? { ...note, title: trimmedTitle } : note)
+  renderList()
+  const persisted = await persistNotes(token)
+  if (!persisted) {
+    return false
+  }
+  clearStatusLater('已重命名')
+  focusNoteList()
+  return true
+}
+
+function nextPinnedAt() {
+  const latestPinnedAt = notes.reduce((latest, note) => {
+    const timestamp = typeof note.pinnedAt === 'string' ? Date.parse(note.pinnedAt) : Number.NaN
+    return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest
+  }, 0)
+  return new Date(Math.max(Date.now(), latestPinnedAt + 1)).toISOString()
+}
+
+async function pinNote(noteId) {
+  if (!notes.some((note) => note.id === noteId)) {
+    return false
+  }
+  const token = sessionToken
+  const pinnedAt = nextPinnedAt()
+  notes = sortNotes(notes.map((note) => note.id === noteId ? { ...note, pinnedAt } : note))
+  noteList.scrollTop = 0
+  renderList()
+  const persisted = await persistNotes(token)
+  if (!persisted) {
+    return false
+  }
+  clearStatusLater('已置顶')
+  focusNoteList()
+  return true
 }
 
 function requestUnsavedDecision() {
@@ -367,6 +618,7 @@ async function saveCurrentNote() {
 }
 
 function openDeleteDialog(noteId) {
+  closeNoteActionsMenu()
   const note = notes.find((item) => item.id === noteId)
   if (!note) {
     return
@@ -390,6 +642,7 @@ async function deleteNote(noteId) {
     return
   }
   clearStatusLater('已删除')
+  focusNoteList()
 }
 
 function hidePanelAfterListCopy() {
@@ -446,7 +699,7 @@ function copyEditorContent({ onSuccess, preferSync = false } = {}) {
 }
 
 function isDialogOpen() {
-  return newDialog.open || deleteDialog.open || unsavedDialog.open
+  return !noteActionsMenu.hidden || newDialog.open || renameDialog.open || deleteDialog.open || unsavedDialog.open
 }
 
 function isFocusInList(target) {
@@ -626,8 +879,16 @@ function handleShortcut(event) {
 }
 
 function closeOrdinaryDialogsOnEscape() {
+  if (!noteActionsMenu.hidden) {
+    closeNoteActionsMenu({ restoreFocus: true })
+    return true
+  }
   if (newDialog.open) {
     closeNewDialog()
+    return true
+  }
+  if (renameDialog.open) {
+    closeRenameDialog()
     return true
   }
   if (deleteDialog.open) {
@@ -723,7 +984,10 @@ document.addEventListener(
   true,
 )
 
-noteList.addEventListener('scroll', scheduleVirtualListRender, { passive: true })
+noteList.addEventListener('scroll', () => {
+  scheduleVirtualListRender()
+  closeNoteActionsMenu()
+}, { passive: true })
 
 noteList.addEventListener('focus', () => {
   listHasFocus = true
@@ -734,12 +998,19 @@ noteList.addEventListener('keydown', (event) => {
   tryCopyFromList(event)
 }, true)
 
-noteList.addEventListener('blur', () => {
+noteList.addEventListener('blur', (event) => {
+  if (event.relatedTarget instanceof Node && noteList.contains(event.relatedTarget)) {
+    return
+  }
   listHasFocus = false
-  renderList()
 })
 
 window.addEventListener('resize', scheduleVirtualListRender)
+window.addEventListener('resize', noteListVirtualScrollbar.schedule)
+window.addEventListener('resize', editorVirtualScrollbar.schedule)
+window.addEventListener('resize', closeNoteActionsMenu)
+
+editorContent.addEventListener('input', editorVirtualScrollbar.schedule)
 
 newBtn.addEventListener('click', () => {
   if (!isDialogOpen()) {
@@ -765,14 +1036,34 @@ newForm.addEventListener('submit', async (event) => {
   await createNote(title)
 })
 
+renameTitleInput.addEventListener('input', () => {
+  renameSaveBtn.setAttribute('aria-disabled', String(renameTitleInput.value.trim().length === 0))
+})
+
+renameCancelBtn.addEventListener('click', () => {
+  closeRenameDialog()
+  focusNoteList()
+})
+
+renameForm.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  const noteId = pendingRenameId
+  const title = renameTitleInput.value
+  if (!noteId || !title.trim()) {
+    return
+  }
+  closeRenameDialog()
+  await renameNote(noteId, title)
+})
+
 noteListViewport.addEventListener('click', async (event) => {
   const target = event.target
   if (!(target instanceof Element)) {
     return
   }
-  const deleteButton = target.closest('[data-note-id].note-delete')
-  if (deleteButton instanceof HTMLButtonElement) {
-    openDeleteDialog(deleteButton.dataset.noteId)
+  const moreButton = target.closest('[data-note-id].note-more')
+  if (moreButton instanceof HTMLButtonElement) {
+    openNoteActionsMenu(moreButton, moreButton.dataset.noteId)
     return
   }
   const selectButton = target.closest('[data-note-id].note-select')
@@ -782,6 +1073,52 @@ noteListViewport.addEventListener('click', async (event) => {
     focusNoteList()
   }
 })
+
+noteActionsMenu.addEventListener('click', (event) => {
+  const target = event.target
+  if (!(target instanceof Element)) {
+    return
+  }
+  const actionButton = target.closest('[data-note-action]')
+  if (!(actionButton instanceof HTMLButtonElement) || !menuNoteId) {
+    return
+  }
+  const noteId = menuNoteId
+  const action = actionButton.dataset.noteAction
+  closeNoteActionsMenu()
+  if (action === 'rename') {
+    openRenameDialog(noteId)
+  } else if (action === 'pin') {
+    void pinNote(noteId)
+  } else if (action === 'delete') {
+    openDeleteDialog(noteId)
+  }
+})
+
+noteActionsMenu.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
+    return
+  }
+  event.preventDefault()
+  const items = [...noteActionsMenu.querySelectorAll('[role="menuitem"]')]
+  const currentIndex = items.indexOf(document.activeElement)
+  const delta = event.key === 'ArrowDown' ? 1 : -1
+  const nextIndex = (currentIndex + delta + items.length) % items.length
+  items[nextIndex]?.focus()
+})
+
+document.addEventListener('pointerdown', (event) => {
+  if (noteActionsMenu.hidden || !(event.target instanceof Node)) {
+    return
+  }
+  if (noteActionsMenu.contains(event.target)) {
+    return
+  }
+  if (event.target instanceof Element && event.target.closest('.note-more')) {
+    return
+  }
+  closeNoteActionsMenu()
+}, true)
 
 deleteCancelBtn.addEventListener('click', () => {
   pendingDeleteId = null
