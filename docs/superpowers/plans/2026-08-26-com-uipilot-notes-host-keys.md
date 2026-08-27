@@ -11,8 +11,8 @@ within 2s. Escape uses sync `preventDefault` only when canceling dialogs or
 starting unsaved confirm; clean Escape is left to Host. Confirmed save/discard
 on Escape-driven unsaved flow calls parameterless `requestHide()`.
 
-**Governing specs:**  
-`docs/superpowers/specs/2026-08-26-public-plugin-panel-key-routing-and-hide-design.md`  
+**Governing specs:**
+`docs/superpowers/specs/2026-08-26-public-plugin-panel-key-routing-and-hide-design.md`
 (plus panel mode / focusHostInput specs). Fixture: `com.uipilot.demo-panel`.
 
 ## Constraints
@@ -52,7 +52,7 @@ feature slice). Dependency: Task 1 → Task 2 → Task 3.
 - **Implementation points:** register `onHostKey` before `onUpdate`; fire-and-forget
   navigation/new; Escape sync arbitration; Escape-unsaved path calls
   `requestHide()` once after save/discard.
-- **Verify:**  
+- **Verify:**
   `node --test --experimental-test-isolation=none examples/public-plugins/com.uipilot.notes/tests/runtime.test.js`
 
 ### Task 3: Package validate and ship commit
