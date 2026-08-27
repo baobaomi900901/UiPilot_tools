@@ -5,6 +5,9 @@ mod data_call_gate;
 mod delayed_messages;
 mod icon;
 mod manifest;
+// Task 4 wires the verified transport behind PluginHttpsBroker.
+#[allow(dead_code)]
+mod network;
 mod owner_cleanup;
 mod package;
 mod runtime;
