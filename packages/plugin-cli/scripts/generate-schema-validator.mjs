@@ -25,7 +25,17 @@ function inlineNumericFormats(value) {
   for (const child of Object.values(value)) inlineNumericFormats(child)
 }
 
+function inlinePanelHostKeyDeclaration(value) {
+  const declaration = value?.$defs?.PanelHostKeyDeclaration
+  const items = value?.$defs?.PublicPanelV1?.properties?.hostKeys?.items
+  if (!declaration || items?.$ref !== '#/$defs/PanelHostKeyDeclaration') {
+    throw new Error('panel host key Schema shape is invalid')
+  }
+  value.$defs.PublicPanelV1.properties.hostKeys.items = structuredClone(declaration)
+}
+
 inlineNumericFormats(schema)
+inlinePanelHostKeyDeclaration(schema)
 const ajv = new Ajv2020({
   strict: true,
   allErrors: true,
