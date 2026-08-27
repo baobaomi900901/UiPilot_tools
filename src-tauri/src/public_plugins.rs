@@ -198,6 +198,7 @@ impl PublicPluginService {
 
     pub(crate) fn shutdown(&self) {
         if let Some(manager) = self.manager.get() {
+            manager.shutdown_network();
             manager.shutdown_delayed_messages();
             manager.shutdown_timers();
         }
@@ -331,7 +332,7 @@ impl PublicPluginService {
                 recovery: Some(recovery),
             });
         }
-        let outcome = match self.manager()?.scheduler().enqueue_reserved(request, now) {
+        let outcome = match self.manager()?.enqueue_reserved(request, now) {
             Ok(outcome) => outcome,
             Err(_) => {
                 self.settle_submission(&token, None);
@@ -521,7 +522,6 @@ impl PublicPluginService {
         drop(recoveries);
         let dispatch = self
             .manager()?
-            .scheduler()
             .enqueue_reserved(request, now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let PluginScheduleOutcome::Dispatched(dispatch) = dispatch else {
@@ -707,8 +707,7 @@ impl PublicPluginService {
     ) -> Result<(), PublicPluginManagementError> {
         let replacements = self
             .manager()?
-            .scheduler()
-            .expire_timeouts(now)
+            .expire_network_timeouts(now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         for replacement in replacements {
             self.settle_request(
@@ -767,8 +766,7 @@ impl PublicPluginService {
             }
             let next = self
                 .manager()?
-                .scheduler()
-                .runtime_replaced(
+                .finish_runtime_replacement(
                     &replacement.plugin_id,
                     replacement.new_generation,
                     candidate.activation_id,
@@ -837,8 +835,7 @@ impl PublicPluginService {
     ) -> Result<Option<ScheduledPluginRequest>, PublicPluginManagementError> {
         let mut next = self
             .manager()?
-            .scheduler()
-            .cancel(context, now)
+            .cancel_scheduled_request(context, now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.settle_submission(submission_token, Some(Err(PluginRuntimeError::Unavailable)));
         while let Some(candidate) = next.as_ref() {
@@ -856,8 +853,7 @@ impl PublicPluginService {
             self.settle_submission(&token, Some(Err(PluginRuntimeError::Unavailable)));
             next = self
                 .manager()?
-                .scheduler()
-                .cancel(&context, now)
+                .cancel_scheduled_request(&context, now)
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
         }
         Ok(next)
@@ -1053,6 +1049,9 @@ impl PublicPluginService {
         )
         .is_err()
         {
+            if let Ok(manager) = self.manager() {
+                manager.invalidate_runtime_generation(&candidate.plugin_id, candidate.generation);
+            }
             let _ = window.destroy();
             return Err(PublicPluginManagementError::RuntimeNotReady);
         }
@@ -1071,14 +1070,31 @@ impl PublicPluginService {
         if *settled == Some(true) {
             Ok(window)
         } else {
+            if let Ok(manager) = self.manager() {
+                manager.invalidate_runtime_generation(&candidate.plugin_id, candidate.generation);
+            }
             let _ = window.destroy();
             Err(PublicPluginManagementError::RuntimeNotReady)
         }
     }
 
     pub(crate) fn destroy_runtime(app: &AppHandle, label: Option<&str>) {
+        if let Some(label) = label {
+            if let Some(service) = app.try_state::<Arc<PublicPluginService>>() {
+                service.invalidate_runtime_label(label);
+            }
+        }
         if let Some(window) = label.and_then(|label| app.get_webview_window(label)) {
             let _ = window.destroy();
+        }
+    }
+
+    fn invalidate_runtime_label(&self, label: &str) {
+        let Some(identity) = parse_runtime_label(label) else {
+            return;
+        };
+        if let Ok(manager) = self.manager() {
+            manager.invalidate_runtime_generation(&identity.plugin_id, identity.generation);
         }
     }
 

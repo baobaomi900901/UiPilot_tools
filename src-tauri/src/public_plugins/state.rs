@@ -47,7 +47,6 @@ pub(crate) struct EffectivePluginConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Wired into the authority gate in Task 5.
 pub(crate) struct PluginNetworkGrantSnapshot {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
@@ -55,7 +54,6 @@ pub(crate) struct PluginNetworkGrantSnapshot {
 }
 
 impl EffectivePluginConfig {
-    #[allow(dead_code)] // Wired into the authority gate in Task 5.
     pub(crate) fn network_grant_snapshot(
         &self,
         manifest: &PublicManifestV1,
@@ -180,6 +178,12 @@ pub(crate) struct PreparedStateCommit {
     previous: Option<StoredState>,
     candidate: StoredState,
     remove_after_publish: bool,
+}
+
+impl PreparedStateCommit {
+    pub(crate) fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

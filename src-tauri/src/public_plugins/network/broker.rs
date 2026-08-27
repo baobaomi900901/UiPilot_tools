@@ -96,10 +96,10 @@ pub(crate) enum PluginNetworkErrorCode {
     ExpiredRequest,
 }
 
-pub(super) type RedirectAuthority =
+pub(crate) type RedirectAuthority =
     Arc<dyn Fn(&PluginNetworkCallIdentity, &str) -> bool + Send + Sync>;
 
-pub(super) struct PluginHttpsBroker {
+pub(crate) struct PluginHttpsBroker {
     registry: PluginNetworkRequestRegistry,
     resolver: BoundedDnsResolver,
     transport: Arc<dyn HttpsTransport>,
@@ -117,12 +117,19 @@ struct ValidatedRequest {
     started: StdInstant,
 }
 
-pub(super) struct PreparedPluginNetworkCall {
+pub(crate) struct PreparedPluginNetworkCall {
     request: ValidatedRequest,
     call: RegisteredPluginNetworkCall,
 }
 
-pub(super) struct PendingPluginNetworkResponse {
+#[cfg(test)]
+impl PreparedPluginNetworkCall {
+    pub(crate) fn is_cancelled_for_test(&self) -> bool {
+        self.call.cancellation().is_cancelled()
+    }
+}
+
+pub(crate) struct PendingPluginNetworkResponse {
     response: PluginNetworkResponse,
     call: RegisteredPluginNetworkCall,
     method: PluginNetworkRequestMethod,
@@ -177,7 +184,7 @@ impl PluginHttpsBroker {
         ))
     }
 
-    fn with_dependencies<T>(
+    pub(super) fn with_dependencies<T>(
         registry: PluginNetworkRequestRegistry,
         resolver: BoundedDnsResolver,
         transport: Arc<T>,
@@ -313,6 +320,49 @@ impl PluginHttpsBroker {
 
     pub(super) fn cancel_context(&self, context: &PluginNetworkContextIdentity) -> usize {
         self.registry.cancel_context(context)
+    }
+
+    pub(super) fn cancel_request_context(
+        &self,
+        plugin_id: &str,
+        plugin_generation: u64,
+        request_id: &str,
+    ) -> usize {
+        self.registry
+            .cancel_request_context(plugin_id, plugin_generation, request_id)
+    }
+
+    pub(super) fn cancel_runtime(
+        &self,
+        plugin_id: &str,
+        plugin_generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> usize {
+        self.registry
+            .cancel_runtime(plugin_id, plugin_generation, activation_id, admission_epoch)
+    }
+
+    pub(super) fn cancel_generation(&self, plugin_id: &str, plugin_generation: u64) -> usize {
+        self.registry
+            .cancel_generation(plugin_id, plugin_generation)
+    }
+
+    pub(super) fn publish_plugin_authority(
+        &self,
+        plugin_id: &str,
+        retained: Option<(u64, u64, u64)>,
+    ) -> usize {
+        self.registry.cancel_plugin_except(plugin_id, retained)
+    }
+
+    pub(super) fn shutdown(&self) -> usize {
+        self.registry.shutdown()
+    }
+
+    #[cfg(test)]
+    pub(super) fn global_active_for_test(&self) -> usize {
+        self.registry.global_active_for_test()
     }
 
     #[cfg(test)]

@@ -51,7 +51,7 @@ impl PluginNetworkContextIdentity {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct PluginNetworkCallIdentity {
+pub(crate) struct PluginNetworkCallIdentity {
     pub(super) context: PluginNetworkContextIdentity,
     pub(super) call_sequence: u64,
 }
@@ -241,36 +241,109 @@ impl PluginNetworkRequestRegistry {
     }
 
     pub(super) fn cancel_context(&self, context: &PluginNetworkContextIdentity) -> usize {
+        self.cancel_matching(|candidate| candidate == context, false)
+    }
+
+    pub(super) fn cancel_request_context(
+        &self,
+        plugin_id: &str,
+        plugin_generation: u64,
+        request_id: &str,
+    ) -> usize {
+        self.cancel_matching(
+            |context| {
+                context.plugin_id == plugin_id
+                    && context.plugin_generation == plugin_generation
+                    && context.request_id == request_id
+            },
+            false,
+        )
+    }
+
+    pub(super) fn cancel_runtime(
+        &self,
+        plugin_id: &str,
+        plugin_generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> usize {
+        self.cancel_matching(
+            |context| {
+                context.plugin_id == plugin_id
+                    && context.plugin_generation == plugin_generation
+                    && context.activation_id == activation_id
+                    && context.admission_epoch == admission_epoch
+            },
+            false,
+        )
+    }
+
+    pub(super) fn cancel_generation(&self, plugin_id: &str, plugin_generation: u64) -> usize {
+        self.cancel_matching(
+            |context| {
+                context.plugin_id == plugin_id && context.plugin_generation == plugin_generation
+            },
+            false,
+        )
+    }
+
+    pub(super) fn cancel_plugin_except(
+        &self,
+        plugin_id: &str,
+        retained: Option<(u64, u64, u64)>,
+    ) -> usize {
+        self.cancel_matching(
+            |context| {
+                context.plugin_id == plugin_id
+                    && retained.is_none_or(|(generation, activation_id, admission_epoch)| {
+                        context.plugin_generation != generation
+                            || context.activation_id != activation_id
+                            || context.admission_epoch != admission_epoch
+                    })
+            },
+            false,
+        )
+    }
+
+    pub(super) fn shutdown(&self) -> usize {
+        self.cancel_matching(|_| true, true)
+    }
+
+    fn cancel_matching(
+        &self,
+        mut predicate: impl FnMut(&PluginNetworkContextIdentity) -> bool,
+        terminal: bool,
+    ) -> usize {
         let Ok(mut state) = self.lock() else {
             return 0;
         };
-        let Some(usage) = state.contexts.get_mut(context) else {
-            return 0;
-        };
-        usage.retired = true;
+        if terminal {
+            state.terminal = true;
+        }
+        for (context, usage) in &mut state.contexts {
+            if predicate(context) {
+                usage.retired = true;
+            }
+        }
         let identities = state
             .calls
             .keys()
-            .filter(|identity| identity.context == *context)
+            .filter(|identity| predicate(&identity.context))
             .cloned()
             .collect::<Vec<_>>();
         for identity in &identities {
             if let Some(call) = state.calls.remove(identity) {
                 call.cancellation.cancel();
-                let _ = release_slot(&mut state, context);
+                let _ = release_slot(&mut state, &identity.context);
                 #[cfg(test)]
                 state
                     .terminals
                     .insert(identity.clone(), PluginNetworkCallTerminal::Cancelled);
             }
         }
-        if state
+        state
             .contexts
-            .get(context)
-            .is_some_and(|usage| usage.active == 0)
-        {
-            state.contexts.remove(context);
-        }
+            .retain(|context, usage| !(usage.active == 0 && predicate(context)));
         identities.len()
     }
 
@@ -321,6 +394,11 @@ impl PluginNetworkRequestRegistry {
             state.contexts.get(context).map_or(0, |usage| usage.active),
             state.global_active,
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn global_active_for_test(&self) -> usize {
+        self.lock().unwrap().global_active
     }
 
     #[cfg(test)]
