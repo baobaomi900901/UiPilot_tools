@@ -372,6 +372,7 @@ export interface FindClient {
     invocationId: string
     querySequence: number
   }): Promise<FileSearchResponse | null>
+  loadThumbnail(input: { requestId: string; resultId: string }): Promise<unknown>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   setPinned(input: { invocationId: string; pinned: boolean }): Promise<{ pinned: boolean }>
   setPreviewPreference(input: { preference: { enabled: boolean } }): Promise<unknown>
@@ -1105,6 +1106,19 @@ export function parseFindForwardPayload(value: unknown): FindForwardPayload | nu
       typeof payload.invocationId !== 'string' || payload.invocationId.length === 0 ||
       typeof payload.query !== 'string' || !forwardSequence) return null
   return { invocationId: payload.invocationId, forwardSequence, query: payload.query }
+}
+
+const FIND_THUMBNAIL_PREFIX = 'data:image/png;base64,'
+const FIND_THUMBNAIL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
+export function parseFindThumbnailDataUrl(value: unknown): string | null {
+  if (
+    typeof value !== 'string' ||
+    value.length > 524_320 ||
+    !value.startsWith(FIND_THUMBNAIL_PREFIX)
+  ) return null
+  const payload = value.slice(FIND_THUMBNAIL_PREFIX.length)
+  return payload.length > 0 && FIND_THUMBNAIL_BASE64.test(payload) ? value : null
 }
 
 export function parseFindReadyOutcome(value: unknown): FindReadyOutcome | null {

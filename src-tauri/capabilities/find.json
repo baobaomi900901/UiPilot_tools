@@ -11,6 +11,7 @@
     "allow-get-find-ready-status",
     "allow-set-find-pinned",
     "allow-set-find-preview-preference",
+    "allow-load-find-thumbnail",
     "allow-hide-find-window",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

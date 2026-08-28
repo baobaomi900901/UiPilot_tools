@@ -4,6 +4,7 @@ import {
   parseFindForwardPayload,
   parseFindPreviewPreferenceResult,
   parseFindReadyOutcome,
+  parseFindThumbnailDataUrl,
   parseFindThemeChanged,
   type CommandErrorCode,
   type FileCategory,
@@ -30,6 +31,8 @@ export interface FindSnapshot {
   sort: FileSort
   previewEnabled: boolean
   previewPending: boolean
+  thumbnailDataUrl?: string
+  thumbnailPending: boolean
   pinned: boolean
   pinPending: boolean
   total: string
@@ -73,6 +76,8 @@ interface Model {
   sort: FileSort
   previewEnabled: boolean
   previewPending: boolean
+  thumbnailDataUrl?: string
+  thumbnailPending: boolean
   pinned: boolean
   pinPending: boolean
   total: string
@@ -99,6 +104,7 @@ const ERROR_TEXT: Partial<Record<CommandErrorCode, string>> = {
 const FALLBACK_ERROR = '操作不可用，请重试。'
 const PREVIEW_ERROR = '无法保存文件预览设置。'
 const READY_ERROR = '文件搜索暂不可用。'
+const PREVIEW_IMAGE_EXTENSION = /\.(?:bmp|gif|heic|jpe?g|png|svg|tiff?|webp)$/iu
 
 function errorText(value: unknown): string {
   if (typeof value !== 'object' || value === null) return FALLBACK_ERROR
@@ -123,6 +129,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     sort: 'modifiedDesc',
     previewEnabled: true,
     previewPending: false,
+    thumbnailPending: false,
     pinned: false,
     pinPending: false,
     total: '0',
@@ -148,6 +155,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   let operationToken = 0
   let searchOwner = 0
   let previewOwner = 0
+  let thumbnailOwner = 0
   let pinOwner = 0
   let executeOwner = 0
   let hideOwner = 0
@@ -162,6 +170,8 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       sort: model.sort,
       previewEnabled: model.previewEnabled,
       previewPending: model.previewPending,
+      ...(model.thumbnailDataUrl ? { thumbnailDataUrl: model.thumbnailDataUrl } : {}),
+      thumbnailPending: model.thumbnailPending,
       pinned: model.pinned,
       pinPending: model.pinPending,
       total: model.total,
@@ -181,10 +191,58 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   }
 
   function clearResults(): void {
+    clearThumbnail()
     model.requestId = undefined
     model.results = []
     model.selectedIndex = -1
     model.total = '0'
+  }
+
+  function clearThumbnail(): void {
+    thumbnailOwner = ++operationToken
+    model.thumbnailDataUrl = undefined
+    model.thumbnailPending = false
+  }
+
+  function beginThumbnail(): void {
+    clearThumbnail()
+    const invocationId = model.invocationId
+    const requestId = model.requestId
+    const selected = model.results[model.selectedIndex]
+    if (
+      !model.previewEnabled || !model.ready || !invocationId || !requestId || !selected ||
+      selected.view.kind !== 'file' || !PREVIEW_IMAGE_EXTENSION.test(selected.view.name)
+    ) {
+      publish()
+      return
+    }
+    const owner = ++operationToken
+    thumbnailOwner = owner
+    const resultId = selected.resultId
+    model.thumbnailPending = true
+    publish()
+    let pending
+    try {
+      pending = client.loadThumbnail({ requestId, resultId })
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    const owns = () => !destroyed && owner === thumbnailOwner && invocationId === model.invocationId &&
+      requestId === model.requestId && resultId === model.results[model.selectedIndex]?.resultId
+    void pending.then(
+      (raw) => {
+        if (!owns()) return
+        model.thumbnailPending = false
+        model.thumbnailDataUrl = parseFindThumbnailDataUrl(raw) ?? undefined
+        publish()
+      },
+      () => {
+        if (!owns()) return
+        model.thumbnailPending = false
+        model.thumbnailDataUrl = undefined
+        publish()
+      },
+    )
   }
 
   function invocationClosed(): void {
@@ -252,6 +310,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         model.selectedIndex = model.results.length ? 0 : -1
         model.status = statusText(response.status, model.results.length > 0)
         publish()
+        beginThumbnail()
       },
       (error: unknown) => {
         if (destroyed || owner !== searchOwner || invocationId !== model.invocationId ||
@@ -409,7 +468,9 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     model.previewEnabled = enabled
     model.previewPending = true
     model.status = ''
+    if (!enabled) clearThumbnail()
     publish()
+    if (enabled) beginThumbnail()
     let pending
     try {
       pending = client.setPreviewPreference({ preference: { enabled } })
@@ -472,7 +533,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   function select(index: number): void {
     if (!model.ready || model.executePending || index < 0 || index >= model.results.length || index === model.selectedIndex) return
     model.selectedIndex = index
-    publish()
+    beginThumbnail()
   }
 
   function executeSelection(): void {
@@ -539,7 +600,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     if (!model.results.length) return
     const offset = key === 'ArrowDown' ? 1 : -1
     model.selectedIndex = (model.selectedIndex + offset + model.results.length) % model.results.length
-    publish()
+    beginThumbnail()
   }
 
   function destroy(): void {
@@ -547,6 +608,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     destroyed = true
     searchOwner = ++operationToken
     previewOwner = ++operationToken
+    thumbnailOwner = ++operationToken
     pinOwner = ++operationToken
     executeOwner = ++operationToken
     hideOwner = ++operationToken

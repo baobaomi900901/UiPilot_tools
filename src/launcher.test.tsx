@@ -5653,7 +5653,7 @@ describe('real adapter and startup', () => {
     }
     for (const command of [
       'prepare_find_initialization', 'commit_find_ready', 'get_find_ready_status',
-      'search_files', 'set_find_pinned', 'set_find_preview_preference', 'hide_find_window',
+      'search_files', 'load_find_thumbnail', 'set_find_pinned', 'set_find_preview_preference', 'hide_find_window',
     ]) {
       expect(mainSource.match(new RegExp(`['"]${command}['"]`, 'g'))).toHaveLength(1)
     }

@@ -114,6 +114,27 @@ pub(crate) fn execute_authenticated_path(
     execute_authenticated_path_with_shell(identity, None, execute_shell)
 }
 
+pub(crate) fn with_authenticated_file<T>(
+    identity: &AuthenticatedPathIdentity,
+    read: impl FnOnce(&str) -> T,
+) -> Result<T, FileExecutionError> {
+    if identity.kind != FilePathKind::File {
+        return Err(FileExecutionError::Stale);
+    }
+    execute_authenticated_path_with(
+        identity,
+        None,
+        |relative, kind, _| open_execution_component(&identity.volume_guid_path, relative, kind),
+        |_, _, handle| inspect_execution_component(handle, identity),
+        |path, kind| {
+            if kind != FilePathKind::File {
+                return Err(FileExecutionError::Stale);
+            }
+            Ok(read(path))
+        },
+    )
+}
+
 fn execute_authenticated_path_with_shell<S>(
     identity: &AuthenticatedPathIdentity,
     expected_filesystem_name: Option<&str>,
@@ -131,17 +152,17 @@ where
     )
 }
 
-fn execute_authenticated_path_with<H, O, I, S>(
+fn execute_authenticated_path_with<H, O, I, S, T>(
     identity: &AuthenticatedPathIdentity,
     expected_filesystem_name: Option<&str>,
     open: O,
     inspect: I,
     shell: S,
-) -> Result<FileExecutionOutcome, FileExecutionError>
+) -> Result<T, FileExecutionError>
 where
     O: FnMut(&str, FilePathKind, ExecutionShare) -> Result<H, FileExecutionError>,
     I: FnMut(&str, FilePathKind, &H) -> Result<ComponentObservation, FileExecutionError>,
-    S: FnOnce(&str, FilePathKind) -> Result<FileExecutionOutcome, FileExecutionError>,
+    S: FnOnce(&str, FilePathKind) -> Result<T, FileExecutionError>,
 {
     let (handles, observation) = walk_expected_components_and_observe_with(
         identity,
@@ -283,10 +304,10 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn execute_with_components<H>(
+fn execute_with_components<H, T>(
     handles: Vec<H>,
-    callback: impl FnOnce() -> Result<FileExecutionOutcome, FileExecutionError>,
-) -> Result<FileExecutionOutcome, FileExecutionError> {
+    callback: impl FnOnce() -> Result<T, FileExecutionError>,
+) -> Result<T, FileExecutionError> {
     let _handles = handles;
     callback()
 }

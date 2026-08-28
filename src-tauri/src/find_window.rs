@@ -359,6 +359,7 @@ impl FindWindowController {
     ) -> Option<NativeTransferPlan> {
         let mut core = self.lock();
         Self::expire_locked(&mut core, now);
+        let pinned = core.pinned;
         let origin = match &core.state {
             AdmissionState::Hidden
                 if snapshot.main_focused
@@ -368,9 +369,13 @@ impl FindWindowController {
                 TransferOrigin::Hidden
             }
             AdmissionState::VisibleReady { invocation_id }
-                if !snapshot.main_focused
+                if (!snapshot.main_focused
                     && snapshot.find_focused
-                    && snapshot.foreground == ForegroundWindow::Find =>
+                    && snapshot.foreground == ForegroundWindow::Find)
+                    || (pinned
+                        && snapshot.main_focused
+                        && !snapshot.find_focused
+                        && snapshot.foreground == ForegroundWindow::Main) =>
             {
                 TransferOrigin::Visible {
                     invocation_id: invocation_id.clone(),
@@ -1158,6 +1163,53 @@ mod tests {
             OpenFindCompletion::Unavailable
         );
         assert!(controller.admit_search(&invocation));
+    }
+
+    #[test]
+    fn pinned_visible_find_accepts_transfer_from_refocused_main() {
+        let now = Instant::now();
+        let controller = FindWindowController::default();
+        let registries = ResultRegistries::default();
+        let prior_invocation = make_ready(&controller, &registries, now);
+        assert!(controller.set_pin(&prior_invocation, true));
+
+        let replacement = prepared_open(&controller, &registries, 2, "replacement", now);
+        assert!(replacement.snapshot_required);
+        let plan = controller
+            .admit_queued_transfer(snapshot(true, false, ForegroundWindow::Main), now)
+            .expect("pinned find must accept focus back from the refocused main window");
+
+        assert_eq!(
+            controller.observe_focus(WindowLabel::Main, false),
+            FocusEffect::RecheckNativeSnapshot(plan.transfer_id)
+        );
+        assert_eq!(
+            controller.observe_focus(WindowLabel::Find, true),
+            FocusEffect::RecheckNativeSnapshot(plan.transfer_id)
+        );
+        assert_eq!(
+            controller.confirm_transfer_focus(
+                plan.transfer_id,
+                snapshot(false, true, ForegroundWindow::Find),
+            ),
+            TransferFocusResult::CommitFindScope
+        );
+        let payload = controller
+            .commit_find_scope(plan.transfer_id, &registries)
+            .unwrap();
+        assert_ne!(payload.invocation_id, prior_invocation);
+        assert_eq!(payload.query, "replacement");
+        assert_eq!(
+            controller.finish_forward_emit(plan.transfer_id, true, &registries),
+            ForwardFinish::Visible {
+                snapshot_required: false,
+            }
+        );
+        assert_eq!(
+            replacement.completion.recv().unwrap(),
+            OpenFindCompletion::Forwarded
+        );
+        assert!(controller.pinned());
     }
 
     #[test]

@@ -11,6 +11,7 @@ fn main() {
             "get_find_ready_status",
             "set_find_pinned",
             "set_find_preview_preference",
+            "load_find_thumbnail",
             "hide_find_window",
             "select_public_plugin_directory",
             "list_public_plugins",

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-load-find-thumbnail"
+description = "Enables the load_find_thumbnail command without any pre-configured scope."
+commands.allow = ["load_find_thumbnail"]
+
+[[permission]]
+identifier = "deny-load-find-thumbnail"
+description = "Denies the load_find_thumbnail command without any pre-configured scope."
+commands.deny = ["load_find_thumbnail"]

@@ -55,13 +55,15 @@ function fakeClient() {
   let theme: ((payload: unknown) => void) | undefined
   const unlistenForward = vi.fn()
   const unlistenTheme = vi.fn()
-  const client: FindClient = {
+  const loadThumbnail = vi.fn(async (_input: { requestId: string; resultId: string }): Promise<unknown> => null)
+  const client = {
     listenForward: vi.fn(async (handler) => { order.push('forward-listener'); forward = handler; return unlistenForward }),
     listenThemeChanged: vi.fn(async (handler) => { order.push('theme-listener'); theme = handler; return unlistenTheme }),
     prepareInitialization: vi.fn(async () => { order.push('prepare'); return ready() }),
     commitReady: vi.fn(async ({ initializationToken }) => ({ status: 'ready', initializationToken })),
     getReadyStatus: vi.fn(async ({ initializationToken }) => ({ status: 'ready', initializationToken })),
     searchFiles: vi.fn(async () => null),
+    loadThumbnail,
     executeResult: vi.fn(async () => ({ status: 'fileRevealRequested' }) satisfies ExecuteOutcome),
     setPinned: vi.fn(async ({ pinned }) => ({ pinned })),
     setPreviewPreference: vi.fn(async ({ preference }) => ({
@@ -69,9 +71,10 @@ function fakeClient() {
       filePreviewEnabled: preference.enabled,
     })),
     hide: vi.fn(async () => undefined),
-  }
+  } as unknown as FindClient
   return {
     client,
+    loadThumbnail,
     order,
     emitForward(payload: unknown) { forward?.(payload) },
     emitTheme(payload: unknown) { theme?.(payload) },
@@ -231,6 +234,72 @@ describe('find forwarding and query ownership', () => {
     stale.resolve(fileResponse('Stale.txt', 'request-stale'))
     await stale.promise
     expect(core.getSnapshot().results[0]?.name).toBe('Current.txt')
+  })
+
+  it('loads only the current selected result thumbnail', async () => {
+    const fake = fakeClient()
+    const first = deferred<unknown>()
+    const second = deferred<unknown>()
+    vi.mocked(fake.loadThumbnail)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    const response = fileResponse('First.png')
+    response.total = '2'
+    response.items.push({
+      ...response.items[0]!,
+      resultId: 'result-Second.png',
+      name: 'Second.png',
+      fullPath: String.raw`C:\Private\Second.png`,
+    })
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(response)
+    const core = createFindCore(fake.client)
+    await core.start()
+    fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'png' })
+    await vi.waitFor(() => expect(fake.loadThumbnail).toHaveBeenCalledWith({
+      requestId: 'request-1', resultId: 'result-First.png',
+    }))
+
+    core.select(1)
+    expect(fake.loadThumbnail).toHaveBeenLastCalledWith({
+      requestId: 'request-1', resultId: 'result-Second.png',
+    })
+    first.resolve('data:image/png;base64,RklSU1Q=')
+    await first.promise
+    await Promise.resolve()
+    expect(core.getSnapshot()).not.toHaveProperty('thumbnailDataUrl')
+
+    second.resolve('data:image/png;base64,U0VDT05E')
+    await second.promise
+    await vi.waitFor(() => expect(core.getSnapshot()).toMatchObject({
+      thumbnailPending: false,
+      thumbnailDataUrl: 'data:image/png;base64,U0VDT05E',
+    }))
+  })
+
+  it('clears an image thumbnail when keyboard selection moves to a folder', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.loadThumbnail).mockResolvedValueOnce('data:image/png;base64,SU1BR0U=')
+    const response = fileResponse('Hong-Kong.png')
+    response.total = '2'
+    response.items.push({
+      ...response.items[0]!,
+      resultId: 'result-folder',
+      name: 'Hong-Kong',
+      kind: 'folder',
+      sizeBytes: null,
+      fullPath: String.raw`C:\Private\Hong-Kong`,
+    })
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(response)
+    const core = createFindCore(fake.client)
+    await core.start()
+    fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'Hong-Kong' })
+    await vi.waitFor(() => expect(core.getSnapshot().thumbnailDataUrl).toBe('data:image/png;base64,SU1BR0U='))
+
+    core.keyDown('ArrowDown', false)
+
+    expect(core.getSnapshot()).toMatchObject({ selectedIndex: 1, thumbnailPending: false })
+    expect(core.getSnapshot()).not.toHaveProperty('thumbnailDataUrl')
+    expect(fake.loadThumbnail).toHaveBeenCalledTimes(1)
   })
 })
 

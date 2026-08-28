@@ -416,6 +416,7 @@ pub fn run() {
             commands::get_find_ready_status,
             commands::set_find_pinned,
             commands::set_find_preview_preference,
+            commands::load_find_thumbnail,
             commands::hide_find_window,
             commands::select_public_plugin_directory,
             commands::list_public_plugins,
@@ -694,7 +695,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 67);
+        assert_eq!(production.matches("commands::").count(), 68);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -702,6 +703,7 @@ mod tests {
             "get_find_ready_status",
             "set_find_pinned",
             "set_find_preview_preference",
+            "load_find_thumbnail",
             "hide_find_window",
             "select_public_plugin_directory",
             "list_public_plugins",
@@ -1631,9 +1633,15 @@ mod lib {
             let build = include_str!("../build.rs");
             assert!(!main_capability.contains("\"allow-search-files\""));
             assert!(find_capability.contains("\"allow-search-files\""));
+            assert!(!main_capability.contains("\"allow-load-find-thumbnail\""));
+            assert!(find_capability.contains("\"allow-load-find-thumbnail\""));
             assert!(main_capability.contains("\"allow-execute-result\""));
             assert!(find_capability.contains("\"allow-execute-result\""));
             assert_eq!(production.matches("commands::search_files,").count(), 1);
+            assert_eq!(
+                production.matches("commands::load_find_thumbnail,").count(),
+                1
+            );
             assert_eq!(production.matches("commands::execute_result,").count(), 1);
             for forbidden in ["refresh_files", "refresh-files"] {
                 assert!(!production.contains(forbidden));

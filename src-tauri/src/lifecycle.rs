@@ -1877,7 +1877,8 @@ pub(crate) fn start_find_transfer(
         .set_always_on_top(false)
         .and_then(|()| find.show())
         .and_then(|()| find.set_focus())
-        .and_then(|()| find.as_ref().set_focus());
+        .and_then(|()| find.as_ref().set_focus())
+        .and_then(|()| main.hide());
     if native_result.is_err() {
         if let Some(snapshot) = transfers.rollback(&lease) {
             let _ = main.set_always_on_top(snapshot.always_on_top);
@@ -2347,11 +2348,14 @@ mod tests {
         let webview_focus = transfer
             .find(".and_then(|()| find.as_ref().set_focus())")
             .expect("find webview focus is missing");
+        let hide_main = transfer
+            .find(".and_then(|()| main.hide())")
+            .expect("main hide is missing from the successful find transfer");
         let confirmation = transfer
             .rfind("advance_find_transfer(app, controller, registries, plan.transfer_id)")
             .expect("find transfer confirmation is missing");
         assert!(show < window_focus && window_focus < webview_focus);
-        assert!(webview_focus < confirmation);
+        assert!(webview_focus < hide_main && hide_main < confirmation);
     }
 
     #[test]

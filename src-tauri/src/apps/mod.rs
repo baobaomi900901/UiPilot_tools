@@ -21,6 +21,7 @@ pub(crate) use action::{execute_application, ApplicationActionOutcome};
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 pub(crate) use cache::start_initial_refresh;
 pub(crate) use cache::AppCache;
+pub(crate) use icon::thumbnail_from_path;
 
 pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application> {
     rank::rank(applications, query)

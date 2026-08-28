@@ -193,6 +193,7 @@ export const findClient: FindClient = {
     const response = await invoke<FileSearchResponse | null>('search_files', payload)
     return response === null ? null : parseFileSearchResponse(response)
   },
+  loadThumbnail: (input) => invoke<unknown>('load_find_thumbnail', input),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   setPinned: (input) => invoke('set_find_pinned', { input }),
   setPreviewPreference: async (input) => {

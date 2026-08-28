@@ -3819,6 +3819,50 @@ pub(crate) async fn set_find_preview_preference(
     })
 }
 
+#[tauri::command]
+pub(crate) async fn load_find_thumbnail(
+    window: WebviewWindow,
+    request_id: String,
+    result_id: String,
+    registries: State<'_, ResultRegistries>,
+    controller: State<'_, Arc<FindWindowController>>,
+) -> Result<Option<String>, CommandError> {
+    require_find_window(&window)?;
+    let invocation_id = controller
+        .current_invocation()
+        .ok_or_else(CommandError::stale_request)?;
+    let action = controller
+        .with_visible_admission(&invocation_id, || {
+            registries.find().resolve(&request_id, &result_id)
+        })
+        .ok_or_else(CommandError::stale_request)?
+        .map_err(|error| match error {
+            RegistryError::StaleRequest => CommandError::stale_request(),
+            RegistryError::UnknownResult => CommandError::unknown_result(),
+        })?;
+    let identity = match action {
+        ResultAction::OpenFile(FileExecutionAction::Everything(action)) => {
+            action.identity().clone()
+        }
+        _ => return Ok(None),
+    };
+    let thumbnail = tauri::async_runtime::spawn_blocking(move || {
+        path_auth::with_authenticated_file(&identity, |path| {
+            apps::thumbnail_from_path(&PathBuf::from(path))
+        })
+        .ok()
+        .flatten()
+    })
+    .await
+    .unwrap_or(None);
+    let still_current = controller
+        .with_visible_admission(&invocation_id, || {
+            registries.find().resolve(&request_id, &result_id).is_ok()
+        })
+        .unwrap_or(false);
+    Ok(still_current.then_some(thumbnail).flatten())
+}
+
 #[cfg(test)]
 fn save_settings_core(
     settings: UserSettingsUpdate,
@@ -4316,6 +4360,23 @@ mod tests {
         settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine},
     };
     use tauri_plugin_global_shortcut::Shortcut;
+
+    #[test]
+    fn find_thumbnail_command_is_find_only_and_opaque_id_based() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let marker = ["pub(crate) async fn load_find_", "thumbnail("].concat();
+        let command = source
+            .split(&marker)
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("find thumbnail command is missing");
+        assert!(command.contains("require_find_window(&window)?"));
+        assert!(command.contains("request_id: String"));
+        assert!(command.contains("result_id: String"));
+        assert!(!command.contains("full_path: String"));
+        assert!(command.contains("resolve("));
+        assert!(command.contains("spawn_blocking"));
+    }
 
     #[test]
     fn plugin_network_command_rejects_non_runtime_and_mismatched_callers() {
