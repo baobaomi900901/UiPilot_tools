@@ -304,6 +304,10 @@ label,
   padding-right: 8px;
 }
 
+.settings-tabs .ant-tabs-tab:not(.ant-tabs-tab-active) .settings-message-tab-badge {
+  color: var(--uipilot-ui-muted-foreground);
+}
+
 .launcher-settings-button.ant-btn:not(:disabled):hover {
   color: var(--uipilot-ui-accent-foreground);
   background: var(--uipilot-ui-accent);
@@ -897,16 +901,14 @@ label,
 
 .public-plugin-inventory {
   min-width: 0;
-  margin-bottom: 18px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--uipilot-ui-border);
 }
 
 .public-install-actions,
 .public-prepare,
 .public-name-control,
 .public-secret-control,
-.public-permissions {
+.public-permissions,
+.public-uninstall-options {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -920,6 +922,14 @@ label,
 
 .public-prepare {
   padding: 8px 0 12px;
+}
+
+.public-plugin-filter {
+  margin: 8px 0 10px;
+}
+
+.public-plugin-filter .ant-input-affix-wrapper {
+  width: 100%;
 }
 
 .public-permissions {
@@ -994,6 +1004,18 @@ label,
   min-width: 0;
 }
 
+.public-plugin-icon-cell {
+  flex: 0 0 48px;
+  display: flex;
+  justify-content: center;
+  padding-top: 2px;
+}
+
+.public-plugin-main {
+  display: grid;
+  gap: 8px;
+}
+
 .public-name-control > .ant-input,
 .public-secret-control > .ant-input-affix-wrapper {
   flex: 1 1 auto;
@@ -1006,7 +1028,96 @@ label,
 }
 
 .public-plugin-actions {
-  flex-wrap: wrap;
+  display: grid;
+  justify-items: end;
+}
+
+.public-uninstall-options {
+  flex-direction: column;
+  align-items: stretch;
+  padding-top: 8px;
+}
+
+.public-plugin-row-links {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.public-plugin-row-links .ant-btn-link {
+  height: 22px;
+  padding: 0 4px;
+  font-size: 0.8125rem;
+}
+
+.public-plugin-detail {
+  min-width: 0;
+}
+
+.public-plugin-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  margin-bottom: 14px;
+}
+
+.public-plugin-detail-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.public-plugin-detail-list {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 10px 14px;
+  margin: 0;
+  padding: 20px 0 0 42px;
+}
+
+.public-plugin-detail-list dt {
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.public-plugin-detail-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--uipilot-ui-foreground);
+  font-size: 0.875rem;
+}
+
+.public-detail-name-term,
+.public-detail-name-value {
+  align-self: center;
+}
+
+.public-plugin-detail-items {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.public-detail-name-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 360px;
+}
+
+.public-detail-name-control .ant-input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .plugin-window-shell {
   app-region: drag;
@@ -1084,6 +1195,8 @@ label,
   justify-content: space-between;
   min-height: 32px;
   margin-bottom: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--uipilot-ui-border);
 }
 
 .plugin-inventory-header h2 {
@@ -1117,15 +1230,17 @@ label,
 }
 
 .plugin-title-line {
-  flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
 }
 
 .plugin-title-line h3 {
-  max-width: 100%;
+  min-width: 0;
+  max-width: min(360px, 100%);
   margin: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 0.9375rem;
 }
 
@@ -1133,6 +1248,22 @@ label,
 .plugin-title-line code {
   color: var(--uipilot-ui-muted-foreground);
   font-size: 0.8125rem;
+}
+
+.public-plugin-command {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.public-plugin-command::before {
+  color: var(--uipilot-ui-muted-foreground);
+  content: '|';
+}
+
+.public-plugin-command code {
+  color: var(--uipilot-ui-foreground);
 }
 
 .plugin-version-list {
@@ -1143,10 +1274,12 @@ label,
 
 .plugin-description {
   min-width: 0;
-  padding-top: 6px;
-  overflow-wrap: anywhere;
+  margin: 0;
+  overflow: hidden;
   color: var(--uipilot-ui-muted-foreground);
   font-size: 0.875rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .plugin-description-label {
@@ -1186,7 +1319,7 @@ label,
 }
 
 .plugin-actions {
-  flex: 0 0 168px;
+  flex: 0 0 88px;
   justify-content: flex-end;
   gap: 8px;
   min-height: 32px;
@@ -1234,6 +1367,9 @@ label,
 
   .plugin-item {
     flex-direction: column;
+  }
+  .public-plugin-icon-cell {
+    justify-content: flex-start;
   }
   .public-name-control,
   .public-secret-control,

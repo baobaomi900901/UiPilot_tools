@@ -279,6 +279,7 @@ export type ClassifiedTextRecord =
 
 export interface LauncherClient {
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
+  listenHidden(handler: () => void): Promise<() => void>
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelError(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelReset(handler: (payload: unknown) => void): Promise<() => void>

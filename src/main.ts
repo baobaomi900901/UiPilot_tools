@@ -38,6 +38,7 @@ import {
 
 export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
+  listenHidden: (handler) => listen('launcher://hidden', () => handler()),
   listenMessageStateChanged: (handler) =>
     listen('message-center://state-changed', (event) => handler(event.payload)),
   listenPluginPanelError: (handler) =>

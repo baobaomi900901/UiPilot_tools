@@ -4409,8 +4409,11 @@ pub(crate) fn clear_and_hide_window(
         },
         |position| settings.set_window_position(position).map_err(|_| ()),
     );
-    if result.is_ok() && reason == HideReason::ExplicitReturn {
-        lifecycle.restore_foreground_after_explicit_return();
+    if result.is_ok() {
+        let _ = window.emit("launcher://hidden", ());
+        if reason == HideReason::ExplicitReturn {
+            lifecycle.restore_foreground_after_explicit_return();
+        }
     }
     result
 }
@@ -7378,6 +7381,24 @@ mod tests",
             .and_then(|tail| tail.split("fn clear_and_hide_with(").next())
             .expect("clear_and_hide source markers are missing");
         assert!(body.find("window.is_visible()").unwrap() < body.find("outer_position()").unwrap());
+    }
+
+    #[test]
+    fn shared_clear_and_hide_window_notifies_frontend_after_successful_hide() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let body = source
+            .split("pub(crate) fn clear_and_hide_window(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn clear_and_hide_with(").next())
+            .expect("clear_and_hide_window source markers are missing");
+        let result = body
+            .find("if result.is_ok()")
+            .expect("successful hide branch is missing");
+        let hidden = body
+            .find("window.emit(\"launcher://hidden\", ())")
+            .expect("frontend hidden notification is missing");
+
+        assert!(result < hidden);
     }
 
     #[test]

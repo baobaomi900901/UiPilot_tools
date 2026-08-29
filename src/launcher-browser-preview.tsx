@@ -2,7 +2,15 @@ import { createRoot } from 'react-dom/client'
 
 import { createLauncherCore } from './launcher-core'
 import { LauncherView } from './launcher-view'
-import { parseU64Decimal, type LauncherClient, type ResultItem, type SearchResponse, type SettingsView } from './protocol'
+import {
+  parseU64Decimal,
+  type LauncherClient,
+  type PluginInventorySnapshot,
+  type PublicPluginInventory,
+  type ResultItem,
+  type SearchResponse,
+  type SettingsView,
+} from './protocol'
 
 const settings: SettingsView = {
   hotkey: 'Alt+Space',
@@ -12,8 +20,99 @@ const settings: SettingsView = {
   webSearchEngine: 'bing',
 }
 const revisionOne = parseU64Decimal('1')!
+const previewPublicPlugins: PublicPluginInventory = {
+  revision: 'preview-public-plugins',
+  items: [
+    {
+      pluginId: 'com.uipilot.notes',
+      name: 'Notes',
+      description: '项目笔记、代码片段和常用链接管理。',
+      version: '0.1.0',
+      source: 'localPackage',
+      defaultName: 'notes',
+      effectiveName: 'notes',
+      enabled: true,
+      fault: null,
+      generation: 1,
+      iconUrl: null,
+      network: null,
+      permissions: [
+        { permission: 'ui.panel', supported: true, granted: true },
+        { permission: 'files.userSelected', supported: true, granted: true },
+      ],
+      settings: [
+        { definition: { type: 'boolean', key: 'showRecent', label: '显示最近笔记', default: true }, value: true },
+      ],
+    },
+    {
+      pluginId: 'com.uipilot.translate',
+      name: 'Translate',
+      description: '选中文本翻译、方向切换和复制结果。',
+      version: '0.3.0',
+      source: 'localPackage',
+      defaultName: 'translate',
+      effectiveName: 'translate',
+      enabled: false,
+      fault: null,
+      generation: 2,
+      iconUrl: null,
+      network: { httpsHosts: ['api.example.com', 'translate.example.com'] },
+      permissions: [
+        { permission: 'clipboard.read', supported: true, granted: true },
+        { permission: 'clipboard.write', supported: true, granted: true },
+        { permission: 'network.https', supported: true, granted: false },
+      ],
+      settings: [
+        {
+          definition: {
+            type: 'select',
+            key: 'direction',
+            label: '默认翻译方向',
+            options: [
+              { value: 'auto-zh', label: '自动 → 中文' },
+              { value: 'zh-en', label: '中文 → 英文' },
+            ],
+            default: 'auto-zh',
+          },
+          value: 'auto-zh',
+        },
+        { definition: { type: 'secret', key: 'apiKey', label: 'API Key' }, secretConfigured: false },
+      ],
+    },
+  ],
+}
+const previewLegacyPlugins: PluginInventorySnapshot = {
+  revision: 'preview-legacy-plugins',
+  items: [
+    {
+      key: 'preview-installed-notes',
+      id: 'com.uipilot.notes',
+      displayName: 'Notes',
+      installed: { state: 'valid', activeVersion: '0.1.0', versions: ['0.1.0'], trigger: '/notes' },
+      development: { state: 'absent' },
+      description: {
+        state: 'available',
+        source: 'installed',
+        markdown: '项目笔记、代码片段和常用链接管理。',
+      },
+    },
+    {
+      key: 'preview-development-translate',
+      id: 'com.uipilot.translate',
+      displayName: 'Translate',
+      installed: { state: 'absent' },
+      development: { state: 'valid', version: '0.3.0', trigger: '/translate' },
+      description: {
+        state: 'available',
+        source: 'development',
+        markdown: '选中文本翻译、方向切换和复制结果。',
+      },
+    },
+  ],
+}
 const previewParameters = new URLSearchParams(window.location.search)
 const panelPreview = previewParameters.get('mode') === 'panel'
+const settingsPreview = previewParameters.get('mode') === 'settings'
 const requestedPanelCommand = previewParameters.get('command')
 const panelPreviewCommand = requestedPanelCommand && /^[a-z][a-z0-9-]{0,31}$/u.test(requestedPanelCommand)
   ? requestedPanelCommand
@@ -21,6 +120,7 @@ const panelPreviewCommand = requestedPanelCommand && /^[a-z][a-z0-9-]{0,31}$/u.t
 const panelPreviewPluginId = 'com.uipilot.demo-panel'
 
 if (panelPreview) document.title = `UiPilot /${panelPreviewCommand} 外壳预览`
+else if (settingsPreview) document.title = 'UiPilot 设置预览'
 
 const appIconAsset = new URL('../src-tauri/icons/icon.png', import.meta.url)
 let appIconDataUrl: Promise<string | null> | undefined
@@ -95,9 +195,14 @@ const noMessages = { revision: '0', unreadCount: 0, messages: [] }
 
 const client: LauncherClient = {
   listenShown: async (handler) => {
-    queueMicrotask(() => handler({ invocationId: 'browser-preview', target: 'launcher', notice: null }))
+    queueMicrotask(() => handler({
+      invocationId: 'browser-preview',
+      target: settingsPreview ? 'settings' : 'launcher',
+      notice: null,
+    }))
     return () => undefined
   },
+  listenHidden: async () => () => undefined,
   listenMessageStateChanged: async () => () => undefined,
   listenPluginPanelError: async () => () => undefined,
   listenPluginPanelReset: async () => () => undefined,
@@ -126,7 +231,7 @@ const client: LauncherClient = {
   setPluginPanelBounds: async () => undefined,
   acknowledgePluginPanelFocusHostInput: async () => undefined,
   commitPluginWindowTransfer: async () => undefined,
-  listPublicPlugins: async () => ({ revision: '0', items: [] }),
+  listPublicPlugins: async () => previewPublicPlugins,
   selectPublicPluginArchive: async () => null,
   selectPublicPluginDirectory: async () => null,
   preparePublicPlugin: async () => { throw new Error('Preview does not install plugins') },
@@ -138,7 +243,7 @@ const client: LauncherClient = {
   setPublicPluginEffectiveName: async () => undefined,
   savePublicPluginSettings: async () => undefined,
   uninstallPublicPlugin: async () => undefined,
-  listPlugins: async () => ({ revision: '0', items: [] }),
+  listPlugins: async () => previewLegacyPlugins,
   installPlugin: async () => ({ revision: '1' }),
   reloadPlugin: async () => ({ revision: '1' }),
   deletePlugin: async () => ({ revision: '1' }),

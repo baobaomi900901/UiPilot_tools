@@ -56,10 +56,14 @@ it('provides a browser-only launcher preview outside the production entry', () =
   const previewSource = readFileSync('src/launcher-browser-preview.tsx', 'utf8')
   expect(previewHtml).toContain('/src/launcher-browser-preview.tsx')
   expect(previewSource).toContain('LauncherView')
+  expect(previewSource).toContain("get('mode') === 'settings'")
   expect(previewSource).toContain("get('mode') === 'panel'")
   expect(previewSource).toContain("get('command')")
   expect(previewSource).toContain('panelPreviewCommand')
   expect(previewSource).toContain("kind: 'panelActivation'")
+  expect(previewSource).toContain('previewPublicPlugins')
+  expect(previewSource).toContain('com.uipilot.notes')
+  expect(previewSource).toContain('com.uipilot.translate')
   expect(previewSource).toContain('core.activateResult')
   expect(previewSource).toContain('com.uipilot.notes/preview.html')
   expect(previewSource).toContain("querySelector<HTMLElement>('.panel-host-region')")
@@ -267,6 +271,7 @@ type TestLauncherClient = LauncherClient & {
 
 function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
+  let hiddenHandler: (() => void) | undefined
   let messageStateHandler: ((payload: unknown) => void) | undefined
   let panelErrorHandler: ((payload: unknown) => void) | undefined
   let panelResetHandler: ((payload: unknown) => void) | undefined
@@ -276,6 +281,10 @@ function fakeClient() {
     listenShown: vi.fn(async (handler) => {
       shownHandler = handler
       return unlisten
+    }),
+    listenHidden: vi.fn(async (handler) => {
+      hiddenHandler = handler
+      return vi.fn()
     }),
     listenMessageStateChanged: vi.fn(async (handler) => {
       messageStateHandler = handler
@@ -346,6 +355,10 @@ function fakeClient() {
     emit(payload: unknown) {
       if (!shownHandler) throw new Error('shown listener is not installed')
       shownHandler(payload)
+    },
+    emitHidden() {
+      if (!hiddenHandler) throw new Error('hidden listener is not installed')
+      hiddenHandler()
     },
     emitMessageState(payload: unknown) {
       if (!messageStateHandler) throw new Error('message state listener is not installed')
@@ -1219,6 +1232,46 @@ describe('shown and search ownership', () => {
     vi.mocked(client.searchApps).mockClear()
     emit(shown('settings', 'settings'))
     expect(client.searchApps).not.toHaveBeenCalled()
+  })
+
+  it('keeps the default launcher list visible while refreshing after native show', async () => {
+    const { core, client, emit } = await startedCore()
+    const first = deferred<SearchResponse | null>()
+    const second = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+
+    emit(shown('first-default'))
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledWith({
+      query: '', invocationId: 'first-default', querySequence: 1,
+    }))
+    first.resolve({
+      requestId: 'first-default-request',
+      items: [{ resultId: 'old-default', title: 'Old default', activation: executeActivation }],
+    })
+    await first.promise
+    await vi.waitFor(() => expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Old default']))
+
+    emit(shown('second-default'))
+    expect(core.getSnapshot()).toMatchObject({
+      invocationId: 'second-default',
+      query: '',
+      queryControlValue: '',
+      querySequence: 1,
+      searchPending: false,
+    })
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Old default'])
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledWith({
+      query: '', invocationId: 'second-default', querySequence: 1,
+    }))
+    expect(core.getSnapshot().searchPending).toBe(false)
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Old default'])
+
+    second.resolve({
+      requestId: 'second-default-request',
+      items: [{ resultId: 'new-default', title: 'New default', activation: executeActivation }],
+    })
+    await second.promise
+    await vi.waitFor(() => expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['New default']))
   })
 
   it('clears on empty, commits current results, wraps selection, and ignores stale completions', async () => {
@@ -2770,6 +2823,43 @@ describe('execute and hide ownership', () => {
     await expect(hide.promise).rejects.toBeDefined()
     await vi.waitFor(() => expect(core.getSnapshot().hidePending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({ view: 'launcher', invocationId: 'hide', status: '窗口操作失败。' })
+  })
+  it('resets hidden non-launcher state before the next native show', async () => {
+    const { core, client, emit } = await startedCore()
+    emit(shown('hide-settings'))
+    core.navigate('settings')
+    expect(core.getSnapshot().view).toBe('settings')
+
+    await core.requestHide()
+
+    expect(client.hideLauncher).toHaveBeenCalledOnce()
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      query: '',
+      queryControlValue: '',
+      results: [],
+      hidePending: false,
+      status: '',
+    })
+    expect(core.getSnapshot()).not.toHaveProperty('settingsLoadStatus')
+  })
+  it('resets non-launcher state after a native blur hide event', async () => {
+    const { core, emit, emitHidden } = await startedCore()
+    emit(shown('blur-hide-settings'))
+    core.navigate('settings')
+    expect(core.getSnapshot().view).toBe('settings')
+
+    emitHidden()
+
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      query: '',
+      queryControlValue: '',
+      results: [],
+      hidePending: false,
+      status: '',
+    })
+    expect(core.getSnapshot()).not.toHaveProperty('settingsLoadStatus')
   })
   it('keeps an application search owner alive when hide is rejected', async () => {
     const { core, client, emit } = await startedCore()
@@ -4361,6 +4451,9 @@ describe('React view and accessibility', () => {
     expect(fake.client.hideLauncher).not.toHaveBeenCalled()
     expect(stylesSource).toMatch(/\.launcher-settings-button\.ant-btn\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(/\.settings-title-group\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s)
+    expect(stylesSource).toMatch(
+      /\.settings-tabs \.ant-tabs-tab:not\(\.ant-tabs-tab-active\) \.settings-message-tab-badge\s*\{[^}]*color:\s*var\(--uipilot-ui-muted-foreground\);/s,
+    )
     await mounted.unmount()
   })
 
@@ -5487,19 +5580,19 @@ describe('React view and accessibility', () => {
     expect(publicPluginPanelSource).not.toContain('@ant-design/icons')
   })
 
-  it('submits generated public settings once without exposing an existing secret', async () => {
+  it('renders public plugins as compact rows and opens advanced details on demand', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
-    vi.mocked(fake.client.listPublicPlugins).mockResolvedValueOnce({
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({
       revision: '1',
       items: [{
-        pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
+        pluginId: 'com.example.demo', name: 'Demo', description: 'A compact plugin description that stays on one row.', version: '1.0.0',
         source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
-        network: null,
-        permissions: [],
+        network: { httpsHosts: ['api.example.com'] },
+        permissions: [{ permission: 'network.https', supported: true, granted: false }],
         settings: [
           { definition: { type: 'text', key: 'prefix', label: 'Prefix' }, value: 'Hello' },
           { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 9 }, value: 3 },
@@ -5515,32 +5608,136 @@ describe('React view and accessibility', () => {
     await act(async () => fake.emit(shown('public-settings', 'settings')))
     await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
-    expect(mounted.host.querySelector<HTMLImageElement>('.public-plugin-item .plugin-icon-image')?.getAttribute('src'))
+    const row = mounted.host.querySelector<HTMLElement>('.public-plugin-item')!
+    expect(row.querySelector('.public-plugin-icon-cell .plugin-icon-image')?.getAttribute('src'))
       .toBe('uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png')
+    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('Demo')
+    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('·')
+    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('v1.0.0')
+    expect(row.querySelector('.plugin-title-line')?.textContent).not.toContain('启动命令')
+    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('/demo')
+    expect(row.querySelector('.plugin-description')?.textContent).toBe('A compact plugin description that stays on one row.')
+    expect(row.querySelector('.public-name-control')).toBeNull()
+    expect(row.querySelector('button[aria-label="查看插件详情"]')).not.toBeNull()
+    expect(row.querySelector('button[aria-label="卸载插件"]')).not.toBeNull()
+    expect(row.querySelector('.public-plugin-actions .ant-switch')).not.toBeNull()
+    expect(mounted.host.querySelector('.public-plugin-form')).toBeNull()
+    expect(mounted.host.querySelector('.public-permissions')).toBeNull()
+    expect(mounted.host.querySelector('.public-network-access')).toBeNull()
+    const refresh = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="刷新"]')!
+    expect(refresh.textContent?.trim()).toBe('')
 
-    const prefix = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Prefix"]')!
-    const secret = mounted.host.querySelector<HTMLInputElement>('input[aria-label="Token"]')!
-    expect(secret.value).toBe('')
+    await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-detail')).not.toBeNull())
+    const detailView = mounted.host.querySelector<HTMLElement>('.public-plugin-detail-view')!
+    const detail = mounted.host.querySelector<HTMLElement>('.public-plugin-detail')!
+    expect(mounted.host.querySelector('.settings-tabs')).toBeNull()
+    expect(mounted.host.querySelector('header.settings-header h1')?.textContent).toBe('Demo')
+    const backButton = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回插件列表"]')!
+    expect(backButton).not.toBeNull()
+    await vi.waitFor(() => expect(document.activeElement).toBe(detailView))
+    expect(mounted.host.querySelector('.public-plugin-detail-title')?.textContent).toBe('Demo')
+    expect(detail.textContent).toContain('启动键')
+    expect(detail.textContent).not.toContain('启动名称')
+    expect(detail.querySelector('.public-detail-name-term')).not.toBeNull()
+    expect(detail.querySelector('.public-detail-name-value')).not.toBeNull()
+    expect(stylesSource).toMatch(/\.public-plugin-detail-list\s*\{[^}]*padding:\s*12px 0 0 12px;/s)
+    expect(stylesSource).toMatch(/\.public-detail-name-term,\s*\.public-detail-name-value\s*\{[^}]*align-self:\s*center;/s)
+    expect(detail.textContent).toContain('版本号')
+    expect(detail.textContent).toContain('1.0.0')
+    expect(detail.textContent).toContain('插件说明')
+    expect(detail.textContent).toContain('A compact plugin description that stays on one row.')
+    expect(detail.textContent).toContain('权限列表')
+    expect(detail.textContent).toContain('network.https · 未授权')
+    expect(detail.textContent).toContain('网络 Host')
+    expect(detail.textContent).toContain('api.example.com')
+    expect(detail.textContent).toContain('插件所在目录')
+    expect(detail.textContent).toContain('暂未提供插件目录')
+
+    const nameInput = detail.querySelector<HTMLInputElement>('input[aria-label="启动键"]')!
+    expect(nameInput.value).toBe('demo')
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
-      setter.call(prefix, 'Welcome')
-      prefix.dispatchEvent(new Event('input', { bubbles: true }))
-      prefix.dispatchEvent(new Event('change', { bubbles: true }))
-      setter.call(secret, 'new-token')
-      secret.dispatchEvent(new Event('input', { bubbles: true }))
-      secret.dispatchEvent(new Event('change', { bubbles: true }))
+      setter.call(nameInput, 'demo-custom')
+      nameInput.dispatchEvent(new Event('input', { bubbles: true }))
+      nameInput.dispatchEvent(new Event('change', { bubbles: true }))
+      nameInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
     })
-    const save = [...mounted.host.querySelectorAll<HTMLButtonElement>('.public-plugin-form button')]
-      .find((button) => button.textContent?.includes('保存设置'))!
-    await act(async () => save.click())
-    await vi.waitFor(() => expect(fake.client.savePublicPluginSettings).toHaveBeenCalledOnce())
-    expect(fake.client.savePublicPluginSettings).toHaveBeenCalledWith({ input: {
+    await vi.waitFor(() => expect(fake.client.setPublicPluginEffectiveName).toHaveBeenCalledWith({
       pluginId: 'com.example.demo',
-      settings: { prefix: 'Welcome', limit: 3, loud: false, style: 'short' },
-      secrets: { token: 'new-token' },
-    } })
+      nameOverride: 'demo-custom',
+    }))
+
+    await act(async () => detail.querySelector<HTMLButtonElement>('button[aria-label="恢复默认启动键"]')!.click())
+    await vi.waitFor(() => expect(fake.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({
+      pluginId: 'com.example.demo',
+      nameOverride: null,
+    }))
+
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    await act(async () => document.activeElement?.dispatchEvent(escape))
+    expect(escape.defaultPrevented).toBe(true)
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+    expect(mounted.host.querySelector('.settings-tabs')).not.toBeNull()
+
+    await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-detail')).not.toBeNull())
+
+    await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回插件列表"]')!.click())
+    await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
+    expect(mounted.host.querySelector('.settings-tabs')).not.toBeNull()
     await mounted.unmount()
     core.destroy()
+  })
+
+  it('filters public plugins by name after a short debounce', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({
+      revision: '1',
+      items: [
+        {
+          pluginId: 'com.example.notes', name: 'Notes', description: null, version: '1.0.0',
+          source: 'localPackage', defaultName: 'notes', effectiveName: 'notes', enabled: true,
+          fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
+        },
+        {
+          pluginId: 'com.example.translate', name: 'Translate', description: null, version: '1.0.0',
+          source: 'localPackage', defaultName: 'translate', effectiveName: 'translate', enabled: true,
+          fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
+        },
+      ],
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('public-filter', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('.public-plugin-item')).toHaveLength(2))
+    vi.useFakeTimers()
+    try {
+      const filter = mounted.host.querySelector<HTMLInputElement>('input[aria-label="筛选插件名称"]')
+      expect(filter).toBeInstanceOf(HTMLInputElement)
+      await act(async () => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+        setter.call(filter!, 'trans')
+        filter!.dispatchEvent(new Event('input', { bubbles: true }))
+        filter!.dispatchEvent(new Event('change', { bubbles: true }))
+      })
+      expect(mounted.host.querySelectorAll('.public-plugin-item')).toHaveLength(2)
+
+      await act(async () => { vi.advanceTimersByTime(149) })
+      expect(mounted.host.querySelectorAll('.public-plugin-item')).toHaveLength(2)
+
+      await act(async () => { vi.advanceTimersByTime(1) })
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('.public-plugin-item')).toHaveLength(1))
+      expect(mounted.host.querySelector('.plugin-title-line h3')?.textContent).toBe('Translate')
+    } finally {
+      vi.useRealTimers()
+      await mounted.unmount()
+      core.destroy()
+    }
   })
 
   it('treats pending public owner cleanup as a committed uninstall', async () => {
@@ -5568,12 +5765,12 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
 
     const deleteButton = mounted.host
-      .querySelector<HTMLButtonElement>('button[aria-label="卸载并删除数据"]')!
+      .querySelector<HTMLButtonElement>('button[aria-label="卸载插件"]')!
     await act(async () => deleteButton.click())
     let confirm: HTMLButtonElement | undefined
     await vi.waitFor(() => {
       confirm = [...document.querySelectorAll<HTMLButtonElement>('button')]
-        .find((button) => button.textContent?.replace(/\s/g, '') === '删除')
+        .find((button) => button.textContent?.replace(/\s/g, '') === '全部卸载')
       expect(confirm).toBeTruthy()
     })
     await act(async () => confirm!.click())
@@ -5735,26 +5932,20 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
-  it('revokes immediately, confirms reauthorization, refreshes authority, and restores switch focus', async () => {
+  it('keeps public plugin network details out of the compact row', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
-    const networkItem = (granted: boolean) => ({
+    const networkItem = {
       pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
       source: 'localPackage' as const, defaultName: 'network', effectiveName: 'network', enabled: true,
       fault: null, generation: 1, iconUrl: null,
       network: { httpsHosts: ['api.example.com', 'auth.example.com'] },
-      permissions: [{ permission: 'network.https' as const, supported: true, granted }],
+      permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
       settings: [],
-    })
+    }
     vi.mocked(fake.client.listPublicPlugins)
-      .mockResolvedValueOnce({ revision: '1', items: [networkItem(true)] })
-      .mockResolvedValueOnce({ revision: '2', items: [networkItem(false)] })
-      .mockResolvedValueOnce({ revision: '3', items: [networkItem(true)] })
-    let releaseRevoke!: () => void
-    vi.mocked(fake.client.setPublicPluginNetworkAccess)
-      .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseRevoke = resolve }))
-      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ revision: '1', items: [networkItem] })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -5762,66 +5953,10 @@ describe('React view and accessibility', () => {
     await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
 
-    let networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
-    await act(async () => networkSwitch.click())
-    expect(fake.client.setPublicPluginNetworkAccess).toHaveBeenCalledWith({
-      pluginId: 'com.example.network',
-      granted: false,
-    })
-    expect(networkSwitch.disabled).toBe(true)
-    await act(async () => releaseRevoke())
-    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
-    networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
-    await vi.waitFor(() => expect(document.activeElement).toBe(networkSwitch))
-
-    await act(async () => networkSwitch.click())
-    await vi.waitFor(() => expect(document.body.textContent).toContain('api.example.com'))
-    expect(document.body.textContent).toContain('auth.example.com')
-    expect(fake.client.setPublicPluginNetworkAccess).toHaveBeenCalledTimes(1)
-    const authorize = [...document.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.replace(/\s/g, '') === '授权')!
-    await act(async () => authorize.click())
-    await vi.waitFor(() => expect(fake.client.setPublicPluginNetworkAccess).toHaveBeenLastCalledWith({
-      pluginId: 'com.example.network',
-      granted: true,
-    }))
-    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(3))
-    networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
-    await vi.waitFor(() => expect(document.activeElement).toBe(networkSwitch))
-    await mounted.unmount()
-    core.destroy()
-  })
-
-  it('uses a fixed network mutation failure, refreshes authority, and restores focus', async () => {
-    installMatchMedia(false)
-    const fake = fakeClient()
-    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
-    const item = {
-      pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
-      source: 'localPackage' as const, defaultName: 'network', effectiveName: 'network', enabled: true,
-      fault: null, generation: 1, iconUrl: null,
-      network: { httpsHosts: ['api.example.com'] },
-      permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
-      settings: [],
-    }
-    vi.mocked(fake.client.listPublicPlugins)
-      .mockResolvedValueOnce({ revision: '1', items: [item] })
-      .mockResolvedValueOnce({ revision: '1', items: [item] })
-    vi.mocked(fake.client.setPublicPluginNetworkAccess).mockRejectedValueOnce({
-      message: 'private host or storage detail',
-    })
-    const core = createLauncherCore(fake.client)
-    await core.start()
-    const mounted = await mountLauncherView(core)
-    await act(async () => fake.emit(shown('public-network-failure', 'settings')))
-    await activateSettingsTab(mounted.host, '插件')
-    let networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
-    await act(async () => networkSwitch.click())
-    await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
-    expect(mounted.host.textContent).toContain('无法更新网络访问权限，请重试。')
-    expect(mounted.host.textContent).not.toContain('private host or storage detail')
-    networkSwitch = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="网络访问"]')!
-    await vi.waitFor(() => expect(document.activeElement).toBe(networkSwitch))
+    expect(mounted.host.querySelector('button[aria-label="网络访问"]')).toBeNull()
+    expect(mounted.host.textContent).not.toContain('api.example.com')
+    expect(mounted.host.textContent).not.toContain('auth.example.com')
+    expect(fake.client.setPublicPluginNetworkAccess).not.toHaveBeenCalled()
     await mounted.unmount()
     core.destroy()
   })
@@ -5916,6 +6051,7 @@ describe('real adapter and startup', () => {
     const unlisten = vi.fn()
     const order: string[] = []
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
+    let hiddenHandler: ((event: { payload: unknown }) => void) | undefined
     tauriCapture.listen.mockImplementation((event, handler) => {
       if (event === 'uipilot-plugin-panel-focus-host-input') {
         expect(document.querySelector('[role="combobox"]')).toBeNull()
@@ -5926,6 +6062,10 @@ describe('real adapter and startup', () => {
       if (event === 'launcher://shown') {
         shownHandler = handler as (event: { payload: unknown }) => void
         return registration.promise
+      }
+      if (event === 'launcher://hidden') {
+        hiddenHandler = handler as (event: { payload: unknown }) => void
+        return Promise.resolve(vi.fn())
       }
       return Promise.resolve(vi.fn())
     })
@@ -5942,11 +6082,13 @@ describe('real adapter and startup', () => {
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://shown', expect.any(Function)))
     expect(tauriCapture.invoke).not.toHaveBeenCalled()
     registration.resolve(unlisten)
+    await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://hidden', expect.any(Function)))
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 8)).toEqual([
+    expect(order.slice(0, 9)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
       'hotkey-recording://current',
       'launcher://shown',
+      'launcher://hidden',
       'uipilot-plugin-panel-error',
       'uipilot-plugin-panel-reset',
       'message-center://state-changed',
@@ -5956,6 +6098,9 @@ describe('real adapter and startup', () => {
 
     await act(async () => shownHandler?.({ payload: shown('during-adapter-load', 'settings') }))
     expect(document.querySelector('.settings-view h1')?.textContent).toBe('设置')
+    await act(async () => hiddenHandler?.({ payload: null }))
+    expect(document.querySelector('.settings-view h1')).toBeNull()
+    await act(async () => shownHandler?.({ payload: shown('during-adapter-load', 'settings') }))
     await act(async () => {
       load.resolve(emptySettings)
       await load.promise
@@ -6113,6 +6258,7 @@ describe('real adapter and startup', () => {
     const privateError = 'private post-start render sentinel'
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const shownUnlisten = vi.fn()
+    const hiddenUnlisten = vi.fn()
     const messageUnlisten = vi.fn()
     const panelUnlisten = vi.fn()
     const panelResetUnlisten = vi.fn()
@@ -6139,6 +6285,7 @@ describe('real adapter and startup', () => {
         shownHandler = handler as (event: { payload: unknown }) => void
         return shownUnlisten
       }
+      if (event === 'launcher://hidden') return hiddenUnlisten
       if (event === 'uipilot-plugin-panel-error') return panelUnlisten
       if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
       if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
@@ -6172,6 +6319,7 @@ describe('real adapter and startup', () => {
       throwFatal = true
       mountedCore!.failInitialization()
       await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
+      expect(hiddenUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
@@ -6187,6 +6335,7 @@ describe('real adapter and startup', () => {
       await pagehide()
       await pagehide()
       expect(shownUnlisten).toHaveBeenCalledOnce()
+      expect(hiddenUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
@@ -6202,7 +6351,7 @@ describe('real adapter and startup', () => {
 
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
-    const unlistens = Array.from({ length: 6 }, () => vi.fn())
+    const unlistens = Array.from({ length: 7 }, () => vi.fn())
     tauriCapture.listen.mockImplementation(async (_event, _handler) => unlistens[tauriCapture.listen.mock.calls.length - 1]!)
     tauriCapture.invoke.mockImplementation((command) =>
       Promise.resolve(command === 'load_settings' ? emptySettings : undefined),
@@ -6236,6 +6385,7 @@ describe('real adapter and startup', () => {
     expect(mainSource.match(/['"]execute_result['"]/g)).toHaveLength(2)
     expect(mainSource.match(/['"]plugin_panel_focus_host_input_ack['"]/g)).toHaveLength(1)
     expect(mainSource.match(/['"]launcher:\/\/shown['"]/g)).toHaveLength(1)
+    expect(mainSource.match(/['"]launcher:\/\/hidden['"]/g)).toHaveLength(1)
     expect(mainSource.match(/['"]find:\/\/(?:forwarded|theme-changed)['"]/g)).toHaveLength(2)
     expect(mainSource).toContain('getCurrentWindow().label')
     expect(mainSource).not.toContain('.hide(')

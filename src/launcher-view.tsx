@@ -33,12 +33,13 @@ import type { LauncherCore } from './launcher-core'
 import { MessageCenterPanel } from './message-center-panel'
 import { bindNativeTextInput } from './native-input'
 import { PluginIcon } from './plugin-icon'
-import { PublicPluginPanel } from './public-plugin-panel'
+import { PublicPluginDetail, PublicPluginPanel } from './public-plugin-panel'
 import type {
   ControlKey,
   FileCategory,
   FileResultKind,
   PluginPanelBounds,
+  PublicPluginInventoryItem,
   ResultIconKind,
   SettingsTabKey,
   ThemePreference,
@@ -398,11 +399,13 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
+  const [selectedPublicPlugin, setSelectedPublicPlugin] = useState<PublicPluginInventoryItem | null>(null)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
   const mainResultInputRef = useRef<HTMLInputElement | null>(null)
   const panelInputRef = useRef<HTMLInputElement | null>(null)
   const panelHostRef = useRef<HTMLDivElement | null>(null)
+  const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const activeSettingsTab = snapshot.settingsTab
@@ -427,6 +430,15 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       delete document.documentElement.dataset.colorScheme
     }
   }, [colorScheme])
+
+  useEffect(() => {
+    if (snapshot.view !== 'settings') setSelectedPublicPlugin(null)
+  }, [snapshot.view])
+
+  useLayoutEffect(() => {
+    if (snapshot.view !== 'settings' || !selectedPublicPlugin) return
+    publicPluginDetailRef.current?.focus()
+  }, [selectedPublicPlugin, snapshot.view])
 
   const reportReady = useCallback(() => {
     if (ready.current) return
@@ -1200,7 +1212,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} />
+        <PublicPluginPanel client={core.client} onOpenDetails={setSelectedPublicPlugin} />
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -1328,6 +1340,44 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       onClear={() => void core.clearMessages()}
     />
   )
+  const publicPluginDetailView = selectedPublicPlugin ? (
+    <section
+      ref={publicPluginDetailRef}
+      className="settings-view public-plugin-detail-view"
+      aria-label={`${selectedPublicPlugin.name} 插件详情`}
+      tabIndex={-1}
+      onKeyDown={(event) => {
+        if (event.key !== 'Escape' || composing(event)) return
+        event.preventDefault()
+        setSelectedPublicPlugin(null)
+      }}
+    >
+      <div className="settings-header-region">
+        <header className="settings-header">
+          <div className="settings-title-group">
+            <Tooltip title="返回插件列表">
+              <Button
+                aria-label="返回插件列表"
+                icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
+                onClick={() => setSelectedPublicPlugin(null)}
+                size="small"
+                type="text"
+              />
+            </Tooltip>
+            <h1 id="public-plugin-detail-title" className="public-plugin-detail-title">{selectedPublicPlugin.name}</h1>
+          </div>
+        </header>
+      </div>
+      <OverlayScrollbarsComponent className="settings-detail-panel" options={settingsScrollbarOptions}>
+        <div className="settings-scroll-content">
+          <PublicPluginDetail
+            client={core.client}
+            plugin={selectedPublicPlugin}
+          />
+        </div>
+      </OverlayScrollbarsComponent>
+    </section>
+  ) : null
   const settingsView = (
     <section className="settings-view" aria-label="设置" onKeyDown={settingsKeyDown}>
       <div className="settings-header-region">
@@ -1397,7 +1447,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           onKeyDownCapture={preventBrowserFind}
         >
           <div className="launcher-region launcher-section-region">
-            {snapshot.view === 'launcher' ? (panelLauncher ?? filePanel ?? launcher) : settingsView}
+            {snapshot.view === 'launcher' ? (panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
           </div>
           {snapshot.view === 'launcher' || status.length > 0 ? (
             <div className="launcher-region launcher-status-region">

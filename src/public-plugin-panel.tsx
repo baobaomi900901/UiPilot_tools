@@ -1,5 +1,5 @@
-import { Button, Checkbox, Form, Input, InputNumber, Popconfirm, Select, Spin, Switch, Tooltip } from 'antd'
-import { FolderOpen, Save, Trash2, Undo2, Upload } from 'lucide-react'
+import { Button, Input, Popconfirm, Spin, Switch, Tooltip } from 'antd'
+import { FolderOpen, RefreshCw, Undo2, Upload } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { PluginIcon } from './plugin-icon'
@@ -9,16 +9,15 @@ import type {
   PublicPluginInventory,
   PublicPluginInventoryItem,
   PublicPluginPrepareSummary,
-  PublicSettingView,
 } from './protocol'
 
 interface PublicPluginPanelProps {
   client: LauncherClient
+  onOpenDetails?: (plugin: PublicPluginInventoryItem) => void
 }
 
-type PlainSettingValue = string | number | boolean
-
 const CLEANUP_PENDING_MESSAGE = '插件已卸载，数据清理将在下次启动时重试'
+const PLUGIN_FILTER_DEBOUNCE_MS = 150
 
 function isCleanupPending(error: unknown): boolean {
   return typeof error === 'object'
@@ -27,44 +26,21 @@ function isCleanupPending(error: unknown): boolean {
     && error.code === 'dataCleanupPending'
 }
 
-function initialSetting(setting: PublicSettingView): PlainSettingValue {
-  if (setting.value !== undefined) return setting.value
-  if (setting.definition.type !== 'secret' && setting.definition.default !== undefined) return setting.definition.default
-  if (setting.definition.type === 'boolean') return false
-  if (setting.definition.type === 'number') return 0
-  if (setting.definition.type === 'select') return setting.definition.options[0]?.value ?? ''
-  return ''
-}
-
 function PublicPluginRow({
   client,
   plugin,
   reload,
   onCleanupPending,
+  onDetails,
 }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
   reload: () => Promise<void>
   onCleanupPending: () => Promise<void>
+  onDetails: () => void
 }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [name, setName] = useState(plugin.effectiveName)
-  const [settings, setSettings] = useState<Record<string, PlainSettingValue>>(() =>
-    Object.fromEntries(plugin.settings.filter(({ definition }) => definition.type !== 'secret').map((setting) => [setting.definition.key, initialSetting(setting)])),
-  )
-  const [secrets, setSecrets] = useState<Record<string, string>>({})
-  const [clearSecrets, setClearSecrets] = useState<Record<string, boolean>>({})
-  const [networkConfirmOpen, setNetworkConfirmOpen] = useState(false)
-  const networkOrigin = useRef<HTMLElement | null>(null)
-  const restoreNetworkOrigin = useRef(false)
-
-  useEffect(() => {
-    if (busy || !restoreNetworkOrigin.current) return
-    restoreNetworkOrigin.current = false
-    const origin = networkOrigin.current
-    if (origin?.isConnected) origin.focus()
-  }, [busy, plugin])
 
   const mutate = async (operation: () => Promise<void>) => {
     if (busy) return
@@ -81,194 +57,163 @@ function PublicPluginRow({
     }
   }
 
-  const secretUpdates = (): Record<string, string | null> => {
-    const updates: Record<string, string | null> = {}
-    for (const { definition } of plugin.settings) {
-      if (definition.type !== 'secret') continue
-      if (clearSecrets[definition.key]) updates[definition.key] = null
-      else if (secrets[definition.key]) updates[definition.key] = secrets[definition.key]
-    }
-    return updates
-  }
-  const networkPermission = plugin.permissions.find(({ permission }) => permission === 'network.https')
-  const networkGranted = networkPermission?.supported === true && networkPermission.granted
-  const mutateNetwork = async (granted: boolean) => {
-    if (busy) return
-    setNetworkConfirmOpen(false)
-    setBusy(true)
-    setError('')
-    try {
-      await client.setPublicPluginNetworkAccess({ pluginId: plugin.pluginId, granted })
-    } catch {
-      setError('无法更新网络访问权限，请重试。')
-    } finally {
-      await reload()
-      restoreNetworkOrigin.current = true
-      setBusy(false)
-    }
-  }
-  const restoreNetworkFocus = () => {
-    setNetworkConfirmOpen(false)
-    const origin = networkOrigin.current
-    queueMicrotask(() => {
-      if (origin?.isConnected) origin.focus()
-    })
-  }
-  const settingControl = ({ definition, secretConfigured }: PublicSettingView) => {
-    if (definition.type === 'secret') {
-      return (
-        <div className="public-secret-control" key={definition.key}>
-          <Input.Password
-            aria-label={definition.label}
-            value={secrets[definition.key] ?? ''}
-            placeholder={secretConfigured ? '已配置' : ''}
-            disabled={busy || clearSecrets[definition.key]}
-            onChange={(event) => setSecrets((current) => ({ ...current, [definition.key]: event.target.value }))}
-          />
-          <Checkbox
-            checked={clearSecrets[definition.key] ?? false}
-            disabled={busy || !secretConfigured}
-            onChange={(event) => setClearSecrets((current) => ({ ...current, [definition.key]: event.target.checked }))}
-          >
-            清除
-          </Checkbox>
-        </div>
-      )
-    }
-    const value = settings[definition.key] ?? initialSetting({ definition })
-    if (definition.type === 'boolean') {
-      return <Switch aria-label={definition.label} checked={Boolean(value)} disabled={busy} onChange={(checked) => setSettings((current) => ({ ...current, [definition.key]: checked }))} />
-    }
-    if (definition.type === 'number') {
-      return (
-        <InputNumber
-          aria-label={definition.label}
-          value={Number(value)}
-          min={definition.min}
-          max={definition.max}
-          step={definition.step}
-          disabled={busy}
-          onChange={(next) => next !== null && setSettings((current) => ({ ...current, [definition.key]: next }))}
-        />
-      )
-    }
-    if (definition.type === 'select') {
-      return (
-        <Select
-          aria-label={definition.label}
-          value={String(value)}
-          options={[...definition.options]}
-          disabled={busy}
-          onChange={(next) => setSettings((current) => ({ ...current, [definition.key]: next }))}
-        />
-      )
-    }
-    return <Input aria-label={definition.label} value={String(value)} disabled={busy} onChange={(event) => setSettings((current) => ({ ...current, [definition.key]: event.target.value }))} />
-  }
-
   return (
     <article className="plugin-item public-plugin-item">
-      <div className="plugin-item-main">
-        <div className="public-plugin-summary">
-          <PluginIcon iconUrl={plugin.iconUrl} size={36} />
-          <div className="public-plugin-summary-copy">
-            <div className="plugin-title-line">
-              <h3>{plugin.name}</h3>
-              <code>/{plugin.effectiveName}</code>
-              <span>{plugin.version}</span>
-              <span>{plugin.enabled ? '已启用' : '已禁用'}</span>
-              {plugin.fault ? <span>运行故障</span> : null}
-            </div>
-            <div className="plugin-version-list">{plugin.pluginId}</div>
+      <div className="public-plugin-icon-cell">
+        <PluginIcon iconUrl={plugin.iconUrl} size={36} />
+      </div>
+      <div className="plugin-item-main public-plugin-main">
+        <div className="public-plugin-summary-copy">
+          <div className="plugin-title-line">
+            <h3>{plugin.name}</h3>
+            <span>·</span>
+            <span>v{plugin.version}</span>
+            <span className="public-plugin-command"><code>/{plugin.effectiveName}</code></span>
+            {plugin.fault ? <span className="plugin-fault-label">运行故障</span> : null}
           </div>
+          {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
         </div>
-        {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
-        <div className="public-permissions">
-          {plugin.permissions.map((permission) => (
-            <span key={permission.permission}>{permission.permission} · {permission.supported ? (permission.granted ? '已授权' : '未授权') : '不支持'}</span>
-          ))}
-        </div>
-        {plugin.network ? (
-          <section className="public-network-access" aria-label="网络访问范围">
-            <div className="public-network-access-header">
-              <span>网络访问</span>
-              <Popconfirm
-                open={networkConfirmOpen}
-                title={(
-                  <div className="public-network-confirm">
-                    <strong>授权访问以下 HTTPS 主机？</strong>
-                    <ul className="public-network-host-list">
-                      {plugin.network.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}
-                    </ul>
-                  </div>
-                )}
-                okText="授权"
-                cancelText="取消"
-                onConfirm={() => void mutateNetwork(true)}
-                onCancel={restoreNetworkFocus}
-                onOpenChange={(open) => { if (!open) setNetworkConfirmOpen(false) }}
-              >
-                <Switch
-                  aria-label="网络访问"
-                  checked={networkGranted}
-                  disabled={busy || networkPermission?.supported !== true}
-                  onChange={(granted, event) => {
-                    networkOrigin.current = event.currentTarget
-                    if (granted) setNetworkConfirmOpen(true)
-                    else void mutateNetwork(false)
-                  }}
-                />
-              </Popconfirm>
-              <span>{networkPermission?.supported !== true ? '当前平台不支持' : networkGranted ? '已授权' : '未授权'}</span>
-            </div>
-            <ul className="public-network-host-list">
-              {plugin.network.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}
-            </ul>
-          </section>
-        ) : null}
-        <Form layout="vertical" size="small" className="public-plugin-form">
-          <Form.Item label="启动名称">
-            <div className="public-name-control">
-              <Input value={name} disabled={busy} onChange={(event) => setName(event.target.value)} />
-              <Tooltip title="保存名称"><Button aria-label="保存名称" icon={<Save aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void mutate(() => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride: name }))} /></Tooltip>
-              <Tooltip title="恢复默认"><Button aria-label="恢复默认" icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={() => void mutate(() => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride: null }))} /></Tooltip>
-            </div>
-          </Form.Item>
-          {plugin.settings.map((setting) => (
-            <Form.Item key={setting.definition.key} label={setting.definition.label}>{settingControl(setting)}</Form.Item>
-          ))}
-          {plugin.settings.length ? (
-            <Button
-              icon={<Save aria-hidden size={16} strokeWidth={1.8} />}
-              loading={busy}
-              onClick={() => void mutate(() => client.savePublicPluginSettings({
-                input: {
-                  pluginId: plugin.pluginId,
-                  settings,
-                  secrets: secretUpdates(),
-                },
-              }))}
-            >
-              保存设置
+        <div className="public-plugin-row-links">
+          <Button type="link" size="small" aria-label="查看插件详情" onClick={onDetails}>
+            详情
+          </Button>
+          <Popconfirm
+            title="卸载插件"
+            description={(
+              <div className="public-uninstall-options">
+                <Button
+                  danger
+                  disabled={busy}
+                  onClick={() => void mutate(() => client.uninstallPublicPlugin({
+                    pluginId: plugin.pluginId,
+                    retainData: false,
+                  }))}
+                >
+                  全部卸载
+                </Button>
+                <Button
+                  disabled={busy}
+                  onClick={() => void mutate(() => client.uninstallPublicPlugin({
+                    pluginId: plugin.pluginId,
+                    retainData: true,
+                  }))}
+                >
+                  保留数据卸载
+                </Button>
+              </div>
+            )}
+            okButtonProps={{ style: { display: 'none' } }}
+            cancelText="取消"
+          >
+            <Button type="link" size="small" danger aria-label="卸载插件" disabled={busy}>
+              删除
             </Button>
-          ) : null}
-        </Form>
+          </Popconfirm>
+        </div>
         {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
       </div>
       <div className="plugin-actions public-plugin-actions">
-        <Switch checked={plugin.enabled} disabled={busy} onChange={(enabled) => void mutate(() => client.setPublicPluginEnabled({ pluginId: plugin.pluginId, enabled }))} />
-        <Popconfirm title="卸载并删除数据？" okText="删除" cancelText="取消" onConfirm={() => void mutate(() => client.uninstallPublicPlugin({ pluginId: plugin.pluginId, retainData: false }))}>
-          <Tooltip title="卸载并删除数据"><Button aria-label="卸载并删除数据" danger icon={<Trash2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} /></Tooltip>
-        </Popconfirm>
-        <Popconfirm title="卸载但保留数据？" okText="保留" cancelText="取消" onConfirm={() => void mutate(() => client.uninstallPublicPlugin({ pluginId: plugin.pluginId, retainData: true }))}>
-          <Button disabled={busy}>保留数据卸载</Button>
-        </Popconfirm>
+        <Switch
+          checked={plugin.enabled}
+          disabled={busy}
+          onChange={(enabled) => void mutate(() => client.setPublicPluginEnabled({
+            pluginId: plugin.pluginId,
+            enabled,
+          }))}
+        />
       </div>
     </article>
   )
 }
 
-export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
+function permissionText({ permission, supported, granted }: PublicPluginInventoryItem['permissions'][number]) {
+  return `${permission} · ${supported ? (granted ? '已授权' : '未授权') : '不支持'}`
+}
+
+export function PublicPluginDetail({
+  client,
+  plugin,
+  reload = async () => undefined,
+}: {
+  client: LauncherClient
+  plugin: PublicPluginInventoryItem
+  reload?: () => Promise<void>
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [name, setName] = useState(plugin.effectiveName)
+
+  const saveName = async (nameOverride: string | null) => {
+    if (busy) return
+    const nextName = nameOverride ?? plugin.defaultName
+    if (nameOverride !== null && nameOverride === plugin.effectiveName) return
+    setBusy(true)
+    setError('')
+    try {
+      await client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride })
+      setName(nextName)
+      await reload()
+    } catch {
+      setError('无法保存启动键，请重试。')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="public-plugin-detail" aria-labelledby="public-plugin-detail-title">
+      <dl className="public-plugin-detail-list">
+        <dt className="public-detail-name-term">启动键</dt>
+        <dd className="public-detail-name-value">
+          <div className="public-detail-name-control">
+            <Input
+              aria-label="启动键"
+              value={name}
+              disabled={busy}
+              onChange={(event) => setName(event.target.value)}
+              onBlur={(event) => void saveName(event.currentTarget.value)}
+            />
+            <Tooltip title="恢复默认">
+              <Button
+                aria-label="恢复默认启动键"
+                icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />}
+                disabled={busy}
+                onClick={() => void saveName(null)}
+              />
+            </Tooltip>
+          </div>
+          {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
+        </dd>
+        <dt>版本号</dt>
+        <dd>{plugin.version}</dd>
+        <dt>插件说明</dt>
+        <dd>{plugin.description || '暂无插件说明'}</dd>
+        <dt>权限列表</dt>
+        <dd>
+          {plugin.permissions.length ? (
+            <ul className="public-plugin-detail-items">
+              {plugin.permissions.map((permission) => (
+                <li key={permission.permission}>{permissionText(permission)}</li>
+              ))}
+            </ul>
+          ) : '无额外权限'}
+        </dd>
+        <dt>网络 Host</dt>
+        <dd>
+          {plugin.network?.httpsHosts.length ? (
+            <ul className="public-plugin-detail-items">
+              {plugin.network.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}
+            </ul>
+          ) : '无'}
+        </dd>
+        <dt>插件所在目录</dt>
+        <dd>暂未提供插件目录</dd>
+      </dl>
+    </section>
+  )
+}
+
+export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelProps) {
   const epoch = useRef(0)
   const [inventory, setInventory] = useState<PublicPluginInventory | null>(null)
   const [loading, setLoading] = useState(true)
@@ -276,6 +221,8 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
   const [notice, setNotice] = useState('')
   const [prepared, setPrepared] = useState<PublicPluginPrepareSummary | null>(null)
   const [busy, setBusy] = useState(false)
+  const [pluginFilterDraft, setPluginFilterDraft] = useState('')
+  const [pluginFilter, setPluginFilter] = useState('')
   const preparedOrigin = useRef<HTMLElement | null>(null)
   const restorePreparedOrigin = useRef(false)
 
@@ -311,6 +258,13 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
     void reload()
     return () => { epoch.current += 1 }
   }, [reload])
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setPluginFilter(pluginFilterDraft.trim().toLocaleLowerCase())
+    }, PLUGIN_FILTER_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [pluginFilterDraft])
 
   const prepare = async (kind: 'archive' | 'developmentDirectory', origin: HTMLElement) => {
     if (busy) return
@@ -357,6 +311,9 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
       setBusy(false)
     }
   }
+  const filteredPlugins = pluginFilter && inventory
+    ? inventory.items.filter((plugin) => plugin.name.toLocaleLowerCase().includes(pluginFilter))
+    : inventory?.items ?? []
 
   return (
     <section className="public-plugin-inventory" aria-labelledby="public-plugin-title">
@@ -365,8 +322,25 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
         <div className="public-install-actions">
           <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)} /></Tooltip>
           <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)} /></Tooltip>
-          <Button disabled={busy || loading} onClick={() => void reload()}>刷新</Button>
+          <Tooltip title="刷新">
+            <Button
+              aria-label="刷新"
+              icon={<RefreshCw aria-hidden size={16} strokeWidth={1.8} />}
+              disabled={busy || loading}
+              onClick={() => void reload()}
+            />
+          </Tooltip>
         </div>
+      </div>
+      <div className="public-plugin-filter">
+        <Input
+          aria-label="筛选插件名称"
+          placeholder="筛选插件名称"
+          allowClear
+          value={pluginFilterDraft}
+          disabled={loading && !inventory}
+          onChange={(event) => setPluginFilterDraft(event.target.value)}
+        />
       </div>
       {prepared ? (
         <div className="public-prepare" role="status">
@@ -395,7 +369,17 @@ export function PublicPluginPanel({ client }: PublicPluginPanelProps) {
       {notice ? <div className="plugin-list-state" role="status">{notice}</div> : null}
       {loading && !inventory ? <div className="plugin-list-state"><Spin size="small" /></div> : null}
       {inventory?.items.length === 0 ? <div className="plugin-list-state">未安装公开插件</div> : null}
-      {inventory?.items.map((plugin) => <PublicPluginRow key={`${plugin.pluginId}:${plugin.generation}`} client={client} plugin={plugin} reload={reload} onCleanupPending={handleCleanupPending} />)}
+      {inventory && inventory.items.length > 0 && filteredPlugins.length === 0 ? <div className="plugin-list-state">未找到匹配插件</div> : null}
+      {filteredPlugins.map((plugin) => (
+        <PublicPluginRow
+          key={`${plugin.pluginId}:${plugin.generation}`}
+          client={client}
+          plugin={plugin}
+          reload={reload}
+          onCleanupPending={handleCleanupPending}
+          onDetails={() => onOpenDetails?.(plugin)}
+        />
+      ))}
     </section>
   )
 }

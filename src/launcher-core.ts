@@ -719,6 +719,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let destroyed = false
   let started = false
   let unlisten: (() => void) | undefined
+  let unlistenHidden: (() => void) | undefined
   let unlistenPanelError: (() => void) | undefined
   let unlistenPanelReset: (() => void) | undefined
   let unlistenPanelFocusHostInput: (() => void) | undefined
@@ -1285,7 +1286,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
   })
 
-  function beginSearch(submit = false): void {
+  function beginSearch(submit = false, showPending = true): void {
     const invocationId = model.invocationId
     if (!invocationId || fileCommand(model.query) !== null || sequenceExhausted) return
     let ownedOrigin: ApplicationSearchOwner['completionOrigin']
@@ -1308,7 +1309,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       ...(ownedOrigin === undefined ? {} : { completionOrigin: ownedOrigin }),
     }
     searchToken = captured.token
-    model.searchPending = true
+    if (showPending) model.searchPending = true
     let pending: Promise<SearchResponse | null>
     try {
       pending = client.searchApps({
@@ -1365,7 +1366,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       publish(true)
     }, 150)
   }
-  function deferCurrentSearch(): void {
+  function deferCurrentSearch(showPending = true): void {
     const owner = {
       epoch: model.viewEpoch,
       invocationId: model.invocationId,
@@ -1378,7 +1379,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         owner.invocationId !== model.invocationId || owner.sequence !== model.querySequence ||
         owner.query !== model.query || owner.query !== model.queryControlValue
       ) return
-      beginSearch()
+      beginSearch(false, showPending)
       publish(true)
     }, 0)
   }
@@ -1774,6 +1775,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (composition) restoreControl(composition.control)
     composition = undefined
     model.mainResultCommand = undefined
+    const preserveDefaultLauncherResults =
+      nextView === 'launcher' &&
+      source === 'native' &&
+      notice === null &&
+      !activationNoticePending &&
+      model.launcherMode === 'applications' &&
+      model.query === '' &&
+      model.queryControlValue === '' &&
+      model.results.length > 0
     leaveFileMode()
     model.viewEpoch += 1
     model.invocationId = invocationId
@@ -1793,7 +1803,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.executePending = false
     model.hidePending = false
     model.status = ''
-    clearResults()
+    if (!preserveDefaultLauncherResults) clearResults()
     model.shownNotice = notice === null ? undefined : NOTICE_TEXT[notice]
     if (nextView === 'launcher') pendingSettingsLoadEpoch = undefined
     else queueSettingsLoad()
@@ -1805,7 +1815,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.query = ''
       model.queryControlValue = ''
       model.querySequence = source === 'native' ? 1 : model.querySequence + 1
-      deferCurrentSearch()
+      deferCurrentSearch(!preserveDefaultLauncherResults)
     } else {
       model.queryControlValue = model.query
     }
@@ -2235,6 +2245,40 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.queryControlValue = ''
     clearResults()
     return true
+  }
+
+  function resetHiddenNonLauncherView(): boolean {
+    if (model.view === 'launcher') return false
+    messageCenter.leave()
+    if (composition) restoreControl(composition.control)
+    composition = undefined
+    model.mainResultCommand = undefined
+    model.viewEpoch += 1
+    model.view = 'launcher'
+    pluginInventoryActive = false
+    completionOrigin = undefined
+    pendingSettingsLoadEpoch = undefined
+    cancelSlashSearch()
+    searchToken = ++token
+    executeToken = ++token
+    model.searchPending = false
+    model.executePending = false
+    model.hidePending = false
+    model.status = ''
+    model.shownNotice = undefined
+    model.query = ''
+    model.queryControlValue = ''
+    clearResults()
+    return true
+  }
+
+  function hidden(): void {
+    if (destroyed) return
+    const discardedPanel = discardPanelUi()
+    const wasHiding = model.hidePending
+    model.hidePending = false
+    const resetView = resetHiddenNonLauncherView()
+    publish(discardedPanel || wasHiding || resetView)
   }
 
   function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): void {
@@ -2822,6 +2866,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       if (destroyed || captured.token !== hideToken || captured.epoch !== model.viewEpoch) return
       model.hidePending = false
       discardPanelUi()
+      resetHiddenNonLauncherView()
       publish(true)
     } catch (error) {
       if (destroyed || captured.token !== hideToken || captured.epoch !== model.viewEpoch) return
@@ -2983,14 +3028,17 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       return
     }
     let registered: (() => void) | undefined
+    let hiddenRegistered: (() => void) | undefined
     let panelErrorsRegistered: (() => void) | undefined
     let panelResetsRegistered: (() => void) | undefined
     try {
       registered = await client.listenShown(shown)
+      hiddenRegistered = await client.listenHidden(hidden)
       panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
       panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
     } catch {
       registered?.()
+      hiddenRegistered?.()
       panelErrorsRegistered?.()
       panelResetsRegistered?.()
       unlistenPanelFocusHostInput?.()
@@ -3000,11 +3048,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     if (destroyed) {
       registered()
+      hiddenRegistered()
       panelErrorsRegistered()
       panelResetsRegistered()
       return
     }
     unlisten = registered
+    unlistenHidden = hiddenRegistered
     unlistenPanelError = panelErrorsRegistered
     unlistenPanelReset = panelResetsRegistered
     await messageCenter.start()
@@ -3058,6 +3108,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     messageCenter.destroy()
     unlisten?.()
     unlisten = undefined
+    unlistenHidden?.()
+    unlistenHidden = undefined
     unlistenPanelError?.()
     unlistenPanelError = undefined
     unlistenPanelReset?.()
