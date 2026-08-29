@@ -51,6 +51,7 @@ fn main() {
             "plugin_panel_storage_remove",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "set_plugin_panel_bounds",
             "close_plugin_panel",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",

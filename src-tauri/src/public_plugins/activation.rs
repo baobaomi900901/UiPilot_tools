@@ -185,6 +185,7 @@ pub(crate) struct PublicCommandSuggestion {
     pub(crate) summary: Option<String>,
     pub(crate) icon_url: Option<String>,
     pub(crate) favorite: bool,
+    pub(crate) input_required: bool,
     pub(crate) output_mode: PublicOutputMode,
 }
 
@@ -2160,13 +2161,16 @@ impl PublicPluginManager {
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
                 favorite: config.favorite,
+                input_required: snapshot.manifest.command.input_required,
                 output_mode: snapshot.manifest.command.output_mode,
             });
         }
         suggestions.sort_by(|left, right| {
-            left.effective_name
-                .cmp(&right.effective_name)
-                .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            right.favorite.cmp(&left.favorite).then_with(|| {
+                left.effective_name
+                    .cmp(&right.effective_name)
+                    .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            })
         });
         Ok(suggestions)
     }
@@ -2197,6 +2201,7 @@ impl PublicPluginManager {
                 summary: snapshot.manifest.command.summary.clone(),
                 icon_url: snapshot.icon_url(),
                 favorite: config.favorite,
+                input_required: snapshot.manifest.command.input_required,
                 output_mode: snapshot.manifest.command.output_mode,
             });
         }
@@ -5853,6 +5858,7 @@ mod tests {
                     summary: Some("返回示例文本到主界面".into()),
                     icon_url: None,
                     favorite: false,
+                    input_required: false,
                     output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
@@ -5862,6 +5868,7 @@ mod tests {
                     summary: Some("打开演示子窗口".into()),
                     icon_url: None,
                     favorite: false,
+                    input_required: false,
                     output_mode: PublicOutputMode::MainResult,
                 },
             ]
@@ -5883,6 +5890,7 @@ mod tests {
                 summary: Some("打开演示子窗口".into()),
                 icon_url: None,
                 favorite: false,
+                input_required: false,
                 output_mode: PublicOutputMode::MainResult,
             }]
         );
@@ -6052,6 +6060,40 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(manager.command_suggestions("demo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn slash_command_suggestions_sort_favorites_before_name_order() {
+        let dir = TestDir::new("slash-favorite-order");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let panel = dir.path().join("source-panel");
+        let pomodoro = dir.path().join("source-pomodoro");
+        write_discovery_package(
+            &panel,
+            "com.example.panel",
+            "Panel Tool",
+            "panel",
+            "Panel summary",
+        );
+        write_discovery_package(
+            &pomodoro,
+            "com.example.pomodoro",
+            "Pomodoro Tool",
+            "pomodoro",
+            "Pomodoro summary",
+        );
+        install_discovery_package(&manager, &panel, now);
+        install_discovery_package(&manager, &pomodoro, now);
+        manager.set_favorite("com.example.pomodoro", true).unwrap();
+
+        let matching = manager.command_suggestions("p").unwrap();
+        assert_eq!(
+            matching
+                .first()
+                .map(|suggestion| (suggestion.effective_name.as_str(), suggestion.favorite)),
+            Some(("pomodoro", true))
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@
     "allow-uninstall-plugin",
     "allow-open-plugin-panel",
     "allow-submit-plugin-panel",
+    "allow-set-plugin-panel-bounds",
     "allow-close-plugin-panel",
     "allow-plugin-panel-host-key-enqueue",
     "allow-plugin-panel-focus-host-input-ack",

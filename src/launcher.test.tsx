@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 
 import { describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
@@ -49,6 +49,27 @@ import protocolSource from './protocol.ts?raw'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
 const publicPluginPanelSource = readFileSync('src/public-plugin-panel.tsx', 'utf8')
+
+it('provides a browser-only launcher preview outside the production entry', () => {
+  expect(existsSync('dev/main-preview.html')).toBe(true)
+  const previewHtml = readFileSync('dev/main-preview.html', 'utf8')
+  const previewSource = readFileSync('src/launcher-browser-preview.tsx', 'utf8')
+  expect(previewHtml).toContain('/src/launcher-browser-preview.tsx')
+  expect(previewSource).toContain('LauncherView')
+  expect(previewSource).toContain("get('mode') === 'panel'")
+  expect(previewSource).toContain("get('command')")
+  expect(previewSource).toContain('panelPreviewCommand')
+  expect(previewSource).toContain("kind: 'panelActivation'")
+  expect(previewSource).toContain('core.activateResult')
+  expect(previewSource).toContain('com.uipilot.notes/preview.html')
+  expect(previewSource).toContain("querySelector<HTMLElement>('.panel-host-region')")
+  expect(previewSource).toContain("frame.style.width = '100%'")
+  expect(previewSource).toContain("frame.style.height = '100%'")
+  expect(previewSource).toContain('region.replaceChildren(frame)')
+  expect(previewSource).not.toContain("frame.style.left = '12px'")
+  expect(previewSource).not.toContain('@tauri-apps')
+  expect(readFileSync('index.html', 'utf8')).not.toContain('launcher-browser-preview')
+})
 
 describe('retired validation settings contract', () => {
   it('contains no research, rescan, export, or validation-clear surface', () => {
@@ -297,6 +318,7 @@ function fakeClient() {
       hostKeys: [],
     })),
     enqueuePluginPanelHostKey: vi.fn(async () => ({ outcome: 'enqueued', routeSequence: '1' })),
+    setPluginPanelBounds: vi.fn(async () => undefined),
     closePluginPanel: vi.fn(async () => undefined),
     acknowledgePluginPanelFocusHostInput: vi.fn(async () => undefined),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
@@ -372,9 +394,7 @@ function findLauncherItem(query: string) {
     title: '/find',
     subtitle: query ? `搜索文件：${query}` : '搜索文件',
     iconKind: 'find' as const,
-    activation: query
-      ? { kind: 'openFind' as const, query }
-      : { kind: 'completion' as const, completionText: '/find ' },
+    activation: { kind: 'openFind' as const, query },
     hasDefaultAction: false,
   }
 }
@@ -847,6 +867,20 @@ describe('shown and search ownership', () => {
         favorite: true,
       },
       {
+        kind: 'windowActivation',
+        pluginId: 'com.uipilot.pomodoro',
+        commandLabel: 'pomodoro',
+        initialArgument: 'focus',
+        favorite: true,
+      },
+      {
+        kind: 'mainResultActivation',
+        pluginId: 'com.uipilot.demo-return',
+        commandLabel: 'demo-return',
+        initialArgument: 'hello',
+        favorite: false,
+      },
+      {
         kind: 'panelActivation',
         pluginId: 'com.uipilot.demo-panel',
         initialArgument: 'hello',
@@ -879,6 +913,14 @@ describe('shown and search ownership', () => {
       { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: 1 },
       { kind: 'pluginCompletion', completionText: '/demo win ', pluginId: 'com.uipilot.demo-win', favorite: false },
       { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: true, extra: false },
+      { kind: 'windowActivation', pluginId: 'Invalid Plugin', commandLabel: 'pomodoro', initialArgument: '', favorite: false },
+      { kind: 'windowActivation', pluginId: 'com.uipilot.pomodoro', commandLabel: 'Pomodoro', initialArgument: '', favorite: false },
+      { kind: 'windowActivation', pluginId: 'com.uipilot.pomodoro', commandLabel: 'pomodoro', initialArgument: ' bad', favorite: false },
+      { kind: 'windowActivation', pluginId: 'com.uipilot.pomodoro', commandLabel: 'pomodoro', initialArgument: '', favorite: false, extra: true },
+      { kind: 'mainResultActivation', pluginId: 'Invalid Plugin', commandLabel: 'demo-return', initialArgument: '', favorite: false },
+      { kind: 'mainResultActivation', pluginId: 'com.uipilot.demo-return', commandLabel: 'Demo-return', initialArgument: '', favorite: false },
+      { kind: 'mainResultActivation', pluginId: 'com.uipilot.demo-return', commandLabel: 'demo-return', initialArgument: ' bad', favorite: false },
+      { kind: 'mainResultActivation', pluginId: 'com.uipilot.demo-return', commandLabel: 'demo-return', initialArgument: '', favorite: false, extra: true },
       { kind: 'panelActivation', pluginId: 'Invalid Plugin', initialArgument: '', favorite: true },
       { kind: 'panelActivation', pluginId: 'com.uipilot.demo-panel', initialArgument: 'bad\narg', favorite: false },
       { kind: 'panelActivation', pluginId: 'com.uipilot.demo-panel', initialArgument: ' hello', favorite: false },
@@ -952,6 +994,82 @@ describe('shown and search ownership', () => {
       querySequence: 2,
     }))
     expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('opens the catalog find row directly with an empty query', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'backend-empty-find-activation',
+      items: [findLauncherItem('')],
+      replaceLocalResults: true,
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('empty-find-activation'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    const querySequence = core.getSnapshot().querySequence
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: '',
+      invocationId: 'empty-find-activation',
+      querySequence,
+    }))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  })
+
+  it('submits a direct window activation on the first list activation', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'window-catalog',
+      items: [{
+        resultId: 'pomodoro-window',
+        title: '/pomodoro',
+        activation: {
+          kind: 'windowActivation',
+          pluginId: 'com.uipilot.pomodoro',
+          commandLabel: 'pomodoro',
+          initialArgument: 'focus',
+          favorite: true,
+        },
+        hasDefaultAction: false,
+      }],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
+      requestId: 'window-dispatch',
+      items: [],
+      windowTransferToken: 'window-token',
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('window-direct'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'focus',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.activateResult(0)
+
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+      query: '/pomodoro focus',
+      invocationId: 'window-direct',
+      querySequence: 3,
+      submit: true,
+      completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.pomodoro' },
+    }))
+    expect(core.getSnapshot().query).toBe('/pomodoro focus')
+    expect(fake.client.searchApps).toHaveBeenCalledTimes(2)
   })
 
   it('refreshes unread messages whenever native shown reopens the main window', async () => {
@@ -1456,6 +1574,59 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
   })
 
+  it('ignores stale panel-bound failures and closes only the matching current session', async () => {
+    const { core, client, emit, emitPanelReset } = await startedCore()
+    const staleBounds = deferred<void>()
+    const currentBounds = deferred<void>()
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-bounds-owner-result',
+      items: [panelItem('hello')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel)
+      .mockResolvedValueOnce({
+        sessionEpoch: u64('41'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
+      })
+      .mockResolvedValueOnce({
+        sessionEpoch: u64('42'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
+      })
+    vi.mocked(client.setPluginPanelBounds)
+      .mockReturnValueOnce(staleBounds.promise)
+      .mockReturnValueOnce(currentBounds.promise)
+
+    const openFromQuery = async (invocationId: string) => {
+      emit(shown(invocationId))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'hello', inputType: 'insertText',
+      })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.keyDown('Enter', false)
+    }
+    const bounds = { x: 12, y: 64, width: 696, height: 320 }
+
+    await openFromQuery('panel-bounds-owner-first')
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('41'))
+    core.setPanelBounds({ sessionEpoch: u64('41'), bounds })
+    emitPanelReset({ sessionEpoch: '41' })
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+
+    await openFromQuery('panel-bounds-owner-second')
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('42'))
+    staleBounds.reject(new Error('stale session'))
+    await Promise.resolve()
+    expect(core.getSnapshot().panel?.sessionEpoch).toBe('42')
+    expect(client.closePluginPanel).not.toHaveBeenCalled()
+
+    core.setPanelBounds({ sessionEpoch: u64('41'), bounds })
+    expect(client.setPluginPanelBounds).toHaveBeenCalledTimes(1)
+    core.setPanelBounds({ sessionEpoch: u64('42'), bounds })
+    currentBounds.reject({ message: 'Command set_plugin_panel_bounds not found' })
+    await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '42' }))
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeUndefined())
+    expect(core.getSnapshot().shownNotice).toBe('Panel 布局同步失败（PANEL_BOUNDS_COMMAND_NOT_FOUND）。')
+  })
+
   it('discards a panel after hide and starts the next shown invocation as a fresh launcher', async () => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValue({
@@ -1874,7 +2045,13 @@ describe('shown and search ownership', () => {
 
       const tag = mounted.host.querySelector<HTMLElement>('[aria-label="command demo-panel"]')
       const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')
+      const surface = mounted.host.querySelector<HTMLElement>('.launcher-surface')
+      const statusRegion = mounted.host.querySelector<HTMLElement>('.launcher-status-region')
       const shell = tag?.parentElement ?? null
+      const inputRegion = shell?.parentElement ?? null
+      expect(surface?.classList.contains('is-panel-active')).toBe(true)
+      expect(inputRegion?.classList.contains('panel-input-region')).toBe(true)
+      expect(inputRegion?.parentElement?.classList.contains('panel-launcher')).toBe(true)
       expect(shell).toContain(tag)
       expect(shell).toContain(input)
       const declaredProperty = (element: Element, property: string) => {
@@ -1890,6 +2067,8 @@ describe('shown and search ownership', () => {
         return value.trim()
       }
       expect(declaredProperty(shell!, 'border')).toContain('1px solid')
+      expect(declaredProperty(statusRegion!, 'display')).toBe('none')
+      expect(declaredProperty(surface!, 'grid-template-rows')).toBe('minmax(52px, 1fr)')
       expect(declaredProperty(tag!, 'border')).toMatch(/^0(?:px)?$/)
       expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
       expect(declaredProperty(input!, 'background')).toBe('transparent')
@@ -1903,6 +2082,121 @@ describe('shown and search ownership', () => {
     } finally {
       style.remove()
       await mounted.unmount()
+    }
+  })
+
+  it('syncs the panel host region bounds once per changed animation frame and cleans up observers', async () => {
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const resizeObservers: Array<{
+      callback: ResizeObserverCallback
+      observed: Element[]
+      disconnect: ReturnType<typeof vi.fn>
+    }> = []
+    const OriginalResizeObserver = globalThis.ResizeObserver
+    class TestResizeObserver {
+      readonly callback: ResizeObserverCallback
+      readonly observed: Element[] = []
+      readonly disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback
+        resizeObservers.push(this)
+      }
+
+      observe(target: Element) {
+        this.observed.push(target)
+      }
+
+      unobserve() {}
+    }
+    Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: TestResizeObserver })
+
+    let nextFrameId = 1
+    const frames = new Map<number, FrameRequestCallback>()
+    const requestFrame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      const id = nextFrameId
+      nextFrameId += 1
+      frames.set(id, callback)
+      return id
+    })
+    const cancelFrame = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => {
+      frames.delete(id)
+    })
+    const flushFrames = async () => {
+      const pending = [...frames.values()]
+      frames.clear()
+      await act(async () => pending.forEach((callback) => callback(performance.now())))
+    }
+
+    let bounds = { x: 12, y: 64, width: 696, height: 320 }
+    const originalRect = HTMLElement.prototype.getBoundingClientRect
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (!this.classList.contains('panel-host-region')) return originalRect.call(this)
+      return {
+        ...bounds,
+        left: bounds.x,
+        top: bounds.y,
+        right: bounds.x + bounds.width,
+        bottom: bounds.y + bounds.height,
+        toJSON: () => ({ ...bounds }),
+      } as DOMRect
+    })
+
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-bounds-result',
+      items: [panelItem('')],
+    } as unknown as SearchResponse)
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('panel-bounds-entry')))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/demo-panel', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('1'))
+
+      const region = mounted.host.querySelector<HTMLElement>('.panel-host-region')!
+      const observer = resizeObservers.find((candidate) => candidate.observed.includes(region))
+      expect(observer).toBeDefined()
+      await flushFrames()
+      expect(client.setPluginPanelBounds).toHaveBeenCalledWith({
+        sessionEpoch: '1',
+        bounds: { x: 12, y: 64, width: 696, height: 320 },
+      })
+
+      observer!.callback([], observer as unknown as ResizeObserver)
+      observer!.callback([], observer as unknown as ResizeObserver)
+      window.dispatchEvent(new Event('resize'))
+      expect(requestFrame).toHaveBeenCalledTimes(2)
+      await flushFrames()
+      expect(client.setPluginPanelBounds).toHaveBeenCalledTimes(1)
+
+      bounds = { x: 8.5, y: 62.25, width: 703.5, height: 329.75 }
+      observer!.callback([], observer as unknown as ResizeObserver)
+      window.dispatchEvent(new Event('resize'))
+      await flushFrames()
+      expect(client.setPluginPanelBounds).toHaveBeenLastCalledWith({
+        sessionEpoch: '1',
+        bounds,
+      })
+      expect(client.setPluginPanelBounds).toHaveBeenCalledTimes(2)
+
+      await mounted.unmount()
+      observer!.callback([], observer as unknown as ResizeObserver)
+      window.dispatchEvent(new Event('resize'))
+      await flushFrames()
+      expect(observer!.disconnect).toHaveBeenCalledOnce()
+      expect(client.setPluginPanelBounds).toHaveBeenCalledTimes(2)
+    } finally {
+      if (mounted.host.isConnected) await mounted.unmount()
+      Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: OriginalResizeObserver })
+      requestFrame.mockRestore()
+      cancelFrame.mockRestore()
+      rect.mockRestore()
     }
   })
 
@@ -1976,6 +2270,66 @@ describe('shown and search ownership', () => {
       vi.useRealTimers()
     }
   })
+
+  it.each(['keyboard', 'pointer'] as const)(
+    'enters a main-result command tag on first %s completion activation',
+    async (activationMethod) => {
+      const { core, client, emit } = await startedCore()
+      vi.mocked(client.searchApps).mockImplementation(async (request) => {
+        if (request.query === '/demo-return' && request.completionOrigin?.phase !== 'preview') {
+          return {
+            requestId: 'demo-return-suggestion',
+            items: [{
+              resultId: 'demo-return-activation',
+              title: '/demo-return',
+              activation: {
+                kind: 'mainResultActivation',
+                pluginId: 'com.uipilot.demo-return',
+                commandLabel: 'demo-return',
+                initialArgument: '',
+                favorite: false,
+              },
+              hasDefaultAction: false,
+            }],
+          } as unknown as SearchResponse
+        }
+        return {
+          requestId: 'demo-return-hint',
+          items: [],
+          commandHint: '请输入信息回车',
+        } as unknown as SearchResponse
+      })
+      emit(shown(`main-result-${activationMethod}`))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      core.text({
+        kind: 'ordinaryInput',
+        control: core.getSnapshot().queryControl,
+        value: '/demo-return',
+        inputType: 'insertText',
+      })
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+      if (activationMethod === 'keyboard') core.keyDown('Enter', false)
+      else core.activateResult(0)
+
+      expect(core.getSnapshot().mainResultCommand).toMatchObject({
+        pluginId: 'com.uipilot.demo-return',
+        commandLabel: 'demo-return',
+        suffix: '',
+      })
+      expect(core.getSnapshot().query).toBe('/demo-return')
+      expect(client.searchApps).not.toHaveBeenCalledWith(expect.objectContaining({ submit: true }))
+      await vi.waitFor(() => expect(core.getSnapshot().commandHint).toBe('请输入信息回车'))
+      expect(client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
+        query: '/demo-return',
+        submit: false,
+        completionOrigin: {
+          phase: 'preview',
+          pluginId: 'com.uipilot.demo-return',
+        },
+      }))
+    },
+  )
 
   it('replaces a committing completion with an edited armed owner and rejects late A failure', async () => {
     const { core, client, emit } = await startedCore()
@@ -3583,6 +3937,69 @@ describe('execute and hide continuation', () => {
 })
 
 describe('React view and accessibility', () => {
+  it('cycles launcher Tab focus only between the query input and settings button', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValue({
+      requestId: 'launcher-tab-focus',
+      items: [
+        findLauncherItem('tab'),
+        {
+          resultId: 'demo-return',
+          title: '/demo-return',
+          subtitle: '返回文本',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/demo-return ',
+            pluginId: 'com.uipilot.demo-return', favorite: true,
+          },
+        },
+        { resultId: 'tab-app', title: 'Tab App', activation: executeActivation },
+      ],
+    } as unknown as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => fake.emit(shown('launcher-tab-focus')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput',
+        control: core.getSnapshot().queryControl,
+        value: 'tab',
+        inputType: 'insertText',
+      }))
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
+
+      const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+      const settings = mounted.host.querySelector<HTMLButtonElement>('.launcher-settings-button')!
+      query.focus()
+      expect(document.activeElement).toBe(query)
+
+      const tabToSettings = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      await act(async () => query.dispatchEvent(tabToSettings))
+      expect(tabToSettings.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(settings)
+
+      const tabToQuery = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      await act(async () => settings.dispatchEvent(tabToQuery))
+      expect(tabToQuery.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(query)
+
+      const shiftTabToSettings = new KeyboardEvent('keydown', {
+        key: 'Tab', shiftKey: true, bubbles: true, cancelable: true,
+      })
+      await act(async () => query.dispatchEvent(shiftTabToSettings))
+      expect(shiftTabToSettings.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(settings)
+
+      const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+      expect(options.every((option) => option.tabIndex === -1)).toBe(true)
+    } finally {
+      await mounted.unmount()
+      core.destroy()
+    }
+  })
+
   it('renders and owns the public-plugin favorite context menu without activating the row', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
@@ -3769,6 +4186,129 @@ describe('React view and accessibility', () => {
     expect(fake.client.executeResult).not.toHaveBeenCalled()
     expect(fake.client.hideLauncher).not.toHaveBeenCalled()
     await mounted.unmount()
+  })
+
+  it('wraps a submitted main-result plugin command in a tag and preserves its argument', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/demo-return' && !request.query.startsWith('/demo-return ')) return null
+      const argument = request.query === '/demo-return' ? '' : request.query.slice('/demo-return '.length)
+      if (!request.submit) {
+        return {
+          requestId: `demo-return-hint-${argument}`,
+          items: [],
+          commandHint: '请输入信息回车',
+        } as unknown as SearchResponse
+      }
+      if (!argument) {
+        return {
+          requestId: 'demo-return-submit-hint',
+          items: [],
+          commandHint: '请输入信息回车',
+          mainResultCommand: {
+            pluginId: 'com.uipilot.demo-return',
+            commandLabel: 'demo-return',
+            argument,
+          },
+        } as unknown as SearchResponse
+      }
+      return {
+        requestId: `demo-return-results-${argument}`,
+        items: [{
+          resultId: 'demo-return-copy',
+          title: argument,
+          subtitle: '英译中 · 按 Enter 复制',
+          activation: executeActivation,
+          hasDefaultAction: true,
+        }],
+        mainResultCommand: {
+          pluginId: 'com.uipilot.demo-return',
+          commandLabel: 'demo-return',
+          argument,
+        },
+      } as unknown as SearchResponse
+    })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('main-result-command-tag')))
+    const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo-return str',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
+      query: '/demo-return str',
+      submit: false,
+    })))
+    await act(async () => query.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+
+    await vi.waitFor(() => {
+      const tag = mounted.host.querySelector('.main-result-command-tag')
+      expect(tag).not.toBeNull()
+      expect(tag?.textContent).toContain('/demo-return')
+    })
+    const argument = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-return argument"]')!
+    expect(argument.value).toBe('str')
+    expect(document.activeElement).toBe(argument)
+    expect(mounted.host.querySelector('[role="option"]')?.textContent).toContain('str')
+    expect(mounted.host.querySelector('.status-region')?.textContent)
+      .toBe('1 个结果 · 英译中 · 按 Enter 复制')
+    expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
+      query: '/demo-return str',
+      submit: true,
+    }))
+
+    const suffixControl = core.getSnapshot().mainResultCommand!.suffixControl
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: suffixControl,
+      value: 'next',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => {
+      expect(core.getSnapshot().searchPending).toBe(false)
+      expect(core.getSnapshot().results).toHaveLength(0)
+      expect(argument.value).toBe('next')
+    })
+    await act(async () => argument.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
+      query: '/demo-return next',
+      submit: true,
+    })))
+    await vi.waitFor(() => expect(mounted.host.querySelector('[role="option"]')?.textContent).toContain('next'))
+
+    const exit = mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 demo-return 命令"]')!
+    await act(async () => exit.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand).toBeUndefined())
+    const plainQuery = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    expect(plainQuery.value).toBe('')
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '/demo-return',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    await act(async () => plainQuery.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand?.suffix).toBe(''))
+    const emptyArgument = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-return argument"]')!
+    emptyArgument.setSelectionRange(0, 0)
+    await act(async () => emptyArgument.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Backspace',
+      bubbles: true,
+    })))
+    await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand).toBeUndefined())
+    expect(mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')?.value).toBe('')
+
+    await mounted.unmount()
+    core.destroy()
   })
 
   it('opens Settings from the query suffix and returns through Escape', async () => {
@@ -3963,6 +4503,30 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/\.result-list:empty\s*\{[^}]*app-region:\s*drag;/)
   })
 
+  it('wraps the active section and status region in separate divs', async () => {
+    installMatchMedia(false)
+    const { core } = await startedCore()
+    const mounted = await mountLauncherView(core)
+    const surface = mounted.host.querySelector<HTMLElement>('.launcher-surface')!
+    const regions = Array.from(surface.children) as HTMLElement[]
+
+    expect(regions.map((region) => region.tagName)).toEqual(['DIV', 'DIV'])
+    expect(regions.map((region) => region.className)).toEqual([
+      'launcher-region launcher-section-region',
+      'launcher-region launcher-status-region',
+    ])
+    expect(regions[0]?.firstElementChild?.tagName).toBe('SECTION')
+    expect(regions[1]?.firstElementChild?.classList.contains('status-region')).toBe(true)
+    const queryRegion = regions[0]?.querySelector<HTMLElement>('.launcher-query-region')
+    expect(queryRegion?.tagName).toBe('DIV')
+    expect(queryRegion?.children[0]?.matches('label.visually-hidden')).toBe(true)
+    expect(queryRegion?.children[1]?.tagName).toBe('SPAN')
+    const resultsRegion = regions[0]?.querySelector<HTMLElement>('.launcher-results-region')
+    expect(resultsRegion?.tagName).toBe('DIV')
+    expect(resultsRegion?.firstElementChild?.matches('.ant-spin.ant-spin-sm')).toBe(true)
+    await mounted.unmount()
+  })
+
   it('keeps launcher chrome separated and gives scrolling only to results', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
@@ -3987,7 +4551,7 @@ describe('React view and accessibility', () => {
       const app = mounted.host.querySelector<HTMLElement>(':scope > .ant-app')!
       const surface = app.querySelector<HTMLElement>('.launcher-surface')!
       const launcher = surface.querySelector<HTMLElement>('.launcher-view')!
-      const spinRoot = launcher.querySelector<HTMLElement>(':scope > .ant-spin')!
+      const spinRoot = launcher.querySelector<HTMLElement>('.launcher-results-region > .ant-spin')!
       const spinContainer = spinRoot.querySelector<HTMLElement>('.ant-spin-container')!
       const results = spinContainer.querySelector<HTMLElement>('.result-list')!
       const image = results.querySelector<HTMLImageElement>('.result-icon-image')!
@@ -4315,6 +4879,11 @@ describe('React view and accessibility', () => {
     await core.start()
     const mounted = await mountLauncherView(core)
     await act(async () => fake.emit(shown('settings-view', 'settings')))
+    const header = mounted.host.querySelector<HTMLElement>('header.settings-header')!
+    expect(header.parentElement?.tagName).toBe('DIV')
+    expect(header.parentElement?.className).toBe('settings-header-region')
+    expect(header.parentElement?.parentElement?.matches('section.settings-view')).toBe(true)
+    expect(mounted.host.querySelector('.launcher-status-region')).toBeNull()
     const heading = mounted.host.querySelector<HTMLElement>('.settings-header h1')!
     expect(heading.textContent).toBe('设置')
     expect(heading.hasAttribute('tabindex')).toBe(false)
@@ -4677,6 +5246,7 @@ describe('React view and accessibility', () => {
     fake.emit(shown('settings-failure', 'settings'))
     const mounted = await mountLauncherView(core)
     await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('error'))
+    expect(mounted.host.querySelector('.launcher-status-region')).not.toBeNull()
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('设置未能确认完成')
     expect(mounted.host.querySelector('.ant-spin-spinning')).toBeNull()
     expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent?.replace(/\s/g, '') === '重试')).toBe(true)
@@ -5419,6 +5989,9 @@ describe('real adapter and startup', () => {
       sessionEpoch: u64('7'), clientSequence: u64('1'), declaration: 'ArrowDown', key: 'ArrowDown',
       ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
     })
+    await main.client.setPluginPanelBounds({
+      sessionEpoch: u64('7'), bounds: { x: 12, y: 64, width: 696, height: 320 },
+    })
     await main.client.closePluginPanel({ sessionEpoch: u64('7') })
     await main.client.acknowledgePluginPanelFocusHostInput({
       sessionEpoch: u64('7'), focusRequestId: u64('9'), focused: true,
@@ -5444,6 +6017,9 @@ describe('real adapter and startup', () => {
       ['plugin_panel_host_key_enqueue', [{ input: {
         sessionEpoch: '7', clientSequence: '1', declaration: 'ArrowDown', key: 'ArrowDown',
         ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+      } }]],
+      ['set_plugin_panel_bounds', [{ input: {
+        sessionEpoch: '7', bounds: { x: 12, y: 64, width: 696, height: 320 },
       } }]],
       ['close_plugin_panel', [{ input: { sessionEpoch: '7' } }]],
       ['plugin_panel_focus_host_input_ack', [{ sessionEpoch: '7', focusRequestId: '9', focused: true }]],

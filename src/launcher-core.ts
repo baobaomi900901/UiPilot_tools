@@ -18,11 +18,13 @@ import {
   type LauncherClient,
   type LauncherResultActivation,
   type LauncherSnapshot,
+  type MainResultCommandContext,
   type MessageCenterStateSnapshot,
   type PluginInventoryView,
   type PluginListStatus,
   type PluginMutationKind,
   type PluginPanelFocusHostInputEvent,
+  type PluginPanelBounds,
   type PanelHostKeyDeclaration,
   type PluginPanelHostKey,
   type ResultItem,
@@ -56,7 +58,9 @@ export interface LauncherCore {
   readonly navigate: (target: ShowTarget) => void
   readonly selectSettingsTab: (key: SettingsTabKey) => void
   readonly requestHide: () => Promise<void>
+  readonly closeMainResultCommand: () => void
   readonly closePanel: () => Promise<void>
+  readonly setPanelBounds: (input: { sessionEpoch: U64Decimal; bounds: PluginPanelBounds }) => void
   readonly settlePanelHostInputFocus: (input: PluginPanelFocusHostInputEvent & { focused: boolean }) => void
   readonly activateResult: (index: number) => void
   readonly openPluginContextMenu: (index: number) => void
@@ -135,6 +139,12 @@ interface PrivatePanelState {
   focusRequestId?: U64Decimal
 }
 
+interface PrivateMainResultCommandState {
+  pluginId: string
+  commandLabel: string
+  suffix: TextControl
+}
+
 interface Model {
   view: 'launcher' | 'settings'
   settingsTab: SettingsTabKey
@@ -163,6 +173,7 @@ interface Model {
   settingsLoadStatus: SettingsLoadStatus
   settingsLoadError?: string
   file?: PrivateFileState
+  mainResultCommand?: PrivateMainResultCommandState
   panel?: PrivatePanelState
   plugins: PrivatePluginList
 }
@@ -311,9 +322,59 @@ const NOTICE_TEXT = {
 
 const REFUSED_NOTICE = 'Windows 拒绝了前台切换，已发送启动请求'
 const FALLBACK_ERROR = '操作不可用，请重试。'
+const PANEL_BOUNDS_ACL_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_ACL）。'
+const PANEL_BOUNDS_COMMAND_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_COMMAND_NOT_FOUND）。'
+const PANEL_BOUNDS_ARGUMENT_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_INVALID_ARGS）。'
+const PANEL_BOUNDS_CALLER_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_INVALID_CALLER）。'
+const PANEL_BOUNDS_SESSION_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_INVALID_SESSION）。'
+const PANEL_BOUNDS_STALE_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_STALE）。'
+const PANEL_BOUNDS_WINDOW_NOTICE = 'Panel 布局同步失败（PANEL_BOUNDS_WINDOW_FAILED）。'
+const PANEL_SUBMIT_IDENTITY_NOTICE = 'Panel 返回身份不匹配（PANEL_SUBMIT_IDENTITY）。'
+const PANEL_SUBMIT_INVOKE_NOTICE = 'Panel 内容提交失败（PANEL_SUBMIT_INVOKE）。'
 const FILE_PREVIEW_ERROR = '无法保存文件预览设置。'
 const THEME_PREFERENCE_ERROR = '无法保存风格设置。'
 const WEB_SEARCH_ENGINE_ERROR = '无法保存搜索引擎设置。'
+
+function panelBoundsInvokeNotice(error: unknown): string {
+  const record = typeof error === 'object' && error !== null
+    ? error as Record<string, unknown>
+    : undefined
+  if (record) {
+    const code = record.code
+    if (code === 'invalidCaller') return PANEL_BOUNDS_CALLER_NOTICE
+    if (code === 'pluginQueryFailed') return PANEL_BOUNDS_SESSION_NOTICE
+    if (code === 'staleRequest') return PANEL_BOUNDS_STALE_NOTICE
+    if (code === 'windowFailed') return PANEL_BOUNDS_WINDOW_NOTICE
+  }
+  const message = typeof error === 'string'
+    ? error
+    : error instanceof Error
+      ? error.message
+      : typeof record?.message === 'string'
+        ? record.message
+        : ''
+  const normalized = message.toLowerCase()
+  if (normalized.includes('not allowed by acl')) return PANEL_BOUNDS_ACL_NOTICE
+  if (normalized.includes('command set_plugin_panel_bounds not found')) return PANEL_BOUNDS_COMMAND_NOTICE
+  if (
+    normalized.includes('invalid args') || normalized.includes('missing required key') ||
+    normalized.includes('unknown field') || normalized.includes('invalid type')
+  ) return PANEL_BOUNDS_ARGUMENT_NOTICE
+  if (message) {
+    const detail = message.replace(/[^\x20-\x7e]/gu, ' ').slice(0, 160)
+    return `Panel 布局同步失败：${detail}`
+  }
+  if (record) {
+    const code = typeof record.code === 'string' && /^[A-Za-z0-9_-]{1,40}$/u.test(record.code)
+      ? `CODE_${record.code}`
+      : `OBJECT_${Object.keys(record).sort().slice(0, 5).join('_') || 'EMPTY'}`
+    return `Panel 布局同步失败（PANEL_BOUNDS_${code}）。`
+  }
+  if (error === undefined) return 'Panel 布局同步失败（PANEL_BOUNDS_UNDEFINED）。'
+  if (error === null) return 'Panel 布局同步失败（PANEL_BOUNDS_NULL）。'
+  if (typeof error !== 'string') return `Panel 布局同步失败（PANEL_BOUNDS_TYPE_${typeof error}）。`
+  return 'Panel 布局同步失败（PANEL_BOUNDS_EMPTY_STRING）。'
+}
 const ERROR_CODES = new Set(Object.keys(ERROR_TEXT))
 const ICON_PREFIX = 'data:image/png;base64,'
 const MAX_ICON_LENGTH = 65_536
@@ -393,6 +454,54 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
         }
       : undefined
   }
+  if (candidate?.kind === 'windowActivation') {
+    const record = exactPlainRecord(
+      value,
+      ['commandLabel', 'favorite', 'initialArgument', 'kind', 'pluginId'],
+    )
+    return record &&
+        typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.commandLabel === 'string' && LAUNCHER_COMMAND.test(record.commandLabel) &&
+        typeof record.initialArgument === 'string' && record.initialArgument.length <= 65_536 &&
+        record.initialArgument.trim() === record.initialArgument &&
+        ![...record.initialArgument].some(
+          (character) =>
+            /\p{Cc}/u.test(character) || character === '\u2028' || character === '\u2029',
+        ) &&
+        typeof record.favorite === 'boolean'
+      ? {
+          kind: 'windowActivation',
+          pluginId: record.pluginId,
+          commandLabel: record.commandLabel,
+          initialArgument: record.initialArgument,
+          favorite: record.favorite,
+        }
+      : undefined
+  }
+  if (candidate?.kind === 'mainResultActivation') {
+    const record = exactPlainRecord(
+      value,
+      ['commandLabel', 'favorite', 'initialArgument', 'kind', 'pluginId'],
+    )
+    return record &&
+        typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.commandLabel === 'string' && LAUNCHER_COMMAND.test(record.commandLabel) &&
+        typeof record.initialArgument === 'string' && record.initialArgument.length <= 65_536 &&
+        record.initialArgument.trim() === record.initialArgument &&
+        ![...record.initialArgument].some(
+          (character) =>
+            /\p{Cc}/u.test(character) || character === '\u{2028}' || character === '\u{2029}',
+        ) &&
+        typeof record.favorite === 'boolean'
+      ? {
+          kind: 'mainResultActivation',
+          pluginId: record.pluginId,
+          commandLabel: record.commandLabel,
+          initialArgument: record.initialArgument,
+          favorite: record.favorite,
+        }
+      : undefined
+  }
   if (candidate?.kind === 'panelActivation') {
     const record = exactPlainRecord(value, ['favorite', 'initialArgument', 'kind', 'pluginId'])
     return record &&
@@ -422,6 +531,29 @@ function safeCommandHint(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+function safeMainResultCommand(value: unknown): MainResultCommandContext | undefined {
+  const command = exactPlainRecord(value, ['argument', 'commandLabel', 'pluginId'])
+  if (
+    !command ||
+    typeof command.pluginId !== 'string' ||
+    command.pluginId.length > 64 ||
+    !PUBLIC_PLUGIN_ID.test(command.pluginId) ||
+    typeof command.commandLabel !== 'string' ||
+    !/^[a-z][a-z0-9-]{0,31}$/u.test(command.commandLabel) ||
+    typeof command.argument !== 'string' ||
+    command.argument.length > 65_536 ||
+    command.argument.trim() !== command.argument ||
+    [...command.argument].some(
+      (character) => /\p{Cc}/u.test(character) || character === '\u{2028}' || character === '\u{2029}',
+    )
+  ) return undefined
+  return {
+    pluginId: command.pluginId,
+    commandLabel: command.commandLabel,
+    argument: command.argument,
+  }
+}
+
 function errorText(value: unknown): string {
   if (typeof value !== 'object' || value === null || !Object.prototype.hasOwnProperty.call(value, 'code')) return FALLBACK_ERROR
   const code = (value as { code?: unknown }).code
@@ -440,7 +572,8 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(iconKind === undefined ? {} : { iconKind }),
         ...(detail === undefined ? {} : { detail }),
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
-        ...(activation.kind === 'pluginCompletion'
+        ...(activation.kind === 'pluginCompletion' || activation.kind === 'windowActivation' ||
+            activation.kind === 'mainResultActivation'
           ? { pluginCompletion: Object.freeze({ pluginId: activation.pluginId, favorite: activation.favorite }) }
           : {}),
         ...(activation.kind === 'panelActivation'
@@ -507,6 +640,14 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(model.panel.focusRequestId === undefined ? {} : { focusRequestId: model.panel.focusRequestId }),
       })
     : undefined
+  const mainResultCommand = model.mainResultCommand
+    ? Object.freeze({
+        pluginId: model.mainResultCommand.pluginId,
+        commandLabel: model.mainResultCommand.commandLabel,
+        suffixControl: model.mainResultCommand.suffix.key,
+        suffix: model.mainResultCommand.suffix.draft,
+      })
+    : undefined
   const plugins = Object.freeze({
     status: model.plugins.status,
     items: Object.freeze(
@@ -544,6 +685,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ...(settings === undefined ? {} : { settings }),
     ...(model.view === 'settings' ? { settingsLoadStatus: model.settingsLoadStatus, plugins } : {}),
     ...(file === undefined ? {} : { file }),
+    ...(mainResultCommand === undefined ? {} : { mainResultCommand }),
     ...(panel === undefined ? {} : { panel }),
   })
 }
@@ -633,6 +775,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let favoriteMenuConsumed = false
   let panelActionToken = 0
   let panelSubmissionToken = 0
+  let panelBoundsToken = 0
   let panelHostKeyEpoch: U64Decimal | undefined
   let nextPanelHostKeyClientSequence = 1n
   let panelHostKeyEnqueueTail: Promise<void> = Promise.resolve()
@@ -697,6 +840,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function getControlDraft(control: ControlKey): string | undefined {
     if (control === model.queryControl) return model.queryControlValue
+    if (control === model.mainResultCommand?.suffix.key) return model.mainResultCommand.suffix.draft
     if (control === model.panel?.suffix.key) return model.panel.suffix.draft
     return findTextControl(control)?.draft
   }
@@ -705,6 +849,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (control === model.queryControl) {
       const changed = model.queryControlValue !== value
       model.queryControlValue = value
+      return changed
+    }
+    if (control === model.mainResultCommand?.suffix.key) {
+      const changed = model.mainResultCommand.suffix.draft !== value
+      model.mainResultCommand.suffix.draft = value
       return changed
     }
     if (control === model.panel?.suffix.key) {
@@ -721,6 +870,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function restoreControl(control: ControlKey): boolean {
     if (control === model.queryControl) return setControlDraft(control, model.query)
+    if (control === model.mainResultCommand?.suffix.key) {
+      return setControlDraft(control, model.mainResultCommand.suffix.value)
+    }
     if (control === model.panel?.suffix.key) return setControlDraft(control, model.panel.suffix.value)
     const field = findTextControl(control)
     return field ? setControlDraft(control, field.value) : false
@@ -733,6 +885,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         return
       }
       applyEdit(value)
+      return
+    }
+    if (control === model.mainResultCommand?.suffix.key) {
+      applyMainResultEdit(value)
       return
     }
     if (control === model.panel?.suffix.key) {
@@ -1099,7 +1255,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function pluginFavoriteActivation(activation: LauncherResultActivation) {
-    return activation.kind === 'pluginCompletion' || activation.kind === 'panelActivation'
+    return activation.kind === 'pluginCompletion' || activation.kind === 'windowActivation' ||
+        activation.kind === 'mainResultActivation' || activation.kind === 'panelActivation'
       ? activation
       : undefined
   }
@@ -1290,6 +1447,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     model.searchPending = false
     if (response !== null) {
+      const mainResultCommand = captured.submit
+        ? safeMainResultCommand(response.mainResultCommand)
+        : undefined
+      if (mainResultCommand) activateMainResultCommand(mainResultCommand)
       model.requestId = response.requestId
       model.commandHint = safeCommandHint(response.commandHint)
       const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
@@ -1354,6 +1515,70 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     model.status = errorText(error)
     publish(true)
+  }
+
+  function mainResultQuery(commandLabel: string, argument: string): string {
+    return argument ? `/${commandLabel} ${argument}` : `/${commandLabel}`
+  }
+
+  function activateMainResultCommand(context: MainResultCommandContext): void {
+    const current = model.mainResultCommand
+    if (current?.pluginId === context.pluginId && current.commandLabel === context.commandLabel) {
+      current.suffix.value = context.argument
+      current.suffix.draft = context.argument
+    } else {
+      model.mainResultCommand = {
+        pluginId: context.pluginId,
+        commandLabel: context.commandLabel,
+        suffix: newTextControl(context.argument),
+      }
+    }
+    const query = mainResultQuery(context.commandLabel, context.argument)
+    model.query = query
+    model.queryControlValue = query
+    completionOrigin = undefined
+  }
+
+  function applyMainResultEdit(value: string): void {
+    const command = model.mainResultCommand
+    if (!command) return
+    invalidateFavoriteInteraction()
+    const query = mainResultQuery(command.commandLabel, value)
+    if (sequenceExhausted) {
+      const changed = command.suffix.value !== value || command.suffix.draft !== value || model.query !== query
+      command.suffix.value = value
+      command.suffix.draft = value
+      model.query = query
+      model.queryControlValue = query
+      publish(changed)
+      return
+    }
+    if (command.suffix.value === value) {
+      publish(setControlDraft(command.suffix.key, value))
+      return
+    }
+    if (!advanceApplicationSequence()) return
+    command.suffix.value = value
+    command.suffix.draft = value
+    model.query = query
+    model.queryControlValue = query
+    completionOrigin = undefined
+    model.shownNotice = undefined
+    searchToken = ++token
+    model.searchPending = false
+    model.status = ''
+    clearResults()
+    scheduleSearch()
+    publish(true)
+  }
+
+  function closeMainResultCommand(): void {
+    const command = model.mainResultCommand
+    if (destroyed || !command) return
+    if (composition?.control === command.suffix.key) composition = undefined
+    model.mainResultCommand = undefined
+    completionOrigin = undefined
+    applyEdit('')
   }
 
   function applyEdit(value: string): void {
@@ -1548,6 +1773,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (notice === 'settingsFailed') model.settingsUncertain = true
     if (composition) restoreControl(composition.control)
     composition = undefined
+    model.mainResultCommand = undefined
     leaveFileMode()
     model.viewEpoch += 1
     model.invocationId = invocationId
@@ -1638,9 +1864,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function text(record: ClassifiedTextRecord): void {
     if (destroyed) return
     const queryControl = record.control === model.queryControl
+    const mainResultControl = record.control === model.mainResultCommand?.suffix.key
     const panelControl = record.control === model.panel?.suffix.key
     const settingsControl = findTextControl(record.control) !== undefined
-    if (!queryControl && !panelControl && !settingsControl) return
+    if (!queryControl && !mainResultControl && !panelControl && !settingsControl) return
     if (settingsControl && !settingsEditable()) return
     if (record.kind === 'ordinaryInput') {
       if (ownsComposition(composition, record.control)) composition = undefined
@@ -1652,7 +1879,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const visibleMutation =
         restored ||
         model.shownNotice !== undefined ||
-        (queryControl &&
+        ((queryControl || mainResultControl) &&
           (model.searchPending ||
             model.requestId !== undefined ||
             model.results.length > 0 ||
@@ -1667,7 +1894,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         lastTrustedDraft: getControlDraft(record.control) ?? '',
       }
       model.shownNotice = undefined
-      if (queryControl) {
+      if (queryControl || mainResultControl) {
         searchToken = ++token
         model.searchPending = false
         model.status = ''
@@ -1998,6 +2225,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (composition?.control === model.panel?.suffix.key) composition = undefined
     panelActionToken += 1
     panelSubmissionToken += 1
+    panelBoundsToken += 1
     searchToken = ++token
     model.searchPending = false
     model.executePending = false
@@ -2082,6 +2310,34 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     void client.acknowledgePluginPanelFocusHostInput(input).catch(() => undefined)
   }
 
+  function setPanelBounds(input: { sessionEpoch: U64Decimal; bounds: PluginPanelBounds }): void {
+    const panel = model.panel
+    if (
+      destroyed || model.view !== 'launcher' || model.launcherMode !== 'panel' ||
+      !panel || panel.closePending || panel.sessionEpoch !== input.sessionEpoch
+    ) return
+    const owner = {
+      token: ++panelBoundsToken,
+      viewEpoch: model.viewEpoch,
+      sessionEpoch: panel.sessionEpoch,
+    }
+    let pending: ReturnType<LauncherClient['setPluginPanelBounds']>
+    try {
+      pending = client.setPluginPanelBounds(input)
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    void pending.catch((error: unknown) => {
+      const current = model.panel
+      if (
+        destroyed || owner.token !== panelBoundsToken || owner.viewEpoch !== model.viewEpoch ||
+        model.launcherMode !== 'panel' || !current || current.closePending ||
+        current.sessionEpoch !== owner.sessionEpoch
+      ) return
+      void closePanelWithError(panelBoundsInvokeNotice(error))
+    })
+  }
+
   function preparePanelHostInputFocusListener(): Promise<boolean> {
     if (panelFocusListenerRegistration) return panelFocusListenerRegistration
     panelFocusListenerRegistration = (async () => {
@@ -2136,7 +2392,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       (result) => {
         if (!owns()) return
         if (!panelIdentityMatches(result, model.panel!)) {
-          void closePanelWithError()
+          void closePanelWithError(PANEL_SUBMIT_IDENTITY_NOTICE)
           return
         }
         model.panel!.hostKeys = Object.freeze([...result.hostKeys])
@@ -2144,7 +2400,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         publish(true)
       },
       () => {
-        if (owns()) void closePanelWithError()
+        if (owns()) void closePanelWithError(PANEL_SUBMIT_INVOKE_NOTICE)
       },
     )
   }
@@ -2235,11 +2491,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
-  async function closePanelWithError(): Promise<void> {
-    await closePanel(FALLBACK_ERROR)
+  async function closePanelWithError(notice = FALLBACK_ERROR): Promise<void> {
+    await closePanel(FALLBACK_ERROR, notice)
   }
 
-  async function closePanel(status = ''): Promise<void> {
+  async function closePanel(status = '', notice?: string): Promise<void> {
     const panel = model.panel
     if (destroyed || model.launcherMode !== 'panel' || !panel || panel.closePending) return
     const owner = {
@@ -2262,6 +2518,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         current.suffix.key !== owner.suffixControl
       ) return
       resetPanelUi(status)
+      if (notice !== undefined) {
+        model.shownNotice = notice
+        publish(true)
+      }
     } catch {
       const current = model.panel
       if (
@@ -2326,6 +2586,53 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return true
   }
 
+  function applyMainResultActivation(result: PrivateApplicationResult): void {
+    if (sequenceExhausted || result.activation.kind !== 'mainResultActivation') return
+    const activation = result.activation
+    if (!advanceApplicationSequence()) return
+    cancelSlashSearch()
+    searchToken = ++token
+    model.searchPending = false
+    model.shownNotice = undefined
+    model.status = ''
+    clearResults()
+    activateMainResultCommand({
+      pluginId: activation.pluginId,
+      commandLabel: activation.commandLabel,
+      argument: activation.initialArgument,
+    })
+    replaceCompletionOrigin({
+      resultKey: result.key,
+      pluginId: activation.pluginId,
+      command: activation.commandLabel,
+    }, 'armed')
+    scheduleSearch()
+    publish(true)
+  }
+
+  function applyWindowActivation(result: PrivateApplicationResult): void {
+    if (sequenceExhausted || result.activation.kind !== 'windowActivation') return
+    const activation = result.activation
+    if (!advanceApplicationSequence()) return
+    cancelSlashSearch()
+    searchToken = ++token
+    model.searchPending = false
+    model.shownNotice = undefined
+    model.status = ''
+    model.query = activation.initialArgument
+      ? `/${activation.commandLabel} ${activation.initialArgument}`
+      : `/${activation.commandLabel}`
+    model.queryControlValue = model.query
+    clearResults()
+    replaceCompletionOrigin({
+      resultKey: result.key,
+      pluginId: activation.pluginId,
+      command: activation.commandLabel,
+    }, 'committing')
+    beginSearch(true)
+    publish(true)
+  }
+
   function executeSelection(): void {
     if (model.view !== 'launcher' || model.executePending) return
     invalidateFavoriteInteraction()
@@ -2339,6 +2646,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       }
       if (selected.activation.kind === 'pluginCompletion') {
         applyPluginCompletion(selected)
+        return
+      }
+      if (selected.activation.kind === 'windowActivation') {
+        applyWindowActivation(selected)
+        return
+      }
+      if (selected.activation.kind === 'mainResultActivation') {
+        applyMainResultActivation(selected)
         return
       }
       if (selected.activation.kind === 'panelActivation') {
@@ -2855,7 +3170,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     navigate,
     selectSettingsTab,
     requestHide,
+    closeMainResultCommand,
     closePanel,
+    setPanelBounds,
     settlePanelHostInputFocus,
     activateResult,
     openPluginContextMenu,

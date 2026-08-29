@@ -30,13 +30,14 @@ use crate::{
     message_center::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
-    model::{LauncherResultActivation, ResultIconKind, SearchResponse},
+    model::{LauncherResultActivation, MainResultCommandContext, ResultIconKind, SearchResponse},
     plugin_panel::{
         self, HostInputFocusAdvance, HostInputFocusIdentity, HostInputFocusOutcome,
-        HostKeyEnqueueInput, HostKeyEnqueueOutcome, PanelAdmissionError, PanelCallError,
-        PanelHideTicketIdentity, PanelHideTicketPhase, PanelOwner, PanelSessionIdentity,
-        PanelSettlementError, PendingDispatch, PluginPanelController, PluginPanelHostKey,
-        PluginPanelUpdate, QueueDispatchOutcome, HOST_INPUT_FOCUS_TIMEOUT,
+        HostKeyEnqueueInput, HostKeyEnqueueOutcome, PanelAdmissionError, PanelBounds,
+        PanelBoundsError, PanelCallError, PanelHideTicketIdentity, PanelHideTicketPhase,
+        PanelOwner, PanelSessionIdentity, PanelSettlementError, PendingDispatch,
+        PluginPanelController, PluginPanelHostKey, PluginPanelUpdate, QueueDispatchOutcome,
+        HOST_INPUT_FOCUS_TIMEOUT,
     },
     plugin_window::{
         self, PluginWindowCallError, PluginWindowController, PluginWindowOwner,
@@ -538,6 +539,22 @@ pub(crate) struct SubmitPluginPanelInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ClosePluginPanelInput {
     session_epoch: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PluginPanelBoundsInput {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SetPluginPanelBoundsInput {
+    session_epoch: String,
+    bounds: PluginPanelBoundsInput,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -2196,6 +2213,37 @@ pub(crate) async fn submit_plugin_panel(
 }
 
 #[tauri::command]
+pub(crate) fn set_plugin_panel_bounds(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    input: SetPluginPanelBoundsInput,
+) -> Result<(), CommandError> {
+    eprintln!(
+        "[plugin-panel-bounds] entered caller={} session={}",
+        webview.label(),
+        input.session_epoch
+    );
+    require_main_label(webview.label())?;
+    let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
+    let result = plugin_panel::set_bounds(
+        &app,
+        controller.inner().as_ref(),
+        session_epoch,
+        PanelBounds {
+            x: input.bounds.x,
+            y: input.bounds.y,
+            width: input.bounds.width,
+            height: input.bounds.height,
+        },
+    );
+    if let Err(error) = &result {
+        eprintln!("[plugin-panel-bounds] session={session_epoch} error={error:?}");
+    }
+    result.map_err(map_panel_bounds_error)
+}
+
+#[tauri::command]
 pub(crate) fn close_plugin_panel(
     webview: tauri::Webview,
     app: AppHandle,
@@ -2204,12 +2252,21 @@ pub(crate) fn close_plugin_panel(
 ) -> Result<(), CommandError> {
     require_main_label(webview.label())?;
     let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
+    eprintln!("[plugin-panel-close] session={session_epoch}");
     plugin_panel::teardown(&app, controller.inner().as_ref(), Some(session_epoch));
     Ok(())
 }
 
 fn parse_panel_session_epoch(value: &str) -> Result<u64, CommandError> {
     parse_canonical_nonzero_u64(value).ok_or_else(CommandError::plugin_query_failed)
+}
+
+fn map_panel_bounds_error(error: PanelBoundsError) -> CommandError {
+    match error {
+        PanelBoundsError::InvalidBounds => CommandError::plugin_query_failed(),
+        PanelBoundsError::Stale => CommandError::stale_request(),
+        PanelBoundsError::Unavailable => CommandError::window_failed(),
+    }
 }
 
 fn panel_route_matches_identity(
@@ -2534,7 +2591,7 @@ fn spawn_panel_submission(
     let event_app = app.clone();
     let session_epoch = identity.session_epoch.to_string();
     tauri::async_runtime::spawn(async move {
-        if run_panel_submission(
+        if let Err(error) = run_panel_submission(
             app,
             public,
             controller,
@@ -2544,8 +2601,8 @@ fn spawn_panel_submission(
             queue_outcome,
         )
         .await
-        .is_err()
         {
+            eprintln!("[plugin-panel-submit] session={session_epoch} error={error:?}");
             let _ = event_app.emit_to(
                 "main",
                 "uipilot-plugin-panel-error",
@@ -2722,6 +2779,7 @@ pub(crate) async fn search_apps(
                     &invocation_id,
                     query_sequence,
                     Some(hint),
+                    submitted_main_result_command(&route, submit),
                 ))
             }
             PublicPluginSearchDecision::Dispatch => {}
@@ -2769,12 +2827,18 @@ pub(crate) async fn search_apps(
             return Ok(None);
         };
         return match response.map_err(CommandError::from)? {
-            PublicPluginResponse::MainResults(results) => Ok(publish_public_main_results(
-                registry,
-                registry_token,
-                &route,
-                results,
-            )),
+            PublicPluginResponse::MainResults(results) => {
+                if route.output_mode != PublicOutputMode::MainResult {
+                    return Err(CommandError::plugin_query_failed());
+                }
+                Ok(publish_public_main_results(
+                    registry,
+                    registry_token,
+                    &route,
+                    results,
+                    submitted_main_result_command(&route, submit),
+                ))
+            }
             PublicPluginResponse::Window(response) => {
                 if route.output_mode != PublicOutputMode::Window {
                     return Err(CommandError::plugin_query_failed());
@@ -2817,6 +2881,7 @@ pub(crate) async fn search_apps(
                     request_id: response.request_id,
                     items: Vec::new(),
                     command_hint: None,
+                    main_result_command: None,
                     window_transfer_token: Some(prepared.transfer_token),
                     replace_local_results: false,
                 }))
@@ -2869,6 +2934,19 @@ enum PublicPluginSearchDecision {
     Dispatch,
 }
 
+fn submitted_main_result_command(
+    route: &PublicPluginRoute,
+    submit: bool,
+) -> Option<MainResultCommandContext> {
+    (submit && route.output_mode == PublicOutputMode::MainResult).then(|| {
+        MainResultCommandContext {
+            plugin_id: route.plugin_id.clone(),
+            command_label: route.command_label.clone(),
+            argument: route.input.clone(),
+        }
+    })
+}
+
 fn public_plugin_search_decision(
     route: &crate::public_plugins::PublicPluginRoute,
     submit: bool,
@@ -2881,6 +2959,20 @@ fn public_plugin_search_decision(
         {
             return Err(());
         }
+    }
+    if matches!(
+        (
+            completion_origin.map(|origin| origin.phase),
+            route.output_mode,
+            submit,
+        ),
+        (
+            Some(CompletionOriginPhase::Commit),
+            PublicOutputMode::Window,
+            true
+        )
+    ) {
+        return Ok(PublicPluginSearchDecision::Dispatch);
     }
     if route.input_required && route.input.is_empty() {
         return Ok(PublicPluginSearchDecision::Hint(
@@ -2946,6 +3038,7 @@ fn public_plugin_prompt(
     invocation_id: &str,
     query_sequence: u64,
     placeholder: Option<String>,
+    main_result_command: Option<MainResultCommandContext>,
 ) -> Option<SearchResponse> {
     let token = registry.begin_query(QueryDomain::Plugin, invocation_id, query_sequence)?;
     registry.publish_if_latest(
@@ -2956,6 +3049,7 @@ fn public_plugin_prompt(
             request_id,
             items: Vec::new(),
             command_hint: Some(placeholder.unwrap_or_else(|| "请输入内容".into())),
+            main_result_command,
             window_transfer_token: None,
             replace_local_results: false,
         },
@@ -2981,6 +3075,7 @@ fn publish_public_main_results(
     token: QueryToken,
     route: &crate::public_plugins::PublicPluginRoute,
     results: Vec<PublicMainResult>,
+    main_result_command: Option<MainResultCommandContext>,
 ) -> Option<SearchResponse> {
     let entries = results
         .into_iter()
@@ -3006,7 +3101,16 @@ fn publish_public_main_results(
             )
         })
         .collect();
-    registry.publish_if_latest(token, entries, || true, search_response)
+    registry.publish_if_latest(
+        token,
+        entries,
+        || true,
+        |request_id, items| {
+            let mut response = search_response(request_id, items);
+            response.main_result_command = main_result_command;
+            response
+        },
+    )
 }
 
 fn search_response(
@@ -3023,6 +3127,7 @@ fn search_response(
             })
             .collect(),
         command_hint: None,
+        main_result_command: None,
         window_transfer_token: None,
         replace_local_results: false,
     }
@@ -3126,15 +3231,18 @@ fn public_plugin_completion_result(
             argument.unwrap_or("").to_owned(),
             suggestion.favorite,
         )?,
-        _ => {
-            let completion_text =
-                argument.map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
-            LauncherResultActivation::plugin_completion(
-                completion_text,
-                suggestion.plugin_id.clone(),
-                suggestion.favorite,
-            )?
-        }
+        PublicOutputMode::MainResult => LauncherResultActivation::main_result_activation(
+            suggestion.plugin_id.clone(),
+            suggestion.effective_name.clone(),
+            argument.unwrap_or("").to_owned(),
+            suggestion.favorite,
+        )?,
+        PublicOutputMode::Window => LauncherResultActivation::window_activation(
+            suggestion.plugin_id.clone(),
+            suggestion.effective_name.clone(),
+            argument.unwrap_or("").to_owned(),
+            suggestion.favorite,
+        )?,
     };
     Some((
         crate::model::ResultItem {
@@ -3201,6 +3309,7 @@ where
                     })
                     .collect(),
                 command_hint: None,
+                main_result_command: None,
                 window_transfer_token: None,
                 replace_local_results: true,
             },
@@ -3250,11 +3359,20 @@ where
                 .then_with(|| left.plugin_id.cmp(&right.plugin_id))
         });
         if catalog_query.is_empty() {
-            entries.extend(completion_result(
-                "find",
-                "搜索文件".into(),
-                Some(ResultIconKind::Find),
-                None,
+            entries.push((
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    activation: LauncherResultActivation::OpenFind {
+                        query: String::new(),
+                    },
+                    title: "/find".into(),
+                    subtitle: Some("搜索文件".into()),
+                    icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: Some(ResultIconKind::Find),
+                    detail: None,
+                    has_default_action: false,
+                },
                 None,
             ));
             entries.extend(completion_result(
@@ -3265,6 +3383,16 @@ where
                 None,
             ));
         } else {
+            for suggestion in suggestions
+                .iter()
+                .filter(|suggestion| suggestion.favorite)
+                .cloned()
+            {
+                entries.extend(public_plugin_completion_result(
+                    suggestion,
+                    Some(catalog_query),
+                ));
+            }
             entries.push((
                 crate::model::ResultItem {
                     result_id: String::new(),
@@ -3300,6 +3428,9 @@ where
             ));
         }
         for suggestion in suggestions {
+            if !catalog_query.is_empty() && suggestion.favorite {
+                continue;
+            }
             let argument = match suggestion.output_mode {
                 PublicOutputMode::Panel
                     if !catalog_query.is_empty() && !catalog_query.starts_with('/') =>
@@ -3337,6 +3468,7 @@ where
                 })
                 .collect(),
             command_hint,
+            main_result_command: None,
             window_transfer_token: None,
             replace_local_results,
         },
@@ -4334,10 +4466,10 @@ mod tests {
         resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_apps_with_catalog, search_files_with,
         select_public_plugin_source_with, set_file_preview_preference_with, start_host_input_focus,
-        CatalogSearchRequest, CommandError, CompletionOriginInput, CompletionOriginPhase,
-        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HostInputFocusStart,
-        HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate,
-        UserSettingsUpdate,
+        submitted_main_result_command, CatalogSearchRequest, CommandError, CompletionOriginInput,
+        CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome,
+        HostInputFocusStart, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
+        ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -4556,6 +4688,7 @@ mod tests {
                             .into(),
                     ),
                     favorite: false,
+                    input_required: false,
                     output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
@@ -4565,6 +4698,7 @@ mod tests {
                     summary: None,
                     icon_url: None,
                     favorite: false,
+                    input_required: false,
                     output_mode: PublicOutputMode::Window,
                 },
             ],
@@ -4577,31 +4711,34 @@ mod tests {
                 .map(|item| (
                     item.title.as_str(),
                     item.subtitle.as_deref(),
-                    match &item.activation {
-                        crate::model::LauncherResultActivation::PluginCompletion {
-                            completion_text,
-                            ..
-                        } => Some(completion_text.as_str()),
-                        _ => None,
-                    },
                     item.has_default_action,
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                (
-                    "/alpha-return",
-                    Some("返回示例文本到主界面"),
-                    Some("/alpha-return "),
-                    false,
-                ),
-                (
-                    "/alpha-window",
-                    Some("Public Plugin Alpha Window"),
-                    Some("/alpha-window "),
-                    false,
-                ),
+                ("/alpha-return", Some("返回示例文本到主界面"), false,),
+                ("/alpha-window", Some("Public Plugin Alpha Window"), false,),
             ]
         );
+        assert!(matches!(
+            &response.items[0].activation,
+            crate::model::LauncherResultActivation::MainResultActivation {
+                plugin_id,
+                command_label,
+                initial_argument,
+                favorite: false,
+            } if plugin_id == "com.example.alpha-return" &&
+                command_label == "alpha-return" && initial_argument.is_empty()
+        ));
+        assert!(matches!(
+            &response.items[1].activation,
+            crate::model::LauncherResultActivation::WindowActivation {
+                plugin_id,
+                command_label,
+                initial_argument,
+                favorite: false,
+            } if plugin_id == "com.example.alpha-window" &&
+                command_label == "alpha-window" && initial_argument.is_empty()
+        ));
         assert_eq!(
             registry.resolve(&response.request_id, &response.items[0].result_id),
             Err(RegistryError::UnknownResult)
@@ -4620,6 +4757,7 @@ mod tests {
             "plugin-discovery",
             2,
             Some("请输入信息回车".into()),
+            None,
         )
         .unwrap();
         assert!(hint.items.is_empty());
@@ -4646,6 +4784,11 @@ mod tests {
             host_keys: Vec::new(),
             icon_url: None,
         };
+        assert!(submitted_main_result_command(&route, false).is_none());
+        let submitted = submitted_main_result_command(&route, true).unwrap();
+        assert_eq!(submitted.plugin_id, "com.example.demo");
+        assert_eq!(submitted.command_label, "demo");
+        assert_eq!(submitted.argument, "");
         assert_eq!(
             public_plugin_search_decision(&route, false, None),
             Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
@@ -4654,6 +4797,20 @@ mod tests {
             public_plugin_search_decision(&route, true, None),
             Ok(PublicPluginSearchDecision::Hint("请输入信息回车".into()))
         );
+
+        route.output_mode = PublicOutputMode::Window;
+        assert_eq!(
+            public_plugin_search_decision(
+                &route,
+                true,
+                Some(&CompletionOriginInput {
+                    phase: CompletionOriginPhase::Commit,
+                    plugin_id: "com.example.demo".into(),
+                }),
+            ),
+            Ok(PublicPluginSearchDecision::Dispatch)
+        );
+        route.output_mode = PublicOutputMode::MainResult;
 
         route.input = "body".into();
         assert_eq!(
@@ -4757,8 +4914,31 @@ mod tests {
             summary: Some(format!("Use {name}")),
             icon_url: None,
             favorite: false,
-            output_mode: PublicOutputMode::MainResult,
+            input_required: false,
+            output_mode: PublicOutputMode::Window,
         }
+    }
+
+    #[test]
+    fn main_result_rows_emit_direct_tag_activation_without_a_trailing_completion() {
+        let (item, _) = super::public_plugin_completion_result(
+            PublicCommandSuggestion {
+                output_mode: PublicOutputMode::MainResult,
+                ..command_suggestion("demo-return")
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(item.activation).unwrap(),
+            serde_json::json!({
+                "kind": "mainResultActivation",
+                "pluginId": "com.example.demo-return",
+                "commandLabel": "demo-return",
+                "initialArgument": "",
+                "favorite": false,
+            })
+        );
     }
 
     fn completion_text(item: &crate::model::ResultItem) -> Option<&str> {
@@ -4780,6 +4960,7 @@ mod tests {
             summary: None,
             icon_url: None,
             favorite: true,
+            input_required: false,
             output_mode: PublicOutputMode::Panel,
         };
         let (empty, _) = super::public_plugin_completion_result(panel.clone(), None).unwrap();
@@ -4815,15 +4996,63 @@ mod tests {
         .unwrap();
         assert!(matches!(
             window.activation,
-            crate::model::LauncherResultActivation::PluginCompletion { .. }
+            crate::model::LauncherResultActivation::WindowActivation {
+                plugin_id,
+                command_label,
+                initial_argument,
+                favorite: false,
+            } if plugin_id == "com.example.demo-win" &&
+                command_label == "demo-win" && initial_argument.is_empty()
         ));
+    }
+
+    #[test]
+    fn optional_window_rows_emit_direct_window_activation_with_initial_argument() {
+        let (item, _) = super::public_plugin_completion_result(
+            PublicCommandSuggestion {
+                input_required: false,
+                output_mode: PublicOutputMode::Window,
+                ..command_suggestion("pomodoro")
+            },
+            Some("focus"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(item.activation).unwrap(),
+            serde_json::json!({
+                "kind": "windowActivation",
+                "pluginId": "com.example.pomodoro",
+                "commandLabel": "pomodoro",
+                "initialArgument": "focus",
+                "favorite": false,
+            })
+        );
+
+        let (required, _) = super::public_plugin_completion_result(
+            PublicCommandSuggestion {
+                input_required: true,
+                output_mode: PublicOutputMode::Window,
+                ..command_suggestion("demo-win")
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(required.activation).unwrap(),
+            serde_json::json!({
+                "kind": "windowActivation",
+                "pluginId": "com.example.demo-win",
+                "commandLabel": "demo-win",
+                "initialArgument": "",
+                "favorite": false,
+            })
+        );
     }
 
     #[test]
     fn launcher_empty_query_publishes_capabilities_without_reading_applications() {
         let registry = ready_registry("launcher-empty");
         let demo_title = format!("/{}", "demo-win");
-        let demo_completion = format!("{demo_title} ");
         let response = search_apps_with_catalog(
             &registry,
             CatalogSearchRequest {
@@ -4850,11 +5079,17 @@ mod tests {
                 .map(|item| (item.title.clone(), completion_text(item).map(str::to_owned)))
                 .collect::<Vec<_>>(),
             vec![
-                ("/find".into(), Some("/find ".into())),
+                ("/find".into(), None),
                 ("/web-search".into(), Some("/web-search ".into())),
-                ("/alpha".into(), Some("/alpha ".into())),
-                (demo_title, Some(demo_completion)),
+                ("/alpha".into(), None),
+                (demo_title, None),
             ]
+        );
+        assert_eq!(
+            response.items[0].activation,
+            crate::model::LauncherResultActivation::OpenFind {
+                query: String::new()
+            }
         );
         for item in &response.items {
             assert_eq!(
@@ -4898,7 +5133,6 @@ mod tests {
     fn launcher_plain_query_orders_find_web_plugins_then_applications() {
         let registry = ready_registry("launcher-plain");
         let demo_title = format!("/{}", "demo-win");
-        let demo_completion = format!("{demo_title} ");
         let response = search_apps_with_catalog(
             &registry,
             CatalogSearchRequest {
@@ -4936,46 +5170,45 @@ mod tests {
                 .map(|item| item.title.clone())
                 .collect::<Vec<_>>(),
             vec![
+                "/alpha".into(),
                 "/find".into(),
                 "Google 搜索".into(),
-                "/alpha".into(),
                 demo_title,
                 "Windows Terminal".into(),
             ]
         );
+        assert!(matches!(
+            &response.items[0].activation,
+            crate::model::LauncherResultActivation::WindowActivation {
+                plugin_id,
+                command_label,
+                initial_argument,
+                favorite: true,
+            } if plugin_id == "com.example.alpha" &&
+                command_label == "alpha" && initial_argument == "win"
+        ));
         assert_eq!(
-            response.items[0].activation,
+            response.items[1].activation,
             crate::model::LauncherResultActivation::OpenFind {
                 query: "win".into()
             }
         );
-        assert_eq!(completion_text(&response.items[2]), Some("/alpha win"));
-        assert_eq!(
-            completion_text(&response.items[3]),
-            Some(demo_completion.as_str())
-        );
-        assert!(matches!(
-            &response.items[2].activation,
-            crate::model::LauncherResultActivation::PluginCompletion {
-                plugin_id,
-                favorite: true,
-                ..
-            } if plugin_id == "com.example.alpha"
-        ));
         assert!(matches!(
             &response.items[3].activation,
-            crate::model::LauncherResultActivation::PluginCompletion {
+            crate::model::LauncherResultActivation::WindowActivation {
                 plugin_id,
+                command_label,
+                initial_argument,
                 favorite: false,
-                ..
-            } if plugin_id == "com.example.demo-win"
+            } if plugin_id == "com.example.demo-win" &&
+                command_label == "demo-win" && initial_argument.is_empty()
         ));
         assert_eq!(
-            registry.resolve(&response.request_id, &response.items[0].result_id),
+            registry.resolve(&response.request_id, &response.items[1].result_id),
             Err(RegistryError::UnknownResult)
         );
         assert!(matches!(
-            registry.resolve(&response.request_id, &response.items[1].result_id),
+            registry.resolve(&response.request_id, &response.items[2].result_id),
             Ok(ResultAction::OpenWebSearch { engine: WebSearchEngine::Google, query }) if query == "win"
         ));
     }
@@ -5206,6 +5439,7 @@ mod tests {
             "clear_messages",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "set_plugin_panel_bounds",
             "close_plugin_panel",
         ] {
             let trace = RefCell::new(Vec::new());
@@ -5219,7 +5453,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_open_submit_and_close_are_main_only_and_use_decimal_session_epochs() {
+    fn panel_open_submit_bounds_and_close_are_main_only_and_use_decimal_session_epochs() {
         assert_eq!(parse_panel_session_epoch("1"), Ok(1));
         assert_eq!(
             parse_panel_session_epoch("18446744073709551615"),
@@ -5273,6 +5507,22 @@ mod tests {
         let state_access = statements.find("controller.inner()").unwrap();
         assert!(guard < state_access);
         assert!(close.contains("Some(session_epoch)"));
+
+        let bounds = source
+            .split("pub(crate) fn set_plugin_panel_bounds(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("missing set_plugin_panel_bounds");
+        assert!(bounds.contains("webview: tauri::Webview"));
+        assert!(!bounds.contains("window: WebviewWindow"));
+        let statements = bounds.split_once("{\n").unwrap().1;
+        let guard = statements
+            .find("require_main_label(webview.label())?;")
+            .unwrap();
+        let state_access = statements.find("controller.inner()").unwrap();
+        assert!(guard < state_access);
+        assert!(bounds.contains("parse_panel_session_epoch"));
+        assert!(bounds.contains("plugin_panel::set_bounds("));
     }
 
     #[test]

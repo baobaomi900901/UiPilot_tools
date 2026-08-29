@@ -91,6 +91,7 @@ export const client: LauncherClient = {
     if (!result) throw { code: 'windowFailed', message: 'panel Host-key enqueue failed' }
     return result
   },
+  setPluginPanelBounds: async (input) => { await invoke('set_plugin_panel_bounds', { input }) },
   closePluginPanel: async (input) => { await invoke('close_plugin_panel', { input }) },
   acknowledgePluginPanelFocusHostInput: async (input) => {
     await invoke('plugin_panel_focus_host_input_ack', { ...input })

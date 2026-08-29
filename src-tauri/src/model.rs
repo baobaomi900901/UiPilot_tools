@@ -15,11 +15,22 @@ pub(crate) enum LauncherResultActivation {
         #[serde(rename = "completionText")]
         completion_text: String,
     },
-    PluginCompletion {
-        #[serde(rename = "completionText")]
-        completion_text: String,
+    WindowActivation {
         #[serde(rename = "pluginId")]
         plugin_id: String,
+        #[serde(rename = "commandLabel")]
+        command_label: String,
+        #[serde(rename = "initialArgument")]
+        initial_argument: String,
+        favorite: bool,
+    },
+    MainResultActivation {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        #[serde(rename = "commandLabel")]
+        command_label: String,
+        #[serde(rename = "initialArgument")]
+        initial_argument: String,
         favorite: bool,
     },
     PanelActivation {
@@ -40,16 +51,36 @@ impl LauncherResultActivation {
         valid_launcher_completion(&completion_text).then_some(Self::Completion { completion_text })
     }
 
-    pub(crate) fn plugin_completion(
-        completion_text: String,
+    pub(crate) fn window_activation(
         plugin_id: String,
+        command_label: String,
+        initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
-        (valid_launcher_completion(&completion_text)
-            && crate::public_plugins::valid_plugin_id(&plugin_id))
-        .then_some(Self::PluginCompletion {
-            completion_text,
+        (crate::public_plugins::valid_plugin_id(&plugin_id)
+            && valid_launcher_command(&command_label)
+            && valid_panel_initial_argument(&initial_argument))
+        .then_some(Self::WindowActivation {
             plugin_id,
+            command_label,
+            initial_argument,
+            favorite,
+        })
+    }
+
+    pub(crate) fn main_result_activation(
+        plugin_id: String,
+        command_label: String,
+        initial_argument: String,
+        favorite: bool,
+    ) -> Option<Self> {
+        (crate::public_plugins::valid_plugin_id(&plugin_id)
+            && valid_launcher_command(&command_label)
+            && valid_panel_initial_argument(&initial_argument))
+        .then_some(Self::MainResultActivation {
+            plugin_id,
+            command_label,
+            initial_argument,
             favorite,
         })
     }
@@ -87,12 +118,7 @@ pub(crate) fn valid_launcher_completion(value: &str) -> bool {
     let Some((command, argument)) = value.split_once(' ') else {
         return false;
     };
-    if command.is_empty()
-        || command.len() > 32
-        || !command.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'-'))
-        })
-    {
+    if !valid_launcher_command(command) {
         return false;
     }
     if argument.is_empty() {
@@ -104,6 +130,22 @@ pub(crate) fn valid_launcher_completion(value: &str) -> bool {
             .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
 }
 
+fn valid_launcher_command(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= 32
+        && command.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'-'))
+        })
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MainResultCommandContext {
+    pub(crate) plugin_id: String,
+    pub(crate) command_label: String,
+    pub(crate) argument: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SearchResponse {
@@ -111,6 +153,8 @@ pub(crate) struct SearchResponse {
     pub(crate) items: Vec<ResultItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) command_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) main_result_command: Option<MainResultCommandContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) window_transfer_token: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -199,6 +243,48 @@ mod tests {
         assert!(LauncherResultActivation::plugin_completion(
             "/demo-win value".into(),
             "Invalid Plugin".into(),
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn window_activation_serializes_command_and_rejects_invalid_values() {
+        let activation = LauncherResultActivation::window_activation(
+            "com.uipilot.pomodoro".into(),
+            "pomodoro".into(),
+            "focus".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(activation).unwrap(),
+            serde_json::json!({
+                "kind": "windowActivation",
+                "pluginId": "com.uipilot.pomodoro",
+                "commandLabel": "pomodoro",
+                "initialArgument": "focus",
+                "favorite": true
+            })
+        );
+        assert!(LauncherResultActivation::window_activation(
+            "Invalid Plugin".into(),
+            "pomodoro".into(),
+            "".into(),
+            false,
+        )
+        .is_none());
+        assert!(LauncherResultActivation::window_activation(
+            "com.uipilot.pomodoro".into(),
+            "Pomodoro".into(),
+            "".into(),
+            false,
+        )
+        .is_none());
+        assert!(LauncherResultActivation::window_activation(
+            "com.uipilot.pomodoro".into(),
+            "pomodoro".into(),
+            "bad\narg".into(),
             false,
         )
         .is_none());

@@ -456,6 +456,7 @@ pub fn run() {
             commands::plugin_panel_storage_remove,
             commands::open_plugin_panel,
             commands::submit_plugin_panel,
+            commands::set_plugin_panel_bounds,
             commands::close_plugin_panel,
             commands::commit_plugin_window_transfer,
             commands::get_public_plugin_window_identity,
@@ -695,7 +696,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 68);
+        assert_eq!(production.matches("commands::").count(), 69);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -742,6 +743,7 @@ mod tests {
             "plugin_panel_focus_host_input_ack",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "set_plugin_panel_bounds",
             "close_plugin_panel",
             "commit_plugin_window_transfer",
             "get_public_plugin_window_identity",
@@ -844,6 +846,7 @@ mod tests {
             "uninstall_plugin",
             "open_plugin_panel",
             "submit_plugin_panel",
+            "set_plugin_panel_bounds",
             "close_plugin_panel",
         ] {
             assert!(build.contains(&format!("\"{command}\",")));
@@ -952,6 +955,30 @@ mod tests {
         assert!(!content.contains("plugin-panel-"));
         assert!(!panel.contains("plugin-window-"));
         assert!(!panel.contains("timer"));
+    }
+
+    #[test]
+    fn plugin_panel_bounds_command_is_registered_for_main_only() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let build = include_str!("../build.rs");
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        let panel = include_str!("../capabilities/plugin-panel-content.json");
+
+        assert_eq!(
+            production
+                .matches("commands::set_plugin_panel_bounds,")
+                .count(),
+            1
+        );
+        assert!(build.contains("\"set_plugin_panel_bounds\","));
+        assert!(main.contains("\"allow-set-plugin-panel-bounds\""));
+        assert!(!runtime.contains("allow-set-plugin-panel-bounds"));
+        assert!(!panel.contains("allow-set-plugin-panel-bounds"));
     }
 
     #[test]

@@ -5,6 +5,20 @@ export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
 export type LauncherResultActivation =
   | { kind: 'completion'; completionText: string }
   | { kind: 'pluginCompletion'; completionText: string; pluginId: string; favorite: boolean }
+  | {
+      kind: 'windowActivation'
+      pluginId: string
+      commandLabel: string
+      initialArgument: string
+      favorite: boolean
+    }
+  | {
+      kind: 'mainResultActivation'
+      pluginId: string
+      commandLabel: string
+      initialArgument: string
+      favorite: boolean
+    }
   | { kind: 'panelActivation'; pluginId: string; initialArgument: string; favorite: boolean }
   | { kind: 'openFind'; query: string }
   | { kind: 'executeResult' }
@@ -39,6 +53,13 @@ export interface SearchResponse {
   windowTransferToken?: string
   replaceLocalResults?: boolean
   commandHint?: string
+  mainResultCommand?: MainResultCommandContext
+}
+
+export interface MainResultCommandContext {
+  pluginId: string
+  commandLabel: string
+  argument: string
 }
 
 export type ThemePreference = 'system' | 'dark' | 'light'
@@ -276,6 +297,7 @@ export interface LauncherClient {
     uiIntentEpoch: number
   }): Promise<PluginPanelCommandResult>
   enqueuePluginPanelHostKey(input: PluginPanelHostKeyEnqueueInput): Promise<PluginPanelHostKeyEnqueueResult>
+  setPluginPanelBounds(input: { sessionEpoch: U64Decimal; bounds: PluginPanelBounds }): Promise<void>
   closePluginPanel(input: { sessionEpoch: U64Decimal }): Promise<void>
   acknowledgePluginPanelFocusHostInput(input: PluginPanelFocusHostInputEvent & { focused: boolean }): Promise<void>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
@@ -399,6 +421,13 @@ export interface PluginPanelCommandResult {
   hostKeys: readonly PanelHostKeyDeclaration[]
 }
 
+export interface PluginPanelBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N'
 export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n'
 
@@ -436,6 +465,12 @@ export interface PluginPanelSnapshot {
   submitPending: boolean
   closePending: boolean
   focusRequestId?: U64Decimal
+}
+export interface MainResultCommandSnapshot {
+  pluginId: string
+  commandLabel: string
+  suffixControl: ControlKey
+  suffix: string
 }
 export interface TextControlView {
   key: ControlKey
@@ -549,6 +584,7 @@ export interface LauncherSnapshot {
   plugins?: PluginListSnapshot
   publicPlugins?: PublicPluginInventory
   file?: FileSnapshot
+  mainResultCommand?: MainResultCommandSnapshot
   panel?: PluginPanelSnapshot
 }
 

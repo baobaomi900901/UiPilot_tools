@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-plugin-panel-bounds"
+description = "Enables the set_plugin_panel_bounds command without any pre-configured scope."
+commands.allow = ["set_plugin_panel_bounds"]
+
+[[permission]]
+identifier = "deny-set-plugin-panel-bounds"
+description = "Denies the set_plugin_panel_bounds command without any pre-configured scope."
+commands.deny = ["set_plugin_panel_bounds"]

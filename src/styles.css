@@ -70,30 +70,80 @@ label,
 
 .launcher-surface {
   display: grid;
-  grid-template-rows: minmax(52px, 1fr) minmax(24px, auto);
+  grid-template-rows: minmax(52px, 1fr) minmax(0, auto);
   width: min(100%, 720px);
   height: min(100%, 420px);
-  padding: 12px;
   overflow: hidden;
   color: var(--uipilot-ui-foreground);
   background: var(--uipilot-ui-background);
 }
 
-.launcher-view {
-  display: grid;
-  grid-template-rows: 44px minmax(0, 1fr);
-  gap: 8px;
+.launcher-surface.is-panel-active {
+  grid-template-rows: minmax(52px, 1fr);
+}
+
+.launcher-surface.is-panel-active > .launcher-status-region {
+  display: none;
+}
+
+.launcher-region {
   min-width: 0;
   min-height: 0;
 }
 
+.launcher-section-region {
+}
+
+.launcher-section-region > section {
+  width: 100%;
+  height: 100%;
+}
+
+.launcher-status-region {
+  padding: 8px;
+  border-top: 1px solid var(--uipilot-ui-border);
+}
+
+.launcher-status-region > .status-region {
+  width: 100%;
+}
+
+.launcher-view {
+  display: grid;
+  grid-template-rows: 60px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+.launcher-query-region {
+  min-width: 0;
+  min-height: 0;
+  padding: 8px;
+}
+
+.launcher-query-region > .ant-input-affix-wrapper,
+.launcher-query-region > .panel-input-row {
+  width: 100%;
+  height: 100%;
+}
+
 .panel-launcher {
   display: grid;
-  grid-template-rows: 44px minmax(0, 1fr);
-  gap: 8px;
+  grid-template-rows: 60px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+.panel-input-region {
+  min-width: 0;
+  min-height: 0;
+  padding: 8px;
+}
+
+.panel-input-region > .panel-input-row {
+  width: 100%;
+  height: 100%;
 }
 
 .panel-input-row {
@@ -162,6 +212,7 @@ label,
 .panel-host-region {
   min-width: 0;
   min-height: 0;
+  padding: 0 8px;
 }
 
 .file-workspace {
@@ -319,7 +370,13 @@ label,
   padding-inline: 0;
 }
 
-.launcher-view > .ant-spin,
+.launcher-results-region {
+  padding: 0 8px;
+  border-top: 1px solid var(--uipilot-ui-border);
+}
+
+.launcher-results-region,
+.launcher-results-region > .ant-spin,
 .launcher-view .ant-spin-container,
 .result-list {
   min-height: 0;
@@ -361,7 +418,6 @@ label,
 
 .result-list {
   overflow-y: auto;
-  border-block: 1px solid var(--uipilot-ui-border);
 }
 
 .result-list::-webkit-scrollbar {
@@ -601,7 +657,6 @@ label,
 .status-region {
   min-height: 24px;
   max-height: 72px;
-  padding-top: 5px;
   overflow: hidden;
   color: var(--uipilot-ui-muted-foreground);
   font-size: 0.875rem;
@@ -624,10 +679,13 @@ label,
   gap: 8px;
 }
 
+.settings-header-region {
+  padding: 8px;
+  border-bottom: 1px solid var(--uipilot-ui-border);
+}
+
 .settings-header {
   justify-content: space-between;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--uipilot-ui-border);
 }
 
 .settings-header h1 {
@@ -655,7 +713,6 @@ label,
   min-width: 0;
   min-height: 0;
   height: 100%;
-  padding-top: 8px;
   overflow: hidden;
 }
 
@@ -669,7 +726,7 @@ label,
 .settings-tabs .ant-tabs-nav {
   flex: 0 0 112px;
   width: 112px;
-  margin: 0;
+  margin: 8px 0;
 }
 
 .settings-tabs .ant-tabs-tab {
@@ -702,11 +759,11 @@ label,
   height: 100%;
   padding: 0;
   overflow: hidden;
+  padding: 16px 24px 16px 4px;
 }
 
 .settings-scroll-content {
   min-height: 100%;
-  padding: 10px 12px 4px;
 }
 
 .message-center-content-root {

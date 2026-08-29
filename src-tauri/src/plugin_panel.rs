@@ -26,11 +26,22 @@ const INTERNAL_BLUR_GRACE: Duration = Duration::from_millis(250);
 const CONTENT_BLUR_RECHECK_DELAY: Duration = Duration::from_millis(50);
 const HOST_KEY_QUEUE_CAPACITY: usize = 8;
 pub(crate) const HOST_KEY_ACK_TIMEOUT: Duration = Duration::from_secs(2);
-// Mirrors the fixed launcher slot: 12px outer padding, 44px input, 8px gap,
-// and a 24px status row above the 12px bottom padding.
-const PANEL_HORIZONTAL_INSET: f64 = 12.0;
-const PANEL_TOP_OFFSET: f64 = 64.0;
-const PANEL_BOTTOM_INSET: f64 = 36.0;
+const PANEL_FALLBACK_SIZE: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PanelBounds {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PanelBoundsError {
+    InvalidBounds,
+    Stale,
+    Unavailable,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PanelSessionIdentity {
@@ -611,6 +622,20 @@ impl PluginPanelController {
             .session
             .as_ref()
             .map(|session| session.identity.clone())
+    }
+
+    pub(crate) fn claim_bounds_identity(
+        &self,
+        session_epoch: u64,
+    ) -> Result<PanelSessionIdentity, PanelBoundsError> {
+        self.core
+            .lock()
+            .map_err(|_| PanelBoundsError::Unavailable)?
+            .session
+            .as_ref()
+            .filter(|session| session.identity.session_epoch == session_epoch)
+            .map(|session| session.identity.clone())
+            .ok_or(PanelBoundsError::Stale)
     }
 
     pub(crate) fn open_session(&self, owner: PanelOwner) -> Option<PanelSessionIdentity> {
@@ -1925,25 +1950,76 @@ pub(crate) fn teardown_plugin(
     Some(identity)
 }
 
-fn panel_bounds(main: &tauri::Window) -> Result<(LogicalPosition<f64>, LogicalSize<f64>), ()> {
-    let size = main.inner_size().map_err(|_| ())?;
-    let scale = main.scale_factor().map_err(|_| ())?;
-    let width = (size.width as f64 / scale).max(1.0);
-    let height = (size.height as f64 / scale).max(1.0);
-    Ok(panel_logical_bounds(width, height))
+fn main_logical_size(main: &tauri::Window) -> Result<(f64, f64), PanelBoundsError> {
+    let size = main
+        .inner_size()
+        .map_err(|_| PanelBoundsError::Unavailable)?;
+    let scale = main
+        .scale_factor()
+        .map_err(|_| PanelBoundsError::Unavailable)?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(PanelBoundsError::Unavailable);
+    }
+    let width = size.width as f64 / scale;
+    let height = size.height as f64 / scale;
+    if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+        return Err(PanelBoundsError::Unavailable);
+    }
+    Ok((width, height))
 }
 
-fn panel_logical_bounds(width: f64, height: f64) -> (LogicalPosition<f64>, LogicalSize<f64>) {
-    let left = PANEL_HORIZONTAL_INSET.min((width - 1.0).max(0.0) / 2.0);
-    let top = PANEL_TOP_OFFSET.min((height - 1.0).max(0.0));
-    let bottom = PANEL_BOTTOM_INSET.min((height - top - 1.0).max(0.0));
-    (
-        LogicalPosition::new(left, top),
-        LogicalSize::new(
-            (width - left * 2.0).max(1.0),
-            (height - top - bottom).max(1.0),
-        ),
-    )
+fn clamp_panel_bounds(
+    main_width: f64,
+    main_height: f64,
+    requested: PanelBounds,
+) -> Result<PanelBounds, PanelBoundsError> {
+    if !main_width.is_finite()
+        || !main_height.is_finite()
+        || main_width < 1.0
+        || main_height < 1.0
+        || !requested.x.is_finite()
+        || !requested.y.is_finite()
+        || !requested.width.is_finite()
+        || !requested.height.is_finite()
+        || requested.width <= 0.0
+        || requested.height <= 0.0
+    {
+        return Err(PanelBoundsError::InvalidBounds);
+    }
+
+    let x = requested.x.clamp(0.0, main_width - 1.0);
+    let y = requested.y.clamp(0.0, main_height - 1.0);
+    Ok(PanelBounds {
+        x,
+        y,
+        width: requested.width.max(1.0).min(main_width - x),
+        height: requested.height.max(1.0).min(main_height - y),
+    })
+}
+
+pub(crate) fn set_bounds(
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    session_epoch: u64,
+    requested: PanelBounds,
+) -> Result<(), PanelBoundsError> {
+    let identity = controller.claim_bounds_identity(session_epoch)?;
+    let main = app
+        .get_window("main")
+        .ok_or(PanelBoundsError::Unavailable)?;
+    let (main_width, main_height) = main_logical_size(&main)?;
+    let bounds = clamp_panel_bounds(main_width, main_height, requested)?;
+    let content = app
+        .get_webview(&identity.content_label)
+        .ok_or(PanelBoundsError::Unavailable)?;
+    content
+        .set_bounds(tauri::Rect {
+            position: tauri::Position::Logical(LogicalPosition::new(bounds.x, bounds.y)),
+            size: tauri::Size::Logical(LogicalSize::new(bounds.width, bounds.height)),
+        })
+        .map_err(|_| PanelBoundsError::Unavailable)?;
+    controller.claim_bounds_identity(session_epoch)?;
+    content.show().map_err(|_| PanelBoundsError::Unavailable)
 }
 
 pub(crate) fn mount(
@@ -1980,8 +2056,6 @@ fn mount_webview(
     let main = app
         .get_window("main")
         .ok_or(PublicPluginManagementError::Unavailable)?;
-    let (position, size) =
-        panel_bounds(&main).map_err(|_| PublicPluginManagementError::Unavailable)?;
     let content_url = tauri::Url::parse(&format!(
         "uipilot-public-plugin://localhost/{}",
         panel_entry.trim_start_matches('/')
@@ -2003,8 +2077,16 @@ fn mount_webview(
     .on_new_window(|_, _| NewWindowResponse::Deny)
     .on_download(|_, _| false);
     let content = main
-        .add_child(content, position, size)
+        .add_child(
+            content,
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(PANEL_FALLBACK_SIZE, PANEL_FALLBACK_SIZE),
+        )
         .map_err(|_| PublicPluginManagementError::Unavailable)?;
+    if content.hide().is_err() {
+        destroy_content(app, &identity.content_label);
+        return Err(PublicPluginManagementError::Unavailable);
+    }
     if register_content_focus_events(app, &content, Arc::clone(&controller), identity).is_err() {
         destroy_content(app, &identity.content_label);
         return Err(PublicPluginManagementError::Unavailable);
@@ -4391,13 +4473,104 @@ mod tests {
     }
 
     #[test]
-    fn panel_bounds_match_the_fixed_launcher_result_slot() {
-        let (position, size) = panel_logical_bounds(720.0, 420.0);
-        assert_eq!((position.x, position.y), (12.0, 64.0));
-        assert_eq!((size.width, size.height), (696.0, 320.0));
+    fn panel_bounds_are_clamped_to_the_main_logical_client_area() {
+        let bounds = clamp_panel_bounds(
+            720.0,
+            420.0,
+            PanelBounds {
+                x: -8.0,
+                y: 64.0,
+                width: 800.0,
+                height: 400.0,
+            },
+        )
+        .unwrap();
 
-        let (position, size) = panel_logical_bounds(20.0, 20.0);
-        assert!(position.x >= 0.0 && position.y >= 0.0);
-        assert!(size.width >= 1.0 && size.height >= 1.0);
+        assert_eq!((bounds.x, bounds.y), (0.0, 64.0));
+        assert_eq!((bounds.width, bounds.height), (720.0, 356.0));
+
+        let edge = clamp_panel_bounds(
+            20.0,
+            20.0,
+            PanelBounds {
+                x: 30.0,
+                y: 30.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        )
+        .unwrap();
+        assert_eq!((edge.x, edge.y), (19.0, 19.0));
+        assert_eq!((edge.width, edge.height), (1.0, 1.0));
+    }
+
+    #[test]
+    fn panel_bounds_reject_non_finite_or_non_positive_dimensions() {
+        for bounds in [
+            PanelBounds {
+                x: f64::NAN,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            PanelBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 1.0,
+            },
+            PanelBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: f64::INFINITY,
+            },
+        ] {
+            assert_eq!(
+                clamp_panel_bounds(720.0, 420.0, bounds),
+                Err(PanelBoundsError::InvalidBounds)
+            );
+        }
+    }
+
+    #[test]
+    fn panel_bounds_identity_requires_the_exact_live_session() {
+        let controller = PluginPanelController::default();
+        let first = controller.open_session(owner("a")).unwrap();
+        assert_eq!(
+            controller.claim_bounds_identity(first.session_epoch),
+            Ok(first.clone())
+        );
+
+        let second = controller.open_session(owner("b")).unwrap();
+        assert_eq!(
+            controller.claim_bounds_identity(first.session_epoch),
+            Err(PanelBoundsError::Stale)
+        );
+        assert_eq!(
+            controller.claim_bounds_identity(second.session_epoch),
+            Ok(second)
+        );
+    }
+
+    #[test]
+    fn child_webview_stays_hidden_until_dynamic_bounds_are_applied() {
+        let source = include_str!("plugin_panel.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("plugin panel test module marker is missing");
+        let bounds_update = production
+            .split("pub(crate) fn set_bounds(")
+            .nth(1)
+            .and_then(|tail| tail.split("\npub(crate) fn mount(").next())
+            .expect("panel bounds update is missing");
+
+        assert!(production.contains("content.hide()"));
+        assert!(bounds_update.contains(".set_bounds("));
+        assert!(bounds_update.contains("content.show()"));
+        assert!(!production.contains("PANEL_HORIZONTAL_INSET"));
+        assert!(!production.contains("PANEL_TOP_OFFSET"));
+        assert!(!production.contains("PANEL_BOTTOM_INSET"));
     }
 }

@@ -793,6 +793,7 @@ mod tests {
                     })
                     .collect(),
                 command_hint: None,
+                main_result_command: None,
                 window_transfer_token: None,
 
                 replace_local_results: false,

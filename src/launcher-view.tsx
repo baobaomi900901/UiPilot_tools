@@ -38,6 +38,7 @@ import type {
   ControlKey,
   FileCategory,
   FileResultKind,
+  PluginPanelBounds,
   ResultIconKind,
   SettingsTabKey,
   ThemePreference,
@@ -102,6 +103,44 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
     }
   }, [control, core, onBindingFailed, onBound, onUnbound])
   return <Input {...props} ref={ref} value={value} onChange={() => {}} />
+}
+
+function CommandTag({
+  commandLabel,
+  className = '',
+  disabled = false,
+  exitLabel,
+  exitTitle,
+  onClose,
+}: {
+  commandLabel: string
+  className?: string
+  disabled?: boolean
+  exitLabel: string
+  exitTitle: string
+  onClose: () => void
+}) {
+  return (
+    <div
+      className={`panel-command-tag${className ? ` ${className}` : ''}`}
+      role="group"
+      aria-label={`command ${commandLabel}`}
+    >
+      <span>/{commandLabel}</span>
+      <Tooltip title={exitTitle}>
+        <Button
+          aria-label={exitLabel}
+          disabled={disabled}
+          icon={<X aria-hidden size={14} strokeWidth={2} />}
+          tabIndex={-1}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={onClose}
+          size="small"
+          type="text"
+        />
+      </Tooltip>
+    </div>
+  )
 }
 
 function composing(event: ReactKeyboardEvent): boolean {
@@ -361,7 +400,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const [systemDark, setSystemDark] = useState(scheme.matches)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
+  const mainResultInputRef = useRef<HTMLInputElement | null>(null)
   const panelInputRef = useRef<HTMLInputElement | null>(null)
+  const panelHostRef = useRef<HTMLDivElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const activeSettingsTab = snapshot.settingsTab
@@ -403,6 +444,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     reportReady()
   }, [reportReady, snapshot.invocationId, snapshot.queryControl, snapshot.view])
 
+  const mainResultCommand = snapshot.mainResultCommand
+  const reportMainResultBound = useCallback((input: HTMLInputElement) => {
+    mainResultInputRef.current = input
+    input.focus()
+    const caret = input.value.length
+    input.setSelectionRange(caret, caret)
+  }, [mainResultCommand?.commandLabel, mainResultCommand?.suffixControl])
+  const reportMainResultUnbound = useCallback((input: HTMLInputElement) => {
+    if (mainResultInputRef.current === input) mainResultInputRef.current = null
+  }, [])
+
   const panel = snapshot.panel
   const reportPanelBound = useCallback((input: HTMLInputElement) => {
     panelInputRef.current = input
@@ -430,10 +482,57 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }, [core, panel?.closePending, panel?.focusRequestId, panel?.sessionEpoch, panel?.suffixControl])
 
   useLayoutEffect(() => {
+    if (snapshot.view !== 'launcher' || !panel || panel.closePending) return
+    const host = panelHostRef.current
+    if (!host) return
+    let disposed = false
+    let frame: number | undefined
+    let lastBounds: PluginPanelBounds | undefined
+
+    const measure = () => {
+      frame = undefined
+      if (disposed || !host.isConnected) return
+      const rect = host.getBoundingClientRect()
+      const bounds: PluginPanelBounds = {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+      }
+      if (
+        !Number.isFinite(bounds.x) || !Number.isFinite(bounds.y) ||
+        !Number.isFinite(bounds.width) || !Number.isFinite(bounds.height) ||
+        bounds.width <= 0 || bounds.height <= 0
+      ) return
+      if (
+        lastBounds?.x === bounds.x && lastBounds.y === bounds.y &&
+        lastBounds.width === bounds.width && lastBounds.height === bounds.height
+      ) return
+      lastBounds = bounds
+      core.setPanelBounds({ sessionEpoch: panel.sessionEpoch, bounds })
+    }
+    const schedule = () => {
+      if (disposed || frame !== undefined) return
+      frame = window.requestAnimationFrame(measure)
+    }
+    const observer = new ResizeObserver(schedule)
+    observer.observe(host)
+    window.addEventListener('resize', schedule)
+    schedule()
+    return () => {
+      disposed = true
+      observer.disconnect()
+      window.removeEventListener('resize', schedule)
+      if (frame !== undefined) window.cancelAnimationFrame(frame)
+    }
+  }, [core, panel?.closePending, panel?.sessionEpoch, snapshot.view])
+
+  useLayoutEffect(() => {
     if (!snapshot.invocationId) return
     if (snapshot.view === 'launcher') {
-      queryRef.current?.focus()
-      queryRef.current?.select()
+      const input = mainResultInputRef.current ?? queryRef.current
+      input?.focus()
+      input?.select()
     } else {
       settingsTabsRef.current
         ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
@@ -489,13 +588,16 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     }
   }, [activeFileIndex, file, snapshot.view])
 
+  const statusResult = snapshot.results[snapshot.selectedIndex]
   const status =
     snapshot.shownNotice ||
     snapshot.status ||
     (snapshot.results.length
-      ? `${snapshot.results.length} 个结果。${snapshot.results[snapshot.selectedIndex]?.title ?? ''}${
-          snapshot.results[snapshot.selectedIndex]?.subtitle ? `，${snapshot.results[snapshot.selectedIndex]!.subtitle}` : ''
-        }`
+      ? snapshot.mainResultCommand
+        ? `${snapshot.results.length} 个结果${statusResult?.subtitle ? ` · ${statusResult.subtitle}` : ''}`
+        : `${snapshot.results.length} 个结果。${statusResult?.title ?? ''}${
+            statusResult?.subtitle ? `，${statusResult.subtitle}` : ''
+          }`
       : '')
   const messageBadgeCount = snapshot.messageCenter.status === 'unavailable'
     ? '!'
@@ -526,6 +628,42 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     const isComposing = composing(event)
     if (!isComposing) event.preventDefault()
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
+  }
+  const launcherTabKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (
+      event.key !== 'Tab' ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.metaKey ||
+      composing(event)
+    ) return
+
+    const input = mainResultInputRef.current ?? queryRef.current
+    if (!input || input.disabled) return
+    const settingsButton = event.currentTarget.querySelector<HTMLElement>('.launcher-settings-button:not([disabled])')
+    event.preventDefault()
+    if (!settingsButton || settingsButton.getAttribute('aria-disabled') === 'true') {
+      input.focus()
+      return
+    }
+    if (event.shiftKey) {
+      if (document.activeElement === input) settingsButton.focus()
+      else input.focus()
+      return
+    }
+    if (document.activeElement === settingsButton) input.focus()
+    else settingsButton.focus()
+  }
+  const mainResultKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Backspace' && !composing(event)) {
+      const input = event.currentTarget
+      if (input.selectionStart === 0 && input.selectionEnd === 0) {
+        event.preventDefault()
+        core.closeMainResultCommand()
+      }
+      return
+    }
+    queryKeyDown(event)
   }
   const panelKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     const isComposing = composing(event)
@@ -604,57 +742,104 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
 
   const launcher = (
-    <section className="launcher-view" aria-label="应用启动器">
-      <label className="visually-hidden" htmlFor={`launcher-query-${snapshot.queryControl}`}>
-        搜索应用
-      </label>
-      <BoundInput
-        core={core}
-        control={snapshot.queryControl}
-        value={snapshot.queryControlValue}
-        id={`launcher-query-${snapshot.queryControl}`}
-        name={`launcher-query-${snapshot.queryControl}`}
-        placeholder="搜索应用"
-        autoComplete="off"
-        spellCheck={false}
-        disabled={!snapshot.invocationId || snapshot.view !== 'launcher'}
-        role="combobox"
-        aria-autocomplete="list"
-        aria-controls="launcher-results"
-        aria-expanded={snapshot.results.length > 0}
-        aria-activedescendant={
-          snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
-        }
-        suffix={(
-          <Tooltip title="设置">
-            <span className="launcher-settings-control">
-              <Badge
-                className={`launcher-settings-badge${snapshot.messageCenter.status === 'unavailable' ? ' is-unavailable' : ''}`}
-                count={messageBadgeCount}
-                offset={[-2, 2]}
-                overflowCount={99}
-                size="small"
-              >
-                <Button
-                  aria-label="打开设置"
-                  className="launcher-settings-button"
-                  disabled={!snapshot.invocationId}
-                  icon={<Settings aria-hidden size={16} strokeWidth={1.8} />}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => core.navigate('settings')}
-                  size="small"
-                  type="text"
-                />
-              </Badge>
-            </span>
-          </Tooltip>
+    <section className="launcher-view" aria-label="应用启动器" onKeyDownCapture={launcherTabKeyDown}>
+      <div className="launcher-query-region">
+        {mainResultCommand ? (
+          <div className="panel-input-row panel-input-shell main-result-input-shell">
+            <CommandTag
+              className="main-result-command-tag"
+              commandLabel={mainResultCommand.commandLabel}
+              exitLabel={`退出 ${mainResultCommand.commandLabel} 命令`}
+              exitTitle="退出命令"
+              onClose={core.closeMainResultCommand}
+            />
+            <label
+              className="visually-hidden"
+              htmlFor={`launcher-main-result-suffix-${mainResultCommand.suffixControl}`}
+            >
+              {mainResultCommand.commandLabel} argument
+            </label>
+            <BoundInput
+              className="panel-suffix-input"
+              core={core}
+              control={mainResultCommand.suffixControl}
+              value={mainResultCommand.suffix}
+              id={`launcher-main-result-suffix-${mainResultCommand.suffixControl}`}
+              name={`launcher-main-result-suffix-${mainResultCommand.suffixControl}`}
+              aria-label={`${mainResultCommand.commandLabel} argument`}
+              aria-autocomplete="list"
+              aria-controls="launcher-results"
+              aria-expanded={snapshot.results.length > 0}
+              aria-activedescendant={
+                snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
+              }
+              autoComplete="off"
+              disabled={!snapshot.invocationId || snapshot.view !== 'launcher'}
+              placeholder="请输入参数"
+              role="combobox"
+              spellCheck={false}
+              onKeyDown={mainResultKeyDown}
+              onBound={reportMainResultBound}
+              onUnbound={reportMainResultUnbound}
+              onBindingFailed={reportFailed}
+            />
+          </div>
+        ) : (
+          <>
+            <label className="visually-hidden" htmlFor={`launcher-query-${snapshot.queryControl}`}>
+              搜索应用
+            </label>
+            <BoundInput
+              core={core}
+              control={snapshot.queryControl}
+              value={snapshot.queryControlValue}
+              id={`launcher-query-${snapshot.queryControl}`}
+              name={`launcher-query-${snapshot.queryControl}`}
+              placeholder="搜索应用"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={!snapshot.invocationId || snapshot.view !== 'launcher'}
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls="launcher-results"
+              aria-expanded={snapshot.results.length > 0}
+              aria-activedescendant={
+                snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
+              }
+              suffix={(
+                <Tooltip title="设置">
+                  <span className="launcher-settings-control">
+                    <Badge
+                      className={`launcher-settings-badge${snapshot.messageCenter.status === 'unavailable' ? ' is-unavailable' : ''}`}
+                      count={messageBadgeCount}
+                      offset={[-2, 2]}
+                      overflowCount={99}
+                      size="small"
+                    >
+                      <Button
+                        aria-label="打开设置"
+                        className="launcher-settings-button"
+                        disabled={!snapshot.invocationId}
+                        icon={<Settings aria-hidden size={16} strokeWidth={1.8} />}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => core.navigate('settings')}
+                        size="small"
+                        type="text"
+                      />
+                    </Badge>
+                  </span>
+                </Tooltip>
+              )}
+              onKeyDown={queryKeyDown}
+              onBound={reportQueryBound}
+              onBindingFailed={reportFailed}
+            />
+          </>
         )}
-        onKeyDown={queryKeyDown}
-        onBound={reportQueryBound}
-        onBindingFailed={reportFailed}
-      />
+      </div>
 
-      <Spin spinning={snapshot.searchPending} size="small">
+      <div className="launcher-results-region">
+        <Spin spinning={snapshot.searchPending} size="small">
         <div className="launcher-result-surface">
           {snapshot.commandHint ? <div className="command-hint">{snapshot.commandHint}</div> : null}
           <div
@@ -755,7 +940,8 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             })}
           </div>
         </div>
-      </Spin>
+        </Spin>
+      </div>
     </section>
   )
 
@@ -885,43 +1071,37 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   ) : null
   const panelLauncher = panel ? (
     <section className="panel-launcher" aria-label={`${panel.commandLabel} 面板`}>
-      <div className="panel-input-row panel-input-shell">
-        <div className="panel-command-tag" role="group" aria-label={`command ${panel.commandLabel}`}>
-          <span>/{panel.commandLabel}</span>
-          <Tooltip title="退出面板">
-            <Button
-              aria-label={`退出 ${panel.commandLabel} 面板`}
-              disabled={panel.closePending}
-              icon={<X aria-hidden size={14} strokeWidth={2} />}
-              tabIndex={-1}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => void core.closePanel()}
-              size="small"
-              type="text"
-            />
-          </Tooltip>
+      <div className="panel-input-region">
+        <div className="panel-input-row panel-input-shell">
+          <CommandTag
+            commandLabel={panel.commandLabel}
+            disabled={panel.closePending}
+            exitLabel={`退出 ${panel.commandLabel} 面板`}
+            exitTitle="退出面板"
+            onClose={() => void core.closePanel()}
+          />
+          <label className="visually-hidden" htmlFor={`launcher-panel-suffix-${panel.suffixControl}`}>
+            {panel.commandLabel} argument
+          </label>
+          <BoundInput
+            className="panel-suffix-input"
+            core={core}
+            control={panel.suffixControl}
+            value={panel.suffix}
+            id={`launcher-panel-suffix-${panel.suffixControl}`}
+            name={`launcher-panel-suffix-${panel.suffixControl}`}
+            aria-label={`${panel.commandLabel} argument`}
+            autoComplete="off"
+            spellCheck={false}
+            disabled={!snapshot.invocationId || panel.closePending}
+            onKeyDown={panelKeyDown}
+            onBound={reportPanelBound}
+            onUnbound={reportPanelUnbound}
+            onBindingFailed={reportFailed}
+          />
         </div>
-        <label className="visually-hidden" htmlFor={`launcher-panel-suffix-${panel.suffixControl}`}>
-          {panel.commandLabel} argument
-        </label>
-        <BoundInput
-          className="panel-suffix-input"
-          core={core}
-          control={panel.suffixControl}
-          value={panel.suffix}
-          id={`launcher-panel-suffix-${panel.suffixControl}`}
-          name={`launcher-panel-suffix-${panel.suffixControl}`}
-          aria-label={`${panel.commandLabel} argument`}
-          autoComplete="off"
-          spellCheck={false}
-          disabled={!snapshot.invocationId || panel.closePending}
-          onKeyDown={panelKeyDown}
-          onBound={reportPanelBound}
-          onUnbound={reportPanelUnbound}
-          onBindingFailed={reportFailed}
-        />
       </div>
-      <div className="panel-host-region" aria-label="插件面板内容" />
+      <div ref={panelHostRef} className="panel-host-region" aria-label="插件面板内容" />
     </section>
   ) : null
 
@@ -1150,21 +1330,23 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   )
   const settingsView = (
     <section className="settings-view" aria-label="设置" onKeyDown={settingsKeyDown}>
-      <header className="settings-header">
-        <div className="settings-title-group">
-          <Tooltip title="返回主界面">
-            <Button
-              aria-label="返回主界面"
-              disabled={snapshot.hidePending}
-              icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
-              onClick={() => core.navigate('launcher')}
-              size="small"
-              type="text"
-            />
-          </Tooltip>
-          <h1>设置</h1>
-        </div>
-      </header>
+      <div className="settings-header-region">
+        <header className="settings-header">
+          <div className="settings-title-group">
+            <Tooltip title="返回主界面">
+              <Button
+                aria-label="返回主界面"
+                disabled={snapshot.hidePending}
+                icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
+                onClick={() => core.navigate('launcher')}
+                size="small"
+                type="text"
+              />
+            </Tooltip>
+            <h1>设置</h1>
+          </div>
+        </header>
+      </div>
       <div
         ref={settingsTabsRef}
         className="settings-tabs"
@@ -1210,14 +1392,20 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     <ConfigProvider theme={uiThemeConfig(colorScheme)}>
       <App>
         <main
-          className="launcher-surface"
+          className={panel ? 'launcher-surface is-panel-active' : 'launcher-surface'}
           data-color-scheme={colorScheme}
           onKeyDownCapture={preventBrowserFind}
         >
-          {snapshot.view === 'launcher' ? (panelLauncher ?? filePanel ?? launcher) : settingsView}
-          <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
-            {status}
+          <div className="launcher-region launcher-section-region">
+            {snapshot.view === 'launcher' ? (panelLauncher ?? filePanel ?? launcher) : settingsView}
           </div>
+          {snapshot.view === 'launcher' || status.length > 0 ? (
+            <div className="launcher-region launcher-status-region">
+              <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
+                {status}
+              </div>
+            </div>
+          ) : null}
         </main>
       </App>
     </ConfigProvider>
