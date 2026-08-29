@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.translate",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.3.2",
+  "name": "Youdao Translate",
+  "description": "使用有道翻译在 UiPilot 主界面完成中英互译。",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "translate",
+    "summary": "中英互译并复制译文",
+    "activationMode": "submit",
+    "outputMode": "mainResult",
+    "inputRequired": true,
+    "inputPlaceholder": "请输入中文或英文后回车"
+  },
+  "runtime": {
+    "entry": "dist/runtime.js"
+  },
+  "permissions": ["clipboard.write", "network.https"],
+  "network": {
+    "httpsHosts": ["openapi.youdao.com"]
+  },
+  "settings": []
+}

@@ -206,6 +206,8 @@ The fixed-output reference packages are:
 
 - `examples/public-plugins/com.uipilot.demo-win`: Windows-only `submit + window` with `ui.window` and a 10-second host-owned delayed message.
 - `examples/public-plugins/com.uipilot.demo-return`: `submit + mainResult` with `clipboard.write`.
+- `examples/public-plugins/com.uipilot.demo-panel`: Windows-only `submit + panel` with `ui.panel`, Host key routing, `focusHostInput()`, and `requestHide()`.
+- `examples/public-plugins/com.uipilot.demo-http`: Windows-only `submit + mainResult` with Host-managed `network.https` requests to `httpbin.org`.
 - `examples/public-plugins/com.uipilot.pomodoro`: Windows-only `submit + window` with the three-permission host timer, pause/resume/reset, message-center completion, and a plugin-supplied finite alarm validated and played by the host.
 
 Each README documents its development-directory installation, focused verification, packaging command, and user-operated acceptance flow.

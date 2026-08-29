@@ -13,6 +13,7 @@
 - [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：主界面结果与复制。
 - [`com.uipilot.demo-win`](../../examples/public-plugins/com.uipilot.demo-win)：单例子窗口。
 - [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)：启动器内嵌面板。
+- [`com.uipilot.demo-http`](../../examples/public-plugins/com.uipilot.demo-http)：Host 托管 HTTPS 请求。
 - [`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)：窗口隐藏后仍由宿主计时的番茄钟。
 
 完整字段、上限和安全合同见 [`Public Plugin API v1`](./public-plugin-v1.md)、[`plugin.json` Schema](./uipilot-plugin-v1.schema.json) 和 [TypeScript API 类型](./uipilot-plugin-api-v1.d.ts)。
@@ -25,10 +26,10 @@
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
 | 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（使用 `hostKeys` 时 `minimumHostVersion` ≥ `0.3.1`） | `demo-panel` |
-| 在 Runtime 中请求声明的 HTTPS 服务 | 任意现有模式 | 任意现有输出 | `network.https`（仅 Windows，`minimumHostVersion` ≥ `0.3.2`） | 无独立 Demo |
+| 在 Runtime 中请求声明的 HTTPS 服务 | 任意现有模式 | 任意现有输出 | `network.https`（仅 Windows，`minimumHostVersion` ≥ `0.3.2`） | `demo-http` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
-MVP 中每个插件只能注册一个启动名称。用户可以在 UiPilot 设置中修改该名称，所以 Runtime 不应硬编码 `/命令名`。
+MVP 中每个插件只能注册一个启动键（Manifest 字段是 `command.defaultName`）。用户可以在 UiPilot 设置中修改该启动键，所以 Runtime 不应硬编码 `/命令名`。
 
 ## 2. 准备目录
 
@@ -78,7 +79,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 | --- | --- | --- |
 | `description` | 设置页插件介绍 | `将输入转换为可复制文本。` |
 | `command.summary` | 输入 `/d` 时的插件匹配提示 | `生成一条文本` |
-| `command.inputPlaceholder` | 命令补全后的用法提示 | `请输入内容后回车` |
+| `command.inputPlaceholder` | 命令进入 tag / 参数输入后的用法提示 | `请输入内容后回车` |
 
 公共规则：
 
@@ -748,13 +749,23 @@ uipilot-plugin validate .\package --platform windows --json
 
 1. 启动 UiPilot。
 2. 打开 **设置 > 插件 > 公开插件**。
-3. 点击“选择开发目录”。
+3. 点击“选择开发目录”图标按钮。
 4. 选择插件的 `package` 目录。
 5. 检查插件名称、版本、图标、权限；网络插件还要逐项检查完整 HTTPS 域名列表。
 6. 点击“确认安装”。
-7. 在主界面输入 `/` 加启动名称测试插件。
+7. 在主界面输入 `/` 加启动键测试插件。
 
-用户可能修改启动名称。实际生效名称以 UiPilot 设置页为准，不以 `defaultName` 永久锁定。
+也可以点击“选择插件包”图标按钮安装 `.uipilot-plugin` 归档。公开插件页提供“筛选插件名称”输入框；列表中可查看插件图标、名称、版本、当前启动命令、简介、详情、删除和启用状态。详情页可查看权限列表、网络 Host，并编辑“启动键”；启动键输入框失焦后保存，旁边的恢复默认按钮会回到 Manifest 中的 `command.defaultName`。
+
+删除插件时需要在弹窗中选择“全部卸载”或“保留数据卸载”。“保留数据卸载”会移除安装状态和权限授权，但保留插件私有数据，供后续重新安装或升级恢复使用。
+
+用户可能修改启动键。实际生效名称以 UiPilot 设置页为准，不以 `defaultName` 永久锁定。
+
+主界面测试时：
+
+- 主界面结果型插件进入命令 tag / 参数输入状态；提交后在主界面显示结果，带 `copyText` 默认动作的结果可再次按 Enter 复制。
+- 子窗口型插件在选择或输入完整命令并回车后直接打开宿主管理的单例子窗口。
+- 面板型插件在选择或输入完整命令并回车后直接挂载到主启动器内，并把光标放到命令 tag 后的参数输入框。
 
 修改插件后：
 
@@ -844,7 +855,7 @@ const hasToken = await api.settings.isSecretConfigured('token')
 
 ### 输入命令没有匹配到插件
 
-检查插件是否已启用、是否有运行故障，以及用户是否在设置页修改了启动名称。
+检查插件是否已启用、是否有运行故障，以及用户是否在设置页修改了启动键。
 
 ### 结果出现但不能复制
 

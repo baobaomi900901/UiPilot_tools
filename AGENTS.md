@@ -19,3 +19,24 @@ repeating the full TDD cycle, implementation snippets, verification steps, or
 commit commands inside every task. Approved design specifications remain the
 source of truth for technical contracts, event ordering, security boundaries,
 and failure behavior.
+
+## UiPilot Public Plugin Development
+
+When creating, updating, or testing a UiPilot public plugin, first read
+`docs/plugin-sdk/public-plugin-developer-guide.md`. Use
+`docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`,
+and `docs/plugin-sdk/uipilot-plugin-v1.schema.json` as contract references when
+the task touches manifest fields, Runtime APIs, window/panel bridges, network,
+settings, permissions, packaging, or validation. Pick the closest tracked example
+under `examples/public-plugins/` before scaffolding new plugin code.
+
+Plugin-development tasks keep UiPilot host/app sources read-only. Implement the
+plugin inside its package, tests, and plugin-owned docs; do not patch `src/`,
+`src-tauri/`, `packages/plugin-cli/`, or SDK contract docs to make the plugin
+work unless the user explicitly assigns host-program development in that task.
+When the existing public plugin API cannot satisfy the plugin requirement, stop
+at the plugin boundary and write a host capability request under
+`docs/superpowers/specs/YYYY-MM-DD-<short-slug>-host-capability.md` covering the
+user need, plugin scenario, current API gap, proposed host/API behavior, and
+acceptance checks. Tell the user the document is ready to hand to the
+host-program development agent.
