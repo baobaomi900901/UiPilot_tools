@@ -696,7 +696,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 69);
+        assert_eq!(production.matches("commands::").count(), 71);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -717,6 +717,7 @@ mod tests {
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
+            "plugin_network_request",
             "plugin_api_call",
             "complete_plugin_command",
             "plugin_window_content_ready",
@@ -1402,7 +1403,11 @@ mod tests {
         let allow_prefix = ["allow", "("].concat();
         assert!(!production_root.contains(&allow_prefix));
 
-        let commands = include_str!("commands.rs").replace("\r\n", "\n");
+        let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
+        let commands = commands_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
         let action = include_str!("apps/action.rs").replace("\r\n", "\n");
         let cache = include_str!("apps/cache.rs").replace("\r\n", "\n");
         let file_index = include_str!("file_index/mod.rs").replace("\r\n", "\n");

@@ -1885,13 +1885,11 @@ mod tests {
 ",
         );
         let close = source
-            .split(
-                "pub(crate) fn close(
-    app: &AppHandle,",
-            )
+            .split("\npub(crate) fn close(")
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn teardown_current(").next())
             .expect("plugin window close function is missing");
+        assert!(close.contains("app: &AppHandle"));
         let hide = close
             .find("hide_and_revoke(")
             .expect("session-aware native hide is missing");

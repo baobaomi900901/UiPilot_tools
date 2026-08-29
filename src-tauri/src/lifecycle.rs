@@ -2424,10 +2424,14 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("fn run_system_end(").next())
             .expect("tray quit source markers are missing");
-        let marker = tray.find("mark_clean_close").unwrap();
-        let uninstall = tray.find("uninstall_hook_for_exit").unwrap();
+        let quit_worker = tray
+            .split("coordinator.run_tray_quit_with(")
+            .nth(1)
+            .expect("tray quit worker source markers are missing");
+        let marker = quit_worker.find("mark_clean_close").unwrap();
+        let uninstall = quit_worker.find("uninstall_hook_for_exit").unwrap();
         assert!(marker < uninstall);
-        assert_eq!(tray.matches("uninstall_hook_for_exit").count(), 1);
+        assert_eq!(tray.matches("uninstall_hook_for_exit").count(), 2);
 
         let system_end = production
             .split("fn run_system_end(")

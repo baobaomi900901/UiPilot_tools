@@ -4946,10 +4946,9 @@ mod tests {
 
     fn completion_text(item: &crate::model::ResultItem) -> Option<&str> {
         match &item.activation {
-            crate::model::LauncherResultActivation::Completion { completion_text }
-            | crate::model::LauncherResultActivation::PluginCompletion {
-                completion_text, ..
-            } => Some(completion_text),
+            crate::model::LauncherResultActivation::Completion { completion_text } => {
+                Some(completion_text)
+            }
             _ => None,
         }
     }

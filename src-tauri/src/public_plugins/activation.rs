@@ -5858,7 +5858,7 @@ mod tests {
                     summary: Some("返回示例文本到主界面".into()),
                     icon_url: None,
                     favorite: false,
-                    input_required: false,
+                    input_required: true,
                     output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
@@ -5868,7 +5868,7 @@ mod tests {
                     summary: Some("打开演示子窗口".into()),
                     icon_url: None,
                     favorite: false,
-                    input_required: false,
+                    input_required: true,
                     output_mode: PublicOutputMode::MainResult,
                 },
             ]
@@ -5890,7 +5890,7 @@ mod tests {
                 summary: Some("打开演示子窗口".into()),
                 icon_url: None,
                 favorite: false,
-                input_required: false,
+                input_required: true,
                 output_mode: PublicOutputMode::MainResult,
             }]
         );

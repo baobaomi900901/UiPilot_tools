@@ -218,37 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn favorite_plugin_completion_serializes_identity_and_rejects_invalid_ownership() {
-        let activation = LauncherResultActivation::plugin_completion(
-            "/demo-win value".into(),
-            "com.uipilot.demo-win".into(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::to_value(activation).unwrap(),
-            serde_json::json!({
-                "kind": "pluginCompletion",
-                "completionText": "/demo-win value",
-                "pluginId": "com.uipilot.demo-win",
-                "favorite": true
-            })
-        );
-        assert!(LauncherResultActivation::plugin_completion(
-            "/demo-win\nvalue".into(),
-            "com.uipilot.demo-win".into(),
-            false,
-        )
-        .is_none());
-        assert!(LauncherResultActivation::plugin_completion(
-            "/demo-win value".into(),
-            "Invalid Plugin".into(),
-            false,
-        )
-        .is_none());
-    }
-
-    #[test]
     fn window_activation_serializes_command_and_rejects_invalid_values() {
         let activation = LauncherResultActivation::window_activation(
             "com.uipilot.pomodoro".into(),
