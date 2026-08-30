@@ -984,6 +984,12 @@ label,
   font-size: 0.75rem;
 }
 
+.public-clipboard-history-notice {
+  margin: 6px 0 0;
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 0.75rem;
+}
+
 .public-network-confirm {
   max-width: 320px;
 }

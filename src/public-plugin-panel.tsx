@@ -18,6 +18,40 @@ interface PublicPluginPanelProps {
 
 const CLEANUP_PENDING_MESSAGE = '插件已卸载，数据清理将在下次启动时重试'
 const PLUGIN_FILTER_DEBOUNCE_MS = 150
+const CLIPBOARD_HISTORY_NOTICE = '授权后，UiPilot 运行、插件启用且权限有效期间，会在本机记录该插件可用的剪贴板历史摘要；不会自动识别密码或敏感来源。'
+
+function permissionLabel(permission: PublicPermission): string {
+  switch (permission) {
+    case 'clipboard.write':
+      return '写入剪贴板'
+    case 'clipboard.read':
+      return '读取剪贴板（保留，暂不支持）'
+    case 'clipboard.history.read':
+      return '剪贴板历史读取'
+    case 'clipboard.history.paste':
+      return '剪贴板历史粘贴'
+    case 'network.https':
+      return '网络访问'
+    case 'notifications.publish':
+      return '发送通知'
+    case 'timer.control':
+      return '计时器控制'
+    case 'ui.window':
+      return '独立窗口'
+    case 'ui.panel':
+      return '启动器面板'
+    default:
+      return permission
+  }
+}
+
+function permissionSummary(permission: PublicPermission): string {
+  return `${permissionLabel(permission)} · ${permission}`
+}
+
+function hasClipboardHistoryRead(permissions: readonly PublicPermission[]) {
+  return permissions.includes('clipboard.history.read')
+}
 
 function isCleanupPending(error: unknown): boolean {
   return typeof error === 'object'
@@ -127,7 +161,7 @@ function PublicPluginRow({
 }
 
 function permissionText({ permission, supported, granted }: PublicPluginInventoryItem['permissions'][number]) {
-  return `${permission} · ${supported ? (granted ? '已授权' : '未授权') : '不支持'}`
+  return `${permissionSummary(permission)} · ${supported ? (granted ? '已授权' : '未授权') : '不支持'}`
 }
 
 export function PublicPluginDetail({
@@ -191,11 +225,16 @@ export function PublicPluginDetail({
         <dt>权限列表</dt>
         <dd>
           {plugin.permissions.length ? (
-            <ul className="public-plugin-detail-items">
-              {plugin.permissions.map((permission) => (
-                <li key={permission.permission}>{permissionText(permission)}</li>
-              ))}
-            </ul>
+            <>
+              <ul className="public-plugin-detail-items">
+                {plugin.permissions.map((permission) => (
+                  <li key={permission.permission}>{permissionText(permission)}</li>
+                ))}
+              </ul>
+              {plugin.permissions.some(({ permission }) => permission === 'clipboard.history.read') ? (
+                <p className="public-clipboard-history-notice">{CLIPBOARD_HISTORY_NOTICE}</p>
+              ) : null}
+            </>
           ) : '无额外权限'}
         </dd>
         <dt>网络 Host</dt>
@@ -346,7 +385,10 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
         <div className="public-prepare" role="status">
           <PluginIcon iconUrl={prepared.iconUrl} size={32} />
           <strong>{prepared.name}</strong><span>{prepared.version}</span>
-          <span>{prepared.permissions.filter((permission) => permission !== 'network.https').join('、') || (prepared.network ? 'network.https' : '无额外权限')}</span>
+          <span>{prepared.permissions.filter((permission) => permission !== 'network.https').map(permissionSummary).join('、') || (prepared.network ? permissionSummary('network.https') : '无额外权限')}</span>
+          {hasClipboardHistoryRead(prepared.permissions) ? (
+            <p className="public-clipboard-history-notice">{CLIPBOARD_HISTORY_NOTICE}</p>
+          ) : null}
           {prepared.network ? (
             <div className="public-network-consent">
               <strong>网络访问 · network.https{prepared.network.requiresNetworkConsent ? '（需要确认）' : ''}</strong>

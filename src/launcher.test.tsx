@@ -4731,8 +4731,8 @@ describe('React view and accessibility', () => {
       const isZero = (value: string) => /^0(?:px)?$/.test(value)
 
       expect(getComputedStyle(app).height).toBe('100%')
-      expect(normalized(getComputedStyle(surface).gridTemplateRows)).toBe('minmax(52px, 1fr) minmax(24px, auto)')
-      expect(normalized(getComputedStyle(launcher).gridTemplateRows)).toBe('44px minmax(0, 1fr)')
+      expect(normalized(getComputedStyle(surface).gridTemplateRows)).toBe('minmax(52px, 1fr) minmax(0, auto)')
+      expect(normalized(getComputedStyle(launcher).gridTemplateRows)).toBe('60px minmax(0, 1fr)')
       for (const element of [spinRoot, spinContainer, results]) {
         expect(isZero(getComputedStyle(element).minHeight)).toBe(true)
         expect(getComputedStyle(element).height).toBe('100%')
@@ -4779,7 +4779,8 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(
       /\.settings-tab-panel\s*\{[^}]*height:\s*100%;[^}]*padding:\s*0;[^}]*overflow:\s*hidden;/s,
     )
-    expect(stylesSource).toMatch(/\.settings-scroll-content\s*\{[^}]*min-height:\s*100%;[^}]*padding:\s*10px 12px 4px;/s)
+    expect(stylesSource).toMatch(/\.settings-tab-panel\s*\{[^}]*padding:\s*16px 24px 16px 4px;/s)
+    expect(stylesSource).toMatch(/\.settings-scroll-content\s*\{[^}]*min-height:\s*100%;/s)
   })
 
   it('uses the third-party overlay scrollbar for both settings panels', async () => {
@@ -4796,7 +4797,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.settings-plugin-panel .settings-scroll-content')).toBeTruthy())
 
     expect(launcherViewSource).toContain("from 'overlayscrollbars-react'")
-    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(2)
+    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(3)
     expect(launcherViewSource).not.toContain('./overlay-scroll-area')
     expect(stylesSource).toMatch(/\.os-theme-uipilot\s*\{[^}]*--os-size:\s*8px;[^}]*--os-handle-bg:\s*var\(--result-scrollbar-thumb\);/s)
     expect(stylesSource).not.toContain('.overlay-scroll-')
@@ -5669,7 +5670,11 @@ describe('React view and accessibility', () => {
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
         network: { httpsHosts: ['api.example.com'] },
-        permissions: [{ permission: 'network.https', supported: true, granted: false }],
+        permissions: [
+          { permission: 'network.https', supported: true, granted: false },
+          { permission: 'clipboard.history.read', supported: true, granted: true },
+          { permission: 'clipboard.history.paste', supported: false, granted: false },
+        ],
         settings: [
           { definition: { type: 'text', key: 'prefix', label: 'Prefix' }, value: 'Hello' },
           { definition: { type: 'number', key: 'limit', label: 'Limit', min: 1, max: 9 }, value: 3 },
@@ -5718,14 +5723,18 @@ describe('React view and accessibility', () => {
     expect(detail.textContent).not.toContain('启动名称')
     expect(detail.querySelector('.public-detail-name-term')).not.toBeNull()
     expect(detail.querySelector('.public-detail-name-value')).not.toBeNull()
-    expect(stylesSource).toMatch(/\.public-plugin-detail-list\s*\{[^}]*padding:\s*12px 0 0 12px;/s)
+    expect(stylesSource).toMatch(/\.public-plugin-detail-list\s*\{[^}]*padding:\s*20px 0 0 42px;/s)
     expect(stylesSource).toMatch(/\.public-detail-name-term,\s*\.public-detail-name-value\s*\{[^}]*align-self:\s*center;/s)
     expect(detail.textContent).toContain('版本号')
     expect(detail.textContent).toContain('1.0.0')
     expect(detail.textContent).toContain('插件说明')
     expect(detail.textContent).toContain('A compact plugin description that stays on one row.')
     expect(detail.textContent).toContain('权限列表')
-    expect(detail.textContent).toContain('network.https · 未授权')
+    expect(detail.textContent).toContain('网络访问 · network.https · 未授权')
+    expect(detail.textContent).toContain('剪贴板历史读取 · clipboard.history.read · 已授权')
+    expect(detail.textContent).toContain('剪贴板历史粘贴 · clipboard.history.paste · 不支持')
+    expect(detail.textContent).toContain('会在本机记录该插件可用的剪贴板历史摘要')
+    expect(detail.textContent).not.toContain('clipboard.read 是 clipboard.history.read')
     expect(detail.textContent).toContain('网络 Host')
     expect(detail.textContent).toContain('api.example.com')
     expect(detail.textContent).toContain('插件所在目录')
@@ -5871,7 +5880,7 @@ describe('React view and accessibility', () => {
       pluginId: 'com.uipilot.demo-win',
       name: 'Public Plugin Demo Window',
       version: '1.0.2',
-      permissions: ['ui.window'],
+      permissions: ['ui.window', 'clipboard.history.read', 'clipboard.history.paste'],
       isUpdate: false,
       sourceVerified: false,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
@@ -5887,6 +5896,12 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-prepare')).not.toBeNull())
     expect(mounted.host.querySelector<HTMLImageElement>('.public-prepare .plugin-icon-image')?.getAttribute('src'))
       .toBe('uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png')
+    const prepare = mounted.host.querySelector<HTMLElement>('.public-prepare')!
+    expect(prepare.textContent).toContain('独立窗口 · ui.window')
+    expect(prepare.textContent).toContain('剪贴板历史读取 · clipboard.history.read')
+    expect(prepare.textContent).toContain('剪贴板历史粘贴 · clipboard.history.paste')
+    expect(prepare.textContent).toContain('会在本机记录该插件可用的剪贴板历史摘要')
+    expect(prepare.textContent).not.toContain('clipboard.read')
     const confirm = [...mounted.host.querySelectorAll<HTMLButtonElement>('.public-prepare button')]
       .find((button) => button.textContent?.includes('确认安装'))!
     await act(async () => {
