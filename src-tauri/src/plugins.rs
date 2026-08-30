@@ -5456,8 +5456,45 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
 }
 
 #[cfg(windows)]
-fn move_directory_handle(handle: &DirectoryHandle, destination: &Path) -> io::Result<()> {
+fn nt_namespace_path(path: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let raw = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if raw.is_empty() {
+        return Err(io::Error::other("plugin delete unavailable"));
+    }
+
+    let nt_prefix = "\\??\\".encode_utf16().collect::<Vec<_>>();
+    if raw.starts_with(&nt_prefix) {
+        return Ok(raw);
+    }
+
+    let extended_prefix = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+    if raw.starts_with(&extended_prefix) {
+        let mut prefixed = nt_prefix;
+        prefixed.extend_from_slice(&raw[extended_prefix.len()..]);
+        return Ok(prefixed);
+    }
+
+    let unc_prefix = [b'\\' as u16, b'\\' as u16];
+    if raw.starts_with(&unc_prefix) {
+        let mut prefixed = "\\??\\UNC\\".encode_utf16().collect::<Vec<_>>();
+        prefixed.extend_from_slice(&raw[unc_prefix.len()..]);
+        return Ok(prefixed);
+    }
+
+    let mut prefixed = nt_prefix;
+    prefixed.extend(raw);
+    Ok(prefixed)
+}
+
+#[cfg(windows)]
+fn move_directory_handle(handle: &DirectoryHandle, destination: &Path) -> io::Result<()> {
     use windows::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
@@ -5465,7 +5502,7 @@ fn move_directory_handle(handle: &DirectoryHandle, destination: &Path) -> io::Re
         },
     };
 
-    let name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name = nt_namespace_path(destination)?;
     let name_bytes = name
         .len()
         .checked_mul(std::mem::size_of::<u16>())
