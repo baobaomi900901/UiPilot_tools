@@ -43,6 +43,9 @@ mod model;
 mod result_registry;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod clipboard_history;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod public_plugins;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
