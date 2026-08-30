@@ -1880,6 +1880,7 @@ describe('shown and search ownership', () => {
     await vi.waitFor(() => expect(client.submitPluginPanel).toHaveBeenCalledTimes(1))
     vi.mocked(client.submitPluginPanel).mockClear()
     const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+    input.focus()
 
     const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
     const shiftTab = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })
@@ -1904,6 +1905,7 @@ describe('shown and search ownership', () => {
     expect(tab.defaultPrevented).toBe(true)
     expect(shiftTab.defaultPrevented).toBe(true)
     expect(enter.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(input)
     await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(3))
     expect(client.enqueuePluginPanelHostKey).toHaveBeenNthCalledWith(1, {
       sessionEpoch: '32', clientSequence: '1', declaration: 'Tab', key: 'Tab',

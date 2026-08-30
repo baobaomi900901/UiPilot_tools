@@ -50,8 +50,19 @@ function recordKeyEvent({ key, source, routeSequence: nextRouteSequence = null }
   renderKeyHistory()
 }
 
-function formatHostKey(key) {
-  return key === 'n' ? 'Ctrl+N' : key
+function formatHostKey(event) {
+  const modifiers = []
+  if (event.ctrlKey) modifiers.push('Ctrl')
+  if (event.metaKey) modifiers.push('Meta')
+  if (event.altKey) modifiers.push('Alt')
+  if (event.shiftKey) modifiers.push('Shift')
+
+  const key = event.key === ' '
+    ? 'Space'
+    : event.key.length === 1
+      ? event.key.toUpperCase()
+      : event.key
+  return [...modifiers, key].join('+')
 }
 
 function formatContentKey(event) {
@@ -76,7 +87,7 @@ window.addEventListener('blur', renderFocusState)
 
 window.uipilotPluginPanel.onHostKey((event) => {
   recordKeyEvent({
-    key: formatHostKey(event.key),
+    key: formatHostKey(event),
     source: 'Host route',
     routeSequence: event.routeSequence,
   })
