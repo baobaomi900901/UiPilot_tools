@@ -101,8 +101,8 @@ describe('shared UiPilot visual theme', () => {
 
   it('maps stable plugin variables from the shared css token layer', () => {
     expect(themeCssSource).toContain(':root,')
-    expect(themeCssSource).toContain(':root[data-color-scheme="light"]')
-    expect(themeCssSource).toContain(':root[data-color-scheme="dark"]')
+    expect(themeCssSource).toMatch(/:root\[data-color-scheme=['"]light['"]\]/)
+    expect(themeCssSource).toMatch(/:root\[data-color-scheme=['"]dark['"]\]/)
     expect(themeCssSource).toContain('--uipilot-color-surface: var(--uipilot-ui-surface);')
     expect(themeCssSource).toContain('--uipilot-color-text: var(--uipilot-ui-foreground);')
     expect(themeCssSource).toContain('--uipilot-color-border: var(--uipilot-ui-border);')
