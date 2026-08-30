@@ -2886,6 +2886,17 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!input.ctrlKey && !input.metaKey && !input.shiftKey && !input.altKey) {
       if (input.key === 'ArrowDown') declaration = key = 'ArrowDown'
       else if (input.key === 'ArrowUp') declaration = key = 'ArrowUp'
+      else if (input.key === 'Tab') declaration = key = 'Tab'
+      else if (input.key === 'Enter') declaration = key = 'Enter'
+    } else if (
+      input.key === 'Tab' &&
+      input.shiftKey &&
+      !input.ctrlKey &&
+      !input.metaKey &&
+      !input.altKey
+    ) {
+      declaration = 'Shift+Tab'
+      key = 'Tab'
     } else if (
       input.key.toLowerCase() === 'n' && !input.shiftKey && !input.altKey &&
       (input.platform === 'windows'

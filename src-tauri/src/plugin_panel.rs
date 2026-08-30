@@ -3113,6 +3113,94 @@ mod tests {
         }
     }
 
+    fn host_key_chord(
+        declaration: PanelHostKeyDeclaration,
+        key: PluginPanelHostKey,
+        ctrl_key: bool,
+        meta_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+    ) -> HostKeyEnqueueInput {
+        HostKeyEnqueueInput {
+            client_sequence: 1,
+            declaration,
+            key,
+            ctrl_key,
+            meta_key,
+            shift_key,
+            alt_key,
+        }
+    }
+
+    #[test]
+    fn host_key_extended_chords_require_exact_modifiers() {
+        assert!(host_key_chord(
+            PanelHostKeyDeclaration::Tab,
+            PluginPanelHostKey::Tab,
+            false,
+            false,
+            false,
+            false,
+        )
+        .valid_chord());
+        assert!(!host_key_chord(
+            PanelHostKeyDeclaration::Tab,
+            PluginPanelHostKey::Tab,
+            false,
+            false,
+            true,
+            false,
+        )
+        .valid_chord());
+
+        assert!(host_key_chord(
+            PanelHostKeyDeclaration::ShiftTab,
+            PluginPanelHostKey::Tab,
+            false,
+            false,
+            true,
+            false,
+        )
+        .valid_chord());
+        assert!(!host_key_chord(
+            PanelHostKeyDeclaration::ShiftTab,
+            PluginPanelHostKey::Tab,
+            false,
+            false,
+            false,
+            false,
+        )
+        .valid_chord());
+
+        assert!(host_key_chord(
+            PanelHostKeyDeclaration::Enter,
+            PluginPanelHostKey::Enter,
+            false,
+            false,
+            false,
+            false,
+        )
+        .valid_chord());
+        assert!(!host_key_chord(
+            PanelHostKeyDeclaration::Enter,
+            PluginPanelHostKey::Enter,
+            false,
+            false,
+            true,
+            false,
+        )
+        .valid_chord());
+        assert!(!host_key_chord(
+            PanelHostKeyDeclaration::Enter,
+            PluginPanelHostKey::Tab,
+            false,
+            false,
+            false,
+            false,
+        )
+        .valid_chord());
+    }
+
     #[test]
     fn host_key_ready_gate_rejects_missing_receiver_and_sticky_empty_registration() {
         let controller = PluginPanelController::default();

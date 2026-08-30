@@ -1846,6 +1846,81 @@ describe('shown and search ownership', () => {
     await mounted.unmount()
   })
 
+  it('routes declared Tab Shift+Tab and Enter Host keys without focus traversal or panel submit', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const hostKeys = ['Tab', 'Shift+Tab', 'Enter'] as const
+    vi.mocked(client.searchApps).mockResolvedValue({
+      requestId: 'panel-extended-host-key-result',
+      items: [panelItem('')],
+    } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('32'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+      hostKeys,
+    })
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('32'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+      hostKeys,
+    })
+    vi.mocked(client.enqueuePluginPanelHostKey).mockResolvedValue({ outcome: 'enqueued', routeSequence: u64('1') })
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('panel-extended-host-key-entry')))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'hello', inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('32'))
+    await vi.waitFor(() => expect(client.submitPluginPanel).toHaveBeenCalledTimes(1))
+    vi.mocked(client.submitPluginPanel).mockClear()
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    const shiftTab = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    const ctrlTab = new KeyboardEvent('keydown', { key: 'Tab', ctrlKey: true, bubbles: true, cancelable: true })
+    const altTab = new KeyboardEvent('keydown', { key: 'Tab', altKey: true, bubbles: true, cancelable: true })
+    const composingEnter = new KeyboardEvent(
+      'keydown',
+      { key: 'Enter', isComposing: true, bubbles: true, cancelable: true },
+    )
+
+    input.dispatchEvent(ctrlTab)
+    input.dispatchEvent(altTab)
+    input.dispatchEvent(composingEnter)
+    input.dispatchEvent(tab)
+    input.dispatchEvent(shiftTab)
+    input.dispatchEvent(enter)
+
+    expect(ctrlTab.defaultPrevented).toBe(false)
+    expect(altTab.defaultPrevented).toBe(false)
+    expect(composingEnter.defaultPrevented).toBe(false)
+    expect(tab.defaultPrevented).toBe(true)
+    expect(shiftTab.defaultPrevented).toBe(true)
+    expect(enter.defaultPrevented).toBe(true)
+    await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(3))
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenNthCalledWith(1, {
+      sessionEpoch: '32', clientSequence: '1', declaration: 'Tab', key: 'Tab',
+      ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    })
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenNthCalledWith(2, {
+      sessionEpoch: '32', clientSequence: '2', declaration: 'Shift+Tab', key: 'Tab',
+      ctrlKey: false, metaKey: false, shiftKey: true, altKey: false,
+    })
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenNthCalledWith(3, {
+      sessionEpoch: '32', clientSequence: '3', declaration: 'Enter', key: 'Enter',
+      ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    })
+    expect(client.submitPluginPanel).not.toHaveBeenCalled()
+    await mounted.unmount()
+  })
+
   it('prevents native browser find across the main surface without stopping key propagation', async () => {
     const { core, emit } = await startedCore()
     installMatchMedia(false)
