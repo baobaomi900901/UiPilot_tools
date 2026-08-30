@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>剪贴板历史</title>
+    <link rel="stylesheet" href="./panel.css" />
+  </head>
+  <body>
+    <main class="clipboard-app">
+      <aside class="filter-rail" aria-label="剪贴板类型">
+        <div id="filter-tabs" class="filter-tabs" role="tablist" aria-orientation="vertical">
+          <button class="filter-tab" type="button" role="tab" tabindex="-1" data-filter="all" aria-selected="true"><span>全部</span><span class="filter-count">0</span></button>
+          <button class="filter-tab" type="button" role="tab" tabindex="-1" data-filter="image" aria-selected="false"><span>图片</span><span class="filter-count">0</span></button>
+          <button class="filter-tab" type="button" role="tab" tabindex="-1" data-filter="files" aria-selected="false"><span>文件</span><span class="filter-count">0</span></button>
+          <button class="filter-tab" type="button" role="tab" tabindex="-1" data-filter="text" aria-selected="false"><span>文字</span><span class="filter-count">0</span></button>
+        </div>
+      </aside>
+
+      <section class="history-pane" aria-labelledby="history-title">
+        <header class="history-header">
+          <div>
+            <h1 id="history-title">最近记录</h1>
+            <p id="history-count" class="history-count">正在读取</p>
+          </div>
+          <button id="clear-history" class="icon-button" type="button" tabindex="-1" title="清空历史" aria-label="清空历史">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 6h18"></path>
+              <path d="M8 6V4h8v2"></path>
+              <path d="M19 6l-1 14H6L5 6"></path>
+              <path d="M10 11v5M14 11v5"></path>
+            </svg>
+          </button>
+        </header>
+
+        <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        <div id="history-list" class="history-list" role="listbox" aria-label="剪贴板记录"></div>
+        <div id="empty-state" class="empty-state" hidden>
+          <p id="empty-title" class="empty-title">暂无记录</p>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./panel.js"></script>
+  </body>
+</html>
