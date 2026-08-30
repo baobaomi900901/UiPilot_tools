@@ -1193,6 +1193,57 @@ fn repository_demo_panel_stages_with_the_panel_only_contract() {
     );
 }
 
+#[test]
+fn clipboard_history_host_fixture_stages_with_final_panel_contract() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let root = TestRoot::new("clipboard-history-host-fixture");
+    let source = workspace.join("tests/fixtures/public-plugins/clipboard-history-host-fixture");
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.manifest.plugin_id,
+        "com.uipilot.clipboard-history-host-fixture"
+    );
+    assert_eq!(
+        prepared.manifest.command.output_mode,
+        PublicOutputMode::Panel
+    );
+    assert_eq!(
+        prepared.manifest.permissions,
+        vec![
+            PublicPermission::UiPanel,
+            PublicPermission::ClipboardHistoryRead,
+            PublicPermission::ClipboardHistoryPaste,
+        ]
+    );
+    assert_eq!(
+        prepared.manifest.panel.as_ref().unwrap().host_keys,
+        vec![
+            PanelHostKeyDeclaration::Tab,
+            PanelHostKeyDeclaration::ShiftTab,
+            PanelHostKeyDeclaration::Enter,
+        ]
+    );
+    assert_eq!(
+        prepared
+            .resources
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "dist/panel.html",
+            "dist/panel.js",
+            "dist/runtime.js",
+            "plugin.json",
+        ]
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn demo_packaging_script_writes_both_installable_archives() {

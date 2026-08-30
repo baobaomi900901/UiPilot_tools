@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.clipboard-history-host-fixture",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.3.3",
+  "name": "Clipboard History Host Fixture",
+  "description": "Host-only fixture for UiPilot clipboard history panel contracts.",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "clipboard-fixture",
+    "summary": "Exercise clipboard history host bridges",
+    "activationMode": "submit",
+    "outputMode": "panel",
+    "inputRequired": false,
+    "inputPlaceholder": "Open clipboard history fixture"
+  },
+  "runtime": {
+    "entry": "dist/runtime.js"
+  },
+  "panel": {
+    "entry": "dist/panel.html",
+    "hostKeys": ["Tab", "Shift+Tab", "Enter"]
+  },
+  "permissions": ["ui.panel", "clipboard.history.read", "clipboard.history.paste"],
+  "settings": []
+}
