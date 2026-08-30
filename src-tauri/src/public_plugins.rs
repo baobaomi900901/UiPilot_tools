@@ -202,6 +202,7 @@ impl PublicPluginService {
     pub(crate) fn shutdown(&self) {
         if let Some(manager) = self.manager.get() {
             manager.shutdown_network();
+            manager.shutdown_clipboard_history();
             manager.shutdown_delayed_messages();
             manager.shutdown_timers();
         }

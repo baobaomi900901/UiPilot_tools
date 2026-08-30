@@ -1171,6 +1171,8 @@ fn repository_demo_panel_stages_with_the_panel_only_contract() {
             PanelHostKeyDeclaration::ArrowDown,
             PanelHostKeyDeclaration::ArrowUp,
             PanelHostKeyDeclaration::PrimaryN,
+            PanelHostKeyDeclaration::Tab,
+            PanelHostKeyDeclaration::ShiftTab,
         ]
     );
     assert!(prepared.manifest.window.is_none());

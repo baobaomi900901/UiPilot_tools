@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
+#[cfg(test)]
+use crate::clipboard_history::ClipboardCapture;
+use crate::clipboard_history::{ClipboardHistoryError, ClipboardHistoryService};
 use crate::message_center::{
     MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest,
     MessagePublisher,
@@ -386,6 +389,12 @@ impl From<PluginStateError> for PublicPluginManagementError {
     }
 }
 
+impl From<ClipboardHistoryError> for PublicPluginManagementError {
+    fn from(_error: ClipboardHistoryError) -> Self {
+        Self::Unavailable
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RuntimeResource {
     pub(super) mime: &'static str,
@@ -500,6 +509,7 @@ pub(crate) struct PublicPluginManager {
     message_center: Arc<MessageCenterService>,
     timer_publisher: Arc<dyn MessagePublisher>,
     timers: Arc<PluginTimerService>,
+    clipboard_history: Arc<ClipboardHistoryService>,
     api: PluginRuntimeApi,
     activation_ids: ActivationIdAllocator,
     admission_epochs: AdmissionEpochAllocator,
@@ -584,6 +594,8 @@ impl PublicPluginManager {
         let data_gate = Arc::new(PluginDataCallGate::default());
         let delayed_messages = Arc::new(DelayedMessageScheduler::default());
         let timers = Arc::new(PluginTimerService::new(timer_clock));
+        let clipboard_history = ClipboardHistoryService::load(&root.join("clipboard-history"))
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let api = PluginRuntimeApi::new(
             Arc::clone(&scheduler),
             Arc::clone(&data_gate),
@@ -702,7 +714,7 @@ impl PublicPluginManager {
                 }
             }
         }
-        Ok(Self {
+        let manager = Self {
             host,
             #[cfg(test)]
             app_data_dir: app_data_dir.to_path_buf(),
@@ -718,6 +730,7 @@ impl PublicPluginManager {
             message_center,
             timer_publisher,
             timers,
+            clipboard_history,
             api,
             activation_ids,
             admission_epochs,
@@ -731,7 +744,52 @@ impl PublicPluginManager {
             runtime_faults: Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(1),
             next_uninstall_transaction: AtomicU64::new(1),
-        })
+        };
+        manager.refresh_clipboard_history_authorization()?;
+        Ok(manager)
+    }
+
+    fn refresh_clipboard_history_authorization(&self) -> Result<(), PublicPluginManagementError> {
+        let plugin_ids = self
+            .state
+            .configs()?
+            .into_iter()
+            .filter(clipboard_history_is_authorized)
+            .map(|config| config.plugin_id);
+        self.clipboard_history
+            .sync_authorized_plugins(plugin_ids)
+            .map_err(PublicPluginManagementError::from)
+    }
+
+    pub(crate) fn shutdown_clipboard_history(&self) {
+        self.clipboard_history.shutdown();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clipboard_history_authorized_plugins_for_test(&self) -> Vec<String> {
+        self.clipboard_history.authorized_plugins_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clipboard_history_snapshot_for_test(
+        &self,
+        plugin_id: &str,
+    ) -> Result<crate::clipboard_history::ClipboardHistorySnapshot, PublicPluginManagementError>
+    {
+        Ok(self.clipboard_history.snapshot(plugin_id)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clipboard_history_capture_for_test(
+        &self,
+        capture: ClipboardCapture,
+    ) -> Result<(), PublicPluginManagementError> {
+        Ok(self.clipboard_history.capture_for_test(capture)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clipboard_history_store_path_for_test(&self, plugin_id: &str) -> PathBuf {
+        self.clipboard_history.store_path_for_test(plugin_id)
     }
 
     pub(crate) fn prepare(
@@ -1124,6 +1182,7 @@ impl PublicPluginManager {
         };
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
+        self.refresh_clipboard_history_authorization()?;
         if let Some(previous_digest) = previous_config
             .as_ref()
             .and_then(|config| config.package_digest.as_deref())
@@ -1313,6 +1372,7 @@ impl PublicPluginManager {
         };
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
+        self.refresh_clipboard_history_authorization()?;
         Ok(commit)
     }
 
@@ -1380,6 +1440,7 @@ impl PublicPluginManager {
         };
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
+        self.refresh_clipboard_history_authorization()?;
         Ok(commit)
     }
 
@@ -1836,6 +1897,7 @@ impl PublicPluginManager {
             .remove(&transaction.plugin_id);
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
+        self.refresh_clipboard_history_authorization()?;
         Ok(PublicPluginUninstallCommit {
             plugin_id: transaction.plugin_id,
             retain_data: transaction.retain_data,
@@ -1850,6 +1912,10 @@ impl PublicPluginManager {
         settings: &crate::settings::SettingsStore,
     ) -> Result<(), PublicPluginManagementError> {
         let mut failed = false;
+        failed |= self
+            .clipboard_history
+            .uninstall(&committed.plugin_id, committed.retain_data)
+            .is_err();
         if !committed.retain_data {
             failed |= self.storage.uninstall(&committed.plugin_id, false).is_err();
             failed |= self.secrets.uninstall(&committed.plugin_id, false).is_err();
@@ -3291,6 +3357,7 @@ impl PublicPluginManager {
         reservation.publish(None)?;
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
+        self.refresh_clipboard_history_authorization()?;
         Ok(true)
     }
 
@@ -3488,6 +3555,15 @@ fn network_authorization_matches(
                 && config.network_https_hosts_grant.is_empty()
         }
     }
+}
+
+fn clipboard_history_is_authorized(config: &EffectivePluginConfig) -> bool {
+    config.installed
+        && config.enabled
+        && config.fault.is_none()
+        && config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardHistoryRead)
 }
 
 fn network_authority_snapshot(
@@ -4031,6 +4107,44 @@ mod tests {
         .unwrap();
     }
 
+    fn write_clipboard_history_package(root: &Path, version: &str, include_history_read: bool) {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        let permissions = if include_history_read {
+            vec!["ui.panel", "clipboard.history.read"]
+        } else {
+            vec!["ui.panel"]
+        };
+        fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "com.example.clipboard-history",
+                "version": version,
+                "apiVersion": 1,
+                "minimumHostVersion": "0.3.3",
+                "name": "Clipboard History",
+                "supportedPlatforms": ["windows"],
+                "command": {
+                    "defaultName": "cliphist",
+                    "activationMode": "submit",
+                    "outputMode": "panel",
+                    "inputRequired": false
+                },
+                "runtime": { "entry": "dist/runtime.js" },
+                "panel": { "entry": "dist/panel.html" },
+                "permissions": permissions
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/runtime.js"),
+            "export async function onCommand() { return { requestId: 'r', data: {} }; }",
+        )
+        .unwrap();
+        fs::write(root.join("dist/panel.html"), "<!doctype html>").unwrap();
+    }
+
     fn write_timer_package(root: &Path, version: &str) {
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::create_dir_all(root.join("assets/sounds")).unwrap();
@@ -4505,6 +4619,173 @@ mod tests {
             network_request(),
         );
         assert!(admitted.is_ok());
+    }
+
+    #[test]
+    fn clipboard_history_lifecycle_tracks_install_update_disable_and_fault() {
+        let dir = TestDir::new("clipboard-history-lifecycle");
+        write_clipboard_history_package(&dir.source(), "1.0.0", true);
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let grants = BTreeSet::from([
+            PublicPermission::UiPanel,
+            PublicPermission::ClipboardHistoryRead,
+        ]);
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, grants, now, |_| true)
+            .unwrap();
+        assert_eq!(
+            manager.clipboard_history_authorized_plugins_for_test(),
+            vec!["com.example.clipboard-history"]
+        );
+        manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "stored",
+                "2026-08-30T01:00:00Z",
+            ))
+            .unwrap();
+        assert_eq!(
+            manager
+                .clipboard_history_snapshot_for_test("com.example.clipboard-history")
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+
+        write_clipboard_history_package(&dir.source(), "1.0.1", false);
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::UiPanel]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        assert!(manager
+            .clipboard_history_authorized_plugins_for_test()
+            .is_empty());
+        manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "not-authorized",
+                "2026-08-30T01:00:01Z",
+            ))
+            .unwrap();
+        assert_eq!(
+            manager
+                .clipboard_history_snapshot_for_test("com.example.clipboard-history")
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+
+        write_clipboard_history_package(&dir.source(), "1.0.2", true);
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        manager
+            .set_enabled_with_readiness("com.example.clipboard-history", false, |_| true)
+            .unwrap();
+        assert!(manager
+            .clipboard_history_authorized_plugins_for_test()
+            .is_empty());
+        manager
+            .set_enabled_with_readiness("com.example.clipboard-history", true, |_| true)
+            .unwrap();
+        assert_eq!(
+            manager.clipboard_history_authorized_plugins_for_test(),
+            vec!["com.example.clipboard-history"]
+        );
+        manager
+            .disable_plugin_for_fault(
+                "com.example.clipboard-history",
+                PublicPluginFault::RuntimeUnavailable,
+            )
+            .unwrap();
+        assert!(manager
+            .clipboard_history_authorized_plugins_for_test()
+            .is_empty());
+    }
+
+    #[test]
+    fn clipboard_history_uninstall_retains_or_deletes_plugin_history_data() {
+        let dir = TestDir::new("clipboard-history-uninstall");
+        write_clipboard_history_package(&dir.source(), "1.0.0", true);
+        let retained_manager = manager(&dir);
+        let now = Instant::now();
+        let grants = BTreeSet::from([
+            PublicPermission::UiPanel,
+            PublicPermission::ClipboardHistoryRead,
+        ]);
+        let prepared = retained_manager
+            .prepare("main", source(&dir.source()), now)
+            .unwrap();
+        retained_manager
+            .commit_with_readiness("main", &prepared.token, grants.clone(), now, |_| true)
+            .unwrap();
+        retained_manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "kept",
+                "2026-08-30T01:00:00Z",
+            ))
+            .unwrap();
+        let store_path =
+            retained_manager.clipboard_history_store_path_for_test("com.example.clipboard-history");
+        assert!(store_path.join("index.json").exists());
+
+        retained_manager
+            .uninstall("com.example.clipboard-history", true)
+            .unwrap();
+        assert!(retained_manager
+            .clipboard_history_authorized_plugins_for_test()
+            .is_empty());
+        assert!(store_path.join("index.json").exists());
+
+        let delete_dir = TestDir::new("clipboard-history-complete-uninstall");
+        write_clipboard_history_package(&delete_dir.source(), "1.0.0", true);
+        let delete_manager = manager(&delete_dir);
+        let prepared = delete_manager
+            .prepare("main", source(&delete_dir.source()), now)
+            .unwrap();
+        delete_manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        delete_manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "deleted",
+                "2026-08-30T01:00:00Z",
+            ))
+            .unwrap();
+        let deleted_store_path =
+            delete_manager.clipboard_history_store_path_for_test("com.example.clipboard-history");
+        assert!(deleted_store_path.join("index.json").exists());
+        delete_manager
+            .uninstall("com.example.clipboard-history", false)
+            .unwrap();
+        assert!(!deleted_store_path.exists());
     }
 
     #[derive(Clone, Copy, Debug)]

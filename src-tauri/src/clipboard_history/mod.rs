@@ -4,21 +4,33 @@
 // intentionally unused by non-test code.
 
 mod model;
+mod observer;
 mod preview;
+mod service;
 mod store;
 
 pub(crate) use model::{
-    CaptureOutcome, ClipboardCapture, ClipboardHistoryEntrySummary, ClipboardHistorySnapshot,
-    IgnoredCaptureReason,
+    CaptureOutcome, ClipboardCapture, ClipboardHistoryEntrySummary, ClipboardHistoryError,
+    ClipboardHistorySnapshot, IgnoredCaptureReason,
 };
+pub(crate) use observer::{
+    normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
+    ClipboardObserver, ClipboardObserverHandle, ClipboardReadError, ClipboardReader,
+};
+pub(crate) use service::ClipboardHistoryService;
 pub(crate) use store::ClipboardHistoryStore;
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
     };
 
     use super::*;
@@ -28,6 +40,81 @@ mod tests {
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct ScriptedClipboardReader {
+        outcomes: Mutex<VecDeque<Result<Option<ClipboardCapture>, ClipboardReadError>>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedClipboardReader {
+        fn push(&self, outcome: Result<Option<ClipboardCapture>, ClipboardReadError>) {
+            self.outcomes.lock().unwrap().push_back(outcome);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ClipboardReader for ScriptedClipboardReader {
+        fn read_capture(&self) -> Result<Option<ClipboardCapture>, ClipboardReadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(None))
+        }
+    }
+
+    #[derive(Default)]
+    struct ManualClipboardObserver {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        callback: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
+    }
+
+    impl ManualClipboardObserver {
+        fn trigger(&self) {
+            let callback = self.callback.lock().unwrap().clone();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::SeqCst)
+        }
+
+        fn stops(&self) -> usize {
+            self.stops.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ClipboardObserver for Arc<ManualClipboardObserver> {
+        fn start(
+            &self,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> Result<Box<dyn ClipboardObserverHandle>, ClipboardHistoryError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            *self.callback.lock().unwrap() = Some(callback);
+            Ok(Box::new(ManualClipboardObserverHandle {
+                observer: Arc::clone(self),
+            }))
+        }
+    }
+
+    struct ManualClipboardObserverHandle {
+        observer: Arc<ManualClipboardObserver>,
+    }
+
+    impl ClipboardObserverHandle for ManualClipboardObserverHandle {
+        fn stop(&self) {
+            self.observer.stops.fetch_add(1, Ordering::SeqCst);
+            *self.observer.callback.lock().unwrap() = None;
+        }
+    }
 
     struct TestDir(PathBuf);
 
@@ -63,6 +150,20 @@ mod tests {
             CaptureOutcome::Stored { id, .. } | CaptureOutcome::MovedToFront { id, .. } => id,
             other => panic!("expected stored text capture, got {other:?}"),
         }
+    }
+
+    fn history_service(
+        dir: &TestDir,
+        reader: Arc<ScriptedClipboardReader>,
+        observer: Arc<ManualClipboardObserver>,
+    ) -> Arc<ClipboardHistoryService> {
+        ClipboardHistoryService::load_with_dependencies(
+            dir.path(),
+            reader,
+            Arc::new(observer),
+            Duration::ZERO,
+        )
+        .unwrap()
     }
 
     fn rgba_noise(width: u32, height: u32) -> Vec<u8> {
@@ -231,6 +332,233 @@ mod tests {
             ClipboardHistoryEntrySummary::Files { available, .. } => assert!(!*available),
             other => panic!("expected files summary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn format_normalization_prefers_files_then_image_then_text() {
+        let text = Some("fallback".into());
+        let image = Some(ClipboardImageSnapshot {
+            rgba: vec![1, 2, 3, 0xff],
+            width: 1,
+            height: 1,
+        });
+        let files = Some(vec![PathBuf::from(r"C:\tmp\a.txt")]);
+
+        assert!(matches!(
+            normalize_clipboard_formats(
+                ClipboardFormatSnapshot {
+                    files: files.clone(),
+                    image: image.clone(),
+                    text: text.clone()
+                },
+                "2026-08-30T01:00:00Z",
+            ),
+            Some(ClipboardCapture::Files { .. })
+        ));
+        assert!(matches!(
+            normalize_clipboard_formats(
+                ClipboardFormatSnapshot {
+                    files: Some(Vec::new()),
+                    image: image.clone(),
+                    text: text.clone()
+                },
+                "2026-08-30T01:00:00Z",
+            ),
+            Some(ClipboardCapture::Image { .. })
+        ));
+        assert_eq!(
+            normalize_clipboard_formats(
+                ClipboardFormatSnapshot {
+                    files: None,
+                    image: None,
+                    text
+                },
+                "2026-08-30T01:00:00Z",
+            ),
+            Some(ClipboardCapture::text("fallback", "2026-08-30T01:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn service_records_only_when_authorized_and_fans_out_to_current_plugins() {
+        let dir = TestDir::new("service-gating");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), Arc::clone(&observer));
+
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "ignored",
+            "2026-08-30T01:00:00Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+        assert_eq!(reader.calls(), 0);
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap(),
+            ClipboardHistorySnapshot::default()
+        );
+
+        service
+            .sync_authorized_plugins(["com.example.one".into(), "com.example.two".into()])
+            .unwrap();
+        assert_eq!(observer.starts(), 1);
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "shared",
+            "2026-08-30T01:00:01Z",
+        ))));
+        observer.trigger();
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            1
+        );
+        assert_eq!(
+            service.snapshot("com.example.two").unwrap().entries.len(),
+            1
+        );
+
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "one-only",
+            "2026-08-30T01:00:02Z",
+        ))));
+        observer.trigger();
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            2
+        );
+        assert_eq!(
+            service.snapshot("com.example.two").unwrap().entries.len(),
+            1
+        );
+
+        service
+            .sync_authorized_plugins(Vec::<String>::new())
+            .unwrap();
+        assert_eq!(observer.stops(), 1);
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "stopped",
+            "2026-08-30T01:00:03Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn service_retries_busy_reads_then_skips_or_captures() {
+        let dir = TestDir::new("busy-retry");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), observer);
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+
+        reader.push(Err(ClipboardReadError::Busy));
+        reader.push(Err(ClipboardReadError::Busy));
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "after-busy",
+            "2026-08-30T01:00:00Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+        assert_eq!(reader.calls(), 3);
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            1
+        );
+
+        reader.push(Err(ClipboardReadError::Busy));
+        reader.push(Err(ClipboardReadError::Busy));
+        reader.push(Err(ClipboardReadError::Busy));
+        service.capture_current_for_test().unwrap();
+        assert_eq!(reader.calls(), 6);
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_clipboard_formats_are_ignored() {
+        let dir = TestDir::new("unsupported");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), observer);
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+
+        reader.push(Ok(None));
+        service.capture_current_for_test().unwrap();
+
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap(),
+            ClipboardHistorySnapshot::default()
+        );
+    }
+
+    #[test]
+    fn retain_data_uninstall_preserves_history_and_complete_uninstall_deletes_it() {
+        let dir = TestDir::new("service-uninstall");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), observer);
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "kept",
+            "2026-08-30T01:00:00Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+
+        service.uninstall("com.example.one", true).unwrap();
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            1
+        );
+
+        service.uninstall("com.example.one", false).unwrap();
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap(),
+            ClipboardHistorySnapshot::default()
+        );
+    }
+
+    #[test]
+    fn restore_feedback_suppression_skips_the_next_observer_capture() {
+        let dir = TestDir::new("restore-suppression");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), observer);
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "first",
+            "2026-08-30T01:00:00Z",
+        ))));
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "second",
+            "2026-08-30T01:00:01Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+        service.capture_current_for_test().unwrap();
+        let first_id = service.snapshot("com.example.one").unwrap().entries[1].id();
+
+        service.move_to_front("com.example.one", &first_id).unwrap();
+        let moved = service.snapshot("com.example.one").unwrap();
+        service.suppress_next_observer_change().unwrap();
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "first",
+            "2026-08-30T01:00:02Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+
+        assert_eq!(service.snapshot("com.example.one").unwrap(), moved);
     }
 
     #[test]
