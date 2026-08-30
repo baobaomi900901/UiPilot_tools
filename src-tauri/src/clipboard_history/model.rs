@@ -73,7 +73,12 @@ pub(crate) enum CaptureOutcome {
     Ignored { reason: IgnoredCaptureReason },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ClipboardHistoryEntrySummary {
     Text {
         id: String,
@@ -112,7 +117,8 @@ impl ClipboardHistoryEntrySummary {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ClipboardHistorySnapshot {
     pub(crate) revision: String,
     pub(crate) entries: Vec<ClipboardHistoryEntrySummary>,
@@ -131,6 +137,23 @@ impl Default for ClipboardHistorySnapshot {
 pub(crate) enum ClipboardHistoryError {
     InvalidCapture,
     Storage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClipboardHistoryBridgeError {
+    PermissionDenied,
+    ExpiredPanelSession,
+    Unavailable,
+}
+
+impl ClipboardHistoryBridgeError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "PermissionDenied",
+            Self::ExpiredPanelSession => "ExpiredPanelSession",
+            Self::Unavailable => "ClipboardHistoryUnavailable",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

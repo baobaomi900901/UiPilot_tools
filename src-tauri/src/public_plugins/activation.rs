@@ -15,7 +15,10 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(test)]
 use crate::clipboard_history::ClipboardCapture;
-use crate::clipboard_history::{ClipboardHistoryError, ClipboardHistoryService};
+use crate::clipboard_history::{
+    ClipboardHistoryBridgeError, ClipboardHistoryError, ClipboardHistoryService,
+    ClipboardHistorySnapshot,
+};
 use crate::message_center::{
     MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest,
     MessagePublisher,
@@ -763,6 +766,105 @@ impl PublicPluginManager {
 
     pub(crate) fn shutdown_clipboard_history(&self) {
         self.clipboard_history.shutdown();
+    }
+
+    pub(crate) fn clipboard_history_snapshot_for_panel(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<ClipboardHistorySnapshot, ClipboardHistoryBridgeError> {
+        self.authorize_clipboard_history_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )?;
+        self.clipboard_history
+            .snapshot(plugin_id)
+            .map_err(|_| ClipboardHistoryBridgeError::Unavailable)
+    }
+
+    pub(crate) fn clipboard_history_remove_for_panel(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        id: &str,
+    ) -> Result<(), ClipboardHistoryBridgeError> {
+        self.authorize_clipboard_history_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )?;
+        self.clipboard_history
+            .remove(plugin_id, id)
+            .map(|_| ())
+            .map_err(|_| ClipboardHistoryBridgeError::Unavailable)
+    }
+
+    pub(crate) fn clipboard_history_clear_for_panel(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<(), ClipboardHistoryBridgeError> {
+        self.authorize_clipboard_history_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )?;
+        self.clipboard_history
+            .clear(plugin_id)
+            .map_err(|_| ClipboardHistoryBridgeError::Unavailable)
+    }
+
+    fn authorize_clipboard_history_panel_call(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<(), ClipboardHistoryBridgeError> {
+        let bundle = self
+            .bundles
+            .bundle(plugin_id)
+            .map_err(|_| ClipboardHistoryBridgeError::Unavailable)?
+            .ok_or(ClipboardHistoryBridgeError::ExpiredPanelSession)?;
+        let config = &bundle.config;
+        let snapshot = &bundle.runtime;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || bundle.runtime_recovery_needed
+            || config.active_generation != generation
+            || snapshot.generation != generation
+            || bundle.activation_id != activation_id
+            || bundle.admission_epoch != admission_epoch
+            || snapshot.manifest.command.output_mode != PublicOutputMode::Panel
+            || !snapshot
+                .manifest
+                .permissions
+                .contains(&PublicPermission::UiPanel)
+        {
+            return Err(ClipboardHistoryBridgeError::ExpiredPanelSession);
+        }
+        if !config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardHistoryRead)
+            || !snapshot
+                .manifest
+                .permissions
+                .contains(&PublicPermission::ClipboardHistoryRead)
+        {
+            return Err(ClipboardHistoryBridgeError::PermissionDenied);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -4786,6 +4888,88 @@ mod tests {
             .uninstall("com.example.clipboard-history", false)
             .unwrap();
         assert!(!deleted_store_path.exists());
+    }
+
+    #[test]
+    fn clipboard_history_panel_bridge_revalidates_identity_and_permission() {
+        let dir = TestDir::new("clipboard-history-panel-bridge");
+        write_clipboard_history_package(&dir.source(), "1.0.0", true);
+        let manager = manager(&dir);
+        let now = Instant::now();
+        manager
+            .commit_with_readiness(
+                "main",
+                &manager
+                    .prepare("main", source(&dir.source()), now)
+                    .unwrap()
+                    .token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let plugin_id = "com.example.clipboard-history";
+        let generation = 1;
+        let activation_id = manager.activation_id(plugin_id).unwrap();
+        let admission_epoch = manager.admission_epoch(plugin_id).unwrap();
+        manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "panel-visible-preview",
+                "2026-08-30T01:00:00Z",
+            ))
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .clipboard_history_snapshot_for_panel(
+                    plugin_id,
+                    generation,
+                    activation_id,
+                    admission_epoch
+                )
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(
+            manager.clipboard_history_snapshot_for_panel(
+                plugin_id,
+                generation + 1,
+                activation_id,
+                admission_epoch
+            ),
+            Err(ClipboardHistoryBridgeError::ExpiredPanelSession)
+        );
+
+        write_clipboard_history_package(&dir.source(), "1.0.1", false);
+        manager
+            .commit_with_readiness(
+                "main",
+                &manager
+                    .prepare("main", source(&dir.source()), now)
+                    .unwrap()
+                    .token,
+                BTreeSet::from([PublicPermission::UiPanel]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let generation = 2;
+        let activation_id = manager.activation_id(plugin_id).unwrap();
+        let admission_epoch = manager.admission_epoch(plugin_id).unwrap();
+        assert_eq!(
+            manager.clipboard_history_snapshot_for_panel(
+                plugin_id,
+                generation,
+                activation_id,
+                admission_epoch
+            ),
+            Err(ClipboardHistoryBridgeError::PermissionDenied)
+        );
     }
 
     #[derive(Clone, Copy, Debug)]

@@ -457,6 +457,9 @@ pub fn run() {
             commands::plugin_panel_storage_get,
             commands::plugin_panel_storage_set,
             commands::plugin_panel_storage_remove,
+            commands::plugin_panel_clipboard_history_list,
+            commands::plugin_panel_clipboard_history_remove,
+            commands::plugin_panel_clipboard_history_clear,
             commands::open_plugin_panel,
             commands::submit_plugin_panel,
             commands::set_plugin_panel_bounds,
@@ -699,7 +702,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 71);
+        assert_eq!(production.matches("commands::").count(), 74);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -743,6 +746,9 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
             "plugin_panel_focus_host_input",
             "plugin_panel_focus_host_input_ack",
             "open_plugin_panel",
@@ -922,6 +928,9 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
             "plugin_panel_focus_host_input",
         ] {
             let permission = format!("\"allow-{}\"", command.replace('_', "-"));

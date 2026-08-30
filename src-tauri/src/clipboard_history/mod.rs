@@ -10,8 +10,8 @@ mod service;
 mod store;
 
 pub(crate) use model::{
-    CaptureOutcome, ClipboardCapture, ClipboardHistoryEntrySummary, ClipboardHistoryError,
-    ClipboardHistorySnapshot, IgnoredCaptureReason,
+    CaptureOutcome, ClipboardCapture, ClipboardHistoryBridgeError, ClipboardHistoryEntrySummary,
+    ClipboardHistoryError, ClipboardHistorySnapshot, IgnoredCaptureReason,
 };
 pub(crate) use observer::{
     normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
@@ -205,6 +205,30 @@ mod tests {
             }
             other => panic!("expected text summary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_serializes_only_camel_case_summary_fields() {
+        let dir = TestDir::new("snapshot-dto");
+        let store = ClipboardHistoryStore::load(dir.path()).unwrap();
+        capture_text(
+            &store,
+            "raw secret value that must not be serialized",
+            "2026-08-30T01:00:00Z",
+        );
+
+        let value = serde_json::to_value(store.snapshot().unwrap()).unwrap();
+        let entry = &value["entries"][0];
+        assert_eq!(value["revision"], "1");
+        assert_eq!(entry["kind"], "text");
+        assert_eq!(entry["capturedAt"], "2026-08-30T01:00:00Z");
+        assert_eq!(
+            entry["textPreview"],
+            "raw secret value that must not be serialized"
+        );
+        assert!(entry.get("text").is_none());
+        assert!(entry.get("text_preview").is_none());
+        assert!(entry.get("captured_at").is_none());
     }
 
     #[test]

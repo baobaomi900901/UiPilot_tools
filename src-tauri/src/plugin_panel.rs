@@ -381,6 +381,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   let invoke = null;
   let readySent = false;
   let storageSession = null;
+  let clipboardHistorySession = null;
   let liveSessionEpoch = '__SESSION_EPOCH__';
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
@@ -388,11 +389,101 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     for (const key of Reflect.ownKeys(value)) deepFreeze(value[key], seen);
     return Object.freeze(value);
   };
+  const compareU64Decimal = (left, right) => left.length === right.length
+    ? left.localeCompare(right)
+    : left.length < right.length ? -1 : 1;
+  const canonicalU64 = (value) => typeof value === 'string'
+    && /^(0|[1-9][0-9]*)$/.test(value);
+  const namedError = (name) => {
+    const error = new Error(name);
+    error.name = name;
+    return error;
+  };
+  const mapClipboardHistoryError = (error) => {
+    const raw = error && typeof error === 'object'
+      ? error.code || error.name || error.message
+      : undefined;
+    if (raw === 'PermissionDenied' || raw === 'permissionDenied') return namedError('PermissionDenied');
+    if (raw === 'ExpiredPanelSession' || raw === 'ExpiredWindowSessionError') return namedError('ExpiredPanelSession');
+    return error;
+  };
+  const assertPlainObject = (value, message) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(message);
+    return value;
+  };
+  const normalizeClipboardHistoryEntry = (entry) => {
+    const value = assertPlainObject(entry, 'invalid clipboard history entry');
+    if (typeof value.id !== 'string' || typeof value.capturedAt !== 'string') {
+      throw new TypeError('invalid clipboard history entry');
+    }
+    if (value.kind === 'text') {
+      if (Object.keys(value).sort().join(',') !== 'capturedAt,id,kind,textPreview' || typeof value.textPreview !== 'string') {
+        throw new TypeError('invalid clipboard history text entry');
+      }
+      return deepFreeze({ id: value.id, kind: 'text', capturedAt: value.capturedAt, textPreview: value.textPreview });
+    }
+    if (value.kind === 'image') {
+      const validSize = Number.isSafeInteger(value.width) && value.width > 0
+        && Number.isSafeInteger(value.height) && value.height > 0;
+      if (
+        Object.keys(value).sort().join(',') !== 'capturedAt,height,id,kind,previewDataUrl,width' ||
+        typeof value.previewDataUrl !== 'string' ||
+        !value.previewDataUrl.startsWith('data:image/png;base64,') ||
+        !validSize
+      ) {
+        throw new TypeError('invalid clipboard history image entry');
+      }
+      return deepFreeze({
+        id: value.id,
+        kind: 'image',
+        capturedAt: value.capturedAt,
+        previewDataUrl: value.previewDataUrl,
+        width: value.width,
+        height: value.height,
+      });
+    }
+    if (value.kind === 'files') {
+      const validCount = Number.isSafeInteger(value.fileCount) && value.fileCount >= 0;
+      if (
+        Object.keys(value).sort().join(',') !== 'available,capturedAt,fileCount,firstFileName,id,kind' ||
+        typeof value.firstFileName !== 'string' ||
+        typeof value.available !== 'boolean' ||
+        !validCount
+      ) {
+        throw new TypeError('invalid clipboard history files entry');
+      }
+      return deepFreeze({
+        id: value.id,
+        kind: 'files',
+        capturedAt: value.capturedAt,
+        firstFileName: value.firstFileName,
+        fileCount: value.fileCount,
+        available: value.available,
+      });
+    }
+    throw new TypeError('invalid clipboard history entry kind');
+  };
+  const normalizeClipboardHistorySnapshot = (snapshot) => {
+    const value = assertPlainObject(snapshot, 'invalid clipboard history snapshot');
+    if (Object.keys(value).sort().join(',') !== 'entries,revision' || !canonicalU64(value.revision) || !Array.isArray(value.entries)) {
+      throw new TypeError('invalid clipboard history snapshot');
+    }
+    return deepFreeze({
+      revision: value.revision,
+      entries: value.entries.map(normalizeClipboardHistoryEntry),
+    });
+  };
   const hostKeys = deepFreeze(__HOST_KEYS__);
   const expiredStorage = deepFreeze({
     get: async () => { throw new Error('ExpiredWindowSessionError'); },
     set: async () => { throw new Error('ExpiredWindowSessionError'); },
     remove: async () => { throw new Error('ExpiredWindowSessionError'); },
+  });
+  const expiredClipboardHistory = deepFreeze({
+    list: async () => { throw namedError('ExpiredPanelSession'); },
+    onChanged: () => { throw namedError('ExpiredPanelSession'); },
+    remove: async () => { throw namedError('ExpiredPanelSession'); },
+    clear: async () => { throw namedError('ExpiredPanelSession'); },
   });
   const createStorageSession = (sessionEpoch) => {
     const session = { sessionEpoch, active: true };
@@ -407,6 +498,118 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     });
     return session;
   };
+  const createClipboardHistorySession = (sessionEpoch) => {
+    const session = {
+      sessionEpoch,
+      active: true,
+      snapshot: null,
+      handler: null,
+      lastDeliveredRevision: null,
+      readToken: 0,
+      refreshInFlight: false,
+      refreshDirty: false,
+      pollTimer: null,
+    };
+    const close = () => {
+      session.active = false;
+      session.handler = null;
+      if (session.pollTimer !== null) {
+        clearInterval(session.pollTimer);
+        session.pollTimer = null;
+      }
+    };
+    const call = async (command, args = {}) => {
+      if (!session.active || clipboardHistorySession !== session || !invoke) throw namedError('ExpiredPanelSession');
+      try {
+        return await invoke(command, { sessionEpoch, ...args });
+      } catch (error) {
+        throw mapClipboardHistoryError(error);
+      }
+    };
+    const acceptSnapshot = (snapshot, forceNewest) => {
+      if (!session.active || clipboardHistorySession !== session) throw namedError('ExpiredPanelSession');
+      const next = normalizeClipboardHistorySnapshot(snapshot);
+      const current = session.snapshot;
+      if (forceNewest || !current || compareU64Decimal(next.revision, current.revision) > 0) {
+        session.snapshot = next;
+      }
+      return session.snapshot || next;
+    };
+    const deliverSnapshot = (snapshot, force) => {
+      if (!session.handler) return;
+      const shouldDeliver = force || !session.lastDeliveredRevision
+        || compareU64Decimal(snapshot.revision, session.lastDeliveredRevision) > 0;
+      if (!shouldDeliver) return;
+      session.lastDeliveredRevision = snapshot.revision;
+      try {
+        const result = session.handler(snapshot);
+        if (result && typeof result.then === 'function') result.catch(() => undefined);
+      } catch (_) {}
+    };
+    const readLatest = async () => {
+      return acceptSnapshot(await call('plugin_panel_clipboard_history_list'), false);
+    };
+    const refresh = async (force = false) => {
+      if (!session.active || clipboardHistorySession !== session) return;
+      if (session.refreshInFlight) {
+        session.refreshDirty = true;
+        return;
+      }
+      session.refreshInFlight = true;
+      try {
+        deliverSnapshot(await readLatest(), force);
+      } catch (error) {
+        if (error && error.name === 'ExpiredPanelSession') close();
+      } finally {
+        session.refreshInFlight = false;
+        if (session.refreshDirty) {
+          session.refreshDirty = false;
+          void refresh(false);
+        }
+      }
+    };
+    session.close = close;
+    session.facade = deepFreeze({
+      async list() {
+        const token = ++session.readToken;
+        const snapshot = normalizeClipboardHistorySnapshot(await call('plugin_panel_clipboard_history_list'));
+        const current = session.snapshot;
+        if (token === session.readToken || !current || compareU64Decimal(snapshot.revision, current.revision) > 0) {
+          session.snapshot = snapshot;
+        }
+        return session.snapshot || snapshot;
+      },
+      onChanged(next) {
+        if (session.handler || typeof next !== 'function') throw new TypeError('one clipboardHistory.onChanged handler required');
+        session.handler = next;
+        queueMicrotask(() => { void refresh(true); });
+        session.pollTimer = setInterval(() => { void refresh(false); }, 500);
+        return () => {
+          if (!session.active || session.handler !== next) return;
+          session.handler = null;
+          if (session.pollTimer !== null) {
+            clearInterval(session.pollTimer);
+            session.pollTimer = null;
+          }
+        };
+      },
+      async remove(input) {
+        const value = assertPlainObject(input, 'invalid clipboard history remove input');
+        if (Object.keys(value).sort().join(',') !== 'id' || typeof value.id !== 'string') {
+          throw new TypeError('invalid clipboard history remove input');
+        }
+        await call('plugin_panel_clipboard_history_remove', { id: value.id });
+        await refresh(true);
+      },
+      async clear() {
+        await call('plugin_panel_clipboard_history_clear');
+        await refresh(true);
+      },
+    });
+    return session;
+  };
+  storageSession = createStorageSession(liveSessionEpoch);
+  clipboardHistorySession = createClipboardHistorySession(liveSessionEpoch);
   const sendReady = async () => {
     if (!invoke || !handler || readySent || (hostKeys.length > 0 && !hostKeyHandler)) return;
     readySent = true;
@@ -468,6 +671,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     },
     requestHide() { return requestPanelHide(); },
     get storage() { return storageSession ? storageSession.storage : expiredStorage; },
+    get clipboardHistory() { return clipboardHistorySession ? clipboardHistorySession.facade : expiredClipboardHistory; },
   });
   Object.defineProperty(window, 'uipilotPluginPanel', { value: api, configurable: false });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_PREPARE__', {
@@ -476,9 +680,15 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       if (typeof sessionEpoch !== 'string' || !/^(0|[1-9][0-9]*)$/.test(sessionEpoch) || sessionEpoch === '0') {
         throw new TypeError('invalid session epoch');
       }
-      if (storageSession) storageSession.active = false;
+      if (storageSession && storageSession.sessionEpoch !== sessionEpoch) storageSession.active = false;
+      if (clipboardHistorySession && clipboardHistorySession.sessionEpoch !== sessionEpoch) clipboardHistorySession.close();
       liveSessionEpoch = sessionEpoch;
-      storageSession = createStorageSession(sessionEpoch);
+      if (!storageSession || storageSession.sessionEpoch !== sessionEpoch) {
+        storageSession = createStorageSession(sessionEpoch);
+      }
+      if (!clipboardHistorySession || clipboardHistorySession.sessionEpoch !== sessionEpoch) {
+        clipboardHistorySession = createClipboardHistorySession(sessionEpoch);
+      }
     },
   });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_UPDATE__', {
@@ -1786,7 +1996,7 @@ impl PluginPanelController {
         }
     }
 
-    pub(crate) fn begin_storage_call(
+    pub(crate) fn begin_content_call(
         &self,
         content_label: &str,
         session_epoch: u64,
@@ -1815,6 +2025,16 @@ impl PluginPanelController {
             return Err(PanelCallError::ExpiredSession);
         }
         Ok(session.identity.clone())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn begin_storage_call(
+        &self,
+        content_label: &str,
+        session_epoch: u64,
+        mutable: bool,
+    ) -> Result<PanelSessionIdentity, PanelCallError> {
+        self.begin_content_call(content_label, session_epoch, mutable)
     }
 
     pub(crate) fn teardown_session(
@@ -4441,6 +4661,43 @@ mod tests {
     }
 
     #[test]
+    fn content_calls_require_live_panel_session_and_epoch() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert_eq!(
+            controller.begin_content_call(
+                "plugin-panel-content-forged",
+                identity.session_epoch,
+                false
+            ),
+            Err(PanelCallError::InvalidCaller)
+        );
+        assert_eq!(
+            controller.begin_content_call(
+                &identity.content_label,
+                identity.session_epoch + 1,
+                false
+            ),
+            Err(PanelCallError::ExpiredSession)
+        );
+        assert!(controller
+            .begin_content_call(&identity.content_label, identity.session_epoch, false)
+            .is_ok());
+        assert_eq!(
+            controller.begin_content_call(&identity.content_label, identity.session_epoch, true),
+            Err(PanelCallError::ExpiredSession)
+        );
+        assert!(content_ready(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch
+        ));
+        assert!(controller
+            .begin_content_call(&identity.content_label, identity.session_epoch, true)
+            .is_ok());
+    }
+
+    #[test]
     fn panel_bootstrap_exposes_host_keys_focus_update_and_storage() {
         let bootstrap = panel_bootstrap(42, &[PanelHostKeyDeclaration::ArrowDown]);
         let api_body = bootstrap
@@ -4467,6 +4724,7 @@ mod tests {
                 "async focusHostInput() {",
                 "requestHide() { return requestPanelHide(); },",
                 "get storage() { return storageSession ? storageSession.storage : expiredStorage; },",
+                "get clipboardHistory() { return clipboardHistorySession ? clipboardHistorySession.facade : expiredClipboardHistory; },",
             ]
         );
         for required in [
@@ -4483,6 +4741,10 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
+            "onChanged(next)",
             "Reflect.deleteProperty(window, '__TAURI_INTERNALS__')",
             "__UIPILOT_PLUGIN_PANEL_UPDATE__",
             "sessionEpoch",
@@ -4500,7 +4762,7 @@ mod tests {
             "srcdoc",
             "fetch(",
             "WebSocket",
-            "clipboard",
+            "navigator.clipboard",
             "notifications",
         ] {
             assert!(

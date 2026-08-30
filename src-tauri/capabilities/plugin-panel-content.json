@@ -13,6 +13,9 @@
     "allow-plugin-panel-focus-host-input",
     "allow-plugin-panel-storage-get",
     "allow-plugin-panel-storage-set",
-    "allow-plugin-panel-storage-remove"
+    "allow-plugin-panel-storage-remove",
+    "allow-plugin-panel-clipboard-history-list",
+    "allow-plugin-panel-clipboard-history-remove",
+    "allow-plugin-panel-clipboard-history-clear"
   ]
 }

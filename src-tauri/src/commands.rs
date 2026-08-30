@@ -13,6 +13,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     apps::{self, AppCache, Application},
+    clipboard_history::{ClipboardHistoryBridgeError, ClipboardHistorySnapshot},
     file_index::{FileIndex, OpenIndexedPath},
     file_search::{
         everything::{EverythingSearchError, EverythingSearchState},
@@ -461,6 +462,15 @@ impl From<WindowStorageError> for CommandError {
         Self {
             code: error.code(),
             message: "public plugin window storage operation failed",
+        }
+    }
+}
+
+impl From<ClipboardHistoryBridgeError> for CommandError {
+    fn from(error: ClipboardHistoryBridgeError) -> Self {
+        Self {
+            code: error.code(),
+            message: "public plugin clipboard history operation failed",
         }
     }
 }
@@ -1519,6 +1529,27 @@ fn map_storage_panel_call_error(error: PanelCallError) -> WindowStorageError {
     }
 }
 
+fn map_clipboard_history_panel_call_error(error: PanelCallError) -> CommandError {
+    match error {
+        PanelCallError::InvalidCaller => CommandError::invalid_caller(),
+        PanelCallError::ExpiredSession => ClipboardHistoryBridgeError::ExpiredPanelSession.into(),
+        PanelCallError::Unavailable => ClipboardHistoryBridgeError::Unavailable.into(),
+    }
+}
+
+fn begin_clipboard_history_panel_call(
+    caller_label: &str,
+    controller: &PluginPanelController,
+    session_epoch: &str,
+    mutable: bool,
+) -> Result<PanelSessionIdentity, CommandError> {
+    let session_epoch = parse_canonical_nonzero_u64(session_epoch)
+        .ok_or(ClipboardHistoryBridgeError::ExpiredPanelSession)?;
+    controller
+        .begin_content_call(caller_label, session_epoch, mutable)
+        .map_err(map_clipboard_history_panel_call_error)
+}
+
 #[tauri::command]
 pub(crate) fn plugin_panel_content_ready(
     webview: tauri::Webview,
@@ -1924,7 +1955,7 @@ pub(crate) fn plugin_panel_storage_get(
     let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
     let identity = controller
         .inner()
-        .begin_storage_call(webview.label(), session_epoch, false)
+        .begin_content_call(webview.label(), session_epoch, false)
         .map_err(map_storage_panel_call_error)?;
     let value = service.manager()?.window_storage_get(
         &identity.plugin_id,
@@ -1948,7 +1979,7 @@ pub(crate) fn plugin_panel_storage_set(
     let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
     let identity = controller
         .inner()
-        .begin_storage_call(webview.label(), session_epoch, true)
+        .begin_content_call(webview.label(), session_epoch, true)
         .map_err(map_storage_panel_call_error)?;
     service.manager()?.window_storage_set(
         &identity.plugin_id,
@@ -1972,7 +2003,7 @@ pub(crate) fn plugin_panel_storage_remove(
     let session_epoch = parse_panel_storage_session_epoch(&session_epoch)?;
     let identity = controller
         .inner()
-        .begin_storage_call(webview.label(), session_epoch, true)
+        .begin_content_call(webview.label(), session_epoch, true)
         .map_err(map_storage_panel_call_error)?;
     service.manager()?.window_storage_remove(
         &identity.plugin_id,
@@ -1982,6 +2013,80 @@ pub(crate) fn plugin_panel_storage_remove(
         &key,
     )?;
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_clipboard_history_list(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+) -> Result<ClipboardHistorySnapshot, CommandError> {
+    let identity = begin_clipboard_history_panel_call(
+        webview.label(),
+        controller.inner().as_ref(),
+        &session_epoch,
+        false,
+    )?;
+    service
+        .manager()?
+        .clipboard_history_snapshot_for_panel(
+            &identity.plugin_id,
+            identity.generation,
+            identity.activation_id,
+            identity.admission_epoch,
+        )
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_clipboard_history_remove(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    id: String,
+) -> Result<(), CommandError> {
+    let identity = begin_clipboard_history_panel_call(
+        webview.label(),
+        controller.inner().as_ref(),
+        &session_epoch,
+        true,
+    )?;
+    service
+        .manager()?
+        .clipboard_history_remove_for_panel(
+            &identity.plugin_id,
+            identity.generation,
+            identity.activation_id,
+            identity.admission_epoch,
+            &id,
+        )
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_clipboard_history_clear(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+) -> Result<(), CommandError> {
+    let identity = begin_clipboard_history_panel_call(
+        webview.label(),
+        controller.inner().as_ref(),
+        &session_epoch,
+        true,
+    )?;
+    service
+        .manager()?
+        .clipboard_history_clear_for_panel(
+            &identity.plugin_id,
+            identity.generation,
+            identity.activation_id,
+            identity.admission_epoch,
+        )
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -6014,6 +6119,9 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
         ] {
             let body = command_body(command);
             assert!(body.contains("webview: tauri::Webview"));
@@ -6027,8 +6135,23 @@ mod tests {
         ] {
             let body = command_body(command);
             assert!(body.contains("session_epoch: String"));
-            assert!(body.contains("begin_storage_call(webview.label(), session_epoch"));
+            assert!(body.contains("begin_content_call(webview.label(), session_epoch"));
         }
+        for command in [
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
+        ] {
+            let body = command_body(command);
+            assert!(body.contains("session_epoch: String"));
+            assert!(body.contains("begin_clipboard_history_panel_call("));
+        }
+        let clipboard_history_gate = source
+            .split("fn begin_clipboard_history_panel_call(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("clipboard history panel gate is missing");
+        assert!(clipboard_history_gate.contains("begin_content_call(caller_label, session_epoch"));
         let ready = command_body("plugin_panel_content_ready");
         assert!(ready.contains("session_epoch: String"));
         assert!(ready.contains("content_ready_with_host_keys("));
@@ -6051,6 +6174,9 @@ mod tests {
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
         ] {
             let permission = format!(
                 "\"{}-{}\"",
@@ -6072,6 +6198,13 @@ mod tests {
         let main_capability = include_str!("../capabilities/main.json");
         assert!(main_capability.contains("allow-plugin-panel-host-key-enqueue"));
         assert!(!capability.contains("allow-plugin-panel-host-key-enqueue"));
+        for command in [
+            "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_remove",
+            "plugin_panel_clipboard_history_clear",
+        ] {
+            assert!(!main_capability.contains(&format!("allow-{}", command.replace('_', "-"))));
+        }
     }
 
     fn panel_focus_owner() -> PanelOwner {
