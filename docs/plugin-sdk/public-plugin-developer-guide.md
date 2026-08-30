@@ -609,7 +609,7 @@ Panel 内容中的 Escape 由 Host capture listener 在同一轮同步事件结�
 
 面板桥没有通用 `close()`、计时器或通知接口，也不能调用 Tauri `invoke`、网络或 Shell；主动隐藏只使用窄接口 `requestHide()`。宿主拥有命令 tag 和参数输入框：第一次 Enter 打开面板，后续 Enter 提交当前参数，并仅在提交后通过 `onUpdate.input` 把新参数交给面板；`focusHostInput()` 不提供实时按键流，`onHostKey()` 只交付 Manifest 声明的 Host chord。× 或参数光标位于 0 时的 Backspace 退出。Escape、失焦隐藏、插件停用、卸载或升级都会销毁当前面板，下次打开主界面从空白启动器开始。
 
-声明 `clipboard.history.read` 的 Windows 面板会收到 `window.uipilotPluginPanel.clipboardHistory`。该桥只提供宿主管理的摘要：`list()`、`onChanged(handler)`、`remove({ id })`、`clear()`；声明 `clipboard.history.paste` 后还可在收到 `Enter` Host Key 的同一会话中调用 `paste({ id, routeSequence })`。Panel 只会看到文字预览、图片缩略图、文件名/数量/可用性、`id`、`capturedAt` 和 `revision`，不会看到完整文本、原图、完整路径、HWND、PID 或任意按键模拟能力。用户授权后，UiPilot 运行、插件启用且权限有效期间的文字、图片和文件列表剪贴板变化会被宿主记录到本机插件隔离数据目录；第一版不会自动识别密码框或敏感输入来源。
+声明 `clipboard.history.read` 的 Windows 面板会收到 `window.uipilotPluginPanel.clipboardHistory`。该桥只提供宿主管理的摘要：`list()`、`onChanged(handler)`、`remove({ id })`、`clear()`；声明 `clipboard.history.paste` 后还可在收到 `Enter` Host Key 的同一会话中调用 `paste({ id, routeSequence })`。Panel 只会看到文字预览、可显示的 `data:image/png;base64,...` 图片缩略图、文件名/数量/可用性、`id`、`capturedAt` 和 `revision`；公共插件 CSP 仍会拒绝网络、文件和 `blob:` 图片。Panel 不会看到完整文本、原图、完整路径、HWND、PID 或任意按键模拟能力。用户授权后，UiPilot 运行、插件启用且权限有效期间的文字、图片和文件列表剪贴板变化会被宿主记录到本机插件隔离数据目录；第一版不会自动识别密码框或敏感输入来源。
 
 完整实现见 [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)。
 

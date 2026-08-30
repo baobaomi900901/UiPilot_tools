@@ -85,7 +85,7 @@ pub(crate) use webview_audio_guard::{
     WebViewGuardOwner,
 };
 const PUBLIC_RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const PUBLIC_PLUGIN_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'";
+const PUBLIC_PLUGIN_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src data:; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicPluginResponse {

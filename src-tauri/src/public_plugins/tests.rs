@@ -65,8 +65,12 @@ fn inert_webview_document_is_host_owned_and_denies_media() {
 }
 
 #[test]
-fn public_plugin_protocol_csp_denies_media() {
+fn public_plugin_protocol_csp_allows_only_data_image_previews_and_denies_media() {
     assert!(super::PUBLIC_PLUGIN_CSP.contains("media-src 'none'"));
+    assert!(super::PUBLIC_PLUGIN_CSP.contains("img-src data:"));
+    assert!(!super::PUBLIC_PLUGIN_CSP.contains("img-src http:"));
+    assert!(!super::PUBLIC_PLUGIN_CSP.contains("img-src https:"));
+    assert!(!super::PUBLIC_PLUGIN_CSP.contains("blob:"));
 }
 
 #[test]
