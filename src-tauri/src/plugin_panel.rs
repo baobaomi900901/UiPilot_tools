@@ -116,6 +116,7 @@ pub(crate) struct PanelDeliveryTicket {
 pub(crate) struct AppFocusLossTicket {
     session_epoch: Option<u64>,
     focus_revision: u64,
+    show_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +341,7 @@ struct PanelHideTicket {
 
 struct LiveSession {
     identity: PanelSessionIdentity,
+    show_generation: u64,
     phase: PanelPhase,
     current_request_id: String,
     current_submission_token: String,
@@ -359,6 +361,7 @@ struct ControllerCore {
     host_input_focus_settlements: BTreeMap<u64, HostInputFocusOutcome>,
     native_host_input_focus_claims: BTreeSet<u64>,
     focus_revision: u64,
+    show_generation: u64,
     main_content_focused: bool,
     internal_blur_until: Option<Instant>,
 }
@@ -884,6 +887,20 @@ fn finish_host_key_ack_locked(
 }
 
 impl PluginPanelController {
+    pub(crate) fn host_shown(&self) -> Option<u64> {
+        let mut core = self.core.lock().ok()?;
+        let show_generation = core.show_generation.checked_add(1)?;
+        let focus_revision = core.focus_revision.checked_add(1)?;
+        core.show_generation = show_generation;
+        core.focus_revision = focus_revision;
+        core.main_content_focused = false;
+        core.internal_blur_until = None;
+        core.hide_ticket = None;
+        core.host_input_focus = None;
+        self.changed.notify_all();
+        Some(show_generation)
+    }
+
     pub(crate) fn live_identity(&self) -> Option<PanelSessionIdentity> {
         self.core
             .lock()
@@ -922,8 +939,10 @@ impl PluginPanelController {
             content_label,
             host_keys: owner.host_keys.clone(),
         };
+        let show_generation = core.show_generation;
         core.session = Some(LiveSession {
             identity: identity.clone(),
+            show_generation,
             phase: PanelPhase::AwaitingReady,
             current_request_id: owner.request_id,
             current_submission_token: owner.submission_token,
@@ -1305,18 +1324,34 @@ impl PluginPanelController {
         let Ok(mut core) = self.core.lock() else {
             return false;
         };
-        let Some(revision) = core.focus_revision.checked_add(1) else {
+        let show_generation = core.show_generation;
+        Self::main_content_got_focus_locked(&mut core, show_generation).is_some()
+    }
+
+    pub(crate) fn main_content_got_focus_for_show(&self, show_generation: u64) -> bool {
+        let Ok(mut core) = self.core.lock() else {
             return false;
         };
+        Self::main_content_got_focus_locked(&mut core, show_generation).is_some()
+    }
+
+    fn main_content_got_focus_locked(
+        core: &mut ControllerCore,
+        show_generation: u64,
+    ) -> Option<u64> {
+        if core.show_generation != show_generation {
+            return None;
+        }
+        let revision = core.focus_revision.checked_add(1)?;
         core.focus_revision = revision;
         core.main_content_focused = true;
-        if let Some(session) = core.session.as_mut() {
-            session.content_focused = false;
-        }
         let live_epoch = core
             .session
             .as_ref()
             .map(|session| session.identity.session_epoch);
+        if let Some(session) = core.session.as_mut() {
+            session.content_focused = false;
+        }
         if let Some(ticket) = core.host_input_focus.as_mut() {
             if Some(ticket.identity.session_epoch) == live_epoch
                 && matches!(
@@ -1327,7 +1362,7 @@ impl PluginPanelController {
                 ticket.confirmed_main_focus_revision = Some(revision);
             }
         }
-        true
+        Some(revision)
     }
 
     pub(crate) fn main_content_lost_focus(
@@ -1335,6 +1370,28 @@ impl PluginPanelController {
         expected_transfer_blur: bool,
     ) -> Option<AppFocusLossTicket> {
         let mut core = self.core.lock().ok()?;
+        let show_generation = core.show_generation;
+        Self::main_content_lost_focus_locked(&mut core, show_generation, expected_transfer_blur)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn main_content_lost_focus_for_show(
+        &self,
+        show_generation: u64,
+        expected_transfer_blur: bool,
+    ) -> Option<AppFocusLossTicket> {
+        let mut core = self.core.lock().ok()?;
+        Self::main_content_lost_focus_locked(&mut core, show_generation, expected_transfer_blur)
+    }
+
+    fn main_content_lost_focus_locked(
+        core: &mut ControllerCore,
+        show_generation: u64,
+        expected_transfer_blur: bool,
+    ) -> Option<AppFocusLossTicket> {
+        if core.show_generation != show_generation {
+            return None;
+        }
         let revision = core.focus_revision.checked_add(1)?;
         core.focus_revision = revision;
         core.main_content_focused = false;
@@ -1356,6 +1413,7 @@ impl PluginPanelController {
                 .as_ref()
                 .map(|session| session.identity.session_epoch),
             focus_revision: revision,
+            show_generation,
         })
     }
 
@@ -1366,6 +1424,7 @@ impl PluginPanelController {
         if !core.session.as_ref().is_some_and(|session| {
             session.identity.content_label == label
                 && session.identity.session_epoch == session_epoch
+                && session.show_generation == core.show_generation
         }) {
             return false;
         }
@@ -1389,9 +1448,11 @@ impl PluginPanelController {
         session_epoch: u64,
     ) -> Option<AppFocusLossTicket> {
         let mut core = self.core.lock().ok()?;
+        let show_generation = core.show_generation;
         if !core.session.as_ref().is_some_and(|session| {
             session.identity.content_label == label
                 && session.identity.session_epoch == session_epoch
+                && session.show_generation == show_generation
         }) {
             return None;
         }
@@ -1404,16 +1465,30 @@ impl PluginPanelController {
         (!core.main_content_focused).then_some(AppFocusLossTicket {
             session_epoch: Some(session_epoch),
             focus_revision: revision,
+            show_generation,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn confirm_app_blur(&self, ticket: &AppFocusLossTicket) -> bool {
+        self.confirm_app_blur_with_native_focus(ticket, false)
+    }
+
+    pub(crate) fn confirm_app_blur_with_native_focus(
+        &self,
+        ticket: &AppFocusLossTicket,
+        native_app_focused: bool,
+    ) -> bool {
+        if native_app_focused {
+            return false;
+        }
         self.core.lock().ok().is_some_and(|core| {
             let current_epoch = core
                 .session
                 .as_ref()
                 .map(|session| session.identity.session_epoch);
             current_epoch == ticket.session_epoch
+                && core.show_generation == ticket.show_generation
                 && core.focus_revision == ticket.focus_revision
                 && !core.main_content_focused
                 && core
@@ -1440,6 +1515,7 @@ impl PluginPanelController {
             return;
         };
         core.focus_revision = core.focus_revision.saturating_add(1);
+        core.show_generation = core.show_generation.saturating_add(1);
         core.main_content_focused = false;
         core.internal_blur_until = None;
         core.session = None;
@@ -2607,7 +2683,9 @@ fn schedule_app_blur(
         std::thread::sleep(CONTENT_BLUR_RECHECK_DELAY);
         let dispatch_app = app.clone();
         let _ = app.run_on_main_thread(move || {
-            if !controller.confirm_app_blur(&ticket) {
+            let native_app_focused =
+                crate::lifecycle::main_window_owns_native_foreground(&dispatch_app);
+            if !controller.confirm_app_blur_with_native_focus(&ticket, native_app_focused) {
                 return;
             }
             let Some(window) = dispatch_app.get_window("main") else {
@@ -3060,6 +3138,78 @@ mod tests {
 
         assert!(!controller.confirm_app_blur(&ticket));
         assert!(controller.live_identity().is_none());
+    }
+
+    #[test]
+    fn stale_blur_from_previous_show_generation_cannot_hide_reopened_panel() {
+        let controller = PluginPanelController::default();
+        let first_show = controller.host_shown().unwrap();
+        let first = controller.open_session(owner("a")).unwrap();
+        assert!(controller.main_content_got_focus_for_show(first_show));
+        let stale_ticket = controller
+            .main_content_lost_focus_for_show(first_show, false)
+            .unwrap();
+
+        controller.host_hidden();
+        let second_show = controller.host_shown().unwrap();
+        let second = controller.open_session(owner("b")).unwrap();
+        assert!(controller.main_content_got_focus_for_show(second_show));
+
+        assert!(!controller.confirm_app_blur(&stale_ticket));
+        assert!(controller
+            .main_content_lost_focus_for_show(first_show, false)
+            .is_none());
+        assert_eq!(controller.live_identity(), Some(second.clone()));
+
+        let real_blur = controller
+            .main_content_lost_focus_for_show(second_show, false)
+            .unwrap();
+        assert_eq!(real_blur.session_epoch, Some(second.session_epoch));
+        assert!(second.session_epoch > first.session_epoch);
+        assert!(controller.confirm_app_blur_with_native_focus(&real_blur, false));
+    }
+
+    #[test]
+    fn native_foreground_ownership_blocks_late_blur_confirmation() {
+        let controller = PluginPanelController::default();
+        let show = controller.host_shown().unwrap();
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert!(controller.main_content_got_focus_for_show(show));
+
+        let blur = controller
+            .main_content_lost_focus_for_show(show, false)
+            .unwrap();
+
+        assert!(!controller.confirm_app_blur_with_native_focus(&blur, true));
+        assert!(controller.confirm_app_blur_with_native_focus(&blur, false));
+        assert_eq!(blur.session_epoch, Some(identity.session_epoch));
+    }
+
+    #[test]
+    fn repeated_reopen_cycles_reject_previous_generation_main_blurs() {
+        let controller = PluginPanelController::default();
+        let mut previous_show = None;
+
+        for index in 0..20 {
+            let show = controller.host_shown().unwrap();
+            let request = format!("cycle-{index}");
+            let identity = controller.open_session(owner(&request)).unwrap();
+            assert!(controller.main_content_got_focus_for_show(show));
+
+            if let Some(old_show) = previous_show {
+                assert!(controller
+                    .main_content_lost_focus_for_show(old_show, false)
+                    .is_none());
+                assert_eq!(controller.live_identity(), Some(identity.clone()));
+            }
+
+            let blur = controller
+                .main_content_lost_focus_for_show(show, false)
+                .unwrap();
+            assert!(controller.confirm_app_blur_with_native_focus(&blur, false));
+            controller.host_hidden();
+            previous_show = Some(show);
+        }
     }
 
     #[test]

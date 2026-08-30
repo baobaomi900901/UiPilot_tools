@@ -1203,8 +1203,9 @@ impl LifecycleCoordinator {
         let mut focus = || {
             window.set_focus().map_err(|_| ())?;
             window.as_ref().set_focus().map_err(|_| ())?;
+            let show_generation = panel_controller.host_shown().ok_or(())?;
             panel_controller
-                .main_content_got_focus()
+                .main_content_got_focus_for_show(show_generation)
                 .then_some(())
                 .ok_or(())
         };
@@ -2439,10 +2440,17 @@ mod tests {
         let webview_focus = show_main
             .find("window.as_ref().set_focus()")
             .expect("main webview focus is missing");
+        let show_generation = show_main
+            .find(".host_shown()")
+            .expect("main show generation marker is missing");
         let focus_ownership = show_main
-            .find(".main_content_got_focus()")
+            .find(".main_content_got_focus_for_show(show_generation)")
             .expect("main content focus ownership confirmation is missing");
-        assert!(window_focus < webview_focus && webview_focus < focus_ownership);
+        assert!(
+            window_focus < webview_focus
+                && webview_focus < show_generation
+                && show_generation < focus_ownership
+        );
     }
 
     #[test]
