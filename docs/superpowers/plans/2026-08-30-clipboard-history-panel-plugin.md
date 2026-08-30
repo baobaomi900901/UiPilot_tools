@@ -66,7 +66,7 @@
 
 **Distinct test coverage:** package contains only allowed files; manifest minimum Host and permission dependency are exact; Runtime preserves `requestId`; preview DTOs cover every record kind and invalid-file state.
 
-**Verify:** `node --test examples/public-plugins/com.uipilot.clipboard-history/tests/package.test.js`
+**Verify:** `node --test --experimental-test-isolation=none examples/public-plugins/com.uipilot.clipboard-history/tests/package.test.js`
 
 ## Final Verification
 
