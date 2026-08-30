@@ -270,11 +270,20 @@ pub(crate) struct HostKeyDeliveryTicket {
     pub(crate) alt_key: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostKeyPasteTicket {
+    pub(crate) session_epoch: u64,
+    pub(crate) content_label: String,
+    pub(crate) route_sequence: u64,
+}
+
 #[derive(Clone, Debug)]
 struct HostKeyInFlight {
     ticket: HostKeyDeliveryTicket,
     phase: HostKeyDeliveryPhase,
     ack_deadline: Option<Instant>,
+    paste_reserved: bool,
+    paste_consumed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +414,10 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       : undefined;
     if (raw === 'PermissionDenied' || raw === 'permissionDenied') return namedError('PermissionDenied');
     if (raw === 'ExpiredPanelSession' || raw === 'ExpiredWindowSessionError') return namedError('ExpiredPanelSession');
+    if (raw === 'RecordNotFound') return namedError('RecordNotFound');
+    if (raw === 'RecordUnavailable') return namedError('RecordUnavailable');
+    if (raw === 'PasteTargetUnavailable') return namedError('PasteTargetUnavailable');
+    if (raw === 'ClipboardWriteFailed') return namedError('ClipboardWriteFailed');
     return error;
   };
   const assertPlainObject = (value, message) => {
@@ -473,6 +486,13 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       entries: value.entries.map(normalizeClipboardHistoryEntry),
     });
   };
+  const normalizeClipboardHistoryPasteOutcome = (outcome) => {
+    const value = assertPlainObject(outcome, 'invalid clipboard history paste outcome');
+    if (Object.keys(value).sort().join(',') !== 'outcome' || value.outcome !== 'admitted') {
+      throw new TypeError('invalid clipboard history paste outcome');
+    }
+    return deepFreeze({ outcome: 'admitted' });
+  };
   const hostKeys = deepFreeze(__HOST_KEYS__);
   const expiredStorage = deepFreeze({
     get: async () => { throw new Error('ExpiredWindowSessionError'); },
@@ -482,6 +502,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   const expiredClipboardHistory = deepFreeze({
     list: async () => { throw namedError('ExpiredPanelSession'); },
     onChanged: () => { throw namedError('ExpiredPanelSession'); },
+    paste: async () => { throw namedError('ExpiredPanelSession'); },
     remove: async () => { throw namedError('ExpiredPanelSession'); },
     clear: async () => { throw namedError('ExpiredPanelSession'); },
   });
@@ -592,6 +613,21 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
             session.pollTimer = null;
           }
         };
+      },
+      async paste(input) {
+        const value = assertPlainObject(input, 'invalid clipboard history paste input');
+        if (
+          Object.keys(value).sort().join(',') !== 'id,routeSequence' ||
+          typeof value.id !== 'string' ||
+          !canonicalU64(value.routeSequence) ||
+          value.routeSequence === '0'
+        ) {
+          throw new TypeError('invalid clipboard history paste input');
+        }
+        return normalizeClipboardHistoryPasteOutcome(await call('plugin_panel_clipboard_history_paste', {
+          id: value.id,
+          routeSequence: value.routeSequence,
+        }));
       },
       async remove(input) {
         const value = assertPlainObject(input, 'invalid clipboard history remove input');
@@ -1700,6 +1736,8 @@ impl PluginPanelController {
             ticket: ticket.clone(),
             phase: HostKeyDeliveryPhase::Prepared,
             ack_deadline: None,
+            paste_reserved: false,
+            paste_consumed: false,
         });
         route.native_focus_blur_expected = true;
         Some(ticket)
@@ -1798,6 +1836,91 @@ impl PluginPanelController {
         }
         in_flight.phase = HostKeyDeliveryPhase::Accomplished;
         self.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn begin_enter_host_key_paste(
+        &self,
+        content_label: &str,
+        session_epoch: u64,
+        route_sequence: u64,
+    ) -> Option<HostKeyPasteTicket> {
+        let mut core = self.core.lock().ok()?;
+        let session = core.session.as_mut()?;
+        if session.identity.content_label != content_label
+            || session.identity.session_epoch != session_epoch
+        {
+            return None;
+        }
+        let in_flight = session.host_key_route.in_flight.as_mut()?;
+        if in_flight.ticket.route_sequence != route_sequence
+            || in_flight.ticket.declaration != PanelHostKeyDeclaration::Enter
+            || in_flight.ticket.key != PluginPanelHostKey::Enter
+            || !matches!(
+                in_flight.phase,
+                HostKeyDeliveryPhase::NativeFocused | HostKeyDeliveryPhase::DeliveredAwaitingAck
+            )
+            || in_flight.paste_reserved
+            || in_flight.paste_consumed
+        {
+            return None;
+        }
+        in_flight.paste_reserved = true;
+        Some(HostKeyPasteTicket {
+            session_epoch,
+            content_label: content_label.to_owned(),
+            route_sequence,
+        })
+    }
+
+    pub(crate) fn cancel_enter_host_key_paste(&self, ticket: HostKeyPasteTicket) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(session) = core.session.as_mut() else {
+            return false;
+        };
+        if session.identity.content_label != ticket.content_label
+            || session.identity.session_epoch != ticket.session_epoch
+        {
+            return false;
+        }
+        let Some(in_flight) = session.host_key_route.in_flight.as_mut() else {
+            return false;
+        };
+        if in_flight.ticket.route_sequence != ticket.route_sequence
+            || !in_flight.paste_reserved
+            || in_flight.paste_consumed
+        {
+            return false;
+        }
+        in_flight.paste_reserved = false;
+        true
+    }
+
+    pub(crate) fn commit_enter_host_key_paste(&self, ticket: HostKeyPasteTicket) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(session) = core.session.as_mut() else {
+            return false;
+        };
+        if session.identity.content_label != ticket.content_label
+            || session.identity.session_epoch != ticket.session_epoch
+        {
+            return false;
+        }
+        let Some(in_flight) = session.host_key_route.in_flight.as_mut() else {
+            return false;
+        };
+        if in_flight.ticket.route_sequence != ticket.route_sequence
+            || !in_flight.paste_reserved
+            || in_flight.paste_consumed
+        {
+            return false;
+        }
+        in_flight.paste_reserved = false;
+        in_flight.paste_consumed = true;
         true
     }
 
@@ -3321,11 +3444,36 @@ mod tests {
         identity
     }
 
+    fn enter_host_key_session(controller: &PluginPanelController) -> PanelSessionIdentity {
+        let mut panel_owner = owner("enter-host-key");
+        panel_owner.host_keys = vec![PanelHostKeyDeclaration::Enter];
+        let identity = controller.open_session(panel_owner).unwrap();
+        assert!(controller.mark_ready(
+            &identity.content_label,
+            identity.session_epoch,
+            true,
+            false,
+        ));
+        identity
+    }
+
     fn host_key_input(client_sequence: u64) -> HostKeyEnqueueInput {
         HostKeyEnqueueInput {
             client_sequence,
             declaration: PanelHostKeyDeclaration::ArrowDown,
             key: PluginPanelHostKey::ArrowDown,
+            ctrl_key: false,
+            meta_key: false,
+            shift_key: false,
+            alt_key: false,
+        }
+    }
+
+    fn enter_host_key_input(client_sequence: u64) -> HostKeyEnqueueInput {
+        HostKeyEnqueueInput {
+            client_sequence,
+            declaration: PanelHostKeyDeclaration::Enter,
+            key: PluginPanelHostKey::Enter,
             ctrl_key: false,
             meta_key: false,
             shift_key: false,
@@ -3522,6 +3670,65 @@ mod tests {
             ticket.route_sequence,
         ));
         assert!(controller.mark_host_key_delivered(&ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
+        assert_eq!(
+            controller.finish_host_key_ack(&ticket, Instant::now()),
+            HostKeyAckOutcome::Acknowledged,
+        );
+    }
+
+    #[test]
+    fn enter_host_key_paste_ticket_is_single_use_without_breaking_ack() {
+        let controller = PluginPanelController::default();
+        let identity = enter_host_key_session(&controller);
+        controller
+            .enqueue_host_key(identity.session_epoch, enter_host_key_input(1))
+            .unwrap();
+        let ticket = controller.claim_next_host_key().unwrap();
+        assert!(controller.mark_host_key_native_focused(&ticket));
+        assert!(controller.mark_host_key_delivered(&ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
+
+        let paste = controller
+            .begin_enter_host_key_paste(
+                &identity.content_label,
+                identity.session_epoch,
+                ticket.route_sequence,
+            )
+            .expect("paste ticket should be admitted");
+        assert!(
+            controller
+                .begin_enter_host_key_paste(
+                    &identity.content_label,
+                    identity.session_epoch,
+                    ticket.route_sequence,
+                )
+                .is_none(),
+            "duplicate paste calls must be rejected before clipboard writes"
+        );
+        assert!(controller.cancel_enter_host_key_paste(paste));
+        let paste = controller
+            .begin_enter_host_key_paste(
+                &identity.content_label,
+                identity.session_epoch,
+                ticket.route_sequence,
+            )
+            .expect("cancelled paste ticket should be retryable");
+        assert!(controller.commit_enter_host_key_paste(paste));
+        assert!(
+            controller
+                .begin_enter_host_key_paste(
+                    &identity.content_label,
+                    identity.session_epoch,
+                    ticket.route_sequence,
+                )
+                .is_none(),
+            "committed paste tickets stay consumed"
+        );
+
+        assert!(controller.ack_host_key(
+            &identity.content_label,
+            identity.session_epoch,
+            ticket.route_sequence,
+        ));
         assert_eq!(
             controller.finish_host_key_ack(&ticket, Instant::now()),
             HostKeyAckOutcome::Acknowledged,
@@ -4742,9 +4949,11 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
             "onChanged(next)",
+            "paste(input)",
             "Reflect.deleteProperty(window, '__TAURI_INTERNALS__')",
             "__UIPILOT_PLUGIN_PANEL_UPDATE__",
             "sessionEpoch",

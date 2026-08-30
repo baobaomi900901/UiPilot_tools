@@ -156,6 +156,63 @@ impl ClipboardHistoryBridgeError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClipboardHistoryRecord {
+    pub(crate) id: String,
+    pub(crate) captured_at: String,
+    pub(crate) payload: ClipboardHistoryRecordPayload,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ClipboardHistoryRecordPayload {
+    Text {
+        text: String,
+    },
+    Image {
+        png: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Files {
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClipboardHistoryPasteError {
+    PermissionDenied,
+    ExpiredPanelSession,
+    RecordNotFound,
+    RecordUnavailable,
+    PasteTargetUnavailable,
+    ClipboardWriteFailed,
+}
+
+impl ClipboardHistoryPasteError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "PermissionDenied",
+            Self::ExpiredPanelSession => "ExpiredPanelSession",
+            Self::RecordNotFound => "RecordNotFound",
+            Self::RecordUnavailable => "RecordUnavailable",
+            Self::PasteTargetUnavailable => "PasteTargetUnavailable",
+            Self::ClipboardWriteFailed => "ClipboardWriteFailed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClipboardHistoryPasteOutcome {
+    pub(crate) outcome: ClipboardHistoryPasteStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ClipboardHistoryPasteStatus {
+    Admitted,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct HistoryDocument {

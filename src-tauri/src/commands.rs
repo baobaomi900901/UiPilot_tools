@@ -13,7 +13,11 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     apps::{self, AppCache, Application},
-    clipboard_history::{ClipboardHistoryBridgeError, ClipboardHistorySnapshot},
+    clipboard_history::{
+        paste_clipboard_history_record, send_ctrl_v_to_foreground_target,
+        ClipboardHistoryBridgeError, ClipboardHistoryPasteError, ClipboardHistoryPasteOutcome,
+        ClipboardHistoryPasteStatus, ClipboardHistorySnapshot,
+    },
     file_index::{FileIndex, OpenIndexedPath},
     file_search::{
         everything::{EverythingSearchError, EverythingSearchState},
@@ -27,7 +31,9 @@ use crate::{
         OpenFindCompletion,
     },
     hotkey::HotkeyKind,
-    lifecycle::{self, CriticalReservation, LifecycleCoordinator, ReservationError},
+    lifecycle::{
+        self, ClipboardPasteTarget, CriticalReservation, LifecycleCoordinator, ReservationError,
+    },
     message_center::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
@@ -471,6 +477,15 @@ impl From<ClipboardHistoryBridgeError> for CommandError {
         Self {
             code: error.code(),
             message: "public plugin clipboard history operation failed",
+        }
+    }
+}
+
+impl From<ClipboardHistoryPasteError> for CommandError {
+    fn from(error: ClipboardHistoryPasteError) -> Self {
+        Self {
+            code: error.code(),
+            message: "public plugin clipboard history paste operation failed",
         }
     }
 }
@@ -2087,6 +2102,89 @@ pub(crate) fn plugin_panel_clipboard_history_clear(
             identity.admission_epoch,
         )
         .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_clipboard_history_paste(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    id: String,
+    route_sequence: String,
+) -> Result<ClipboardHistoryPasteOutcome, CommandError> {
+    let identity = begin_clipboard_history_panel_call(
+        webview.label(),
+        controller.inner().as_ref(),
+        &session_epoch,
+        true,
+    )?;
+    let route_sequence = parse_canonical_nonzero_u64(&route_sequence)
+        .ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+    let manager = service.manager()?;
+    let record = manager
+        .clipboard_history_record_for_paste_panel(
+            &identity.plugin_id,
+            identity.generation,
+            identity.activation_id,
+            identity.admission_epoch,
+            &id,
+        )
+        .map_err(CommandError::from)?;
+    let paste_ticket = controller
+        .begin_enter_host_key_paste(webview.label(), identity.session_epoch, route_sequence)
+        .ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+    let target = match app
+        .state::<Arc<LifecycleCoordinator>>()
+        .clipboard_paste_target_for_explicit_return()
+    {
+        Some(target) => target,
+        None => {
+            let _ = controller.cancel_enter_host_key_paste(paste_ticket);
+            return Err(ClipboardHistoryPasteError::PasteTargetUnavailable.into());
+        }
+    };
+    if let Err(error) = manager.clipboard_history_begin_paste_restore_for_panel() {
+        let _ = controller.cancel_enter_host_key_paste(paste_ticket);
+        return Err(error.into());
+    }
+    if let Err(error) = paste_clipboard_history_record(&record) {
+        manager.clipboard_history_cancel_paste_restore_for_panel();
+        let _ = controller.cancel_enter_host_key_paste(paste_ticket);
+        return Err(error.into());
+    }
+    if !controller.commit_enter_host_key_paste(paste_ticket) {
+        return Err(ClipboardHistoryPasteError::ExpiredPanelSession.into());
+    }
+    manager
+        .clipboard_history_complete_paste_for_panel(&identity.plugin_id, &id)
+        .map_err(CommandError::from)?;
+    schedule_clipboard_history_paste_hide_and_send(app, target);
+    Ok(ClipboardHistoryPasteOutcome {
+        outcome: ClipboardHistoryPasteStatus::Admitted,
+    })
+}
+
+fn schedule_clipboard_history_paste_hide_and_send(app: AppHandle, target: ClipboardPasteTarget) {
+    std::thread::spawn(move || {
+        let dispatch_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let Some(window) = dispatch_app.get_window("main") else {
+                return;
+            };
+            let registries = dispatch_app.state::<ResultRegistries>();
+            if clear_and_hide_window(registries.main(), &window, HideReason::ExplicitReturn)
+                .is_err()
+            {
+                return;
+            }
+            let lifecycle = dispatch_app.state::<Arc<LifecycleCoordinator>>();
+            if lifecycle.clipboard_paste_target_is_foreground(target) {
+                let _ = send_ctrl_v_to_foreground_target(target);
+            }
+        });
+    });
 }
 
 #[tauri::command]
@@ -6120,6 +6218,7 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
         ] {
@@ -6139,6 +6238,7 @@ mod tests {
         }
         for command in [
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
         ] {
@@ -6175,6 +6275,7 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
         ] {
@@ -6200,6 +6301,7 @@ mod tests {
         assert!(!capability.contains("allow-plugin-panel-host-key-enqueue"));
         for command in [
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
         ] {

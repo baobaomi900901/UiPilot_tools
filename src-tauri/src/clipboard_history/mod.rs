@@ -5,17 +5,24 @@
 
 mod model;
 mod observer;
+mod paste;
 mod preview;
 mod service;
 mod store;
 
 pub(crate) use model::{
     CaptureOutcome, ClipboardCapture, ClipboardHistoryBridgeError, ClipboardHistoryEntrySummary,
-    ClipboardHistoryError, ClipboardHistorySnapshot, IgnoredCaptureReason,
+    ClipboardHistoryError, ClipboardHistoryPasteError, ClipboardHistoryPasteOutcome,
+    ClipboardHistoryPasteStatus, ClipboardHistoryRecord, ClipboardHistoryRecordPayload,
+    ClipboardHistorySnapshot, IgnoredCaptureReason,
 };
 pub(crate) use observer::{
     normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
     ClipboardObserver, ClipboardObserverHandle, ClipboardReadError, ClipboardReader,
+};
+pub(crate) use paste::{
+    paste_clipboard_history_record, send_ctrl_v_to_foreground_target, ClipboardHistoryPasteDriver,
+    ClipboardHistoryPasteWrite,
 };
 pub(crate) use service::ClipboardHistoryService;
 pub(crate) use store::ClipboardHistoryStore;
@@ -359,6 +366,75 @@ mod tests {
     }
 
     #[test]
+    fn paste_payload_retrieval_keeps_content_host_side_and_reports_unavailable_records() {
+        let dir = TestDir::new("paste-payload");
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let file = source.join("one.txt");
+        fs::write(&file, "one").unwrap();
+        let store = ClipboardHistoryStore::load(dir.path().join("history").as_path()).unwrap();
+
+        let text_id = capture_text(&store, "full secret text", "2026-08-30T01:00:00Z");
+        let files_id = match store
+            .capture(ClipboardCapture::files(
+                vec![file.clone()],
+                "2026-08-30T01:00:01Z",
+            ))
+            .unwrap()
+        {
+            CaptureOutcome::Stored { id, .. } => id,
+            other => panic!("expected stored files capture, got {other:?}"),
+        };
+        let image_id = match store
+            .capture(ClipboardCapture::image(
+                vec![255, 0, 0, 255],
+                1,
+                1,
+                "2026-08-30T01:00:02Z",
+            ))
+            .unwrap()
+        {
+            CaptureOutcome::Stored { id, .. } => id,
+            other => panic!("expected stored image capture, got {other:?}"),
+        };
+
+        assert_eq!(
+            store.record_for_paste(&text_id).unwrap().payload,
+            ClipboardHistoryRecordPayload::Text {
+                text: "full secret text".into()
+            }
+        );
+        assert_eq!(
+            store.record_for_paste(&files_id).unwrap().payload,
+            ClipboardHistoryRecordPayload::Files {
+                paths: vec![file.clone()]
+            }
+        );
+        match store.record_for_paste(&image_id).unwrap().payload {
+            ClipboardHistoryRecordPayload::Image { png, width, height } => {
+                assert_eq!((width, height), (1, 1));
+                assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            }
+            other => panic!("expected image payload, got {other:?}"),
+        }
+        assert_eq!(
+            store.record_for_paste("999"),
+            Err(ClipboardHistoryPasteError::RecordNotFound)
+        );
+
+        fs::remove_file(&file).unwrap();
+        assert_eq!(
+            store.record_for_paste(&files_id),
+            Err(ClipboardHistoryPasteError::RecordUnavailable)
+        );
+        fs::remove_file(store.image_path_for_test(&image_id).unwrap()).unwrap();
+        assert_eq!(
+            store.record_for_paste(&image_id),
+            Err(ClipboardHistoryPasteError::RecordUnavailable)
+        );
+    }
+
+    #[test]
     fn format_normalization_prefers_files_then_image_then_text() {
         let text = Some("fallback".into());
         let image = Some(ClipboardImageSnapshot {
@@ -583,6 +659,78 @@ mod tests {
         service.capture_current_for_test().unwrap();
 
         assert_eq!(service.snapshot("com.example.one").unwrap(), moved);
+    }
+
+    #[test]
+    fn complete_paste_moves_record_to_front_and_suppresses_restore_feedback() {
+        let dir = TestDir::new("paste-complete");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), observer);
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "first",
+            "2026-08-30T01:00:00Z",
+        ))));
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "second",
+            "2026-08-30T01:00:01Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+        service.capture_current_for_test().unwrap();
+        let first_id = service.snapshot("com.example.one").unwrap().entries[1].id();
+
+        assert_eq!(
+            service
+                .record_for_paste("com.example.one", &first_id)
+                .unwrap()
+                .payload,
+            ClipboardHistoryRecordPayload::Text {
+                text: "first".into()
+            }
+        );
+        service
+            .begin_paste_restore_suppression()
+            .expect("paste should suppress its pending clipboard observer feedback");
+        service
+            .complete_paste("com.example.one", &first_id)
+            .expect("paste completion should update recency");
+        let moved = service.snapshot("com.example.one").unwrap();
+        assert_eq!(moved.entries[0].id(), first_id);
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "first",
+            "2026-08-30T01:00:02Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+
+        assert_eq!(service.snapshot("com.example.one").unwrap(), moved);
+    }
+
+    #[test]
+    fn cancelled_paste_restore_suppression_does_not_skip_later_user_clipboard_changes() {
+        let dir = TestDir::new("paste-suppression-cancel");
+        let reader = Arc::new(ScriptedClipboardReader::default());
+        let observer = Arc::new(ManualClipboardObserver::default());
+        let service = history_service(&dir, Arc::clone(&reader), observer);
+        service
+            .sync_authorized_plugins(["com.example.one".into()])
+            .unwrap();
+        service.begin_paste_restore_suppression().unwrap();
+        service.cancel_paste_restore_suppression().unwrap();
+
+        reader.push(Ok(Some(ClipboardCapture::text(
+            "user-change-after-failed-paste",
+            "2026-08-30T01:00:00Z",
+        ))));
+        service.capture_current_for_test().unwrap();
+
+        assert_eq!(
+            service.snapshot("com.example.one").unwrap().entries.len(),
+            1,
+            "failed paste write must not leave a stale suppression token"
+        );
     }
 
     #[test]

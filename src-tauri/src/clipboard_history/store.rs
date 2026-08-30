@@ -1,6 +1,6 @@
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Mutex,
 };
 
@@ -11,6 +11,7 @@ use crate::atomic_file::{
 use super::{
     model::{
         CaptureOutcome, ClipboardCapture, ClipboardHistoryEntrySummary, ClipboardHistoryError,
+        ClipboardHistoryPasteError, ClipboardHistoryRecord, ClipboardHistoryRecordPayload,
         ClipboardHistorySnapshot, HistoryDocument, HistoryEntry, HistoryEntryPayload,
         IgnoredCaptureReason, INDEX_SCHEMA, MAX_ENTRIES, MAX_IMAGE_PNG_BYTES,
         MAX_TOTAL_IMAGE_PNG_BYTES,
@@ -147,6 +148,55 @@ impl ClipboardHistoryStore {
                 .iter()
                 .map(|entry| summary(entry))
                 .collect(),
+        })
+    }
+
+    pub(crate) fn record_for_paste(
+        &self,
+        id: &str,
+    ) -> Result<ClipboardHistoryRecord, ClipboardHistoryPasteError> {
+        let entry = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?;
+            state
+                .document
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .cloned()
+                .ok_or(ClipboardHistoryPasteError::RecordNotFound)?
+        };
+        let payload = match entry.payload {
+            HistoryEntryPayload::Text { text, .. } => ClipboardHistoryRecordPayload::Text { text },
+            HistoryEntryPayload::Image {
+                width,
+                height,
+                png_file,
+                ..
+            } => {
+                let path = self
+                    .image_path_from_index(&png_file)
+                    .ok_or(ClipboardHistoryPasteError::RecordUnavailable)?;
+                let png =
+                    fs::read(path).map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?;
+                if png.is_empty() {
+                    return Err(ClipboardHistoryPasteError::RecordUnavailable);
+                }
+                ClipboardHistoryRecordPayload::Image { png, width, height }
+            }
+            HistoryEntryPayload::Files { paths } => {
+                if paths.is_empty() || !paths.iter().all(path_available) {
+                    return Err(ClipboardHistoryPasteError::RecordUnavailable);
+                }
+                ClipboardHistoryRecordPayload::Files { paths }
+            }
+        };
+        Ok(ClipboardHistoryRecord {
+            id: entry.id,
+            captured_at: entry.captured_at,
+            payload,
         })
     }
 
@@ -329,6 +379,16 @@ impl ClipboardHistoryStore {
             .or_else(|| Some(self.images_root.join(format!("{id}.png"))))
     }
 
+    fn image_path_from_index(&self, png_file: &str) -> Option<PathBuf> {
+        let mut components = Path::new(png_file).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) if !name.is_empty() => {
+                Some(self.images_root.join(name))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn thumbnail_dimensions_for_test(&self, id: &str) -> Option<(u32, u32)> {
         let state = self.state.lock().ok()?;
         state.document.entries.iter().find_map(|entry| {
@@ -489,10 +549,14 @@ fn summary(entry: &HistoryEntry) -> ClipboardHistoryEntrySummary {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             file_count: paths.len(),
-            available: paths.iter().all(|path| match fs::metadata(path) {
-                Ok(_) => true,
-                Err(error) => error.kind() != io::ErrorKind::NotFound && path.exists(),
-            }),
+            available: paths.iter().all(path_available),
         },
+    }
+}
+
+fn path_available(path: &PathBuf) -> bool {
+    match fs::metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound && path.exists(),
     }
 }

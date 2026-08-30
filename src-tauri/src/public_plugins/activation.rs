@@ -16,8 +16,8 @@ use tauri::{AppHandle, Manager};
 #[cfg(test)]
 use crate::clipboard_history::ClipboardCapture;
 use crate::clipboard_history::{
-    ClipboardHistoryBridgeError, ClipboardHistoryError, ClipboardHistoryService,
-    ClipboardHistorySnapshot,
+    ClipboardHistoryBridgeError, ClipboardHistoryError, ClipboardHistoryPasteError,
+    ClipboardHistoryRecord, ClipboardHistoryService, ClipboardHistorySnapshot,
 };
 use crate::message_center::{
     MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome, MessagePublishRequest,
@@ -824,6 +824,43 @@ impl PublicPluginManager {
             .map_err(|_| ClipboardHistoryBridgeError::Unavailable)
     }
 
+    pub(crate) fn clipboard_history_record_for_paste_panel(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        id: &str,
+    ) -> Result<ClipboardHistoryRecord, ClipboardHistoryPasteError> {
+        self.authorize_clipboard_history_paste_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )?;
+        self.clipboard_history.record_for_paste(plugin_id, id)
+    }
+
+    pub(crate) fn clipboard_history_complete_paste_for_panel(
+        &self,
+        plugin_id: &str,
+        id: &str,
+    ) -> Result<(), ClipboardHistoryPasteError> {
+        self.clipboard_history.complete_paste(plugin_id, id)
+    }
+
+    pub(crate) fn clipboard_history_begin_paste_restore_for_panel(
+        &self,
+    ) -> Result<(), ClipboardHistoryPasteError> {
+        self.clipboard_history
+            .begin_paste_restore_suppression()
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)
+    }
+
+    pub(crate) fn clipboard_history_cancel_paste_restore_for_panel(&self) {
+        let _ = self.clipboard_history.cancel_paste_restore_suppression();
+    }
+
     fn authorize_clipboard_history_panel_call(
         &self,
         plugin_id: &str,
@@ -863,6 +900,50 @@ impl PublicPluginManager {
                 .contains(&PublicPermission::ClipboardHistoryRead)
         {
             return Err(ClipboardHistoryBridgeError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn authorize_clipboard_history_paste_panel_call(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<(), ClipboardHistoryPasteError> {
+        self.authorize_clipboard_history_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )
+        .map_err(|error| match error {
+            ClipboardHistoryBridgeError::PermissionDenied => {
+                ClipboardHistoryPasteError::PermissionDenied
+            }
+            ClipboardHistoryBridgeError::ExpiredPanelSession => {
+                ClipboardHistoryPasteError::ExpiredPanelSession
+            }
+            ClipboardHistoryBridgeError::Unavailable => {
+                ClipboardHistoryPasteError::RecordUnavailable
+            }
+        })?;
+        let bundle = self
+            .bundles
+            .bundle(plugin_id)
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
+            .ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+        if !bundle
+            .config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardHistoryPaste)
+            || !bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::ClipboardHistoryPaste)
+        {
+            return Err(ClipboardHistoryPasteError::PermissionDenied);
         }
         Ok(())
     }
@@ -4427,6 +4508,43 @@ mod tests {
         .unwrap();
     }
 
+    fn write_clipboard_history_package_with_permissions(
+        root: &Path,
+        version: &str,
+        permissions: Vec<&str>,
+    ) {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "com.example.clipboard-history",
+                "version": version,
+                "apiVersion": 1,
+                "minimumHostVersion": "0.3.3",
+                "name": "Clipboard History",
+                "supportedPlatforms": ["windows"],
+                "command": {
+                    "defaultName": "cliphist",
+                    "activationMode": "submit",
+                    "outputMode": "panel",
+                    "inputRequired": false
+                },
+                "runtime": { "entry": "dist/runtime.js" },
+                "panel": { "entry": "dist/panel.html" },
+                "permissions": permissions
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/runtime.js"),
+            "export async function onCommand() { return { requestId: 'r', data: {} }; }",
+        )
+        .unwrap();
+        fs::write(root.join("dist/panel.html"), "<!doctype html>").unwrap();
+    }
+
     fn install_discovery_package(manager: &PublicPluginManager, source: &Path, now: Instant) {
         let prepared = manager.prepare("main", self::source(source), now).unwrap();
         manager
@@ -4969,6 +5087,130 @@ mod tests {
                 admission_epoch
             ),
             Err(ClipboardHistoryBridgeError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn clipboard_history_paste_panel_bridge_requires_read_and_paste_permissions() {
+        let dir = TestDir::new("clipboard-history-paste-panel-bridge");
+        write_clipboard_history_package_with_permissions(
+            &dir.source(),
+            "1.0.0",
+            vec![
+                "ui.panel",
+                "clipboard.history.read",
+                "clipboard.history.paste",
+            ],
+        );
+        let full_manager = manager(&dir);
+        let now = Instant::now();
+        full_manager
+            .commit_with_readiness(
+                "main",
+                &full_manager
+                    .prepare("main", source(&dir.source()), now)
+                    .unwrap()
+                    .token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                    PublicPermission::ClipboardHistoryPaste,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let plugin_id = "com.example.clipboard-history";
+        let generation = 1;
+        let activation_id = full_manager.activation_id(plugin_id).unwrap();
+        let admission_epoch = full_manager.admission_epoch(plugin_id).unwrap();
+        full_manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "panel paste text",
+                "2026-08-30T01:00:00Z",
+            ))
+            .unwrap();
+        let id = full_manager
+            .clipboard_history_snapshot_for_panel(
+                plugin_id,
+                generation,
+                activation_id,
+                admission_epoch,
+            )
+            .unwrap()
+            .entries[0]
+            .id();
+
+        assert_eq!(
+            full_manager
+                .clipboard_history_record_for_paste_panel(
+                    plugin_id,
+                    generation,
+                    activation_id,
+                    admission_epoch,
+                    &id
+                )
+                .unwrap()
+                .payload,
+            crate::clipboard_history::ClipboardHistoryRecordPayload::Text {
+                text: "panel paste text".into()
+            }
+        );
+        assert_eq!(
+            full_manager.clipboard_history_record_for_paste_panel(
+                plugin_id,
+                generation + 1,
+                activation_id,
+                admission_epoch,
+                &id,
+            ),
+            Err(crate::clipboard_history::ClipboardHistoryPasteError::ExpiredPanelSession)
+        );
+
+        let read_only_dir = TestDir::new("clipboard-history-paste-read-only-panel-bridge");
+        write_clipboard_history_package_with_permissions(
+            &read_only_dir.source(),
+            "1.0.0",
+            vec!["ui.panel", "clipboard.history.read"],
+        );
+        let read_only_manager = manager(&read_only_dir);
+        read_only_manager
+            .commit_with_readiness(
+                "main",
+                &read_only_manager
+                    .prepare("main", source(&read_only_dir.source()), now)
+                    .unwrap()
+                    .token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        read_only_manager
+            .clipboard_history_capture_for_test(ClipboardCapture::text(
+                "read only",
+                "2026-08-30T01:00:01Z",
+            ))
+            .unwrap();
+        let activation_id = read_only_manager.activation_id(plugin_id).unwrap();
+        let admission_epoch = read_only_manager.admission_epoch(plugin_id).unwrap();
+        let read_only_id = read_only_manager
+            .clipboard_history_snapshot_for_panel(plugin_id, 1, activation_id, admission_epoch)
+            .unwrap()
+            .entries[0]
+            .id();
+        assert_eq!(
+            read_only_manager.clipboard_history_record_for_paste_panel(
+                plugin_id,
+                1,
+                activation_id,
+                admission_epoch,
+                &read_only_id,
+            ),
+            Err(crate::clipboard_history::ClipboardHistoryPasteError::PermissionDenied)
         );
     }
 

@@ -9,6 +9,7 @@ interface BootstrapPanelApi {
   readonly clipboardHistory: {
     list(): Promise<unknown>
     onChanged(handler: (snapshot: unknown) => void | Promise<void>): () => void
+    paste(input: { id: string, routeSequence: string }): Promise<unknown>
     remove(input: { id: string }): Promise<void>
     clear(): Promise<void>
   }
@@ -202,6 +203,36 @@ describe('public plugin panel bootstrap', () => {
     })
     expect(invoke).toHaveBeenCalledWith('plugin_panel_clipboard_history_list', {
       sessionEpoch: '7',
+    })
+  })
+
+  it('admits clipboard history paste with route sequence and maps stable paste errors', async () => {
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      if (command === 'plugin_panel_clipboard_history_paste') {
+        if (invoke.mock.calls.filter(([name]) => name === command).length === 1) {
+          return { outcome: 'admitted' }
+        }
+        const error = new Error('record unavailable')
+        ;(error as Error & { code?: string }).code = 'RecordUnavailable'
+        throw error
+      }
+      return undefined
+    })
+    const { hostWindow } = executePanelBootstrap(invoke)
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+
+    await expect(api.clipboardHistory.paste({ id: 'entry-1', routeSequence: '12' })).resolves.toEqual({
+      outcome: 'admitted',
+    })
+    await expect(api.clipboardHistory.paste({ id: 'entry-1', routeSequence: '12' })).rejects.toMatchObject({
+      name: 'RecordUnavailable',
+    })
+    await expect(api.clipboardHistory.paste({ id: 'entry-1', routeSequence: '012' })).rejects.toThrow('invalid clipboard history paste input')
+    await expect(api.clipboardHistory.paste({ id: 'entry-1' } as { id: string, routeSequence: string })).rejects.toThrow('invalid clipboard history paste input')
+    expect(invoke).toHaveBeenCalledWith('plugin_panel_clipboard_history_paste', {
+      sessionEpoch: '7',
+      id: 'entry-1',
+      routeSequence: '12',
     })
   })
 })

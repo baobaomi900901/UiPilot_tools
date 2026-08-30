@@ -12,7 +12,8 @@ use super::{
         default_clipboard_observer, default_clipboard_reader, ClipboardObserver,
         ClipboardObserverHandle, ClipboardReadError, ClipboardReader,
     },
-    ClipboardCapture, ClipboardHistoryError, ClipboardHistorySnapshot, ClipboardHistoryStore,
+    ClipboardCapture, ClipboardHistoryError, ClipboardHistoryPasteError, ClipboardHistoryRecord,
+    ClipboardHistorySnapshot, ClipboardHistoryStore,
 };
 
 const BUSY_RETRY_ATTEMPTS: usize = 3;
@@ -111,6 +112,41 @@ impl ClipboardHistoryService {
     #[allow(dead_code)]
     pub(crate) fn clear(&self, plugin_id: &str) -> Result<(), ClipboardHistoryError> {
         self.store_for_plugin(plugin_id)?.clear()
+    }
+
+    pub(crate) fn record_for_paste(
+        &self,
+        plugin_id: &str,
+        id: &str,
+    ) -> Result<ClipboardHistoryRecord, ClipboardHistoryPasteError> {
+        self.store_for_plugin(plugin_id)
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
+            .record_for_paste(id)
+    }
+
+    pub(crate) fn complete_paste(
+        &self,
+        plugin_id: &str,
+        id: &str,
+    ) -> Result<(), ClipboardHistoryPasteError> {
+        self.store_for_plugin(plugin_id)
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
+            .move_to_front(id)
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
+            .then_some(())
+            .ok_or(ClipboardHistoryPasteError::RecordNotFound)
+    }
+
+    pub(crate) fn begin_paste_restore_suppression(&self) -> Result<(), ClipboardHistoryError> {
+        self.suppress_next_observer_change()
+    }
+
+    pub(crate) fn cancel_paste_restore_suppression(&self) -> Result<(), ClipboardHistoryError> {
+        let mut state = self.lock()?;
+        if state.suppressed_observer_changes > 0 {
+            state.suppressed_observer_changes -= 1;
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

@@ -95,6 +95,23 @@ struct ForegroundCapture {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ClipboardPasteTarget {
+    pub(crate) show_generation: u64,
+    pub(crate) hwnd: isize,
+    pub(crate) pid: u32,
+}
+
+impl From<ForegroundCapture> for ClipboardPasteTarget {
+    fn from(capture: ForegroundCapture) -> Self {
+        Self {
+            show_generation: capture.show_generation,
+            hwnd: capture.hwnd,
+            pid: capture.pid,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForegroundObservation {
     UiPilot,
     Shell,
@@ -671,6 +688,36 @@ fn restore_foreground_capture(capture: ForegroundCapture) -> bool {
     unsafe { SetForegroundWindow(hwnd).as_bool() }
 }
 
+fn clipboard_paste_target_matches(
+    target: ClipboardPasteTarget,
+    observation: ForegroundObservation,
+) -> bool {
+    matches!(
+        observation,
+        ForegroundObservation::External { hwnd, pid }
+            if hwnd == target.hwnd && pid == target.pid
+    )
+}
+
+fn validate_clipboard_paste_target(target: ClipboardPasteTarget) -> bool {
+    let hwnd = HWND(target.hwnd as *mut c_void);
+    let is_window = unsafe { IsWindow(Some(hwnd)).as_bool() };
+    let mut observed_pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut observed_pid)) } == 0 {
+        return false;
+    }
+    restore_capture_matches(
+        ForegroundCapture {
+            show_generation: target.show_generation,
+            hwnd: target.hwnd,
+            pid: target.pid,
+        },
+        is_window,
+        observed_pid,
+        unsafe { GetCurrentProcessId() },
+    )
+}
+
 impl LifecycleCoordinator {
     fn capture_foreground_for_show_with(
         &self,
@@ -713,6 +760,25 @@ impl LifecycleCoordinator {
         if let Some(capture) = capture {
             let _ = restore_foreground_capture(capture);
         }
+    }
+
+    pub(crate) fn clipboard_paste_target_for_explicit_return(
+        &self,
+    ) -> Option<ClipboardPasteTarget> {
+        let target = self
+            .foreground_capture
+            .lock()
+            .ok()
+            .and_then(|state| state.capture)
+            .map(ClipboardPasteTarget::from)?;
+        validate_clipboard_paste_target(target).then_some(target)
+    }
+
+    pub(crate) fn clipboard_paste_target_is_foreground(
+        &self,
+        target: ClipboardPasteTarget,
+    ) -> bool {
+        clipboard_paste_target_matches(target, observe_foreground_window())
     }
 
     #[cfg(test)]
@@ -2976,6 +3042,39 @@ mod tests {
         assert!(!restore_capture_matches(capture, false, 404, 505));
         assert!(!restore_capture_matches(capture, true, 405, 505));
         assert!(!restore_capture_matches(capture, true, 404, 404));
+    }
+
+    #[test]
+    fn clipboard_paste_target_requires_matching_external_foreground_after_restore() {
+        let target = ClipboardPasteTarget {
+            show_generation: 1,
+            hwnd: 44,
+            pid: 404,
+        };
+        assert!(clipboard_paste_target_matches(
+            target,
+            ForegroundObservation::External { hwnd: 44, pid: 404 }
+        ));
+        assert!(!clipboard_paste_target_matches(
+            target,
+            ForegroundObservation::External { hwnd: 45, pid: 404 }
+        ));
+        assert!(!clipboard_paste_target_matches(
+            target,
+            ForegroundObservation::External { hwnd: 44, pid: 405 }
+        ));
+        assert!(!clipboard_paste_target_matches(
+            target,
+            ForegroundObservation::UiPilot
+        ));
+        assert!(!clipboard_paste_target_matches(
+            target,
+            ForegroundObservation::Shell
+        ));
+        assert!(!clipboard_paste_target_matches(
+            target,
+            ForegroundObservation::Missing
+        ));
     }
 
     fn exit_snapshot(coordinator: &LifecycleCoordinator) -> (ExitState, usize, CleanAttempt) {
