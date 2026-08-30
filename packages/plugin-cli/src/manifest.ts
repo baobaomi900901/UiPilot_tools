@@ -8,6 +8,8 @@ export type PublicPermission =
   | 'ui.panel'
   | 'clipboard.write'
   | 'clipboard.read'
+  | 'clipboard.history.read'
+  | 'clipboard.history.paste'
   | 'network.https'
   | 'files.userSelected'
   | 'files.index.readAll'
@@ -15,7 +17,7 @@ export type PublicPermission =
   | 'timer.control'
   | 'background.schedule'
 
-export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N'
+export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter'
 
 export interface PublicNetworkV1 {
   httpsHosts: string[]
@@ -152,6 +154,9 @@ const panelHostKeyOrder: Readonly<Record<PanelHostKeyDeclaration, number>> = {
   ArrowDown: 0,
   ArrowUp: 1,
   'Primary+N': 2,
+  Tab: 3,
+  'Shift+Tab': 4,
+  Enter: 5,
 }
 
 function canonicalPanelHostKeys(values: readonly PanelHostKeyDeclaration[]): PanelHostKeyDeclaration[] {
@@ -229,6 +234,8 @@ function validSetting(setting: PublicSettingV1): boolean {
 function semanticValid(manifest: PublicManifestV1): boolean {
   const settings = manifest.settings ?? []
   const permissions = manifest.permissions
+  const hasClipboardHistoryRead = permissions.includes('clipboard.history.read')
+  const hasClipboardHistoryPaste = permissions.includes('clipboard.history.paste')
   if (
     manifest.schemaVersion !== 1 ||
     !/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/u.test(manifest.pluginId) ||
@@ -302,6 +309,18 @@ function semanticValid(manifest: PublicManifestV1): boolean {
   ) {
     return false
   }
+  if (
+    (hasClipboardHistoryRead || hasClipboardHistoryPaste) &&
+    (manifest.command.activationMode !== 'submit' ||
+      manifest.command.outputMode !== 'panel' ||
+      manifest.panel == null ||
+      manifest.window != null ||
+      !permissions.includes('ui.panel') ||
+      permissions.includes('ui.window') ||
+      (hasClipboardHistoryPaste && !hasClipboardHistoryRead))
+  ) {
+    return false
+  }
   return true
 }
 
@@ -318,6 +337,7 @@ function permissionAvailable(permission: PublicPermission, platform: PluginPlatf
     permission === 'ui.window' ||
     permission === 'ui.panel' ||
     permission === 'clipboard.write' ||
+    ((permission === 'clipboard.history.read' || permission === 'clipboard.history.paste') && platform === 'windows') ||
     (permission === 'network.https' && platform === 'windows') ||
     ((permission === 'notifications.publish' || permission === 'timer.control') && platform === 'windows')
   )
@@ -359,9 +379,14 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 3, 2]) ||
+    versionGreater(minimumHost, [0, 3, 3]) ||
     (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
     ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost)) ||
+    ((manifest.panel?.hostKeys ?? []).some((key) => key === 'Tab' || key === 'Shift+Tab' || key === 'Enter') &&
+      versionGreater([0, 3, 3], minimumHost)) ||
+    ((manifest.permissions.includes('clipboard.history.read') ||
+      manifest.permissions.includes('clipboard.history.paste')) &&
+      versionGreater([0, 3, 3], minimumHost)) ||
     (manifest.network != null && versionGreater([0, 3, 2], minimumHost))
   ) {
     issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })

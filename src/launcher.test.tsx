@@ -177,11 +177,11 @@ describe('plugin protocol', () => {
       sessionEpoch: '18446744073709551615',
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
-      hostKeys: ['Primary+N', 'ArrowUp', 'ArrowDown'],
+      hostKeys: ['Enter', 'Shift+Tab', 'Tab', 'Primary+N', 'ArrowUp', 'ArrowDown'],
     }
     expect(parsePluginPanelCommandResult(identity)).toEqual({
       ...identity,
-      hostKeys: ['ArrowDown', 'ArrowUp', 'Primary+N'],
+      hostKeys: ['ArrowDown', 'ArrowUp', 'Primary+N', 'Tab', 'Shift+Tab', 'Enter'],
     })
     expect(parsePluginPanelErrorEvent({ sessionEpoch: '9' })).toEqual({ sessionEpoch: '9' })
     for (const invalid of [
@@ -190,7 +190,7 @@ describe('plugin protocol', () => {
       { ...identity, pluginId: 'Invalid Plugin' },
       { ...identity, commandLabel: '/demo-panel' },
       { ...identity, hostKeys: 'ArrowDown' },
-      { ...identity, hostKeys: ['Enter'] },
+      { ...identity, hostKeys: ['Space'] },
       { ...identity, hostKeys: ['ArrowDown', 'ArrowDown'] },
       { ...identity, extra: true },
     ]) expect(parsePluginPanelCommandResult(invalid)).toBeNull()

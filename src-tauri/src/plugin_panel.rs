@@ -165,6 +165,8 @@ pub(crate) enum PluginPanelHostKey {
     ArrowUp,
     #[serde(rename = "n")]
     N,
+    Tab,
+    Enter,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -205,6 +207,27 @@ impl HostKeyEnqueueInput {
                     } else {
                         self.ctrl_key && !self.meta_key
                     }
+            }
+            PanelHostKeyDeclaration::Tab => {
+                self.key == PluginPanelHostKey::Tab
+                    && !self.ctrl_key
+                    && !self.meta_key
+                    && !self.shift_key
+                    && !self.alt_key
+            }
+            PanelHostKeyDeclaration::ShiftTab => {
+                self.key == PluginPanelHostKey::Tab
+                    && !self.ctrl_key
+                    && !self.meta_key
+                    && self.shift_key
+                    && !self.alt_key
+            }
+            PanelHostKeyDeclaration::Enter => {
+                self.key == PluginPanelHostKey::Enter
+                    && !self.ctrl_key
+                    && !self.meta_key
+                    && !self.shift_key
+                    && !self.alt_key
             }
         }
     }

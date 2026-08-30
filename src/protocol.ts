@@ -122,6 +122,8 @@ export type PublicPermission =
   | 'ui.panel'
   | 'clipboard.write'
   | 'clipboard.read'
+  | 'clipboard.history.read'
+  | 'clipboard.history.paste'
   | 'network.https'
   | 'files.userSelected'
   | 'files.index.readAll'
@@ -429,8 +431,8 @@ export interface PluginPanelBounds {
   height: number
 }
 
-export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N'
-export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n'
+export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter'
+export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter'
 
 export interface PluginPanelHostKeyEnqueueInput {
   sessionEpoch: U64Decimal
@@ -729,7 +731,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 }
 
 const publicPermissions = new Set<PublicPermission>([
-  'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.read', 'network.https',
+  'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])
@@ -917,6 +919,9 @@ export function parsePluginPanelCommandResult(value: unknown): PluginPanelComman
     ArrowDown: 0,
     ArrowUp: 1,
     'Primary+N': 2,
+    Tab: 3,
+    'Shift+Tab': 4,
+    Enter: 5,
   }
   const hostKeys: PanelHostKeyDeclaration[] = []
   const seen = new Set<PanelHostKeyDeclaration>()

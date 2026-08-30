@@ -39,8 +39,9 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `command.summary` is an optional one-line discovery hint. It is limited to 512 Unicode scalar values; when omitted, the launcher uses `name`.
 - `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
 - `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
-- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`.
+- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`, and the extended `Tab`, `Shift+Tab`, or `Enter` declarations require `minimumHostVersion >= 0.3.3`.
 - Windows Runtime HTTPS requires `minimumHostVersion >= 0.3.2`, exact permission `network.https`, and a non-null `network` object containing `httpsHosts`. The permission and object must either both be present or both be absent.
+- Windows Panel clipboard history requires `minimumHostVersion >= 0.3.3`, exact permissions `clipboard.history.read` and optionally `clipboard.history.paste`, plus `submit + panel + ui.panel`. `clipboard.read` remains reserved and unsupported; it is not an alias for clipboard history.
 
 `network.https` declares exact destination hosts, not URLs, origins, wildcard suffixes, or redirect groups:
 
@@ -144,19 +145,22 @@ Bundled test credentials are ordinary plugin code and can be inspected. API v1 s
 
 `window` returns `{ requestId, data }`. The host creates or reuses one window for that plugin and sends a `PluginWindowUpdate` through `window.uipilotPluginWindow.onUpdate`. Content receives input, platform, theme, invocation time, singleton instance `1`, and plugin data. It cannot invoke commands or own pin, close, drag, focus, theme, or position behavior.
 
-`panel` returns `{ requestId, data }`. The host mounts one launcher panel session for that plugin and sends a `PluginPanelUpdate` through `window.uipilotPluginPanel.onUpdate`. Panel content receives input, platform, theme, invocation time, session epoch, and plugin data. Its bridge exposes private storage plus `onHostKey(handler)`, `focusHostInput()`, and `requestHide()`; it cannot own timers or publish notifications. The base panel contract requires host `0.3.0+`; the three `0.3.1` methods require `minimumHostVersion >= 0.3.1` when used.
+`panel` returns `{ requestId, data }`. The host mounts one launcher panel session for that plugin and sends a `PluginPanelUpdate` through `window.uipilotPluginPanel.onUpdate`. Panel content receives input, platform, theme, invocation time, session epoch, and plugin data. Its bridge exposes private storage plus `onHostKey(handler)`, `focusHostInput()`, `requestHide()`, and, when the manifest declares clipboard history permissions, `clipboardHistory`; it cannot own timers or publish notifications. The base panel contract requires host `0.3.0+`; the three `0.3.1` methods require `minimumHostVersion >= 0.3.1` when used.
 
 `window.uipilotPluginPanel.focusHostInput()` moves keyboard focus to the live panel session's tagged launcher argument input. It preserves the panel, command tag, argument text, selection, and submission state. Repeated calls while that input is already focused succeed. Missing, replaced, torn-down, or stale sessions resolve without side effects; a current native-focus, event, acknowledgement, or timeout failure rejects with `windowFailed`. The method does not stream edits to panel content: argument changes reach `onUpdate.input` only after the user presses Enter.
 
 ### Panel Host Keys And Return
 
-`panel.hostKeys` is optional, contains at most eight unique declarations, and accepts only `ArrowDown`, `ArrowUp`, and `Primary+N`. Validators reject unknown values, duplicates, non-arrays, wrong element types, and extra panel properties. Canonical order is `ArrowDown < ArrowUp < Primary+N`.
+`panel.hostKeys` is optional, contains at most eight unique declarations, and accepts only `ArrowDown`, `ArrowUp`, `Primary+N`, `Tab`, `Shift+Tab`, and `Enter`. Validators reject unknown values, duplicates, non-arrays, wrong element types, and extra panel properties. Canonical order is `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter`. `Tab`, `Shift+Tab`, and `Enter` require `minimumHostVersion >= 0.3.3`.
 
 | Declaration | Launcher input match | Delivered `event.key` |
 | --- | --- | --- |
 | `ArrowDown` | no modifiers | `ArrowDown` |
 | `ArrowUp` | no modifiers | `ArrowUp` |
 | `Primary+N` | Windows Ctrl-only+N; macOS Meta-only+N; no Alt/Shift | `n` |
+| `Tab` | no modifiers | `Tab` with `shiftKey: false` |
+| `Shift+Tab` | Shift-only | `Tab` with `shiftKey: true` |
+| `Enter` | no modifiers and not IME composing | `Enter` |
 
 IME composition, undeclared keys, ordinary characters, and extended chords are never routed. The launcher consumes a matching physical key before enqueue. Host delivery is strictly serial with a queue depth of eight and a two-second acknowledgement timeout. Queue-full presses remain consumed but are not delivered. A handler throw/rejection is acknowledged without retry; a hung handler, unsubscribe, sequence violation, or counter exhaustion ends the exact panel session instead of overlapping handlers.
 
@@ -165,6 +169,12 @@ When `hostKeys` is non-empty, content must register exactly one `onHostKey(handl
 `requestHide(): Promise<void>` takes no arguments. A current session resolves after hide admission and before teardown; the document may be destroyed on the next macrotask, so the resolving continuation must not start later DOM work. Missing, stale, replaced, or in-pattern unauthorized sessions resolve as no-ops. Admission failure rejects with `windowFailed`. If the renderer hangs or crashes before observing admission, the Promise may never settle; Host reclaims an unobserved admission after 30 seconds. Once observed, a 500 ms fallback protects the normal next-macrotask commit.
 
 Escape in panel content uses capture-phase arbitration. A synchronous `preventDefault()`, active `dialog[open]`, or composition suppresses hide; `preventDefault()` after an `await` is too late. Explicit-return hides best-effort restore the external HWND+PID captured when UiPilot was shown. Blur and launch-handoff hides never restore, and foreground restore failure does not turn a successful hide into an error.
+
+### Panel Clipboard History
+
+`window.uipilotPluginPanel.clipboardHistory` is Windows-only and available only to `submit + panel + ui.panel` plugins declaring `clipboard.history.read`; paste also requires `clipboard.history.paste`. The Host records text, image, and file-list clipboard changes while UiPilot is running, the plugin is enabled, and permission is granted. Panel code receives only summaries through `list()` and `onChanged(handler)`: text previews, image thumbnails, file names/counts, availability, `id`, `capturedAt`, and `revision`. It never receives raw text, original PNG bytes, complete file paths, HWND, PID, arbitrary key names, or paste counts.
+
+`clipboardHistory.paste({ id, routeSequence })` is accepted only from the current Panel session after a routed Enter event. It returns `{ outcome: 'admitted' }` before teardown, then the Host writes the selected record to the system clipboard, hides UiPilot, restores the previously captured external window when safe, and sends one platform paste chord. Failures expose stable `Error.name` values: `PermissionDenied`, `ExpiredPanelSession`, `RecordNotFound`, `RecordUnavailable`, `PasteTargetUnavailable`, and `ClipboardWriteFailed`. Error messages are redacted.
 
 Every plugin content window also sees the frozen `window.uipilotPluginWindow.timer` facade. Calls require the Windows-only `timer.control` permission together with `ui.window` and `notifications.publish`; unpermitted callers receive `PermissionDenied`. The host owns one process-local timer per active plugin generation, continues it while the window is hidden, and discards it on process exit.
 
@@ -192,6 +202,8 @@ API v1 implements only:
 - `ui.window`: create the host-owned singleton window.
 - `ui.panel`: mount the host-owned launcher panel surface.
 - `clipboard.write`: expose a host-owned `copyText` default action.
+- `clipboard.history.read`: on Windows Host `0.3.3+`, allow the Host to collect this plugin's local clipboard history and expose redacted summaries to its Panel.
+- `clipboard.history.paste`: on Windows Host `0.3.3+`, allow a current Panel session to restore one selected clipboard history record and paste it once after a routed Enter event; requires `clipboard.history.read`.
 - `network.https`: on Windows Host `0.3.2+`, expose bounded request-scoped Host-managed HTTPS to the exact authorized `network.httpsHosts` set.
 - `notifications.publish`: on Windows only, submit one immediate or host-owned delayed plain-text message and ask the host to show its own notification and tray reminder.
 - `timer.control`: on Windows only, control one host-owned plugin-window timer that can continue after the window hides; requires `ui.window`, `notifications.publish`, and `submit + window`.
@@ -200,7 +212,7 @@ Other parsed permission names are reserved and installation fails until the host
 
 ## Unsupported In v1
 
-Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, browser/WebView networking, raw sockets, arbitrary files, clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. External access is limited to request-scoped Host-managed HTTPS described above. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
+Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, browser/WebView networking, raw sockets, arbitrary files, raw clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. External access is limited to request-scoped Host-managed HTTPS and the Host-managed clipboard history summary bridge described above. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
 
 The fixed-output reference packages are:
 

@@ -188,7 +188,57 @@ export interface UiPilotPluginPanelStorageApiV1 {
   remove(key: string): Promise<void>
 }
 
-export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n'
+export type ClipboardHistoryEntrySummary =
+  | Readonly<{
+      id: string
+      kind: 'text'
+      capturedAt: string
+      textPreview: string
+    }>
+  | Readonly<{
+      id: string
+      kind: 'image'
+      capturedAt: string
+      previewDataUrl: string
+      width: number
+      height: number
+    }>
+  | Readonly<{
+      id: string
+      kind: 'files'
+      capturedAt: string
+      firstFileName: string
+      fileCount: number
+      available: boolean
+    }>
+
+export interface ClipboardHistorySnapshot {
+  revision: U64Decimal
+  entries: readonly ClipboardHistoryEntrySummary[]
+}
+
+export type ClipboardHistoryPasteErrorName =
+  | 'PermissionDenied'
+  | 'ExpiredPanelSession'
+  | 'RecordNotFound'
+  | 'RecordUnavailable'
+  | 'PasteTargetUnavailable'
+  | 'ClipboardWriteFailed'
+
+export interface UiPilotPluginPanelClipboardHistoryApiV1 {
+  list(): Promise<Readonly<ClipboardHistorySnapshot>>
+  onChanged(
+    handler: (snapshot: Readonly<ClipboardHistorySnapshot>) => void | Promise<void>,
+  ): () => void
+  paste(input: Readonly<{
+    id: string
+    routeSequence: U64Decimal
+  }>): Promise<Readonly<{ outcome: 'admitted' }>>
+  remove(input: Readonly<{ id: string }>): Promise<void>
+  clear(): Promise<void>
+}
+
+export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter'
 
 export interface PluginPanelHostKeyEvent {
   key: PluginPanelHostKey
@@ -210,6 +260,7 @@ export interface UiPilotPluginPanelApiV1 {
   focusHostInput(): Promise<void>
   requestHide(): Promise<void>
   readonly storage: Readonly<UiPilotPluginPanelStorageApiV1>
+  readonly clipboardHistory: Readonly<UiPilotPluginPanelClipboardHistoryApiV1>
 }
 
 declare global {

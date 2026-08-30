@@ -4,7 +4,7 @@
 
 - **主界面结果型**：处理命令后在 UiPilot 主界面显示结果，用户再次按 Enter 执行复制。
 - **单例子窗口型**：处理命令后打开一个由 UiPilot 托管的子窗口。
-- **启动器面板型**：处理命令后在主启动器内挂载插件面板（基础能力需宿主 `0.3.0+`，Host 按键与主动隐藏需 `0.3.1+`）。
+- **启动器面板型**：处理命令后在主启动器内挂载插件面板（基础能力需宿主 `0.3.0+`，Host 按键与主动隐藏需 `0.3.1+`，扩展 `Tab` / `Shift+Tab` / `Enter` 与剪贴板历史需 `0.3.3+`）。
 
 三种插件的 Runtime 都可以按需使用 Windows Host `0.3.2+` 提供的受控 HTTPS 能力。网络请求由宿主代理执行，不会向 Runtime 或内容 WebView 开放浏览器 `fetch`。
 
@@ -25,7 +25,8 @@
 | 按 Enter 后在主界面显示结果 | `submit` | `mainResult` | 复制时使用 `clipboard.write` | `demo-return` |
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
-| 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（使用 `hostKeys` 时 `minimumHostVersion` ≥ `0.3.1`） | `demo-panel` |
+| 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（使用基础 `hostKeys` 时 `minimumHostVersion` ≥ `0.3.1`；使用 `Tab` / `Shift+Tab` / `Enter` 或剪贴板历史时 ≥ `0.3.3`） | `demo-panel` |
+| 在面板中显示宿主管理的剪贴板历史摘要并粘贴一次 | `submit` | `panel` | `ui.panel`、`clipboard.history.read`、可选 `clipboard.history.paste`（仅 Windows，`minimumHostVersion` ≥ `0.3.3`） | 暂无产品 Demo |
 | 在 Runtime 中请求声明的 HTTPS 服务 | 任意现有模式 | 任意现有输出 | `network.https`（仅 Windows，`minimumHostVersion` ≥ `0.3.2`） | `demo-http` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
 
@@ -87,7 +88,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - `command.defaultName` 不包含 `/`，只能有一个。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish` 和 `timer.control`。
+- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read` 和 `clipboard.history.paste`。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -159,7 +160,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 ### 分支 C：启动器面板型 Manifest
 
-面板基础模式要求 UiPilot `0.3.0+`；下面示例声明 Host 按键，因此要求 `0.3.1+`。面板仅支持 Windows、`submit` 激活和独立的 `panel.entry`：
+面板基础模式要求 UiPilot `0.3.0+`；下面示例声明基础 Host 按键，因此要求 `0.3.1+`。如果声明 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史权限，要求 `0.3.3+`。面板仅支持 Windows、`submit` 激活和独立的 `panel.entry`：
 
 ```json
 {
@@ -600,13 +601,15 @@ Panel 首次打开成功后，宿主会自动把光标放到命令 tag 后的参
 
 `focusHostInput()` 不接收参数，只把焦点交回当前会话带命令 tag 的参数输入框；它不会关闭面板、删除 tag、提交或改写参数与选择区。输入框已经聚焦时可以重复调用。会话已经隐藏、替换或销毁时调用会安静地无操作完成；当前会话的宿主聚焦失败会拒绝 Promise。
 
-非空 `panel.hostKeys` 要求页面在 ready 前恰好注册一次 `onHostKey(handler)`。声明只允许 `ArrowDown`、`ArrowUp`、`Primary+N`，并按该顺序规范化。方向键只匹配无修饰键；Windows 的 `Primary+N` 只匹配 Ctrl+N，macOS 只匹配 Meta+N。IME、Shift 变体、未声明按键和普通字符不会路由。handler 串行执行；抛错或拒绝会 ack 但不重试，超过 2 秒未完成会隐藏并销毁会话。调用 unsubscribe 也会结束会话。
+非空 `panel.hostKeys` 要求页面在 ready 前恰好注册一次 `onHostKey(handler)`。声明只允许 `ArrowDown`、`ArrowUp`、`Primary+N`、`Tab`、`Shift+Tab`、`Enter`，并按 `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter` 规范化。方向键和 `Tab` 只匹配无修饰键；`Shift+Tab` 只匹配仅带 Shift 的 Tab；`Enter` 只匹配无修饰键且非 IME composing；Windows 的 `Primary+N` 只匹配 Ctrl+N，macOS 只匹配 Meta+N。未声明按键、普通字符和其他组合不会路由。handler 串行执行；抛错或拒绝会 ack 但不重试，超过 2 秒未完成会隐藏并销毁会话。调用 unsubscribe 也会结束会话。
 
 `requestHide()` 不接收参数。当前会话的 Promise 在 Host 接纳隐藏后、WebView 销毁前 resolve；resolve 后下一个 macrotask 即可销毁文档，不要再启动 DOM 工作。旧会话或已销毁会话安静完成；当前接纳失败以 `windowFailed` 拒绝。renderer 在观察接纳前挂死时 Promise 可能永不 settle，Host 最迟 30 秒回收；正常观察后有 500ms fallback。
 
 Panel 内容中的 Escape 由 Host capture listener 在同一轮同步事件结束后的 microtask 仲裁。同步 `preventDefault()`、打开的 `<dialog>` 或 IME 会阻止隐藏；`await` 之后再 `preventDefault()` 已来不及。显式返回会 best-effort 恢复 UiPilot 显示前捕获的外部窗口；失焦隐藏和启动交接不恢复。
 
-面板桥没有通用 `close()`、计时器或通知接口，也不能调用 Tauri `invoke`、网络或 Shell；主动隐藏只使用窄接口 `requestHide()`。宿主拥有命令 tag 和参数输入框：第一次 Enter 打开面板，后续 Enter 提交当前参数，并仅在提交后通过 `onUpdate.input` 把新参数交给面板；`focusHostInput()` 不提供实时按键流，`onHostKey()` 只交付 Manifest 声明的三个 Host chord。× 或参数光标位于 0 时的 Backspace 退出。Escape、失焦隐藏、插件停用、卸载或升级都会销毁当前面板，下次打开主界面从空白启动器开始。
+面板桥没有通用 `close()`、计时器或通知接口，也不能调用 Tauri `invoke`、网络或 Shell；主动隐藏只使用窄接口 `requestHide()`。宿主拥有命令 tag 和参数输入框：第一次 Enter 打开面板，后续 Enter 提交当前参数，并仅在提交后通过 `onUpdate.input` 把新参数交给面板；`focusHostInput()` 不提供实时按键流，`onHostKey()` 只交付 Manifest 声明的 Host chord。× 或参数光标位于 0 时的 Backspace 退出。Escape、失焦隐藏、插件停用、卸载或升级都会销毁当前面板，下次打开主界面从空白启动器开始。
+
+声明 `clipboard.history.read` 的 Windows 面板会收到 `window.uipilotPluginPanel.clipboardHistory`。该桥只提供宿主管理的摘要：`list()`、`onChanged(handler)`、`remove({ id })`、`clear()`；声明 `clipboard.history.paste` 后还可在收到 `Enter` Host Key 的同一会话中调用 `paste({ id, routeSequence })`。Panel 只会看到文字预览、图片缩略图、文件名/数量/可用性、`id`、`capturedAt` 和 `revision`，不会看到完整文本、原图、完整路径、HWND、PID 或任意按键模拟能力。用户授权后，UiPilot 运行、插件启用且权限有效期间的文字、图片和文件列表剪贴板变化会被宿主记录到本机插件隔离数据目录；第一版不会自动识别密码框或敏感输入来源。
 
 完整实现见 [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)。
 
@@ -745,6 +748,8 @@ uipilot-plugin validate .\package --platform windows --json
 
 使用 `network.https` 时，CLI 只验证 Manifest 的 Windows 平台、`minimumHostVersion >= 0.3.2`、权限配对和精确主机语法；CLI 自身不会联网，也不会验证第三方服务或凭据。
 
+使用 `clipboard.history.read` / `clipboard.history.paste` 时，CLI 只验证 Windows `submit + panel + ui.panel`、`minimumHostVersion >= 0.3.3`、`paste` 依赖 `read`、以及 `clipboard.read` 不能作为别名；真实剪贴板采集、持久化、粘贴和焦点恢复仍以 UiPilot 宿主验收为准。
+
 ## 11. 使用开发目录安装
 
 1. 启动 UiPilot。
@@ -867,7 +872,11 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 ### 面板没有内容或隐藏后仍残留
 
-确认基础 panel 的 `minimumHostVersion` 至少为 `0.3.0`；使用 `hostKeys`、`onHostKey` 或 `requestHide` 时至少为 `0.3.1`。Manifest 使用 `submit + panel + ui.panel`；`panel.js` 尽早注册 `onUpdate`，非空 `hostKeys` 还必须在 ready 前注册一次 `onHostKey`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
+确认基础 panel 的 `minimumHostVersion` 至少为 `0.3.0`；使用基础 `hostKeys`、`onHostKey` 或 `requestHide` 时至少为 `0.3.1`；使用 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史时至少为 `0.3.3`。Manifest 使用 `submit + panel + ui.panel`；`panel.js` 尽早注册 `onUpdate`，非空 `hostKeys` 还必须在 ready 前注册一次 `onHostKey`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
+
+### 剪贴板历史为空或粘贴被拒绝
+
+确认目标系统是 Windows、`minimumHostVersion` 至少为 `0.3.3`，Manifest 使用 `submit + panel + ui.panel` 并声明 `clipboard.history.read`；需要自动粘贴时还要声明并授权 `clipboard.history.paste`，且必须在收到声明的 `Enter` Host Key 后使用同一事件的 `routeSequence` 调用 `clipboardHistory.paste()`。查看 `Error.name` 区分 `PermissionDenied`、`ExpiredPanelSession`、`RecordNotFound`、`RecordUnavailable`、`PasteTargetUnavailable` 和 `ClipboardWriteFailed`。不要把剪贴板正文、完整路径、图片内容或系统窗口信息写入日志。
 
 ### 网络请求被拒绝或没有返回
 
@@ -891,8 +900,9 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `pluginId` 使用自己的稳定命名空间。
 - [ ] `version` 已提高，`minimumHostVersion` 合理。
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
-- [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`。
+- [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`，扩展 Host 按键和剪贴板历史要求 `0.3.3+`。
 - [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和九种固定错误名。
+- [ ] 使用剪贴板历史时，仅面向 Windows Host `0.3.3+`，同时声明 `ui.panel` 和 `clipboard.history.read`，需要粘贴时再声明 `clipboard.history.paste`，并处理六种固定 `Error.name`。
 - [ ] 网络插件未记录凭据、签名字段或完整请求体；了解内置测试凭据可被检查，正式 secret 消费尚未开放。
 - [ ] Runtime 始终原样返回 `requestId`。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
@@ -900,7 +910,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `timer.control` 包只包含唯一的 `assets/sounds/timer-alarm.wav`，且 WAV 满足固定 PCM、大小与时长限制。
 - [ ] 内部空格不会被插件意外压缩。
 - [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
-- [ ] 面板内容只通过 `uipilotPluginPanel.onUpdate`、`onHostKey`、`focusHostInput`、`requestHide` 与 `storage`，隐藏/停用/卸载/升级后不保留会话。
+- [ ] 面板内容只通过 `uipilotPluginPanel.onUpdate`、`onHostKey`、`focusHostInput`、`requestHide`、`storage` 与授权后的 `clipboardHistory`，隐藏/停用/卸载/升级后不保留会话。
 - [ ] `icon.png` 满足固定规则。
 - [ ] Runtime 测试通过。
 - [ ] 开发目录和最终 `.uipilot-plugin` 均通过 `uipilot-plugin validate`。

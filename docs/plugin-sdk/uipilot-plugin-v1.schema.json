@@ -4,7 +4,10 @@
       "enum": [
         "ArrowDown",
         "ArrowUp",
-        "Primary+N"
+        "Primary+N",
+        "Tab",
+        "Shift+Tab",
+        "Enter"
       ],
       "type": "string"
     },
@@ -107,6 +110,8 @@
         "ui.panel",
         "clipboard.write",
         "clipboard.read",
+        "clipboard.history.read",
+        "clipboard.history.paste",
         "network.https",
         "files.userSelected",
         "files.index.readAll",

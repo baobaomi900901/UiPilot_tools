@@ -111,13 +111,74 @@ describe('validateManifest', () => {
     })
   })
 
-  it('validates and canonicalizes panel hostKeys with the 0.3.1 version gate', () => {
+  it('validates clipboard history permissions only for Windows panel plugins', () => {
+    const value = {
+      schemaVersion: 1,
+      pluginId: 'com.example.clipboard-history',
+      version: '1.0.0',
+      apiVersion: 1,
+      minimumHostVersion: '0.3.3',
+      name: 'Clipboard History',
+      supportedPlatforms: ['windows'],
+      command: {
+        defaultName: 'cliphist',
+        activationMode: 'submit',
+        outputMode: 'panel',
+        inputRequired: false,
+      },
+      runtime: { entry: 'dist/runtime.js' },
+      panel: { entry: 'dist/panel.html' },
+      permissions: ['ui.panel', 'clipboard.history.read', 'clipboard.history.paste'],
+      settings: [],
+    }
+    expect(validate(value)).toMatchObject({ ok: true })
+
+    const pasteWithoutRead = structuredClone(value)
+    pasteWithoutRead.permissions = ['ui.panel', 'clipboard.history.paste']
+    expect(validate(pasteWithoutRead)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }],
+    })
+
+    const mainResult = structuredClone(value) as any
+    mainResult.command.outputMode = 'mainResult'
+    delete mainResult.panel
+    mainResult.permissions = ['clipboard.history.read']
+    expect(validate(mainResult)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }],
+    })
+
+    const reservedClipboardRead = structuredClone(value)
+    reservedClipboardRead.permissions = ['ui.panel', 'clipboard.read']
+    expect(validate(reservedClipboardRead)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'PERMISSION_UNSUPPORTED' }],
+    })
+
+    expect(validate(value, 'macos')).toMatchObject({
+      ok: false,
+      issues: [
+        { code: 'PLATFORM_INCOMPATIBLE' },
+        { code: 'PERMISSION_UNSUPPORTED' },
+      ],
+    })
+
+    const lowHost = structuredClone(value)
+    lowHost.minimumHostVersion = '0.3.2'
+    expect(validate(lowHost)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'API_INCOMPATIBLE' }],
+    })
+  })
+
+  it('validates and canonicalizes panel hostKeys with the 0.3.3 extended key version gate', () => {
     const value = {
       schemaVersion: 1,
       pluginId: 'com.example.panel-keys',
       version: '1.0.0',
       apiVersion: 1,
-      minimumHostVersion: '0.3.1',
+      minimumHostVersion: '0.3.3',
       name: 'Panel Keys',
       supportedPlatforms: ['windows'],
       command: {
@@ -127,17 +188,19 @@ describe('validateManifest', () => {
         inputRequired: false,
       },
       runtime: { entry: 'dist/runtime.js' },
-      panel: { entry: 'dist/panel.html', hostKeys: ['Primary+N', 'ArrowUp', 'ArrowDown'] },
+      panel: { entry: 'dist/panel.html', hostKeys: ['Enter', 'Shift+Tab', 'Tab', 'Primary+N', 'ArrowUp', 'ArrowDown'] },
       permissions: ['ui.panel'],
       settings: [],
     }
     const result = validate(value)
     expect(result).toMatchObject({ ok: true })
-    if (result.ok) expect(result.manifest.panel?.hostKeys).toEqual(['ArrowDown', 'ArrowUp', 'Primary+N'])
+    if (result.ok) {
+      expect(result.manifest.panel?.hostKeys).toEqual(['ArrowDown', 'ArrowUp', 'Primary+N', 'Tab', 'Shift+Tab', 'Enter'])
+    }
 
     for (const hostKeys of [
       'ArrowDown',
-      ['Enter'],
+      ['Space'],
       ['ArrowDown', 'ArrowDown'],
       ['ArrowDown', 'ArrowUp', 'Primary+N', 'ArrowDown', 'ArrowUp', 'Primary+N', 'ArrowDown', 'ArrowUp', 'Primary+N'],
     ]) {
@@ -147,13 +210,13 @@ describe('validateManifest', () => {
     }
 
     const lowHost = structuredClone(value)
-    lowHost.minimumHostVersion = '0.3.0'
+    lowHost.minimumHostVersion = '0.3.2'
     expect(validate(lowHost)).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
 
-    const empty = structuredClone(value)
-    empty.minimumHostVersion = '0.3.0'
-    empty.panel.hostKeys = []
-    expect(validate(empty)).toMatchObject({ ok: true })
+    const existingKeys = structuredClone(value)
+    existingKeys.minimumHostVersion = '0.3.1'
+    existingKeys.panel.hostKeys = ['Primary+N', 'ArrowDown']
+    expect(validate(existingKeys)).toMatchObject({ ok: true })
   })
 
   it('still accepts older non-panel packages that declare minimumHostVersion 0.2.0', () => {
