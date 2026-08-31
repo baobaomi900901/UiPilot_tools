@@ -39,6 +39,7 @@
     "allow-save-hotkey",
     "allow-set-theme-preference",
     "allow-set-web-search-engine",
+    "allow-set-builtin-feature-favorite",
     "allow-hide-launcher",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

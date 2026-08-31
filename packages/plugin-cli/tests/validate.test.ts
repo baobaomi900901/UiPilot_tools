@@ -59,10 +59,10 @@ function networkSnapshot() {
 }
 
 describe('validateSnapshot', () => {
-  it('reports Host 0.3.3 for a valid network Manifest', () => {
+  it('reports Host 0.3.4 for a valid network Manifest', () => {
     const report = validateSnapshot(networkSnapshot(), 'network-package', 'windows')
     expect(report.valid).toBe(true)
-    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.3.3', apiVersion: 1 })
+    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.3.4', apiVersion: 1 })
   })
 
   it('accepts the complete Timer package on Windows', () => {

@@ -4,7 +4,7 @@
 
 - **主界面结果型**：处理命令后在 UiPilot 主界面显示结果，用户再次按 Enter 执行复制。
 - **单例子窗口型**：处理命令后打开一个由 UiPilot 托管的子窗口。
-- **启动器面板型**：处理命令后在主启动器内挂载插件面板（基础能力需宿主 `0.3.0+`，Host 按键与主动隐藏需 `0.3.1+`，扩展 `Tab` / `Shift+Tab` / `Enter` 与剪贴板历史需 `0.3.3+`）。
+- **启动器面板型**：处理命令后在主启动器内挂载插件面板（基础能力需宿主 `0.3.0+`，Host 按键与主动隐藏需 `0.3.1+`，扩展 `Tab` / `Shift+Tab` / `Enter` 与剪贴板历史需 `0.3.3+`，显式 Host Key 焦点策略需 `0.3.4+`）。
 
 三种插件的 Runtime 都可以按需使用 Windows Host `0.3.2+` 提供的受控 HTTPS 能力。网络请求由宿主代理执行，不会向 Runtime 或内容 WebView 开放浏览器 `fetch`。
 
@@ -160,7 +160,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 ### 分支 C：启动器面板型 Manifest
 
-面板基础模式要求 UiPilot `0.3.0+`；下面示例声明基础 Host 按键，因此要求 `0.3.1+`。如果声明 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史权限，要求 `0.3.3+`。面板仅支持 Windows、`submit` 激活和独立的 `panel.entry`：
+面板基础模式要求 UiPilot `0.3.0+`；下面示例声明基础 Host 按键，因此要求 `0.3.1+`。如果声明 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史权限，要求 `0.3.3+`；显式声明 `hostKeyFocus` 要求 `0.3.4+`。面板仅支持 Windows、`submit` 激活和独立的 `panel.entry`：
 
 ```json
 {
@@ -603,6 +603,8 @@ Panel 首次打开成功后，宿主会自动把光标放到命令 tag 后的参
 
 非空 `panel.hostKeys` 要求页面在 ready 前恰好注册一次 `onHostKey(handler)`。声明只允许 `ArrowDown`、`ArrowUp`、`Primary+N`、`Tab`、`Shift+Tab`、`Enter`，并按 `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter` 规范化。方向键和 `Tab` 只匹配无修饰键；`Shift+Tab` 只匹配仅带 Shift 的 Tab；`Enter` 只匹配无修饰键且非 IME composing；Windows 的 `Primary+N` 只匹配 Ctrl+N，macOS 只匹配 Meta+N。未声明按键、普通字符和其他组合不会路由。handler 串行执行；抛错或拒绝会 ack 但不重试，超过 2 秒未完成会隐藏并销毁会话。调用 unsubscribe 也会结束会话。
 
+`panel.hostKeyFocus` 可省略或设为 `content` / `host`。省略等价于 `content`：每次 Host Key 投递前，宿主把原生焦点交给 Panel WebView，适合需要打开对话框或继续接收内容键盘输入的面板。`host` 保持带命令 tag 的宿主输入框焦点，适合只用 Host Key 切换分类或移动选择的面板；插件不需要在 handler 后调用 `focusHostInput()`。显式字段要求 `minimumHostVersion >= 0.3.4`；错误类型、`null` 和未知值都会被拒绝。焦点策略不改变串行队列、ack、超时、会话销毁或 Enter 粘贴权限。
+
 `requestHide()` 不接收参数。当前会话的 Promise 在 Host 接纳隐藏后、WebView 销毁前 resolve；resolve 后下一个 macrotask 即可销毁文档，不要再启动 DOM 工作。旧会话或已销毁会话安静完成；当前接纳失败以 `windowFailed` 拒绝。renderer 在观察接纳前挂死时 Promise 可能永不 settle，Host 最迟 30 秒回收；正常观察后有 500ms fallback。
 
 Panel 内容中的 Escape 由 Host capture listener 在同一轮同步事件结束后的 microtask 仲裁。同步 `preventDefault()`、打开的 `<dialog>` 或 IME 会阻止隐藏；`await` 之后再 `preventDefault()` 已来不及。显式返回会 best-effort 恢复 UiPilot 显示前捕获的外部窗口；失焦隐藏和启动交接不恢复。
@@ -872,7 +874,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 ### 面板没有内容或隐藏后仍残留
 
-确认基础 panel 的 `minimumHostVersion` 至少为 `0.3.0`；使用基础 `hostKeys`、`onHostKey` 或 `requestHide` 时至少为 `0.3.1`；使用 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史时至少为 `0.3.3`。Manifest 使用 `submit + panel + ui.panel`；`panel.js` 尽早注册 `onUpdate`，非空 `hostKeys` 还必须在 ready 前注册一次 `onHostKey`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
+确认基础 panel 的 `minimumHostVersion` 至少为 `0.3.0`；使用基础 `hostKeys`、`onHostKey` 或 `requestHide` 时至少为 `0.3.1`；使用 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史时至少为 `0.3.3`；显式使用 `hostKeyFocus` 时至少为 `0.3.4`。Manifest 使用 `submit + panel + ui.panel`；`panel.js` 尽早注册 `onUpdate`，非空 `hostKeys` 还必须在 ready 前注册一次 `onHostKey`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
 
 ### 剪贴板历史为空或粘贴被拒绝
 
@@ -900,7 +902,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `pluginId` 使用自己的稳定命名空间。
 - [ ] `version` 已提高，`minimumHostVersion` 合理。
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
-- [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`，扩展 Host 按键和剪贴板历史要求 `0.3.3+`。
+- [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`，扩展 Host 按键和剪贴板历史要求 `0.3.3+`，显式 Host Key 焦点策略要求 `0.3.4+`。
 - [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和九种固定错误名。
 - [ ] 使用剪贴板历史时，仅面向 Windows Host `0.3.3+`，同时声明 `ui.panel` 和 `clipboard.history.read`，需要粘贴时再声明 `clipboard.history.paste`，并处理六种固定 `Error.name`。
 - [ ] 网络插件未记录凭据、签名字段或完整请求体；了解内置测试凭据可被检查，正式 secret 消费尚未开放。

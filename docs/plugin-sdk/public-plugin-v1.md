@@ -39,7 +39,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `command.summary` is an optional one-line discovery hint. It is limited to 512 Unicode scalar values; when omitted, the launcher uses `name`.
 - `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
 - `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
-- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`, and the extended `Tab`, `Shift+Tab`, or `Enter` declarations require `minimumHostVersion >= 0.3.3`.
+- `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`, the extended `Tab`, `Shift+Tab`, or `Enter` declarations require `minimumHostVersion >= 0.3.3`, and an explicit `panel.hostKeyFocus` requires `minimumHostVersion >= 0.3.4`.
 - Windows Runtime HTTPS requires `minimumHostVersion >= 0.3.2`, exact permission `network.https`, and a non-null `network` object containing `httpsHosts`. The permission and object must either both be present or both be absent.
 - Windows Panel clipboard history requires `minimumHostVersion >= 0.3.3`, exact permissions `clipboard.history.read` and optionally `clipboard.history.paste`, plus `submit + panel + ui.panel`. `clipboard.read` remains reserved and unsupported; it is not an alias for clipboard history.
 
@@ -152,6 +152,8 @@ Bundled test credentials are ordinary plugin code and can be inspected. API v1 s
 ### Panel Host Keys And Return
 
 `panel.hostKeys` is optional, contains at most eight unique declarations, and accepts only `ArrowDown`, `ArrowUp`, `Primary+N`, `Tab`, `Shift+Tab`, and `Enter`. Validators reject unknown values, duplicates, non-arrays, wrong element types, and extra panel properties. Canonical order is `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter`. `Tab`, `Shift+Tab`, and `Enter` require `minimumHostVersion >= 0.3.3`.
+
+`panel.hostKeyFocus` is optional and accepts only `content` or `host`. Omitted is equivalent to `content`, preserving the original behavior: before each Host Key delivery, the Host gives native focus to the Panel content WebView. `host` keeps native focus on the tagged launcher input while delivering the same frozen event and is intended for panels that use Host Keys only as list/category commands. An explicit value requires `minimumHostVersion >= 0.3.4`. Wrong types, `null`, unknown values, and extra properties fail closed. The setting does not change queue ordering, acknowledgement, timeout, teardown, or routed Enter paste authority.
 
 | Declaration | Launcher input match | Delivered `event.key` |
 | --- | --- | --- |

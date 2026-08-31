@@ -61,9 +61,28 @@ async function flush() {
 async function loadPanel({
   initialList = Promise.resolve(snapshot),
   paste = async () => ({ outcome: 'admitted' }),
+  scrollMetrics,
 } = {}) {
   const html = await readFile(panelHtmlUrl, 'utf8')
   const dom = new JSDOM(html, { url: 'https://panel.uipilot.invalid/' })
+  dom.window.requestAnimationFrame = (callback) => {
+    callback(0)
+    return 1
+  }
+  if (scrollMetrics) {
+    const historyList = dom.window.document.querySelector('#history-list')
+    const scrollbar = dom.window.document.querySelector('#history-list-scrollbar')
+    assert.ok(historyList)
+    assert.ok(scrollbar)
+    Object.defineProperties(historyList, {
+      clientHeight: { configurable: true, value: scrollMetrics.clientHeight },
+      scrollHeight: { configurable: true, value: scrollMetrics.scrollHeight },
+    })
+    Object.defineProperty(scrollbar, 'clientHeight', {
+      configurable: true,
+      value: scrollMetrics.trackHeight,
+    })
+  }
   const calls = {
     order: [],
     paste: [],
@@ -189,6 +208,13 @@ function activeFilter(panel) {
   return panel.document.querySelector('[role="tab"][aria-selected="true"]')?.dataset.filter ?? null
 }
 
+test('keeps the scrollable history list out of the sequential focus order', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+
+  assert.equal(panel.document.querySelector('#history-list')?.getAttribute('tabindex'), '-1')
+})
+
 test('cycles filters and clamps list selection with Host-routed keys', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
@@ -214,30 +240,62 @@ test('cycles filters and clamps list selection with Host-routed keys', async (t)
   assert.equal(selectedEntryId(panel), 'files-missing')
 })
 
-test('restores Host input focus after category changes so consecutive Tab remains routable', async (t) => {
+test('keeps Host input focus stable while consecutive Tab remains routable', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
 
   await panel.hostKey(hostKey('Tab', '17'))
   assert.equal(activeFilter(panel), 'image')
-  assert.equal(panel.calls.focusHostInput, 1)
+  assert.equal(panel.calls.focusHostInput, 0)
 
   await panel.hostKey(hostKey('Tab', '18'))
   assert.equal(activeFilter(panel), 'files')
-  assert.equal(panel.calls.focusHostInput, 2)
+  assert.equal(panel.calls.focusHostInput, 0)
 })
 
-test('restores Host input focus after list navigation so ArrowUp remains routable', async (t) => {
+test('keeps Host input focus stable while routed Arrow keys navigate the list', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
 
   await panel.hostKey(hostKey('ArrowDown', '17'))
   assert.equal(selectedEntryId(panel), 'image-1')
-  assert.equal(panel.calls.focusHostInput, 1)
+  assert.equal(panel.calls.focusHostInput, 0)
 
   await panel.hostKey(hostKey('ArrowUp', '18'))
   assert.equal(selectedEntryId(panel), 'text-1')
-  assert.equal(panel.calls.focusHostInput, 2)
+  assert.equal(panel.calls.focusHostInput, 0)
+})
+
+test('shows a Notes-style virtual scrollbar and mirrors list scrolling', async (t) => {
+  const panel = await loadPanel({
+    scrollMetrics: { clientHeight: 100, scrollHeight: 400, trackHeight: 100 },
+  })
+  t.after(panel.cleanup)
+
+  const shell = panel.document.querySelector('.history-list-shell')
+  const list = panel.document.querySelector('#history-list')
+  const scrollbar = panel.document.querySelector('#history-list-scrollbar')
+  const thumb = panel.document.querySelector('#history-list-scrollbar-thumb')
+  assert.ok(shell)
+  assert.ok(list)
+  assert.ok(scrollbar)
+  assert.ok(thumb)
+  assert.equal(shell.classList.contains('is-scrollable'), true)
+  assert.equal(thumb.style.height, '25px')
+  assert.equal(thumb.style.transform, 'translateY(0px)')
+
+  list.scrollTop = 150
+  list.dispatchEvent(new panel.document.defaultView.Event('scroll'))
+  assert.equal(thumb.style.transform, 'translateY(37.5px)')
+
+  const wheel = new panel.document.defaultView.WheelEvent('wheel', {
+    bubbles: true,
+    cancelable: true,
+    deltaY: 25,
+  })
+  scrollbar.dispatchEvent(wheel)
+  assert.equal(wheel.defaultPrevented, true)
+  assert.equal(list.scrollTop, 175)
 })
 
 test('pastes the selected entry once and ignores later snapshots after admission', async (t) => {

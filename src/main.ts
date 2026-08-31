@@ -120,6 +120,7 @@ export const client: LauncherClient = {
   setPublicPluginEnabled: async (input) => { await invoke('set_plugin_enabled', input) },
   setPublicPluginNetworkAccess: async (input) => { await invoke('set_public_plugin_network_access', input) },
   setPublicPluginFavorite: async (input) => { await invoke('set_plugin_favorite', input) },
+  setBuiltinFeatureFavorite: async (input) => { await invoke('set_builtin_feature_favorite', { input }) },
   setPublicPluginEffectiveName: async (input) => { await invoke('set_plugin_effective_name', input) },
   savePublicPluginSettings: async (input) => { await invoke('save_plugin_settings', input) },
   uninstallPublicPlugin: async (input) => { await invoke('uninstall_plugin', input) },  listPlugins: async () => {

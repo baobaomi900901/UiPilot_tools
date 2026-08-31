@@ -54,8 +54,8 @@ pub(crate) use activation::{
 pub(crate) use alarm_asset::AlarmAssetIdentity;
 pub(crate) use alarm_asset::{PreparedAlarmAsset, ValidatedAlarmAsset};
 pub(crate) use manifest::{
-    public_manifest_v1_schema, valid_plugin_id, PanelHostKeyDeclaration, PublicActivationMode,
-    PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
+    public_manifest_v1_schema, valid_plugin_id, PanelHostKeyDeclaration, PanelHostKeyFocus,
+    PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
 };
 pub(crate) use network::{PluginNetworkErrorCode, PluginNetworkResponse};
 #[cfg(test)]
@@ -1172,7 +1172,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 3, 3],
+            version: [0, 3, 4],
             api_version: 1,
         }
     }

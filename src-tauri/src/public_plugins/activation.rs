@@ -33,8 +33,8 @@ use super::{
     delayed_messages::{DelayedMessageScheduler, ScheduledPluginMessage},
     icon::{self, IconRequest, ICON_PATH},
     manifest::{
-        valid_plugin_id, PanelHostKeyDeclaration, PublicActivationMode, PublicOutputMode,
-        PublicPermission, PublicSettingV1,
+        valid_plugin_id, PanelHostKeyDeclaration, PanelHostKeyFocus, PublicActivationMode,
+        PublicOutputMode, PublicPermission, PublicSettingV1,
     },
     network::{
         PluginNetworkAuthorityGate, PluginNetworkAuthoritySnapshot, PluginNetworkErrorCode,
@@ -180,6 +180,7 @@ pub(crate) struct PublicPluginRoute {
     pub(crate) window_entry: Option<String>,
     pub(crate) panel_entry: Option<String>,
     pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
+    pub(crate) host_key_focus: PanelHostKeyFocus,
     pub(crate) icon_url: Option<String>,
 }
 
@@ -2311,6 +2312,12 @@ impl PublicPluginManager {
                     .as_ref()
                     .map(|panel| panel.canonical_host_keys())
                     .unwrap_or_default(),
+                host_key_focus: snapshot
+                    .manifest
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.host_key_focus())
+                    .unwrap_or(PanelHostKeyFocus::Content),
                 icon_url: snapshot.icon_url(),
             }));
         }
@@ -2374,6 +2381,12 @@ impl PublicPluginManager {
                     .as_ref()
                     .map(|panel| panel.canonical_host_keys())
                     .unwrap_or_default(),
+                host_key_focus: snapshot
+                    .manifest
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.host_key_focus())
+                    .unwrap_or(PanelHostKeyFocus::Content),
                 icon_url: snapshot.icon_url(),
             }));
         }
@@ -6521,6 +6534,7 @@ mod tests {
                 window_entry: None,
                 panel_entry: None,
                 host_keys: Vec::new(),
+                host_key_focus: PanelHostKeyFocus::Content,
                 icon_url: None,
             }
         );

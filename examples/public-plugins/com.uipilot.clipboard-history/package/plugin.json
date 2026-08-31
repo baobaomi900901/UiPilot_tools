@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "pluginId": "com.uipilot.clipboard-history",
-  "version": "1.0.4",
+  "version": "1.0.7",
   "apiVersion": 1,
-  "minimumHostVersion": "0.3.3",
+  "minimumHostVersion": "0.3.4",
   "name": "剪贴板历史",
   "description": "查看并重新粘贴 UiPilot 运行期间保存的最近 20 条剪贴板记录。",
   "supportedPlatforms": ["windows"],
@@ -20,7 +20,8 @@
   },
   "panel": {
     "entry": "dist/panel.html",
-    "hostKeys": ["ArrowDown", "ArrowUp", "Tab", "Shift+Tab", "Enter"]
+    "hostKeys": ["ArrowDown", "ArrowUp", "Tab", "Shift+Tab", "Enter"],
+    "hostKeyFocus": "host"
   },
   "permissions": ["ui.panel", "clipboard.history.read", "clipboard.history.paste"],
   "settings": []

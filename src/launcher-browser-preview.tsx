@@ -153,6 +153,10 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
           initialArgument: '',
           favorite: false,
         },
+        favorite: {
+          target: { kind: 'publicPlugin', pluginId: panelPreviewPluginId },
+          favorite: false,
+        },
         hasDefaultAction: false,
       }],
     }
@@ -240,6 +244,7 @@ const client: LauncherClient = {
   setPublicPluginEnabled: async () => undefined,
   setPublicPluginNetworkAccess: async () => undefined,
   setPublicPluginFavorite: async () => undefined,
+  setBuiltinFeatureFavorite: async () => undefined,
   setPublicPluginEffectiveName: async () => undefined,
   savePublicPluginSettings: async () => undefined,
   uninstallPublicPlugin: async () => undefined,

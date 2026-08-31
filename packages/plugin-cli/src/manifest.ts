@@ -18,6 +18,7 @@ export type PublicPermission =
   | 'background.schedule'
 
 export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter'
+export type PanelHostKeyFocus = 'content' | 'host'
 
 export interface PublicNetworkV1 {
   httpsHosts: string[]
@@ -42,7 +43,11 @@ export interface PublicManifestV1 {
   }
   runtime: { entry: string }
   window?: { entry: string } | null
-  panel?: { entry: string; hostKeys?: PanelHostKeyDeclaration[] } | null
+  panel?: {
+    entry: string
+    hostKeys?: PanelHostKeyDeclaration[]
+    hostKeyFocus?: PanelHostKeyFocus
+  } | null
   network?: PublicNetworkV1
   permissions: PublicPermission[]
   settings?: PublicSettingV1[]
@@ -379,11 +384,12 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 3, 3]) ||
+    versionGreater(minimumHost, [0, 3, 4]) ||
     (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
     ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost)) ||
     ((manifest.panel?.hostKeys ?? []).some((key) => key === 'Tab' || key === 'Shift+Tab' || key === 'Enter') &&
       versionGreater([0, 3, 3], minimumHost)) ||
+    (manifest.panel?.hostKeyFocus !== undefined && versionGreater([0, 3, 4], minimumHost)) ||
     ((manifest.permissions.includes('clipboard.history.read') ||
       manifest.permissions.includes('clipboard.history.paste')) &&
       versionGreater([0, 3, 3], minimumHost)) ||

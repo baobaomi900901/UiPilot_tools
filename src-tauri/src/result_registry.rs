@@ -727,6 +727,7 @@ mod tests {
             plugin_icon_url: None,
             icon_kind: None,
             detail: None,
+            favorite: None,
             has_default_action: true,
         }
     }

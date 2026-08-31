@@ -9,7 +9,10 @@ import {
 const panel = window.uipilotPluginPanel
 const tabs = [...document.querySelectorAll('[data-filter]')]
 const historyCount = document.querySelector('#history-count')
+const historyListShell = document.querySelector('.history-list-shell')
 const historyList = document.querySelector('#history-list')
+const historyListScrollbar = document.querySelector('#history-list-scrollbar')
+const historyListScrollbarThumb = document.querySelector('#history-list-scrollbar-thumb')
 const emptyState = document.querySelector('#empty-state')
 const status = document.querySelector('#status')
 const clearHistory = document.querySelector('#clear-history')
@@ -34,6 +37,97 @@ const EMPTY_TITLES = Object.freeze({
   image: '暂无图片记录',
   files: '暂无文件记录',
   text: '暂无文字记录',
+})
+
+function createVirtualScrollbar({ scrollable, surface, track, thumb }) {
+  let updateScheduled = false
+  let drag = null
+
+  function update() {
+    const scrollRange = scrollable.scrollHeight - scrollable.clientHeight
+    const trackHeight = track.clientHeight
+    if (scrollRange <= 1 || trackHeight <= 0) {
+      surface.classList.remove('is-scrollable')
+      thumb.style.height = ''
+      thumb.style.transform = ''
+      return
+    }
+
+    const thumbHeight = Math.max(24, trackHeight * scrollable.clientHeight / scrollable.scrollHeight)
+    const thumbRange = Math.max(0, trackHeight - thumbHeight)
+    const thumbTop = thumbRange * scrollable.scrollTop / scrollRange
+    thumb.style.height = `${thumbHeight}px`
+    thumb.style.transform = `translateY(${thumbTop}px)`
+    surface.classList.add('is-scrollable')
+  }
+
+  function schedule() {
+    if (updateScheduled) return
+    updateScheduled = true
+    window.requestAnimationFrame(() => {
+      updateScheduled = false
+      update()
+    })
+  }
+
+  scrollable.addEventListener('scroll', schedule, { passive: true })
+  track.addEventListener('wheel', (event) => {
+    event.preventDefault()
+    scrollable.scrollTop += event.deltaY
+  }, { passive: false })
+  track.addEventListener('pointerdown', (event) => {
+    if (event.target === thumb) return
+    event.preventDefault()
+    const trackRect = track.getBoundingClientRect()
+    const thumbRect = thumb.getBoundingClientRect()
+    const thumbRange = Math.max(0, trackRect.height - thumbRect.height)
+    const scrollRange = Math.max(0, scrollable.scrollHeight - scrollable.clientHeight)
+    if (thumbRange === 0 || scrollRange === 0) return
+    const thumbTop = Math.min(
+      thumbRange,
+      Math.max(0, event.clientY - trackRect.top - thumbRect.height / 2),
+    )
+    scrollable.scrollTop = scrollRange * thumbTop / thumbRange
+  })
+  thumb.addEventListener('pointerdown', (event) => {
+    event.preventDefault()
+    drag = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startScrollTop: scrollable.scrollTop,
+    }
+    thumb.classList.add('is-dragging')
+    thumb.setPointerCapture?.(event.pointerId)
+  })
+  thumb.addEventListener('pointermove', (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const thumbRange = track.clientHeight - thumb.clientHeight
+    const scrollRange = scrollable.scrollHeight - scrollable.clientHeight
+    if (thumbRange <= 0 || scrollRange <= 0) return
+    scrollable.scrollTop = drag.startScrollTop
+      + (event.clientY - drag.startY) * scrollRange / thumbRange
+  })
+
+  function finishDrag(event) {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    drag = null
+    thumb.classList.remove('is-dragging')
+    if (event.type !== 'lostpointercapture' && thumb.hasPointerCapture?.(event.pointerId)) {
+      thumb.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  thumb.addEventListener('pointerup', finishDrag)
+  thumb.addEventListener('pointercancel', finishDrag)
+  thumb.addEventListener('lostpointercapture', finishDrag)
+  return Object.freeze({ schedule })
+}
+
+const historyListVirtualScrollbar = createVirtualScrollbar({
+  scrollable: historyList,
+  surface: historyListShell,
+  track: historyListScrollbar,
+  thumb: historyListScrollbarThumb,
 })
 
 function setStatus(message, tone = '') {
@@ -158,6 +252,7 @@ function render() {
   document.querySelector('#empty-title').textContent = EMPTY_TITLES[activeFilter]
   emptyState.hidden = visibleEntries.length !== 0
   historyList.querySelector('[aria-selected="true"]')?.scrollIntoView?.({ block: 'nearest' })
+  historyListVirtualScrollbar.schedule()
 }
 
 function setFilter(nextFilter) {
@@ -206,17 +301,14 @@ panel.onHostKey(async (event) => {
   if (sessionLeaving) return
   if (event.key === 'Tab') {
     setFilter(cycleFilter(activeFilter, event.shiftKey ? -1 : 1))
-    await panel.focusHostInput()
     return
   }
   if (event.key === 'ArrowUp') {
     moveVisibleSelection(-1)
-    await panel.focusHostInput()
     return
   }
   if (event.key === 'ArrowDown') {
     moveVisibleSelection(1)
-    await panel.focusHostInput()
     return
   }
   if (event.key === 'Enter') {
@@ -227,6 +319,7 @@ panel.onUpdate((update) => {
   document.documentElement.dataset.theme = update.theme
 })
 panel.clipboardHistory.onChanged(applySnapshot)
+window.addEventListener('resize', historyListVirtualScrollbar.schedule)
 void panel.clipboardHistory.list().then(applySnapshot).catch(() => {
   if (sessionLeaving) return
   historyCount.textContent = '读取失败'

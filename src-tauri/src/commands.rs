@@ -37,7 +37,10 @@ use crate::{
     message_center::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
     },
-    model::{LauncherResultActivation, MainResultCommandContext, ResultIconKind, SearchResponse},
+    model::{
+        LauncherResultActivation, MainResultCommandContext, ResultFavorite, ResultIconKind,
+        SearchResponse,
+    },
     plugin_panel::{
         self, HostInputFocusAdvance, HostInputFocusIdentity, HostInputFocusOutcome,
         HostKeyEnqueueInput, HostKeyEnqueueOutcome, PanelAdmissionError, PanelBounds,
@@ -68,8 +71,8 @@ use crate::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
     },
     settings::{
-        SettingsError, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine,
-        WindowPosition,
+        BuiltinFeature, SettingsError, SettingsStore, SettingsUpdate, ThemePreference,
+        WebSearchEngine, WindowPosition,
     },
     window_transfer::MainWindowTransferCoordinator,
 };
@@ -131,6 +134,13 @@ pub(crate) struct ThemePreferenceUpdate {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct WebSearchEngineUpdate {
     engine: WebSearchEngine,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct BuiltinFeatureFavoriteUpdate {
+    feature: BuiltinFeature,
+    favorite: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -2478,6 +2488,7 @@ fn panel_route_matches_identity(
         && route.command_label == identity.command_label
         && route.panel_entry.is_some()
         && route.host_keys == identity.host_keys
+        && route.host_key_focus == identity.host_key_focus
 }
 
 fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandResult {
@@ -2833,6 +2844,7 @@ async fn open_plugin_panel_impl(
         submission_token: String::new(),
         argument: input.argument.clone(),
         host_keys: route.host_keys.clone(),
+        host_key_focus: route.host_key_focus,
     };
     let mount_app = app.clone();
     let mount_controller = Arc::clone(controller.inner());
@@ -2916,7 +2928,8 @@ pub(crate) async fn search_apps(
     let settings = app.state::<SettingsStore>();
     let public = app.state::<Arc<PublicPluginService>>();
     let normalized_query = query.trim().to_owned();
-    let web_search_engine = settings.snapshot().web_search_engine;
+    let settings_snapshot = settings.snapshot();
+    let web_search_engine = settings_snapshot.web_search_engine;
     if completion_origin.is_none()
         && (!normalized_query.starts_with('/') || normalized_query == "/")
     {
@@ -2927,6 +2940,7 @@ pub(crate) async fn search_apps(
                 invocation_id: &invocation_id,
                 query_sequence,
                 web_search_engine,
+                favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
             },
             |plain_query| public.manager()?.launcher_command_suggestions(plain_query),
             || cache.snapshot(),
@@ -2946,6 +2960,7 @@ pub(crate) async fn search_apps(
                 invocation_id: &invocation_id,
                 query_sequence,
                 web_search_engine,
+                favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
             },
             |_| Ok(Vec::new()),
             Vec::new,
@@ -3292,6 +3307,7 @@ fn publish_public_main_results(
                     plugin_icon_url: route.icon_url.clone(),
                     icon_kind: None,
                     detail: result.detail,
+                    favorite: None,
                     has_default_action: action.is_some(),
                 },
                 action,
@@ -3356,6 +3372,7 @@ struct CatalogSearchRequest<'a> {
     invocation_id: &'a str,
     query_sequence: u64,
     web_search_engine: WebSearchEngine,
+    favorite_builtin_features: &'a BTreeSet<BuiltinFeature>,
 }
 
 fn search_apps_with<S, D>(
@@ -3371,6 +3388,7 @@ where
     S: FnOnce() -> Vec<Application>,
     D: FnOnce(&mut [Application]),
 {
+    let favorite_builtin_features = BTreeSet::new();
     search_apps_with_catalog(
         registry,
         CatalogSearchRequest {
@@ -3378,6 +3396,7 @@ where
             invocation_id,
             query_sequence,
             web_search_engine,
+            favorite_builtin_features: &favorite_builtin_features,
         },
         |_| Ok(Vec::new()),
         snapshot,
@@ -3405,10 +3424,67 @@ fn completion_result(
             plugin_icon_url,
             icon_kind,
             detail: None,
+            favorite: None,
             has_default_action: false,
         },
         None,
     ))
+}
+
+fn builtin_completion_result(
+    command: &str,
+    subtitle: String,
+    icon_kind: ResultIconKind,
+    feature: BuiltinFeature,
+    favorite: bool,
+) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
+    let (mut item, action) = completion_result(command, subtitle, Some(icon_kind), None, None)?;
+    item.favorite = Some(ResultFavorite::builtin(feature, favorite));
+    Some((item, action))
+}
+
+fn find_result(
+    query: String,
+    subtitle: String,
+    favorite: bool,
+) -> (crate::model::ResultItem, Option<ResultAction>) {
+    (
+        crate::model::ResultItem {
+            result_id: String::new(),
+            activation: LauncherResultActivation::OpenFind { query },
+            title: "/find".into(),
+            subtitle: Some(subtitle),
+            icon: None,
+            plugin_icon_url: None,
+            icon_kind: Some(ResultIconKind::Find),
+            detail: None,
+            favorite: Some(ResultFavorite::builtin(BuiltinFeature::Find, favorite)),
+            has_default_action: false,
+        },
+        None,
+    )
+}
+
+fn web_search_result(
+    engine: WebSearchEngine,
+    query: String,
+    favorite: bool,
+) -> (crate::model::ResultItem, Option<ResultAction>) {
+    (
+        crate::model::ResultItem {
+            result_id: String::new(),
+            activation: LauncherResultActivation::ExecuteResult,
+            title: crate::web_search::search_result_title(engine).into(),
+            subtitle: Some(format!("搜索：{query}")),
+            icon: None,
+            plugin_icon_url: None,
+            icon_kind: Some(ResultIconKind::WebSearch),
+            detail: None,
+            favorite: Some(ResultFavorite::builtin(BuiltinFeature::WebSearch, favorite)),
+            has_default_action: true,
+        },
+        Some(ResultAction::OpenWebSearch { engine, query }),
+    )
 }
 
 fn public_plugin_completion_result(
@@ -3441,6 +3517,8 @@ fn public_plugin_completion_result(
             suggestion.favorite,
         )?,
     };
+    let favorite =
+        ResultFavorite::public_plugin(suggestion.plugin_id.clone(), suggestion.favorite)?;
     Some((
         crate::model::ResultItem {
             result_id: String::new(),
@@ -3451,6 +3529,7 @@ fn public_plugin_completion_result(
             plugin_icon_url: suggestion.icon_url,
             icon_kind: None,
             detail: None,
+            favorite: Some(favorite),
             has_default_action: false,
         },
         None,
@@ -3490,6 +3569,7 @@ where
             plugin_icon_url: None,
             icon_kind: Some(ResultIconKind::Calculator),
             detail: None,
+            favorite: None,
             has_default_action: true,
         };
         return registry.publish_if_latest(
@@ -3517,30 +3597,34 @@ where
     let mut replace_local_results = false;
     let mut entries: Vec<(crate::model::ResultItem, Option<ResultAction>)> = Vec::new();
     let catalog_query = if query == "/" { "" } else { query };
-    if query == "/web-search" {
+    let find_favorite = request
+        .favorite_builtin_features
+        .contains(&BuiltinFeature::Find);
+    let web_search_favorite = request
+        .favorite_builtin_features
+        .contains(&BuiltinFeature::WebSearch);
+    if query == "/find" {
+        entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
+        replace_local_results = true;
+    } else if query == "/web-search" {
         command_hint = Some("请输入搜索内容".into());
+        entries.extend(builtin_completion_result(
+            "web-search",
+            "使用默认搜索引擎搜索".into(),
+            ResultIconKind::WebSearch,
+            BuiltinFeature::WebSearch,
+            web_search_favorite,
+        ));
         replace_local_results = true;
     } else if let Some(argument) = query.strip_prefix("/web-search ") {
         let argument = argument.trim();
         if argument.is_empty() {
             command_hint = Some("请输入搜索内容".into());
         } else {
-            entries.push((
-                crate::model::ResultItem {
-                    result_id: String::new(),
-                    activation: LauncherResultActivation::ExecuteResult,
-                    title: crate::web_search::search_result_title(request.web_search_engine).into(),
-                    subtitle: Some(format!("搜索：{argument}")),
-                    icon: None,
-                    plugin_icon_url: None,
-                    icon_kind: Some(ResultIconKind::WebSearch),
-                    detail: None,
-                    has_default_action: true,
-                },
-                Some(ResultAction::OpenWebSearch {
-                    engine: request.web_search_engine,
-                    query: argument.to_owned(),
-                }),
+            entries.push(web_search_result(
+                request.web_search_engine,
+                argument.to_owned(),
+                web_search_favorite,
             ));
         }
         replace_local_results = true;
@@ -3556,28 +3640,13 @@ where
                 .then_with(|| left.plugin_id.cmp(&right.plugin_id))
         });
         if catalog_query.is_empty() {
-            entries.push((
-                crate::model::ResultItem {
-                    result_id: String::new(),
-                    activation: LauncherResultActivation::OpenFind {
-                        query: String::new(),
-                    },
-                    title: "/find".into(),
-                    subtitle: Some("搜索文件".into()),
-                    icon: None,
-                    plugin_icon_url: None,
-                    icon_kind: Some(ResultIconKind::Find),
-                    detail: None,
-                    has_default_action: false,
-                },
-                None,
-            ));
-            entries.extend(completion_result(
+            entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
+            entries.extend(builtin_completion_result(
                 "web-search",
                 "使用默认搜索引擎搜索".into(),
-                Some(ResultIconKind::WebSearch),
-                None,
-                None,
+                ResultIconKind::WebSearch,
+                BuiltinFeature::WebSearch,
+                web_search_favorite,
             ));
         } else {
             for suggestion in suggestions
@@ -3590,38 +3659,15 @@ where
                     Some(catalog_query),
                 ));
             }
-            entries.push((
-                crate::model::ResultItem {
-                    result_id: String::new(),
-                    activation: LauncherResultActivation::OpenFind {
-                        query: catalog_query.to_owned(),
-                    },
-                    title: "/find".into(),
-                    subtitle: Some(format!("搜索文件：{catalog_query}")),
-                    icon: None,
-                    plugin_icon_url: None,
-                    icon_kind: Some(ResultIconKind::Find),
-                    detail: None,
-                    has_default_action: false,
-                },
-                None,
+            entries.push(find_result(
+                catalog_query.to_owned(),
+                format!("搜索文件：{catalog_query}"),
+                find_favorite,
             ));
-            entries.push((
-                crate::model::ResultItem {
-                    result_id: String::new(),
-                    activation: LauncherResultActivation::ExecuteResult,
-                    title: crate::web_search::search_result_title(request.web_search_engine).into(),
-                    subtitle: Some(format!("搜索：{query}")),
-                    icon: None,
-                    plugin_icon_url: None,
-                    icon_kind: Some(ResultIconKind::WebSearch),
-                    detail: None,
-                    has_default_action: true,
-                },
-                Some(ResultAction::OpenWebSearch {
-                    engine: request.web_search_engine,
-                    query: catalog_query.to_owned(),
-                }),
+            entries.push(web_search_result(
+                request.web_search_engine,
+                catalog_query.to_owned(),
+                web_search_favorite,
             ));
         }
         for suggestion in suggestions {
@@ -3648,6 +3694,19 @@ where
                     .map(apps::registry_entry)
                     .map(|(item, action)| (item, Some(action))),
             );
+        }
+        if catalog_query.is_empty() {
+            entries.sort_by(|(left, _), (right, _)| {
+                let left_favorite = left
+                    .favorite
+                    .as_ref()
+                    .is_some_and(|favorite| favorite.favorite);
+                let right_favorite = right
+                    .favorite
+                    .as_ref()
+                    .is_some_and(|favorite| favorite.favorite);
+                right_favorite.cmp(&left_favorite)
+            });
         }
     }
 
@@ -4061,6 +4120,30 @@ pub(crate) async fn set_web_search_engine(
         app_for_worker
             .state::<SettingsStore>()
             .set_web_search_engine(preference.engine)
+            .map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ());
+    map_theme_preference_worker_result(result)
+}
+
+#[tauri::command]
+pub(crate) async fn set_builtin_feature_favorite(
+    window: tauri::WebviewWindow,
+    input: BuiltinFeatureFavoriteUpdate,
+    app: tauri::AppHandle,
+    coordinator: tauri::State<'_, std::sync::Arc<LifecycleCoordinator>>,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    let reservation = coordinator
+        .reserve_critical()
+        .map_err(|_| CommandError::settings_failed())?;
+    let app_for_worker = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _reservation = reservation;
+        app_for_worker
+            .state::<SettingsStore>()
+            .set_builtin_feature_favorite(input.feature, input.favorite)
             .map_err(|_| ())
     })
     .await
@@ -4649,7 +4732,7 @@ where
 mod tests {
     use std::{
         cell::{Cell, RefCell},
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
         sync::{
@@ -4695,7 +4778,10 @@ mod tests {
             PublicPluginRoute, TimerError, WindowStorageError,
         },
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
-        settings::{Settings, SettingsStore, SettingsUpdate, ThemePreference, WebSearchEngine},
+        settings::{
+            BuiltinFeature, Settings, SettingsStore, SettingsUpdate, ThemePreference,
+            WebSearchEngine,
+        },
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
@@ -4988,6 +5074,7 @@ mod tests {
             window_entry: None,
             panel_entry: None,
             host_keys: Vec::new(),
+            host_key_focus: crate::public_plugins::PanelHostKeyFocus::Content,
             icon_url: None,
         };
         assert!(submitted_main_result_command(&route, false).is_none());
@@ -5063,6 +5150,7 @@ mod tests {
             window_entry: None,
             panel_entry: None,
             host_keys: Vec::new(),
+            host_key_focus: crate::public_plugins::PanelHostKeyFocus::Content,
             icon_url: None,
         };
         let preview = CompletionOriginInput {
@@ -5265,6 +5353,7 @@ mod tests {
                 invocation_id: "launcher-empty",
                 query_sequence: 1,
                 web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
             },
             |_| {
                 Ok(vec![
@@ -5305,6 +5394,88 @@ mod tests {
     }
 
     #[test]
+    fn launcher_builtin_commands_are_favoritable_and_exact_queries_keep_their_item() {
+        let favorites = BTreeSet::from([BuiltinFeature::Find, BuiltinFeature::WebSearch]);
+        for (query, expected_title, expected_feature, expected_hint) in [
+            ("/find", "/find", "find", None),
+            (
+                "/web-search",
+                "/web-search",
+                "webSearch",
+                Some("请输入搜索内容"),
+            ),
+        ] {
+            let registry = ready_registry("builtin-exact");
+            let response = search_apps_with_catalog(
+                &registry,
+                CatalogSearchRequest {
+                    query,
+                    invocation_id: "builtin-exact",
+                    query_sequence: 1,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &favorites,
+                },
+                |_| panic!("reserved builtin command must not read plugin inventory"),
+                || panic!("reserved builtin command must not read applications"),
+                |_| {},
+            )
+            .unwrap();
+
+            assert_eq!(response.items.len(), 1);
+            assert_eq!(response.items[0].title, expected_title);
+            assert_eq!(response.command_hint.as_deref(), expected_hint);
+            assert_eq!(
+                serde_json::to_value(&response.items[0]).unwrap()["favorite"],
+                serde_json::json!({
+                    "target": { "kind": "builtin", "feature": expected_feature },
+                    "favorite": true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_empty_query_orders_all_favorites_before_all_other_features() {
+        let registry = ready_registry("launcher-favorite-groups");
+        let favorites = BTreeSet::from([BuiltinFeature::Find]);
+        let demo_title = format!("/{}", "demo-win");
+        let response = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "",
+                invocation_id: "launcher-favorite-groups",
+                query_sequence: 1,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &favorites,
+            },
+            |_| {
+                let mut favorite = command_suggestion("alpha");
+                favorite.favorite = true;
+                Ok(vec![command_suggestion("demo-win"), favorite])
+            },
+            || panic!("empty launcher query must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/find", "/alpha", "/web-search", demo_title.as_str()]
+        );
+        assert_eq!(
+            serde_json::to_value(&response.items[1]).unwrap()["favorite"],
+            serde_json::json!({
+                "target": { "kind": "publicPlugin", "pluginId": "com.example.alpha" },
+                "favorite": true,
+            })
+        );
+    }
+
+    #[test]
     fn launcher_slash_query_publishes_the_command_catalog_without_reading_applications() {
         let registry = ready_registry("launcher-slash");
         let response = search_apps_with_catalog(
@@ -5314,6 +5485,7 @@ mod tests {
                 invocation_id: "launcher-slash",
                 query_sequence: 1,
                 web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
             },
             |query| {
                 assert_eq!(query, "");
@@ -5345,6 +5517,7 @@ mod tests {
                 invocation_id: "launcher-plain",
                 query_sequence: 1,
                 web_search_engine: WebSearchEngine::Google,
+                favorite_builtin_features: &BTreeSet::new(),
             },
             |query| {
                 assert_eq!(query, "win");
@@ -5428,6 +5601,7 @@ mod tests {
                 invocation_id: "launcher-fallback",
                 query_sequence: 1,
                 web_search_engine: WebSearchEngine::Baidu,
+                favorite_builtin_features: &BTreeSet::new(),
             },
             |_| Err(crate::public_plugins::PublicPluginManagementError::Unavailable),
             || panic!("empty launcher query must not read applications"),
@@ -5450,6 +5624,7 @@ mod tests {
                 invocation_id: "launcher-fallback",
                 query_sequence: 2,
                 web_search_engine: WebSearchEngine::Baidu,
+                favorite_builtin_features: &BTreeSet::new(),
             },
             |_| panic!("reserved web command must not read plugin inventory"),
             || panic!("reserved web command must not read applications"),
@@ -5469,13 +5644,16 @@ mod tests {
                 invocation_id: "launcher-fallback",
                 query_sequence: 3,
                 web_search_engine: WebSearchEngine::Baidu,
+                favorite_builtin_features: &BTreeSet::new(),
             },
             |_| panic!("reserved web hint must not read plugin inventory"),
             || panic!("reserved web hint must not read applications"),
             |_| {},
         )
         .unwrap();
-        assert!(hint.items.is_empty());
+        assert_eq!(hint.items.len(), 1);
+        assert_eq!(hint.items[0].title, "/web-search");
+        assert_eq!(completion_text(&hint.items[0]), Some("/web-search "));
         assert_eq!(hint.command_hint.as_deref(), Some("请输入搜索内容"));
     }
 
@@ -5596,6 +5774,7 @@ mod tests {
             theme: ThemePreference::System,
             web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: true,
+            favorite_builtin_features: Default::default(),
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
             find_window_position: None,
@@ -5745,6 +5924,7 @@ mod tests {
                 crate::public_plugins::PanelHostKeyDeclaration::ArrowDown,
                 crate::public_plugins::PanelHostKeyDeclaration::PrimaryN,
             ],
+            host_key_focus: crate::public_plugins::PanelHostKeyFocus::Content,
         };
         let mut route = PublicPluginRoute {
             plugin_id: identity.plugin_id.clone(),
@@ -5762,6 +5942,7 @@ mod tests {
             window_entry: None,
             panel_entry: Some("dist/panel.html".into()),
             host_keys: identity.host_keys.clone(),
+            host_key_focus: identity.host_key_focus,
             icon_url: None,
         };
         assert!(panel_route_matches_identity(&route, &identity));
@@ -5769,6 +5950,9 @@ mod tests {
             serde_json::to_value(super::panel_command_result(&identity)).unwrap()["hostKeys"],
             serde_json::json!(["ArrowDown", "Primary+N"])
         );
+        route.host_key_focus = crate::public_plugins::PanelHostKeyFocus::Host;
+        assert!(!panel_route_matches_identity(&route, &identity));
+        route.host_key_focus = identity.host_key_focus;
         route
             .host_keys
             .push(crate::public_plugins::PanelHostKeyDeclaration::ArrowUp);
@@ -6320,6 +6504,7 @@ mod tests {
             submission_token: "token-a".into(),
             argument: "query".into(),
             host_keys: Vec::new(),
+            host_key_focus: crate::public_plugins::PanelHostKeyFocus::Content,
         }
     }
 
@@ -7143,7 +7328,7 @@ mod tests",
             .find("pub(crate) async fn set_web_search_engine(")
             .expect("set_web_search_engine command missing");
         let end = production[start..]
-            .find("async fn set_file_preview_preference_with")
+            .find("pub(crate) async fn set_builtin_feature_favorite(")
             .map(|offset| start + offset)
             .expect("set_web_search_engine command end missing");
         let command = &production[start..end];
@@ -7152,6 +7337,28 @@ mod tests",
         assert!(first.starts_with("require_main_window(&window)?;"));
         assert_eq!(command.matches(".state::<SettingsStore>()").count(), 1);
         assert!(!command.contains("reconcile_runtime_settings"));
+        let guard = command.find("require_main_window(&window)?;").unwrap();
+        for forbidden in ["reserve_critical", "state::<SettingsStore>"] {
+            assert!(guard < command.find(forbidden).unwrap());
+        }
+    }
+
+    #[test]
+    fn builtin_feature_favorite_command_is_narrow_and_guarded_first() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let start = production
+            .find("pub(crate) async fn set_builtin_feature_favorite(")
+            .expect("set_builtin_feature_favorite command missing");
+        let end = production[start..]
+            .find("async fn set_file_preview_preference_with")
+            .map(|offset| start + offset)
+            .expect("set_builtin_feature_favorite command end missing");
+        let command = &production[start..end];
+        let first = command[command.find('{').unwrap() + 1..].trim_start();
+
+        assert!(first.starts_with("require_main_window(&window)?;"));
+        assert_eq!(command.matches(".state::<SettingsStore>()").count(), 1);
         let guard = command.find("require_main_window(&window)?;").unwrap();
         for forbidden in ["reserve_critical", "state::<SettingsStore>"] {
             assert!(guard < command.find(forbidden).unwrap());

@@ -11,6 +11,13 @@
       ],
       "type": "string"
     },
+    "PanelHostKeyFocus": {
+      "enum": [
+        "content",
+        "host"
+      ],
+      "type": "string"
+    },
     "PublicActivationMode": {
       "enum": [
         "live",
@@ -88,6 +95,9 @@
       "properties": {
         "entry": {
           "type": "string"
+        },
+        "hostKeyFocus": {
+          "$ref": "#/$defs/PanelHostKeyFocus"
         },
         "hostKeys": {
           "default": [],

@@ -339,6 +339,7 @@ function fakeClient() {
     setPublicPluginEnabled: vi.fn(async () => undefined),
     setPublicPluginNetworkAccess: vi.fn(async () => undefined),
     setPublicPluginFavorite: vi.fn(async () => undefined),
+    setBuiltinFeatureFavorite: vi.fn(async () => undefined),
     setPublicPluginEffectiveName: vi.fn(async () => undefined),
     savePublicPluginSettings: vi.fn(async () => undefined),
     uninstallPublicPlugin: vi.fn(async () => undefined),    listPlugins: vi.fn(async () => pluginInventory()),
@@ -395,6 +396,10 @@ function panelItem(initialArgument: string, pluginId = 'com.uipilot.demo-panel')
       initialArgument,
       favorite: false,
     },
+    favorite: {
+      target: { kind: 'publicPlugin' as const, pluginId },
+      favorite: false,
+    },
     hasDefaultAction: false,
   }
 }
@@ -408,6 +413,10 @@ function findLauncherItem(query: string) {
     subtitle: query ? `搜索文件：${query}` : '搜索文件',
     iconKind: 'find' as const,
     activation: { kind: 'openFind' as const, query },
+    favorite: {
+      target: { kind: 'builtin' as const, feature: 'find' as const },
+      favorite: false,
+    },
     hasDefaultAction: false,
   }
 }
@@ -2612,6 +2621,10 @@ describe('shown and search ownership', () => {
           kind: 'pluginCompletion', completionText: '/demo-win abc',
           pluginId: 'com.uipilot.demo-win', favorite,
         },
+        favorite: {
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          favorite,
+        },
       }] : [],
     } as unknown as SearchResponse))
     emit(shown('favorite-current'))
@@ -2631,10 +2644,42 @@ describe('shown and search ownership', () => {
     mutation.resolve()
     await mutation.promise
     await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledTimes(2))
-    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.pluginCompletion?.favorite).toBe(true))
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.favorite?.favorite).toBe(true))
     expect(core.getSnapshot()).toMatchObject({ query: 'abc', status: '', favoriteMutationPending: false })
     expect(client.executeResult).not.toHaveBeenCalled()
     expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('persists a builtin favorite without optimistic state and refreshes the current query', async () => {
+    const { core, client, emit } = await startedCore()
+    const mutation = deferred<void>()
+    let favorite = false
+    vi.mocked(client.setBuiltinFeatureFavorite).mockReturnValueOnce(mutation.promise)
+    vi.mocked(client.searchApps).mockImplementation(async (request) => ({
+      requestId: `builtin-favorite-${request.querySequence}`,
+      items: request.query === '' ? [{
+        ...findLauncherItem(''),
+        favorite: {
+          target: { kind: 'builtin', feature: 'find' },
+          favorite,
+        },
+      }] : [],
+    } as unknown as SearchResponse))
+    emit(shown('builtin-favorite-current'))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.openPluginContextMenu(0)
+    core.setPluginFavorite(0, true)
+    core.closePluginContextMenu()
+    expect(client.setBuiltinFeatureFavorite).toHaveBeenCalledWith({ feature: 'find', favorite: true })
+    expect(core.getSnapshot().results[0]?.favorite?.favorite).toBe(false)
+    expect(core.getSnapshot().favoriteMutationPending).toBe(true)
+
+    favorite = true
+    mutation.resolve()
+    await mutation.promise
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.favorite?.favorite).toBe(true))
+    expect(core.getSnapshot()).toMatchObject({ query: '', status: '', favoriteMutationPending: false })
   })
 
   it('removes a nonmatching plugin from the captured plain query after cancelling favorite', async () => {
@@ -2648,6 +2693,10 @@ describe('shown and search ownership', () => {
         activation: {
           kind: 'pluginCompletion', completionText: '/demo-win unrelated',
           pluginId: 'com.uipilot.demo-win', favorite: true,
+        },
+        favorite: {
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          favorite: true,
         },
       }] : [],
     } as unknown as SearchResponse))
@@ -2679,6 +2728,10 @@ describe('shown and search ownership', () => {
           kind: 'pluginCompletion', completionText: '/demo-win abc',
           pluginId: 'com.uipilot.demo-win', favorite: false,
         },
+        favorite: {
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          favorite: false,
+        },
       }] : [],
     } as unknown as SearchResponse))
     emit(shown('favorite-current-failure'))
@@ -2709,12 +2762,20 @@ describe('shown and search ownership', () => {
               kind: 'pluginCompletion', completionText: '/demo-a abc',
               pluginId: 'com.uipilot.demo-a', favorite: false,
             },
+            favorite: {
+              target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-a' },
+              favorite: false,
+            },
           },
           {
             resultId: 'second', title: '/demo-b',
             activation: {
               kind: 'pluginCompletion', completionText: '/demo-b abc',
               pluginId: 'com.uipilot.demo-b', favorite: false,
+            },
+            favorite: {
+              target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-b' },
+              favorite: false,
             },
           },
         ] : [],
@@ -4104,6 +4165,112 @@ describe('execute and hide continuation', () => {
 })
 
 describe('React view and accessibility', () => {
+  it('groups empty-query favorites without duplicating results and keeps nonempty searches flat', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
+      requestId: `feature-groups-${request.querySequence}`,
+      items: request.query === '' ? [
+        {
+          ...findLauncherItem(''),
+          favorite: { target: { kind: 'builtin', feature: 'find' }, favorite: true },
+        },
+        {
+          resultId: 'favorite-plugin',
+          title: '/favorite-plugin',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/favorite-plugin ',
+            pluginId: 'com.uipilot.favorite-plugin', favorite: true,
+          },
+          favorite: {
+            target: { kind: 'publicPlugin', pluginId: 'com.uipilot.favorite-plugin' },
+            favorite: true,
+          },
+        },
+        {
+          resultId: 'web-search',
+          title: '/web-search',
+          iconKind: 'webSearch',
+          activation: { kind: 'completion', completionText: '/web-search ' },
+          favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite: false },
+        },
+        { resultId: 'app', title: 'Demo App', activation: executeActivation },
+      ] : [{ resultId: 'app-search', title: 'Matched App', activation: executeActivation }],
+    } as unknown as SearchResponse))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('feature-groups')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
+
+    const sections = [...mounted.host.querySelectorAll<HTMLElement>('.result-section')]
+    expect(sections.map((section) => section.querySelector('.result-section-title')?.textContent)).toEqual([
+      '常用', '所有功能',
+    ])
+    expect(stylesSource).toMatch(
+      /\.result-section-title\s*\{[^}]*color:\s*var\(--uipilot-ui-muted-foreground\);[^}]*font-weight:\s*400;/s,
+    )
+    expect([...sections[0]!.querySelectorAll('.result-title')].map((node) => node.textContent)).toEqual([
+      '/find', '/favorite-plugin',
+    ])
+    expect([...sections[1]!.querySelectorAll('.result-title')].map((node) => node.textContent)).toEqual([
+      '/web-search', 'Demo App',
+    ])
+    expect([...mounted.host.querySelectorAll('.result-title')].map((node) => node.textContent)).toEqual([
+      '/find', '/favorite-plugin', '/web-search', 'Demo App',
+    ])
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'matched', inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+    expect(mounted.host.querySelector('.result-section')).toBeNull()
+    expect(mounted.host.querySelector('[role="option"]')?.textContent).toContain('Matched App')
+    await mounted.unmount()
+  })
+
+  it('keeps the first result group heading visible when keyboard selection wraps to its first item', async () => {
+    installMatchMedia(false)
+    const scroll = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scroll })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValue({
+      requestId: 'group-wrap-scroll',
+      items: [
+        {
+          ...findLauncherItem(''),
+          favorite: { target: { kind: 'builtin', feature: 'find' }, favorite: true },
+        },
+        {
+          resultId: 'web-search',
+          title: '/web-search',
+          iconKind: 'webSearch',
+          activation: { kind: 'completion', completionText: '/web-search ' },
+          favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite: false },
+        },
+      ],
+    } as unknown as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('group-wrap-scroll')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    const favoritesTitle = mounted.host.querySelector<HTMLElement>('#launcher-favorites-title')!
+
+    await act(async () => core.keyDown('ArrowUp', false))
+    expect(core.getSnapshot().selectedIndex).toBe(1)
+    scroll.mockClear()
+    await act(async () => core.keyDown('ArrowDown', false))
+
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+    expect(scroll).toHaveBeenLastCalledWith({ block: 'nearest' })
+    expect(scroll.mock.instances[scroll.mock.instances.length - 1]).toBe(favoritesTitle)
+    await mounted.unmount()
+    core.destroy()
+  })
+
   it('cycles launcher Tab focus only between the query input and settings button', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
@@ -4177,27 +4344,36 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.setPublicPluginFavorite)
       .mockReturnValueOnce(mutation.promise)
       .mockReturnValueOnce(secondMutation.promise)
-    vi.mocked(fake.client.searchApps).mockImplementation(async () => ({
-      requestId: 'favorite-menu',
-      items: [
-        findLauncherItem(''),
-        {
-          resultId: 'demo-win', title: '/demo-win', subtitle: '打开演示子窗口',
-          activation: {
-            kind: 'pluginCompletion', completionText: '/demo-win ',
-            pluginId: 'com.uipilot.demo-win', favorite,
-          },
+    vi.mocked(fake.client.searchApps).mockImplementation(async () => {
+      const demoWin = {
+        resultId: 'demo-win', title: '/demo-win', subtitle: '打开演示子窗口',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-win ',
+          pluginId: 'com.uipilot.demo-win', favorite,
         },
-        {
-          resultId: 'demo-return', title: '/demo-return', subtitle: '返回文本',
-          activation: {
-            kind: 'pluginCompletion', completionText: '/demo-return ',
-            pluginId: 'com.uipilot.demo-return', favorite: true,
-          },
+        favorite: {
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          favorite,
         },
-        { resultId: 'app', title: 'Demo App', activation: executeActivation },
-      ],
-    } as unknown as SearchResponse))
+      }
+      const demoReturn = {
+        resultId: 'demo-return', title: '/demo-return', subtitle: '返回文本',
+        activation: {
+          kind: 'pluginCompletion', completionText: '/demo-return ',
+          pluginId: 'com.uipilot.demo-return', favorite: true,
+        },
+        favorite: {
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-return' },
+          favorite: true,
+        },
+      }
+      return {
+        requestId: 'favorite-menu',
+        items: favorite
+          ? [demoWin, demoReturn, findLauncherItem(''), { resultId: 'app', title: 'Demo App', activation: executeActivation }]
+          : [demoReturn, findLauncherItem(''), demoWin, { resultId: 'app', title: 'Demo App', activation: executeActivation }],
+      } as unknown as SearchResponse
+    })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -4205,20 +4381,20 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
     const options = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
 
-    expect(options[2]?.querySelector('.result-favorite-star')).not.toBeNull()
+    expect(options[0]?.querySelector('.result-favorite-star')).not.toBeNull()
     expect(options[1]?.querySelector('.result-favorite-star')).toBeNull()
-    expect(options[0]?.querySelector('.result-favorite-star')).toBeNull()
-    await act(async () => options[0]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    expect(options[2]?.querySelector('.result-favorite-star')).toBeNull()
+    await act(async () => options[3]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
     expect(document.querySelector('[role="menuitem"]')).toBeNull()
 
-    await act(async () => options[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await act(async () => options[2]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
     let menuItem: HTMLElement | null = null
     await vi.waitFor(() => {
       menuItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
         .find((item) => item.textContent?.trim() === '设为常用') ?? null
       expect(menuItem).not.toBeNull()
     })
-    expect(options[1]?.getAttribute('aria-selected')).toBe('true')
+    expect(options[2]?.getAttribute('aria-selected')).toBe('true')
     await act(async () => menuItem!.click())
     expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledWith({
       pluginId: 'com.uipilot.demo-win', favorite: true,
@@ -4243,7 +4419,7 @@ describe('React view and accessibility', () => {
     await act(async () => refreshed[0]?.dispatchEvent(arrowDown))
     expect(arrowDown.defaultPrevented).toBe(true)
     await vi.waitFor(() => expect(refreshed[1]?.getAttribute('aria-selected')).toBe('true'))
-    await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await act(async () => refreshed[0]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
     let cancelItem: HTMLElement | null = null
     await vi.waitFor(() => {
       cancelItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
@@ -4252,7 +4428,7 @@ describe('React view and accessibility', () => {
     })
     await act(async () => cancelItem!.click())
     expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledTimes(2)
-    await act(async () => refreshed[1]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await act(async () => refreshed[0]?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
     await vi.waitFor(() => {
       const pendingItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
         .find((item) => item.textContent?.trim() === '取消常用')
@@ -4783,7 +4959,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/\.settings-scroll-content\s*\{[^}]*min-height:\s*100%;/s)
   })
 
-  it('uses the third-party overlay scrollbar for both settings panels', async () => {
+  it('uses the third-party overlay scrollbar for settings and detail panels', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -5765,6 +5941,7 @@ describe('React view and accessibility', () => {
     expect(escape.defaultPrevented).toBe(true)
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
     expect(mounted.host.querySelector('.settings-tabs')).not.toBeNull()
+    await vi.waitFor(() => expect(document.activeElement).toBe(settingsTab(mounted.host, '插件')))
 
     await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click())
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-detail')).not.toBeNull())
@@ -5772,6 +5949,7 @@ describe('React view and accessibility', () => {
     await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="返回插件列表"]')!.click())
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
     expect(mounted.host.querySelector('.settings-tabs')).not.toBeNull()
+    await vi.waitFor(() => expect(document.activeElement).toBe(settingsTab(mounted.host, '插件')))
     await mounted.unmount()
     core.destroy()
   })
@@ -6220,6 +6398,7 @@ describe('real adapter and startup', () => {
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
     await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', favorite: true })
+    await main.client.setBuiltinFeatureFavorite({ feature: 'find', favorite: true })
     await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
     await main.client.enqueuePluginPanelHostKey({
@@ -6249,6 +6428,7 @@ describe('real adapter and startup', () => {
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
       ['set_plugin_favorite', [{ pluginId: 'com.uipilot.demo-win', favorite: true }]],
+      ['set_builtin_feature_favorite', [{ input: { feature: 'find', favorite: true } }]],
       ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
       ['plugin_panel_host_key_enqueue', [{ input: {
@@ -6543,30 +6723,63 @@ describe('launcher find forwarding ownership', () => {
     }))
   })
 
-  it('keeps explicit find commands free of suggestions and establishes ownership only on Enter', async () => {
-    for (const [value, query] of [['/find windows', 'windows'], ['/find', '']] as const) {
+  it('keeps explicit find arguments free of suggestions and establishes ownership only on Enter', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('explicit-windows'))
+    const control = core.getSnapshot().queryControl
+
+    core.text({ kind: 'ordinaryInput', control, value: '/find windows', inputType: 'insertText' })
+    expect(core.getSnapshot()).toMatchObject({ results: [], selectedIndex: -1, searchPending: false })
+    expect(fake.client.searchApps).not.toHaveBeenCalled()
+
+    core.keyDown('Enter', false)
+    expect(fake.client.searchApps).toHaveBeenCalledWith({
+      query: '/find windows',
+      invocationId: 'explicit-windows',
+      querySequence: core.getSnapshot().querySequence,
+    })
+    await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
+      query: 'windows',
+      invocationId: 'explicit-windows',
+      querySequence: core.getSnapshot().querySequence,
+    }))
+    core.destroy()
+  })
+
+  it('searches the exact find command and still opens an empty find query on Enter', async () => {
+    vi.useFakeTimers()
+    try {
       const fake = fakeClient()
+      vi.mocked(fake.client.searchApps).mockResolvedValue({
+        requestId: 'exact-find',
+        items: [findLauncherItem('')],
+      })
       const core = createLauncherCore(fake.client)
       await core.start()
-      fake.emit(shown(`explicit-${query || 'empty'}`))
+      fake.emit(shown('explicit-empty'))
       const control = core.getSnapshot().queryControl
 
-      core.text({ kind: 'ordinaryInput', control, value, inputType: 'insertText' })
-      expect(core.getSnapshot()).toMatchObject({ results: [], selectedIndex: -1, searchPending: false })
-      expect(fake.client.searchApps).not.toHaveBeenCalled()
+      core.text({ kind: 'ordinaryInput', control, value: '/find', inputType: 'insertText' })
+      await vi.advanceTimersByTimeAsync(150)
+      await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith({
+        query: '/find',
+        invocationId: 'explicit-empty',
+        querySequence: core.getSnapshot().querySequence,
+        submit: false,
+      }))
+      await vi.waitFor(() => expect(core.getSnapshot().results.map(({ title }) => title)).toEqual(['/find']))
 
       core.keyDown('Enter', false)
-      expect(fake.client.searchApps).toHaveBeenCalledWith({
-        query: value,
-        invocationId: `explicit-${query || 'empty'}`,
-        querySequence: core.getSnapshot().querySequence,
-      })
       await vi.waitFor(() => expect(fake.client.openFind).toHaveBeenCalledWith({
-        query,
-        invocationId: `explicit-${query || 'empty'}`,
+        query: '',
+        invocationId: 'explicit-empty',
         querySequence: core.getSnapshot().querySequence,
       }))
       core.destroy()
+    } finally {
+      vi.useRealTimers()
     }
   })
 

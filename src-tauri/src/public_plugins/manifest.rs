@@ -98,6 +98,26 @@ pub(crate) struct PublicWindowV1 {
     pub(crate) entry: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PanelHostKeyFocus {
+    Content,
+    Host,
+}
+
+fn deserialize_present_panel_host_key_focus<'de, D>(
+    deserializer: D,
+) -> Result<Option<PanelHostKeyFocus>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    PanelHostKeyFocus::deserialize(deserializer).map(Some)
+}
+
+fn present_panel_host_key_focus_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<PanelHostKeyFocus>()
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicPanelV1 {
@@ -105,6 +125,13 @@ pub(crate) struct PublicPanelV1 {
     #[serde(default)]
     #[schemars(schema_with = "panel_host_keys_schema")]
     pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_panel_host_key_focus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_panel_host_key_focus_schema")]
+    pub(crate) host_key_focus: Option<PanelHostKeyFocus>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -166,6 +193,10 @@ impl PublicPanelV1 {
         let mut keys = self.host_keys.clone();
         keys.sort_unstable();
         keys
+    }
+
+    pub(crate) fn host_key_focus(&self) -> PanelHostKeyFocus {
+        self.host_key_focus.unwrap_or(PanelHostKeyFocus::Content)
     }
 }
 
@@ -523,6 +554,14 @@ fn validate_manifest(
     if manifest
         .panel
         .as_ref()
+        .is_some_and(|panel| panel.host_key_focus.is_some())
+        && minimum_host < [0, 3, 4]
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest
+        .panel
+        .as_ref()
         .is_some_and(|panel| !panel.host_keys.is_empty())
         && minimum_host < [0, 3, 1]
     {
@@ -728,6 +767,8 @@ mod schema_tests {
             "PublicPermission",
             "PublicWindowV1",
             "PublicPanelV1",
+            "PanelHostKeyFocus",
+            "hostKeyFocus",
             "PublicNetworkV1",
             "additionalProperties",
             "ui.window",
@@ -1058,6 +1099,75 @@ mod schema_tests {
     }
 
     #[test]
+    fn panel_host_key_focus_is_optional_strict_and_requires_host_0_3_4_when_present() {
+        let mut panel = manifest(None);
+        panel["minimumHostVersion"] = serde_json::json!("0.3.4");
+        panel["command"] = serde_json::json!({
+            "defaultName": "panel",
+            "activationMode": "submit",
+            "outputMode": "panel",
+            "inputRequired": false
+        });
+        panel["panel"] = serde_json::json!({
+            "entry": "dist/panel.html",
+            "hostKeys": ["Tab"],
+            "hostKeyFocus": "host"
+        });
+        panel["permissions"] = serde_json::json!(["ui.panel"]);
+        let host_0_3_4 = PublicPluginHost {
+            platform: PublicPlatform::Windows,
+            version: [0, 3, 4],
+            api_version: 1,
+        };
+        let parse_for_0_3_4 =
+            |value: &Value| parse_manifest(&serde_json::to_vec(value).unwrap(), &host_0_3_4);
+
+        let parsed = parse_for_0_3_4(&panel).expect("host focus is valid on host 0.3.4");
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["panel"]["hostKeyFocus"],
+            serde_json::json!("host")
+        );
+
+        let mut omitted = panel.clone();
+        omitted["minimumHostVersion"] = serde_json::json!("0.3.3");
+        omitted["panel"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hostKeyFocus");
+        let omitted = parse_for_0_3_4(&omitted).unwrap();
+        assert_eq!(
+            omitted.panel.as_ref().unwrap().host_key_focus(),
+            PanelHostKeyFocus::Content
+        );
+        let serialized = serde_json::to_value(omitted).unwrap();
+        assert!(serialized["panel"].get("hostKeyFocus").is_none());
+
+        let mut explicit_content = panel.clone();
+        explicit_content["panel"]["hostKeyFocus"] = serde_json::json!("content");
+        assert!(parse_for_0_3_4(&explicit_content).is_ok());
+
+        let mut old_minimum = panel.clone();
+        old_minimum["minimumHostVersion"] = serde_json::json!("0.3.3");
+        assert_eq!(
+            parse_for_0_3_4(&old_minimum),
+            Err(PublicPackageError::IncompatibleApi)
+        );
+
+        for invalid in [
+            serde_json::json!("main"),
+            serde_json::json!(false),
+            Value::Null,
+        ] {
+            let mut candidate = panel.clone();
+            candidate["panel"]["hostKeyFocus"] = invalid;
+            assert_eq!(
+                parse_for_0_3_4(&candidate),
+                Err(PublicPackageError::InvalidPackage)
+            );
+        }
+    }
+
+    #[test]
     fn plugin_network_manifest_contract_is_strict_versioned_and_canonical() {
         let old_serialized = serde_json::to_value(parse(&manifest(None)).unwrap()).unwrap();
         assert!(old_serialized.get("network").is_none());
@@ -1152,7 +1262,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 3, 3]
+            [0, 3, 4]
         );
     }
 

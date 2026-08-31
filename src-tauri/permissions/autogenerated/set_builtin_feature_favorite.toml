@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-builtin-feature-favorite"
+description = "Enables the set_builtin_feature_favorite command without any pre-configured scope."
+commands.allow = ["set_builtin_feature_favorite"]
+
+[[permission]]
+identifier = "deny-set-builtin-feature-favorite"
+description = "Denies the set_builtin_feature_favorite command without any pre-configured scope."
+commands.deny = ["set_builtin_feature_favorite"]

@@ -16,7 +16,8 @@ use webview2_com::FocusChangedEventHandler;
 
 use crate::public_plugins::{
     inert_url, prepare_windows_webview, verify_windows_webview_muted, PanelHostKeyDeclaration,
-    PluginInvocationTheme, PublicPluginManagementError, PublicPluginService, WebViewGuardOwner,
+    PanelHostKeyFocus, PluginInvocationTheme, PublicPluginManagementError, PublicPluginService,
+    WebViewGuardOwner,
 };
 
 const CONTENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +54,7 @@ pub(crate) struct PanelSessionIdentity {
     pub(crate) command_label: String,
     pub(crate) content_label: String,
     pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
+    pub(crate) host_key_focus: PanelHostKeyFocus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +68,7 @@ pub(crate) struct PanelOwner {
     pub(crate) submission_token: String,
     pub(crate) argument: String,
     pub(crate) host_keys: Vec<PanelHostKeyDeclaration>,
+    pub(crate) host_key_focus: PanelHostKeyFocus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,7 +268,7 @@ pub(crate) struct HostKeyEnqueueDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostKeyDeliveryPhase {
     Prepared,
-    NativeFocused,
+    ReadyToDeliver,
     DeliveredAwaitingAck,
     Accomplished,
     Cancelled,
@@ -282,6 +285,13 @@ pub(crate) struct HostKeyDeliveryTicket {
     pub(crate) meta_key: bool,
     pub(crate) shift_key: bool,
     pub(crate) alt_key: bool,
+    pub(crate) host_key_focus: PanelHostKeyFocus,
+}
+
+impl HostKeyDeliveryTicket {
+    pub(crate) fn requires_content_focus(&self) -> bool {
+        self.host_key_focus == PanelHostKeyFocus::Content
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1003,6 +1013,7 @@ impl PluginPanelController {
             command_label: owner.command_label.clone(),
             content_label,
             host_keys: owner.host_keys.clone(),
+            host_key_focus: owner.host_key_focus,
         };
         let show_generation = core.show_generation;
         core.session = Some(LiveSession {
@@ -1889,6 +1900,7 @@ impl PluginPanelController {
             meta_key: input.meta_key,
             shift_key: input.shift_key,
             alt_key: input.alt_key,
+            host_key_focus: session.identity.host_key_focus,
         });
         let start_pump = !route.pump_running;
         route.pump_running = true;
@@ -1917,15 +1929,15 @@ impl PluginPanelController {
             paste_reserved: false,
             paste_consumed: false,
         });
-        route.native_focus_blur_expected = true;
+        route.native_focus_blur_expected = ticket.requires_content_focus();
         Some(ticket)
     }
 
-    pub(crate) fn mark_host_key_native_focused(&self, ticket: &HostKeyDeliveryTicket) -> bool {
+    pub(crate) fn mark_host_key_ready_to_deliver(&self, ticket: &HostKeyDeliveryTicket) -> bool {
         self.advance_host_key_phase(
             ticket,
             HostKeyDeliveryPhase::Prepared,
-            HostKeyDeliveryPhase::NativeFocused,
+            HostKeyDeliveryPhase::ReadyToDeliver,
             None,
         )
     }
@@ -1948,7 +1960,7 @@ impl PluginPanelController {
             return false;
         }
         match in_flight.phase {
-            HostKeyDeliveryPhase::NativeFocused => {
+            HostKeyDeliveryPhase::ReadyToDeliver => {
                 in_flight.phase = HostKeyDeliveryPhase::DeliveredAwaitingAck;
                 in_flight.ack_deadline = Some(ack_deadline);
                 self.changed.notify_all();
@@ -2007,7 +2019,7 @@ impl PluginPanelController {
         if in_flight.ticket.route_sequence != route_sequence
             || !matches!(
                 in_flight.phase,
-                HostKeyDeliveryPhase::NativeFocused | HostKeyDeliveryPhase::DeliveredAwaitingAck
+                HostKeyDeliveryPhase::ReadyToDeliver | HostKeyDeliveryPhase::DeliveredAwaitingAck
             )
         {
             return false;
@@ -2036,7 +2048,7 @@ impl PluginPanelController {
             || in_flight.ticket.key != PluginPanelHostKey::Enter
             || !matches!(
                 in_flight.phase,
-                HostKeyDeliveryPhase::NativeFocused | HostKeyDeliveryPhase::DeliveredAwaitingAck
+                HostKeyDeliveryPhase::ReadyToDeliver | HostKeyDeliveryPhase::DeliveredAwaitingAck
             )
             || in_flight.paste_reserved
             || in_flight.paste_consumed
@@ -3032,13 +3044,25 @@ pub(crate) fn deliver_panel_update(
     deliver_update(app, controller, identity, &ticket, update)
 }
 
+fn focus_host_key_content_if_required<E>(
+    ticket: &HostKeyDeliveryTicket,
+    focus_content: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    if ticket.requires_content_focus() {
+        focus_content()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn start_host_key_pump(app: AppHandle, controller: Arc<PluginPanelController>) {
     std::thread::spawn(move || {
         while let Some(ticket) = controller.claim_next_host_key() {
             let delivered = (|| {
                 let content = app.get_webview(&ticket.content_label).ok_or(())?;
-                content.set_focus().map_err(|_| ())?;
-                if !controller.mark_host_key_native_focused(&ticket) {
+                focus_host_key_content_if_required(&ticket, || {
+                    content.set_focus().map_err(|_| ())
+                })?;
+                if !controller.mark_host_key_ready_to_deliver(&ticket) {
                     return Err(());
                 }
                 let payload = serde_json::to_string(&serde_json::json!({
@@ -3192,6 +3216,7 @@ pub(crate) fn queue_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::time::Duration;
 
     fn owner(request: &str) -> PanelOwner {
@@ -3205,6 +3230,7 @@ mod tests {
             submission_token: format!("token-{request}"),
             argument: "hello".into(),
             host_keys: Vec::new(),
+            host_key_focus: PanelHostKeyFocus::Content,
         }
     }
 
@@ -3394,8 +3420,75 @@ mod tests {
 
         let ticket = controller.claim_next_host_key().unwrap();
 
+        assert!(ticket.requires_content_focus());
         assert!(controller.main_content_lost_focus(false).is_none());
-        assert!(controller.mark_host_key_native_focused(&ticket));
+        assert!(controller.mark_host_key_ready_to_deliver(&ticket));
+    }
+
+    #[test]
+    fn host_key_host_focus_policy_keeps_native_blur_unexpected_and_remains_deliverable() {
+        let controller = PluginPanelController::default();
+        let mut panel_owner = owner("host-focus");
+        panel_owner.host_keys = vec![PanelHostKeyDeclaration::ArrowDown];
+        panel_owner.host_key_focus = crate::public_plugins::PanelHostKeyFocus::Host;
+        let identity = controller.open_session(panel_owner).unwrap();
+        assert!(controller.mark_ready(
+            &identity.content_label,
+            identity.session_epoch,
+            true,
+            false,
+        ));
+        assert_content_visible(&controller, &identity);
+        assert!(controller.main_content_got_focus());
+        assert!(matches!(
+            controller
+                .enqueue_host_key(identity.session_epoch, host_key_input(1))
+                .unwrap()
+                .outcome,
+            HostKeyEnqueueOutcome::Enqueued { .. }
+        ));
+
+        let ticket = controller.claim_next_host_key().unwrap();
+
+        assert_eq!(
+            ticket.host_key_focus,
+            crate::public_plugins::PanelHostKeyFocus::Host
+        );
+        assert!(!ticket.requires_content_focus());
+        assert!(controller.main_content_lost_focus(false).is_some());
+        assert!(controller.mark_host_key_ready_to_deliver(&ticket));
+        assert!(controller.mark_host_key_delivered(&ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
+    }
+
+    #[test]
+    fn host_key_focus_policy_calls_native_content_focus_only_for_content_strategy() {
+        for (focus, expected_calls) in [
+            (PanelHostKeyFocus::Content, 1),
+            (PanelHostKeyFocus::Host, 0),
+        ] {
+            let calls = Cell::new(0);
+            let ticket = HostKeyDeliveryTicket {
+                session_epoch: 1,
+                content_label: "content".into(),
+                route_sequence: 1,
+                declaration: PanelHostKeyDeclaration::Tab,
+                key: PluginPanelHostKey::Tab,
+                ctrl_key: false,
+                meta_key: false,
+                shift_key: false,
+                alt_key: false,
+                host_key_focus: focus,
+            };
+
+            assert_eq!(
+                focus_host_key_content_if_required(&ticket, || {
+                    calls.set(calls.get() + 1);
+                    Ok::<_, ()>(())
+                }),
+                Ok(())
+            );
+            assert_eq!(calls.get(), expected_calls);
+        }
     }
 
     #[test]
@@ -4042,7 +4135,7 @@ mod tests {
         assert!(first.start_pump);
         let first_ticket = controller.claim_next_host_key().unwrap();
         assert!(controller.claim_next_host_key().is_none());
-        assert!(controller.mark_host_key_native_focused(&first_ticket));
+        assert!(controller.mark_host_key_ready_to_deliver(&first_ticket));
         assert!(controller
             .mark_host_key_delivered(&first_ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
 
@@ -4104,7 +4197,7 @@ mod tests {
             .enqueue_host_key(identity.session_epoch, host_key_input(1))
             .unwrap();
         let ticket = controller.claim_next_host_key().unwrap();
-        assert!(controller.mark_host_key_native_focused(&ticket));
+        assert!(controller.mark_host_key_ready_to_deliver(&ticket));
 
         assert!(controller.ack_host_key(
             &identity.content_label,
@@ -4126,7 +4219,7 @@ mod tests {
             .enqueue_host_key(identity.session_epoch, enter_host_key_input(1))
             .unwrap();
         let ticket = controller.claim_next_host_key().unwrap();
-        assert!(controller.mark_host_key_native_focused(&ticket));
+        assert!(controller.mark_host_key_ready_to_deliver(&ticket));
         assert!(controller.mark_host_key_delivered(&ticket, Instant::now() + HOST_KEY_ACK_TIMEOUT,));
 
         let paste = controller
@@ -4188,7 +4281,7 @@ mod tests {
             .enqueue_host_key(identity.session_epoch, host_key_input(2))
             .unwrap();
         let ticket = controller.claim_next_host_key().unwrap();
-        assert!(controller.mark_host_key_native_focused(&ticket));
+        assert!(controller.mark_host_key_ready_to_deliver(&ticket));
         assert!(controller.mark_host_key_delivered(&ticket, Instant::now()));
         assert_eq!(
             controller.finish_host_key_ack(&ticket, Instant::now()),

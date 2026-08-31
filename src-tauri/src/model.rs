@@ -1,11 +1,48 @@
 use serde::Serialize;
 
+use crate::settings::BuiltinFeature;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ResultIconKind {
     Find,
     Calculator,
     WebSearch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum ResultFavoriteTarget {
+    PublicPlugin {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+    },
+    Builtin {
+        feature: BuiltinFeature,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResultFavorite {
+    pub(crate) target: ResultFavoriteTarget,
+    pub(crate) favorite: bool,
+}
+
+impl ResultFavorite {
+    pub(crate) fn public_plugin(plugin_id: String, favorite: bool) -> Option<Self> {
+        crate::public_plugins::valid_plugin_id(&plugin_id).then_some(Self {
+            target: ResultFavoriteTarget::PublicPlugin { plugin_id },
+            favorite,
+        })
+    }
+
+    pub(crate) fn builtin(feature: BuiltinFeature, favorite: bool) -> Self {
+        Self {
+            target: ResultFavoriteTarget::Builtin { feature },
+            favorite,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -177,6 +214,8 @@ pub(crate) struct ResultItem {
     pub(crate) icon_kind: Option<ResultIconKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) favorite: Option<ResultFavorite>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) has_default_action: bool,
 }

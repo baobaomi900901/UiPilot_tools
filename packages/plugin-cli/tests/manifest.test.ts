@@ -219,6 +219,66 @@ describe('validateManifest', () => {
     expect(validate(existingKeys)).toMatchObject({ ok: true })
   })
 
+  it('validates optional panel hostKeyFocus with the 0.3.4 version gate', () => {
+    const value = {
+      schemaVersion: 1,
+      pluginId: 'com.example.panel-host-focus',
+      version: '1.0.0',
+      apiVersion: 1,
+      minimumHostVersion: '0.3.4',
+      name: 'Panel Host Focus',
+      supportedPlatforms: ['windows'],
+      command: {
+        defaultName: 'panel-host-focus',
+        activationMode: 'submit',
+        outputMode: 'panel',
+        inputRequired: false,
+      },
+      runtime: { entry: 'dist/runtime.js' },
+      panel: {
+        entry: 'dist/panel.html',
+        hostKeys: ['Tab'],
+        hostKeyFocus: 'host',
+      },
+      permissions: ['ui.panel'],
+      settings: [],
+    }
+
+    expect(validate(value)).toMatchObject({
+      ok: true,
+      manifest: { panel: { hostKeyFocus: 'host' } },
+    })
+
+    const explicitContent = structuredClone(value)
+    explicitContent.panel.hostKeyFocus = 'content'
+    expect(validate(explicitContent)).toMatchObject({
+      ok: true,
+      manifest: { panel: { hostKeyFocus: 'content' } },
+    })
+
+    const omitted = structuredClone(value) as any
+    omitted.minimumHostVersion = '0.3.3'
+    delete omitted.panel.hostKeyFocus
+    const omittedResult = validate(omitted)
+    expect(omittedResult).toMatchObject({ ok: true })
+    if (omittedResult.ok) expect(omittedResult.manifest.panel).not.toHaveProperty('hostKeyFocus')
+
+    const lowHost = structuredClone(value)
+    lowHost.minimumHostVersion = '0.3.3'
+    expect(validate(lowHost)).toMatchObject({
+      ok: false,
+      issues: [{ code: 'API_INCOMPATIBLE' }],
+    })
+
+    for (const invalid of ['main', false, null]) {
+      const candidate = structuredClone(value) as any
+      candidate.panel.hostKeyFocus = invalid
+      const result = validate(candidate)
+      expect(result).toMatchObject({ ok: false })
+      if (!result.ok) expect(result.issues[0]?.code).toBe('MANIFEST_SCHEMA_INVALID')
+    }
+  })
+
   it('still accepts older non-panel packages that declare minimumHostVersion 0.2.0', () => {
     const value = timerManifest()
     expect(validate(value)).toMatchObject({ ok: true })

@@ -487,6 +487,7 @@ pub fn run() {
             commands::set_file_preview_preference,
             commands::set_theme_preference,
             commands::set_web_search_engine,
+            commands::set_builtin_feature_favorite,
             commands::hide_launcher,
         ]);
 
@@ -703,7 +704,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 75);
+        assert_eq!(production.matches("commands::").count(), 76);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -779,6 +780,7 @@ mod tests {
             "set_file_preview_preference",
             "set_theme_preference",
             "set_web_search_engine",
+            "set_builtin_feature_favorite",
             "hide_launcher",
         ] {
             assert!(production.contains(&format!("commands::{command}")));
@@ -834,6 +836,23 @@ mod tests {
         assert!(
             !include_str!("../capabilities/plugin-runtime.json").contains("set-theme-preference")
         );
+    }
+
+    #[test]
+    fn builtin_feature_favorite_command_is_declared_and_main_only() {
+        let build = include_str!("../build.rs");
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        let shell = include_str!("../capabilities/plugin-window-shell.json");
+        let content = include_str!("../capabilities/plugin-window-content.json");
+        let panel = include_str!("../capabilities/plugin-panel-content.json");
+        let find = include_str!("../capabilities/find.json");
+
+        assert!(build.contains("\"set_builtin_feature_favorite\","));
+        assert!(main.contains("\"allow-set-builtin-feature-favorite\""));
+        for capability in [runtime, shell, content, panel, find] {
+            assert!(!capability.contains("set-builtin-feature-favorite"));
+        }
     }
 
     #[test]

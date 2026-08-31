@@ -75,8 +75,8 @@ test('manifest declares the Windows clipboard history Panel contract', async () 
   const manifest = JSON.parse(await readFile(manifestUrl, 'utf8'))
 
   assert.equal(manifest.pluginId, 'com.uipilot.clipboard-history')
-  assert.equal(manifest.version, '1.0.4')
-  assert.equal(manifest.minimumHostVersion, '0.3.3')
+  assert.equal(manifest.version, '1.0.7')
+  assert.equal(manifest.minimumHostVersion, '0.3.4')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'panel')
   assert.equal(manifest.command.inputRequired, false)
@@ -84,6 +84,7 @@ test('manifest declares the Windows clipboard history Panel contract', async () 
   assert.deepEqual(manifest.panel, {
     entry: 'dist/panel.html',
     hostKeys: ['ArrowDown', 'ArrowUp', 'Tab', 'Shift+Tab', 'Enter'],
+    hostKeyFocus: 'host',
   })
   assert.deepEqual(manifest.permissions, [
     'ui.panel',

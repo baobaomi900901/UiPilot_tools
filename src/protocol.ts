@@ -1,6 +1,11 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
+export type BuiltinFeature = 'find' | 'webSearch'
+export type ResultFavoriteTarget =
+  | Readonly<{ kind: 'publicPlugin'; pluginId: string }>
+  | Readonly<{ kind: 'builtin'; feature: BuiltinFeature }>
+export type ResultFavorite = Readonly<{ target: ResultFavoriteTarget; favorite: boolean }>
 
 export type LauncherResultActivation =
   | { kind: 'completion'; completionText: string }
@@ -45,6 +50,7 @@ export interface ResultItem {
   pluginIconUrl?: string
   iconKind?: ResultIconKind
   detail?: string
+  favorite?: ResultFavorite
   hasDefaultAction?: boolean
 }
 export interface SearchResponse {
@@ -313,6 +319,7 @@ export interface LauncherClient {
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
   setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean }): Promise<void>
   setPublicPluginFavorite(input: { pluginId: string; favorite: boolean }): Promise<void>
+  setBuiltinFeatureFavorite(input: { feature: BuiltinFeature; favorite: boolean }): Promise<void>
   setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
   savePublicPluginSettings(input: { input: { pluginId: string; settings: Readonly<Record<string, string | number | boolean>>; secrets: Readonly<Record<string, string | null>> } }): Promise<void>
   uninstallPublicPlugin(input: { pluginId: string; retainData: boolean }): Promise<void>
@@ -413,8 +420,8 @@ export interface ViewResult {
   iconKind?: ResultIconKind
   detail?: string
   hasDefaultAction?: boolean
-  pluginCompletion?: Readonly<{ pluginId: string; favorite: boolean }>
-  panelActivation?: Readonly<{ pluginId: string; initialArgument: string; favorite: boolean }>
+  favorite?: ResultFavorite
+  panelActivation?: Readonly<{ pluginId: string; initialArgument: string }>
 }
 
 export interface PluginPanelCommandResult {

@@ -1648,6 +1648,7 @@ impl PluginManager {
                     plugin_icon_url: None,
                     icon_kind: None,
                     detail: None,
+                    favorite: None,
                     has_default_action: true,
                 },
                 action,
@@ -7543,6 +7544,7 @@ mod tests {
                             plugin_icon_url: None,
                             icon_kind: None,
                             detail: None,
+                            favorite: None,
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
@@ -7626,6 +7628,7 @@ mod tests {
                             plugin_icon_url: None,
                             icon_kind: None,
                             detail: None,
+                            favorite: None,
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {

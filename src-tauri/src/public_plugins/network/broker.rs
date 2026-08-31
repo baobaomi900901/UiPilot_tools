@@ -30,7 +30,7 @@ const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
 const TOTAL_DEADLINE: Duration = Duration::from_secs(10);
-const USER_AGENT: &str = "UiPilot-Plugin/0.3.3";
+const USER_AGENT: &str = "UiPilot-Plugin/0.3.4";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
@@ -898,6 +898,10 @@ mod tests {
             .headers
             .iter()
             .any(|(name, value)| name == "accept-encoding" && value == b"identity")));
+        assert!(sent.iter().all(|request| request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "user-agent" && value == b"UiPilot-Plugin/0.3.4")));
     }
 
     #[tokio::test]

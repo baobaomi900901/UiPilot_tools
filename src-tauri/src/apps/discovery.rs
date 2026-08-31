@@ -391,6 +391,7 @@ pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAc
             plugin_icon_url: None,
             icon_kind: None,
             detail: None,
+            favorite: None,
             has_default_action: true,
         },
         ResultAction::LaunchApplication {

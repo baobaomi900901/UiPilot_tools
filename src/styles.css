@@ -437,6 +437,15 @@ label,
   border-radius: 3px;
 }
 
+.result-section-title {
+  min-height: 28px;
+  padding: 8px 10px 4px;
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+}
+
 .result-row {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);

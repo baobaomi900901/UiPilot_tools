@@ -6,7 +6,8 @@ Windows 启动器 Panel 插件，展示 UiPilot 运行期间由宿主管理的�
 
 - `activationMode`: `submit`
 - `outputMode`: `panel`
-- `minimumHostVersion`: `0.3.3`
+- `minimumHostVersion`: `0.3.4`
+- `hostKeyFocus`: `host`（Host Key 投递时保持主输入框焦点）
 - 权限：`ui.panel`、`clipboard.history.read`、`clipboard.history.paste`
 - Host Keys：`ArrowDown`、`ArrowUp`、`Tab`、`Shift+Tab`、`Enter`
 
@@ -14,7 +15,7 @@ Windows 启动器 Panel 插件，展示 UiPilot 运行期间由宿主管理的�
 
 ## 安装
 
-1. 启动 Windows 版 UiPilot `0.3.3+`。
+1. 启动 Windows 版 UiPilot `0.3.4+`。
 2. 打开 **设置 > 插件 > 公开插件**，选择“开发目录”。
 3. 选择本目录下的 `package` 文件夹。
 4. 确认剪贴板历史读取与粘贴权限。
@@ -25,6 +26,7 @@ Windows 启动器 Panel 插件，展示 UiPilot 运行期间由宿主管理的�
 - `Tab` / `Shift+Tab`：循环切换全部、图片、文件、文字。
 - `ArrowUp` / `ArrowDown`：在当前列表中移动选择，到首尾后停止。
 - `Enter`：恢复选中记录，隐藏 UiPilot，返回原窗口并粘贴一次。
+- Host Key 不把原生焦点交给 Panel；连续操作时主输入框光标保持可见。
 - 鼠标可选择、删除单条记录或清空历史；操作后焦点返回宿主输入框。
 - 已移动或删除的文件会显示为不可用，不执行粘贴。
 

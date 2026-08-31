@@ -408,6 +408,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
+  const restoreSettingsTabFocus = useRef(false)
   const activeSettingsTab = snapshot.settingsTab
   const optionRefs = useRef(new Map<number, HTMLElement>())
   const favoriteFocusTarget = useRef<{
@@ -439,6 +440,15 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (snapshot.view !== 'settings' || !selectedPublicPlugin) return
     publicPluginDetailRef.current?.focus()
   }, [selectedPublicPlugin, snapshot.view])
+
+  useLayoutEffect(() => {
+    if (!restoreSettingsTabFocus.current) return
+    if (snapshot.view !== 'settings' || selectedPublicPlugin) return
+    restoreSettingsTabFocus.current = false
+    settingsTabsRef.current
+      ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+      ?.focus()
+  }, [activeSettingsTab, selectedPublicPlugin, snapshot.view])
 
   const reportReady = useCallback(() => {
     if (ready.current) return
@@ -554,7 +564,13 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
   useLayoutEffect(() => {
     const selected = snapshot.results[snapshot.selectedIndex]
-    if (snapshot.view === 'launcher' && selected) optionRefs.current.get(selected.key)?.scrollIntoView({ block: 'nearest' })
+    if (snapshot.view !== 'launcher' || !selected) return
+    const option = optionRefs.current.get(selected.key)
+    option?.scrollIntoView({ block: 'nearest' })
+    const section = option?.closest('.result-section')
+    if (section && section.querySelector('[role="option"]') === option) {
+      section.querySelector<HTMLElement>('.result-section-title')?.scrollIntoView({ block: 'nearest' })
+    }
   }, [snapshot.results, snapshot.selectedIndex, snapshot.view])
 
   useLayoutEffect(() => {
@@ -616,6 +632,21 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     : snapshot.messageCenter.status === 'ready'
       ? snapshot.messageCenter.unreadCount ?? 0
       : 0
+  const indexedLauncherResults = snapshot.results.map((item, index) => ({ item, index }))
+  const launcherResultSections = snapshot.queryControlValue === ''
+    ? [
+        {
+          key: 'favorites',
+          title: '常用',
+          results: indexedLauncherResults.filter(({ item }) => item.favorite?.favorite === true),
+        },
+        {
+          key: 'all',
+          title: '所有功能',
+          results: indexedLauncherResults.filter(({ item }) => item.favorite?.favorite !== true),
+        },
+      ].filter(({ results }) => results.length > 0)
+    : undefined
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (
@@ -753,6 +784,96 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     selectedTab.focus()
   }
 
+  const renderLauncherResult = (item: (typeof snapshot.results)[number], index: number) => {
+    const resultFavorite = item.favorite
+    const row = (
+      <div
+        key={item.key}
+        id={`launcher-result-${item.key}`}
+        role="option"
+        aria-selected={snapshot.selectedIndex === index}
+        className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
+        tabIndex={-1}
+        onClick={() => core.activateResult(index)}
+        onContextMenu={resultFavorite ? (event) => event.preventDefault() : undefined}
+        ref={(element) => {
+          if (element) optionRefs.current.set(item.key, element)
+          else optionRefs.current.delete(item.key)
+        }}
+      >
+        <span className="result-icon" aria-hidden="true">
+          {item.iconKind ? (
+            <BuiltInResultIcon kind={item.iconKind} />
+          ) : item.pluginIconUrl ? (
+            <PluginIcon iconUrl={item.pluginIconUrl} size={28} />
+          ) : (
+            <>
+              <span className="app-mark" hidden={item.icon !== undefined} />
+              {item.icon ? (
+                <img
+                  className="result-icon-image"
+                  src={item.icon}
+                  alt=""
+                  aria-hidden="true"
+                  draggable={false}
+                  onError={(event) => {
+                    event.currentTarget.hidden = true
+                    const fallback = event.currentTarget.previousElementSibling
+                    if (fallback instanceof HTMLElement) fallback.hidden = false
+                  }}
+                />
+              ) : null}
+            </>
+          )}
+        </span>
+        <span className="result-copy">
+          <span className="result-title-line">
+            <span className="result-title">{item.title}</span>
+            {resultFavorite?.favorite ? (
+              <Star
+                aria-label="常用"
+                className="result-favorite-star"
+                fill="currentColor"
+                size={14}
+                strokeWidth={1.8}
+              />
+            ) : null}
+          </span>
+          {item.subtitle ? <span className="result-subtitle">{item.subtitle}</span> : null}
+          {item.detail ? <span className="result-detail">{item.detail}</span> : null}
+        </span>
+      </div>
+    )
+    if (!resultFavorite) return row
+    return (
+      <Dropdown
+        key={item.key}
+        trigger={['contextMenu']}
+        menu={{
+          items: [{
+            key: 'favorite',
+            label: resultFavorite.favorite ? '取消常用' : '设为常用',
+            disabled: snapshot.favoriteMutationPending,
+          }],
+          onClick: () => {
+            favoriteFocusTarget.current = {
+              invocationId: snapshot.invocationId,
+              viewEpoch: snapshot.viewEpoch,
+              queryControlValue: snapshot.queryControlValue,
+            }
+            core.setPluginFavorite(index, !resultFavorite.favorite)
+          },
+        }}
+        onOpenChange={(open) => {
+          if (open) core.openPluginContextMenu(index)
+          else core.closePluginContextMenu()
+        }}
+      >
+        {row}
+      </Dropdown>
+    )
+  }
+
   const launcher = (
     <section className="launcher-view" aria-label="应用启动器" onKeyDownCapture={launcherTabKeyDown}>
       <div className="launcher-query-region">
@@ -861,95 +982,25 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             aria-label="搜索结果"
             onKeyDown={queryKeyDown}
           >
-            {snapshot.results.map((item, index) => {
-              const pluginActivation = item.pluginCompletion ?? item.panelActivation
-              const row = (
-                <div
-                key={item.key}
-                id={`launcher-result-${item.key}`}
-                role="option"
-                aria-selected={snapshot.selectedIndex === index}
-                className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
-                tabIndex={-1}
-                onClick={() => core.activateResult(index)}
-                onContextMenu={pluginActivation ? (event) => event.preventDefault() : undefined}
-                ref={(element) => {
-                  if (element) optionRefs.current.set(item.key, element)
-                  else optionRefs.current.delete(item.key)
-                }}
-              >
-                <span className="result-icon" aria-hidden="true">
-                  {item.iconKind ? (
-                    <BuiltInResultIcon kind={item.iconKind} />
-                  ) : item.pluginIconUrl ? (
-                    <PluginIcon iconUrl={item.pluginIconUrl} size={28} />
-                  ) : (
-                    <>
-                      <span className="app-mark" hidden={item.icon !== undefined} />
-                      {item.icon ? (
-                        <img
-                          className="result-icon-image"
-                          src={item.icon}
-                          alt=""
-                          aria-hidden="true"
-                          draggable={false}
-                          onError={(event) => {
-                            event.currentTarget.hidden = true
-                            const fallback = event.currentTarget.previousElementSibling
-                            if (fallback instanceof HTMLElement) fallback.hidden = false
-                          }}
-                        />
-                      ) : null}
-                    </>
-                  )}
-                </span>
-                <span className="result-copy">
-                  <span className="result-title-line">
-                    <span className="result-title">{item.title}</span>
-                    {pluginActivation?.favorite ? (
-                      <Star
-                        aria-label="常用"
-                        className="result-favorite-star"
-                        fill="currentColor"
-                        size={14}
-                        strokeWidth={1.8}
-                      />
-                    ) : null}
-                  </span>
-                  {item.subtitle ? <span className="result-subtitle">{item.subtitle}</span> : null}
-                  {item.detail ? <span className="result-detail">{item.detail}</span> : null}
-                </span>
-              </div>
-              )
-              if (!pluginActivation) return row
-              return (
-                <Dropdown
-                  key={item.key}
-                  trigger={['contextMenu']}
-                  menu={{
-                    items: [{
-                      key: 'favorite',
-                      label: pluginActivation.favorite ? '取消常用' : '设为常用',
-                      disabled: snapshot.favoriteMutationPending,
-                    }],
-                    onClick: () => {
-                      favoriteFocusTarget.current = {
-                        invocationId: snapshot.invocationId,
-                        viewEpoch: snapshot.viewEpoch,
-                        queryControlValue: snapshot.queryControlValue,
-                      }
-                      core.setPluginFavorite(index, !pluginActivation.favorite)
-                    },
-                  }}
-                  onOpenChange={(open) => {
-                    if (open) core.openPluginContextMenu(index)
-                    else core.closePluginContextMenu()
-                  }}
-                >
-                  {row}
-                </Dropdown>
-              )
-            })}
+            {launcherResultSections
+              ? launcherResultSections.map((section) => (
+                  <div
+                    key={section.key}
+                    className="result-section"
+                    role="group"
+                    aria-labelledby={`launcher-${section.key}-title`}
+                  >
+                    <div
+                      id={`launcher-${section.key}-title`}
+                      className="result-section-title"
+                      role="presentation"
+                    >
+                      {section.title}
+                    </div>
+                    {section.results.map(({ item, index }) => renderLauncherResult(item, index))}
+                  </div>
+                ))
+              : indexedLauncherResults.map(({ item, index }) => renderLauncherResult(item, index))}
           </div>
         </div>
         </Spin>
@@ -1209,6 +1260,10 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       core.deactivatePlugins()
     }
   }
+  const closePublicPluginDetail = () => {
+    restoreSettingsTabFocus.current = true
+    setSelectedPublicPlugin(null)
+  }
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
@@ -1349,7 +1404,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       onKeyDown={(event) => {
         if (event.key !== 'Escape' || composing(event)) return
         event.preventDefault()
-        setSelectedPublicPlugin(null)
+        closePublicPluginDetail()
       }}
     >
       <div className="settings-header-region">
@@ -1359,7 +1414,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               <Button
                 aria-label="返回插件列表"
                 icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
-                onClick={() => setSelectedPublicPlugin(null)}
+                onClick={closePublicPluginDetail}
                 size="small"
                 type="text"
               />

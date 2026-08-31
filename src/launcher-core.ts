@@ -28,6 +28,8 @@ import {
   type PanelHostKeyDeclaration,
   type PluginPanelHostKey,
   type ResultItem,
+  type ResultFavorite,
+  type ResultFavoriteTarget,
   type ResultIconKind,
   type SearchResponse,
   type SettingsTabKey,
@@ -309,7 +311,7 @@ interface FavoriteInteractionOwner {
   querySequence: number
   value: string
   resultKey: number
-  pluginId: string
+  target: ResultFavoriteTarget
 }
 
 interface FavoriteMutationOwner extends FavoriteInteractionOwner {
@@ -406,6 +408,28 @@ function safeApplicationIcon(value: unknown): string | undefined {
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
   return value === 'find' || value === 'calculator' || value === 'webSearch' ? value : undefined
+}
+
+function safeResultFavorite(value: unknown): ResultFavorite | undefined {
+  const favorite = exactPlainRecord(value, ['favorite', 'target'])
+  if (!favorite || typeof favorite.favorite !== 'boolean') return undefined
+  const target = typeof favorite.target === 'object' && favorite.target !== null
+    ? favorite.target as Record<string, unknown>
+    : undefined
+  if (target?.kind === 'publicPlugin') {
+    const record = exactPlainRecord(target, ['kind', 'pluginId'])
+    return record && typeof record.pluginId === 'string' && record.pluginId.length <= 64 &&
+        PUBLIC_PLUGIN_ID.test(record.pluginId)
+      ? { target: { kind: 'publicPlugin', pluginId: record.pluginId }, favorite: favorite.favorite }
+      : undefined
+  }
+  if (target?.kind === 'builtin') {
+    const record = exactPlainRecord(target, ['feature', 'kind'])
+    return record && (record.feature === 'find' || record.feature === 'webSearch')
+      ? { target: { kind: 'builtin', feature: record.feature }, favorite: favorite.favorite }
+      : undefined
+  }
+  return undefined
 }
 
 function validLauncherCompletion(value: string): boolean {
@@ -527,6 +551,36 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
   return undefined
 }
 
+function pluginFavoriteActivation(activation: LauncherResultActivation) {
+  return activation.kind === 'pluginCompletion' || activation.kind === 'windowActivation' ||
+      activation.kind === 'mainResultActivation' || activation.kind === 'panelActivation'
+    ? activation
+    : undefined
+}
+
+function sameFavoriteTarget(left: ResultFavoriteTarget, right: ResultFavoriteTarget): boolean {
+  if (left.kind !== right.kind) return false
+  return left.kind === 'publicPlugin'
+    ? left.pluginId === (right as Extract<ResultFavoriteTarget, { kind: 'publicPlugin' }>).pluginId
+    : left.feature === (right as Extract<ResultFavoriteTarget, { kind: 'builtin' }>).feature
+}
+
+function favoriteMatchesResult(
+  favorite: ResultFavorite,
+  activation: LauncherResultActivation,
+  iconKind: ResultIconKind | undefined,
+): boolean {
+  if (favorite.target.kind === 'publicPlugin') {
+    const plugin = pluginFavoriteActivation(activation)
+    return plugin?.pluginId === favorite.target.pluginId && plugin.favorite === favorite.favorite
+  }
+  if (favorite.target.feature === 'find') {
+    return activation.kind === 'openFind' && iconKind === 'find'
+  }
+  return iconKind === 'webSearch' &&
+    (activation.kind === 'completion' || activation.kind === 'executeResult')
+}
+
 function safeCommandHint(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
@@ -562,7 +616,7 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, hasDefaultAction, activation }) =>
+    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation }) =>
       Object.freeze({
         key,
         title,
@@ -572,16 +626,19 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(iconKind === undefined ? {} : { iconKind }),
         ...(detail === undefined ? {} : { detail }),
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
-        ...(activation.kind === 'pluginCompletion' || activation.kind === 'windowActivation' ||
-            activation.kind === 'mainResultActivation'
-          ? { pluginCompletion: Object.freeze({ pluginId: activation.pluginId, favorite: activation.favorite }) }
-          : {}),
+        ...(favorite === undefined
+          ? {}
+          : {
+              favorite: Object.freeze({
+                target: Object.freeze({ ...favorite.target }),
+                favorite: favorite.favorite,
+              }),
+            }),
         ...(activation.kind === 'panelActivation'
           ? {
               panelActivation: Object.freeze({
                 pluginId: activation.pluginId,
                 initialArgument: activation.initialArgument,
-                favorite: activation.favorite,
               }),
             }
           : {}),
@@ -1255,13 +1312,6 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     favoriteMenuConsumed = false
   }
 
-  function pluginFavoriteActivation(activation: LauncherResultActivation) {
-    return activation.kind === 'pluginCompletion' || activation.kind === 'windowActivation' ||
-        activation.kind === 'mainResultActivation' || activation.kind === 'panelActivation'
-      ? activation
-      : undefined
-  }
-
   function ownsFavoriteInteraction(owner: FavoriteInteractionOwner): boolean {
     if (
       destroyed ||
@@ -1277,8 +1327,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       owner.value !== model.queryControlValue
     ) return false
     const selected = model.results[model.selectedIndex]
-    const activation = selected ? pluginFavoriteActivation(selected.activation) : undefined
-    return selected?.key === owner.resultKey && activation?.pluginId === owner.pluginId
+    return selected?.key === owner.resultKey && selected.favorite !== undefined &&
+      sameFavoriteTarget(selected.favorite.target, owner.target)
   }
 
   unsubscribeMessages = messageCenter.subscribe(() => {
@@ -1288,7 +1338,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function beginSearch(submit = false, showPending = true): void {
     const invocationId = model.invocationId
-    if (!invocationId || fileCommand(model.query) !== null || sequenceExhausted) return
+    if (!invocationId || (model.query !== '/find' && fileCommand(model.query) !== null) || sequenceExhausted) return
     let ownedOrigin: ApplicationSearchOwner['completionOrigin']
     if (ownsCompletionOrigin(completionOrigin)) {
       if (!submit && completionOrigin.phase === 'armed') {
@@ -1461,6 +1511,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         const icon = safeApplicationIcon(item.icon)
         const pluginIconUrl = safePublicPluginIconUrl(item.pluginIconUrl)
         const iconKind = safeResultIconKind(item.iconKind)
+        const favorite = item.favorite === undefined ? undefined : safeResultFavorite(item.favorite)
+        if (
+          (item.favorite !== undefined && favorite === undefined) ||
+          (favorite !== undefined && !favoriteMatchesResult(favorite, activation, iconKind))
+        ) return []
         return [{
           kind: 'application',
           key: resultKey++,
@@ -1472,6 +1527,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           ...(pluginIconUrl === undefined ? {} : { pluginIconUrl }),
           ...(iconKind === undefined ? {} : { iconKind }),
           ...(item.detail === undefined ? {} : { detail: item.detail }),
+          ...(favorite === undefined ? {} : { favorite }),
           ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
         }]
       })
@@ -2769,13 +2825,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       index >= model.results.length
     ) return
     const result = model.results[index]
-    const activation = result ? pluginFavoriteActivation(result.activation) : undefined
-    if (!activation || !model.invocationId) return
+    const resultFavorite = result?.favorite
+    if (!resultFavorite || !model.invocationId) return
     if (
       favoriteInteraction &&
       ownsFavoriteInteraction(favoriteInteraction) &&
       favoriteInteraction.resultKey === result.key &&
-      favoriteInteraction.pluginId === activation.pluginId
+      sameFavoriteTarget(favoriteInteraction.target, resultFavorite.target)
     ) {
       favoriteMenuConsumed = false
       publish(false)
@@ -2791,7 +2847,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       querySequence: model.querySequence,
       value: model.queryControlValue,
       resultKey: result.key,
-      pluginId: activation.pluginId,
+      target: resultFavorite.target,
     }
     publish(true)
   }
@@ -2807,14 +2863,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function setPluginFavorite(index: number, favorite: boolean): void {
     if (model.favoriteMutationPending || !Number.isInteger(index)) return
     const result = model.results[index]
-    const activation = result ? pluginFavoriteActivation(result.activation) : undefined
+    const resultFavorite = result?.favorite
     const interaction = favoriteInteraction
     if (
       !interaction ||
       !ownsFavoriteInteraction(interaction) ||
       result?.key !== interaction.resultKey ||
-      activation?.pluginId !== interaction.pluginId ||
-      activation.favorite === favorite
+      resultFavorite === undefined ||
+      !sameFavoriteTarget(resultFavorite.target, interaction.target) ||
+      resultFavorite.favorite === favorite
     ) return
     const owner: FavoriteMutationOwner = { ...interaction, favorite }
     favoriteMutation = owner
@@ -2824,7 +2881,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: Promise<void>
     try {
-      pending = client.setPublicPluginFavorite({ pluginId: owner.pluginId, favorite })
+      pending = owner.target.kind === 'publicPlugin'
+        ? client.setPublicPluginFavorite({ pluginId: owner.target.pluginId, favorite })
+        : client.setBuiltinFeatureFavorite({ feature: owner.target.feature, favorite })
     } catch (error) {
       pending = Promise.reject(error)
     }
@@ -2835,7 +2894,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function finishFavoriteMutation(owner: FavoriteMutationOwner, failed: boolean): void {
-    if (favoriteMutation?.token !== owner.token || favoriteMutation.pluginId !== owner.pluginId) return
+    if (
+      favoriteMutation?.token !== owner.token ||
+      !sameFavoriteTarget(favoriteMutation.target, owner.target)
+    ) return
     favoriteMutation = undefined
     model.favoriteMutationPending = false
     if (!ownsFavoriteInteraction(owner)) {

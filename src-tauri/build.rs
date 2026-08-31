@@ -79,6 +79,7 @@ fn main() {
             "set_file_preview_preference",
             "set_theme_preference",
             "set_web_search_engine",
+            "set_builtin_feature_favorite",
             "hide_launcher",
         ]),
     ))

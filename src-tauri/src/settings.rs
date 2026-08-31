@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::Path,
     sync::{Mutex, MutexGuard},
@@ -39,6 +39,13 @@ pub(crate) enum WebSearchEngine {
     Google,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum BuiltinFeature {
+    Find,
+    WebSearch,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
@@ -50,6 +57,8 @@ pub(crate) struct Settings {
     pub(crate) web_search_engine: WebSearchEngine,
     #[serde(default = "default_file_preview_enabled")]
     pub(crate) file_preview_enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) favorite_builtin_features: BTreeSet<BuiltinFeature>,
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +112,7 @@ impl Default for Settings {
             theme: ThemePreference::System,
             web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: default_file_preview_enabled(),
+            favorite_builtin_features: BTreeSet::new(),
             use_counts: BTreeMap::new(),
             window_position: None,
             find_window_position: None,
@@ -226,6 +236,21 @@ impl SettingsStore {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
         candidate.web_search_engine = engine;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_builtin_feature_favorite(
+        &self,
+        feature: BuiltinFeature,
+        favorite: bool,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        if favorite {
+            candidate.favorite_builtin_features.insert(feature);
+        } else {
+            candidate.favorite_builtin_features.remove(&feature);
+        }
         self.persist(&mut state, candidate)
     }
 
@@ -405,7 +430,7 @@ fn valid_app_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
         sync::{
@@ -534,6 +559,53 @@ mod tests {
             "webSearchEngine": "unknown"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn builtin_feature_favorites_default_persist_and_do_not_overwrite_other_settings() {
+        let dir = TestDir::new("builtin-feature-favorites");
+        let initial = Settings {
+            hotkey: "Alt+Space".into(),
+            autostart: true,
+            theme: ThemePreference::Dark,
+            web_search_engine: WebSearchEngine::Google,
+            ..Settings::default()
+        };
+        write_settings(&dir.current(), &initial);
+
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert!(store.snapshot().favorite_builtin_features.is_empty());
+        store
+            .set_builtin_feature_favorite(BuiltinFeature::Find, true)
+            .unwrap();
+        store
+            .set_builtin_feature_favorite(BuiltinFeature::WebSearch, true)
+            .unwrap();
+        drop(store);
+
+        let reloaded = SettingsStore::load(dir.path()).unwrap();
+        let favorited = reloaded.snapshot();
+        assert_eq!(favorited.hotkey, "Alt+Space");
+        assert!(favorited.autostart);
+        assert_eq!(favorited.theme, ThemePreference::Dark);
+        assert_eq!(favorited.web_search_engine, WebSearchEngine::Google);
+        assert_eq!(
+            favorited.favorite_builtin_features,
+            BTreeSet::from([BuiltinFeature::Find, BuiltinFeature::WebSearch])
+        );
+
+        reloaded
+            .set_builtin_feature_favorite(BuiltinFeature::Find, false)
+            .unwrap();
+        drop(reloaded);
+
+        assert_eq!(
+            SettingsStore::load(dir.path())
+                .unwrap()
+                .snapshot()
+                .favorite_builtin_features,
+            BTreeSet::from([BuiltinFeature::WebSearch])
+        );
     }
 
     #[test]
@@ -1076,6 +1148,7 @@ mod tests {
             web_search_engine: WebSearchEngine::Bing,
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
+            favorite_builtin_features: BTreeSet::new(),
             window_position: None,
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
