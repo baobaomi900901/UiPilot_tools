@@ -206,14 +206,17 @@ panel.onHostKey(async (event) => {
   if (sessionLeaving) return
   if (event.key === 'Tab') {
     setFilter(cycleFilter(activeFilter, event.shiftKey ? -1 : 1))
+    await panel.focusHostInput()
     return
   }
   if (event.key === 'ArrowUp') {
     moveVisibleSelection(-1)
+    await panel.focusHostInput()
     return
   }
   if (event.key === 'ArrowDown') {
     moveVisibleSelection(1)
+    await panel.focusHostInput()
     return
   }
   if (event.key === 'Enter') {

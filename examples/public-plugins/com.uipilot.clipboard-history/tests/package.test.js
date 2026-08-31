@@ -6,7 +6,7 @@ const exampleRoot = new URL('../', import.meta.url)
 const packageRoot = new URL('../package/', import.meta.url)
 
 test('strict package root contains only the public clipboard history Panel assets', async () => {
-  assert.deepEqual((await readdir(packageRoot)).sort(), ['dist', 'plugin.json'])
+  assert.deepEqual((await readdir(packageRoot)).sort(), ['dist', 'icon.png', 'plugin.json'])
   assert.deepEqual((await readdir(new URL('dist/', packageRoot))).sort(), [
     'clipboard-history-logic.js',
     'panel.css',

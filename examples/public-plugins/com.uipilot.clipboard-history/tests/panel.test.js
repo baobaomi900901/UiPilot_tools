@@ -214,6 +214,32 @@ test('cycles filters and clamps list selection with Host-routed keys', async (t)
   assert.equal(selectedEntryId(panel), 'files-missing')
 })
 
+test('restores Host input focus after category changes so consecutive Tab remains routable', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+
+  await panel.hostKey(hostKey('Tab', '17'))
+  assert.equal(activeFilter(panel), 'image')
+  assert.equal(panel.calls.focusHostInput, 1)
+
+  await panel.hostKey(hostKey('Tab', '18'))
+  assert.equal(activeFilter(panel), 'files')
+  assert.equal(panel.calls.focusHostInput, 2)
+})
+
+test('restores Host input focus after list navigation so ArrowUp remains routable', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+
+  await panel.hostKey(hostKey('ArrowDown', '17'))
+  assert.equal(selectedEntryId(panel), 'image-1')
+  assert.equal(panel.calls.focusHostInput, 1)
+
+  await panel.hostKey(hostKey('ArrowUp', '18'))
+  assert.equal(selectedEntryId(panel), 'text-1')
+  assert.equal(panel.calls.focusHostInput, 2)
+})
+
 test('pastes the selected entry once and ignores later snapshots after admission', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
@@ -400,7 +426,7 @@ test('uses a stable responsive layout and contains no forbidden capability bypas
   ])
 
   for (const required of [
-    'grid-template-columns: 104px minmax(0, 1fr)',
+    'grid-template-columns: 112px minmax(0, 1fr)',
     '-webkit-line-clamp: 2',
     'letter-spacing: 0',
     '@media (max-width: 520px)',
@@ -420,4 +446,17 @@ test('uses a stable responsive layout and contains no forbidden capability bypas
   ]) {
     assert.doesNotMatch(source, new RegExp(forbidden.replace('(', '\\(')))
   }
+})
+
+test('matches Host settings density without drawing an active tab edge', async () => {
+  const css = await readFile(panelCssUrl, 'utf8')
+  const activeTabRule = css.match(/\.filter-tab\[aria-selected='true'\]\s*\{([^}]*)\}/s)?.[1]
+
+  assert.match(css, /grid-template-columns:\s*112px minmax\(0, 1fr\)/)
+  assert.match(css, /\.filter-tab\s*\{[^}]*height:\s*40px;/s)
+  assert.match(css, /\.history-item\s*\{[^}]*min-height:\s*54px;/s)
+  assert.ok(activeTabRule)
+  assert.match(activeTabRule, /color:\s*var\(--uipilot-color-accent/)
+  assert.match(activeTabRule, /background:\s*transparent/)
+  assert.doesNotMatch(activeTabRule, /border-(?:left|right)|box-shadow|outline/)
 })
