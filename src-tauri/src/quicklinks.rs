@@ -155,6 +155,17 @@ impl QuicklinksStore {
             .map(|item| self.view_for(item))
     }
 
+    pub(crate) fn commands(&self) -> Vec<String> {
+        let mut state = self.state.lock().expect("quicklinks store lock poisoned");
+        self.ensure_loaded_locked(&mut state);
+        state
+            .document
+            .items
+            .iter()
+            .map(|item| item.command.clone())
+            .collect()
+    }
+
     pub(crate) fn save(
         &self,
         input: QuicklinkSaveInput,

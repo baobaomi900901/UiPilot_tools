@@ -391,6 +391,40 @@ fn effective_names_are_global_and_failed_rename_is_atomic() {
 }
 
 #[test]
+fn dynamic_reserved_names_block_public_plugin_activation_and_rename() {
+    let dir = TestDir::new("dynamic-names");
+    let store = PluginStateStore::load(dir.path(), ["find".into()]).unwrap();
+    store
+        .replace_external_reserved_names(["jd".into()])
+        .unwrap();
+
+    assert_eq!(
+        store.install_or_upgrade(
+            &manifest("com.example.quicklink", "jd", json!([])),
+            BTreeSet::new(),
+        ),
+        Err(PluginStateError::NameConflict { owner: None })
+    );
+
+    install(&store, &manifest("com.example.alpha", "alpha", json!([])));
+    assert_eq!(
+        store.rename("com.example.alpha", Some("jd")),
+        Err(PluginStateError::NameConflict { owner: None })
+    );
+
+    store
+        .replace_external_reserved_names(Vec::<String>::new())
+        .unwrap();
+    assert_eq!(
+        store
+            .rename("com.example.alpha", Some("jd"))
+            .unwrap()
+            .effective_name,
+        "jd"
+    );
+}
+
+#[test]
 fn timer_upgrade_requires_every_declared_grant_and_preserves_current_generation() {
     let dir = TestDir::new("timer-grants");
     let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();

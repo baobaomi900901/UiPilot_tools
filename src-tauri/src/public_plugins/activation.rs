@@ -2251,6 +2251,27 @@ impl PublicPluginManager {
             items,
         })
     }
+
+    pub(crate) fn installed_command_names(
+        &self,
+    ) -> Result<Vec<String>, PublicPluginManagementError> {
+        Ok(self
+            .state
+            .configs()?
+            .into_iter()
+            .filter(|config| config.installed)
+            .map(|config| config.effective_name)
+            .collect())
+    }
+
+    pub(crate) fn replace_external_reserved_names(
+        &self,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<(), PublicPluginManagementError> {
+        self.state.replace_external_reserved_names(names)?;
+        Ok(())
+    }
+
     pub(crate) fn route(
         &self,
         query: &str,

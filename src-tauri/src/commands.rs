@@ -67,6 +67,10 @@ use crate::{
         PublicPluginMutation, PublicPluginPrepareSummary, PublicPluginResponse, PublicPluginRoute,
         PublicPluginService, PublicPluginWindowIdentity, TimerError, WindowStorageError,
     },
+    quicklinks::{
+        QuicklinkErrorCode, QuicklinkIconCandidate, QuicklinkListResponse, QuicklinkSaveInput,
+        QuicklinkView, QuicklinksStore,
+    },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
     },
@@ -416,6 +420,43 @@ impl CommandError {
         Self {
             code: "webSearchFailed",
             message: "browser search could not be opened",
+        }
+    }
+
+    fn quicklink(error: QuicklinkErrorCode) -> Self {
+        match error {
+            QuicklinkErrorCode::LoadFailed => Self {
+                code: "quicklinkLoadFailed",
+                message: "quicklinks could not be loaded",
+            },
+            QuicklinkErrorCode::SaveFailed => Self {
+                code: "quicklinkSaveFailed",
+                message: "quicklink could not be saved",
+            },
+            QuicklinkErrorCode::DeleteFailed => Self {
+                code: "quicklinkDeleteFailed",
+                message: "quicklink could not be deleted",
+            },
+            QuicklinkErrorCode::CommandConflict => Self {
+                code: "quicklinkCommandConflict",
+                message: "quicklink command conflicts with another command",
+            },
+            QuicklinkErrorCode::InvalidCommand => Self {
+                code: "quicklinkInvalidCommand",
+                message: "quicklink command is invalid",
+            },
+            QuicklinkErrorCode::InvalidTemplate => Self {
+                code: "quicklinkInvalidTemplate",
+                message: "quicklink template is invalid",
+            },
+            QuicklinkErrorCode::InvalidIcon => Self {
+                code: "quicklinkInvalidIcon",
+                message: "quicklink icon is invalid",
+            },
+            QuicklinkErrorCode::OpenFailed => Self {
+                code: "quicklinkOpenFailed",
+                message: "quicklink URL could not be opened",
+            },
         }
     }
 }
@@ -1137,6 +1178,82 @@ pub(crate) fn list_public_plugins(
     require_main_window(&window)?;
     Ok(service.manager()?.inventory()?)
 }
+
+#[tauri::command]
+pub(crate) fn list_quicklinks(
+    window: WebviewWindow,
+    store: State<'_, Arc<QuicklinksStore>>,
+) -> Result<QuicklinkListResponse, CommandError> {
+    require_main_window(&window)?;
+    Ok(store.list())
+}
+
+#[tauri::command]
+pub(crate) fn save_quicklink(
+    window: WebviewWindow,
+    store: State<'_, Arc<QuicklinksStore>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    input: QuicklinkSaveInput,
+) -> Result<QuicklinkView, CommandError> {
+    require_main_window(&window)?;
+    let manager = service.manager()?;
+    let public_commands = manager.installed_command_names()?;
+    let saved = store
+        .save_with_external_conflicts(input, &public_commands)
+        .map_err(CommandError::quicklink)?;
+    manager.replace_external_reserved_names(store.commands())?;
+    Ok(saved)
+}
+
+#[tauri::command]
+pub(crate) fn delete_quicklink(
+    window: WebviewWindow,
+    store: State<'_, Arc<QuicklinksStore>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    id: String,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    store.delete(&id).map_err(CommandError::quicklink)?;
+    service
+        .manager()?
+        .replace_external_reserved_names(store.commands())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn choose_quicklink_icon(
+    window: WebviewWindow,
+    app: AppHandle,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
+    store: State<'_, Arc<QuicklinksStore>>,
+) -> Result<Option<QuicklinkIconCandidate>, CommandError> {
+    require_main_window(&window)?;
+    let _focus = coordinator
+        .suppress_transient_focus_loss()
+        .map_err(|_| CommandError::quicklink(QuicklinkErrorCode::InvalidIcon))?;
+    let selected = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("选择 128x128 PNG 图标")
+        .add_filter("PNG 图片", &["png"])
+        .blocking_pick_file()
+        .and_then(|path| path.into_path().ok());
+    let result = selected
+        .as_deref()
+        .map(|path| store.create_icon_candidate_from_path(path))
+        .transpose()
+        .map_err(CommandError::quicklink)?;
+    window
+        .set_focus()
+        .map_err(|_| CommandError::window_failed())?;
+    window
+        .as_ref()
+        .set_focus()
+        .map_err(|_| CommandError::window_failed())?;
+    Ok(result)
+}
+
 #[tauri::command]
 pub(crate) fn prepare_public_plugin_install(
     window: WebviewWindow,
@@ -1167,6 +1284,7 @@ pub(crate) async fn commit_public_plugin_install(
     app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
+    quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
     input: CommitPublicPluginInstallInput,
@@ -1175,8 +1293,10 @@ pub(crate) async fn commit_public_plugin_install(
     let _focus = coordinator
         .suppress_transient_focus_loss()
         .map_err(|_| CommandError::plugin_install_failed())?;
+    let manager = service.manager()?;
+    manager.replace_external_reserved_names(quicklinks.commands())?;
     let mut created_runtime = None;
-    let result = service.manager()?.commit_with_readiness(
+    let result = manager.commit_with_readiness(
         window.label(),
         &input.token,
         input.permission_grants,
@@ -1292,14 +1412,15 @@ pub(crate) fn set_plugin_effective_name(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
     name_override: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
-    let mutation = service
-        .manager()?
-        .rename(&plugin_id, name_override.as_deref())?;
+    let manager = service.manager()?;
+    manager.replace_external_reserved_names(quicklinks.commands())?;
+    let mutation = manager.rename(&plugin_id, name_override.as_deref())?;
     plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
     Ok(mutation)
 }
@@ -6026,6 +6147,40 @@ mod tests {
             assert!(build.contains(&format!("\"{command}\",")));
             assert!(main.contains(&permission));
             assert!(!runtime.contains(&permission));
+        }
+    }
+
+    #[test]
+    fn quicklink_commands_are_main_only_and_have_exact_capabilities() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let build = include_str!("../build.rs");
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        let find = include_str!("../capabilities/find.json");
+        let panel = include_str!("../capabilities/plugin-panel-content.json");
+        for command in [
+            "list_quicklinks",
+            "save_quicklink",
+            "delete_quicklink",
+            "choose_quicklink_icon",
+        ] {
+            let marker = format!("pub(crate) fn {command}(");
+            let body = source
+                .split(&marker)
+                .nth(1)
+                .and_then(|tail| tail.split("\n#[tauri::command]").next())
+                .unwrap_or_else(|| panic!("missing {command}"));
+            let first_statement = body[body.find('{').unwrap() + 1..].trim_start();
+            assert!(
+                first_statement.starts_with("require_main_window(&window)?;"),
+                "{command} must guard caller before state access"
+            );
+            let permission = format!("{}-{}", ["al", "low"].concat(), command.replace('_', "-"));
+            assert!(build.contains(&format!("\"{command}\",")), "{command}");
+            assert!(main.contains(&permission), "{command}");
+            assert!(!runtime.contains(&permission), "{command}");
+            assert!(!find.contains(&permission), "{command}");
+            assert!(!panel.contains(&permission), "{command}");
         }
     }
 

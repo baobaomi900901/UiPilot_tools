@@ -125,6 +125,11 @@ fn setup_production_lifecycle(
     if !app.manage(settings) {
         return Err(lifecycle_setup_error().into());
     }
+    let quicklinks_store = Arc::new(quicklinks::QuicklinksStore::new(app_data_dir.clone()));
+    let quicklink_reserved_names = quicklinks_store.commands();
+    if !app.manage(Arc::clone(&quicklinks_store)) {
+        return Err(lifecycle_setup_error().into());
+    }
 
     let window = app
         .get_webview_window("main")
@@ -289,10 +294,17 @@ fn setup_production_lifecycle(
     message_center
         .install_native_effects(toast, tray_attention, attention_audio)
         .map_err(|_| lifecycle_setup_error())?;
+    let mut reserved_plugin_names = vec![
+        "find".into(),
+        "math".into(),
+        "quicklinks".into(),
+        "web-search".into(),
+    ];
+    reserved_plugin_names.extend(quicklink_reserved_names);
     public_plugin_service.initialize(
         app.handle(),
         &app_data_dir,
-        ["find".into(), "math".into(), "web-search".into()],
+        reserved_plugin_names,
         Arc::clone(&message_center),
         native_attention::attention_route(route_messages),
     )?;
@@ -426,6 +438,10 @@ pub fn run() {
             commands::hide_find_window,
             commands::select_public_plugin_directory,
             commands::list_public_plugins,
+            commands::list_quicklinks,
+            commands::save_quicklink,
+            commands::delete_quicklink,
+            commands::choose_quicklink_icon,
             commands::prepare_public_plugin_install,
             commands::commit_public_plugin_install,
             commands::cancel_public_plugin_install,
@@ -707,7 +723,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 76);
+        assert_eq!(production.matches("commands::").count(), 80);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -719,6 +735,10 @@ mod tests {
             "hide_find_window",
             "select_public_plugin_directory",
             "list_public_plugins",
+            "list_quicklinks",
+            "save_quicklink",
+            "delete_quicklink",
+            "choose_quicklink_icon",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",

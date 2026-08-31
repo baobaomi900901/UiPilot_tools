@@ -201,6 +201,7 @@ struct StateData {
 pub(crate) struct PluginStateStore {
     root: PathBuf,
     reserved_names: BTreeSet<String>,
+    external_reserved_names: Mutex<BTreeSet<String>>,
     state: Mutex<StateData>,
 }
 
@@ -238,6 +239,7 @@ impl PluginStateStore {
         let store = Self {
             root: root.to_path_buf(),
             reserved_names,
+            external_reserved_names: Mutex::new(BTreeSet::new()),
             state: Mutex::new(StateData {
                 revision: persisted_revision.max(owner_revision),
                 by_plugin,
@@ -245,6 +247,24 @@ impl PluginStateStore {
         };
         store.validate_loaded_names()?;
         Ok(store)
+    }
+
+    pub(crate) fn replace_external_reserved_names(
+        &self,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<(), PluginStateError> {
+        let names = names
+            .into_iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        if names.iter().any(|name| !valid_command_name(name)) {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        *self
+            .external_reserved_names
+            .lock()
+            .map_err(|_| PluginStateError::Storage)? = names;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -830,7 +850,13 @@ impl PluginStateStore {
         name: &str,
     ) -> Result<(), PluginStateError> {
         let folded = name.to_ascii_lowercase();
-        if self.reserved_names.contains(&folded) {
+        if self.reserved_names.contains(&folded)
+            || self
+                .external_reserved_names
+                .lock()
+                .map_err(|_| PluginStateError::Storage)?
+                .contains(&folded)
+        {
             return Err(PluginStateError::NameConflict { owner: None });
         }
         if let Some(owner) = state.by_plugin.values().find_map(|stored| {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-quicklinks"
+description = "Enables the list_quicklinks command without any pre-configured scope."
+commands.allow = ["list_quicklinks"]
+
+[[permission]]
+identifier = "deny-list-quicklinks"
+description = "Denies the list_quicklinks command without any pre-configured scope."
+commands.deny = ["list_quicklinks"]
