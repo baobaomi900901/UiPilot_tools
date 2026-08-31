@@ -68,8 +68,8 @@ use crate::{
         PublicPluginService, PublicPluginWindowIdentity, TimerError, WindowStorageError,
     },
     quicklinks::{
-        QuicklinkErrorCode, QuicklinkIconCandidate, QuicklinkListResponse, QuicklinkSaveInput,
-        QuicklinkView, QuicklinksStore,
+        expand_template, QuicklinkErrorCode, QuicklinkIconCandidate, QuicklinkListResponse,
+        QuicklinkSaveInput, QuicklinkView, QuicklinksStore,
     },
     result_registry::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
@@ -3048,9 +3048,11 @@ pub(crate) async fn search_apps(
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let public = app.state::<Arc<PublicPluginService>>();
+    let quicklinks = app.state::<Arc<QuicklinksStore>>();
     let normalized_query = query.trim().to_owned();
     let settings_snapshot = settings.snapshot();
     let web_search_engine = settings_snapshot.web_search_engine;
+    let quicklink_items = quicklinks.list().items;
     if completion_origin.is_none()
         && (!normalized_query.starts_with('/') || normalized_query == "/")
     {
@@ -3060,8 +3062,10 @@ pub(crate) async fn search_apps(
                 query: &normalized_query,
                 invocation_id: &invocation_id,
                 query_sequence,
+                submit,
                 web_search_engine,
                 favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                quicklinks: &quicklink_items,
             },
             |plain_query| public.manager()?.launcher_command_suggestions(plain_query),
             || cache.snapshot(),
@@ -3071,8 +3075,10 @@ pub(crate) async fn search_apps(
     if completion_origin.is_none()
         && (normalized_query == "/find"
             || normalized_query.starts_with("/find ")
+            || normalized_query == "/quicklinks"
             || normalized_query == "/web-search"
-            || normalized_query.starts_with("/web-search "))
+            || normalized_query.starts_with("/web-search ")
+            || quicklink_query(&normalized_query, &quicklink_items).is_some())
     {
         return Ok(search_apps_with_catalog(
             registry,
@@ -3080,8 +3086,10 @@ pub(crate) async fn search_apps(
                 query: &normalized_query,
                 invocation_id: &invocation_id,
                 query_sequence,
+                submit,
                 web_search_engine,
                 favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                quicklinks: &quicklink_items,
             },
             |_| Ok(Vec::new()),
             Vec::new,
@@ -3216,6 +3224,7 @@ pub(crate) async fn search_apps(
                     command_hint: None,
                     main_result_command: None,
                     window_transfer_token: Some(prepared.transfer_token),
+                    auto_execute_result_id: None,
                     replace_local_results: false,
                 }))
             }
@@ -3384,6 +3393,7 @@ fn public_plugin_prompt(
             command_hint: Some(placeholder.unwrap_or_else(|| "请输入内容".into())),
             main_result_command,
             window_transfer_token: None,
+            auto_execute_result_id: None,
             replace_local_results: false,
         },
     )
@@ -3463,6 +3473,7 @@ fn search_response(
         command_hint: None,
         main_result_command: None,
         window_transfer_token: None,
+        auto_execute_result_id: None,
         replace_local_results: false,
     }
 }
@@ -3492,8 +3503,10 @@ struct CatalogSearchRequest<'a> {
     query: &'a str,
     invocation_id: &'a str,
     query_sequence: u64,
+    submit: bool,
     web_search_engine: WebSearchEngine,
     favorite_builtin_features: &'a BTreeSet<BuiltinFeature>,
+    quicklinks: &'a [QuicklinkView],
 }
 
 fn search_apps_with<S, D>(
@@ -3516,8 +3529,10 @@ where
             query,
             invocation_id,
             query_sequence,
+            submit: false,
             web_search_engine,
             favorite_builtin_features: &favorite_builtin_features,
+            quicklinks: &[],
         },
         |_| Ok(Vec::new()),
         snapshot,
@@ -3606,6 +3621,104 @@ fn web_search_result(
         },
         Some(ResultAction::OpenWebSearch { engine, query }),
     )
+}
+
+fn quicklinks_result() -> (crate::model::ResultItem, Option<ResultAction>) {
+    (
+        crate::model::ResultItem {
+            result_id: String::new(),
+            activation: LauncherResultActivation::OpenQuicklinks,
+            title: "/quicklinks".into(),
+            subtitle: Some("管理快速链接".into()),
+            icon: None,
+            plugin_icon_url: None,
+            icon_kind: None,
+            detail: None,
+            favorite: None,
+            has_default_action: false,
+        },
+        None,
+    )
+}
+
+fn quicklink_result(
+    quicklink: &QuicklinkView,
+    argument: Option<&str>,
+) -> (crate::model::ResultItem, Option<ResultAction>) {
+    let title = format!("/{}", quicklink.command);
+    let icon = quicklink.icon_data_url.clone();
+    let Some(argument) = argument else {
+        return (
+            crate::model::ResultItem {
+                result_id: String::new(),
+                activation: LauncherResultActivation::completion(format!("{title} "))
+                    .unwrap_or(LauncherResultActivation::ExecuteResult),
+                title,
+                subtitle: Some(quicklink.name.clone()),
+                icon,
+                plugin_icon_url: None,
+                icon_kind: None,
+                detail: None,
+                favorite: None,
+                has_default_action: false,
+            },
+            None,
+        );
+    };
+    match expand_template(&quicklink.template, argument) {
+        Ok(url) => (
+            crate::model::ResultItem {
+                result_id: String::new(),
+                activation: LauncherResultActivation::ExecuteResult,
+                title,
+                subtitle: Some(quicklink.name.clone()),
+                icon,
+                plugin_icon_url: None,
+                icon_kind: None,
+                detail: Some(url.to_string()),
+                favorite: None,
+                has_default_action: true,
+            },
+            Some(ResultAction::OpenQuicklink {
+                id: quicklink.id.clone(),
+                url: url.to_string(),
+            }),
+        ),
+        Err(_) => (
+            crate::model::ResultItem {
+                result_id: String::new(),
+                activation: LauncherResultActivation::ExecuteResult,
+                title,
+                subtitle: Some("快速链接配置无效".into()),
+                icon,
+                plugin_icon_url: None,
+                icon_kind: None,
+                detail: None,
+                favorite: None,
+                has_default_action: false,
+            },
+            None,
+        ),
+    }
+}
+
+fn quicklink_query<'a, 'q>(
+    query: &'q str,
+    quicklinks: &'a [QuicklinkView],
+) -> Option<(&'a QuicklinkView, Option<&'q str>)> {
+    let command = query.strip_prefix('/')?;
+    let (command, argument) = command
+        .split_once(' ')
+        .map_or((command, None), |(command, argument)| {
+            (command, Some(argument.trim()))
+        });
+    if command.is_empty() {
+        return None;
+    }
+    let quicklink = quicklinks
+        .iter()
+        .find(|quicklink| quicklink.command == command)?;
+    Some((quicklink, argument.filter(|argument| !argument.is_empty())))
 }
 
 fn public_plugin_completion_result(
@@ -3709,6 +3822,7 @@ where
                 command_hint: None,
                 main_result_command: None,
                 window_transfer_token: None,
+                auto_execute_result_id: None,
                 replace_local_results: true,
             },
         );
@@ -3716,6 +3830,7 @@ where
 
     let mut command_hint = None;
     let mut replace_local_results = false;
+    let mut auto_execute_first_result = false;
     let mut entries: Vec<(crate::model::ResultItem, Option<ResultAction>)> = Vec::new();
     let catalog_query = if query == "/" { "" } else { query };
     let find_favorite = request
@@ -3726,6 +3841,9 @@ where
         .contains(&BuiltinFeature::WebSearch);
     if query == "/find" {
         entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
+        replace_local_results = true;
+    } else if query == "/quicklinks" {
+        entries.push(quicklinks_result());
         replace_local_results = true;
     } else if query == "/web-search" {
         command_hint = Some("请输入搜索内容".into());
@@ -3747,7 +3865,15 @@ where
                 argument.to_owned(),
                 web_search_favorite,
             ));
+            auto_execute_first_result = request.submit;
         }
+        replace_local_results = true;
+    } else if let Some((quicklink, argument)) = quicklink_query(query, request.quicklinks) {
+        if argument.is_none() {
+            command_hint = Some("请输入参数".into());
+        }
+        entries.push(quicklink_result(quicklink, argument));
+        auto_execute_first_result = request.submit && argument.is_some();
         replace_local_results = true;
     } else if query.starts_with('/') && query != "/" {
         replace_local_results = true;
@@ -3762,6 +3888,7 @@ where
         });
         if catalog_query.is_empty() {
             entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
+            entries.push(quicklinks_result());
             entries.extend(builtin_completion_result(
                 "web-search",
                 "使用默认搜索引擎搜索".into(),
@@ -3835,19 +3962,26 @@ where
         token,
         entries,
         || true,
-        |request_id, items| SearchResponse {
-            request_id,
-            items: items
+        |request_id, items| {
+            let items = items
                 .into_iter()
                 .map(|(result_id, mut item)| {
                     item.result_id = result_id;
                     item
                 })
-                .collect(),
-            command_hint,
-            main_result_command: None,
-            window_transfer_token: None,
-            replace_local_results,
+                .collect::<Vec<_>>();
+            let auto_execute_result_id = auto_execute_first_result
+                .then(|| items.first().map(|item| item.result_id.clone()))
+                .flatten();
+            SearchResponse {
+                request_id,
+                items,
+                command_hint,
+                main_result_command: None,
+                window_transfer_token: None,
+                auto_execute_result_id,
+                replace_local_results,
+            }
         },
     )
 }
@@ -4500,6 +4634,7 @@ pub(crate) async fn execute_result(
                 }
             },
             open_web_search: crate::web_search::open_search,
+            open_quicklink: crate::browser_open::open_url,
             copy_builtin: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
             copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                 if public_plugins
@@ -4522,20 +4657,21 @@ pub(crate) async fn execute_result(
     .await
 }
 
-struct ClipboardExecution<R, A, F, W, B, P, H, S> {
+struct ClipboardExecution<R, A, F, W, Q, B, P, H, S> {
     resolve: R,
     execute: A,
     execute_file: F,
     open_web_search: W,
+    open_quicklink: Q,
     copy_builtin: B,
     copy_plugin: P,
     clear_and_hide: H,
     increment: S,
 }
 
-async fn execute_result_with_clipboard<R, A, F, Fut, W, B, P, H, S>(
+async fn execute_result_with_clipboard<R, A, F, Fut, W, Q, B, P, H, S>(
     ids: (&str, &str),
-    execution: ClipboardExecution<R, A, F, W, B, P, H, S>,
+    execution: ClipboardExecution<R, A, F, W, Q, B, P, H, S>,
 ) -> Result<ExecuteOutcome, CommandError>
 where
     R: FnOnce(&str, &str) -> Result<ResultAction, RegistryError>,
@@ -4543,6 +4679,7 @@ where
     F: FnOnce(FileExecutionAction) -> Fut,
     Fut: Future<Output = Result<FileExecutionOutcome, CommandError>>,
     W: FnOnce(WebSearchEngine, &str) -> Result<(), ()>,
+    Q: FnOnce(url::Url) -> Result<(), ()>,
     B: FnOnce(&str) -> Result<(), ()>,
     P: FnOnce(&str, u64, &str) -> Result<(), PluginCopyError>,
     H: FnOnce() -> Result<(), CommandError>,
@@ -4554,6 +4691,7 @@ where
         execute,
         execute_file,
         open_web_search,
+        open_quicklink,
         copy_builtin,
         copy_plugin,
         clear_and_hide,
@@ -4565,6 +4703,9 @@ where
     })?;
     if let ResultAction::OpenWebSearch { engine, query } = &action {
         return execute_web_search_with(*engine, query, open_web_search, clear_and_hide);
+    }
+    if let ResultAction::OpenQuicklink { url, .. } = &action {
+        return execute_quicklink_with(url, open_quicklink, clear_and_hide);
     }
     if let ResultAction::CopyBuiltInText { text } = &action {
         copy_builtin(text).map_err(|_| CommandError::clipboard_write_failed())?;
@@ -4656,6 +4797,7 @@ where
         }
         ResultAction::CopyBuiltInText { .. }
         | ResultAction::OpenWebSearch { .. }
+        | ResultAction::OpenQuicklink { .. }
         | ResultAction::CopyText { .. } => Err(CommandError::application_entry_unavailable()),
     }
 }
@@ -4686,6 +4828,7 @@ where
         action,
         ResultAction::CopyBuiltInText { .. }
             | ResultAction::OpenWebSearch { .. }
+            | ResultAction::OpenQuicklink { .. }
             | ResultAction::CopyText { .. }
     ) {
         return Err(CommandError::application_entry_unavailable());
@@ -4741,6 +4884,25 @@ where
     H: FnOnce() -> Result<(), CommandError>,
 {
     open(engine, query).map_err(|_| CommandError::web_search_failed())?;
+    clear_and_hide()?;
+    Ok(ExecuteOutcome::LaunchRequested)
+}
+
+fn execute_quicklink_with<O, H>(
+    url: &str,
+    open: O,
+    clear_and_hide: H,
+) -> Result<ExecuteOutcome, CommandError>
+where
+    O: FnOnce(url::Url) -> Result<(), ()>,
+    H: FnOnce() -> Result<(), CommandError>,
+{
+    let url = url::Url::parse(url)
+        .map_err(|_| CommandError::quicklink(QuicklinkErrorCode::OpenFailed))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CommandError::quicklink(QuicklinkErrorCode::OpenFailed));
+    }
+    open(url).map_err(|_| CommandError::quicklink(QuicklinkErrorCode::OpenFailed))?;
     clear_and_hide()?;
     Ok(ExecuteOutcome::LaunchRequested)
 }
@@ -4898,6 +5060,7 @@ mod tests {
             PluginInvocationTheme, PublicActivationMode, PublicCommandSuggestion, PublicOutputMode,
             PublicPluginRoute, TimerError, WindowStorageError,
         },
+        quicklinks::QuicklinkView,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{
             BuiltinFeature, Settings, SettingsStore, SettingsUpdate, ThemePreference,
@@ -5334,6 +5497,18 @@ mod tests {
         }
     }
 
+    fn quicklink_view(command: &str) -> QuicklinkView {
+        QuicklinkView {
+            id: "1".into(),
+            name: "京东搜索".into(),
+            command: command.into(),
+            template: "https://search.jd.com/Search?keyword={Query}".into(),
+            icon_data_url: Some("data:image/png;base64,iVBORw==".into()),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        }
+    }
+
     #[test]
     fn main_result_rows_emit_direct_tag_activation_without_a_trailing_completion() {
         let (item, _) = super::public_plugin_completion_result(
@@ -5473,8 +5648,10 @@ mod tests {
                 query: "   ",
                 invocation_id: "launcher-empty",
                 query_sequence: 1,
+                submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
             },
             |_| {
                 Ok(vec![
@@ -5495,6 +5672,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("/find".into(), None),
+                ("/quicklinks".into(), None),
                 ("/web-search".into(), Some("/web-search ".into())),
                 ("/alpha".into(), None),
                 (demo_title, None),
@@ -5533,8 +5711,10 @@ mod tests {
                     query,
                     invocation_id: "builtin-exact",
                     query_sequence: 1,
+                    submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &favorites,
+                    quicklinks: &[],
                 },
                 |_| panic!("reserved builtin command must not read plugin inventory"),
                 || panic!("reserved builtin command must not read applications"),
@@ -5556,6 +5736,142 @@ mod tests {
     }
 
     #[test]
+    fn launcher_quicklinks_open_manage_panel_and_execute_user_commands() {
+        let quicklinks = vec![quicklink_view("jd")];
+        let registry = ready_registry("quicklinks-open");
+        let manage = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "/quicklinks",
+                invocation_id: "quicklinks-open",
+                query_sequence: 1,
+                submit: true,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &quicklinks,
+            },
+            |_| panic!("reserved quicklinks command must not read plugin inventory"),
+            || panic!("reserved quicklinks command must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(manage.items.len(), 1);
+        assert_eq!(manage.items[0].title, "/quicklinks");
+        assert_eq!(
+            manage.items[0].activation,
+            crate::model::LauncherResultActivation::OpenQuicklinks
+        );
+
+        let registry = ready_registry("quicklinks-prompt");
+        let prompt = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "/jd",
+                invocation_id: "quicklinks-prompt",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &quicklinks,
+            },
+            |_| panic!("quicklink exact command must win before plugin inventory"),
+            || panic!("quicklink command must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(prompt.command_hint.as_deref(), Some("请输入参数"));
+        assert_eq!(prompt.items[0].title, "/jd");
+        assert_eq!(prompt.items[0].subtitle.as_deref(), Some("京东搜索"));
+        assert_eq!(
+            prompt.items[0].icon.as_deref(),
+            Some("data:image/png;base64,iVBORw==")
+        );
+        assert!(!prompt.items[0].has_default_action);
+        assert_eq!(
+            registry.resolve(&prompt.request_id, &prompt.items[0].result_id),
+            Err(RegistryError::UnknownResult)
+        );
+
+        let registry = ready_registry("quicklinks-execute");
+        let execute = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "/jd 手机 A&B?",
+                invocation_id: "quicklinks-execute",
+                query_sequence: 1,
+                submit: true,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &quicklinks,
+            },
+            |_| panic!("quicklink exact command must win before plugin inventory"),
+            || panic!("quicklink command must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(execute.items.len(), 1);
+        assert_eq!(
+            execute.auto_execute_result_id.as_deref(),
+            Some(execute.items[0].result_id.as_str())
+        );
+        assert_eq!(
+            registry.resolve(&execute.request_id, &execute.items[0].result_id),
+            Ok(ResultAction::OpenQuicklink {
+                id: "1".into(),
+                url: "https://search.jd.com/Search?keyword=%E6%89%8B%E6%9C%BA%20A%26B%3F".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn launcher_web_search_submit_uses_auto_execute_result_id() {
+        let registry = ready_registry("web-search-auto");
+        let response = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "/web-search UiPilot docs",
+                invocation_id: "web-search-auto",
+                query_sequence: 1,
+                submit: true,
+                web_search_engine: WebSearchEngine::Baidu,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
+            },
+            |_| panic!("web-search command must not read plugin inventory"),
+            || panic!("web-search command must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            response.auto_execute_result_id.as_deref(),
+            Some(response.items[0].result_id.as_str())
+        );
+        assert!(matches!(
+            registry.resolve(&response.request_id, &response.items[0].result_id),
+            Ok(ResultAction::OpenWebSearch { engine: WebSearchEngine::Baidu, query }) if query == "UiPilot docs"
+        ));
+
+        let registry = ready_registry("web-search-preview");
+        let preview = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "/web-search UiPilot docs",
+                invocation_id: "web-search-preview",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Baidu,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
+            },
+            |_| panic!("web-search command must not read plugin inventory"),
+            || panic!("web-search command must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(preview.auto_execute_result_id, None);
+    }
+
+    #[test]
     fn launcher_empty_query_orders_all_favorites_before_all_other_features() {
         let registry = ready_registry("launcher-favorite-groups");
         let favorites = BTreeSet::from([BuiltinFeature::Find]);
@@ -5566,8 +5882,10 @@ mod tests {
                 query: "",
                 invocation_id: "launcher-favorite-groups",
                 query_sequence: 1,
+                submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &favorites,
+                quicklinks: &[],
             },
             |_| {
                 let mut favorite = command_suggestion("alpha");
@@ -5585,7 +5903,13 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/alpha", "/web-search", demo_title.as_str()]
+            vec![
+                "/find",
+                "/alpha",
+                "/quicklinks",
+                "/web-search",
+                demo_title.as_str(),
+            ]
         );
         assert_eq!(
             serde_json::to_value(&response.items[1]).unwrap()["favorite"],
@@ -5605,8 +5929,10 @@ mod tests {
                 query: "/",
                 invocation_id: "launcher-slash",
                 query_sequence: 1,
+                submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
             },
             |query| {
                 assert_eq!(query, "");
@@ -5623,7 +5949,7 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/web-search", "/alpha"]
+            vec!["/find", "/quicklinks", "/web-search", "/alpha"]
         );
     }
 
@@ -5637,8 +5963,10 @@ mod tests {
                 query: "  win  ",
                 invocation_id: "launcher-plain",
                 query_sequence: 1,
+                submit: false,
                 web_search_engine: WebSearchEngine::Google,
                 favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
             },
             |query| {
                 assert_eq!(query, "win");
@@ -5721,8 +6049,10 @@ mod tests {
                 query: "",
                 invocation_id: "launcher-fallback",
                 query_sequence: 1,
+                submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
             },
             |_| Err(crate::public_plugins::PublicPluginManagementError::Unavailable),
             || panic!("empty launcher query must not read applications"),
@@ -5735,7 +6065,7 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/web-search"]
+            vec!["/find", "/quicklinks", "/web-search"]
         );
 
         let direct = search_apps_with_catalog(
@@ -5744,8 +6074,10 @@ mod tests {
                 query: " /web-search  UiPilot docs ",
                 invocation_id: "launcher-fallback",
                 query_sequence: 2,
+                submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
             },
             |_| panic!("reserved web command must not read plugin inventory"),
             || panic!("reserved web command must not read applications"),
@@ -5764,8 +6096,10 @@ mod tests {
                 query: "/web-search   ",
                 invocation_id: "launcher-fallback",
                 query_sequence: 3,
+                submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
             },
             |_| panic!("reserved web hint must not read plugin inventory"),
             || panic!("reserved web hint must not read applications"),
@@ -7209,7 +7543,7 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/web-search"]
+            vec!["/find", "/quicklinks", "/web-search"]
         );
     }
 
@@ -8290,6 +8624,10 @@ mod tests",
             unreachable!()
         }
 
+        fn no_quicklink(_: url::Url) -> Result<(), ()> {
+            unreachable!()
+        }
+
         #[test]
         fn built_in_copy_bypasses_plugin_permission_and_hides_after_success() {
             let trace = RefCell::new(Vec::new());
@@ -8303,6 +8641,7 @@ mod tests",
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
                         open_web_search: no_web_search,
+                        open_quicklink: no_quicklink,
                         copy_builtin: |text: &str| {
                             trace.borrow_mut().push("clipboard");
                             assert_eq!(text, "14");
@@ -8332,6 +8671,7 @@ mod tests",
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
                         open_web_search: no_web_search,
+                        open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |_: &str, _: u64, _: &str| {
                             Err(PluginCopyError::PermissionDenied)
@@ -8366,6 +8706,7 @@ mod tests",
                         },
                         execute_file: no_file_execution,
                         open_web_search: no_web_search,
+                        open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
                             trace.borrow_mut().push("permission");
@@ -8404,6 +8745,7 @@ mod tests",
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
                         open_web_search: no_web_search,
+                        open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |_: &str, _: u64, _: &str| {
                             Err(PluginCopyError::SideEffectFailed)
@@ -8431,6 +8773,7 @@ mod tests",
                         execute: |_: &ResultAction| unreachable!(),
                         execute_file: no_file_execution,
                         open_web_search: no_web_search,
+                        open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
                         copy_plugin: |_: &str, _: u64, _: &str| {
                             side_effects.set(side_effects.get() + 1);
@@ -8501,6 +8844,55 @@ mod tests",
                     },
                 ),
                 Err(CommandError::web_search_failed())
+            );
+            assert_eq!(hide_calls.get(), 0);
+        }
+    }
+
+    mod execute_quicklink {
+        use std::{cell::RefCell, rc::Rc};
+
+        use super::super::execute_quicklink_with;
+        use super::*;
+        use crate::quicklinks::QuicklinkErrorCode;
+
+        #[test]
+        fn successful_browser_open_hides_only_after_the_launch_request() {
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            let open_trace = Rc::clone(&trace);
+            let hide_trace = Rc::clone(&trace);
+
+            assert_eq!(
+                execute_quicklink_with(
+                    "https://search.jd.com/Search?keyword=phone",
+                    move |url| {
+                        assert_eq!(url.as_str(), "https://search.jd.com/Search?keyword=phone");
+                        open_trace.borrow_mut().push("open");
+                        Ok(())
+                    },
+                    move || {
+                        hide_trace.borrow_mut().push("clear-hide");
+                        Ok(())
+                    },
+                ),
+                Ok(ExecuteOutcome::LaunchRequested)
+            );
+            assert_eq!(*trace.borrow(), ["open", "clear-hide"]);
+        }
+
+        #[test]
+        fn browser_open_failure_keeps_the_launcher_visible() {
+            let hide_calls = Cell::new(0);
+            assert_eq!(
+                execute_quicklink_with(
+                    "https://search.jd.com/Search?keyword=phone",
+                    |_| Err(()),
+                    || {
+                        hide_calls.set(hide_calls.get() + 1);
+                        Ok(())
+                    },
+                ),
+                Err(CommandError::quicklink(QuicklinkErrorCode::OpenFailed))
             );
             assert_eq!(hide_calls.get(), 0);
         }

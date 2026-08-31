@@ -44,32 +44,9 @@ pub(crate) fn search_url(engine: WebSearchEngine, query: &str) -> Option<String>
     Some(url.to_string())
 }
 
-#[cfg(windows)]
 pub(crate) fn open_search(engine: WebSearchEngine, query: &str) -> Result<(), ()> {
-    use windows::{
-        core::PCWSTR,
-        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
-    };
-
     let url = search_url(engine, query).ok_or(())?;
-    let wide: Vec<u16> = url.encode_utf16().chain([0]).collect();
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            PCWSTR::null(),
-            PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-        .0 as isize
-    };
-    (result > 32).then_some(()).ok_or(())
-}
-
-#[cfg(not(windows))]
-pub(crate) fn open_search(_engine: WebSearchEngine, _query: &str) -> Result<(), ()> {
-    Err(())
+    crate::browser_open::open_url(Url::parse(&url).map_err(|_| ())?)
 }
 
 #[cfg(test)]

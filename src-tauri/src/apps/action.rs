@@ -62,6 +62,7 @@ where
         }
         ResultAction::CopyBuiltInText { .. }
         | ResultAction::OpenWebSearch { .. }
+        | ResultAction::OpenQuicklink { .. }
         | ResultAction::CopyText { .. } => {
             return Err(ApplicationActionError::ApplicationEntryUnavailable)
         }

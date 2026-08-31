@@ -404,6 +404,7 @@ impl PluginManager {
                 command_hint: None,
                 main_result_command: None,
                 window_transfer_token: None,
+                auto_execute_result_id: None,
                 replace_local_results: false,
             },
         )

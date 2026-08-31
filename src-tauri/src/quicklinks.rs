@@ -144,6 +144,7 @@ impl QuicklinksStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn find_by_command(&self, command: &str) -> Option<QuicklinkView> {
         let mut state = self.state.lock().expect("quicklinks store lock poisoned");
         self.ensure_loaded_locked(&mut state);
@@ -166,6 +167,7 @@ impl QuicklinksStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn save(
         &self,
         input: QuicklinkSaveInput,

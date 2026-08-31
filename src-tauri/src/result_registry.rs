@@ -24,6 +24,10 @@ pub(crate) enum ResultAction {
         engine: WebSearchEngine,
         query: String,
     },
+    OpenQuicklink {
+        id: String,
+        url: String,
+    },
     CopyText {
         plugin_id: String,
         generation: u64,
@@ -796,7 +800,7 @@ mod tests {
                 command_hint: None,
                 main_result_command: None,
                 window_transfer_token: None,
-
+                auto_execute_result_id: None,
                 replace_local_results: false,
             },
         )

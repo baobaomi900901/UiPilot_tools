@@ -77,6 +77,7 @@ pub(crate) enum LauncherResultActivation {
         initial_argument: String,
         favorite: bool,
     },
+    OpenQuicklinks,
     OpenFind {
         query: String,
     },
@@ -194,6 +195,8 @@ pub(crate) struct SearchResponse {
     pub(crate) main_result_command: Option<MainResultCommandContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) window_transfer_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_execute_result_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) replace_local_results: bool,
 }
