@@ -7,6 +7,7 @@ import {
   type LauncherClient,
   type PluginInventorySnapshot,
   type PublicPluginInventory,
+  type QuicklinkView,
   type ResultItem,
   type SearchResponse,
   type SettingsView,
@@ -20,6 +21,24 @@ const settings: SettingsView = {
   webSearchEngine: 'bing',
 }
 const revisionOne = parseU64Decimal('1')!
+const previewQuicklinks: QuicklinkView[] = [
+  {
+    id: 'preview-jd',
+    name: '京东搜索',
+    command: 'jd',
+    template: 'https://search.jd.com/Search?keyword={Query}',
+    createdAt: '2026-08-31T00:00:00Z',
+    updatedAt: '2026-08-31T00:00:00Z',
+  },
+  {
+    id: 'preview-github',
+    name: 'GitHub 搜索',
+    command: 'gh',
+    template: 'https://github.com/search?q={Query}',
+    createdAt: '2026-08-31T00:00:00Z',
+    updatedAt: '2026-08-31T00:00:00Z',
+  },
+]
 const previewPublicPlugins: PublicPluginInventory = {
   revision: 'preview-public-plugins',
   items: [
@@ -187,6 +206,18 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
     },
   ]
   const normalized = query.trim().toLocaleLowerCase()
+  if (normalized === '/quicklinks') {
+    return {
+      requestId: `browser-preview-${querySequence}`,
+      items: [{
+        resultId: 'preview-quicklinks',
+        title: '/quicklinks',
+        subtitle: '管理快速链接',
+        activation: { kind: 'openQuicklinks' },
+        hasDefaultAction: false,
+      }],
+    }
+  }
   return {
     requestId: `browser-preview-${querySequence}`,
     items: normalized
@@ -216,6 +247,17 @@ const client: LauncherClient = {
   readMessageCenter: async () => noMessages,
   clearMessages: async () => noMessages,
   searchApps: ({ query, querySequence }) => searchResponse(query, querySequence),
+  listQuicklinks: async () => ({ items: previewQuicklinks }),
+  saveQuicklink: async ({ input }) => ({
+    id: input.id ?? `preview-${input.command || 'quicklink'}`,
+    name: input.name,
+    command: input.command,
+    template: input.template,
+    createdAt: '2026-08-31T00:00:00Z',
+    updatedAt: '2026-08-31T00:00:00Z',
+  }),
+  deleteQuicklink: async () => undefined,
+  chooseQuicklinkIcon: async () => null,
   openFind: async () => ({ status: 'forwarded' }),
   executeResult: async () => ({ status: 'launchRequested' }),
   openPluginPanel: async () => ({

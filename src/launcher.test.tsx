@@ -307,6 +307,18 @@ function fakeClient() {
     readMessageCenter: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
     clearMessages: vi.fn(async () => ({ revision: '0', unreadCount: 0, messages: [] })),
     searchApps: vi.fn(async () => null),
+    listQuicklinks: vi.fn(async () => ({ items: [] })),
+    saveQuicklink: vi.fn(async (input: { input: { id?: string; name: string; command: string; template: string; iconToken?: string | null } }) => ({
+      id: input.input.id ?? 'quicklink-new',
+      name: input.input.name,
+      command: input.input.command,
+      template: input.input.template,
+      iconDataUrl: undefined,
+      createdAt: '2026-08-31T00:00:00Z',
+      updatedAt: '2026-08-31T00:00:00Z',
+    })),
+    deleteQuicklink: vi.fn(async () => undefined),
+    chooseQuicklinkIcon: vi.fn(async () => null),
     commitPluginWindowTransfer: vi.fn(async () => {}),
     openFind: vi.fn(async () => ({ status: 'forwarded' as const })),
     searchFiles: vi.fn(async () => null),
@@ -418,6 +430,26 @@ function findLauncherItem(query: string) {
       favorite: false,
     },
     hasDefaultAction: false,
+  }
+}
+
+function quicklinkView(overrides: Partial<{
+  id: string
+  name: string
+  command: string
+  template: string
+  iconDataUrl?: string
+  createdAt: string
+  updatedAt: string
+}> = {}) {
+  return {
+    id: overrides.id ?? 'quicklink-jd',
+    name: overrides.name ?? '京东搜索',
+    command: overrides.command ?? 'jd',
+    template: overrides.template ?? 'https://search.jd.com/Search?keyword={Query}',
+    ...(overrides.iconDataUrl === undefined ? {} : { iconDataUrl: overrides.iconDataUrl }),
+    createdAt: overrides.createdAt ?? '2026-08-31T00:00:00Z',
+    updatedAt: overrides.updatedAt ?? '2026-08-31T00:00:00Z',
   }
 }
 
@@ -843,6 +875,7 @@ describe('shown and search ownership', () => {
         if (request.query === '') return { requestId: 'empty', items: [] }
         return {
           requestId: 'submitted-web',
+          autoExecuteResultId: 'web-result',
           items: [{
             resultId: 'web-result',
             title: 'Bing 搜索',
@@ -874,6 +907,114 @@ describe('shown and search ownership', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('auto-executes the submitted result selected by the backend response', async () => {
+    const fake = fakeClient()
+    vi.useFakeTimers()
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => {
+        if (request.query === '') return { requestId: 'empty', items: [] }
+        return {
+          requestId: 'submitted-quicklink',
+          autoExecuteResultId: 'quicklink-result',
+          items: [
+            {
+              resultId: 'quicklink-result',
+              title: '/jd',
+              activation: executeActivation,
+              hasDefaultAction: true,
+            },
+          ],
+        }
+      })
+      const core = createLauncherCore(fake.client)
+      await core.start()
+      fake.emit(shown('fast-quicklink'))
+      await vi.runAllTicks()
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/jd 手机', inputType: 'insertText',
+      })
+
+      core.keyDown('Enter', false)
+      await vi.runAllTicks()
+      await Promise.resolve()
+
+      expect(fake.client.searchApps).toHaveBeenCalledWith({
+        query: '/jd 手机', invocationId: 'fast-quicklink', querySequence: 3, submit: true,
+      })
+      expect(fake.client.executeResult).toHaveBeenCalledOnce()
+      expect(fake.client.executeResult).toHaveBeenCalledWith({
+        requestId: 'submitted-quicklink', resultId: 'quicklink-result',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('opens the built-in quicklinks panel from a submitted /quicklinks result', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [quicklinkView()],
+    })
+
+    emit(shown('quicklinks-open'))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '/quicklinks', inputType: 'insertText',
+    })
+    core.keyDown('Enter', false)
+
+    await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+    expect(client.listQuicklinks).toHaveBeenCalledOnce()
+    expect(core.getSnapshot().quicklinks?.items.map((item) => item.command)).toEqual(['jd'])
+    expect(core.getSnapshot().query).toBe('')
+    expect(core.getSnapshot().results).toHaveLength(0)
+  })
+
+  it('completes a focused quicklink command back into the launcher input', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [quicklinkView()],
+    })
+
+    emit(shown('quicklinks-complete'))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '/quicklinks', inputType: 'insertText',
+    })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+    core.completeQuicklink('quicklink-jd')
+
+    expect(core.getSnapshot().quicklinks).toBeUndefined()
+    expect(core.getSnapshot().queryControlValue).toBe('/jd ')
   })
 
   it('accepts only the closed launcher activation union and completion grammar', () => {
@@ -909,6 +1050,7 @@ describe('shown and search ownership', () => {
         favorite: true,
       },
       { kind: 'openFind', query: ' da  value ' },
+      { kind: 'openQuicklinks' },
       { kind: 'executeResult' },
     ]
     for (const activation of valid) expect(safeLauncherActivation(activation)).toEqual(activation)
@@ -919,6 +1061,7 @@ describe('shown and search ownership', () => {
       { kind: 'executeResult', query: 'borrowed' },
       { kind: 'openFind' },
       { kind: 'openFind', query: 'query', completionText: '/demo-win ' },
+      { kind: 'openQuicklinks', query: 'borrowed' },
       { kind: 'completion' },
       { kind: 'completion', completionText: '/demo-win' },
       { kind: 'completion', completionText: '/demo-win  da' },

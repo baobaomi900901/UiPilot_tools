@@ -29,7 +29,7 @@
 - `src-tauri/src/browser_open.rs` exposes `open_url(url::Url) -> Result<(), ()>`; `web_search::open_search` and quicklinks execution share it.
 - `src/protocol.ts` mirrors Rust DTOs and adds quicklinks client methods.
 - `src/launcher-core.ts` owns quicklinks state transitions, keyboard behavior, auto-execute gating, and command completion back to `/jd `.
-- `src/quicklinks-panel.tsx` owns the visual management panel; `src/launcher-view.tsx` only wires it into the existing surface.
+- `src/launcher-view.tsx` owns the built-in visual management panel and wires it into the existing surface.
 
 ## Task List
 
@@ -39,12 +39,12 @@
 
 **Dependencies:** Design sections `数据模型`, `链接模板规则`, `图标规则`, `错误处理`.
 
-- [ ] Create the `quicklinks` module with `QuicklinksStore`, `QuicklinkRecord`, `QuicklinkDraftInput`, `QuicklinkListResponse`, `QuicklinkError`, and fixed error-code serialization.
-- [ ] Make launcher command validation reusable from `model.rs` without changing the accepted grammar.
-- [ ] Implement config load/save under `app_data_dir/quicklinks/quicklinks.json` using temp-file + rename and an in-memory cache updated immediately after successful save.
-- [ ] Quarantine corrupt config to `quicklinks.corrupt.<timestamp>.json`, return an empty list, and surface `quicklinkLoadFailed`.
-- [ ] Implement URL template validation and `{Query}` expansion with URL-component percent encoding.
-- [ ] Implement PNG validation/data-url helpers for exactly `128x128` decoded images.
+- [x] Create the `quicklinks` module with `QuicklinksStore`, `QuicklinkRecord`, `QuicklinkDraftInput`, `QuicklinkListResponse`, `QuicklinkError`, and fixed error-code serialization.
+- [x] Make launcher command validation reusable from `model.rs` without changing the accepted grammar.
+- [x] Implement config load/save under `app_data_dir/quicklinks/quicklinks.json` using temp-file + rename and an in-memory cache updated immediately after successful save.
+- [x] Quarantine corrupt config to `quicklinks.corrupt.<timestamp>.json`, return an empty list, and surface `quicklinkLoadFailed`.
+- [x] Implement URL template validation and `{Query}` expansion with URL-component percent encoding.
+- [x] Implement PNG validation/data-url helpers for exactly `128x128` decoded images.
 
 **Distinct test coverage:** valid and invalid command grammar; reserved command rejection; template scheme/query placeholder/control-character rejection; `手机 A&B?` encoding; corrupt config backup and empty response; create/update/delete cache behavior; fake/corrupt/wrong-size PNG rejection and 128x128 PNG acceptance.
 
@@ -56,11 +56,11 @@
 
 **Dependencies:** Task 1; design sections `全局命令命名空间`, `后端接口设计`.
 
-- [ ] Register `list_quicklinks`, `save_quicklink`, `delete_quicklink`, and `choose_quicklink_icon` for the `main` webview only.
-- [ ] Add generated permission entries through the existing Tauri permission generation path and include them in `src-tauri/capabilities/main.json`.
-- [ ] Validate save conflicts against reserved built-ins, existing quicklinks, installed public plugin effective names, and legacy plugin route names.
-- [ ] Update public plugin install/effective-name rename checks so a plugin cannot claim an existing quicklink command.
-- [ ] Keep command responses fixed-code and path-redacted; the frontend should not receive raw icon file paths.
+- [x] Register `list_quicklinks`, `save_quicklink`, `delete_quicklink`, and `choose_quicklink_icon` for the `main` webview only.
+- [x] Add generated permission entries through the existing Tauri permission generation path and include them in `src-tauri/capabilities/main.json`.
+- [x] Validate save conflicts against reserved built-ins, existing quicklinks, installed public plugin effective names, and legacy plugin route names.
+- [x] Update public plugin install/effective-name rename checks so a plugin cannot claim an existing quicklink command.
+- [x] Keep command responses fixed-code and path-redacted; the frontend should not receive raw icon file paths.
 
 **Distinct test coverage:** main caller succeeds while non-main callers fail; save rejects reserved names and public plugin conflicts; public plugin install/rename rejects quicklink conflicts; delete removes store record and icon reference; choose icon rejects invalid files and returns `{ token, dataUrl }`.
 
@@ -72,12 +72,12 @@
 
 **Dependencies:** Tasks 1-2; design sections `默认浏览器打开 URL`, `主界面搜索与执行`, `自动执行事件流`, `执行动作设计`.
 
-- [ ] Add `browser_open::open_url(url::Url)` and refactor `web_search::open_search` to use it without changing existing provider URLs.
-- [ ] Add `ResultAction::OpenQuicklink { id, url }` and execute it via the shared browser opener after reparsing and revalidating `http/https`.
-- [ ] Add `LauncherResultActivation::OpenQuicklinks` and `SearchResponse::auto_execute_result_id`.
-- [ ] Add `/quicklinks` built-in search result and `/` catalog ordering: `/find`, `/quicklinks`, `/web-search`, then public plugin suggestions.
-- [ ] Add `/jd` and `/jd 参数` matching against the quicklinks cache before public plugin routes.
-- [ ] Move `/web-search 参数` submit auto-execution onto `auto_execute_result_id` so quicklinks and web search share one frontend contract.
+- [x] Add `browser_open::open_url(url::Url)` and refactor `web_search::open_search` to use it without changing existing provider URLs.
+- [x] Add `ResultAction::OpenQuicklink { id, url }` and execute it via the shared browser opener after reparsing and revalidating `http/https`.
+- [x] Add `LauncherResultActivation::OpenQuicklinks` and `SearchResponse::auto_execute_result_id`.
+- [x] Add `/quicklinks` built-in search result and `/` catalog ordering: `/find`, `/quicklinks`, `/web-search`, then public plugin suggestions.
+- [x] Add `/jd` and `/jd 参数` matching against the quicklinks cache before public plugin routes.
+- [x] Move `/web-search 参数` submit auto-execution onto `auto_execute_result_id` so quicklinks and web search share one frontend contract.
 
 **Distinct test coverage:** `/quicklinks` returns `OpenQuicklinks`; `/` catalog order includes quicklinks between find and web-search; `/jd` returns `hasDefaultAction=false` and prompt; `/jd 手机` returns registry `OpenQuicklink` with encoded URL and sets `autoExecuteResultId` only on submit; `/web-search 手机` still works through `autoExecuteResultId`; quicklink execution hides launcher on success and returns `quicklinkOpenFailed` on invalid/open failure.
 
@@ -85,16 +85,16 @@
 
 ### Task 4: Frontend Protocol And Launcher Core State
 
-**Files:** `src/protocol.ts`, `src/protocol.test.ts`, `src/launcher-core.ts`, `src/launcher.test.tsx`
+**Files:** `src/protocol.ts`, `src/launcher-core.ts`, `src/launcher.test.tsx`
 
 **Dependencies:** Task 3; design sections `前端状态设计`, `主界面搜索与执行`, `自动执行事件流`, `从 Quicklinks Panel 补全命令`.
 
-- [ ] Mirror quicklinks DTOs, client methods, `openQuicklinks` activation, and `autoExecuteResultId` parsing in `src/protocol.ts`.
-- [ ] Extend launcher model with `launcherMode='quicklinks'` and quicklinks state: `items`, `selectedId`, `draft`, `loadStatus`, `saveStatus`, `deleteStatus`, `fieldErrors`.
-- [ ] Open Quicklinks mode from `/quicklinks` result selection or submit without starting a public plugin panel session.
-- [ ] Implement load/list/new/select/edit/blur-save/delete/icon-select actions in core with debounced or owner-checked async state updates.
-- [ ] Implement `completeQuicklinkCommand(command)` so Enter on a quicklink list item returns to launcher, fills `/{command} `, focuses the main input, and triggers parameter prompt search.
-- [ ] Replace the frontend `/web-search\s+\S` hard-coded auto-execute condition with `response.autoExecuteResultId`, including stale-response checks.
+- [x] Mirror quicklinks DTOs, client methods, `openQuicklinks` activation, and `autoExecuteResultId` parsing in `src/protocol.ts`.
+- [x] Extend launcher model with `launcherMode='quicklinks'` and quicklinks state: `items`, `selectedId`, `draft`, load/save/delete/icon operation, and error text.
+- [x] Open Quicklinks mode from `/quicklinks` result selection or submit without starting a public plugin panel session.
+- [x] Implement load/list/new/select/edit/manual-save/delete/icon-select actions in core with owner-checked async state updates.
+- [x] Implement `completeQuicklinkCommand(command)` so Enter on a quicklink list item returns to launcher, fills `/{command} `, focuses the main input, and triggers parameter prompt search.
+- [x] Replace the frontend `/web-search\s+\S` hard-coded auto-execute condition with `response.autoExecuteResultId`, including stale-response checks.
 
 **Distinct test coverage:** invalid activation/response payloads are rejected; `/quicklinks` selection changes mode to quicklinks; quicklinks mode does not call `openPluginPanel`/`closePluginPanel`; Esc exits to launcher; Enter on list item completes `/jd ` and focuses main input; blur-save does not write incomplete drafts; auto-execute ignores stale or non-default `autoExecuteResultId`.
 
@@ -102,19 +102,19 @@
 
 ### Task 5: Quicklinks Panel UI And Styles
 
-**Files:** `src/quicklinks-panel.tsx`, `src/quicklinks-panel.test.tsx`, `src/launcher-view.tsx`, `src/styles.css`, `dev/main-preview.html`
+**Files:** `src/launcher-view.tsx`, `src/styles.css`, `src/launcher-browser-preview.tsx`
 
 **Dependencies:** Task 4; design sections `Quicklinks Panel UI`, `从 Quicklinks Panel 补全命令`, `人工验收`.
 
-- [ ] Add `QuicklinksPanel` with Notes-like left list and right form: 目录名称、启动键、图标、链接.
-- [ ] Render the panel inside the main surface when `launcherMode='quicklinks'`, visually reusing the panel host area but not the public plugin iframe/WebView machinery.
-- [ ] Use a command tag `/quicklinks`, a new item button, icon preview/choose button, delete confirmation, inline field errors, and save/load/delete status text.
-- [ ] Implement keyboard handling for left list ArrowUp/ArrowDown/Enter/Escape without taking Tab focus away from the intended controls.
-- [ ] Add dev preview fixture data for `/quicklinks` so styles can be tuned in browser without installing or manipulating real links.
+- [x] Add built-in Quicklinks Panel with Notes-like left list and right form: 目录名称、启动键、图标、链接.
+- [x] Render the panel inside the main surface when `launcherMode='quicklinks'`, visually reusing the panel host area but not the public plugin iframe/WebView machinery.
+- [x] Use a command tag `/quicklinks`, a new item button, icon preview/choose button, delete confirmation, inline field errors, and save/load/delete status text.
+- [x] Implement keyboard handling for left list ArrowUp/ArrowDown/Enter/Escape without taking Tab focus away from the intended controls.
+- [x] Add dev preview fixture data for `/quicklinks` so styles can be tuned in browser without installing or manipulating real links.
 
-**Distinct test coverage:** panel renders empty/list/error states; form fields display validation errors; choosing an icon calls the client method; delete confirmation calls delete; list Enter calls complete command; preview fixture shows at least two quicklinks.
+**Distinct test coverage:** core opens the built-in quicklinks panel, loads list data, auto-executes backend-designated quicklink results, accepts `openQuicklinks`, and completes a list item back into `/{command} `. UI styling and delete/icon flows require manual acceptance in Task 6.
 
-**Verify:** `npm.cmd test -- src\quicklinks-panel.test.tsx src\launcher.test.tsx`
+**Verify:** `npm.cmd test -- src\launcher.test.tsx`
 
 ### Task 6: End-To-End Verification, Cleanup, And Handoff
 
@@ -122,10 +122,10 @@
 
 **Dependencies:** Tasks 1-5.
 
-- [ ] Run formatting and focused test suites after all task commits.
-- [ ] Run full Rust tests, frontend tests, and production build.
-- [ ] Confirm no unrelated public plugin files are dirty or staged.
-- [ ] Update the design document status only if implementation results changed the documented contract.
+- [x] Run formatting and focused test suites after all task commits.
+- [x] Run full Rust tests, frontend tests, and production build.
+- [x] Confirm no unrelated public plugin files are dirty or staged.
+- [x] Update the design document status only if implementation results changed the documented contract.
 - [ ] Hand off manual verification steps to the user instead of driving the UI.
 
 **Distinct test coverage:** final suites catch cross-task integration regressions; manual checks cover `/quicklinks` open, add `jd`, `/jd` prompt, `/jd 手机` browser open, panel Enter completion, edit immediate effect, and delete removal.

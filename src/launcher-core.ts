@@ -27,6 +27,10 @@ import {
   type PluginPanelBounds,
   type PanelHostKeyDeclaration,
   type PluginPanelHostKey,
+  type QuicklinkDraftSnapshot,
+  type QuicklinkView,
+  type QuicklinksOperation,
+  type QuicklinksSnapshot,
   type ResultItem,
   type ResultFavorite,
   type ResultFavoriteTarget,
@@ -62,6 +66,14 @@ export interface LauncherCore {
   readonly requestHide: () => Promise<void>
   readonly closeMainResultCommand: () => void
   readonly closePanel: () => Promise<void>
+  readonly closeQuicklinks: () => void
+  readonly newQuicklink: () => void
+  readonly selectQuicklink: (id: string) => void
+  readonly completeQuicklink: (id: string) => void
+  readonly setQuicklinkDraft: (field: 'name' | 'command' | 'template', value: string) => void
+  readonly chooseQuicklinkIcon: () => Promise<void>
+  readonly saveQuicklink: () => Promise<void>
+  readonly deleteQuicklink: () => Promise<void>
   readonly setPanelBounds: (input: { sessionEpoch: U64Decimal; bounds: PluginPanelBounds }) => void
   readonly settlePanelHostInputFocus: (input: PluginPanelFocusHostInputEvent & { focused: boolean }) => void
   readonly activateResult: (index: number) => void
@@ -141,6 +153,15 @@ interface PrivatePanelState {
   focusRequestId?: U64Decimal
 }
 
+interface PrivateQuicklinksState {
+  status: 'loading' | 'ready' | 'error'
+  items: QuicklinkView[]
+  draft: QuicklinkDraftSnapshot
+  selectedId?: string
+  operation?: QuicklinksOperation
+  error?: string
+}
+
 interface PrivateMainResultCommandState {
   pluginId: string
   commandLabel: string
@@ -151,7 +172,7 @@ interface Model {
   view: 'launcher' | 'settings'
   settingsTab: SettingsTabKey
   messageCenter: MessageCenterStateSnapshot
-  launcherMode: 'applications' | 'files' | 'panel'
+  launcherMode: 'applications' | 'files' | 'panel' | 'quicklinks'
   viewEpoch: number
   theme: ThemePreference
   invocationId?: string
@@ -177,6 +198,7 @@ interface Model {
   file?: PrivateFileState
   mainResultCommand?: PrivateMainResultCommandState
   panel?: PrivatePanelState
+  quicklinks?: PrivateQuicklinksState
   plugins: PrivatePluginList
 }
 
@@ -459,6 +481,9 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
     const record = exactPlainRecord(value, ['kind', 'query'])
     return record && typeof record.query === 'string' ? { kind: 'openFind', query: record.query } : undefined
   }
+  if (candidate?.kind === 'openQuicklinks') {
+    return exactPlainRecord(value, ['kind']) ? { kind: 'openQuicklinks' } : undefined
+  }
   if (candidate?.kind === 'completion') {
     const record = exactPlainRecord(value, ['completionText', 'kind'])
     return record && typeof record.completionText === 'string' && validLauncherCompletion(record.completionText)
@@ -714,6 +739,16 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ),
     ...(model.plugins.error === undefined ? {} : { error: model.plugins.error }),
   })
+  const quicklinks: QuicklinksSnapshot | undefined = model.quicklinks
+    ? Object.freeze({
+        status: model.quicklinks.status,
+        items: Object.freeze(model.quicklinks.items.map((item) => Object.freeze({ ...item }))),
+        draft: Object.freeze({ ...model.quicklinks.draft }),
+        ...(model.quicklinks.selectedId === undefined ? {} : { selectedId: model.quicklinks.selectedId }),
+        ...(model.quicklinks.operation === undefined ? {} : { operation: model.quicklinks.operation }),
+        ...(model.quicklinks.error === undefined ? {} : { error: model.quicklinks.error }),
+      })
+    : undefined
   return Object.freeze({
     view: model.view,
     settingsTab: model.settingsTab,
@@ -744,6 +779,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ...(file === undefined ? {} : { file }),
     ...(mainResultCommand === undefined ? {} : { mainResultCommand }),
     ...(panel === undefined ? {} : { panel }),
+    ...(quicklinks === undefined ? {} : { quicklinks }),
   })
 }
 
@@ -792,6 +828,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let durableWebSearchEngine: WebSearchEngine = 'bing'
   let token = 0
   let searchToken = 0
+  let quicklinksToken = 0
+  let quicklinksOperationToken = 0
   let slashSearchTimer: ReturnType<typeof setTimeout> | undefined
   let executeToken = 0
   let hideToken = 0
@@ -998,6 +1036,284 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.file = undefined
     model.query = ''
     model.queryControlValue = ''
+  }
+
+  function emptyQuicklinkDraft(): QuicklinkDraftSnapshot {
+    return {
+      name: '',
+      command: '',
+      template: '',
+    }
+  }
+
+  function quicklinkDraft(item: QuicklinkView): QuicklinkDraftSnapshot {
+    return {
+      id: item.id,
+      name: item.name,
+      command: item.command,
+      template: item.template,
+      ...(item.iconDataUrl === undefined ? {} : { iconDataUrl: item.iconDataUrl }),
+    }
+  }
+
+  function ensureQuicklinksState(): PrivateQuicklinksState {
+    if (!model.quicklinks) {
+      model.quicklinks = {
+        status: 'loading',
+        items: [],
+        draft: emptyQuicklinkDraft(),
+      }
+    }
+    return model.quicklinks
+  }
+
+  function applyQuicklinksList(items: QuicklinkView[], loadError?: string): void {
+    const quicklinks = ensureQuicklinksState()
+    quicklinks.status = 'ready'
+    quicklinks.items = [...items]
+    const selected =
+      quicklinks.items.find((item) => item.id === quicklinks.selectedId) ??
+      quicklinks.items[0]
+    if (selected) {
+      quicklinks.selectedId = selected.id
+      quicklinks.draft = quicklinkDraft(selected)
+    } else {
+      quicklinks.selectedId = undefined
+      quicklinks.draft = emptyQuicklinkDraft()
+    }
+    quicklinks.operation = undefined
+    quicklinks.error = loadError
+  }
+
+  function ownsQuicklinksOperation(owner: { viewEpoch: number; token: number; operationToken: number }): boolean {
+    return !destroyed &&
+      model.view === 'launcher' &&
+      model.launcherMode === 'quicklinks' &&
+      model.viewEpoch === owner.viewEpoch &&
+      quicklinksToken === owner.token &&
+      quicklinksOperationToken === owner.operationToken
+  }
+
+  async function loadQuicklinks(): Promise<void> {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    quicklinks.status = 'loading'
+    quicklinks.operation = 'load'
+    quicklinks.error = undefined
+    const owner = {
+      viewEpoch: model.viewEpoch,
+      token: quicklinksToken,
+      operationToken: ++quicklinksOperationToken,
+    }
+    publish(true)
+    try {
+      const response = await client.listQuicklinks()
+      if (!ownsQuicklinksOperation(owner)) return
+      applyQuicklinksList(response.items, response.loadError)
+      publish(true)
+    } catch (error) {
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      quicklinks.status = 'error'
+      quicklinks.operation = undefined
+      quicklinks.error = errorText(error)
+      publish(true)
+    }
+  }
+
+  function openQuicklinks(): void {
+    if (destroyed || model.view !== 'launcher') return
+    if (model.launcherMode === 'panel') return
+    leaveFileMode()
+    quicklinksToken += 1
+    quicklinksOperationToken += 1
+    cancelSlashSearch()
+    searchToken = ++token
+    executeToken = ++token
+    model.searchPending = false
+    model.executePending = false
+    model.launcherMode = 'quicklinks'
+    model.quicklinks = {
+      status: 'loading',
+      items: [],
+      draft: emptyQuicklinkDraft(),
+      operation: 'load',
+    }
+    model.query = ''
+    model.queryControlValue = ''
+    model.status = ''
+    model.shownNotice = undefined
+    clearResults()
+    publish(true)
+    void loadQuicklinks()
+  }
+
+  function discardQuicklinksUi(): boolean {
+    if (model.launcherMode !== 'quicklinks' && !model.quicklinks) return false
+    quicklinksToken += 1
+    quicklinksOperationToken += 1
+    model.quicklinks = undefined
+    if (model.launcherMode === 'quicklinks') model.launcherMode = 'applications'
+    return true
+  }
+
+  function closeQuicklinks(): void {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'quicklinks') return
+    discardQuicklinksUi()
+    model.status = ''
+    model.query = ''
+    model.queryControlValue = ''
+    clearResults()
+    if (advanceApplicationSequence()) deferCurrentSearch(false)
+    publish(true)
+  }
+
+  function newQuicklink(): void {
+    if (destroyed || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    quicklinks.selectedId = undefined
+    quicklinks.draft = emptyQuicklinkDraft()
+    quicklinks.error = undefined
+    publish(true)
+  }
+
+  function selectQuicklink(id: string): void {
+    if (destroyed || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    const item = quicklinks.items.find((candidate) => candidate.id === id)
+    if (!item) return
+    quicklinks.selectedId = item.id
+    quicklinks.draft = quicklinkDraft(item)
+    quicklinks.error = undefined
+    publish(true)
+  }
+
+  function completeQuicklink(id: string): void {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'quicklinks') return
+    const item = model.quicklinks?.items.find((candidate) => candidate.id === id)
+    if (!item) return
+    discardQuicklinksUi()
+    model.status = ''
+    applyEdit(`/${item.command} `)
+  }
+
+  function setQuicklinkDraft(field: 'name' | 'command' | 'template', value: string): void {
+    if (destroyed || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    quicklinks.draft = { ...quicklinks.draft, [field]: value }
+    quicklinks.error = undefined
+    publish(true)
+  }
+
+  async function chooseQuicklinkIcon(): Promise<void> {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    quicklinks.operation = 'icon'
+    quicklinks.error = undefined
+    const owner = {
+      viewEpoch: model.viewEpoch,
+      token: quicklinksToken,
+      operationToken: ++quicklinksOperationToken,
+    }
+    publish(true)
+    try {
+      const candidate = await client.chooseQuicklinkIcon()
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      quicklinks.operation = undefined
+      if (candidate) {
+        quicklinks.draft = {
+          ...quicklinks.draft,
+          iconDataUrl: candidate.dataUrl,
+          iconToken: candidate.token,
+        }
+      }
+      publish(true)
+    } catch (error) {
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      quicklinks.operation = undefined
+      quicklinks.error = errorText(error)
+      publish(true)
+    }
+  }
+
+  async function saveQuicklink(): Promise<void> {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    const draft = quicklinks.draft
+    quicklinks.operation = 'save'
+    quicklinks.error = undefined
+    const owner = {
+      viewEpoch: model.viewEpoch,
+      token: quicklinksToken,
+      operationToken: ++quicklinksOperationToken,
+    }
+    publish(true)
+    try {
+      const saved = await client.saveQuicklink({
+        input: {
+          ...(draft.id === undefined ? {} : { id: draft.id }),
+          name: draft.name,
+          command: draft.command,
+          template: draft.template,
+          iconToken: draft.iconToken ?? null,
+        },
+      })
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      const nextItems = quicklinks.items.filter((item) => item.id !== saved.id)
+      nextItems.push(saved)
+      nextItems.sort((left, right) => left.command.localeCompare(right.command))
+      quicklinks.items = nextItems
+      quicklinks.selectedId = saved.id
+      quicklinks.draft = quicklinkDraft(saved)
+      quicklinks.operation = undefined
+      quicklinks.status = 'ready'
+      publish(true)
+    } catch (error) {
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      quicklinks.operation = undefined
+      quicklinks.error = errorText(error)
+      publish(true)
+    }
+  }
+
+  async function deleteQuicklink(): Promise<void> {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'quicklinks') return
+    const quicklinks = ensureQuicklinksState()
+    const id = quicklinks.draft.id
+    if (!id) return
+    quicklinks.operation = 'delete'
+    quicklinks.error = undefined
+    const owner = {
+      viewEpoch: model.viewEpoch,
+      token: quicklinksToken,
+      operationToken: ++quicklinksOperationToken,
+    }
+    publish(true)
+    try {
+      await client.deleteQuicklink({ id })
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      const deletedIndex = quicklinks.items.findIndex((item) => item.id === id)
+      quicklinks.items = quicklinks.items.filter((item) => item.id !== id)
+      const nextSelected =
+        quicklinks.items[Math.max(0, deletedIndex)] ??
+        quicklinks.items[quicklinks.items.length - 1]
+      quicklinks.selectedId = nextSelected?.id
+      quicklinks.draft = nextSelected ? quicklinkDraft(nextSelected) : emptyQuicklinkDraft()
+      quicklinks.operation = undefined
+      quicklinks.status = 'ready'
+      publish(true)
+    } catch (error) {
+      if (!ownsQuicklinksOperation(owner)) return
+      const quicklinks = ensureQuicklinksState()
+      quicklinks.operation = undefined
+      quicklinks.error = errorText(error)
+      publish(true)
+    }
   }
 
   function fileCommand(value: string): string | null {
@@ -1534,6 +1850,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.results = applications
       model.selectedIndex = model.results.length ? 0 : -1
       model.status = model.results.length || model.commandHint ? '' : '未找到应用'
+      const autoExecuteIndex = captured.submit && typeof response.autoExecuteResultId === 'string'
+        ? applications.findIndex((item) =>
+            item.resultId === response.autoExecuteResultId &&
+            item.activation.kind === 'executeResult' &&
+            item.hasDefaultAction !== false)
+        : -1
+      if (autoExecuteIndex >= 0) model.selectedIndex = autoExecuteIndex
       const activateDefault =
         pendingDefaultActivation?.epoch === captured.epoch &&
         pendingDefaultActivation.invocationId === captured.invocationId &&
@@ -1544,15 +1867,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       if (
         captured.submit &&
         applications.length === 1 &&
-        applications[0]?.activation.kind === 'panelActivation'
+        (applications[0]?.activation.kind === 'panelActivation' ||
+          applications[0]?.activation.kind === 'openQuicklinks')
       ) {
         executeSelection()
       } else if (
-        captured.submit &&
-        /^\/web-search\s+\S/u.test(captured.query.trim()) &&
-        applications.length === 1 &&
-        applications[0]?.activation.kind === 'executeResult' &&
-        applications[0]?.hasDefaultAction !== false
+        autoExecuteIndex >= 0
       ) {
         executeSelection()
       } else if (activateDefault && applications.length > 0) {
@@ -1841,6 +2161,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.queryControlValue === '' &&
       model.results.length > 0
     leaveFileMode()
+    discardQuicklinksUi()
     model.viewEpoch += 1
     model.invocationId = invocationId
     model.view = nextView
@@ -1899,6 +2220,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     const panelSessionEpoch = model.panel?.sessionEpoch
     discardPanelUi()
+    discardQuicklinksUi()
     if (panelSessionEpoch) {
       void client.closePluginPanel({ sessionEpoch: panelSessionEpoch }).catch(() => undefined)
     }
@@ -2331,10 +2653,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function hidden(): void {
     if (destroyed) return
     const discardedPanel = discardPanelUi()
+    const discardedQuicklinks = discardQuicklinksUi()
     const wasHiding = model.hidePending
     model.hidePending = false
     const resetView = resetHiddenNonLauncherView()
-    publish(discardedPanel || wasHiding || resetView)
+    publish(discardedPanel || discardedQuicklinks || wasHiding || resetView)
   }
 
   function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): void {
@@ -2764,6 +3087,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         submitFind(selected.activation.query)
         return
       }
+      if (selected.activation.kind === 'openQuicklinks') {
+        openQuicklinks()
+        return
+      }
       if (selected.hasDefaultAction === false) return
       resultId = selected.resultId
     } else {
@@ -2920,6 +3247,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     completionOrigin = undefined
     invalidateFavoriteInteraction()
     leaveFileMode()
+    discardQuicklinksUi()
     const captured = { token: ++token, epoch: model.viewEpoch }
     hideToken = captured.token
     publish(true)
@@ -3002,6 +3330,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed || isComposing) return
     if (key === 'Escape') {
       if (model.view === 'settings') navigate('launcher')
+      else if (model.launcherMode === 'quicklinks') closeQuicklinks()
       else void requestHide()
       return
     }
@@ -3012,6 +3341,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         if (panel) submitPanel(panel.suffix.value)
         return
       }
+      if (model.view === 'launcher' && model.launcherMode === 'quicklinks') return
       if (
         model.view === 'launcher' &&
         model.launcherMode === 'applications' &&
@@ -3065,6 +3395,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     if (sequenceExhausted) return
     if (model.launcherMode === 'panel') return
+    if (model.launcherMode === 'quicklinks') return
     if (model.launcherMode === 'files') {
       const file = model.file
       if (!file?.results.length) return
@@ -3297,6 +3628,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     requestHide,
     closeMainResultCommand,
     closePanel,
+    closeQuicklinks,
+    newQuicklink,
+    selectQuicklink,
+    completeQuicklink,
+    setQuicklinkDraft,
+    chooseQuicklinkIcon,
+    saveQuicklink,
+    deleteQuicklink,
     setPanelBounds,
     settlePanelHostInputFocus,
     activateResult,

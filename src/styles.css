@@ -35,6 +35,7 @@ input {
 .launcher-view,
 .file-workspace,
 .panel-launcher,
+.quicklinks-workspace,
 .panel-host-region,
 .settings-view,
 .settings-header,
@@ -47,6 +48,9 @@ input,
 label,
 .result-list,
 .panel-input-row,
+.quicklinks-body,
+.quicklinks-directory,
+.quicklinks-editor,
 .file-preview,
 .file-toolbar,
 .settings-tabs,
@@ -213,6 +217,198 @@ label,
   min-width: 0;
   min-height: 0;
   padding: 0 8px;
+}
+
+.quicklinks-workspace {
+  display: grid;
+  grid-template-rows: 60px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.quicklinks-panel-heading {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quicklinks-body {
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  margin: 0 8px 8px;
+  overflow: hidden;
+  background: var(--uipilot-ui-surface);
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: var(--uipilot-ui-radius-sm);
+}
+
+.quicklinks-directory {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--uipilot-ui-border);
+}
+
+.quicklinks-directory-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--uipilot-ui-border);
+}
+
+.quicklinks-directory-header > span {
+  font-weight: 600;
+}
+
+.quicklinks-directory > .ant-spin,
+.quicklinks-directory .ant-spin-container,
+.quicklinks-list {
+  min-height: 0;
+  height: 100%;
+}
+
+.quicklinks-list {
+  padding: 8px;
+  overflow-y: auto;
+}
+
+.quicklink-item {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  min-height: 48px;
+  padding: 7px 8px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: var(--uipilot-ui-radius-sm);
+  cursor: pointer;
+}
+
+.quicklink-item:hover,
+.quicklink-item:focus-visible {
+  background: var(--uipilot-ui-accent);
+  outline: none;
+}
+
+.quicklink-item.is-selected {
+  background: var(--uipilot-ui-accent);
+  box-shadow: inset 3px 0 var(--uipilot-ui-primary);
+}
+
+.quicklink-item-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  overflow: hidden;
+  color: var(--uipilot-ui-muted-foreground);
+  background: var(--uipilot-ui-background);
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: 8px;
+}
+
+.quicklink-item-icon img,
+.quicklink-icon-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.quicklink-item-copy {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+}
+
+.quicklink-item-name {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quicklink-item code {
+  color: var(--uipilot-ui-muted-foreground);
+  font: inherit;
+}
+
+.quicklinks-empty {
+  padding: 12px 8px;
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 13px;
+}
+
+.quicklinks-editor {
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.quicklinks-form {
+  max-width: 560px;
+}
+
+.quicklink-icon-picker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.quicklink-icon-preview {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  padding: 0;
+  overflow: hidden;
+  color: var(--uipilot-ui-muted-foreground);
+  background: var(--uipilot-ui-background);
+  border: 1px dashed var(--uipilot-ui-border);
+  border-radius: var(--uipilot-ui-radius-sm);
+  cursor: pointer;
+}
+
+.quicklink-icon-preview:not(:disabled):hover,
+.quicklink-icon-preview:not(:disabled):focus-visible {
+  border-color: var(--uipilot-ui-ring);
+  outline: none;
+}
+
+.quicklink-icon-preview > span {
+  display: grid;
+  place-items: center;
+  gap: 4px;
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: center;
+}
+
+.quicklinks-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.quicklinks-error {
+  margin-bottom: 12px;
+  color: var(--uipilot-ui-destructive);
+  font-size: 13px;
 }
 
 .file-workspace {

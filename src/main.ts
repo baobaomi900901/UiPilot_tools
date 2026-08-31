@@ -32,6 +32,9 @@ import {
   type HotkeySettingsView,
   type LauncherClient,
   type PluginWindowClient,
+  type QuicklinkIconCandidate,
+  type QuicklinkListResponse,
+  type QuicklinkView,
   type SearchResponse,
   type SettingsView,
 } from './protocol'
@@ -72,6 +75,10 @@ export const client: LauncherClient = {
     return snapshot
   },
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', { ...input }),
+  listQuicklinks: () => invoke<QuicklinkListResponse>('list_quicklinks'),
+  saveQuicklink: (input) => invoke<QuicklinkView>('save_quicklink', input),
+  deleteQuicklink: (input) => invoke('delete_quicklink', input),
+  chooseQuicklinkIcon: () => invoke<QuicklinkIconCandidate | null>('choose_quicklink_icon'),
   openFind: (input) => invoke('open_find_window', { input }),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   openPluginPanel: async (input) => {

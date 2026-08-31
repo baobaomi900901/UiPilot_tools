@@ -26,6 +26,7 @@ export type LauncherResultActivation =
     }
   | { kind: 'panelActivation'; pluginId: string; initialArgument: string; favorite: boolean }
   | { kind: 'openFind'; query: string }
+  | { kind: 'openQuicklinks' }
   | { kind: 'executeResult' }
 
 export type CompletionOrigin = Readonly<{
@@ -60,6 +61,7 @@ export interface SearchResponse {
   replaceLocalResults?: boolean
   commandHint?: string
   mainResultCommand?: MainResultCommandContext
+  autoExecuteResultId?: string
 }
 
 export interface MainResultCommandContext {
@@ -70,6 +72,54 @@ export interface MainResultCommandContext {
 
 export type ThemePreference = 'system' | 'dark' | 'light'
 export type WebSearchEngine = 'bing' | 'baidu' | 'google'
+
+export interface QuicklinkView {
+  id: string
+  name: string
+  command: string
+  template: string
+  iconDataUrl?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface QuicklinkListResponse {
+  items: QuicklinkView[]
+  loadError?: string
+}
+
+export interface QuicklinkSaveInput {
+  id?: string
+  name: string
+  command: string
+  template: string
+  iconToken?: string | null
+}
+
+export interface QuicklinkIconCandidate {
+  token: string
+  dataUrl: string
+}
+
+export type QuicklinksOperation = 'load' | 'save' | 'delete' | 'icon'
+
+export interface QuicklinkDraftSnapshot {
+  id?: string
+  name: string
+  command: string
+  template: string
+  iconDataUrl?: string
+  iconToken?: string
+}
+
+export interface QuicklinksSnapshot {
+  status: 'loading' | 'ready' | 'error'
+  items: readonly QuicklinkView[]
+  draft: QuicklinkDraftSnapshot
+  selectedId?: string
+  operation?: QuicklinksOperation
+  error?: string
+}
 
 export interface SettingsView {
   hotkey: string
@@ -297,6 +347,10 @@ export interface LauncherClient {
   readMessageCenter(): Promise<unknown>
   clearMessages(): Promise<unknown>
   searchApps(input: SearchAppsInput): Promise<SearchResponse | null>
+  listQuicklinks(): Promise<QuicklinkListResponse>
+  saveQuicklink(input: { input: QuicklinkSaveInput }): Promise<QuicklinkView>
+  deleteQuicklink(input: { id: string }): Promise<void>
+  chooseQuicklinkIcon(): Promise<QuicklinkIconCandidate | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   openPluginPanel(input: { pluginId: string; argument: string }): Promise<PluginPanelCommandResult>
@@ -596,6 +650,7 @@ export interface LauncherSnapshot {
   file?: FileSnapshot
   mainResultCommand?: MainResultCommandSnapshot
   panel?: PluginPanelSnapshot
+  quicklinks?: QuicklinksSnapshot
 }
 
 const shownKeys = ['invocationId', 'notice', 'target']
