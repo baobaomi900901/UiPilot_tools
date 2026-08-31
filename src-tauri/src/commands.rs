@@ -3096,15 +3096,22 @@ pub(crate) async fn search_apps(
             |_| {},
         ));
     }
-    if completion_origin.is_none() {
-        if let Some(prefix) = plugin_discovery_prefix(&normalized_query) {
-            return Ok(publish_public_command_suggestions(
-                registry,
-                &invocation_id,
+    if completion_origin.is_none() && plugin_discovery_prefix(&normalized_query).is_some() {
+        return Ok(search_apps_with_catalog(
+            registry,
+            CatalogSearchRequest {
+                query: &normalized_query,
+                invocation_id: &invocation_id,
                 query_sequence,
-                public.manager()?.command_suggestions(prefix)?,
-            ));
-        }
+                submit,
+                web_search_engine,
+                favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                quicklinks: &quicklink_items,
+            },
+            |prefix| public.manager()?.command_suggestions(prefix),
+            Vec::new,
+            |_| {},
+        ));
     }
     let route_query = completion_origin
         .as_ref()
@@ -3399,6 +3406,7 @@ fn public_plugin_prompt(
     )
 }
 
+#[cfg(test)]
 fn publish_public_command_suggestions(
     registry: &ResultRegistry,
     invocation_id: &str,
@@ -3641,6 +3649,30 @@ fn quicklinks_result() -> (crate::model::ResultItem, Option<ResultAction>) {
     )
 }
 
+fn builtin_prefix_results(
+    prefix: &str,
+    find_favorite: bool,
+    web_search_favorite: bool,
+) -> Vec<(crate::model::ResultItem, Option<ResultAction>)> {
+    let mut entries = Vec::new();
+    if "find".starts_with(prefix) {
+        entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
+    }
+    if "quicklinks".starts_with(prefix) {
+        entries.push(quicklinks_result());
+    }
+    if "web-search".starts_with(prefix) {
+        entries.extend(builtin_completion_result(
+            "web-search",
+            "使用默认搜索引擎搜索".into(),
+            ResultIconKind::WebSearch,
+            BuiltinFeature::WebSearch,
+            web_search_favorite,
+        ));
+    }
+    entries
+}
+
 fn quicklink_result(
     quicklink: &QuicklinkView,
     argument: Option<&str>,
@@ -3874,6 +3906,19 @@ where
         }
         entries.push(quicklink_result(quicklink, argument));
         auto_execute_first_result = request.submit && argument.is_some();
+        replace_local_results = true;
+    } else if let Some(prefix) = plugin_discovery_prefix(query) {
+        entries.extend(builtin_prefix_results(
+            prefix,
+            find_favorite,
+            web_search_favorite,
+        ));
+        entries.extend(
+            plugin_catalog(prefix)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|suggestion| public_plugin_completion_result(suggestion, None)),
+        );
         replace_local_results = true;
     } else if query.starts_with('/') && query != "/" {
         replace_local_results = true;
@@ -5338,6 +5383,41 @@ mod tests {
         .unwrap();
         assert!(hint.items.is_empty());
         assert_eq!(hint.command_hint.as_deref(), Some("请输入信息回车"));
+    }
+
+    #[test]
+    fn slash_prefix_query_publishes_matching_builtin_commands() {
+        let registry = ResultRegistry::default();
+        registry.on_show("builtin-prefix".into());
+        let response = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "/qu",
+                invocation_id: "builtin-prefix",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
+            },
+            |_| Ok(Vec::new()),
+            || panic!("builtin prefix must not read applications"),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/quicklinks"]
+        );
+        assert_eq!(
+            response.items[0].activation,
+            crate::model::LauncherResultActivation::OpenQuicklinks
+        );
     }
 
     #[test]
