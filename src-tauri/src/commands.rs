@@ -1221,7 +1221,7 @@ pub(crate) fn delete_quicklink(
 }
 
 #[tauri::command]
-pub(crate) fn choose_quicklink_icon(
+pub(crate) async fn choose_quicklink_icon(
     window: WebviewWindow,
     app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
@@ -1231,19 +1231,25 @@ pub(crate) fn choose_quicklink_icon(
     let _focus = coordinator
         .suppress_transient_focus_loss()
         .map_err(|_| CommandError::quicklink(QuicklinkErrorCode::InvalidIcon))?;
-    let selected = app
-        .dialog()
-        .file()
-        .set_parent(&window)
-        .set_title("选择 128x128 PNG 图标")
-        .add_filter("PNG 图片", &["png"])
-        .blocking_pick_file()
-        .and_then(|path| path.into_path().ok());
-    let result = selected
-        .as_deref()
-        .map(|path| store.create_icon_candidate_from_path(path))
-        .transpose()
-        .map_err(CommandError::quicklink)?;
+    let picker_window = window.clone();
+    let picker_store = Arc::clone(store.inner());
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .set_parent(&picker_window)
+            .set_title("选择 128x128 PNG 图标")
+            .add_filter("PNG 图片", &["png"])
+            .blocking_pick_file()
+            .and_then(|path| path.into_path().ok());
+        selected
+            .as_deref()
+            .map(|path| picker_store.create_icon_candidate_from_path(path))
+            .transpose()
+    })
+    .await
+    .map_err(|_| CommandError::quicklink(QuicklinkErrorCode::InvalidIcon))?
+    .map_err(CommandError::quicklink)?;
     window
         .set_focus()
         .map_err(|_| CommandError::window_failed())?;
@@ -3631,7 +3637,7 @@ fn web_search_result(
     )
 }
 
-fn quicklinks_result() -> (crate::model::ResultItem, Option<ResultAction>) {
+fn quicklinks_result(favorite: bool) -> (crate::model::ResultItem, Option<ResultAction>) {
     (
         crate::model::ResultItem {
             result_id: String::new(),
@@ -3642,7 +3648,10 @@ fn quicklinks_result() -> (crate::model::ResultItem, Option<ResultAction>) {
             plugin_icon_url: None,
             icon_kind: None,
             detail: None,
-            favorite: None,
+            favorite: Some(ResultFavorite::builtin(
+                BuiltinFeature::Quicklinks,
+                favorite,
+            )),
             has_default_action: false,
         },
         None,
@@ -3652,6 +3661,7 @@ fn quicklinks_result() -> (crate::model::ResultItem, Option<ResultAction>) {
 fn builtin_prefix_results(
     prefix: &str,
     find_favorite: bool,
+    quicklinks_favorite: bool,
     web_search_favorite: bool,
 ) -> Vec<(crate::model::ResultItem, Option<ResultAction>)> {
     let mut entries = Vec::new();
@@ -3659,7 +3669,7 @@ fn builtin_prefix_results(
         entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
     }
     if "quicklinks".starts_with(prefix) {
-        entries.push(quicklinks_result());
+        entries.push(quicklinks_result(quicklinks_favorite));
     }
     if "web-search".starts_with(prefix) {
         entries.extend(builtin_completion_result(
@@ -3868,6 +3878,9 @@ where
     let find_favorite = request
         .favorite_builtin_features
         .contains(&BuiltinFeature::Find);
+    let quicklinks_favorite = request
+        .favorite_builtin_features
+        .contains(&BuiltinFeature::Quicklinks);
     let web_search_favorite = request
         .favorite_builtin_features
         .contains(&BuiltinFeature::WebSearch);
@@ -3875,7 +3888,7 @@ where
         entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
         replace_local_results = true;
     } else if query == "/quicklinks" {
-        entries.push(quicklinks_result());
+        entries.push(quicklinks_result(quicklinks_favorite));
         replace_local_results = true;
     } else if query == "/web-search" {
         command_hint = Some("请输入搜索内容".into());
@@ -3911,6 +3924,7 @@ where
         entries.extend(builtin_prefix_results(
             prefix,
             find_favorite,
+            quicklinks_favorite,
             web_search_favorite,
         ));
         entries.extend(
@@ -3933,7 +3947,7 @@ where
         });
         if catalog_query.is_empty() {
             entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
-            entries.push(quicklinks_result());
+            entries.push(quicklinks_result(quicklinks_favorite));
             entries.extend(builtin_completion_result(
                 "web-search",
                 "使用默认搜索引擎搜索".into(),
@@ -5774,9 +5788,14 @@ mod tests {
 
     #[test]
     fn launcher_builtin_commands_are_favoritable_and_exact_queries_keep_their_item() {
-        let favorites = BTreeSet::from([BuiltinFeature::Find, BuiltinFeature::WebSearch]);
+        let favorites = BTreeSet::from([
+            BuiltinFeature::Find,
+            BuiltinFeature::Quicklinks,
+            BuiltinFeature::WebSearch,
+        ]);
         for (query, expected_title, expected_feature, expected_hint) in [
             ("/find", "/find", "find", None),
+            ("/quicklinks", "/quicklinks", "quicklinks", None),
             (
                 "/web-search",
                 "/web-search",
@@ -5840,6 +5859,13 @@ mod tests {
         assert_eq!(
             manage.items[0].activation,
             crate::model::LauncherResultActivation::OpenQuicklinks
+        );
+        assert_eq!(
+            serde_json::to_value(&manage.items[0]).unwrap()["favorite"],
+            serde_json::json!({
+                "target": { "kind": "builtin", "feature": "quicklinks" },
+                "favorite": false,
+            })
         );
 
         let registry = ready_registry("quicklinks-prompt");
@@ -6567,6 +6593,10 @@ mod tests {
     #[test]
     fn quicklink_commands_are_main_only_and_have_exact_capabilities() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
         let build = include_str!("../build.rs");
         let main = include_str!("../capabilities/main.json");
         let runtime = include_str!("../capabilities/plugin-runtime.json");
@@ -6578,8 +6608,12 @@ mod tests {
             "delete_quicklink",
             "choose_quicklink_icon",
         ] {
-            let marker = format!("pub(crate) fn {command}(");
-            let body = source
+            let marker = if command == "choose_quicklink_icon" {
+                format!("pub(crate) async fn {command}(")
+            } else {
+                format!("pub(crate) fn {command}(")
+            };
+            let body = production
                 .split(&marker)
                 .nth(1)
                 .and_then(|tail| tail.split("\n#[tauri::command]").next())
@@ -6596,6 +6630,34 @@ mod tests {
             assert!(!find.contains(&permission), "{command}");
             assert!(!panel.contains(&permission), "{command}");
         }
+    }
+
+    #[test]
+    fn quicklink_icon_picker_is_async_and_moves_blocking_dialog_off_command_thread() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("commands test module marker is missing");
+        let marker = ["pub(crate) async fn choose_quicklink_", "icon("].concat();
+        let body = production
+            .split(&marker)
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("choose_quicklink_icon command must be async");
+        let first_statement = body[body.find('{').unwrap() + 1..].trim_start();
+        assert!(first_statement.starts_with("require_main_window(&window)?;"));
+
+        let spawn = body
+            .find("tauri::async_runtime::spawn_blocking")
+            .expect("quicklink icon selection must leave the command thread");
+        let picker = body
+            .find(".blocking_pick_file()")
+            .expect("quicklink icon selection must use the native file picker");
+        assert!(
+            spawn < picker,
+            "blocking native file picker must run inside spawn_blocking"
+        );
     }
 
     #[test]

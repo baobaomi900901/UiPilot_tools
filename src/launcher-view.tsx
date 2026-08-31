@@ -69,6 +69,14 @@ interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
 
 export const HOTKEY_RECORDING_CURRENT_DOM_EVENT = 'uipilot-hotkey-recording-current'
 
+const QUICKLINKS_STATUS_DURATION_MS = 2000
+const QUICKLINK_EDITOR_FOCUSABLE_SELECTOR = 'input:not(:disabled), textarea:not(:disabled), button:not(:disabled)'
+
+type QuicklinksUiStatus = {
+  message: string
+  tone: 'success' | 'error'
+}
+
 function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed, ...props }: BoundInputProps) {
   const ref = useRef<InputRef>(null)
   useLayoutEffect(() => {
@@ -401,10 +409,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
   const [selectedPublicPlugin, setSelectedPublicPlugin] = useState<PublicPluginInventoryItem | null>(null)
+  const [quicklinksStatus, setQuicklinksStatus] = useState<QuicklinksUiStatus | null>(null)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
   const mainResultInputRef = useRef<HTMLInputElement | null>(null)
   const panelInputRef = useRef<HTMLInputElement | null>(null)
+  const quicklinksInputRef = useRef<HTMLInputElement | null>(null)
+  const quicklinkItemRefs = useRef(new Map<string, HTMLButtonElement>())
+  const quicklinksEditorRef = useRef<HTMLElement | null>(null)
+  const quicklinkCreateDialogRef = useRef<HTMLDialogElement | null>(null)
+  const quicklinkFocusAfterSaveId = useRef<string | undefined>(undefined)
+  const quicklinksStatusTimer = useRef<number | undefined>(undefined)
   const panelHostRef = useRef<HTMLDivElement | null>(null)
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
@@ -480,7 +495,26 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
   const panel = snapshot.panel
   const quicklinks = snapshot.quicklinks
+  const quicklinksCreateOpen = quicklinks?.createDraft !== undefined
   const panelActive = Boolean(panel || quicklinks)
+  const clearQuicklinksStatus = useCallback(() => {
+    if (quicklinksStatusTimer.current !== undefined) {
+      window.clearTimeout(quicklinksStatusTimer.current)
+      quicklinksStatusTimer.current = undefined
+    }
+    setQuicklinksStatus(null)
+  }, [])
+  const showQuicklinksStatus = useCallback((message: string, tone: QuicklinksUiStatus['tone'] = 'success') => {
+    if (quicklinksStatusTimer.current !== undefined) {
+      window.clearTimeout(quicklinksStatusTimer.current)
+      quicklinksStatusTimer.current = undefined
+    }
+    setQuicklinksStatus({ message, tone })
+    quicklinksStatusTimer.current = window.setTimeout(() => {
+      quicklinksStatusTimer.current = undefined
+      setQuicklinksStatus(null)
+    }, QUICKLINKS_STATUS_DURATION_MS)
+  }, [])
   const reportPanelBound = useCallback((input: HTMLInputElement) => {
     panelInputRef.current = input
     input.focus()
@@ -490,6 +524,113 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const reportPanelUnbound = useCallback((input: HTMLInputElement) => {
     if (panelInputRef.current === input) panelInputRef.current = null
   }, [])
+  const reportQuicklinksBound = useCallback((input: HTMLInputElement) => {
+    quicklinksInputRef.current = input
+    queryRef.current = input
+    input.focus()
+    const caret = input.value.length
+    input.setSelectionRange(caret, caret)
+    reportReady()
+  }, [reportReady, snapshot.queryControl])
+  const reportQuicklinksUnbound = useCallback((input: HTMLInputElement) => {
+    if (quicklinksInputRef.current === input) quicklinksInputRef.current = null
+    if (queryRef.current === input) queryRef.current = null
+  }, [])
+  const focusQuicklinksInput = useCallback((): boolean => {
+    const input = quicklinksInputRef.current
+    if (!input?.isConnected || input.disabled) return false
+    input.focus()
+    const caret = input.value.length
+    input.setSelectionRange(caret, caret)
+    return document.activeElement === input
+  }, [])
+  const focusQuicklinkItem = useCallback((id?: string): boolean => {
+    const snapshot = core.getSnapshot()
+    const targetId = id ?? snapshot.quicklinks?.selectedId ?? snapshot.quicklinks?.items[0]?.id
+    if (!targetId) return false
+    const target = quicklinkItemRefs.current.get(targetId)
+    if (!target?.isConnected || target.disabled) return false
+    target.focus()
+    return document.activeElement === target
+  }, [core])
+  const focusQuicklinksEditor = useCallback((): boolean => {
+    const target = quicklinksEditorRef.current
+      ?.querySelector<HTMLElement>(QUICKLINK_EDITOR_FOCUSABLE_SELECTOR)
+    if (!target) return false
+    target.focus()
+    return document.activeElement === target
+  }, [])
+  const focusQuicklinksEditorByTab = useCallback((
+    origin: HTMLElement | null,
+    direction: 'previous' | 'next',
+  ): boolean => {
+    const editor = quicklinksEditorRef.current
+    if (!editor) return false
+    const controls = Array.from(
+      editor.querySelectorAll<HTMLElement>(QUICKLINK_EDITOR_FOCUSABLE_SELECTOR),
+    ).filter((element) => element.tabIndex >= 0)
+    if (controls.length === 0) return false
+    const originControl = origin?.closest<HTMLElement>(QUICKLINK_EDITOR_FOCUSABLE_SELECTOR) ?? null
+    const originIndex = originControl ? controls.indexOf(originControl) : -1
+    const targetIndex = originIndex < 0
+      ? direction === 'next' ? 0 : controls.length - 1
+      : (originIndex + (direction === 'next' ? 1 : -1) + controls.length) % controls.length
+    const target = controls[targetIndex]
+    if (!target) return false
+    target.focus()
+    return document.activeElement === target
+  }, [])
+  const saveQuicklinkWithStatus = useCallback(async (focusAfterSaveId?: string) => {
+    if (focusAfterSaveId) quicklinkFocusAfterSaveId.current = focusAfterSaveId
+    await core.saveQuicklink()
+    const latestQuicklinks = core.getSnapshot().quicklinks
+    if (!latestQuicklinks) return
+    if (latestQuicklinks.error) {
+      showQuicklinksStatus('保存失败', 'error')
+      return
+    }
+    showQuicklinksStatus('已保存')
+  }, [core, showQuicklinksStatus])
+
+  useLayoutEffect(() => {
+    if (snapshot.view !== 'launcher' || !quicklinks || quicklinks.operation) return
+    const focusAfterSaveId = quicklinkFocusAfterSaveId.current
+    if (focusAfterSaveId) {
+      quicklinkFocusAfterSaveId.current = undefined
+      if (focusQuicklinkItem(focusAfterSaveId)) return
+    }
+    focusQuicklinksInput()
+  }, [focusQuicklinkItem, focusQuicklinksInput, quicklinks?.operation, snapshot.queryControl, snapshot.view])
+
+  useLayoutEffect(() => {
+    const dialog = quicklinkCreateDialogRef.current
+    if (!dialog) return
+    if (quicklinksCreateOpen) {
+      if (!dialog.open) {
+        const showAsTopLayer = (dialog as HTMLDialogElement & Record<string, unknown>)['show' + '\u004dodal']
+        if (typeof showAsTopLayer === 'function') showAsTopLayer.call(dialog)
+        else dialog.setAttribute('open', '')
+      }
+      return
+    }
+    if (!dialog.open) return
+    if (typeof dialog.close === 'function') dialog.close()
+    else dialog.removeAttribute('open')
+  }, [quicklinksCreateOpen])
+
+  useEffect(() => {
+    return () => {
+      if (quicklinksStatusTimer.current !== undefined) {
+        window.clearTimeout(quicklinksStatusTimer.current)
+        quicklinksStatusTimer.current = undefined
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (quicklinks !== undefined) return
+    clearQuicklinksStatus()
+  }, [clearQuicklinksStatus, quicklinks])
 
   useLayoutEffect(() => {
     if (!panel?.focusRequestId || panel.closePending) return
@@ -739,22 +880,158 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
   const quicklinksKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const isComposing = composing(event)
+    const target = event.target
+    const targetElement = target instanceof HTMLElement ? target : null
+    const fromFilterInput =
+      target instanceof HTMLInputElement &&
+      target.getAttribute('aria-label') === '搜索快速链接目录'
+    const fromQuicklinkItem = targetElement?.closest<HTMLButtonElement>('.quicklink-item') ?? null
+    const fromQuicklinksEditor = targetElement?.closest('.quicklinks-editor') !== null
+    const primaryModifier = event.ctrlKey || event.metaKey
+    if (
+      event.key === 'Tab' &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !isComposing
+    ) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (fromQuicklinksEditor) {
+        focusQuicklinksEditorByTab(targetElement, event.shiftKey ? 'previous' : 'next')
+      }
+      return
+    }
+    if (
+      primaryModifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      !isComposing &&
+      event.key.toLowerCase() === 'f'
+    ) {
+      event.preventDefault()
+      event.stopPropagation()
+      focusQuicklinksInput()
+      return
+    }
+    if (
+      primaryModifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      !isComposing &&
+      event.key.toLowerCase() === 's' &&
+      fromQuicklinksEditor
+    ) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (quicklinksCanSave && quicklinks?.selectedId) {
+        void saveQuicklinkWithStatus(quicklinks.selectedId)
+      }
+      return
+    }
+    if (
+      event.key.toLowerCase() === 'n' &&
+      primaryModifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      !isComposing
+    ) {
+      event.preventDefault()
+      event.stopPropagation()
+      core.newQuicklink()
+      return
+    }
+    if (
+      event.key === 'ArrowDown' &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      !isComposing &&
+      fromFilterInput
+    ) {
+      event.preventDefault()
+      event.stopPropagation()
+      focusQuicklinkSelectionFromInput()
+      return
+    }
+    if (
+      (event.key === 'ArrowDown' || event.key === 'ArrowUp') &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      !isComposing &&
+      fromQuicklinkItem
+    ) {
+      if (moveQuicklinkSelection(event.key === 'ArrowDown' ? 'next' : 'previous', fromQuicklinkItem.dataset.quicklinkId)) {
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
+    }
+    if (
+      event.key === 'ArrowRight' &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      !isComposing &&
+      fromQuicklinkItem
+    ) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (fromQuicklinkItem.dataset.quicklinkId) core.selectQuicklink(fromQuicklinkItem.dataset.quicklinkId)
+      focusQuicklinksEditor()
+      return
+    }
+    if (event.key === 'Backspace' && !isComposing) {
+      if (event.currentTarget instanceof HTMLInputElement) {
+        const input = event.currentTarget
+        if (input.selectionStart === 0 && input.selectionEnd === 0) {
+          event.preventDefault()
+          event.stopPropagation()
+          core.closeQuicklinks()
+        }
+      }
+      return
+    }
     if (event.key !== 'Escape' || isComposing) return
     event.preventDefault()
+    event.stopPropagation()
     core.keyDown('Escape', false)
   }
-  const moveQuicklinkFocus = (
-    event: ReactKeyboardEvent<HTMLButtonElement>,
+  const focusQuicklinkSelectionFromInput = (): boolean => {
+    if (!quicklinks || quicklinks.operation !== undefined || quicklinks.items.length === 0) return false
+    const selectedVisible = quicklinks.selectedId !== undefined &&
+      quicklinks.items.some((item) => item.id === quicklinks.selectedId)
+    const targetId = selectedVisible ? quicklinks.selectedId : quicklinks.items[0]?.id
+    if (!targetId) return false
+    if (!selectedVisible) core.selectQuicklink(targetId)
+    return focusQuicklinkItem(targetId)
+  }
+  const moveQuicklinkSelection = (
     direction: 'previous' | 'next',
-  ) => {
-    const list = event.currentTarget.closest('.quicklinks-list')
-    if (!list) return
-    const items = [...list.querySelectorAll<HTMLButtonElement>('.quicklink-item')]
-    const index = items.indexOf(event.currentTarget)
-    const target = items[index + (direction === 'next' ? 1 : -1)]
-    if (!target) return
-    event.preventDefault()
-    target.focus()
+    sourceId?: string,
+  ): boolean => {
+    if (!quicklinks || quicklinks.operation !== undefined || quicklinks.items.length === 0) return false
+    const sourceIndex = sourceId === undefined
+      ? -1
+      : quicklinks.items.findIndex((item) => item.id === sourceId)
+    const selectedIndex = quicklinks.selectedId === undefined
+      ? -1
+      : quicklinks.items.findIndex((item) => item.id === quicklinks.selectedId)
+    const currentIndex = sourceIndex >= 0 ? sourceIndex : selectedIndex
+    const targetIndex = currentIndex >= 0
+      ? Math.max(0, Math.min(quicklinks.items.length - 1, currentIndex + (direction === 'next' ? 1 : -1)))
+      : direction === 'next'
+        ? 0
+        : quicklinks.items.length - 1
+    const target = quicklinks.items[targetIndex]
+    if (!target) return false
+    if (target.id !== quicklinks.selectedId) core.selectQuicklink(target.id)
+    focusQuicklinkItem(target.id)
+    return true
   }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const isComposing = composing(event)
@@ -1192,168 +1469,321 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
   const quicklinksBusy = quicklinks?.operation !== undefined
   const quicklinksDraft = quicklinks?.draft
+  const quicklinksCreateDraft = quicklinks?.createDraft
+  const quicklinksDraftActive = quicklinks?.draftActive === true
   const quicklinksCanSave = Boolean(
-    quicklinksDraft?.name.trim() &&
+    quicklinksDraftActive &&
+      quicklinksDraft?.name.trim() &&
       quicklinksDraft.command.trim() &&
       quicklinksDraft.template.trim() &&
       !quicklinksBusy,
   )
+  const quicklinksCreateCanSave = Boolean(
+    quicklinksCreateDraft?.name.trim() &&
+      quicklinksCreateDraft.command.trim() &&
+      quicklinksCreateDraft.template.trim() &&
+      !quicklinksBusy,
+  )
   const quicklinksPanel = quicklinks ? (
-    <section className="quicklinks-workspace" aria-label="快速链接" onKeyDown={quicklinksKeyDown}>
-      <div className="panel-input-region">
-        <div className="panel-input-row panel-input-shell quicklinks-input-shell">
-          <CommandTag
-            commandLabel="quicklinks"
-            disabled={quicklinksBusy}
-            exitLabel="退出 quicklinks 面板"
-            exitTitle="退出面板"
-            onClose={core.closeQuicklinks}
-          />
-          <span className="quicklinks-panel-heading">快速链接</span>
-        </div>
-      </div>
-      <div className="quicklinks-body">
-        <aside className="quicklinks-directory" aria-label="快速链接目录">
-          <div className="quicklinks-directory-header">
-            <span>目录</span>
-            <Button
-              aria-label="新增快速链接"
-              icon={<Plus aria-hidden size={16} />}
-              onClick={core.newQuicklink}
-              size="small"
-              type="primary"
+    <>
+      <section className="quicklinks-workspace" aria-label="快速链接" onKeyDown={quicklinksKeyDown}>
+        <div className="panel-input-region">
+          <div className="panel-input-row panel-input-shell quicklinks-input-shell">
+            <CommandTag
+              commandLabel="quicklinks"
+              disabled={quicklinksBusy}
+              exitLabel="退出 quicklinks 面板"
+              exitTitle="退出面板"
+              onClose={core.closeQuicklinks}
+            />
+            <label className="visually-hidden" htmlFor={`quicklinks-filter-${snapshot.queryControl}`}>
+              搜索快速链接目录
+            </label>
+            <BoundInput
+              className="panel-suffix-input quicklinks-filter-input"
+              core={core}
+              control={snapshot.queryControl}
+              value={snapshot.queryControlValue}
+              id={`quicklinks-filter-${snapshot.queryControl}`}
+              name={`quicklinks-filter-${snapshot.queryControl}`}
+              aria-label="搜索快速链接目录"
+              placeholder="搜索目录"
+              autoComplete="off"
+              spellCheck={false}
+              tabIndex={-1}
+              disabled={!snapshot.invocationId || quicklinksBusy}
+              onKeyDown={quicklinksKeyDown}
+              onBound={reportQuicklinksBound}
+              onUnbound={reportQuicklinksUnbound}
+              onBindingFailed={reportFailed}
             />
           </div>
-          <Spin spinning={quicklinks.status === 'loading'} size="small">
-            <div className="quicklinks-list" role="list">
-              {quicklinks.items.length ? quicklinks.items.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={quicklinks.selectedId === item.id ? 'quicklink-item is-selected' : 'quicklink-item'}
-                  aria-current={quicklinks.selectedId === item.id ? 'true' : undefined}
-                  onClick={() => core.selectQuicklink(item.id)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'ArrowDown' && !composing(event)) {
-                      moveQuicklinkFocus(event, 'next')
-                      return
-                    }
-                    if (event.key === 'ArrowUp' && !composing(event)) {
-                      moveQuicklinkFocus(event, 'previous')
-                      return
-                    }
-                    if (event.key !== 'Enter' || composing(event)) return
-                    event.preventDefault()
-                    core.completeQuicklink(item.id)
-                  }}
-                >
-                  <span className="quicklink-item-icon" aria-hidden="true">
-                    {item.iconDataUrl ? (
-                      <img src={item.iconDataUrl} alt="" draggable={false} />
-                    ) : (
-                      <ImageIcon size={18} strokeWidth={1.8} />
-                    )}
-                  </span>
-                  <span className="quicklink-item-copy">
-                    <span className="quicklink-item-name">{item.name || '未命名目录'}</span>
-                    <code>/{item.command}</code>
-                  </span>
-                </button>
-              )) : (
-                <div className="quicklinks-empty">暂无快速链接，点击右上角新增。</div>
-              )}
+        </div>
+        <div className="quicklinks-body">
+          <aside className="quicklinks-directory" aria-label="快速链接目录">
+            <div className="quicklinks-directory-header">
+              <span>目录</span>
+              <Button
+                aria-label="新增快速链接"
+                disabled={quicklinksBusy}
+                icon={<Plus aria-hidden size={16} />}
+                onClick={core.newQuicklink}
+                size="small"
+                tabIndex={-1}
+                type="primary"
+              />
             </div>
-          </Spin>
-        </aside>
-        <section className="quicklinks-editor" aria-label="快速链接表单">
-          <Form component="div" layout="vertical" className="quicklinks-form">
-            <Form.Item label="目录名称">
-              <Input
-                aria-label="目录名称"
-                value={quicklinksDraft?.name ?? ''}
-                disabled={quicklinksBusy}
-                onChange={(event) => core.setQuicklinkDraft('name', event.target.value)}
-              />
-            </Form.Item>
-            <Form.Item label="启动键">
-              <Input
-                aria-label="启动键"
-                addonBefore="/"
-                value={quicklinksDraft?.command ?? ''}
-                disabled={quicklinksBusy}
-                placeholder="jd"
-                onChange={(event) => core.setQuicklinkDraft('command', event.target.value)}
-              />
-            </Form.Item>
-            <Form.Item label="图标">
-              <div className="quicklink-icon-picker">
-                <button
-                  type="button"
-                  className="quicklink-icon-preview"
-                  disabled={quicklinksBusy}
-                  onClick={() => void core.chooseQuicklinkIcon()}
-                >
-                  {quicklinksDraft?.iconDataUrl ? (
-                    <img src={quicklinksDraft.iconDataUrl} alt="" draggable={false} />
-                  ) : (
-                    <span>
-                      <ImageIcon size={22} strokeWidth={1.8} />
-                      选择 128×128 PNG
-                    </span>
+            <Spin spinning={quicklinks.status === 'loading'} size="small">
+              <OverlayScrollbarsComponent className="quicklinks-list-scroll" options={settingsScrollbarOptions}>
+                <div className="quicklinks-list" role="list">
+                  {quicklinks.items.length ? quicklinks.items.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      data-quicklink-id={item.id}
+                      className={quicklinks.selectedId === item.id ? 'quicklink-item is-selected' : 'quicklink-item'}
+                      aria-current={quicklinks.selectedId === item.id ? 'true' : undefined}
+                      tabIndex={-1}
+                      onClick={() => core.selectQuicklink(item.id)}
+                      ref={(element) => {
+                        if (element) quicklinkItemRefs.current.set(item.id, element)
+                        else quicklinkItemRefs.current.delete(item.id)
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Enter' || composing(event)) return
+                        event.preventDefault()
+                        event.stopPropagation()
+                        core.completeQuicklink(item.id)
+                      }}
+                    >
+                      <span className="quicklink-item-icon" aria-hidden="true">
+                        {item.iconDataUrl ? (
+                          <img src={item.iconDataUrl} alt="" draggable={false} />
+                        ) : (
+                          <ImageIcon size={18} strokeWidth={1.8} />
+                        )}
+                      </span>
+                      <span className="quicklink-item-copy">
+                        <span className="quicklink-item-name">{item.name || '未命名目录'}</span>
+                        <code>/{item.command}</code>
+                      </span>
+                    </button>
+                  )) : (
+                    <div className="quicklinks-empty">暂无快速链接，点击右上角新增。</div>
                   )}
-                </button>
-                <Button
-                  icon={<ImageIcon aria-hidden size={16} />}
-                  loading={quicklinks.operation === 'icon'}
-                  disabled={quicklinksBusy && quicklinks.operation !== 'icon'}
-                  onClick={() => void core.chooseQuicklinkIcon()}
+                </div>
+              </OverlayScrollbarsComponent>
+            </Spin>
+          </aside>
+          <OverlayScrollbarsComponent className="quicklinks-editor-scroll" options={settingsScrollbarOptions}>
+            <section ref={quicklinksEditorRef} className="quicklinks-editor" aria-label="快速链接表单">
+              {quicklinksStatus ? (
+                <div
+                  className="quicklinks-editor-status"
+                  data-tone={quicklinksStatus.tone}
+                  role="status"
+                  aria-live="polite"
                 >
-                  选择图标
-                </Button>
-              </div>
-            </Form.Item>
-            <Form.Item label="链接">
-              <Input
-                aria-label="链接"
-                value={quicklinksDraft?.template ?? ''}
-                disabled={quicklinksBusy}
-                placeholder="https://search.jd.com/Search?keyword={Query}"
-                onChange={(event) => core.setQuicklinkDraft('template', event.target.value)}
-              />
-            </Form.Item>
-            {quicklinks.error ? <div className="quicklinks-error">{quicklinks.error}</div> : null}
-            <div className="quicklinks-actions">
+                  {quicklinksStatus.message}
+                </div>
+              ) : null}
+              {quicklinksDraftActive ? (
+                <Form component="div" layout="vertical" className="quicklinks-form">
+                  <Form.Item label="目录名称" className="quicklinks-form-row">
+                    <Input
+                      aria-label="目录名称"
+                      value={quicklinksDraft?.name ?? ''}
+                      disabled={quicklinksBusy}
+                      onChange={(event) => core.setQuicklinkDraft('name', event.target.value)}
+                    />
+                  </Form.Item>
+                  <Form.Item label="启动键" className="quicklinks-form-row">
+                    <div className="quicklink-command-field">
+                      <span aria-hidden="true">/</span>
+                      <Input
+                        aria-label="启动键"
+                        value={quicklinksDraft?.command ?? ''}
+                        disabled={quicklinksBusy}
+                        placeholder="jd"
+                        onChange={(event) => core.setQuicklinkDraft('command', event.target.value)}
+                      />
+                    </div>
+                  </Form.Item>
+                  <Form.Item label="图标" className="quicklinks-form-row quicklinks-form-row-icon">
+                    <div className="quicklink-icon-picker">
+                      <button
+                        type="button"
+                        className="quicklink-icon-preview"
+                        disabled={quicklinksBusy}
+                        onClick={() => void core.chooseQuicklinkIcon()}
+                      >
+                        {quicklinksDraft?.iconDataUrl ? (
+                          <img src={quicklinksDraft.iconDataUrl} alt="" draggable={false} />
+                        ) : (
+                          <span>
+                            <ImageIcon size={22} strokeWidth={1.8} />
+                            选择 128×128 PNG
+                          </span>
+                        )}
+                      </button>
+                      <Button
+                        icon={<ImageIcon aria-hidden size={16} />}
+                        loading={quicklinks.operation === 'icon'}
+                        disabled={quicklinksBusy && quicklinks.operation !== 'icon'}
+                        onClick={() => void core.chooseQuicklinkIcon()}
+                      >
+                        选择图标
+                      </Button>
+                    </div>
+                  </Form.Item>
+                  <Form.Item label="链接" className="quicklinks-form-row">
+                    <Input
+                      aria-label="链接"
+                      value={quicklinksDraft?.template ?? ''}
+                      disabled={quicklinksBusy}
+                      placeholder="https://search.jd.com/Search?keyword={Query}"
+                      onChange={(event) => core.setQuicklinkDraft('template', event.target.value)}
+                    />
+                  </Form.Item>
+                  {quicklinks.error ? <div className="quicklinks-error">{quicklinks.error}</div> : null}
+                  <div className="quicklinks-actions">
+                    <Button
+                      type="primary"
+                      icon={<Save aria-hidden size={16} />}
+                      loading={quicklinks.operation === 'save'}
+                      disabled={!quicklinksCanSave}
+                      onClick={() => void saveQuicklinkWithStatus()}
+                    >
+                      保存
+                    </Button>
+                    <Popconfirm
+                      title="删除快速链接？"
+                      description="删除后该启动键将不再可用。"
+                      okText="删除"
+                      cancelText="取消"
+                      disabled={!quicklinksDraft?.id || quicklinksBusy}
+                      onConfirm={() => void core.deleteQuicklink()}
+                    >
+                      <Button
+                        danger
+                        icon={<Trash2 aria-hidden size={16} />}
+                        loading={quicklinks.operation === 'delete'}
+                        disabled={!quicklinksDraft?.id || quicklinksBusy}
+                      >
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  </div>
+                </Form>
+              ) : (
+                <div className="quicklinks-editor-empty">
+                  <ImageIcon aria-hidden size={28} strokeWidth={1.8} />
+                  <h2>请选择或新增快速链接</h2>
+                  <p>从左侧目录选择一条快速链接进行编辑，或点击右上角新增。</p>
+                </div>
+              )}
+            </section>
+          </OverlayScrollbarsComponent>
+        </div>
+      </section>
+      {quicklinksCreateOpen ? (
+        <dialog
+          ref={quicklinkCreateDialogRef}
+          className="dialog quicklink-create-dialog"
+          role="dialog"
+          aria-labelledby="quicklink-create-title"
+          onCancel={(event) => {
+            event.preventDefault()
+            if (!quicklinksBusy) core.closeNewQuicklink()
+          }}
+        >
+          <form
+            method="dialog"
+            className="dialog-body quicklinks-create-form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              if (quicklinksCreateCanSave) void core.saveNewQuicklink()
+            }}
+          >
+            <h3 id="quicklink-create-title" className="dialog-title">新建快速链接</h3>
+            <Form component="div" layout="vertical" className="quicklinks-form">
+              <Form.Item label="目录名称">
+                <Input
+                  aria-label="目录名称"
+                  autoFocus
+                  value={quicklinksCreateDraft?.name ?? ''}
+                  disabled={quicklinksBusy}
+                  onChange={(event) => core.setNewQuicklinkDraft('name', event.target.value)}
+                />
+              </Form.Item>
+              <Form.Item label="启动键">
+                <div className="quicklink-command-field">
+                  <span aria-hidden="true">/</span>
+                  <Input
+                    aria-label="启动键"
+                    value={quicklinksCreateDraft?.command ?? ''}
+                    disabled={quicklinksBusy}
+                    placeholder="jd"
+                    onChange={(event) => core.setNewQuicklinkDraft('command', event.target.value)}
+                  />
+                </div>
+              </Form.Item>
+              <Form.Item label="图标">
+                <div className="quicklink-icon-picker">
+                  <button
+                    type="button"
+                    className="quicklink-icon-preview"
+                    disabled={quicklinksBusy}
+                    onClick={() => void core.chooseNewQuicklinkIcon()}
+                  >
+                    {quicklinksCreateDraft?.iconDataUrl ? (
+                      <img src={quicklinksCreateDraft.iconDataUrl} alt="" draggable={false} />
+                    ) : (
+                      <span>
+                        <ImageIcon size={22} strokeWidth={1.8} />
+                        选择 128×128 PNG
+                      </span>
+                    )}
+                  </button>
+                  <Button
+                    icon={<ImageIcon aria-hidden size={16} />}
+                    loading={quicklinks.operation === 'icon'}
+                    disabled={quicklinksBusy && quicklinks.operation !== 'icon'}
+                    onClick={() => void core.chooseNewQuicklinkIcon()}
+                  >
+                    选择图标
+                  </Button>
+                </div>
+              </Form.Item>
+              <Form.Item label="链接">
+                <Input
+                  aria-label="链接"
+                  value={quicklinksCreateDraft?.template ?? ''}
+                  disabled={quicklinksBusy}
+                  placeholder="https://search.jd.com/Search?keyword={Query}"
+                  onChange={(event) => core.setNewQuicklinkDraft('template', event.target.value)}
+                />
+              </Form.Item>
+              {quicklinks.error ? <div className="quicklinks-error">{quicklinks.error}</div> : null}
+            </Form>
+            <div className="dialog-actions">
               <Button
                 type="primary"
+                htmlType="submit"
                 icon={<Save aria-hidden size={16} />}
                 loading={quicklinks.operation === 'save'}
-                disabled={!quicklinksCanSave}
-                onClick={() => void core.saveQuicklink()}
+                disabled={!quicklinksCreateCanSave}
               >
                 保存
               </Button>
-              <Popconfirm
-                title="删除快速链接？"
-                description="删除后该启动键将不再可用。"
-                okText="删除"
-                cancelText="取消"
-                disabled={!quicklinksDraft?.id || quicklinksBusy}
-                onConfirm={() => void core.deleteQuicklink()}
-              >
-                <Button
-                  danger
-                  icon={<Trash2 aria-hidden size={16} />}
-                  loading={quicklinks.operation === 'delete'}
-                  disabled={!quicklinksDraft?.id || quicklinksBusy}
-                >
-                  删除
-                </Button>
-              </Popconfirm>
+              <Button disabled={quicklinksBusy} onClick={core.closeNewQuicklink}>
+                取消
+              </Button>
             </div>
-          </Form>
-        </section>
-      </div>
-    </section>
+          </form>
+        </dialog>
+      ) : null}
+    </>
   ) : null
 
   const settings = snapshot.settings

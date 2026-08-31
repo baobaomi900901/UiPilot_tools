@@ -1,7 +1,7 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
-export type BuiltinFeature = 'find' | 'webSearch'
+export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string }>
   | Readonly<{ kind: 'builtin'; feature: BuiltinFeature }>
@@ -116,6 +116,8 @@ export interface QuicklinksSnapshot {
   status: 'loading' | 'ready' | 'error'
   items: readonly QuicklinkView[]
   draft: QuicklinkDraftSnapshot
+  draftActive: boolean
+  createDraft?: QuicklinkDraftSnapshot
   selectedId?: string
   operation?: QuicklinksOperation
   error?: string

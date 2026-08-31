@@ -43,6 +43,7 @@ pub(crate) enum WebSearchEngine {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum BuiltinFeature {
     Find,
+    Quicklinks,
     WebSearch,
 }
 
@@ -579,6 +580,9 @@ mod tests {
             .set_builtin_feature_favorite(BuiltinFeature::Find, true)
             .unwrap();
         store
+            .set_builtin_feature_favorite(BuiltinFeature::Quicklinks, true)
+            .unwrap();
+        store
             .set_builtin_feature_favorite(BuiltinFeature::WebSearch, true)
             .unwrap();
         drop(store);
@@ -591,7 +595,11 @@ mod tests {
         assert_eq!(favorited.web_search_engine, WebSearchEngine::Google);
         assert_eq!(
             favorited.favorite_builtin_features,
-            BTreeSet::from([BuiltinFeature::Find, BuiltinFeature::WebSearch])
+            BTreeSet::from([
+                BuiltinFeature::Find,
+                BuiltinFeature::Quicklinks,
+                BuiltinFeature::WebSearch
+            ])
         );
 
         reloaded
@@ -604,7 +612,7 @@ mod tests {
                 .unwrap()
                 .snapshot()
                 .favorite_builtin_features,
-            BTreeSet::from([BuiltinFeature::WebSearch])
+            BTreeSet::from([BuiltinFeature::Quicklinks, BuiltinFeature::WebSearch])
         );
     }
 

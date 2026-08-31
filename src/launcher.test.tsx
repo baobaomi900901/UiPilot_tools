@@ -1017,6 +1017,580 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().queryControlValue).toBe('/jd ')
   })
 
+  it('filters quicklinks by typing in the quicklinks panel input without app searching', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [
+        quicklinkView({ id: 'quicklink-jd', name: '京东搜索', command: 'jd' }),
+        quicklinkView({ id: 'quicklink-github', name: 'GitHub 搜索', command: 'gh' }),
+      ],
+    })
+
+    emit(shown('quicklinks-filter'))
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '/quicklinks', inputType: 'insertText',
+    })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+    vi.mocked(client.searchApps).mockClear()
+
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '京', inputType: 'insertText',
+    })
+
+    expect(core.getSnapshot().queryControlValue).toBe('京')
+    expect(core.getSnapshot().quicklinks?.items.map((item) => item.command)).toEqual(['jd'])
+    expect(client.searchApps).not.toHaveBeenCalled()
+  })
+
+  it('focuses the quicklinks panel input and renders empty placeholders on both sides', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({ items: [] })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-empty')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')
+      expect(input).not.toBeNull()
+      expect(document.activeElement).toBe(input)
+      expect(mounted.host.textContent).toContain('暂无快速链接')
+      expect(mounted.host.textContent).toContain('请选择或新增快速链接')
+      expect(mounted.host.textContent).not.toContain('目录名称')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('closes the quicklinks tag only for non-composing Backspace at filter caret zero', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [quicklinkView()],
+    })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-backspace')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+      expect(input).not.toBeNull()
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'jd', inputType: 'insertText',
+      }))
+      input.setSelectionRange(2, 2)
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
+      expect(core.getSnapshot().quicklinks).toBeDefined()
+
+      input.setSelectionRange(0, 0)
+      await act(async () => input.dispatchEvent(new KeyboardEvent(
+        'keydown', { key: 'Backspace', bubbles: true, isComposing: true },
+      )))
+      expect(core.getSnapshot().quicklinks).toBeDefined()
+
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '', inputType: 'deleteContentBackward',
+      }))
+      input.setSelectionRange(0, 0)
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
+      expect(core.getSnapshot().quicklinks).toBeUndefined()
+      expect(core.getSnapshot().queryControlValue).toBe('')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('moves focus from the quicklinks panel input to the selected directory item and back with Ctrl+F', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [
+        quicklinkView({ id: 'quicklink-jd', name: '京东搜索', command: 'jd' }),
+        quicklinkView({ id: 'quicklink-github', name: 'GitHub 搜索', command: 'gh' }),
+      ],
+    })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-arrow-selection')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+      expect(core.getSnapshot().quicklinks?.selectedId).toBe('quicklink-jd')
+
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+      const arrowDown = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+      await act(async () => input.dispatchEvent(arrowDown))
+
+      expect(arrowDown.defaultPrevented).toBe(true)
+      expect(core.getSnapshot().quicklinks?.selectedId).toBe('quicklink-jd')
+      expect(document.activeElement).toBe(mounted.host.querySelector('.quicklink-item.is-selected'))
+      expect(document.activeElement?.textContent).toContain('/jd')
+
+      const focusSearch = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true })
+      await act(async () => document.activeElement?.dispatchEvent(focusSearch))
+
+      expect(focusSearch.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(input)
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('moves directory selection with vertical arrows and completes the focused quicklink with Enter', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [
+        quicklinkView({ id: 'quicklink-jd', name: '京东搜索', command: 'jd' }),
+        quicklinkView({ id: 'quicklink-github', name: 'GitHub 搜索', command: 'gh' }),
+      ],
+    })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-directory-keyboard')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })))
+      const firstItem = mounted.host.querySelector<HTMLButtonElement>('.quicklink-item.is-selected')!
+      expect(document.activeElement).toBe(firstItem)
+
+      const arrowDown = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
+      await act(async () => firstItem.dispatchEvent(arrowDown))
+
+      expect(arrowDown.defaultPrevented).toBe(true)
+      expect(core.getSnapshot().quicklinks?.selectedId).toBe('quicklink-github')
+      expect(document.activeElement).toBe(mounted.host.querySelector('.quicklink-item.is-selected'))
+      expect(mounted.host.querySelector('.quicklink-item.is-selected code')?.textContent).toBe('/gh')
+      expect(mounted.host.querySelector<HTMLInputElement>('.quicklinks-editor [aria-label="启动键"]')?.value).toBe('gh')
+
+      const arrowUp = new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
+      await act(async () => document.activeElement?.dispatchEvent(arrowUp))
+
+      expect(arrowUp.defaultPrevented).toBe(true)
+      expect(core.getSnapshot().quicklinks?.selectedId).toBe('quicklink-jd')
+      expect(document.activeElement).toBe(mounted.host.querySelector('.quicklink-item.is-selected'))
+      expect(mounted.host.querySelector('.quicklink-item.is-selected code')?.textContent).toBe('/jd')
+      expect(mounted.host.querySelector<HTMLInputElement>('.quicklinks-editor [aria-label="启动键"]')?.value).toBe('jd')
+
+      const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      await act(async () => document.activeElement?.dispatchEvent(enter))
+
+      expect(enter.defaultPrevented).toBe(true)
+      expect(core.getSnapshot().quicklinks).toBeUndefined()
+      expect(core.getSnapshot().queryControlValue).toBe('/jd ')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('moves from a directory item to the form with ArrowRight and restores item focus after Ctrl+S saves', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [
+        quicklinkView({ id: 'quicklink-jd', name: '京东搜索', command: 'jd' }),
+        quicklinkView({ id: 'quicklink-github', name: 'GitHub 搜索', command: 'gh' }),
+      ],
+    })
+    const save = deferred<Awaited<ReturnType<typeof client.saveQuicklink>>>()
+    vi.mocked(client.saveQuicklink).mockReturnValueOnce(save.promise)
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-editor-keyboard')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })))
+      const item = mounted.host.querySelector<HTMLButtonElement>('.quicklink-item.is-selected')!
+      expect(document.activeElement).toBe(item)
+
+      const arrowRight = new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true })
+      await act(async () => item.dispatchEvent(arrowRight))
+
+      expect(arrowRight.defaultPrevented).toBe(true)
+      const nameInput = mounted.host.querySelector<HTMLInputElement>('.quicklinks-editor [aria-label="目录名称"]')!
+      expect(document.activeElement).toBe(nameInput)
+
+      await act(async () => core.setQuicklinkDraft('name', '京东商城'))
+      const ctrlS = new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true, cancelable: true })
+      await act(async () => nameInput.dispatchEvent(ctrlS))
+
+      expect(ctrlS.defaultPrevented).toBe(true)
+      expect(client.saveQuicklink).toHaveBeenCalledWith({
+        input: {
+          id: 'quicklink-jd',
+          name: '京东商城',
+          command: 'jd',
+          template: 'https://search.jd.com/Search?keyword={Query}',
+          iconToken: null,
+        },
+      })
+      await act(async () => {
+        save.resolve(quicklinkView({ id: 'quicklink-jd', name: '京东商城', command: 'jd' }))
+        await save.promise
+      })
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.operation).toBeUndefined())
+      await vi.waitFor(() => expect(document.activeElement).toBe(mounted.host.querySelector('.quicklink-item.is-selected')))
+      await vi.waitFor(() => expect(mounted.host.querySelector('.quicklinks-editor-status')?.textContent).toBe('已保存'))
+      expect(document.activeElement?.textContent).toContain('/jd')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('keeps quicklinks chrome outside Tab order and traps Tab inside the right form', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [quicklinkView({ id: 'quicklink-jd', name: '京东搜索', command: 'jd' })],
+    })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-tab-scope')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+      const addButton = mounted.host.querySelector<HTMLButtonElement>('[aria-label="新增快速链接"]')!
+      const item = mounted.host.querySelector<HTMLButtonElement>('.quicklink-item')!
+      expect(input.tabIndex).toBe(-1)
+      expect(addButton.tabIndex).toBe(-1)
+      expect(item.tabIndex).toBe(-1)
+
+      const inputTab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      await act(async () => input.dispatchEvent(inputTab))
+      expect(inputTab.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(input)
+
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })))
+      expect(document.activeElement).toBe(item)
+      const itemTab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      await act(async () => item.dispatchEvent(itemTab))
+      expect(itemTab.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(item)
+
+      await act(async () => item.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true })))
+      const formControls = Array.from(
+        mounted.host.querySelectorAll<HTMLElement>('.quicklinks-editor input:not(:disabled), .quicklinks-editor button:not(:disabled)'),
+      )
+      expect(formControls.length).toBeGreaterThan(1)
+      const firstControl = formControls[0]!
+      const lastControl = formControls[formControls.length - 1]!
+      expect(document.activeElement).toBe(firstControl)
+
+      await act(async () => lastControl.focus())
+      const wrapForward = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      await act(async () => lastControl.dispatchEvent(wrapForward))
+      expect(wrapForward.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(firstControl)
+
+      const wrapBackward = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })
+      await act(async () => firstControl.dispatchEvent(wrapBackward))
+      expect(wrapBackward.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(lastControl)
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('renders quicklinks with notes-like scroll shells and compact horizontal form rows', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [quicklinkView({ id: 'quicklink-jd', name: '京东搜索', command: 'jd' })],
+    })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-notes-like-layout')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      expect(mounted.host.querySelector('.quicklinks-list-scroll')).not.toBeNull()
+      expect(mounted.host.querySelector('.quicklinks-editor-scroll')).not.toBeNull()
+      expect(mounted.host.querySelectorAll('.quicklinks-editor .quicklinks-form-row')).toHaveLength(4)
+      expect(mounted.host.querySelector('.quicklinks-editor .quicklinks-form-row-icon')).not.toBeNull()
+      expect(stylesSource).toContain('.quicklinks-editor .quicklinks-form-row .ant-form-item-row')
+      expect(stylesSource).toContain('grid-template-columns: 88px minmax(0, 1fr);')
+      expect(stylesSource).toContain('.quicklinks-list-scroll')
+      expect(stylesSource).toContain('.quicklinks-editor-scroll')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('opens the quicklink creation dialog from Ctrl+N without replacing the selected editor', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({
+      items: [quicklinkView()],
+    })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-ctrl-new')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+
+      const ctrlN = new KeyboardEvent('keydown', { key: 'n', ctrlKey: true, bubbles: true, cancelable: true })
+      await act(async () => input.dispatchEvent(ctrlN))
+
+      expect(ctrlN.defaultPrevented).toBe(true)
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')?.textContent).toContain('新建快速链接'))
+      expect(mounted.host.querySelector<HTMLInputElement>('[aria-label="目录名称"]')?.value).toBe('京东搜索')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('opens the quicklink creation dialog from the add button while the empty editor stays empty', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({ items: [] })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-add-new')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="新增快速链接"]')?.click())
+
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')?.textContent).toContain('新建快速链接'))
+      const editor = mounted.host.querySelector<HTMLElement>('.quicklinks-editor')!
+      expect(editor.textContent).toContain('请选择或新增快速链接')
+      expect(editor.textContent).not.toContain('目录名称')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
+  it('saves a new quicklink from the creation dialog and selects it', async () => {
+    installMatchMedia(false)
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockImplementation(async (request) => {
+      if (request.query !== '/quicklinks') return { requestId: 'empty', items: [] }
+      return {
+        requestId: 'quicklinks-open',
+        items: [{
+          resultId: 'quicklinks-result',
+          title: '/quicklinks',
+          activation: { kind: 'openQuicklinks' },
+          hasDefaultAction: false,
+        }],
+      }
+    })
+    vi.mocked(client.listQuicklinks).mockResolvedValueOnce({ items: [] })
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => emit(shown('quicklinks-save-new')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="新增快速链接"]')?.click())
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')?.textContent).toContain('新建快速链接'))
+
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
+      const setInputValue = async (selector: string, value: string) => {
+        const input = dialog.querySelector<HTMLInputElement>(selector)!
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+        await act(async () => {
+          setter.call(input, value)
+          input.dispatchEvent(new Event('input', { bubbles: true }))
+          input.dispatchEvent(new Event('change', { bubbles: true }))
+        })
+      }
+      await setInputValue('[aria-label="目录名称"]', '淘宝搜索')
+      await setInputValue('[aria-label="启动键"]', 'tb')
+      await setInputValue('[aria-label="链接"]', 'https://s.taobao.com/search?q={Query}')
+      await act(async () => {
+        ;[...document.querySelectorAll<HTMLButtonElement>('button')]
+          .find((button) => button.textContent?.trim() === '保存')
+          ?.click()
+      })
+
+      await vi.waitFor(() => expect(client.saveQuicklink).toHaveBeenCalledWith({
+        input: {
+          name: '淘宝搜索',
+          command: 'tb',
+          template: 'https://s.taobao.com/search?q={Query}',
+          iconToken: null,
+        },
+      }))
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull())
+      expect(core.getSnapshot().quicklinks?.selectedId).toBe('quicklink-new')
+      expect(core.getSnapshot().quicklinks?.draft.name).toBe('淘宝搜索')
+    } finally {
+      await mounted.unmount()
+    }
+  })
+
   it('accepts only the closed launcher activation union and completion grammar', () => {
     const boundary = `/d ${'a'.repeat(65_533)}`
     const valid = [
@@ -2987,9 +3561,11 @@ describe('shown and search ownership', () => {
       vi.useRealTimers()
     }
   })
-  it('keeps only strict bounded PNG data icons', async () => {
+  it('keeps only strict bounded quicklink-sized PNG data icons', async () => {
     const { core, client, emit } = await startedCore()
-    const valid = `data:image/png;base64,${'A'.repeat(65_512)}`
+    const backendMaxPngBytes = 256 * 1024
+    const backendMaxBase64Payload = Math.ceil(backendMaxPngBytes / 3) * 4
+    const valid = `data:image/png;base64,${'A'.repeat(backendMaxBase64Payload)}`
     const invalid = [
       'data:image/png;base64,',
       'data:image/svg+xml;base64,AAAA',
@@ -3001,7 +3577,7 @@ describe('shown and search ownership', () => {
       'data:image/png;base64,AA_A',
       'data:image/png;base64,AA%2F',
       'data:image/png;base64,AAAA\n',
-      `data:image/png;base64,${'A'.repeat(65_516)}`,
+      `data:image/png;base64,${'A'.repeat(backendMaxBase64Payload + 4)}`,
     ]
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'icons',
@@ -4588,6 +5164,60 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
+  it('renders and owns the quicklinks builtin favorite context menu', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const mutation = deferred<void>()
+    vi.mocked(fake.client.setBuiltinFeatureFavorite).mockReturnValueOnce(mutation.promise)
+    vi.mocked(fake.client.searchApps).mockImplementation(async () => ({
+      requestId: 'quicklinks-favorite-menu',
+      items: [{
+        resultId: 'quicklinks',
+        title: '/quicklinks',
+        subtitle: '管理快速链接',
+        activation: { kind: 'openQuicklinks' },
+        favorite: {
+          target: { kind: 'builtin', feature: 'quicklinks' },
+          favorite: false,
+        },
+        hasDefaultAction: false,
+      }],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => fake.emit(shown('quicklinks-favorite-menu')))
+      await act(async () => core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: '/quicklinks', inputType: 'insertText',
+      }))
+      await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+      const option = mounted.host.querySelector<HTMLElement>('[role="option"]')!
+
+      await act(async () => option.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+      let menuItem: HTMLElement | null = null
+      await vi.waitFor(() => {
+        menuItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+          .find((item) => item.textContent?.trim() === '设为常用') ?? null
+        expect(menuItem).not.toBeNull()
+      })
+      await act(async () => menuItem!.click())
+      expect(fake.client.setBuiltinFeatureFavorite).toHaveBeenCalledWith({
+        feature: 'quicklinks',
+        favorite: true,
+      })
+      expect(fake.client.executeResult).not.toHaveBeenCalled()
+      expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    } finally {
+      mutation.resolve()
+      await mounted.unmount()
+      core.destroy()
+    }
+  })
+
   it('completes a plugin command and keeps an unselectable command usage hint until submit', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
@@ -5102,7 +5732,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/\.settings-scroll-content\s*\{[^}]*min-height:\s*100%;/s)
   })
 
-  it('uses the third-party overlay scrollbar for settings and detail panels', async () => {
+  it('uses the third-party overlay scrollbar for settings, detail, and quicklinks panels', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -5116,7 +5746,9 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.settings-plugin-panel .settings-scroll-content')).toBeTruthy())
 
     expect(launcherViewSource).toContain("from 'overlayscrollbars-react'")
-    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(3)
+    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(5)
+    expect(launcherViewSource).toContain('className="quicklinks-list-scroll"')
+    expect(launcherViewSource).toContain('className="quicklinks-editor-scroll"')
     expect(launcherViewSource).not.toContain('./overlay-scroll-area')
     expect(stylesSource).toMatch(/\.os-theme-uipilot\s*\{[^}]*--os-size:\s*8px;[^}]*--os-handle-bg:\s*var\(--result-scrollbar-thumb\);/s)
     expect(stylesSource).not.toContain('.overlay-scroll-')

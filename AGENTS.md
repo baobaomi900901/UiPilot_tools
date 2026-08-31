@@ -20,6 +20,16 @@ commit commands inside every task. Approved design specifications remain the
 source of truth for technical contracts, event ordering, security boundaries,
 and failure behavior.
 
+## UiPilot Host Built-in Launcher Features
+
+When adding a host-owned built-in feature that appears in the main launcher
+result list, decide whether the result is a reusable launcher entry. Reusable
+entries should be favoritable by default. Wire the full favorite path in the
+same change: `BuiltinFeature`, backend `ResultFavorite::builtin(...)`, frontend
+`BuiltinFeature` / `safeResultFavorite`, `favoriteMatchesResult`, and launcher
+context-menu tests. Recent lesson: `/quicklinks` initially opened correctly but
+could not be right-clicked as a favorite because its result had `favorite: None`.
+
 ## UiPilot Public Plugin Development
 
 When creating, updating, or testing a UiPilot public plugin, first read
