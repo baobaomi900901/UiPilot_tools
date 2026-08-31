@@ -120,6 +120,19 @@ pub(crate) struct AppFocusLossTicket {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppBlurDecision {
+    Confirmed,
+    NativeAppFocused,
+    Unavailable,
+    SessionMismatch,
+    ShowGenerationMismatch,
+    FocusRevisionMismatch,
+    ContentNotVisible,
+    MainContentFocused,
+    ContentFocused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostInputFocusIdentity {
     pub(crate) session_epoch: u64,
     pub(crate) focus_request_id: u64,
@@ -347,6 +360,7 @@ struct LiveSession {
     current_submission_token: String,
     pending: Option<PendingDispatch>,
     content_focused: bool,
+    content_visible: bool,
     host_key_route: HostKeyRouteState,
 }
 
@@ -364,6 +378,17 @@ struct ControllerCore {
     show_generation: u64,
     main_content_focused: bool,
     internal_blur_until: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PanelFocusTraceState {
+    show_generation: u64,
+    focus_revision: u64,
+    session_epoch: Option<u64>,
+    session_show_generation: Option<u64>,
+    main_content_focused: bool,
+    content_focused: bool,
+    content_visible: bool,
 }
 
 #[derive(Default)]
@@ -910,6 +935,30 @@ impl PluginPanelController {
             .map(|session| session.identity.clone())
     }
 
+    fn focus_trace_state(&self) -> Option<PanelFocusTraceState> {
+        let core = self.core.lock().ok()?;
+        let session_epoch = core
+            .session
+            .as_ref()
+            .map(|session| session.identity.session_epoch);
+        let content_visible = core
+            .session
+            .as_ref()
+            .is_some_and(|session| session.content_visible);
+        Some(PanelFocusTraceState {
+            show_generation: core.show_generation,
+            focus_revision: core.focus_revision,
+            session_epoch,
+            session_show_generation: core.session.as_ref().map(|session| session.show_generation),
+            main_content_focused: core.main_content_focused,
+            content_focused: core
+                .session
+                .as_ref()
+                .is_some_and(|session| session.content_focused),
+            content_visible,
+        })
+    }
+
     pub(crate) fn claim_bounds_identity(
         &self,
         session_epoch: u64,
@@ -922,6 +971,22 @@ impl PluginPanelController {
             .filter(|session| session.identity.session_epoch == session_epoch)
             .map(|session| session.identity.clone())
             .ok_or(PanelBoundsError::Stale)
+    }
+
+    pub(crate) fn mark_content_visible(&self, session_epoch: u64) -> Result<(), PanelBoundsError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelBoundsError::Unavailable)?;
+        let Some(session) = core.session.as_mut() else {
+            return Err(PanelBoundsError::Stale);
+        };
+        if session.identity.session_epoch != session_epoch {
+            return Err(PanelBoundsError::Stale);
+        }
+        session.content_visible = true;
+        self.changed.notify_all();
+        Ok(())
     }
 
     pub(crate) fn open_session(&self, owner: PanelOwner) -> Option<PanelSessionIdentity> {
@@ -948,6 +1013,7 @@ impl PluginPanelController {
             current_submission_token: owner.submission_token,
             pending: None,
             content_focused: false,
+            content_visible: false,
             host_key_route: HostKeyRouteState::default(),
         });
         core.hide_ticket = None;
@@ -1403,7 +1469,7 @@ impl PluginPanelController {
             || core
                 .session
                 .as_ref()
-                .is_some_and(|session| session.content_focused)
+                .is_some_and(|session| !session.content_visible || session.content_focused)
         {
             return None;
         }
@@ -1462,6 +1528,13 @@ impl PluginPanelController {
             .as_mut()
             .expect("validated panel focus session")
             .content_focused = false;
+        if core
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.content_visible)
+        {
+            return None;
+        }
         (!core.main_content_focused).then_some(AppFocusLossTicket {
             session_epoch: Some(session_epoch),
             focus_revision: revision,
@@ -1474,28 +1547,57 @@ impl PluginPanelController {
         self.confirm_app_blur_with_native_focus(ticket, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn confirm_app_blur_with_native_focus(
         &self,
         ticket: &AppFocusLossTicket,
         native_app_focused: bool,
     ) -> bool {
+        self.app_blur_decision(ticket, native_app_focused) == AppBlurDecision::Confirmed
+    }
+
+    fn app_blur_decision(
+        &self,
+        ticket: &AppFocusLossTicket,
+        native_app_focused: bool,
+    ) -> AppBlurDecision {
         if native_app_focused {
-            return false;
+            return AppBlurDecision::NativeAppFocused;
         }
-        self.core.lock().ok().is_some_and(|core| {
-            let current_epoch = core
-                .session
-                .as_ref()
-                .map(|session| session.identity.session_epoch);
-            current_epoch == ticket.session_epoch
-                && core.show_generation == ticket.show_generation
-                && core.focus_revision == ticket.focus_revision
-                && !core.main_content_focused
-                && core
-                    .session
-                    .as_ref()
-                    .is_none_or(|session| !session.content_focused)
-        })
+        let Ok(core) = self.core.lock() else {
+            return AppBlurDecision::Unavailable;
+        };
+        let current_epoch = core
+            .session
+            .as_ref()
+            .map(|session| session.identity.session_epoch);
+        if current_epoch != ticket.session_epoch {
+            return AppBlurDecision::SessionMismatch;
+        }
+        if core.show_generation != ticket.show_generation {
+            return AppBlurDecision::ShowGenerationMismatch;
+        }
+        if core.focus_revision != ticket.focus_revision {
+            return AppBlurDecision::FocusRevisionMismatch;
+        }
+        if core
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.content_visible)
+        {
+            return AppBlurDecision::ContentNotVisible;
+        }
+        if core.main_content_focused {
+            return AppBlurDecision::MainContentFocused;
+        }
+        if core
+            .session
+            .as_ref()
+            .is_some_and(|session| session.content_focused)
+        {
+            return AppBlurDecision::ContentFocused;
+        }
+        AppBlurDecision::Confirmed
     }
 
     pub(crate) fn consume_internal_main_blur(&self, now: Instant) -> bool {
@@ -2439,6 +2541,83 @@ fn clamp_panel_bounds(
     })
 }
 
+#[cfg(windows)]
+fn panel_focus_trace_enabled() -> bool {
+    std::env::var("UIPILOT_PANEL_FOCUS_TRACE")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".into())
+}
+
+#[cfg(windows)]
+fn focus_state_fragment(state: Option<PanelFocusTraceState>) -> String {
+    let Some(state) = state else {
+        return "state=unavailable".into();
+    };
+    format!(
+        "showGeneration={} focusRevision={} sessionEpoch={} sessionShowGeneration={} mainFocused={} contentFocused={} contentVisible={}",
+        state.show_generation,
+        state.focus_revision,
+        optional_u64(state.session_epoch),
+        optional_u64(state.session_show_generation),
+        state.main_content_focused,
+        state.content_focused,
+        state.content_visible
+    )
+}
+
+#[cfg(windows)]
+fn focus_ticket_fragment(ticket: Option<&AppFocusLossTicket>) -> String {
+    let Some(ticket) = ticket else {
+        return "ticket=none".into();
+    };
+    format!(
+        "ticket={{showGeneration={},focusRevision={},sessionEpoch={}}}",
+        ticket.show_generation,
+        ticket.focus_revision,
+        optional_u64(ticket.session_epoch)
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn trace_panel_focus(
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    event: &str,
+    detail: impl FnOnce() -> String,
+) {
+    if !panel_focus_trace_enabled() {
+        return;
+    }
+    eprintln!(
+        "[DEBUG-panel-focus] event={} {} detail={} {}",
+        event,
+        focus_state_fragment(controller.focus_trace_state()),
+        detail(),
+        crate::lifecycle::main_foreground_trace_summary(app)
+    );
+}
+
+#[cfg(not(windows))]
+pub(crate) fn trace_panel_focus(
+    _app: &AppHandle,
+    _controller: &PluginPanelController,
+    _event: &str,
+    _detail: impl FnOnce() -> String,
+) {
+}
+
 pub(crate) fn set_bounds(
     app: &AppHandle,
     controller: &PluginPanelController,
@@ -2460,8 +2639,19 @@ pub(crate) fn set_bounds(
             size: tauri::Size::Logical(LogicalSize::new(bounds.width, bounds.height)),
         })
         .map_err(|_| PanelBoundsError::Unavailable)?;
+    trace_panel_focus(app, controller, "content-bounds", || {
+        format!(
+            "sessionEpoch={} requested={:?} clamped={:?}",
+            session_epoch, requested, bounds
+        )
+    });
     controller.claim_bounds_identity(session_epoch)?;
-    content.show().map_err(|_| PanelBoundsError::Unavailable)
+    content.show().map_err(|_| PanelBoundsError::Unavailable)?;
+    controller.mark_content_visible(session_epoch)?;
+    trace_panel_focus(app, controller, "content-show", || {
+        format!("sessionEpoch={session_epoch}")
+    });
+    Ok(())
 }
 
 pub(crate) fn mount(
@@ -2474,6 +2664,9 @@ pub(crate) fn mount(
     let identity = controller
         .open_session(owner)
         .ok_or(PublicPluginManagementError::Unavailable)?;
+    trace_panel_focus(app, controller.as_ref(), "session-open", || {
+        format!("sessionEpoch={}", identity.session_epoch)
+    });
     if let Err(error) = mount_webview(app, Arc::clone(&controller), &identity, panel_entry) {
         teardown(app, &controller, Some(identity.session_epoch));
         return Err(error);
@@ -2492,6 +2685,9 @@ fn mount_webview(
     identity: &PanelSessionIdentity,
     panel_entry: &str,
 ) -> Result<(), PublicPluginManagementError> {
+    trace_panel_focus(app, controller.as_ref(), "mount-begin", || {
+        format!("sessionEpoch={}", identity.session_epoch)
+    });
     if app.get_webview(&identity.content_label).is_some() {
         destroy_content(app, &identity.content_label);
     }
@@ -2525,14 +2721,23 @@ fn mount_webview(
             LogicalSize::new(PANEL_FALLBACK_SIZE, PANEL_FALLBACK_SIZE),
         )
         .map_err(|_| PublicPluginManagementError::Unavailable)?;
+    trace_panel_focus(app, controller.as_ref(), "content-add-child", || {
+        format!("sessionEpoch={}", identity.session_epoch)
+    });
     if content.hide().is_err() {
         destroy_content(app, &identity.content_label);
         return Err(PublicPluginManagementError::Unavailable);
     }
+    trace_panel_focus(app, controller.as_ref(), "content-initial-hide", || {
+        format!("sessionEpoch={}", identity.session_epoch)
+    });
     if register_content_focus_events(app, &content, Arc::clone(&controller), identity).is_err() {
         destroy_content(app, &identity.content_label);
         return Err(PublicPluginManagementError::Unavailable);
     }
+    trace_panel_focus(app, controller.as_ref(), "content-focus-registered", || {
+        format!("sessionEpoch={}", identity.session_epoch)
+    });
 
     let guard_controller = Arc::clone(&controller);
     let guard_app = app.clone();
@@ -2561,6 +2766,9 @@ fn mount_webview(
         return Err(PublicPluginManagementError::RuntimeNotReady);
     }
     let _ = verify_windows_webview_muted(&content, CONTENT_READY_TIMEOUT);
+    trace_panel_focus(app, controller.as_ref(), "mount-prepared", || {
+        format!("sessionEpoch={}", identity.session_epoch)
+    });
     Ok(())
 }
 
@@ -2572,11 +2780,15 @@ pub(crate) fn register_main_focus_events(
     lifecycle: Arc<crate::lifecycle::LifecycleCoordinator>,
 ) -> Result<(), ()> {
     let (sender, receiver) = mpsc::sync_channel(1);
+    let got_app = app.clone();
     let got_controller = Arc::clone(&controller);
     let lost_app = app.clone();
     main.with_webview(move |platform| {
         let got = FocusChangedEventHandler::create(Box::new(move |_, _| {
-            let _ = got_controller.main_content_got_focus();
+            let accepted = got_controller.main_content_got_focus();
+            trace_panel_focus(&got_app, got_controller.as_ref(), "main-got-focus", || {
+                format!("accepted={accepted}")
+            });
             Ok(())
         }));
         let lost = FocusChangedEventHandler::create(Box::new(move |_, _| {
@@ -2584,9 +2796,17 @@ pub(crate) fn register_main_focus_events(
                 lost_app.state::<Arc<crate::window_transfer::MainWindowTransferCoordinator>>();
             let expected_transfer_blur = transfers.consume_expected_main_webview_blur();
             let transient_focus_suppressed = lifecycle.transient_focus_loss_suppressed();
-            if let Some(ticket) = controller
-                .main_content_lost_focus(expected_transfer_blur || transient_focus_suppressed)
-            {
+            let ticket = controller
+                .main_content_lost_focus(expected_transfer_blur || transient_focus_suppressed);
+            trace_panel_focus(&lost_app, controller.as_ref(), "main-lost-focus", || {
+                format!(
+                    "expectedTransferBlur={} transientSuppressed={} {}",
+                    expected_transfer_blur,
+                    transient_focus_suppressed,
+                    focus_ticket_fragment(ticket.as_ref())
+                )
+            });
+            if let Some(ticket) = ticket {
                 schedule_app_blur(lost_app.clone(), Arc::clone(&controller), ticket);
             }
             Ok(())
@@ -2626,6 +2846,7 @@ fn register_content_focus_events(
     identity: &PanelSessionIdentity,
 ) -> Result<(), PublicPluginManagementError> {
     let (sender, receiver) = mpsc::sync_channel(1);
+    let got_app = app.clone();
     let got_controller = Arc::clone(&controller);
     let got_label = identity.content_label.clone();
     let got_epoch = identity.session_epoch;
@@ -2636,11 +2857,30 @@ fn register_content_focus_events(
     content
         .with_webview(move |platform| {
             let got = FocusChangedEventHandler::create(Box::new(move |_, _| {
-                let _ = got_controller.content_got_focus(&got_label, got_epoch);
+                let accepted = got_controller.content_got_focus(&got_label, got_epoch);
+                trace_panel_focus(
+                    &got_app,
+                    got_controller.as_ref(),
+                    "content-got-focus",
+                    || format!("sessionEpoch={got_epoch} accepted={accepted}"),
+                );
                 Ok(())
             }));
             let lost = FocusChangedEventHandler::create(Box::new(move |_, _| {
-                if let Some(ticket) = lost_controller.content_lost_focus(&lost_label, lost_epoch) {
+                let ticket = lost_controller.content_lost_focus(&lost_label, lost_epoch);
+                trace_panel_focus(
+                    &lost_app,
+                    lost_controller.as_ref(),
+                    "content-lost-focus",
+                    || {
+                        format!(
+                            "sessionEpoch={} {}",
+                            lost_epoch,
+                            focus_ticket_fragment(ticket.as_ref())
+                        )
+                    },
+                );
+                if let Some(ticket) = ticket {
                     schedule_app_blur(lost_app.clone(), Arc::clone(&lost_controller), ticket);
                 }
                 Ok(())
@@ -2685,12 +2925,24 @@ fn schedule_app_blur(
         let _ = app.run_on_main_thread(move || {
             let native_app_focused =
                 crate::lifecycle::main_window_owns_native_foreground(&dispatch_app);
-            if !controller.confirm_app_blur_with_native_focus(&ticket, native_app_focused) {
+            let decision = controller.app_blur_decision(&ticket, native_app_focused);
+            trace_panel_focus(&dispatch_app, controller.as_ref(), "blur-recheck", || {
+                format!(
+                    "nativeAppFocused={} decision={:?} {}",
+                    native_app_focused,
+                    decision,
+                    focus_ticket_fragment(Some(&ticket))
+                )
+            });
+            if decision != AppBlurDecision::Confirmed {
                 return;
             }
             let Some(window) = dispatch_app.get_window("main") else {
                 return;
             };
+            trace_panel_focus(&dispatch_app, controller.as_ref(), "blur-hide", || {
+                focus_ticket_fragment(Some(&ticket))
+            });
             let registries = dispatch_app.state::<crate::result_registry::ResultRegistries>();
             let _ = crate::commands::clear_and_hide_window(
                 registries.main(),
@@ -2960,6 +3212,12 @@ mod tests {
         Instant::now() + Duration::from_secs(1)
     }
 
+    fn assert_content_visible(controller: &PluginPanelController, identity: &PanelSessionIdentity) {
+        assert!(controller
+            .mark_content_visible(identity.session_epoch)
+            .is_ok());
+    }
+
     fn assert_focus_advanced(result: Result<HostInputFocusAdvance, PanelSettlementError>) {
         assert_eq!(result, Ok(HostInputFocusAdvance::Advanced));
     }
@@ -3002,9 +3260,31 @@ mod tests {
     }
 
     #[test]
-    fn panel_focus_loss_hides_only_without_a_new_internal_focus_owner() {
+    fn panel_mount_content_focus_noise_before_visible_does_not_hide() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
+
+        assert!(controller.content_got_focus(&identity.content_label, identity.session_epoch,));
+        assert!(controller
+            .content_lost_focus(&identity.content_label, identity.session_epoch)
+            .is_none());
+    }
+
+    #[test]
+    fn panel_mount_main_focus_loss_before_visible_does_not_hide() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+
+        assert!(controller.main_content_got_focus());
+        assert!(controller.main_content_lost_focus(false).is_none());
+        assert_eq!(controller.live_identity(), Some(identity));
+    }
+
+    #[test]
+    fn panel_focus_loss_hides_only_after_content_is_visible() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &identity);
 
         assert!(controller.content_got_focus(&identity.content_label, identity.session_epoch,));
         let stale = controller
@@ -3051,9 +3331,10 @@ mod tests {
     }
 
     #[test]
-    fn main_focus_loss_with_live_panel_schedules_hide_when_panel_never_owned_focus() {
+    fn main_focus_loss_with_visible_panel_schedules_hide_when_panel_never_owned_focus() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &identity);
 
         assert!(controller.main_content_got_focus());
         let ticket = controller.main_content_lost_focus(false).unwrap();
@@ -3088,6 +3369,7 @@ mod tests {
     fn panel_focus_invalidates_main_focus_loss_ticket() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &identity);
 
         assert!(controller.main_content_got_focus());
         let ticket = controller.main_content_lost_focus(false).unwrap();
@@ -3100,6 +3382,7 @@ mod tests {
     fn host_key_native_focus_transfer_does_not_create_app_blur_ticket() {
         let controller = PluginPanelController::default();
         let identity = host_key_session(&controller);
+        assert_content_visible(&controller, &identity);
         assert!(controller.main_content_got_focus());
         assert!(matches!(
             controller
@@ -3129,6 +3412,7 @@ mod tests {
     fn host_hide_invalidates_pending_panel_focus_loss() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &identity);
 
         assert!(controller.content_got_focus(&identity.content_label, identity.session_epoch));
         let ticket = controller
@@ -3145,6 +3429,7 @@ mod tests {
         let controller = PluginPanelController::default();
         let first_show = controller.host_shown().unwrap();
         let first = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &first);
         assert!(controller.main_content_got_focus_for_show(first_show));
         let stale_ticket = controller
             .main_content_lost_focus_for_show(first_show, false)
@@ -3153,6 +3438,7 @@ mod tests {
         controller.host_hidden();
         let second_show = controller.host_shown().unwrap();
         let second = controller.open_session(owner("b")).unwrap();
+        assert_content_visible(&controller, &second);
         assert!(controller.main_content_got_focus_for_show(second_show));
 
         assert!(!controller.confirm_app_blur(&stale_ticket));
@@ -3174,6 +3460,7 @@ mod tests {
         let controller = PluginPanelController::default();
         let show = controller.host_shown().unwrap();
         let identity = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &identity);
         assert!(controller.main_content_got_focus_for_show(show));
 
         let blur = controller
@@ -3194,6 +3481,7 @@ mod tests {
             let show = controller.host_shown().unwrap();
             let request = format!("cycle-{index}");
             let identity = controller.open_session(owner(&request)).unwrap();
+            assert_content_visible(&controller, &identity);
             assert!(controller.main_content_got_focus_for_show(show));
 
             if let Some(old_show) = previous_show {
@@ -3320,6 +3608,7 @@ mod tests {
         ] {
             let controller = PluginPanelController::default();
             let session = controller.open_session(owner("a")).unwrap();
+            assert_content_visible(&controller, &session);
             assert!(controller.content_got_focus(&session.content_label, session.session_epoch));
             let deadline = focus_deadline();
             let first = controller
@@ -3423,6 +3712,7 @@ mod tests {
     fn host_input_focus_claim_then_teardown_makes_late_confirm_and_ack_stale() {
         let controller = PluginPanelController::default();
         let session = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &session);
         assert!(controller.main_content_got_focus());
         let blur = controller.main_content_lost_focus(false).unwrap();
         let request = controller
@@ -3498,6 +3788,7 @@ mod tests {
     fn host_input_focus_true_ack_after_real_blur_cannot_cancel_hide() {
         let controller = PluginPanelController::default();
         let session = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &session);
         assert!(controller.content_got_focus(&session.content_label, session.session_epoch));
         let request = controller
             .prepare_host_input_focus(
@@ -3523,6 +3814,7 @@ mod tests {
     fn host_input_focus_native_failure_preserves_existing_blur_ticket() {
         let controller = PluginPanelController::default();
         let session = controller.open_session(owner("a")).unwrap();
+        assert_content_visible(&controller, &session);
         assert!(controller.main_content_got_focus());
         let blur = controller.main_content_lost_focus(false).unwrap();
 

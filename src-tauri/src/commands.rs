@@ -2422,11 +2422,6 @@ pub(crate) fn set_plugin_panel_bounds(
     controller: State<'_, Arc<PluginPanelController>>,
     input: SetPluginPanelBoundsInput,
 ) -> Result<(), CommandError> {
-    eprintln!(
-        "[plugin-panel-bounds] entered caller={} session={}",
-        webview.label(),
-        input.session_epoch
-    );
     require_main_label(webview.label())?;
     let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
     let result = plugin_panel::set_bounds(
@@ -2455,7 +2450,6 @@ pub(crate) fn close_plugin_panel(
 ) -> Result<(), CommandError> {
     require_main_label(webview.label())?;
     let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
-    eprintln!("[plugin-panel-close] session={session_epoch}");
     plugin_panel::teardown(&app, controller.inner().as_ref(), Some(session_epoch));
     Ok(())
 }
@@ -4607,8 +4601,14 @@ pub(crate) fn clear_and_hide_window(
             })
         },
         || {
+            plugin_panel::trace_panel_focus(&app, panel_controller.as_ref(), "host-hide", || {
+                format!("reason={reason:?}")
+            });
             plugin_panel::teardown(&app, panel_controller.as_ref(), None);
             panel_controller.host_hidden();
+            plugin_panel::trace_panel_focus(&app, panel_controller.as_ref(), "host-hidden", || {
+                format!("reason={reason:?}")
+            });
         },
         |position| settings.set_window_position(position).map_err(|_| ()),
     );
@@ -6402,6 +6402,9 @@ mod tests {
         assert_eq!(event_calls.get(), 0);
 
         let session = controller.open_session(panel_focus_owner()).unwrap();
+        assert!(controller
+            .mark_content_visible(session.session_epoch)
+            .is_ok());
         assert!(controller.main_content_got_focus());
         let blur = controller.main_content_lost_focus(false).unwrap();
         let current = controller

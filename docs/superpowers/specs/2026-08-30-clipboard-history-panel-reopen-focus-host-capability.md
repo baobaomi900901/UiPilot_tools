@@ -3,7 +3,7 @@
 ## 文档信息
 
 - 日期：2026-08-30
-- 状态：宿主修复已实现，等待 Windows 人工验收
+- 状态：`6ffc9f2` 后仍偶发复现；已加入脱敏追踪、窗口族前台复核与 Panel 可见门闩候选修正，等待 Windows 人工复验
 - 目标平台：Windows
 - 场景：Panel 插件完成一次显式返回后，再次显示并打开新 Panel 会话
 
@@ -94,3 +94,39 @@ show generation B -> open Panel B ----^ callback/ticket is attributed to B
 - Panel session 和 app blur ticket 绑定 show generation；旧 generation 的 main/content focus loss 不能隐藏新会话。
 - 延迟 blur 真正隐藏前会在主线程重新确认 UiPilot 是否仍拥有原生前台窗口；若新 Panel 已经重新打开并处于前台，迟到 blur 不会隐藏它。
 - 当前 generation 的真实失焦仍沿用既有延迟 recheck 后隐藏语义。
+
+## `6ffc9f2` 后续人工复验
+
+宿主加入 show generation 和延迟 blur 前台复核后，Windows 人工验收仍能偶发复现：在主界面选择插件并
+按 Enter 后，主界面直接消失。复现时进程 PID 不变、插件 `fault` 为空，也没有发生自动粘贴。因此跨
+generation 修复有效覆盖了已有单元场景，但没有覆盖全部真实 WebView2 事件顺序。
+
+当前实现的前台复核只接受 `GetForegroundWindow() == main_hwnd`。继续修复前必须先用脱敏开发追踪记录：
+
+- show generation、session epoch、focus revision；
+- 事件来源（main/content）与 GotFocus/LostFocus；
+- blur ticket 的创建、失效和确认原因；
+- main HWND、foreground HWND、`GA_ROOTOWNER`、窗口类和所属 PID；
+- Panel mount、set bounds、show、主输入框 focus ack 与 hide reason 的相对顺序。
+
+追踪不得记录窗口标题、剪贴板内容、插件参数或文件路径。完成定位后删除或关闭开发追踪。
+
+新增自动化验收要求：
+
+- [ ] 同一 show generation 内穷举 main LostFocus、content GotFocus、主输入框 focus ack 和 bounds/show 的合法事件顺序。
+- [ ] Panel mount 期间由 UiPilot 拥有的 child/owned WebView HWND 临时成为 foreground 时，不得视为外部失焦。
+- [ ] 前台归属不能宽化为“任意同 PID 窗口”；必须限定为 main 的 root/owner/child 窗口族，避免 Find 或独立插件窗口错误保活主界面。
+- [ ] 如果 foreground 确为外部进程，当前 generation 的 blur 仍按既有规则隐藏。
+- [ ] Windows 压力验收必须实际完成图片、文字和文件各 10 轮；任一偶发隐藏都表示本缺陷未关闭。
+
+## 本轮宿主诊断记录
+
+- 增加 `UIPILOT_PANEL_FOCUS_TRACE=1` 开关；开启后输出 `[DEBUG-panel-focus]` 脱敏日志。
+- 日志包含 show generation、session epoch、focus revision、main/content 焦点状态、blur ticket、hide reason、foreground HWND、`GA_ROOT`、`GA_ROOTOWNER`、窗口类和 PID。
+- 日志不包含窗口标题、剪贴板内容、插件参数或文件路径。
+- 将前台复核从“foreground HWND 必须等于 main HWND”收窄升级为“foreground 必须属于 main HWND 的窗口族”：main 本身、main 的 child，或 `GA_ROOT` / `GA_ROOTOWNER` 指向 main；不会因为同 PID 就保活。
+- 人工复现日志显示：旧 show generation 的 blur ticket 已被 `ShowGenerationMismatch` 正确拦截；本轮剩余故障来自当前 show generation 内 Panel mount 阶段的 WebView2 focus 抖动。
+- 具体失败尾段为：`content-show` 前多次 `content-got-focus/content-lost-focus` 使最后一个 content blur ticket 成为当前 `focusRevision`，随后 `blur-recheck` 得到 `decision=Confirmed` 并以 `HideReason::Blur` 隐藏主窗口。
+- 宿主增加 `content_visible` 门闩：Panel content 只有在 `set_bounds` 后 `content.show()` 成功才标记为可见；在此之前 main/content LostFocus 不生成 app blur ticket，且 recheck 也不会确认隐藏。
+- 新增回归测试覆盖“Panel mount 中 content focus 抖动不可隐藏”和“Panel mount 中 main focus loss 不可隐藏”；同时保留可见后真实失焦仍可隐藏的测试。
+- 该修正仍需 Windows 人工复验确认，不能在未复验前视为缺陷关闭。

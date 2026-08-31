@@ -19,9 +19,9 @@ use windows::Win32::{
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
-            SetForegroundWindow, WM_ENDSESSION, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
-            WM_QUERYENDSESSION,
+            GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsChild,
+            IsWindow, SetForegroundWindow, GA_ROOT, GA_ROOTOWNER, WM_ENDSESSION, WM_ENTERSIZEMOVE,
+            WM_EXITSIZEMOVE, WM_NCDESTROY, WM_QUERYENDSESSION,
         },
     },
 };
@@ -117,6 +117,32 @@ enum ForegroundObservation {
     Shell,
     External { hwnd: isize, pid: u32 },
     Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MainForegroundOwnership {
+    MainWindow,
+    MainWindowFamily,
+    Other,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeWindowTrace {
+    hwnd: isize,
+    root_hwnd: isize,
+    root_owner_hwnd: isize,
+    pid: u32,
+    class_name: String,
+    is_main_child: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MainForegroundTrace {
+    main: Option<NativeWindowTrace>,
+    foreground: Option<NativeWindowTrace>,
+    ownership: MainForegroundOwnership,
 }
 
 #[derive(Default, Debug)]
@@ -645,12 +671,7 @@ fn observe_foreground_window() -> ForegroundObservation {
     if pid == unsafe { GetCurrentProcessId() } {
         return ForegroundObservation::UiPilot;
     }
-    let mut class_name = [0_u16; 128];
-    let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
-    let class_name = usize::try_from(length)
-        .ok()
-        .and_then(|length| String::from_utf16(&class_name[..length]).ok())
-        .unwrap_or_default();
+    let class_name = window_class_name(hwnd);
     if matches!(
         class_name.as_str(),
         "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW"
@@ -662,6 +683,138 @@ fn observe_foreground_window() -> ForegroundObservation {
             pid,
         }
     }
+}
+
+#[cfg(windows)]
+fn window_class_name(hwnd: HWND) -> String {
+    let mut class_name = [0_u16; 128];
+    let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    usize::try_from(length)
+        .ok()
+        .and_then(|length| String::from_utf16(&class_name[..length]).ok())
+        .unwrap_or_default()
+}
+
+fn classify_main_foreground_ownership(
+    main_hwnd: isize,
+    foreground_hwnd: isize,
+    foreground_root_hwnd: isize,
+    foreground_root_owner_hwnd: isize,
+    foreground_is_main_child: bool,
+) -> MainForegroundOwnership {
+    if main_hwnd == 0 || foreground_hwnd == 0 {
+        return MainForegroundOwnership::Other;
+    }
+    if foreground_hwnd == main_hwnd {
+        return MainForegroundOwnership::MainWindow;
+    }
+    if foreground_is_main_child
+        || foreground_root_hwnd == main_hwnd
+        || foreground_root_owner_hwnd == main_hwnd
+    {
+        return MainForegroundOwnership::MainWindowFamily;
+    }
+    MainForegroundOwnership::Other
+}
+
+#[cfg(windows)]
+fn hwnd_value(hwnd: HWND) -> isize {
+    hwnd.0 as isize
+}
+
+#[cfg(windows)]
+fn observe_native_window_trace(hwnd: HWND, main_hwnd: HWND) -> Option<NativeWindowTrace> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) } == 0 || pid == 0 {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let root_owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    Some(NativeWindowTrace {
+        hwnd: hwnd_value(hwnd),
+        root_hwnd: hwnd_value(root),
+        root_owner_hwnd: hwnd_value(root_owner),
+        pid,
+        class_name: window_class_name(hwnd),
+        is_main_child: hwnd != main_hwnd && unsafe { IsChild(main_hwnd, hwnd).as_bool() },
+    })
+}
+
+#[cfg(windows)]
+fn observe_main_foreground_trace(app: &AppHandle) -> MainForegroundTrace {
+    let Some(main) = app.get_webview_window("main") else {
+        return MainForegroundTrace {
+            main: None,
+            foreground: None,
+            ownership: MainForegroundOwnership::Other,
+        };
+    };
+    let Ok(main_hwnd) = main.hwnd() else {
+        return MainForegroundTrace {
+            main: None,
+            foreground: None,
+            ownership: MainForegroundOwnership::Other,
+        };
+    };
+    let foreground_hwnd = unsafe { GetForegroundWindow() };
+    let main = observe_native_window_trace(main_hwnd, main_hwnd);
+    let foreground = observe_native_window_trace(foreground_hwnd, main_hwnd);
+    let ownership = foreground
+        .as_ref()
+        .map(|window| {
+            classify_main_foreground_ownership(
+                hwnd_value(main_hwnd),
+                window.hwnd,
+                window.root_hwnd,
+                window.root_owner_hwnd,
+                window.is_main_child,
+            )
+        })
+        .unwrap_or(MainForegroundOwnership::Other);
+    MainForegroundTrace {
+        main,
+        foreground,
+        ownership,
+    }
+}
+
+#[cfg(windows)]
+fn format_hwnd(value: isize) -> String {
+    if value == 0 {
+        "0x0".into()
+    } else {
+        format!("0x{:x}", value as usize)
+    }
+}
+
+#[cfg(windows)]
+fn format_window_trace(prefix: &str, trace: Option<&NativeWindowTrace>) -> String {
+    let Some(trace) = trace else {
+        return format!("{prefix}=missing");
+    };
+    format!(
+        "{prefix}={{hwnd={},root={},rootOwner={},pid={},class={:?},isMainChild={}}}",
+        format_hwnd(trace.hwnd),
+        format_hwnd(trace.root_hwnd),
+        format_hwnd(trace.root_owner_hwnd),
+        trace.pid,
+        trace.class_name,
+        trace.is_main_child
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn main_foreground_trace_summary(app: &AppHandle) -> String {
+    let trace = observe_main_foreground_trace(app);
+    format!(
+        "foregroundOwnership={:?} {} {}",
+        trace.ownership,
+        format_window_trace("main", trace.main.as_ref()),
+        format_window_trace("foreground", trace.foreground.as_ref())
+    )
 }
 
 fn restore_capture_matches(
@@ -1204,10 +1357,23 @@ impl LifecycleCoordinator {
             window.set_focus().map_err(|_| ())?;
             window.as_ref().set_focus().map_err(|_| ())?;
             let show_generation = panel_controller.host_shown().ok_or(())?;
+            crate::plugin_panel::trace_panel_focus(
+                app,
+                panel_controller.as_ref(),
+                "host-shown",
+                || format!("target={target:?} showGeneration={show_generation}"),
+            );
             panel_controller
                 .main_content_got_focus_for_show(show_generation)
                 .then_some(())
-                .ok_or(())
+                .ok_or(())?;
+            crate::plugin_panel::trace_panel_focus(
+                app,
+                panel_controller.as_ref(),
+                "host-shown-focus-owned",
+                || format!("target={target:?} showGeneration={show_generation}"),
+            );
+            Ok(())
         };
         let mut registry_on_show = |invocation_id| registry.on_show(invocation_id);
         let mut emit =
@@ -1852,13 +2018,10 @@ pub(crate) fn should_dispatch_hotkey_show(main_owns_native_foreground: bool) -> 
 
 #[cfg(windows)]
 pub(crate) fn main_window_owns_native_foreground(app: &AppHandle) -> bool {
-    let Some(main) = app.get_webview_window("main") else {
-        return false;
-    };
-    let Ok(main_hwnd) = main.hwnd() else {
-        return false;
-    };
-    unsafe { GetForegroundWindow() == main_hwnd }
+    matches!(
+        observe_main_foreground_trace(app).ownership,
+        MainForegroundOwnership::MainWindow | MainForegroundOwnership::MainWindowFamily
+    )
 }
 
 #[cfg(not(windows))]
@@ -2145,6 +2308,30 @@ mod tests {
     fn native_foreground_main_suppresses_hotkey_show_dispatch() {
         assert!(!should_dispatch_hotkey_show(true));
         assert!(should_dispatch_hotkey_show(false));
+    }
+
+    #[test]
+    fn main_foreground_ownership_accepts_only_main_window_family() {
+        assert_eq!(
+            classify_main_foreground_ownership(10, 10, 10, 10, false),
+            MainForegroundOwnership::MainWindow
+        );
+        assert_eq!(
+            classify_main_foreground_ownership(10, 20, 10, 10, true),
+            MainForegroundOwnership::MainWindowFamily
+        );
+        assert_eq!(
+            classify_main_foreground_ownership(10, 30, 30, 10, false),
+            MainForegroundOwnership::MainWindowFamily
+        );
+        assert_eq!(
+            classify_main_foreground_ownership(10, 40, 40, 40, false),
+            MainForegroundOwnership::Other
+        );
+        assert_eq!(
+            classify_main_foreground_ownership(0, 10, 10, 10, true),
+            MainForegroundOwnership::Other
+        );
     }
 
     #[test]
