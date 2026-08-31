@@ -167,7 +167,7 @@ pub(crate) fn valid_launcher_completion(value: &str) -> bool {
             .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
 }
 
-fn valid_launcher_command(command: &str) -> bool {
+pub(crate) fn valid_launcher_command(command: &str) -> bool {
     !command.is_empty()
         && command.len() <= 32
         && command.bytes().enumerate().all(|(index, byte)| {

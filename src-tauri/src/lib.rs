@@ -40,6 +40,9 @@ mod apps;
 mod model;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod quicklinks;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod result_registry;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
