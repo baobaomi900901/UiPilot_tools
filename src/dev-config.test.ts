@@ -31,11 +31,12 @@ describe('development server contract', () => {
     )
   })
 
-  it('keeps command-line launchers from overriding the Vite endpoint', () => {
+  it('keeps the command-line Vite endpoint aligned with the selected development port', () => {
     const packageJson = JSON.parse(packageJsonSource)
 
     expect(packageJson.scripts['dev:vite']).toBe('vite')
-    expect(startupScript).not.toMatch(/--(?:host|port|strictPort)/)
+    expect(startupScript).toContain('$env:UIPILOT_DEV_PORT')
+    expect(startupScript).toContain("& $vitePath '--host' '127.0.0.1' '--port' ([string]$frontendPort) '--strictPort'")
   })
 
   it('disables native maximize only for the fixed-size main window', () => {

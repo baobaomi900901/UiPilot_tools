@@ -1,5 +1,5 @@
 import { App, Button, ConfigProvider, Input, Spin, Switch, Tooltip } from 'antd'
-import { File, Folder, ImageOff, Pin, X } from 'lucide-react'
+import { File, FileSearch, Folder, ImageOff, Pin, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 
 import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
@@ -77,6 +77,12 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
+        event.preventDefault()
+        event.stopPropagation()
+        inputRef.current?.focus()
+        return
+      }
       if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
       if (event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
       event.preventDefault()
@@ -93,12 +99,6 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   }, [snapshot.selectedIndex])
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey) {
-      if (event.nativeEvent.isComposing) return
-      event.preventDefault()
-      core.cycleCategory(event.shiftKey ? 'previous' : 'next')
-      return
-    }
     if (!['Enter', 'Escape'].includes(event.key)) return
     if (event.key === 'Escape' && !event.nativeEvent.isComposing) event.preventDefault()
     core.keyDown(event.key as 'Enter' | 'Escape', event.nativeEvent.isComposing)
@@ -120,6 +120,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               placeholder="搜索文件"
               autoComplete="off"
               spellCheck={false}
+              tabIndex={-1}
               disabled={disabled || !snapshot.invocationId}
               role="combobox"
               aria-autocomplete="list"
@@ -143,6 +144,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                 )}
                 aria-label={snapshot.pinned ? '取消固定' : '固定窗口'}
                 aria-pressed={snapshot.pinned}
+                tabIndex={-1}
                 disabled={disabled || snapshot.pinPending || !snapshot.invocationId}
                 onClick={() => core.setPinned(!snapshot.pinned)}
               />
@@ -153,6 +155,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                 type="text"
                 icon={<X aria-hidden size={17} strokeWidth={1.8} />}
                 aria-label="关闭"
+                tabIndex={-1}
                 disabled={disabled || snapshot.hidePending || !snapshot.invocationId}
                 onClick={() => void core.requestHide(true)}
               />
@@ -164,10 +167,6 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             <nav
               className="find-categories file-categories"
               aria-label="文件类型"
-              onMouseDown={(event) => {
-                event.preventDefault()
-                inputRef.current?.focus()
-              }}
             >
               {FIND_CATEGORY_ORDER.map((category) => (
                 <button
@@ -175,7 +174,6 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                   type="button"
                   className={snapshot.category === category ? 'find-category file-category is-selected' : 'find-category file-category'}
                   aria-pressed={snapshot.category === category}
-                  tabIndex={-1}
                   disabled={disabled || !snapshot.invocationId}
                   onClick={() => core.setCategory(category)}
                 >
@@ -252,7 +250,14 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                   <dt>大小</dt><dd>{fileSize(selected.kind, selected.sizeBytes)}</dd>
                   <dt>修改时间</dt><dd>{modified(selected.modifiedUtc)}</dd>
                 </dl>
-                </> : <p>请选择文件</p>}
+                </> : (
+                  <div className="find-preview-empty">
+                    <span className="find-preview-empty-icon" aria-hidden="true">
+                      <FileSearch size={24} strokeWidth={1.6} />
+                    </span>
+                    <p>未选择文件</p>
+                  </div>
+                )}
             </aside>
           </div>
 
@@ -264,6 +269,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                 aria-label="文件预览"
                 checked={snapshot.previewEnabled}
                 loading={snapshot.previewPending}
+                tabIndex={-1}
                 disabled={disabled || snapshot.previewPending || !snapshot.invocationId}
                 onChange={(checked) => core.setPreviewEnabled(checked)}
               />

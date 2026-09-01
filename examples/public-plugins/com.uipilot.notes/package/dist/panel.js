@@ -6,7 +6,7 @@ import {
   sortNotes,
 } from './notes-logic.js'
 
-const ITEM_HEIGHT = 40
+const ITEM_HEIGHT = 48
 const LIST_OVERSCAN = 4
 
 const newBtn = document.querySelector('#new-btn')
@@ -20,6 +20,9 @@ const noteListSpacer = document.querySelector('#note-list-spacer')
 const noteListViewport = document.querySelector('#note-list-viewport')
 const emptyState = document.querySelector('#empty-state')
 const editorPanel = document.querySelector('#editor-panel')
+const editorTitle = document.querySelector('#editor-title')
+const editorTime = document.querySelector('#editor-time')
+const editorSaveState = document.querySelector('#editor-save-state')
 const editorSurface = document.querySelector('.editor-surface')
 const editorContent = document.querySelector('#editor-content')
 const editorScrollbar = document.querySelector('#editor-scrollbar')
@@ -83,6 +86,29 @@ function isDirty() {
     return false
   }
   return editorContent.value !== savedContent
+}
+
+function formatNoteTime(createdAt) {
+  const date = new Date(createdAt)
+  if (Number.isNaN(date.getTime())) {
+    return ''
+  }
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
+}
+
+function updateEditorMeta(note = getSelectedNote()) {
+  editorTitle.textContent = note?.title ?? ''
+  editorTime.textContent = note ? formatNoteTime(note.createdAt) : ''
+  editorTime.dateTime = note?.createdAt ?? ''
+  const dirty = Boolean(note) && isDirty()
+  editorSaveState.classList.toggle('is-dirty', dirty)
+  editorSaveState.querySelector('span').textContent = dirty ? '未保存' : '已保存'
 }
 
 function filteredNotes() {
@@ -159,7 +185,11 @@ function createNoteListItem(note) {
   title.className = 'note-title'
   title.textContent = note.title
 
-  selectBtn.append(title)
+  const preview = document.createElement('small')
+  preview.className = 'note-preview'
+  preview.textContent = note.content.trim().split(/\r?\n/, 1)[0] || '空白笔记'
+
+  selectBtn.append(title, preview)
 
   const moreBtn = document.createElement('button')
   moreBtn.type = 'button'
@@ -355,6 +385,7 @@ function renderEditor() {
     editorPanel.hidden = true
     editorContent.value = ''
     savedContent = ''
+    updateEditorMeta(null)
     setStatus('')
     editorVirtualScrollbar.schedule()
     return
@@ -364,6 +395,7 @@ function renderEditor() {
   editorPanel.hidden = false
   editorContent.value = note.content
   savedContent = note.content
+  updateEditorMeta(note)
   setStatus('')
   editorVirtualScrollbar.schedule()
 }
@@ -1010,7 +1042,10 @@ window.addEventListener('resize', noteListVirtualScrollbar.schedule)
 window.addEventListener('resize', editorVirtualScrollbar.schedule)
 window.addEventListener('resize', closeNoteActionsMenu)
 
-editorContent.addEventListener('input', editorVirtualScrollbar.schedule)
+editorContent.addEventListener('input', () => {
+  editorVirtualScrollbar.schedule()
+  updateEditorMeta()
+})
 
 newBtn.addEventListener('click', () => {
   if (!isDialogOpen()) {

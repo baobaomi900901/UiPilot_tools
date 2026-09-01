@@ -47,12 +47,28 @@
 
       <section class="editor" aria-label="笔记编辑区">
         <div id="empty-state" class="empty-state">
-          <div class="empty-icon" aria-hidden="true">✎</div>
+          <div class="empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 14 7.5 11.1A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.82 1.2A2 2 0 0 0 12.07 6H18a2 2 0 0 1 2 2v2"></path>
+            </svg>
+          </div>
           <p class="empty-title">还没有选中笔记</p>
           <p class="empty-hint">从左侧选择一条笔记，或按 Ctrl+N 开始记录。搜索请用主输入框并按 Enter。</p>
         </div>
 
         <div id="editor-panel" class="editor-panel" hidden>
+          <header class="editor-header">
+            <div class="editor-heading">
+              <strong id="editor-title" class="editor-title"></strong>
+              <time id="editor-time" class="editor-time"></time>
+            </div>
+            <span id="editor-save-state" class="editor-save-state">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m5 12 4 4L19 6"></path>
+              </svg>
+              <span>已保存</span>
+            </span>
+          </header>
           <div class="editor-surface">
             <textarea
               id="editor-content"

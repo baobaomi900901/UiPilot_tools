@@ -1,14 +1,32 @@
 :root {
   --clipboard-scrollbar-thumb: rgba(115, 115, 115, 0.42);
+  --panel-canvas: var(--uipilot-color-background, #f7f7f8);
+  --panel-surface: var(--uipilot-color-surface, #ffffff);
+  --panel-elevated: color-mix(in srgb, var(--uipilot-color-text, #171719) 4%, var(--panel-canvas));
+  --panel-card: color-mix(in srgb, var(--uipilot-color-text, #171719) 7%, var(--panel-canvas));
+  --panel-selection-surface: #e9e9ec;
+  --panel-selection-border: rgba(23, 23, 25, 0.2);
+  --panel-border-strong: color-mix(in srgb, var(--uipilot-color-text, #171719) 24%, var(--uipilot-color-border, #d9d9dc));
+  --panel-blue: #168cff;
+  --panel-blue-soft: rgba(22, 140, 255, 0.12);
+  --panel-yellow: #a36b00;
+  --panel-yellow-soft: rgba(208, 141, 0, 0.13);
   color-scheme: light;
-  font-family: var(--uipilot-font-family, 'Segoe UI', system-ui, sans-serif);
-  color: var(--uipilot-color-text, #171717);
-  background: var(--uipilot-color-background, #ffffff);
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
+  color: var(--uipilot-color-text, #171719);
+  background: var(--panel-canvas);
   letter-spacing: 0;
 }
 
 :root[data-theme='dark'] {
   --clipboard-scrollbar-thumb: rgba(163, 163, 163, 0.48);
+  --panel-blue: #57c1ff;
+  --panel-blue-soft: rgba(87, 193, 255, 0.15);
+  --panel-yellow: #ffc533;
+  --panel-yellow-soft: rgba(255, 197, 51, 0.15);
+  --panel-selection-surface: #1b1c1e;
+  --panel-selection-border: rgba(255, 255, 255, 0.17);
   color-scheme: dark;
 }
 
@@ -36,23 +54,49 @@ button {
 
 .clipboard-app {
   display: grid;
-  grid-template-columns: 112px minmax(0, 1fr);
+  grid-template-columns: 220px minmax(0, 1fr);
   width: 100%;
   height: 100dvh;
   min-height: 280px;
-  background: var(--uipilot-color-background, #ffffff);
+  overflow: hidden;
+  border-top: 1px solid var(--uipilot-color-border, #d9d9dc);
+  background: var(--panel-canvas);
 }
 
 .filter-rail {
+  display: grid;
+  grid-template-rows: 48px minmax(0, 1fr);
   min-width: 0;
-  padding: 8px 0;
-  border-right: 1px solid var(--uipilot-color-border, #d9d9d9);
-  background: var(--uipilot-color-background, #ffffff);
+  min-height: 0;
+  border-right: 1px solid var(--uipilot-color-border, #d9d9dc);
+  background: var(--panel-surface);
+}
+
+.filter-header {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--uipilot-color-border, #d9d9dc);
+}
+
+.filter-header h2 {
+  margin: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .filter-tabs {
   display: grid;
-  gap: 0;
+  align-content: start;
+  gap: 2px;
+  min-height: 0;
+  padding: 6px;
+  overflow: hidden;
 }
 
 .filter-tab {
@@ -61,26 +105,26 @@ button {
   align-items: center;
   width: 100%;
   min-width: 0;
-  height: 40px;
-  padding: 0 12px;
+  height: 36px;
+  padding: 0 10px;
   overflow: hidden;
   border: 0;
-  border-radius: 0;
+  border-radius: 6px;
   background: transparent;
-  color: var(--uipilot-color-text-muted, #595959);
+  color: var(--uipilot-color-text-muted, #6f6f74);
   cursor: pointer;
   text-align: left;
 }
 
 .filter-tab:hover {
-  background: color-mix(in srgb, var(--uipilot-color-text, #171717) 7%, transparent);
-  color: var(--uipilot-color-text, #171717);
+  background: var(--panel-elevated);
+  color: var(--uipilot-color-text, #171719);
 }
 
 .filter-tab[aria-selected='true'] {
-  background: transparent;
-  color: var(--uipilot-color-accent, #0067c0);
-  font-weight: 600;
+  background: var(--panel-card);
+  color: var(--uipilot-color-text, #171719);
+  font-weight: 500;
 }
 
 .filter-tab[aria-selected='true'] .filter-count {
@@ -90,7 +134,7 @@ button {
 .filter-count {
   min-width: 18px;
   padding-left: 6px;
-  color: var(--uipilot-color-text-muted, #595959);
+  color: var(--uipilot-color-text-muted, #6f6f74);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -99,9 +143,10 @@ button {
 .history-pane {
   position: relative;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: 48px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+  background: var(--panel-canvas);
 }
 
 .history-header {
@@ -109,26 +154,27 @@ button {
   align-items: center;
   justify-content: space-between;
   min-width: 0;
-  min-height: 52px;
-  padding: 8px 14px 7px 16px;
-  border-bottom: 1px solid var(--uipilot-color-border, #d9d9d9);
+  height: 48px;
+  min-height: 48px;
+  padding: 4px 12px 4px 16px;
+  border-bottom: 1px solid var(--uipilot-color-border, #d9d9dc);
 }
 
 h1 {
   margin: 0;
   overflow: hidden;
-  font-size: 15px;
-  font-weight: 650;
-  line-height: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 16px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .history-count {
-  margin: 2px 0 0;
-  color: var(--uipilot-color-text-muted, #595959);
+  margin: 1px 0 0;
+  color: var(--uipilot-color-text-muted, #6f6f74);
   font-size: 11px;
-  line-height: 16px;
+  line-height: 14px;
 }
 
 .icon-button {
@@ -139,16 +185,16 @@ h1 {
   flex: 0 0 30px;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
-  color: var(--uipilot-color-text-muted, #595959);
+  color: var(--uipilot-color-text-muted, #6f6f74);
   cursor: pointer;
 }
 
 .icon-button:hover:not(:disabled) {
-  border-color: var(--uipilot-color-border, #d9d9d9);
-  background: var(--uipilot-color-surface, #f7f7f7);
-  color: var(--uipilot-color-danger, #c62828);
+  border-color: var(--uipilot-color-border, #d9d9dc);
+  background: var(--panel-elevated);
+  color: var(--uipilot-color-danger, #dc4343);
 }
 
 .icon-button:disabled {
@@ -162,16 +208,23 @@ h1 {
 }
 
 .status {
-  min-width: 0;
-  min-height: 0;
+  position: absolute;
+  top: 56px;
+  left: 50%;
+  z-index: 3;
+  max-width: calc(100% - 32px);
   margin: 0;
-  padding: 3px 16px;
+  padding: 6px 10px;
   overflow: hidden;
-  color: var(--uipilot-color-text-muted, #595959);
+  color: var(--uipilot-color-text-muted, #6f6f74);
   font-size: 11px;
-  line-height: 18px;
+  line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
+  border: 1px solid var(--uipilot-color-border, #d9d9dc);
+  border-radius: 6px;
+  background: var(--panel-surface);
+  transform: translateX(-50%);
 }
 
 .status:empty {
@@ -179,7 +232,7 @@ h1 {
 }
 
 .status[data-tone='error'] {
-  color: var(--uipilot-color-danger, #c62828);
+  color: var(--uipilot-color-danger, #dc4343);
 }
 
 .history-list-shell {
@@ -195,7 +248,7 @@ h1 {
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 0 8px 10px;
+  padding: 6px 14px 8px 6px;
   scrollbar-width: none;
 }
 
@@ -236,7 +289,7 @@ h1 {
 
 .history-list-scrollbar-thumb:hover,
 .history-list-scrollbar-thumb.is-dragging {
-  background: color-mix(in srgb, var(--uipilot-color-text-muted, #595959) 72%, transparent);
+  background: color-mix(in srgb, var(--uipilot-color-text-muted, #6f6f74) 72%, transparent);
 }
 
 .history-item {
@@ -244,22 +297,27 @@ h1 {
   grid-template-columns: minmax(0, 1fr) 34px;
   align-items: stretch;
   min-width: 0;
-  min-height: 54px;
-  border-bottom: 1px solid color-mix(in srgb, var(--uipilot-color-border, #d9d9d9) 72%, transparent);
+  min-height: 55px;
+  border-bottom: 1px solid color-mix(in srgb, var(--uipilot-color-border, #d9d9dc) 72%, transparent);
+  border-radius: 6px;
+}
+
+.history-item:hover {
+  background: var(--panel-elevated);
 }
 
 .history-item[aria-selected='true'] {
-  background: color-mix(in srgb, var(--uipilot-color-accent, #0067c0) 11%, transparent);
-  box-shadow: inset 3px 0 0 var(--uipilot-color-accent, #0067c0);
+  background: var(--panel-selection-surface);
+  box-shadow: inset 0 0 0 1px var(--panel-selection-border);
 }
 
 .entry-select {
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
+  grid-template-columns: 38px minmax(0, 1fr);
   align-items: center;
   min-width: 0;
-  min-height: 53px;
-  padding: 6px 8px 6px 10px;
+  min-height: 54px;
+  padding: 5px 8px 5px 6px;
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -272,53 +330,45 @@ h1 {
 }
 
 .entry-image {
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--uipilot-color-border, #d9d9d9);
-  border-radius: 4px;
-  background: var(--uipilot-color-surface, #f7f7f7);
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--uipilot-color-border, #d9d9dc);
+  border-radius: 7px;
+  background: var(--panel-surface);
   object-fit: cover;
 }
 
 .entry-icon {
   position: relative;
-  display: block;
-  width: 30px;
-  height: 36px;
-  border: 1.5px solid var(--uipilot-color-text-muted, #595959);
-  border-radius: 3px;
-  color: var(--uipilot-color-text-muted, #595959);
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--panel-blue);
+  background: var(--panel-blue-soft);
 }
 
 .entry-icon::before {
-  position: absolute;
-  top: -2px;
-  right: -2px;
-  width: 10px;
-  height: 10px;
-  border-bottom: 1.5px solid currentColor;
-  border-left: 1.5px solid currentColor;
-  background: var(--uipilot-color-background, #ffffff);
-  content: '';
-}
-
-.history-item[aria-selected='true'] .entry-icon::before {
-  background: color-mix(in srgb, var(--uipilot-color-accent, #0067c0) 11%, var(--uipilot-color-background, #ffffff));
+  content: none;
 }
 
 .entry-icon-text::after {
-  position: absolute;
-  top: 11px;
-  left: 8px;
   content: 'T';
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 600;
+}
+
+.entry-icon-files {
+  color: var(--panel-yellow);
+  background: var(--panel-yellow-soft);
 }
 
 .entry-icon-files::after {
   position: absolute;
-  top: 14px;
-  left: 7px;
+  top: 10px;
+  left: 9px;
   width: 14px;
   height: 1.5px;
   background: currentColor;
@@ -336,8 +386,9 @@ h1 {
   max-height: 34px;
   margin: 0;
   overflow: hidden;
-  font-size: 13px;
-  font-weight: 550;
+  color: var(--uipilot-color-text, #171719);
+  font-size: 12px;
+  font-weight: 500;
   line-height: 17px;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
@@ -356,7 +407,7 @@ h1 {
 .entry-time {
   margin: 0;
   overflow: hidden;
-  color: var(--uipilot-color-text-muted, #595959);
+  color: var(--uipilot-color-text-muted, #6f6f74);
   font-size: 11px;
   line-height: 14px;
   text-overflow: ellipsis;
@@ -389,10 +440,13 @@ h1 {
 
 .empty-state {
   position: absolute;
-  inset: 52px 0 0;
-  display: grid;
-  place-items: center;
-  padding: 20px;
+  inset: 48px 0 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
   pointer-events: none;
 }
 
@@ -400,19 +454,41 @@ h1 {
   display: none;
 }
 
+.empty-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 14px;
+  color: var(--uipilot-color-text-muted, #6f6f74);
+  border: 1px dashed var(--uipilot-color-border, #d9d9dc);
+  border-radius: 10px;
+  background: var(--panel-elevated);
+}
+
+.empty-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
 .empty-title {
   margin: 0;
-  color: var(--uipilot-color-text-muted, #595959);
+  color: var(--uipilot-color-text, #171719);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.empty-hint {
+  margin: 8px 0 0;
+  color: var(--uipilot-color-text-muted, #6f6f74);
   font-size: 13px;
+  line-height: 1.55;
 }
 
 @media (max-width: 520px) {
   .clipboard-app {
-    grid-template-columns: 88px minmax(0, 1fr);
-  }
-
-  .filter-rail {
-    padding-inline: 0;
+    grid-template-columns: 112px minmax(0, 1fr);
   }
 
   .filter-tab {

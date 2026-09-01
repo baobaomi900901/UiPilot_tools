@@ -489,7 +489,7 @@ test('uses a stable responsive layout and contains no forbidden capability bypas
     'letter-spacing: 0',
     '@media (max-width: 520px)',
     '--uipilot-color-background',
-    '--uipilot-color-accent',
+    '--uipilot-color-text',
   ]) {
     assert.match(css, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   }
@@ -506,15 +506,15 @@ test('uses a stable responsive layout and contains no forbidden capability bypas
   }
 })
 
-test('matches Host settings density without drawing an active tab edge', async () => {
+test('matches Raycast panel density with a surface-based active tab', async () => {
   const css = await readFile(panelCssUrl, 'utf8')
   const activeTabRule = css.match(/\.filter-tab\[aria-selected='true'\]\s*\{([^}]*)\}/s)?.[1]
 
   assert.match(css, /grid-template-columns:\s*112px minmax\(0, 1fr\)/)
-  assert.match(css, /\.filter-tab\s*\{[^}]*height:\s*40px;/s)
-  assert.match(css, /\.history-item\s*\{[^}]*min-height:\s*54px;/s)
+  assert.match(css, /\.filter-tab\s*\{[^}]*height:\s*36px;/s)
+  assert.match(css, /\.history-item\s*\{[^}]*min-height:\s*55px;/s)
   assert.ok(activeTabRule)
-  assert.match(activeTabRule, /color:\s*var\(--uipilot-color-accent/)
-  assert.match(activeTabRule, /background:\s*transparent/)
+  assert.match(activeTabRule, /color:\s*var\(--uipilot-color-text/)
+  assert.match(activeTabRule, /background:\s*var\(--panel-card\)/)
   assert.doesNotMatch(activeTabRule, /border-(?:left|right)|box-shadow|outline/)
 })

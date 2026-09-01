@@ -44,23 +44,23 @@ describe('shared UiPilot visual theme', () => {
     expect(Object.keys(uiSemanticTokens.light).sort()).toEqual([...semanticKeys])
     expect(Object.keys(uiSemanticTokens.dark).sort()).toEqual([...semanticKeys])
     expect(uiSemanticTokens.light).toMatchObject({
-      background: '#ffffff',
-      foreground: '#0a0a0a',
+      background: '#f7f7f8',
+      foreground: '#171719',
       surface: '#ffffff',
-      primary: '#171717',
-      muted: '#f5f5f5',
-      mutedForeground: '#737373',
-      border: '#e5e5e5',
-      ring: '#a3a3a3',
+      primary: '#18191a',
+      muted: '#f1f1f2',
+      mutedForeground: '#6f6f74',
+      border: '#d9d9dc',
+      ring: '#8e8e93',
     })
     expect(uiSemanticTokens.dark).toMatchObject({
-      background: '#0a0a0a',
-      foreground: '#fafafa',
-      surface: '#171717',
-      primary: '#e5e5e5',
-      muted: '#262626',
-      mutedForeground: '#a3a3a3',
-      ring: '#737373',
+      background: '#07080a',
+      foreground: '#f4f4f6',
+      surface: '#0d0d0d',
+      primary: '#ffffff',
+      muted: '#101111',
+      mutedForeground: '#9c9c9d',
+      ring: '#434345',
     })
   })
 
@@ -74,11 +74,11 @@ describe('shared UiPilot visual theme', () => {
       colorText: uiSemanticTokens.light.foreground,
       colorPrimary: uiSemanticTokens.light.primary,
       colorBorder: uiSemanticTokens.light.border,
-      borderRadius: 10,
+      borderRadius: 8,
       borderRadiusSM: 6,
-      controlHeight: 32,
-      controlHeightSM: 24,
-      fontFamily: 'Inter, Avenir, Helvetica, Arial, "Microsoft YaHei UI", sans-serif',
+      controlHeight: 36,
+      controlHeightSM: 28,
+      fontFamily: 'Inter, "Inter Fallback", -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif',
       motion: false,
     })
     expect(dark.token).toMatchObject({
@@ -89,12 +89,12 @@ describe('shared UiPilot visual theme', () => {
       colorBorder: uiSemanticTokens.dark.border,
     })
     expect(light.components?.Switch).toMatchObject({
-      colorPrimary: '#16a34a',
-      colorPrimaryHover: '#15803d',
+      colorPrimary: '#18191a',
+      colorPrimaryHover: '#2e2e30',
     })
     expect(dark.components?.Switch).toMatchObject({
-      colorPrimary: '#16a34a',
-      colorPrimaryHover: '#15803d',
+      colorPrimary: '#ffffff',
+      colorPrimaryHover: '#e8e8e8',
     })
     expect(light.algorithm).not.toBe(dark.algorithm)
   })
@@ -107,6 +107,8 @@ describe('shared UiPilot visual theme', () => {
     expect(themeCssSource).toContain('--uipilot-color-text: var(--uipilot-ui-foreground);')
     expect(themeCssSource).toContain('--uipilot-color-border: var(--uipilot-ui-border);')
     expect(themeCssSource).toContain('--uipilot-color-accent: var(--uipilot-ui-primary);')
+    expect(themeCssSource).toContain('--uipilot-ui-surface-elevated: #101111;')
+    expect(themeCssSource).toContain('--uipilot-ui-surface-card: #121212;')
   })
 
   it('loads semantic tokens through the primary stylesheet entry', () => {
@@ -115,6 +117,21 @@ describe('shared UiPilot visual theme', () => {
     )
     expect(indexHtmlSource).toContain('<link rel="stylesheet" href="/src/styles.css" />')
     expect(indexHtmlSource).not.toContain('<link rel="stylesheet" href="/src/ui-theme.css" />')
+  })
+
+  it('applies Raycast chrome to launcher results, settings tabs, and plugin details', () => {
+    expect(applicationCssSource).toMatch(
+      /\.launcher-view \.result-row\.is-selected\s*\{[^}]*background:\s*var\(--uipilot-ui-surface-card\);[^}]*box-shadow:\s*none;/s,
+    )
+    expect(applicationCssSource).toMatch(
+      /\.settings-tabs \.ant-tabs-tab-active\s*\{[^}]*background:\s*var\(--uipilot-ui-accent\);/s,
+    )
+    expect(applicationCssSource).toMatch(
+      /\.settings-view \.ant-btn:not\([^}]*background:\s*var\(--uipilot-ui-surface-elevated\);/s,
+    )
+    expect(applicationCssSource).toMatch(
+      /\.public-plugin-detail-list\s*\{[^}]*grid-template-columns:\s*92px minmax\(0, 1fr\);[^}]*padding:\s*8px 0 0;/s,
+    )
   })
 
   it('adds only Lucide and no Tailwind or Radix dependency', () => {

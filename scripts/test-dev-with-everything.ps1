@@ -19,6 +19,21 @@ $runtimePath = Join-Path $PSScriptRoot 'dev-everything-runtime.ps1'
 Assert-Condition (Test-Path -LiteralPath $runtimePath -PathType Leaf) 'Dev Everything runtime helper is missing'
 . $runtimePath
 
+$portRuntimePath = Join-Path $PSScriptRoot 'dev-port-runtime.ps1'
+Assert-Condition (Test-Path -LiteralPath $portRuntimePath -PathType Leaf) 'Dev port runtime helper is missing'
+. $portRuntimePath
+
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+try {
+    $listener.Start()
+    $occupiedPort = [int]$listener.LocalEndpoint.Port
+    $selectedPort = Get-UiPilotAvailableDevPort -StartPort $occupiedPort
+    Assert-Condition ($selectedPort -gt $occupiedPort) 'Dev port selection must advance past an occupied port'
+}
+finally {
+    $listener.Stop()
+}
+
 $processes = @(
     [pscustomobject]@{ ProcessName = 'Everything'; SessionId = 0; Id = 10 },
     [pscustomobject]@{ ProcessName = 'Everything'; SessionId = 4; Id = 20 },
@@ -47,5 +62,10 @@ $mainSource = Get-Content -LiteralPath $mainPath -Raw -Encoding utf8
 Assert-Condition $mainSource.Contains(". (Join-Path `$PSScriptRoot 'dev-everything-runtime.ps1')") 'Dev script must load the runtime helper'
 Assert-Condition (-not $mainSource.Contains("Get-Process -Name 'Everything' -ErrorAction SilentlyContinue | Select-Object -First 1")) 'Dev script must not confuse the service with an interactive client'
 Assert-Condition (-not $mainSource.Contains('-Verb RunAs')) 'Dev startup must never elevate'
+Assert-Condition $mainSource.Contains('UIPILOT_DEV_PORT') 'Dev script must use the selected frontend port'
+
+$tauriPath = Join-Path $PSScriptRoot 'tauri.ps1'
+$tauriSource = Get-Content -LiteralPath $tauriPath -Raw -Encoding utf8
+Assert-Condition $tauriSource.Contains("'--config'") 'Tauri dev must receive a matching devUrl override'
 
 Write-Output 'DEV_EVERYTHING_RUNTIME_PASS'

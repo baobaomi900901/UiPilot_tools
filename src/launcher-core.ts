@@ -149,6 +149,7 @@ export interface PluginPanelHostKeyPhysicalInput {
 interface PrivatePanelState {
   pluginId: string
   commandLabel: string
+  inputPlaceholder?: string
   sessionEpoch: U64Decimal
   hostKeys: readonly PanelHostKeyDeclaration[]
   suffix: TextControl
@@ -436,7 +437,9 @@ function safeApplicationIcon(value: unknown): string | undefined {
 }
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
-  return value === 'find' || value === 'calculator' || value === 'webSearch' ? value : undefined
+  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'webSearch'
+    ? value
+    : undefined
 }
 
 function safeResultFavorite(value: unknown): ResultFavorite | undefined {
@@ -723,6 +726,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     ? Object.freeze({
         pluginId: model.panel.pluginId,
         commandLabel: model.panel.commandLabel,
+        ...(model.panel.inputPlaceholder === undefined ? {} : { inputPlaceholder: model.panel.inputPlaceholder }),
         sessionEpoch: model.panel.sessionEpoch,
         hostKeys: Object.freeze([...model.panel.hostKeys]),
         suffixControl: model.panel.suffix.key,
@@ -1096,9 +1100,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const quicklinks = ensureQuicklinksState()
     quicklinks.status = 'ready'
     quicklinks.items = [...items]
-    const selected =
-      quicklinks.items.find((item) => item.id === quicklinks.selectedId) ??
-      quicklinks.items[0]
+    const selected = quicklinks.items.find((item) => item.id === quicklinks.selectedId)
     if (selected) {
       quicklinks.selectedId = selected.id
       quicklinks.draft = quicklinkDraft(selected)
@@ -3029,6 +3031,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         model.panel = {
           pluginId: identity.pluginId,
           commandLabel: identity.commandLabel,
+          ...(identity.inputPlaceholder === undefined ? {} : { inputPlaceholder: identity.inputPlaceholder }),
           sessionEpoch: identity.sessionEpoch,
           hostKeys: Object.freeze([...identity.hostKeys]),
           suffix: newTextControl(owner.argument),

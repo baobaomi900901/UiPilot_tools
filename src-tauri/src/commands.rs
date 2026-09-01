@@ -676,6 +676,8 @@ pub(crate) struct PluginPanelCommandResult {
     session_epoch: String,
     plugin_id: String,
     command_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_placeholder: Option<String>,
     host_keys: Vec<crate::public_plugins::PanelHostKeyDeclaration>,
 }
 
@@ -2618,11 +2620,15 @@ fn panel_route_matches_identity(
         && route.host_key_focus == identity.host_key_focus
 }
 
-fn panel_command_result(identity: &PanelSessionIdentity) -> PluginPanelCommandResult {
+fn panel_command_result(
+    identity: &PanelSessionIdentity,
+    input_placeholder: Option<&str>,
+) -> PluginPanelCommandResult {
     PluginPanelCommandResult {
         session_epoch: identity.session_epoch.to_string(),
         plugin_id: identity.plugin_id.clone(),
         command_label: identity.command_label.clone(),
+        input_placeholder: input_placeholder.map(str::to_owned),
         host_keys: identity.host_keys.clone(),
     }
 }
@@ -2990,7 +2996,10 @@ async fn open_plugin_panel_impl(
         );
         return Err(CommandError::window_failed());
     }
-    Ok(Some(panel_command_result(&identity)))
+    Ok(Some(panel_command_result(
+        &identity,
+        route.input_placeholder.as_deref(),
+    )))
 }
 
 async fn submit_plugin_panel_impl(
@@ -3010,6 +3019,7 @@ async fn submit_plugin_panel_impl(
         .panel_route(&identity.plugin_id, &input.argument)?
         .filter(|route| panel_route_matches_identity(route, &identity))
         .ok_or_else(CommandError::plugin_query_failed)?;
+    let input_placeholder = route.input_placeholder.clone();
     let prepared = public.prepare_command(route, input.ui_intent_epoch, input.argument.clone())?;
     let pending = PendingDispatch {
         request_id: prepared.request_context().request_id.clone(),
@@ -3025,7 +3035,7 @@ async fn submit_plugin_panel_impl(
             return Err(error.into());
         }
     };
-    let result = panel_command_result(&identity);
+    let result = panel_command_result(&identity, input_placeholder.as_deref());
     spawn_panel_submission(
         app,
         Arc::clone(public.inner()),
@@ -3646,7 +3656,7 @@ fn quicklinks_result(favorite: bool) -> (crate::model::ResultItem, Option<Result
             subtitle: Some("管理快速链接".into()),
             icon: None,
             plugin_icon_url: None,
-            icon_kind: None,
+            icon_kind: Some(ResultIconKind::Quicklinks),
             detail: None,
             favorite: Some(ResultFavorite::builtin(
                 BuiltinFeature::Quicklinks,
@@ -3956,6 +3966,14 @@ where
                 web_search_favorite,
             ));
         } else {
+            let mut applications = snapshot();
+            decorate(&mut applications);
+            entries.extend(
+                apps::rank(&applications, catalog_query)
+                    .iter()
+                    .map(apps::registry_entry)
+                    .map(|(item, action)| (item, Some(action))),
+            );
             for suggestion in suggestions
                 .iter()
                 .filter(|suggestion| suggestion.favorite)
@@ -3991,16 +4009,6 @@ where
                 _ => None,
             };
             entries.extend(public_plugin_completion_result(suggestion, argument));
-        }
-        if !catalog_query.is_empty() {
-            let mut applications = snapshot();
-            decorate(&mut applications);
-            entries.extend(
-                apps::rank(&applications, catalog_query)
-                    .iter()
-                    .map(apps::registry_entry)
-                    .map(|(item, action)| (item, Some(action))),
-            );
         }
         if catalog_query.is_empty() {
             entries.sort_by(|(left, _), (right, _)| {
@@ -5857,6 +5865,10 @@ mod tests {
         assert_eq!(manage.items.len(), 1);
         assert_eq!(manage.items[0].title, "/quicklinks");
         assert_eq!(
+            serde_json::to_value(&manage.items[0]).unwrap()["iconKind"],
+            serde_json::json!("quicklinks")
+        );
+        assert_eq!(
             manage.items[0].activation,
             crate::model::LauncherResultActivation::OpenQuicklinks
         );
@@ -6060,7 +6072,7 @@ mod tests {
     }
 
     #[test]
-    fn launcher_plain_query_orders_find_web_plugins_then_applications() {
+    fn launcher_plain_query_orders_applications_favorites_find_web_then_other_plugins() {
         let registry = ready_registry("launcher-plain");
         let demo_title = format!("/{}", "demo-win");
         let response = search_apps_with_catalog(
@@ -6103,15 +6115,15 @@ mod tests {
                 .map(|item| item.title.clone())
                 .collect::<Vec<_>>(),
             vec![
+                "Windows Terminal".into(),
                 "/alpha".into(),
                 "/find".into(),
                 "Google 搜索".into(),
                 demo_title,
-                "Windows Terminal".into(),
             ]
         );
         assert!(matches!(
-            &response.items[0].activation,
+            &response.items[1].activation,
             crate::model::LauncherResultActivation::WindowActivation {
                 plugin_id,
                 command_label,
@@ -6121,13 +6133,13 @@ mod tests {
                 command_label == "alpha" && initial_argument == "win"
         ));
         assert_eq!(
-            response.items[1].activation,
+            response.items[2].activation,
             crate::model::LauncherResultActivation::OpenFind {
                 query: "win".into()
             }
         );
         assert!(matches!(
-            &response.items[3].activation,
+            &response.items[4].activation,
             crate::model::LauncherResultActivation::WindowActivation {
                 plugin_id,
                 command_label,
@@ -6137,11 +6149,11 @@ mod tests {
                 command_label == "demo-win" && initial_argument.is_empty()
         ));
         assert_eq!(
-            registry.resolve(&response.request_id, &response.items[1].result_id),
+            registry.resolve(&response.request_id, &response.items[2].result_id),
             Err(RegistryError::UnknownResult)
         );
         assert!(matches!(
-            registry.resolve(&response.request_id, &response.items[2].result_id),
+            registry.resolve(&response.request_id, &response.items[3].result_id),
             Ok(ResultAction::OpenWebSearch { engine: WebSearchEngine::Google, query }) if query == "win"
         ));
     }
@@ -6507,10 +6519,17 @@ mod tests {
             icon_url: None,
         };
         assert!(panel_route_matches_identity(&route, &identity));
+        route.input_placeholder = Some("搜索目录".into());
+        let result = serde_json::to_value(super::panel_command_result(
+            &identity,
+            route.input_placeholder.as_deref(),
+        ))
+        .unwrap();
         assert_eq!(
-            serde_json::to_value(super::panel_command_result(&identity)).unwrap()["hostKeys"],
+            result["hostKeys"],
             serde_json::json!(["ArrowDown", "Primary+N"])
         );
+        assert_eq!(result["inputPlaceholder"], "搜索目录");
         route.host_key_focus = crate::public_plugins::PanelHostKeyFocus::Host;
         assert!(!panel_route_matches_identity(&route, &identity));
         route.host_key_focus = identity.host_key_focus;
@@ -6536,9 +6555,7 @@ mod tests {
             .unwrap();
         let mount = open.find("plugin_panel::mount(").unwrap();
         let focus = open.find("focus_main_window_content(").unwrap();
-        let returned = open
-            .find("Ok(Some(panel_command_result(&identity)))")
-            .unwrap();
+        let returned = open.find("Ok(Some(panel_command_result(").unwrap();
         assert!(mount < focus && focus < returned);
         assert!(open.contains("plugin_panel::teardown("));
         assert!(!open.contains("prepare_command("));
@@ -7525,12 +7542,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.items.len(), 22);
-        assert_eq!(response.items[0].title, "/find");
-        assert_eq!(response.items[1].title, "Bing 搜索");
-        assert_eq!(response.items[1].subtitle.as_deref(), Some("搜索：app"));
+        assert_eq!(response.items[0].title, "App 00");
+        assert_eq!(response.items[20].title, "/find");
+        assert_eq!(response.items[21].title, "Bing 搜索");
+        assert_eq!(response.items[21].subtitle.as_deref(), Some("搜索：app"));
         assert_eq!(
             registry
-                .resolve(&response.request_id, &response.items[1].result_id)
+                .resolve(&response.request_id, &response.items[21].result_id)
                 .unwrap(),
             ResultAction::OpenWebSearch {
                 engine: WebSearchEngine::Bing,
@@ -7542,7 +7560,7 @@ mod tests {
             assert!(!json.contains(private));
         }
         assert!(registry
-            .resolve(&response.request_id, &response.items[1].result_id)
+            .resolve(&response.request_id, &response.items[21].result_id)
             .is_ok());
     }
 
@@ -8409,7 +8427,7 @@ mod tests",
             WebSearchEngine::Bing,
         )
         .unwrap();
-        let result_id = &response.items[1].result_id;
+        let result_id = &response.items[0].result_id;
         assert!(registry.resolve(&response.request_id, result_id).is_ok());
 
         assert_eq!(

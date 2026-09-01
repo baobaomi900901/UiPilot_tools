@@ -178,12 +178,13 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel notes contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.notes')
-  assert.equal(manifest.version, '1.2.2')
+  assert.equal(manifest.version, '1.2.5')
   assert.equal(manifest.minimumHostVersion, '0.3.1')
   assert.equal(manifest.command.defaultName, 'notes')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'panel')
   assert.equal(manifest.command.inputRequired, false)
+  assert.equal(manifest.command.inputPlaceholder, '搜索目录')
   assert.deepEqual(manifest.supportedPlatforms, ['windows'])
   assert.deepEqual(manifest.permissions, ['ui.panel'])
   assert.deepEqual(manifest.panel, {
@@ -364,12 +365,30 @@ test('sidebar toolbar renders a directory title and icon-only new action', async
   const newButtonIconStyle = panel.window.getComputedStyle(newButton.querySelector('svg'))
 
   assert.match(css, /\.toolbar\s*\{[\s\S]*justify-content:\s*space-between;/)
-  assert.equal(newButtonStyle.color, 'rgb(255, 255, 255)')
+  assert.match(css, /\.btn\.new-btn\s*\{[^}]*color:\s*var\(--note-canvas\);/s)
   assert.equal(newButtonStyle.padding, '0px')
   assert.equal(newButtonStyle.lineHeight, '0')
   assert.equal(newButtonIconStyle.display, 'block')
-  assert.match(css, /\.note-list\s*\{[^}]*padding:\s*0;/)
+  assert.match(css, /\.note-list\s*\{[^}]*padding:\s*6px 14px 6px 6px;/)
   assert.match(css, /\.note-item\s*\{[^}]*padding:\s*0;/)
+})
+
+test('panel shell separates from the host and uses a distinct directory selection state', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+
+  const emptyIcon = panel.document.querySelector('.empty-icon')
+  assert.equal(emptyIcon.getAttribute('aria-hidden'), 'true')
+  assert.ok(emptyIcon.querySelector('svg'))
+  assert.equal(emptyIcon.textContent.trim(), '')
+
+  const css = await readFile(new URL('../package/dist/panel.css', import.meta.url), 'utf8')
+  assert.match(css, /\.app\s*\{[^}]*border-top:\s*1px solid var\(--uipilot-color-border\);/s)
+  assert.match(css, /html\[data-theme='light'\]\s*\{[^}]*--note-selection-surface:\s*#e9e9ec;/s)
+  assert.match(css, /html\[data-theme='dark'\]\s*\{[^}]*--note-selection-surface:\s*#1b1c1e;/s)
+  assert.match(css, /\.note-card\.is-active\s*\{[^}]*background:\s*var\(--note-selection-surface\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--note-selection-border\);/s)
+  assert.match(css, /\.empty-icon svg\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px;/s)
 })
 
 test('panel content uses only the panel bridge APIs', async () => {
@@ -788,6 +807,12 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
   assert.equal(listScrollbar.getAttribute('aria-hidden'), 'true')
   assert.ok(listScrollbar.querySelector('#note-list-scrollbar-thumb'))
   const status = panel.document.querySelector('#editor-status')
+  const editorHeader = panel.document.querySelector('.editor-header')
+  const editorTitle = panel.document.querySelector('#editor-title')
+  const editorSaveState = panel.document.querySelector('#editor-save-state')
+  assert.ok(editorHeader)
+  assert.ok(editorTitle)
+  assert.ok(editorSaveState)
   assert.equal(status.closest('footer'), null)
   assert.equal(status.getAttribute('role'), 'status')
   assert.equal(status.getAttribute('aria-atomic'), 'true')
@@ -803,6 +828,11 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
     routeSequence: '1',
   })
   await panel.flush()
+  assert.equal(editorTitle.textContent, 'Project Plan')
+  assert.equal(editorSaveState.textContent.trim(), '已保存')
+  panel.editor().value = 'changed'
+  panel.editor().dispatchEvent(new panel.window.Event('input', { bubbles: true }))
+  assert.equal(editorSaveState.textContent.trim(), '未保存')
   copyButton.click()
   await panel.flush()
   assert.equal(status.textContent, '已复制')
@@ -821,6 +851,7 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
   assert.match(css, /\.editor-status\[data-tone='success'\]/)
   assert.match(css, /\.editor-status\[data-tone='error'\]/)
   assert.match(css, /\.editor-panel\s*\{[^}]*padding:\s*0;[^}]*gap:\s*0;/)
+  assert.match(css, /\.editor-header\s*\{[^}]*border-bottom:\s*1px solid var\(--uipilot-color-border\);/s)
   assert.match(css, /\.editor-surface\s*\{[^}]*padding:\s*0;[^}]*border:\s*0;[^}]*border-radius:\s*0;/)
   assert.match(css, /\.editor-content\s*\{[^}]*scrollbar-width:\s*none;/)
   assert.match(css, /\.editor-content::-webkit-scrollbar\s*\{[^}]*display:\s*none;[^}]*width:\s*0;/)

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_ENTRIES: usize = 20;
+pub(crate) const MAX_ENTRIES: usize = 50;
 pub(crate) const MAX_IMAGE_PNG_BYTES: usize = 10 * 1024 * 1024;
-pub(crate) const MAX_TOTAL_IMAGE_PNG_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_IMAGE_PNG_BYTES: usize = 500 * 1024 * 1024;
 pub(crate) const THUMBNAIL_MAX_EDGE: u32 = 256;
 pub(crate) const MAX_THUMBNAIL_PNG_BYTES: usize = 256 * 1024;
 

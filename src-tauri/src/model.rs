@@ -6,6 +6,7 @@ use crate::settings::BuiltinFeature;
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ResultIconKind {
     Find,
+    Quicklinks,
     Calculator,
     WebSearch,
 }

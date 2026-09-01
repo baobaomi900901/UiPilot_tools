@@ -10,6 +10,9 @@ import type { ExecuteOutcome, FileSearchResponse, FindClient } from './protocol'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
 const findViewSource = readFileSync('src/find-view.tsx', 'utf8')
+const findPreviewSource = readFileSync('src/find-browser-preview.tsx', 'utf8')
+const notesStylesSource = readFileSync('examples/public-plugins/com.uipilot.notes/package/dist/panel.css', 'utf8')
+const clipboardStylesSource = readFileSync('examples/public-plugins/com.uipilot.clipboard-history/package/dist/panel.css', 'utf8')
 
 function response(): FileSearchResponse {
   return {
@@ -139,6 +142,7 @@ describe('FindView', () => {
     expect(existsSync('dev/find-preview.html')).toBe(true)
     const previewHtml = readFileSync('dev/find-preview.html', 'utf8')
     expect(previewHtml).toContain('/src/find-browser-preview.tsx')
+    expect(findPreviewSource).toContain("get('theme') === 'light'")
     expect(readFileSync('index.html', 'utf8')).not.toContain('find-browser-preview')
   })
 
@@ -227,10 +231,70 @@ describe('FindView', () => {
     )
   })
 
-  it('uses a blue accent for the selected result edge', () => {
-    expect(stylesSource).toMatch(/\.find-surface\s*\{[^}]*--find-selection-accent:\s*#2786e8;/s)
+  it('matches the notes directory treatment for the selected search result', () => {
+    for (const declaration of [
+      'selection-surface: #e9e9ec;',
+      'selection-border: rgba(23, 23, 25, 0.2);',
+      'selection-surface: #1b1c1e;',
+      'selection-border: rgba(255, 255, 255, 0.17);',
+    ]) {
+      expect(notesStylesSource).toContain(`--note-${declaration}`)
+      expect(stylesSource).toContain(`--find-${declaration}`)
+    }
     expect(stylesSource).toMatch(
-      /\.find-surface \.result-row\.is-selected\s*\{[^}]*box-shadow:\s*inset 3px 0 var\(--find-selection-accent\);/s,
+      /\.find-surface \.result-row\.is-selected\s*\{[^}]*background:\s*var\(--find-selection-surface\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--find-selection-border\);/s,
+    )
+    expect(stylesSource).not.toContain('--find-selection-accent')
+  })
+
+  it('matches the clipboard-history category selected state', () => {
+    expect(clipboardStylesSource).toMatch(
+      /--panel-card:\s*color-mix\(in srgb, var\(--uipilot-color-text, #171719\) 7%, var\(--panel-canvas\)\);/,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-surface\s*\{[^}]*--find-category-selection-surface:\s*color-mix\(in srgb, var\(--uipilot-ui-foreground\) 7%, var\(--uipilot-ui-background\)\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-surface \.file-category\.is-selected\s*\{[^}]*color:\s*var\(--uipilot-ui-foreground\);[^}]*background:\s*var\(--find-category-selection-surface\);[^}]*font-weight:\s*500;/s,
+    )
+  })
+
+  it('applies the built-in surface hierarchy to the find workspace', () => {
+    expect(stylesSource).toMatch(
+      /\.find-header > \.ant-input\s*\{[^}]*background:\s*var\(--uipilot-ui-surface-elevated\);[^}]*border-color:\s*var\(--uipilot-ui-hairline-strong\);[^}]*border-radius:\s*var\(--uipilot-ui-control-radius\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-categories-region\s*\{[^}]*background:\s*var\(--uipilot-ui-surface\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-surface \.file-category\.is-selected\s*\{[^}]*color:\s*var\(--uipilot-ui-foreground\);[^}]*background:\s*var\(--find-category-selection-surface\);[^}]*font-weight:\s*500;/s,
+    )
+    expect(stylesSource).toMatch(/\.find-results\s*\{[^}]*padding:\s*0 8px;/s)
+    expect(stylesSource).toMatch(
+      /\.find-surface \.result-row\s*\{[^}]*min-height:\s*53px;[^}]*margin-block:\s*1px;[^}]*padding:\s*7px 10px;[^}]*border-radius:\s*var\(--uipilot-ui-radius-sm\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-preview-media\s*\{[^}]*aspect-ratio:\s*4 \/ 3;/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.find-footer-region\s*\{[^}]*background:\s*var\(--uipilot-ui-surface\);/s,
+    )
+  })
+
+  it('renders a compact file empty state before a result is selected', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+
+    const empty = host.querySelector<HTMLElement>('.find-preview-empty')
+    expect(empty).not.toBeNull()
+    expect(empty?.querySelector('.lucide-file-search')).not.toBeNull()
+    expect(empty?.textContent).toBe('未选择文件')
+  })
+
+  it('uses the shared success green for the enabled preview switch', () => {
+    expect(stylesSource).toMatch(
+      /\.find-surface \.ant-switch\.ant-switch-checked,[\s\S]*?\.find-surface \.ant-switch\.ant-switch-checked:not\(\.ant-switch-disabled\):hover\s*\{[^}]*background:\s*var\(--uipilot-ui-icon-green\);/,
     )
   })
 
@@ -341,24 +405,57 @@ describe('FindView', () => {
     expect(fake.client.hide).not.toHaveBeenCalled()
   })
 
-  it('keeps the query input as the category keyboard focus owner', async () => {
+  it('prevents the browser find shortcut and focuses the query input', async () => {
     const fake = fakeClient()
     const core = createFindCore(fake.client)
     const host = await mount(core)
     await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
     await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
     const input = host.querySelector<HTMLInputElement>('[role="combobox"]')!
-    const categories = host.querySelector<HTMLElement>('.find-categories')!
-    const buttons = [...categories.querySelectorAll<HTMLButtonElement>('.find-category')]
-    buttons[0]!.focus()
+    const close = host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
+    close.focus()
+    expect(document.activeElement).toBe(close)
 
-    await act(async () => categories.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })))
+    const focusSearch = new KeyboardEvent('keydown', {
+      key: 'f',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    })
+    await act(async () => window.dispatchEvent(focusSearch))
 
-    expect(buttons.every((button) => button.tabIndex === -1)).toBe(true)
+    expect(focusSearch.defaultPrevented).toBe(true)
     expect(document.activeElement).toBe(input)
-    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })))
-    expect(core.getSnapshot().category).toBe('folder')
-    expect(document.activeElement).toBe(input)
+    expect(input.value).toBe('windows')
+  })
+
+  it('keeps only file categories in the Tab order', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
+    const input = host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const pin = host.querySelector<HTMLButtonElement>('button[aria-label="固定窗口"]')!
+    const close = host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
+    const previewSwitch = host.querySelector<HTMLElement>('[role="switch"][aria-label="文件预览"]')!
+    const categories = [...host.querySelectorAll<HTMLButtonElement>('.find-category')]
+
+    expect(input.tabIndex).toBe(-1)
+    expect(pin.tabIndex).toBe(-1)
+    expect(close.tabIndex).toBe(-1)
+    expect(previewSwitch.tabIndex).toBe(-1)
+    expect(categories.every((button) => button.tabIndex === 0)).toBe(true)
+    expect(
+      [...host.querySelectorAll<HTMLElement>('*')]
+        .filter((element) => element.tabIndex >= 0 && !('disabled' in element && element.disabled)),
+    ).toEqual(categories)
+
+    input.focus()
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    await act(async () => input.dispatchEvent(tab))
+    expect(tab.defaultPrevented).toBe(false)
+    expect(core.getSnapshot().category).toBe('all')
   })
 
   it('navigates file results with arrow keys from any focused control', async () => {

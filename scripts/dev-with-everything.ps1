@@ -6,6 +6,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'dev-everything-runtime.ps1')
 
+$frontendPort = 14321
+if (-not [string]::IsNullOrWhiteSpace($env:UIPILOT_DEV_PORT)) {
+    if (-not [int]::TryParse($env:UIPILOT_DEV_PORT, [ref]$frontendPort) -or $frontendPort -lt 1 -or $frontendPort -gt 65535) {
+        throw "UIPILOT_DEV_PORT must be an integer between 1 and 65535; received '$($env:UIPILOT_DEV_PORT)'."
+    }
+}
+
 if ($env:OS -ne 'Windows_NT') {
     throw 'Everything dev startup requires Windows.'
 }
@@ -92,7 +99,7 @@ try {
         if (-not (Test-Path -LiteralPath $vitePath -PathType Leaf)) {
             throw 'Vite is not installed. Run npm.cmd ci before starting dev.'
         }
-        & $vitePath
+        & $vitePath '--host' '127.0.0.1' '--port' ([string]$frontendPort) '--strictPort'
         $exitCode = $LASTEXITCODE
     }
 }

@@ -16,7 +16,7 @@ import {
   type InputProps,
   type InputRef,
 } from 'antd'
-import { ArrowLeft, Calculator, FolderSearch, ImageIcon, PanelsTopLeft, Plus, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
+import { ArrowLeft, Calculator, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Plus, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -174,20 +174,21 @@ function BuiltInResultIcon({ kind }: { kind: ResultIconKind }) {
       </span>
     )
   }
-  const isFind = kind === 'find'
+  if (kind === 'find' || kind === 'quicklinks') {
+    const Icon = kind === 'find' ? FolderSearch : Link2
+    return (
+      <span className={`built-in-result-icon built-in-result-icon-${kind}`} data-result-icon-kind={kind}>
+        <Icon aria-hidden size={26} strokeWidth={1.8} />
+      </span>
+    )
+  }
   return (
     <span
-      className={`built-in-result-icon ${isFind ? 'built-in-result-icon-find' : 'built-in-result-icon-web-search'}`}
+      className="built-in-result-icon built-in-result-icon-web-search"
       data-result-icon-kind={kind}
     >
-      {isFind ? (
-        <FolderSearch aria-hidden size={26} strokeWidth={1.8} />
-      ) : (
-        <>
-          <PanelsTopLeft aria-hidden size={25} strokeWidth={1.8} />
-          <Search aria-hidden className="built-in-result-icon-badge" size={12} strokeWidth={2} />
-        </>
-      )}
+      <PanelsTopLeft aria-hidden size={25} strokeWidth={1.8} />
+      <Search aria-hidden className="built-in-result-icon-badge" size={12} strokeWidth={2} />
     </span>
   )
 }
@@ -1035,6 +1036,25 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const isComposing = composing(event)
+    const primaryModifier = event.ctrlKey || event.metaKey
+    if (
+      activeSettingsTab === 'plugins' &&
+      primaryModifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      !isComposing &&
+      event.key.toLowerCase() === 'f'
+    ) {
+      const input = settingsTabsRef.current
+        ?.querySelector<HTMLInputElement>('input[aria-label="筛选插件名称"]')
+      if (!input?.isConnected || input.disabled) return
+      event.preventDefault()
+      event.stopPropagation()
+      input.focus()
+      const caret = input.value.length
+      input.setSelectionRange(caret, caret)
+      return
+    }
     if (event.key === 'Escape') {
       if (!isComposing) event.preventDefault()
       core.keyDown('Escape', isComposing)
@@ -1453,6 +1473,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             id={`launcher-panel-suffix-${panel.suffixControl}`}
             name={`launcher-panel-suffix-${panel.suffixControl}`}
             aria-label={`${panel.commandLabel} argument`}
+            placeholder={panel.inputPlaceholder}
             autoComplete="off"
             spellCheck={false}
             disabled={!snapshot.invocationId || panel.closePending}
@@ -1507,7 +1528,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               id={`quicklinks-filter-${snapshot.queryControl}`}
               name={`quicklinks-filter-${snapshot.queryControl}`}
               aria-label="搜索快速链接目录"
-              placeholder="搜索目录"
+              placeholder="搜索快速链接"
               autoComplete="off"
               spellCheck={false}
               tabIndex={-1}
@@ -1522,7 +1543,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         <div className="quicklinks-body">
           <aside className="quicklinks-directory" aria-label="快速链接目录">
             <div className="quicklinks-directory-header">
-              <span>目录</span>
+              <span>快速链接</span>
               <Button
                 aria-label="新增快速链接"
                 disabled={quicklinksBusy}
@@ -1575,19 +1596,30 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               </OverlayScrollbarsComponent>
             </Spin>
           </aside>
-          <OverlayScrollbarsComponent className="quicklinks-editor-scroll" options={settingsScrollbarOptions}>
-            <section ref={quicklinksEditorRef} className="quicklinks-editor" aria-label="快速链接表单">
-              {quicklinksStatus ? (
-                <div
-                  className="quicklinks-editor-status"
-                  data-tone={quicklinksStatus.tone}
-                  role="status"
-                  aria-live="polite"
-                >
-                  {quicklinksStatus.message}
-                </div>
-              ) : null}
-              {quicklinksDraftActive ? (
+          <section
+            className={quicklinksDraftActive ? 'quicklinks-editor-pane' : 'quicklinks-editor-pane is-empty'}
+            aria-label="快速链接表单"
+          >
+            {quicklinksDraftActive ? (
+              <>
+                <header className="quicklinks-editor-header">
+                  <div className="quicklinks-editor-heading">
+                    <strong>{quicklinksDraft?.name || '未命名目录'}</strong>
+                    <code>/{quicklinksDraft?.command}</code>
+                  </div>
+                  {quicklinksStatus ? (
+                    <span
+                      className="quicklinks-editor-status"
+                      data-tone={quicklinksStatus.tone}
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {quicklinksStatus.message}
+                    </span>
+                  ) : null}
+                </header>
+                <OverlayScrollbarsComponent className="quicklinks-editor-scroll" options={settingsScrollbarOptions}>
+                  <section ref={quicklinksEditorRef} className="quicklinks-editor">
                 <Form component="div" layout="vertical" className="quicklinks-form">
                   <Form.Item label="目录名称" className="quicklinks-form-row">
                     <Input
@@ -1675,15 +1707,19 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                     </Popconfirm>
                   </div>
                 </Form>
+                  </section>
+                </OverlayScrollbarsComponent>
+              </>
               ) : (
-                <div className="quicklinks-editor-empty">
-                  <ImageIcon aria-hidden size={28} strokeWidth={1.8} />
+                <section ref={quicklinksEditorRef} className="quicklinks-editor-empty">
+                  <span className="quicklinks-editor-empty-icon" aria-hidden="true">
+                    <Link2 size={24} strokeWidth={1.7} />
+                  </span>
                   <h2>请选择或新增快速链接</h2>
                   <p>从左侧目录选择一条快速链接进行编辑，或点击右上角新增。</p>
-                </div>
+                </section>
               )}
-            </section>
-          </OverlayScrollbarsComponent>
+          </section>
         </div>
       </section>
       {quicklinksCreateOpen ? (

@@ -22,6 +22,10 @@ and failure behavior.
 
 ## UiPilot Host Built-in Launcher Features
 
+Before creating or changing a UiPilot host-owned built-in feature, read
+`docs/ui-guidelines.md` and apply its launcher, settings, panel, theme, state,
+keyboard, and accessibility rules to every user-facing surface in scope.
+
 When adding a host-owned built-in feature that appears in the main launcher
 result list, decide whether the result is a reusable launcher entry. Reusable
 entries should be favoritable by default. Wire the full favorite path in the
@@ -33,7 +37,9 @@ could not be right-clicked as a favorite because its result had `favorite: None`
 ## UiPilot Public Plugin Development
 
 When creating, updating, or testing a UiPilot public plugin, first read
-`docs/plugin-sdk/public-plugin-developer-guide.md`. Use
+`docs/plugin-sdk/public-plugin-developer-guide.md` and `docs/ui-guidelines.md`.
+Apply the UI guidelines to every plugin-owned panel or window while keeping
+implementation inside the plugin package. Use
 `docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`,
 and `docs/plugin-sdk/uipilot-plugin-v1.schema.json` as contract references when
 the task touches manifest fields, Runtime APIs, window/panel bridges, network,

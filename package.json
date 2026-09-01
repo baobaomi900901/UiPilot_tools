@@ -10,7 +10,7 @@
     "dev": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-with-everything.ps1",
     "dev:vite": "vite",
     "build": "tsc --noEmit && vite build",
-    "tauri": "tauri"
+    "tauri": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1"
   },
   "type": "module",
   "dependencies": {

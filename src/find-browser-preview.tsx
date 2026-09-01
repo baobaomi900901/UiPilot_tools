@@ -32,6 +32,7 @@ const RESULTS: readonly FileResultItem[] = [
 ]
 
 const thumbnailAsset = new URL('../src-tauri/icons/icon.png', import.meta.url)
+const previewTheme = new URLSearchParams(window.location.search).get('theme') === 'light' ? 'light' : 'dark'
 let thumbnailDataUrl: Promise<string | null> | undefined
 let previewRevision = 1n
 
@@ -64,7 +65,7 @@ const client: FindClient = {
     initialization: {
       initializationToken: 'browser-preview-init',
       themeRevision: '1',
-      theme: 'dark',
+      theme: previewTheme,
       filePreviewRevision: '1',
       filePreviewEnabled: true,
       pinned: false,

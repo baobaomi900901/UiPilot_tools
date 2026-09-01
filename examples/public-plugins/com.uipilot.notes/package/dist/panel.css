@@ -1,11 +1,20 @@
 :root {
+  --note-canvas: var(--uipilot-color-background, #f7f7f8);
+  --note-surface: var(--uipilot-color-surface, #ffffff);
+  --note-elevated: color-mix(in srgb, var(--uipilot-color-text, #171719) 4%, var(--note-canvas));
+  --note-card: color-mix(in srgb, var(--uipilot-color-text, #171719) 7%, var(--note-canvas));
+  --note-selection-surface: color-mix(in srgb, var(--uipilot-color-text, #171719) 13%, var(--note-canvas));
+  --note-selection-border: color-mix(in srgb, var(--uipilot-color-text, #171719) 22%, transparent);
+  --note-border-strong: color-mix(in srgb, var(--uipilot-color-text, #171719) 24%, var(--uipilot-color-border, #d9d9dc));
   color: var(--uipilot-color-text);
-  background: var(--uipilot-color-background);
-  font-family: var(--uipilot-font-family);
+  background: var(--note-canvas);
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
+  letter-spacing: 0;
   --note-radius: 10px;
-  --note-radius-sm: 8px;
-  --note-transition: 160ms ease;
-  --note-item-height: 40px;
+  --note-radius-sm: 6px;
+  --note-transition: 120ms ease;
+  --note-item-height: 48px;
 }
 
 * {
@@ -44,6 +53,7 @@ button:not(:disabled):not([aria-disabled='true']):active {
   width: 100%;
   height: 100%;
   overflow: hidden;
+  border-top: 1px solid var(--uipilot-color-border);
 }
 
 .sidebar {
@@ -52,8 +62,9 @@ button:not(:disabled):not([aria-disabled='true']):active {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  max-width: 220px;
   border-right: 1px solid var(--uipilot-color-border);
-  background: var(--uipilot-color-surface);
+  background: var(--note-surface);
 }
 
 .toolbar {
@@ -61,7 +72,8 @@ button:not(:disabled):not([aria-disabled='true']):active {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 12px;
+  min-height: 48px;
+  padding: 8px 10px 8px 12px;
   flex: 0 0 auto;
   border-bottom: 1px solid var(--uipilot-color-border);
 }
@@ -70,7 +82,7 @@ button:not(:disabled):not([aria-disabled='true']):active {
   margin: 0;
   color: var(--uipilot-color-text);
   font-size: 14px;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.4;
 }
 
@@ -81,7 +93,9 @@ button:not(:disabled):not([aria-disabled='true']):active {
   width: 30px;
   height: 30px;
   padding: 0;
-  color: #fff;
+  color: var(--note-canvas);
+  background: var(--uipilot-color-accent);
+  border-color: var(--uipilot-color-accent);
   line-height: 0;
 }
 
@@ -95,7 +109,7 @@ button:not(:disabled):not([aria-disabled='true']):active {
 .editor-content {
   width: 100%;
   color: var(--uipilot-color-text);
-  background: var(--uipilot-color-background);
+  background: var(--note-elevated);
   border: 1px solid var(--uipilot-color-border);
   border-radius: var(--note-radius-sm);
   transition:
@@ -104,18 +118,20 @@ button:not(:disabled):not([aria-disabled='true']):active {
 }
 
 .text-input {
-  padding: 10px 12px;
+  height: 36px;
+  padding: 8px 12px;
 }
 
 .text-input:focus,
 .editor-content:focus {
   outline: none;
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 70%, var(--uipilot-color-border));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--uipilot-color-accent) 18%, transparent);
+  border-color: var(--note-border-strong);
+  box-shadow: none;
 }
 
 .btn {
-  padding: 9px 14px;
+  min-height: 32px;
+  padding: 6px 12px;
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-background);
   border: 1px solid var(--uipilot-color-border);
@@ -131,11 +147,11 @@ button:not(:disabled):not([aria-disabled='true']):active {
 }
 
 .btn:not(:disabled):not([aria-disabled='true']):hover {
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 45%, var(--uipilot-color-border));
+  border-color: var(--note-border-strong);
 }
 
 .btn-primary {
-  color: var(--uipilot-color-background);
+  color: var(--note-canvas);
   background: var(--uipilot-color-accent);
   border-color: var(--uipilot-color-accent);
 }
@@ -150,7 +166,7 @@ button:not(:disabled):not([aria-disabled='true']):active {
 }
 
 .btn-ghost:not(:disabled):not([aria-disabled='true']):hover {
-  background: color-mix(in srgb, var(--uipilot-color-text) 6%, transparent);
+  background: var(--note-elevated);
 }
 
 .btn-danger {
@@ -178,21 +194,25 @@ button:not(:disabled):not([aria-disabled='true']):active {
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
-  padding: 0;
+  padding: 6px 14px 6px 6px;
   outline: none;
   scrollbar-width: none;
 }
 
 html[data-theme='light'] {
   --note-scrollbar-thumb: rgba(115, 115, 115, 0.42);
-  --note-success: #137333;
-  --note-success-surface: #e6f4ea;
+  --note-selection-surface: #e9e9ec;
+  --note-selection-border: rgba(23, 23, 25, 0.2);
+  --note-success: #168c59;
+  --note-success-surface: rgba(22, 140, 89, 0.12);
 }
 
 html[data-theme='dark'] {
   --note-scrollbar-thumb: rgba(163, 163, 163, 0.48);
-  --note-success: #81c995;
-  --note-success-surface: #16351f;
+  --note-selection-surface: #1b1c1e;
+  --note-selection-border: rgba(255, 255, 255, 0.17);
+  --note-success: #59d499;
+  --note-success-surface: rgba(89, 212, 153, 0.15);
 }
 
 .note-list::-webkit-scrollbar {
@@ -240,39 +260,25 @@ html[data-theme='dark'] {
   width: 100%;
   height: 100%;
   color: var(--uipilot-color-text);
-}
-
-.note-card::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 3px;
-  background: transparent;
-  pointer-events: none;
+  border-radius: var(--note-radius-sm);
 }
 
 .note-card:hover {
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 35%, var(--uipilot-color-border));
-  background: color-mix(in srgb, var(--uipilot-color-accent) 4%, var(--uipilot-color-background));
+  background: var(--note-elevated);
 }
 
 .note-card.is-active {
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 55%, var(--uipilot-color-border));
-  background: color-mix(in srgb, var(--uipilot-color-accent) 8%, var(--uipilot-color-background));
-}
-
-.note-card.is-active::before {
-  background: var(--uipilot-color-accent);
+  background: var(--note-selection-surface);
+  box-shadow: inset 0 0 0 1px var(--note-selection-border);
 }
 
 .note-select {
   flex: 1 1 auto;
   min-width: 0;
-  display: flex;
-  align-items: center;
-  padding: 0 8px 0 12px;
+  display: grid;
+  align-content: center;
+  gap: 1px;
+  padding: 5px 8px 5px 10px;
   text-align: left;
   color: inherit;
   background: transparent;
@@ -291,9 +297,20 @@ html[data-theme='dark'] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 14px;
-  font-weight: 560;
+  font-size: 12px;
+  font-weight: 500;
   line-height: 1.3;
+}
+
+.note-preview {
+  display: block;
+  overflow: hidden;
+  color: var(--uipilot-color-text-muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .note-more {
@@ -326,7 +343,7 @@ html[data-theme='dark'] {
 .note-more:not(:disabled):hover,
 .note-more[aria-expanded='true'] {
   color: var(--uipilot-color-text);
-  background: color-mix(in srgb, var(--uipilot-color-text) 8%, transparent);
+  background: var(--note-elevated);
 }
 
 .note-actions-menu {
@@ -337,7 +354,7 @@ html[data-theme='dark'] {
   background: var(--uipilot-color-surface);
   border: 1px solid var(--uipilot-color-border);
   border-radius: 6px;
-  box-shadow: 0 10px 24px color-mix(in srgb, #000 28%, transparent);
+  box-shadow: none;
 }
 
 .note-actions-menu[hidden] {
@@ -359,7 +376,7 @@ html[data-theme='dark'] {
 .note-action:hover,
 .note-action:focus-visible {
   outline: none;
-  background: color-mix(in srgb, var(--uipilot-color-text) 8%, transparent);
+  background: var(--note-elevated);
 }
 
 .note-action-danger {
@@ -372,7 +389,7 @@ html[data-theme='dark'] {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--uipilot-color-background);
+  background: var(--note-canvas);
 }
 
 .empty-state[hidden],
@@ -396,10 +413,14 @@ html[data-theme='dark'] {
   display: grid;
   place-items: center;
   color: var(--uipilot-color-text-muted);
-  font-size: 22px;
   border: 1px dashed var(--uipilot-color-border);
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--uipilot-color-surface) 80%, transparent);
+  border-radius: 10px;
+  background: var(--note-elevated);
+}
+
+.empty-icon svg {
+  width: 24px;
+  height: 24px;
 }
 
 .empty-title {
@@ -417,12 +438,68 @@ html[data-theme='dark'] {
 
 .editor-panel {
   position: relative;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: 48px minmax(0, 1fr);
   flex: 1 1 auto;
   min-height: 0;
   padding: 0;
   gap: 0;
+}
+
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 7px 12px 7px 16px;
+  border-bottom: 1px solid var(--uipilot-color-border);
+}
+
+.editor-heading {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.editor-title {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editor-time {
+  overflow: hidden;
+  color: var(--uipilot-color-text-muted);
+  font-size: 11px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editor-save-state {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: var(--note-success);
+  font-size: 11px;
+}
+
+.editor-save-state.is-dirty {
+  color: var(--uipilot-color-text-muted);
+}
+
+.editor-save-state.is-dirty svg {
+  display: none;
+}
+
+.editor-save-state svg {
+  width: 14px;
+  height: 14px;
 }
 
 .editor-surface {
@@ -432,14 +509,14 @@ html[data-theme='dark'] {
   padding: 0;
   border: 0;
   border-radius: 0;
-  background: var(--uipilot-color-surface);
+  background: var(--note-canvas);
 }
 
 .editor-content {
   display: block;
   height: 100%;
   min-height: 0;
-  padding: 14px 48px 48px 16px;
+  padding: 18px 48px 48px 18px;
   border: none;
   border-radius: 0;
   resize: none;
@@ -538,7 +615,7 @@ html[data-theme='dark'] {
   height: 30px;
   padding: 0;
   color: var(--uipilot-color-text-muted);
-  background: color-mix(in srgb, var(--uipilot-color-surface) 92%, transparent);
+  background: var(--note-elevated);
   border: 1px solid var(--uipilot-color-border);
   border-radius: 6px;
   cursor: pointer;
@@ -550,13 +627,13 @@ html[data-theme='dark'] {
 }
 
 .editor-copy-button:hover {
-  color: var(--uipilot-color-accent);
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 50%, var(--uipilot-color-border));
-  background: color-mix(in srgb, var(--uipilot-color-accent) 8%, var(--uipilot-color-surface));
+  color: var(--uipilot-color-text);
+  border-color: var(--note-border-strong);
+  background: var(--note-card);
 }
 
 .editor-copy-button:focus-visible {
-  outline: 2px solid var(--uipilot-color-accent);
+  outline: 1px solid var(--note-border-strong);
   outline-offset: 2px;
 }
 
@@ -590,8 +667,8 @@ html[data-theme='dark'] {
   transform: translate(-50%, 0);
   border: 1px solid var(--uipilot-color-border);
   border-radius: 6px;
-  background: var(--uipilot-color-surface);
-  box-shadow: 0 8px 20px color-mix(in srgb, #000 20%, transparent);
+  background: var(--note-surface);
+  box-shadow: none;
 }
 
 .editor-status[data-tone='success'] {
@@ -612,13 +689,12 @@ html[data-theme='dark'] {
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-surface);
   border: 1px solid var(--uipilot-color-border);
-  border-radius: 14px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  border-radius: var(--note-radius);
+  box-shadow: none;
 }
 
 .dialog::backdrop {
   background: rgba(0, 0, 0, 0.42);
-  backdrop-filter: blur(2px);
 }
 
 .dialog-body {
@@ -630,8 +706,8 @@ html[data-theme='dark'] {
 
 .dialog-title {
   margin: 0;
-  font-size: 17px;
-  font-weight: 650;
+  font-size: 15px;
+  font-weight: 500;
 }
 
 .dialog-message {
@@ -662,9 +738,9 @@ html[data-theme='dark'] {
   font-size: 13px;
   line-height: 1.5;
   text-align: center;
-  border: 1px dashed var(--uipilot-color-border);
+  border: 0;
   border-radius: var(--note-radius-sm);
-  background: color-mix(in srgb, var(--uipilot-color-background) 70%, transparent);
+  background: transparent;
 }
 
 @media (forced-colors: active) {

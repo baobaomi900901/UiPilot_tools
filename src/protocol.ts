@@ -1,6 +1,6 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
-export type ResultIconKind = 'find' | 'calculator' | 'webSearch'
+export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string }>
@@ -484,6 +484,7 @@ export interface PluginPanelCommandResult {
   sessionEpoch: U64Decimal
   pluginId: string
   commandLabel: string
+  inputPlaceholder?: string
   hostKeys: readonly PanelHostKeyDeclaration[]
 }
 
@@ -524,6 +525,7 @@ export interface PluginPanelFocusHostInputEvent {
 export interface PluginPanelSnapshot {
   pluginId: string
   commandLabel: string
+  inputPlaceholder?: string
   sessionEpoch: U64Decimal
   hostKeys: readonly PanelHostKeyDeclaration[]
   suffixControl: ControlKey
@@ -976,7 +978,11 @@ function parsePrepareNetwork(value: unknown): PublicPluginPrepareNetwork | null 
 
 export function parsePluginPanelCommandResult(value: unknown): PluginPanelCommandResult | null {
   const record = plainRecord(value)
-  if (!record || !exactKeys(record, ['commandLabel', 'hostKeys', 'pluginId', 'sessionEpoch'])) return null
+  if (!record) return null
+  const keys = record.inputPlaceholder === undefined
+    ? ['commandLabel', 'hostKeys', 'pluginId', 'sessionEpoch']
+    : ['commandLabel', 'hostKeys', 'inputPlaceholder', 'pluginId', 'sessionEpoch']
+  if (!exactKeys(record, keys)) return null
   const sessionEpoch = parseU64Decimal(record.sessionEpoch)
   if (!Array.isArray(record.hostKeys) || !exactDenseArray(record.hostKeys)) return null
   const order: Readonly<Record<PanelHostKeyDeclaration, number>> = {
@@ -1003,10 +1009,17 @@ export function parsePluginPanelCommandResult(value: unknown): PluginPanelComman
     record.pluginId.length > 64 ||
     !PUBLIC_PLUGIN_ID.test(record.pluginId) ||
     typeof record.commandLabel !== 'string' ||
-    !/^[a-z][a-z0-9-]{0,31}$/u.test(record.commandLabel)
+    !/^[a-z][a-z0-9-]{0,31}$/u.test(record.commandLabel) ||
+    (record.inputPlaceholder !== undefined && typeof record.inputPlaceholder !== 'string')
   ) return null
   hostKeys.sort((left, right) => order[left] - order[right])
-  return { sessionEpoch, pluginId: record.pluginId, commandLabel: record.commandLabel, hostKeys }
+  return {
+    sessionEpoch,
+    pluginId: record.pluginId,
+    commandLabel: record.commandLabel,
+    ...(record.inputPlaceholder === undefined ? {} : { inputPlaceholder: record.inputPlaceholder }),
+    hostKeys,
+  }
 }
 
 export function parsePluginPanelHostKeyEnqueueResult(value: unknown): PluginPanelHostKeyEnqueueResult | null {

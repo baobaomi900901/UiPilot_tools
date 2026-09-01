@@ -40,6 +40,8 @@ test('README documents permissions, privacy boundary, preview, verification, and
   const readme = await readFile(new URL('README.md', exampleRoot), 'utf8')
 
   for (const required of [
+    '最近 50 条',
+    '500 MiB',
     'clipboard.history.read',
     'clipboard.history.paste',
     '不会获得完整文本、原图或完整文件路径',

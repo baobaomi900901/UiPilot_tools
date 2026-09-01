@@ -65,7 +65,7 @@ it('provides a browser-only launcher preview outside the production entry', () =
   expect(previewSource).toContain('com.uipilot.notes')
   expect(previewSource).toContain('com.uipilot.translate')
   expect(previewSource).toContain('core.activateResult')
-  expect(previewSource).toContain('com.uipilot.notes/preview.html')
+  expect(previewSource).toContain('/examples/public-plugins/${contentPreview.path}/preview.html?theme=${previewTheme}')
   expect(previewSource).toContain("querySelector<HTMLElement>('.panel-host-region')")
   expect(previewSource).toContain("frame.style.width = '100%'")
   expect(previewSource).toContain("frame.style.height = '100%'")
@@ -177,6 +177,7 @@ describe('plugin protocol', () => {
       sessionEpoch: '18446744073709551615',
       pluginId: 'com.uipilot.demo-panel',
       commandLabel: 'demo-panel',
+      inputPlaceholder: '搜索目录',
       hostKeys: ['Enter', 'Shift+Tab', 'Tab', 'Primary+N', 'ArrowUp', 'ArrowDown'],
     }
     expect(parsePluginPanelCommandResult(identity)).toEqual({
@@ -981,6 +982,8 @@ describe('shown and search ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
     expect(client.listQuicklinks).toHaveBeenCalledOnce()
     expect(core.getSnapshot().quicklinks?.items.map((item) => item.command)).toEqual(['jd'])
+    expect(core.getSnapshot().quicklinks?.selectedId).toBeUndefined()
+    expect(core.getSnapshot().quicklinks?.draftActive).toBe(false)
     expect(core.getSnapshot().query).toBe('')
     expect(core.getSnapshot().results).toHaveLength(0)
   })
@@ -1085,6 +1088,7 @@ describe('shown and search ownership', () => {
 
       const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')
       expect(input).not.toBeNull()
+      expect(input?.placeholder).toBe('搜索快速链接')
       expect(document.activeElement).toBe(input)
       expect(mounted.host.textContent).toContain('暂无快速链接')
       expect(mounted.host.textContent).toContain('请选择或新增快速链接')
@@ -1181,7 +1185,7 @@ describe('shown and search ownership', () => {
       }))
       await act(async () => core.keyDown('Enter', false))
       await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
-      expect(core.getSnapshot().quicklinks?.selectedId).toBe('quicklink-jd')
+      expect(core.getSnapshot().quicklinks?.selectedId).toBeUndefined()
 
       const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
       const arrowDown = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })
@@ -1439,13 +1443,24 @@ describe('shown and search ownership', () => {
       await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
 
       expect(mounted.host.querySelector('.quicklinks-list-scroll')).not.toBeNull()
+      expect(mounted.host.querySelector('.quicklinks-editor-pane.is-empty')).not.toBeNull()
+      expect(mounted.host.textContent).toContain('请选择或新增快速链接')
+
+      await act(async () => core.selectQuicklink('quicklink-jd'))
+
       expect(mounted.host.querySelector('.quicklinks-editor-scroll')).not.toBeNull()
+      expect(mounted.host.querySelector('.quicklinks-editor-pane')).not.toBeNull()
+      expect(mounted.host.querySelector('.quicklinks-editor-header')?.textContent).toContain('京东搜索')
+      expect(mounted.host.querySelector('.quicklinks-editor-heading code')?.textContent).toBe('/jd')
       expect(mounted.host.querySelectorAll('.quicklinks-editor .quicklinks-form-row')).toHaveLength(4)
       expect(mounted.host.querySelector('.quicklinks-editor .quicklinks-form-row-icon')).not.toBeNull()
       expect(stylesSource).toContain('.quicklinks-editor .quicklinks-form-row .ant-form-item-row')
-      expect(stylesSource).toContain('grid-template-columns: 88px minmax(0, 1fr);')
+      expect(stylesSource).toContain('grid-template-columns: 76px minmax(0, 1fr);')
       expect(stylesSource).toContain('.quicklinks-list-scroll')
       expect(stylesSource).toContain('.quicklinks-editor-scroll')
+      expect(stylesSource).toContain('padding: 6px 14px 6px 6px;')
+      expect(stylesSource).toContain('grid-template-rows: 48px minmax(0, 1fr);')
+      expect(stylesSource).toContain('box-shadow: inset 0 0 0 1px')
     } finally {
       await mounted.unmount()
     }
@@ -1478,6 +1493,7 @@ describe('shown and search ownership', () => {
       }))
       await act(async () => core.keyDown('Enter', false))
       await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+      await act(async () => core.selectQuicklink('quicklink-jd'))
       const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
 
       const ctrlN = new KeyboardEvent('keydown', { key: 'n', ctrlKey: true, bubbles: true, cancelable: true })
@@ -1520,7 +1536,7 @@ describe('shown and search ownership', () => {
       await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="新增快速链接"]')?.click())
 
       await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')?.textContent).toContain('新建快速链接'))
-      const editor = mounted.host.querySelector<HTMLElement>('.quicklinks-editor')!
+      const editor = mounted.host.querySelector<HTMLElement>('.quicklinks-editor-empty')!
       expect(editor.textContent).toContain('请选择或新增快速链接')
       expect(editor.textContent).not.toContain('目录名称')
     } finally {
@@ -2079,6 +2095,7 @@ describe('shown and search ownership', () => {
       requestId: 'icon-kinds',
       items: [
         findLauncherItem('alpha'),
+        { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==', activation: executeActivation },
@@ -2097,6 +2114,7 @@ describe('shown and search ownership', () => {
 
     expect(core.getSnapshot().results.map(({ title, iconKind, icon, pluginIconUrl }) => ({ title, iconKind, icon, pluginIconUrl }))).toEqual([
       { title: '/find', iconKind: 'find', icon: undefined, pluginIconUrl: undefined },
+      { title: '/quicklinks', iconKind: 'quicklinks', icon: undefined, pluginIconUrl: undefined },
       { title: '2', iconKind: 'calculator', icon: undefined, pluginIconUrl: undefined },
       { title: 'Bing 搜索', iconKind: 'webSearch', icon: undefined, pluginIconUrl: undefined },
       { title: 'App', iconKind: undefined, icon: 'data:image/png;base64,AA==', pluginIconUrl: undefined },
@@ -2468,6 +2486,13 @@ describe('shown and search ownership', () => {
       requestId: 'panel-dom-result',
       items: [panelItem('hello')],
     } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('1'),
+      pluginId: 'com.uipilot.demo-panel',
+      commandLabel: 'demo-panel',
+      inputPlaceholder: '搜索目录',
+      hostKeys: [],
+    } as unknown as PluginPanelCommandResult)
     const mounted = await mountLauncherView(core)
     await act(async () => emit(shown('panel-dom-entry')))
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -2481,6 +2506,7 @@ describe('shown and search ownership', () => {
     const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
     expect(input).not.toBeNull()
     expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5])
+    expect(input.placeholder).toBe('搜索目录')
 
     input.setSelectionRange(2, 2)
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true })))
@@ -2925,7 +2951,8 @@ describe('shown and search ownership', () => {
       expect(declaredProperty(shell!, 'border')).toContain('1px solid')
       expect(declaredProperty(statusRegion!, 'display')).toBe('none')
       expect(declaredProperty(surface!, 'grid-template-rows')).toBe('minmax(52px, 1fr)')
-      expect(declaredProperty(tag!, 'border')).toMatch(/^0(?:px)?$/)
+      expect(declaredProperty(tag!, 'background')).toContain('color-mix')
+      expect(declaredProperty(tag!, 'border')).toContain('1px solid')
       expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
       expect(declaredProperty(input!, 'background')).toBe('transparent')
 
@@ -5720,7 +5747,7 @@ describe('React view and accessibility', () => {
       /\.settings-tabs > \.ant-tabs\s*\{[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
     )
     expect(stylesSource).toMatch(
-      /\.settings-tabs \.ant-tabs-nav\s*\{[^}]*flex:\s*0 0 112px;[^}]*width:\s*112px;/s,
+      /\.settings-tabs \.ant-tabs-nav\s*\{[^}]*flex:\s*0 0 144px;[^}]*width:\s*144px;/s,
     )
     expect(stylesSource).toMatch(
       /\.settings-tabs \.ant-tabs-body-holder,\s*\.settings-tabs \.ant-tabs-body,\s*\.settings-tabs \.ant-tabs-content\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*height:\s*100%;[^}]*overflow:\s*hidden;/s,
@@ -5779,6 +5806,7 @@ describe('React view and accessibility', () => {
       requestId: 'built-in-icons',
       items: request.query === 'icons' ? [
         findLauncherItem('icons'),
+        { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         {
@@ -5798,22 +5826,24 @@ describe('React view and accessibility', () => {
     await act(async () =>
       core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
     )
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(6))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(7))
 
     const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     const find = rows[0]!.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
-    const calculator = rows[1]!.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
-    const web = rows[2]!.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
+    const quicklinks = rows[1]!.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
+    const calculator = rows[2]!.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
+    const web = rows[3]!.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
     expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
+    expect(quicklinks?.querySelector('.lucide-link-2')).toBeTruthy()
     expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
     expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
     expect(web?.querySelector('.lucide-search')).toBeTruthy()
-    for (const icon of [find, calculator, web]) {
+    for (const icon of [find, quicklinks, calculator, web]) {
       expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
     }
-    expect(rows[3]!.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
-    expect(rows[4]!.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
-    expect(rows[5]!.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
+    expect(rows[4]!.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rows[5]!.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rows[6]!.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
     await mounted.unmount()
@@ -6774,6 +6804,32 @@ describe('React view and accessibility', () => {
       expect(mounted.host.querySelector('.plugin-title-line h3')?.textContent).toBe('Translate')
     } finally {
       vi.useRealTimers()
+      await mounted.unmount()
+      core.destroy()
+    }
+  })
+
+  it('focuses the public plugin filter with Ctrl+F while the plugins tab is active', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '1', items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => fake.emit(shown('public-filter-shortcut', 'settings')))
+      await activateSettingsTab(mounted.host, '插件')
+      const filter = mounted.host.querySelector<HTMLInputElement>('input[aria-label="筛选插件名称"]')!
+      const focusSearch = new KeyboardEvent('keydown', {
+        key: 'f', ctrlKey: true, bubbles: true, cancelable: true,
+      })
+
+      await act(async () => settingsTab(mounted.host, '插件').dispatchEvent(focusSearch))
+
+      expect(focusSearch.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(filter)
+    } finally {
       await mounted.unmount()
       core.destroy()
     }

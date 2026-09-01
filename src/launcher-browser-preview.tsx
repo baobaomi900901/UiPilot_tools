@@ -13,11 +13,13 @@ import {
   type SettingsView,
 } from './protocol'
 
+const previewParameters = new URLSearchParams(window.location.search)
+const previewTheme = previewParameters.get('theme') === 'light' ? 'light' : 'dark'
 const settings: SettingsView = {
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
-  theme: 'dark',
+  theme: previewTheme,
   webSearchEngine: 'bing',
 }
 const revisionOne = parseU64Decimal('1')!
@@ -129,17 +131,19 @@ const previewLegacyPlugins: PluginInventorySnapshot = {
     },
   ],
 }
-const previewParameters = new URLSearchParams(window.location.search)
 const panelPreview = previewParameters.get('mode') === 'panel'
 const settingsPreview = previewParameters.get('mode') === 'settings'
+const quicklinksPreview = previewParameters.get('mode') === 'quicklinks'
 const requestedPanelCommand = previewParameters.get('command')
 const panelPreviewCommand = requestedPanelCommand && /^[a-z][a-z0-9-]{0,31}$/u.test(requestedPanelCommand)
   ? requestedPanelCommand
   : 'demo-panel'
 const panelPreviewPluginId = 'com.uipilot.demo-panel'
+const panelPreviewInputPlaceholder = panelPreviewCommand === 'notes' ? '搜索目录' : undefined
 
 if (panelPreview) document.title = `UiPilot /${panelPreviewCommand} 外壳预览`
 else if (settingsPreview) document.title = 'UiPilot 设置预览'
+else if (quicklinksPreview) document.title = 'UiPilot /quicklinks 预览'
 
 const appIconAsset = new URL('../src-tauri/icons/icon.png', import.meta.url)
 let appIconDataUrl: Promise<string | null> | undefined
@@ -213,6 +217,7 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
         resultId: 'preview-quicklinks',
         title: '/quicklinks',
         subtitle: '管理快速链接',
+        iconKind: 'quicklinks',
         activation: { kind: 'openQuicklinks' },
         hasDefaultAction: false,
       }],
@@ -264,12 +269,14 @@ const client: LauncherClient = {
     sessionEpoch: revisionOne,
     pluginId: panelPreviewPluginId,
     commandLabel: panelPreviewCommand,
+    ...(panelPreviewInputPlaceholder === undefined ? {} : { inputPlaceholder: panelPreviewInputPlaceholder }),
     hostKeys: [],
   }),
   submitPluginPanel: async ({ sessionEpoch }) => ({
     sessionEpoch,
     pluginId: panelPreviewPluginId,
     commandLabel: panelPreviewCommand,
+    ...(panelPreviewInputPlaceholder === undefined ? {} : { inputPlaceholder: panelPreviewInputPlaceholder }),
     hostKeys: [],
   }),
   enqueuePluginPanelHostKey: async () => ({ outcome: 'enqueued', routeSequence: revisionOne }),
@@ -306,16 +313,22 @@ const host = document.querySelector<HTMLElement>('#app')
 if (!host) throw new Error('Missing preview root')
 
 function mountPanelContentPreview(hostElement: HTMLElement): () => void {
-  if (!panelPreview || panelPreviewCommand !== 'notes') return () => undefined
+  if (!panelPreview) return () => undefined
+  const contentPreview = panelPreviewCommand === 'notes'
+    ? { title: 'Notes 插件内容预览', path: 'com.uipilot.notes' }
+    : panelPreviewCommand === 'clipboard-history'
+      ? { title: '剪贴板历史插件内容预览', path: 'com.uipilot.clipboard-history' }
+      : null
+  if (!contentPreview) return () => undefined
 
   const frame = document.createElement('iframe')
-  frame.title = 'Notes 插件内容预览'
-  frame.src = '/examples/public-plugins/com.uipilot.notes/preview.html?theme=dark'
+  frame.title = contentPreview.title
+  frame.src = `/examples/public-plugins/${contentPreview.path}/preview.html?theme=${previewTheme}`
   frame.style.display = 'block'
   frame.style.width = '100%'
   frame.style.height = '100%'
   frame.style.border = '0'
-  frame.style.background = '#202020'
+  frame.style.background = previewTheme === 'dark' ? '#07080a' : '#f7f7f8'
   frame.allow = 'clipboard-write'
 
   const attach = () => {
@@ -358,10 +371,22 @@ root.render(<LauncherView
     }
     if (started) return
     started = true
-    void core.start()
+    void startPreview()
   }}
 />)
 const stopPanelContentPreview = mountPanelContentPreview(host)
+
+async function startPreview(): Promise<void> {
+  await core.start()
+  if (!quicklinksPreview || core.getSnapshot().view !== 'launcher') return
+  await core.text({
+    kind: 'ordinaryInput',
+    control: core.getSnapshot().queryControl,
+    value: '/quicklinks',
+    inputType: 'insertText',
+  })
+  await core.keyDown('Enter', false)
+}
 
 window.addEventListener('pagehide', () => {
   stopPanelContentPreview()

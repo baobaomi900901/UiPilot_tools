@@ -42,7 +42,9 @@ mod tests {
 
     use super::*;
     use crate::clipboard_history::{
-        model::{MAX_ENTRIES, MAX_THUMBNAIL_PNG_BYTES, THUMBNAIL_MAX_EDGE},
+        model::{
+            MAX_ENTRIES, MAX_THUMBNAIL_PNG_BYTES, MAX_TOTAL_IMAGE_PNG_BYTES, THUMBNAIL_MAX_EDGE,
+        },
         preview::decode_data_url_for_test,
     };
 
@@ -290,11 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn capacity_keeps_twenty_most_recent_entries() {
+    fn capacity_keeps_fifty_most_recent_entries() {
         let dir = TestDir::new("capacity");
         let store = ClipboardHistoryStore::load(dir.path()).unwrap();
+        assert_eq!(MAX_ENTRIES, 50);
+        assert_eq!(MAX_TOTAL_IMAGE_PNG_BYTES, 500 * 1024 * 1024);
         let mut ids = Vec::new();
-        for index in 0..25 {
+        for index in 0..55 {
             ids.push(capture_text(
                 &store,
                 &format!("text-{index}"),
@@ -304,7 +308,7 @@ mod tests {
 
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.entries.len(), MAX_ENTRIES);
-        assert_eq!(snapshot.entries[0].id(), ids[24]);
+        assert_eq!(snapshot.entries[0].id(), ids[54]);
         assert_eq!(snapshot.entries.last().unwrap().id(), ids[5]);
         assert!(!snapshot.entries.iter().any(|entry| entry.id() == ids[0]));
     }
@@ -770,7 +774,7 @@ mod tests {
         }
         assert!(store.image_path_for_test(&id).unwrap().exists());
 
-        for index in 1..=20 {
+        for index in 1..=MAX_ENTRIES {
             store
                 .capture(ClipboardCapture::image(
                     vec![index as u8, 0, 0, 0xff],

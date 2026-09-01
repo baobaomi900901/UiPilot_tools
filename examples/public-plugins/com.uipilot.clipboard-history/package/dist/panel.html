@@ -9,6 +9,9 @@
   <body>
     <main class="clipboard-app">
       <aside class="filter-rail" aria-label="剪贴板类型">
+        <header class="filter-header">
+          <h2>分类</h2>
+        </header>
         <div id="filter-tabs" class="filter-tabs" role="tablist" aria-orientation="vertical">
           <button class="filter-tab" type="button" role="tab" tabindex="-1" data-filter="all" aria-selected="true"><span>全部</span><span class="filter-count">0</span></button>
           <button class="filter-tab" type="button" role="tab" tabindex="-1" data-filter="image" aria-selected="false"><span>图片</span><span class="filter-count">0</span></button>
@@ -41,7 +44,14 @@
           </div>
         </div>
         <div id="empty-state" class="empty-state" hidden>
-          <p id="empty-title" class="empty-title">暂无记录</p>
+          <span class="empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <rect width="14" height="14" x="5" y="7" rx="2"></rect>
+              <path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"></path>
+            </svg>
+          </span>
+          <h2 id="empty-title" class="empty-title">暂无记录</h2>
+          <p class="empty-hint">新的剪贴板记录会显示在这里</p>
         </div>
       </section>
     </main>
