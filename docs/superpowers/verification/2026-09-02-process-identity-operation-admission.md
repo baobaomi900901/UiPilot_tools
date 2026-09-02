@@ -1,0 +1,123 @@
+# Stage 1 Process Identity And Operation Admission Verification Record
+
+**Date:** 2026-09-02
+**Status:** AWAITING USER ACCEPTANCE（等待用户验收）
+**Verification outcome:** `DONE_WITH_CONCERNS` — focused and default tests pass, but the all-feature test gate and both Clippy gates are not green.
+**Scope:** Stage 1 aggregate regression, Windows read-only/admission evidence, changed-file audit, and exit-gate evidence only. This record adds no product behavior.
+
+## Revision Under Verification
+
+- Branch: `codex/plugin-platform-roadmap`
+- Approved-design base: `890fdbdd5b38747852109a184d66e3c4e0238a74`
+- Task 4 execution-start HEAD: `41fef1250ddfcd448eaca5bfa2ac0819650baaec`
+- Final implementation/source HEAD under test: `41fef1250ddfcd448eaca5bfa2ac0819650baaec`
+- The documentation commit containing this record is the only post-verification tracked change; it does not alter the tested implementation.
+
+## Environment
+
+All commands and the aggregate snapshot probe ran from the worktree root in the same standard-user session.
+
+| Item | Fresh result |
+|---|---|
+| OS | Microsoft Windows 11 Pro for Workstations (`Microsoft Windows 11 专业工作站版`) |
+| Version / build | `10.0.26100` / `26100` |
+| Architecture | 64-bit (`x64`) |
+| Administrator/elevated | `False`; standard-user session |
+| rustc | `rustc 1.96.1 (31fca3adb 2026-06-26)` |
+| cargo | `cargo 1.96.1 (356927216 2026-06-26)` |
+
+The approved plan names Rust 1.96.0, while this verification host provides 1.96.1. This toolchain drift is recorded as a limitation; no source was changed to accommodate it.
+
+## Required Command Results
+
+Every command below was freshly run from the worktree root. A failed command was rerun once with the same arguments to distinguish a transient failure; all three failing gates reproduced.
+
+| Command | Exit | Result |
+|---|---:|---|
+| `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 0 | Clean. |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control -- --nocapture --test-threads=1` | 0 | Main test target: **49 passed, 0 failed, 1 ignored, 976 filtered**. Other unit targets ran 0 tests; the integration target had 1 filtered test. The ignored item is the child fixture, which the live-child tests spawn explicitly. |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline` | 0 | Main library: **1023 passed, 0 failed, 3 ignored, 0 filtered**; integration: **1 passed, 0 failed**; remaining unit/doc targets: 0 tests. The retained-child fixture's isolated subprocess also reported 1 passed and 1025 filtered before returning to the parent test. |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features` | 101 | Reproduced on the required retry before tests ran: the schema-generator binary cannot resolve its schema function when `test-instrumentation` is enabled because that function is cfg-excluded. Source correction is outside Task 4. |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings` | 101 | Reproduced on retry. Clippy reported 12 deny-warning errors for the library and 15 for the library test target. They span existing host areas and include two test-only `process_control` findings (`enum_variant_names` and `derivable_impls`). No fixes were made. |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets --all-features -- -D warnings` | 101 | Reproduced on retry: the all-feature schema cfg failure plus the same deny-warning set. No clean Clippy result exists for this revision/toolchain. |
+| `git diff --exit-code 890fdbd...HEAD -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | 0 | Empty dependency diff. |
+| `Get-CimInstance Win32_OperatingSystem \| Select-Object Caption, Version, BuildNumber, OSArchitecture` | 0 | Environment values recorded above. |
+| `[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)` | 0 | `False`. |
+| `rustc --version` | 0 | Version recorded above. |
+| `cargo --version` | 0 | Version recorded above. |
+
+The required expectation that every Cargo command exit 0 is therefore **not met**. Stage 1's verification/exit gate is not all green.
+
+## Fake Adapter Contract Evidence
+
+The focused process-control command passed all **18 snapshot** and **15 admission** Fake/core contract tests.
+
+Snapshot coverage includes deterministic ordering, zero-omission success, duplicate/PID-change behavior, invalid identity, path fallback with same-handle revalidation, single-entry failure with partial catalog success, global and mid-enumeration failure without partial publication, refresh stability, metadata-independent identity, stable redacted error display, no Tauri/frontend wiring, mutation hooks, and exact temporary-handle closure. The deterministic omission-priority case asserts exactly:
+
+- `exitedOrChanged = 1`
+- `inspectionDenied = 1`
+- `identityUnavailable = 1`
+- `total = 3`
+- opened handles `3`, dropped handles `3`
+
+Additional exact omission examples passed: reliable success `0/0/0`; changed fallback `1/0/0`; denied entry `0/1/0`; two PID-zero entries `0/0/2`; valid/invalid duplicate ordering preserves the required `exitedOrChanged > inspectionDenied > identityUnavailable` priority.
+
+Admission coverage includes invalid and expired targets before Adapter access, PID reuse as `TargetChanged`, exit before/after open, observation and creation-time inspection failures, zero creation time, exact liveness mapping, self/critical/PPL/unreadable protection, error priority, all three intents, retained lease ownership, and single consumption. Every intent requested only snapshot observation access; failure and Drop assertions showed exact open/drop balance and no side-effect Adapter.
+
+## Windows Standard-User Evidence
+
+The focused command passed **15 Windows tests**, with the dedicated fixture ignored in the parent harness and invoked only as an exact child by the live tests.
+
+- **Live snapshot and omissions:** a temporary read-only aggregate probe compiled the tracked `process_control` module directly, emitted counts only, and was deleted immediately. The fresh snapshot returned **253 process records** with omissions `exitedOrChanged = 0`, `inspectionDenied = 125`, `identityUnavailable = 1`, `total = 126`. These are a point-in-time observation and may vary with the host process set.
+- **Current self:** the snapshot found the exact current test-process identity; `Terminate` admission returned `ProtectedTarget`. Its critical/PPL queries were readable and reported unprotected, so the denial is the exact-self policy rather than a name rule.
+- **Live exact child admission:** a child created from the current Rust test executable entered the catalog and received a read-only `Restart` admission while the test retained that exact `Child`; dropping the admission and bounded child cleanup succeeded.
+- **Numeric 259 and stale identity:** another retained exact child first received a read-only `ForceTerminate` admission, exited naturally with numeric code **259**, and the old target then returned `TargetExited`. This proves zero-time HANDLE signaling, not `STILL_ACTIVE`, decides liveness.
+- **Protected target:** no inspectable real Protected Process/PPL was present. This item is explicitly **environment N/A**. Deterministic Fake Adapter coverage for critical, PPL, combined protection, and unreadable protection passed and remains mandatory evidence.
+- **Helper cleanup:** after all commands, the count of matching fixture helper processes was **0**. The temporary aggregate-probe executable count was also **0**.
+- **HANDLE/RAII:** the real private `OwnedHandle` Drop test observed closer calls `0` before Drop and exactly `1` after Drop. Production process and snapshot handles use that single-owner RAII path. Fake success/failure tests additionally assert exact opened/dropped counts.
+- **Least access:** Windows open-seam evidence passed for exactly `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`, non-inheritable. No operation handle or operation access was opened.
+- **Ordinary error/log redaction:** the stable error-display test passed all eight approved Stage 1 codes; CNG initialization failure mapped only to `Unavailable`. A source scan found no ordinary log-emission macro in production `process_control`. No executable path, command line, user data, raw HANDLE, or raw platform error is emitted to ordinary callers/logs.
+
+No test invokes product termination or restart. Fixture cleanup is limited to the exact retained child created by that test.
+
+## Changed Files And Boundary Audit
+
+Relative to approved-design base `890fdbd`, the final intended tracked file list is:
+
+- `docs/superpowers/plans/2026-09-02-process-identity-operation-admission.md` — added approved plan
+- `docs/superpowers/verification/2026-09-02-process-identity-operation-admission.md` — this record
+- `src-tauri/src/lib.rs` — scoped module declaration and source guards only
+- `src-tauri/src/process_control/core.rs` — added
+- `src-tauri/src/process_control/mod.rs` — added
+- `src-tauri/src/process_control/tests.rs` — added
+- `src-tauri/src/process_control/windows.rs` — added
+
+`src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` are byte-identical to the approved-design base. Their Git blob IDs are respectively `36aba5680ba2f2eb5aceda973a465293ccb4fb3e` and `e19e3b0c1c6bfcf2ca7f1fc2a8d6826ed5e00346` at both the base and verified worktree.
+
+The changed-file audit plus focused source guards confirm there is no new Tauri command, managed state, capability, frontend, Runtime entry, public plugin contract, Public Plugin API v1, host version, SDK, schema, CLI, UI, process-tree/search feature, or macOS Adapter. Stage 1 adds no product process side effect, termination, restart, elevation, confirmation flow, operation HANDLE/access, raw-HANDLE exposure, Stage 2 operation error, or dependency/lockfile change.
+
+## Design 12 / 13 Exit Checklist
+
+| Requirement | Evidence | Result |
+|---|---|---|
+| 12.1 Fake Adapter contract | 18 snapshot + 15 admission tests passed; identity, omissions, fixed precedence, protection, access, liveness, redaction, no-side-effect, and handle ownership covered with exact counts above. | PASS |
+| 12.2 Windows tests | 15 Windows tests passed; current self, exact child admission, code-259 exit, stale target, critical/PPL readability, access mask, Tool Help traversal, ordinal names, CNG, and RAII covered. Real protected target is environment N/A as permitted. | PASS with allowed environment N/A |
+| 12.3 Manual acceptance evidence | Standard-user OS/toolchain/elevation, live aggregate snapshot/omissions, self denial, live helper, stale target, redaction, and zero residual helper/probe counts are recorded above. | EVIDENCE RECORDED; USER REVIEW PENDING |
+| 13: design and independent plan approved | Both tracked documents state user-approved status. | PASS |
+| 13: catalog/admit Fake contracts | Focused Fake/core results above. | PASS |
+| 13: Windows 11 read-only/admission validation | Focused Windows results and standard-user evidence above. | PASS with protected-target environment N/A |
+| 13: deterministic PID reuse, exit, self, protection | `TargetChanged`, `TargetExited`, exact-self `ProtectedTarget`, and Fake protected/unreadable cases passed. | PASS |
+| 13: failure paths have no process side effect or HANDLE leak | Fake exact counters, real RAII exact-close test, source guards, exact-child cleanup, and residual helper count 0. | PASS |
+| 13: no prohibited product/API surface | Changed-file audit and source guards above. | PASS |
+| 13: changes and limitations recorded | File list, toolchain drift, protected-target N/A, and failed aggregate gates are recorded here. | PASS |
+| Task 4 aggregate Cargo gate | Default/focused tests and fmt pass; all-feature test and both Clippy commands reproducibly fail. | **FAIL — exit gate not all green** |
+| User acceptance before Stage 2 | This record has not yet been reviewed and accepted by the user. | **PENDING** |
+
+## Limitations And Stop Gate
+
+1. The required all-feature test command fails during schema-generator compilation under the all-feature cfg combination.
+2. Both required Clippy commands fail with `-D warnings`; two diagnostics are in Stage 1 test support and the remaining diagnostics span other host areas. Fixing any of them requires source edits outside this evidence-only task.
+3. The host uses Rust/Cargo 1.96.1 rather than the plan's stated 1.96.0.
+4. A real inspectable protected target was unavailable; this is environment N/A, with deterministic Fake coverage retained.
+
+This record does **not** mark Stage 1 accepted. Stage 1 remains **AWAITING USER ACCEPTANCE**, and its aggregate exit gate is not all green. **Do not begin Stage 2 design, planning, or implementation** unless the failed gates are dispositioned and the user explicitly accepts the Stage 1 evidence.
