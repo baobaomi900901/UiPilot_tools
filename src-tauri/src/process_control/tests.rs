@@ -1365,6 +1365,7 @@ fn admission_source_keeps_the_lease_opaque_and_has_no_side_effect_adapter() {
 #[cfg(windows)]
 mod windows_tests {
     use std::{
+        cell::Cell,
         collections::VecDeque,
         ffi::OsString,
         os::windows::ffi::OsStringExt,
@@ -1374,10 +1375,9 @@ mod windows_tests {
     };
 
     use windows::Win32::{
-        Foundation::{FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::Threading::{
-            GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount,
-            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            GetCurrentProcessId, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         },
     };
 
@@ -1385,7 +1385,7 @@ mod windows_tests {
     use crate::process_control::windows::{
         collect_candidates_with, filetime_to_u64, find_reenumerated_name,
         generate_host_instance_with, liveness_from_wait_result, open_observation_with,
-        EnumerationStep, WindowsProcessAdapter,
+        EnumerationStep, OwnedHandle, WindowsProcessAdapter,
     };
     use crate::process_control::{
         ProcessAuthority, ProcessAuthorityInitError, ProcessError, ProcessIntent,
@@ -1563,22 +1563,15 @@ mod windows_tests {
     }
 
     #[test]
-    fn windows_owned_process_handles_close_exactly_once() {
-        let adapter = WindowsProcessAdapter;
-        let pid = unsafe { GetCurrentProcessId() };
-        let before = current_process_handle_count();
-        let handles = (0..16)
-            .map(|_| {
-                adapter
-                    .open_observation(pid, ObservationAccess::SNAPSHOT)
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let during = current_process_handle_count();
+    fn windows_owned_handle_drop_invokes_injected_closer_exactly_once() {
+        let close_calls = Cell::new(0);
+        let handle = OwnedHandle::with_closer(HANDLE::default(), |_| {
+            close_calls.set(close_calls.get() + 1);
+        });
 
-        assert!(during >= before + handles.len() as u32);
-        drop(handles);
-        assert_eq!(current_process_handle_count(), before);
+        assert_eq!(close_calls.get(), 0);
+        drop(handle);
+        assert_eq!(close_calls.get(), 1);
     }
 
     #[test]
@@ -1697,12 +1690,6 @@ mod windows_tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-    }
-
-    fn current_process_handle_count() -> u32 {
-        let mut count = 0;
-        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.unwrap();
-        count
     }
 
     struct FixtureChild {

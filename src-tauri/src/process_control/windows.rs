@@ -43,23 +43,53 @@ pub(super) struct OwnedProcessHandle(OwnedHandle);
 
 struct OwnedSnapshotHandle(OwnedHandle);
 
-struct OwnedHandle(HANDLE);
+pub(super) trait HandleCloser {
+    fn close(&mut self, handle: HANDLE);
+}
 
-impl OwnedHandle {
-    fn new(handle: HANDLE) -> Self {
-        Self(handle)
-    }
-
-    fn get(&self) -> HANDLE {
-        self.0
+impl<F> HandleCloser for F
+where
+    F: FnMut(HANDLE),
+{
+    fn close(&mut self, handle: HANDLE) {
+        self(handle);
     }
 }
 
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
+pub(super) struct NativeHandleCloser;
+
+impl HandleCloser for NativeHandleCloser {
+    fn close(&mut self, handle: HANDLE) {
         unsafe {
-            let _ = CloseHandle(self.0);
+            let _ = CloseHandle(handle);
         }
+    }
+}
+
+pub(super) struct OwnedHandle<C: HandleCloser = NativeHandleCloser> {
+    handle: HANDLE,
+    closer: C,
+}
+
+impl OwnedHandle<NativeHandleCloser> {
+    fn new(handle: HANDLE) -> Self {
+        Self::with_closer(handle, NativeHandleCloser)
+    }
+}
+
+impl<C: HandleCloser> OwnedHandle<C> {
+    pub(super) fn with_closer(handle: HANDLE, closer: C) -> Self {
+        Self { handle, closer }
+    }
+
+    fn get(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+impl<C: HandleCloser> Drop for OwnedHandle<C> {
+    fn drop(&mut self) {
+        self.closer.close(self.handle);
     }
 }
 
