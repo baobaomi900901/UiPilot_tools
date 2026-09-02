@@ -1362,18 +1362,25 @@ mod windows_tests {
         time::{Duration, Instant},
     };
 
-    use windows::Win32::{
-        Foundation::{FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::{
-            GetCurrentProcessId, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    use windows::{
+        core::{Error as WindowsError, HRESULT},
+        Win32::{
+            Foundation::{
+                ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, FILETIME, HANDLE,
+                WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            },
+            System::Threading::{
+                GetCurrentProcessId, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            },
         },
     };
 
     use super::*;
     use crate::process_control::windows::{
-        collect_candidates_with, filetime_to_u64, find_reenumerated_name,
-        generate_host_instance_with, liveness_from_wait_result, open_observation_with,
-        EnumerationStep, OwnedHandle, WindowsProcessAdapter,
+        classify_observation_error, classify_path_query_error, collect_candidates_with,
+        filetime_to_u64, find_reenumerated_name, generate_host_instance_with,
+        liveness_from_wait_result, open_observation_with, EnumerationStep, OwnedHandle,
+        WindowsProcessAdapter,
     };
     use crate::process_control::{
         ProcessAuthority, ProcessAuthorityInitError, ProcessError, ProcessIntent,
@@ -1497,6 +1504,68 @@ mod windows_tests {
                 false,
                 7_001,
             ))
+        );
+    }
+
+    #[test]
+    fn windows_path_query_access_denied_enters_revalidated_pathless_fallback() {
+        let pid = 7_002;
+        let path_query_failure = classify_path_query_error(WindowsError::from_hresult(
+            HRESULT::from_win32(ERROR_ACCESS_DENIED.0),
+        ));
+        let adapter = FakeProcessAdapter::default()
+            .with_enumeration(vec![Ok(candidate(pid, "fallback.exe", Some(7)))])
+            .with_process(
+                pid,
+                FakeProcessScript {
+                    open: vec![Ok(())].into(),
+                    creation_times: vec![Ok(70_020), Ok(70_020)].into(),
+                    liveness: vec![Ok(Liveness::Alive), Ok(Liveness::Alive)].into(),
+                    observations: vec![Err(path_query_failure)].into(),
+                    reenumerated_names: vec![Ok(Some("fallback.exe".into()))].into(),
+                    ..FakeProcessScript::default()
+                },
+            );
+
+        let snapshot = authority(adapter.clone()).snapshot().unwrap();
+
+        assert_eq!(snapshot.processes().len(), 1);
+        assert_eq!(snapshot.processes()[0].name(), "fallback.exe");
+        assert_eq!(snapshot.processes()[0].executable_path(), None);
+        assert_eq!(snapshot.omissions().total(), 0);
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                FakeCall::Enumerate,
+                FakeCall::Open(pid),
+                FakeCall::CreationTime(pid),
+                FakeCall::Liveness(pid),
+                FakeCall::Observation(pid),
+                FakeCall::ReenumerateName(pid),
+                FakeCall::ProcessNamesEquivalent,
+                FakeCall::Liveness(pid),
+                FakeCall::CreationTime(pid),
+            ]
+        );
+        assert_eq!(adapter.opened(), 1);
+        assert_eq!(adapter.dropped(), 1);
+    }
+
+    #[test]
+    fn windows_path_query_error_classification_is_context_specific() {
+        let error = |code| WindowsError::from_hresult(HRESULT::from_win32(code));
+
+        assert_eq!(
+            classify_path_query_error(error(ERROR_INVALID_PARAMETER.0)),
+            ObservationFailure::ExitedOrChanged
+        );
+        assert_eq!(
+            classify_path_query_error(error(ERROR_NOT_FOUND.0)),
+            ObservationFailure::ExitedOrChanged
+        );
+        assert_eq!(
+            classify_observation_error(error(ERROR_ACCESS_DENIED.0)),
+            ObservationFailure::AccessDenied
         );
     }
 

@@ -155,7 +155,7 @@ impl ProcessPlatformAdapter for WindowsProcessAdapter {
                 &mut length,
             )
         }
-        .map_err(classify_observation_error)?;
+        .map_err(classify_path_query_error)?;
         let length =
             usize::try_from(length).map_err(|_| ObservationFailure::IdentityUnavailable)?;
         if length == 0 || length > path.len() {
@@ -385,7 +385,16 @@ fn nul_terminated_slice(value: &[u16]) -> &[u16] {
     &value[..length]
 }
 
-fn classify_observation_error(error: windows::core::Error) -> ObservationFailure {
+pub(super) fn classify_path_query_error(error: windows::core::Error) -> ObservationFailure {
+    match classify_observation_error(error) {
+        ObservationFailure::ExitedOrChanged => ObservationFailure::ExitedOrChanged,
+        ObservationFailure::AccessDenied | ObservationFailure::IdentityUnavailable => {
+            ObservationFailure::IdentityUnavailable
+        }
+    }
+}
+
+pub(super) fn classify_observation_error(error: windows::core::Error) -> ObservationFailure {
     let code = error.code();
     if code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
         ObservationFailure::AccessDenied
