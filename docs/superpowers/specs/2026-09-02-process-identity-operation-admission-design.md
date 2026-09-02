@@ -185,20 +185,25 @@ Restart
 ```text
 validate target structure
   → compare hostInstanceId
-  → open PID with the access profile selected for intent
-  → compare creationTime on the opened process object
+  → open one inspection handle with limited-query access
+  → compare creationTime on the pinned process object
   → verify that the process is still alive
   → read critical and protection attributes
   → compare the exact current UiPilot host identity
   → apply protection policy
-  → return AdmittedProcess owning that same handle
+  → while retaining the inspection handle, open one final handle with the access profile selected for intent
+  → repeat identity, liveness, critical and protection checks on the final handle
+  → close the inspection handle
+  → return AdmittedProcess owning the final handle
 ```
 
 创建时间不一致时必须返回 `TargetChanged`，不能自动为新进程签发目标或继续检查新进程是否允许操作。
 
+第一次 HANDLE 在第二次打开和复核完成前始终保持进程对象存活，因此 PID 不能在两次打开之间被另一个进程复用。第二次打开仍属于同一次最终 `admit`；`admit` 返回后任何调用者都不得再按 PID 打开目标。
+
 ### 7.3 Least Access
 
-平台 Adapter 根据意图申请“身份复核所需权限 + 该意图实际执行所需的最小权限”。禁止 `PROCESS_ALL_ACCESS`、`SeDebugPrivilege` 或与意图无关的权限。
+检查 HANDLE 只申请 `PROCESS_QUERY_LIMITED_INFORMATION`。最终 HANDLE 根据意图申请“身份复核所需权限 + 该意图实际执行所需的最小权限”。禁止 `PROCESS_ALL_ACCESS`、`SeDebugPrivilege` 或与意图无关的权限。
 
 Stage 1 冻结最小权限原则、按意图选择权限的接缝和禁止项，但不提前冻结 Stage 2 的具体终止与重启算法。Stage 2 的设计必须逐项列出最终 Win32 调用与访问掩码。例如 `TerminateProcess` 需要 `PROCESS_TERMINATE`；新建替代进程不需要在旧目标中创建线程，因此 Restart 不得无理由申请 `PROCESS_CREATE_THREAD`。
 
@@ -265,7 +270,8 @@ target structure
 - `hostInstanceId` 在 `ProcessAuthority` 生命周期内不可变。
 - 快照签发和准入之间不共享可变目标注册表。
 - PID 只定位，`pid + creationTime` 才识别目标。
-- 打开 HANDLE 后的所有最终检查都针对该进程对象；不能关闭后再按 PID 打开执行。
+- 检查 HANDLE 在最终 HANDLE 打开并完成复核前始终存活，阻止两次打开之间发生 PID 复用。
+- `admit` 返回后的所有最终检查和 Stage 2 操作都针对返回的最终 HANDLE；不能关闭后再按 PID 打开执行。
 - 持有 HANDLE 会使已退出进程对象保持可识别；它不能把租约转换成后来复用相同 PID 的进程。
 - `AdmittedProcess` 不跨宿主重启、不序列化、不克隆且单次消费。
 - 确认、提权或其他可能等待的流程必须在最终准入之前完成。
@@ -300,11 +306,12 @@ Stage 1 不启用 `SeDebugPrivilege`，也不通过 PowerShell、WMI、Shell 命
 - 旧 `hostInstanceId` 返回 `ExpiredTarget`，且不打开 PID。
 - 快照后 PID 复用返回 `TargetChanged`。
 - 进程在枚举、打开或最终检查阶段退出。
+- 检查 HANDLE 在最终 HANDLE 打开前保持存活，第二次打开不能命中复用 PID。
 - 当前宿主、critical、Protected Process/PPL 和保护属性不可读。
 - 多种错误并存时遵循固定优先级。
 - 成功准入保留原 HANDLE；随后 PID 复用不改变租约目标。
 - 所有失败路径关闭临时 HANDLE，副作用调用计数为零。
-- 每个 intent 只申请测试策略声明的权限，且从不申请 all-access。
+- 检查 HANDLE 只申请 limited-query；每个 intent 的最终 HANDLE 只申请测试策略声明的权限，且从不申请 all-access。
 - 刷新目录不会使仍存活的同一身份失效。
 - 快照顺序和遗漏摘要可重复。
 - `AdmittedProcess` Drop 关闭 HANDLE，消费后不能再次使用。
