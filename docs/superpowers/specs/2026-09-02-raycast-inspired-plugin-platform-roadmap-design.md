@@ -1,7 +1,7 @@
 # Raycast-Inspired Plugin Platform Roadmap Design
 
 **Date:** 2026-09-02
-**Status:** Review — conversational sections approved; written specification awaits user acceptance
+**Status:** Approved — accepted by the user on 2026-09-02
 
 **Related:**
 
