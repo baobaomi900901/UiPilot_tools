@@ -25,6 +25,10 @@ mod message_center;
 mod native_attention;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+#[allow(dead_code, reason = "Stage 2 supplies the first production caller")]
+mod process_control;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -1432,6 +1436,36 @@ mod tests {
     }
 
     #[test]
+    fn process_control_stage_one_module_is_scoped_and_unwired() {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        let declaration = concat!(
+            "#[cfg(any(test, not(feature = \"test-instrumentation\")))]\n",
+            "#[allow(dead_code, reason = \"Stage 2 supplies the first production caller\")]\n",
+            "mod process_control;"
+        );
+
+        assert_eq!(production.matches(declaration).count(), 1);
+        assert_eq!(production.matches("process_control").count(), 1);
+        for forbidden in [
+            ".manage(process_control",
+            ".manage(Arc::new(process_control",
+            "process_control::command",
+            "process_control::build_capability",
+            "process_control::register_frontend",
+            "generate_handler![process_control",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "Stage 1 process control wiring is forbidden: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn production_modules_have_no_task6_lint_exceptions() {
         let source = include_str!("lib.rs").replace("\r\n", "\n");
         let product_cfg = "#[cfg(any(test, not(feature = \"test-instrumentation\")))]";
@@ -1460,8 +1494,18 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("test module marker is missing");
+        let process_control_exception = concat!(
+            "#[allow(dead_code, reason = \"Stage 2 supplies the first production caller\")]\n",
+            "mod process_control;"
+        );
+        assert_eq!(
+            production_root.matches(process_control_exception).count(),
+            1
+        );
+        let production_root_without_process_control_exception =
+            production_root.replacen(process_control_exception, "mod process_control;", 1);
         let allow_prefix = ["allow", "("].concat();
-        assert!(!production_root.contains(&allow_prefix));
+        assert!(!production_root_without_process_control_exception.contains(&allow_prefix));
 
         let commands_source = include_str!("commands.rs").replace("\r\n", "\n");
         let commands = commands_source
@@ -1492,7 +1536,10 @@ mod tests {
             "{commands_without_search_files_allow}\n{search_files_allow}"
         )));
         let product_sources = [
-            ("lib.rs", production_root),
+            (
+                "lib.rs",
+                production_root_without_process_control_exception.as_str(),
+            ),
             ("atomic_file.rs", include_str!("atomic_file.rs")),
             ("commands.rs", commands_without_search_files_allow.as_str()),
             ("apps/mod.rs", include_str!("apps/mod.rs")),
