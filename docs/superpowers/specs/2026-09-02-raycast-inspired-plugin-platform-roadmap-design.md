@@ -126,9 +126,9 @@ Distribution Module ──► Store / Install / Update / Rollback
 
 ### Stage 6: Developer toolchain
 
-交付稳定 TypeScript SDK、CLI、构建打包、Schema 同步、开发模式、热重载、日志、测试框架、诊断和迁移辅助。开发者不需要阅读宿主实现即可完成插件开发、测试和打包。
+交付稳定 TypeScript SDK、CLI、构建打包、Schema 同步、开发模式、热重载、日志、测试框架、诊断和迁移辅助。开发模式使用与生产安装隔离、明确标识且不可发布的本地信任路径；它复用结构、权限、Runtime 和资源校验，但不能把未签名开发包送入商店、自动更新或生产安装状态。开发者不需要阅读宿主实现即可完成插件开发、测试和打包。
 
-**Exit:** 外部开发者只依赖公开 SDK、CLI 和文档即可创建、验证、运行、测试和打包插件。
+**Exit:** 外部开发者只依赖公开 SDK、CLI 和文档即可创建、验证、运行、测试和打包插件；开发 generation 始终可识别、可撤销且不能被生产安装链信任。
 
 ### Stage 7: AI Tools
 
@@ -144,7 +144,7 @@ Distribution Module ──► Store / Install / Update / Rollback
 
 ### Stage 9: Trust and review
 
-建立开发者身份、包签名、来源证明、权限审查、静态检查、恶意包处置、签名撤销和审核记录。审核结论必须绑定不可变包内容。
+建立开发者身份、包签名、来源证明、权限审查、静态检查、恶意包处置、签名撤销和审核记录。审核结论必须绑定不可变包内容。签名体系必须保持 Stage 6 已验收的开发信任路径与生产信任路径隔离，不能把开发标记或本地授权解释为生产签名。
 
 **Exit:** 每个可分发包具有可验证身份、内容 Hash、签名、审核状态和撤销策略。
 
@@ -237,7 +237,7 @@ Stage 8 可以为不同 Host-owned System Module 分批交付平台 Adapter，�
 
 ## 11. Canonical Data Flows
 
-### 11.1 Installation
+### 11.1 Distributable package installation
 
 ```text
 Plugin Package
@@ -252,7 +252,21 @@ Plugin Package
 
 任何一步失败都保留旧版本；新版本不能部分生效。
 
-### 11.2 Invocation
+### 11.2 Development load
+
+```text
+User-selected development directory or package
+  → Static structure and schema validation
+  → Host/platform compatibility check
+  → Permission diff and user consent
+  → Explicit development identity
+  → Staging Runtime readiness
+  → Atomic development generation activation
+```
+
+开发加载是独立信任路径，不是生产签名校验的旁路。开发 generation 必须持续显示开发身份，不能发布到商店、接收自动更新或转化为受信任生产包；Runtime、Capability、权限和资源限制不得因开发模式放宽。
+
+### 11.3 Invocation
 
 ```text
 Command / Action / AI Tool
@@ -260,14 +274,15 @@ Command / Action / AI Tool
   → Runtime handling
   → Capability facade
   → Permission and policy admission
+  → Host confirmation when required
   → Platform adapter
   → Stable outcome or stable error
   → Host UI feedback
 ```
 
-Command、Action 和 AI Tool 只能改变入口，不能绕过中间的权限与准入链。
+Command、Action 和 AI Tool 只能改变入口，不能绕过中间的权限、准入与宿主确认链。用户拒绝或取消确认必须产生不调用 Platform Adapter、不产生系统副作用的稳定 outcome。
 
-### 11.3 Update
+### 11.4 Update
 
 ```text
 Store metadata
