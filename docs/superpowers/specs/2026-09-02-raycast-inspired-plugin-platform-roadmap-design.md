@@ -46,7 +46,7 @@
 
 采用“宿主管理、逐阶段深化”的演进路线。
 
-现有 Public Plugin API v1 是兼容基线。每项新增能力都以完整垂直切片交付：宿主 Module、权限、Runtime Interface、Manifest/Schema、CLI 校验、参考或验收 fixture、文档、自动测试和真实平台验收。平台先建立安全能力底座，再扩展插件表达能力、开发者体验和分发生态。
+现有 Public Plugin API v1 是兼容基线。每项向公共插件开放的能力都以完整垂直切片交付：宿主 Module、权限、Runtime Interface、Manifest/Schema、CLI 校验、参考或验收 fixture、文档、自动测试和真实平台验收。Stage 1–2 只建立 Stage 3 所需的宿主前置能力，不要求提前修改公共插件合同。平台先建立安全能力底座，再扩展插件表达能力、开发者体验和分发生态。
 
 ### 4.1 Rejected: Raycast source compatibility first
 
@@ -177,7 +177,7 @@ Stage 12 ← Stage 11 ← Stage 10 ← Stage 9 ← Stage 8 ← Stage 7
 
 阶段之间默认串行。某阶段内部只有在该阶段实施计划证明任务独立、不会共享未冻结 Interface 或状态时才可并行。
 
-Stage 8 可以为不同 Host-owned System Module 分批交付平台 Adapter，但任何 Adapter 都必须等待对应共享 Interface 在前置阶段验收。Stage 9 的签名原型可以在 Stage 8 期间做不进入生产的研究，但签名设计、实施计划和生产代码仍须等待 Stage 8 阶段验收。
+Stage 8 可以为不同 Host-owned System Module 分批交付平台 Adapter，但任何 Adapter 都必须等待对应共享 Interface 在前置阶段验收。Stage 8 阶段验收前，不开展 Stage 9 的原型、详细设计、实施计划或生产代码。
 
 ## 8. Stage Gate State Machine
 
@@ -298,7 +298,7 @@ Store metadata
 
 ## 13. Verification Strategy
 
-每阶段验收材料统一包括：
+每阶段只提交与该阶段范围适用的验收材料；不适用项必须明确标记 `N/A` 并说明原因，不能为了满足清单而提前扩展公共合同。材料类型包括：
 
 - 已批准的阶段设计规格和实施计划。
 - 聚焦测试以及受影响的完整回归结果。

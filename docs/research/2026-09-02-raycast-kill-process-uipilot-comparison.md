@@ -2,13 +2,13 @@
 
 - 研究日期：2026-09-02
 - Raycast 源码基线：[`b2293b093846d374e0b703c832787dd2015800b3`](https://github.com/raycast/extensions/tree/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/)
-- UiPilot 基线：当前工作区 `0.3.4`（[`package.json` 第 3 行](/D:/code/UiPilot_tools/package.json:3)、[`PublicPluginHost::current` 第 1165–1177 行](/D:/code/UiPilot_tools/src-tauri/src/public_plugins.rs:1165)）
+- UiPilot 基线：当前工作区 `0.3.4`（[`package.json` 第 3 行](../../package.json)、[`PublicPluginHost::current` 第 1165–1177 行](../../src-tauri/src/public_plugins.rs)）
 
 ## 结论先行
 
 Raycast 的 Kill Process 已经是一套完整的跨平台进程管理扩展：它能枚举进程，展示 CPU/内存，搜索、排序和聚合应用进程，并提供终止、强制终止、终止同名进程、终止进程树、重启、复制路径、自动刷新和 AI 工具入口。它能做到这些的关键不只是 `@raycast/api`，而是 Raycast 允许扩展直接使用 Node.js 的 `child_process`、文件系统和操作系统命令。源码分别在 macOS 调用 `ps`、`kill`、`killall`、`pgrep`、`open`，在 Windows 调用 PowerShell、WMI/CIM 和 `taskkill`。[进程执行层](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/process.ts#L1-L53)；[平台命令层](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/platform.ts#L32-L165)
 
-UiPilot `0.3.4` 的公开插件 API 目前不能实现真实的 Kill Process。公开 Runtime 明确不能访问 Shell、任意文件、原生二进制、Tauri 或原生输入；现有权限中也没有进程枚举或进程控制权限。能做的是插件私有存储、设置读取、受控 HTTPS、受控通知/计时器，以及 `mainResult`、单例窗口或 Panel UI。[公开插件 Runtime 边界](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:63)；[已实现权限](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:200)；[v1 明确不支持的能力](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:215)
+UiPilot `0.3.4` 的公开插件 API 目前不能实现真实的 Kill Process。公开 Runtime 明确不能访问 Shell、任意文件、原生二进制、Tauri 或原生输入；现有权限中也没有进程枚举或进程控制权限。能做的是插件私有存储、设置读取、受控 HTTPS、受控通知/计时器，以及 `mainResult`、单例窗口或 Panel UI。[公开插件 Runtime 边界](../plugin-sdk/public-plugin-v1.md)；[已实现权限](../plugin-sdk/public-plugin-v1.md)；[v1 明确不支持的能力](../plugin-sdk/public-plugin-v1.md)
 
 因此：
 
@@ -39,13 +39,13 @@ UiPilot `0.3.4` 的公开插件 API 目前不能实现真实的 Kill Process。�
 
 以当前源码和合同为准，主要核对：
 
-- [`Public Plugin API v1`](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:1)
-- [`第三方插件开发教程`](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-developer-guide.md:1)
-- [`TypeScript API v1`](/D:/code/UiPilot_tools/docs/plugin-sdk/uipilot-plugin-api-v1.d.ts:1)
-- [`Manifest Schema`](/D:/code/UiPilot_tools/docs/plugin-sdk/uipilot-plugin-v1.schema.json:1)
-- [`公开插件 UI 规范`](/D:/code/UiPilot_tools/docs/ui-guidelines.md:1)
-- [`PublicPermission` 实现](/D:/code/UiPilot_tools/src-tauri/src/public_plugins/manifest.rs:20)
-- [`公开 WebView CSP`](/D:/code/UiPilot_tools/src-tauri/src/public_plugins.rs:87)
+- [`Public Plugin API v1`](../plugin-sdk/public-plugin-v1.md)
+- [`第三方插件开发教程`](../plugin-sdk/public-plugin-developer-guide.md)
+- [`TypeScript API v1`](../plugin-sdk/uipilot-plugin-api-v1.d.ts)
+- [`Manifest Schema`](../plugin-sdk/uipilot-plugin-v1.schema.json)
+- [`公开插件 UI 规范`](../ui-guidelines.md)
+- [`PublicPermission` 实现](../../src-tauri/src/public_plugins/manifest.rs)
+- [`公开 WebView CSP`](../../src-tauri/src/public_plugins.rs)
 
 另用仓库 CodeGraph 和全文检索检查了 `src/`、`src-tauri/`、`packages/`、`examples/` 与 `docs/`。当前没有面向用户的进程管理/终止功能；匹配到的 `TerminateProcess`、`Stop-Process` 或 `child_process` 用途属于测试进程清理、开发脚本或插件 CLI 构建适配，不是启动器功能，也没有公开给插件。
 
@@ -61,8 +61,8 @@ Manifest 同时注册一个 `view` 命令和三个 AI tools：`list-processes`�
 
 - macOS 直接执行 `ps -eo pid,ppid,pcpu,rss,comm`；Windows 先用 `Get-Process` 取 PID、名称、Working Set 和路径，再用 `Win32_PerfFormattedData_PerfProc_Process` 补 CPU，并按逻辑核心数归一化。[平台读取命令](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/platform.ts#L32-L113)
 - UI 初始加载进程；Windows 的 CPU 查询在后台完成并缓存，后续刷新先复用缓存，避免列表先全部显示为 0。[主 UI 第 106–162 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L106-L162)
-- 默认按 CPU 降序，可切换按内存降序；排序下拉使用 `storeValue` 持久化。[主 UI 第 167–186、385–407 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L167-L186)
-- 搜索始终匹配进程名，可按偏好追加路径、PID 和聚合应用名；每行显示 CPU 百分比与内存，并可选显示 PID/路径。[主 UI 第 335–372、415–466 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L335-L372)
+- 默认按 CPU 降序，可切换按内存降序；排序下拉使用 `storeValue` 持久化。[排序实现第 167–186 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L167-L186)；[排序下拉第 385–407 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L385-L407)
+- 搜索始终匹配进程名，可按偏好追加路径、PID 和聚合应用名；每行显示 CPU 百分比与内存，并可选显示 PID/路径。[副标题第 335–372 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L335-L372)；[过滤与 accessories 第 415–466 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L415-L466)
 - macOS `.app` bundle 内的主进程与 helper 会聚合为一项，CPU/内存求和并记录子 PID；Windows 路径不匹配 `.app`，所以该聚合逻辑实际只对 macOS 生效。[聚合实现](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/process-grouping.ts#L3-L62)
 - 自动刷新默认 3000 ms，可设为 0；代码强制有效间隔至少 1000 ms，并在 `background` launch type 下完全禁用刷新。[刷新 Hook](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/hooks/use-interval.tsx#L5-L27)；[后台刷新判定](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/refresh.ts#L1-L3)
 
@@ -76,11 +76,13 @@ Manifest 同时注册一个 `view` 命令和三个 AI tools：`list-processes`�
 4. Force Restart（存在可启动路径时）
 5. Kill All
 6. Force Kill All
-7. Copy Path（路径存在时）
+7. Copy Path（当前实现通常显示；无法取得路径时可能复制空字符串）
 8. Reload
 9. 启用/禁用应用聚合
 
 [ActionPanel 源码第 467–518 行](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L467-L518)
+
+进程读取层会把缺失路径归一化为 `""`，但 UI 只排除 `null`/`undefined`，因此没有可读路径的进程仍可能显示 Copy Path 并复制空字符串。[路径归一化](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/process.ts#L107-L123)；[Copy Path 条件](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L499-L505)
 
 Kill/Kill All/Restart 默认先弹确认框，并启用 `rememberUserChoice`；用户也可通过偏好完全跳过确认。成功后用 Toast 反馈，立即从本地列表移除结果或重新读取，并按偏好关闭窗口、回根搜索或清空搜索栏。[单进程终止](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L220-L260)；[同名终止与重启](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/index.tsx#L262-L333)
 
@@ -107,7 +109,7 @@ Kill/Kill All/Restart 默认先弹确认框，并启用 `rememberUserChoice`；�
 ### AI tools
 
 - `list-processes` 支持多个搜索词、任意 `Process` 字段排序和升/降序，找不到结果时抛错。[源码](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/tools/list-processes.ts#L4-L70)
-- `kill-process` 按 PID 终止；`killall-process` 按精确进程名终止全部实例。两者都导出 `Tool.Confirmation`，由 Raycast 在执行危险工具前生成人在回路的确认 UI。[单进程 tool](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/tools/kill-process.ts#L30-L77)；[同名 tool](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/tools/killall-process.ts#L17-L53)；[Raycast 官方 Tool/Confirmation 文档](https://developers.raycast.com/ai/learn-core-concepts-of-ai-extensions)
+- `kill-process` 按 PID 终止；`killall-process` 的接口说明和 AI 指令要求精确进程名，但 Windows 实现把输入直接传给支持通配符的 `Get-Process -Name`，所以包含 `*`、`?` 或 `[]` 的输入可能匹配超出字面名称的进程。两者都导出 `Tool.Confirmation`，由 Raycast 在执行危险工具前生成人在回路的确认 UI。[单进程 tool](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/tools/kill-process.ts#L30-L77)；[同名 tool](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/tools/killall-process.ts#L17-L53)；[Windows 命令构造](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/src/utils/platform.ts#L153-L165)；[Microsoft `Get-Process -Name` 文档](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-process#-name)；[Raycast 官方 Tool/Confirmation 文档](https://developers.raycast.com/ai/learn-core-concepts-of-ai-extensions)
 - `ai.yaml` 指示 AI 先列进程、精确匹配名称、默认不杀 helper、按 PID 请求时直接调用 kill tool，并把确认责任交给 tool。[AI 指令](https://github.com/raycast/extensions/blob/b2293b093846d374e0b703c832787dd2015800b3/extensions/kill-process/ai.yaml#L1-L52)
 - 没有 AI 重启 tool；Restart/Force Restart 只存在于可视 UI。
 
@@ -152,13 +154,13 @@ Raycast 官方当前说明 AI Extensions 暂不支持 Windows，因此在 Window
 - `window`：一个宿主管理的单例内容窗口。
 - `panel`：一个挂载在启动器内的插件 Panel。
 
-[合同总览与 Manifest 约束](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:5)；[响应合同](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:142)
+[合同总览与 Manifest 约束](../plugin-sdk/public-plugin-v1.md)；[响应合同](../plugin-sdk/public-plugin-v1.md)
 
-`mainResult` 每项只有 `id/title/subtitle/detail`，可选的唯一动作是宿主持有的 `copyText`；不支持 `actions[]`、自定义标签、回调、链接、命令、HTML/Markdown 或多个动作。[类型定义](/D:/code/UiPilot_tools/docs/plugin-sdk/uipilot-plugin-api-v1.d.ts:74)；[合同限制](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:144)
+`mainResult` 每项只有 `id/title/subtitle/detail`，可选的唯一动作是宿主持有的 `copyText`；不支持 `actions[]`、自定义标签、回调、链接、命令、HTML/Markdown 或多个动作。[类型定义](../plugin-sdk/uipilot-plugin-api-v1.d.ts)；[合同限制](../plugin-sdk/public-plugin-v1.md)
 
-Panel/Window 能运行插件自己的 HTML/CSS/JS，因此可以画出接近 Raycast 列表的界面。Panel 有 `onUpdate`、有限 Host Key、`focusHostInput()`、`requestHide()`、私有存储和可选剪贴板历史桥；Window 有 `onUpdate`、私有存储、关闭和受控计时器。[Window 类型](/D:/code/UiPilot_tools/docs/plugin-sdk/uipilot-plugin-api-v1.d.ts:113)；[Panel 类型](/D:/code/UiPilot_tools/docs/plugin-sdk/uipilot-plugin-api-v1.d.ts:175)
+Panel/Window 能运行插件自己的 HTML/CSS/JS，因此可以画出接近 Raycast 列表的界面。Panel 有 `onUpdate`、有限 Host Key、`focusHostInput()`、`requestHide()`、私有存储和可选剪贴板历史桥；Window 有 `onUpdate`、私有存储、关闭和受控计时器。[Window 类型](../plugin-sdk/uipilot-plugin-api-v1.d.ts)；[Panel 类型](../plugin-sdk/uipilot-plugin-api-v1.d.ts)
 
-不过这些内容页不能调用 Tauri、网络或 Shell；Panel 的按键路由也只允许 Manifest 声明的少数键。[开发教程第 571–614 行](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-developer-guide.md:571)
+不过这些内容页不能调用 Tauri、网络或 Shell；Panel 的按键路由也只允许 Manifest 声明的少数键。[开发教程第 571–614 行](../plugin-sdk/public-plugin-developer-guide.md)
 
 ### Runtime 与权限
 
@@ -169,11 +171,11 @@ Runtime API 只暴露：
 - 非 secret 设置读取和 secret 是否已配置；
 - Windows 请求绑定的即时/延迟纯文本通知。
 
-[Runtime TypeScript API](/D:/code/UiPilot_tools/docs/plugin-sdk/uipilot-plugin-api-v1.d.ts:15)；[Runtime 合同](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:63)
+[Runtime TypeScript API](../plugin-sdk/uipilot-plugin-api-v1.d.ts)；[Runtime 合同](../plugin-sdk/public-plugin-v1.md)
 
-当前实际可用权限为 `ui.window`、`ui.panel`、`clipboard.write`，以及 Windows 上的剪贴板历史、HTTPS、通知和受控计时器。源码还解析了若干保留名字，但 `is_available` 对它们返回 false，安装会失败；其中同样没有 `process.read`、`process.terminate` 或 `shell`。[权限实现](/D:/code/UiPilot_tools/src-tauri/src/public_plugins/manifest.rs:20)；[公开合同](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:200)
+当前实际可用权限为 `ui.window`、`ui.panel`、`clipboard.write`，以及 Windows 上的剪贴板历史、HTTPS、通知和受控计时器。源码还解析了若干保留名字，但 `is_available` 对它们返回 false，安装会失败；其中同样没有 `process.read`、`process.terminate` 或 `shell`。[权限实现](../../src-tauri/src/public_plugins/manifest.rs)；[公开合同](../plugin-sdk/public-plugin-v1.md)
 
-公开 WebView 的 CSP 只允许自身脚本/样式、宿主 IPC 和 `data:` 图片，媒体、对象、frame、form action 均关闭；合同进一步明确不提供浏览器网络、原始 socket、任意文件、原生二进制和 Shell。[CSP 实现](/D:/code/UiPilot_tools/src-tauri/src/public_plugins.rs:87)；[Unsupported in v1](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-v1.md:215)
+公开 WebView 的 CSP 只允许自身脚本/样式、宿主 IPC 和 `data:` 图片，媒体、对象、frame、form action 均关闭；合同进一步明确不提供浏览器网络、原始 socket、任意文件、原生二进制和 Shell。[CSP 实现](../../src-tauri/src/public_plugins.rs)；[Unsupported in v1](../plugin-sdk/public-plugin-v1.md)
 
 ## 逐项功能差异
 
@@ -208,7 +210,7 @@ Runtime API 只暴露：
 - Panel 的列表布局、CPU/内存 accessory、空状态、加载状态、主题适配和键盘选择模型。
 - boolean/number/select 类型偏好与插件私有状态。
 
-UiPilot 的 Panel 设计规范本身支持紧凑、键盘优先的列表工作流，并要求方向键、Enter、Escape、Tab 和 Light/Dark 对等；视觉层不是主要障碍。[Panel 布局规范](/D:/code/UiPilot_tools/docs/ui-guidelines.md:128)；[键盘规范](/D:/code/UiPilot_tools/docs/ui-guidelines.md:172)；[公开插件规则](/D:/code/UiPilot_tools/docs/ui-guidelines.md:191)
+UiPilot 的 Panel 设计规范本身支持紧凑、键盘优先的列表工作流，并要求方向键、Enter、Escape、Tab 和 Light/Dark 对等；视觉层不是主要障碍。[Panel 布局规范](../ui-guidelines.md)；[键盘规范](../ui-guidelines.md)；[公开插件规则](../ui-guidelines.md)
 
 ### 当前不能由公开插件完成的部分
 
@@ -219,7 +221,7 @@ UiPilot 的 Panel 设计规范本身支持紧凑、键盘优先的列表工作�
 3. 以 PID、名称或树为范围终止进程，并区分普通/强制权限。
 4. 验证并重新启动可执行文件或应用 bundle。
 
-公开插件文档明确要求遇到未覆盖需求时不要绕过 WebView/Tauri 边界，而应等待宿主公开版本化 API。[开发教程第 887–898 行](/D:/code/UiPilot_tools/docs/plugin-sdk/public-plugin-developer-guide.md:887)
+公开插件文档明确要求遇到未覆盖需求时不要绕过 WebView/Tauri 边界，而应等待宿主公开版本化 API。[开发教程第 887–898 行](../plugin-sdk/public-plugin-developer-guide.md)
 
 ### 最小产品方向（仅作为差异结论，不是实现方案）
 
