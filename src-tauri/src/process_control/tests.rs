@@ -1327,7 +1327,14 @@ fn admission_source_keeps_the_lease_opaque_and_has_no_side_effect_adapter() {
     let process_module = include_str!("mod.rs");
     let process_core = include_str!("core.rs");
 
-    assert!(!process_module.contains("CoreAdmission"));
+    assert_eq!(
+        process_module
+            .matches("core::CoreAdmission<windows::OwnedProcessHandle>")
+            .count(),
+        1
+    );
+    assert!(!process_module.contains("pub(crate) _inner"));
+    assert!(!process_module.contains("raw_handle"));
     for forbidden in [
         "derive(Clone",
         "Serialize for CoreAdmission",
@@ -1352,5 +1359,413 @@ fn admission_source_keeps_the_lease_opaque_and_has_no_side_effect_adapter() {
         .expect("CoreAuthority must follow the Adapter");
     for forbidden in ["terminate", "restart", "operation", "side_effect"] {
         assert!(!adapter_source.contains(forbidden));
+    }
+}
+
+#[cfg(windows)]
+mod windows_tests {
+    use std::{
+        collections::VecDeque,
+        ffi::OsString,
+        os::windows::ffi::OsStringExt,
+        process::{Child, Command, ExitStatus, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use windows::Win32::{
+        Foundation::{FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{
+            GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        },
+    };
+
+    use super::*;
+    use crate::process_control::windows::{
+        collect_candidates_with, filetime_to_u64, find_reenumerated_name,
+        generate_host_instance_with, liveness_from_wait_result, open_observation_with,
+        EnumerationStep, WindowsProcessAdapter,
+    };
+    use crate::process_control::{
+        ProcessAuthority, ProcessAuthorityInitError, ProcessError, ProcessIntent,
+    };
+
+    const FIXTURE_TEST: &str = "process_control::tests::windows_tests::windows_fixture_child";
+    const FIXTURE_MARKER: &str = "UIPILOT_PROCESS_CONTROL_TEST_CHILD";
+
+    #[test]
+    fn windows_cng_generation_seam_accepts_successful_fill() {
+        let host = generate_host_instance_with(|bytes| {
+            bytes.copy_from_slice(&[0x5a; 16]);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(host.as_bytes(), [0x5a; 16]);
+    }
+
+    #[test]
+    fn windows_cng_generation_seam_redacts_fill_failure() {
+        assert_eq!(
+            generate_host_instance_with(|_| Err(())),
+            Err(ProcessAuthorityInitError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn windows_toolhelp_end_is_distinct_from_traversal_failure() {
+        let mut complete = VecDeque::from([
+            EnumerationStep::Entry(candidate(41, "first.exe", Some(4))),
+            EnumerationStep::End,
+        ]);
+        let complete = collect_candidates_with(|| complete.pop_front().unwrap());
+        assert_eq!(complete, vec![Ok(candidate(41, "first.exe", Some(4)))]);
+
+        let mut failed = VecDeque::from([
+            EnumerationStep::Entry(candidate(42, "second.exe", None)),
+            EnumerationStep::Failed,
+        ]);
+        let failed = collect_candidates_with(|| failed.pop_front().unwrap());
+        assert_eq!(
+            failed,
+            vec![
+                Ok(candidate(42, "second.exe", None)),
+                Err(EnumerationFailure::Unavailable),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_reenumeration_rejects_a_name_from_incomplete_traversal() {
+        assert_eq!(
+            find_reenumerated_name(
+                vec![
+                    Ok((41, "complete.exe".into())),
+                    Ok((42, "other.exe".into()))
+                ],
+                41,
+            ),
+            Ok(Some("complete.exe".into()))
+        );
+        assert_eq!(
+            find_reenumerated_name(
+                vec![
+                    Ok((41, "incomplete.exe".into())),
+                    Err(EnumerationFailure::Unavailable),
+                ],
+                41,
+            ),
+            Err(ObservationFailure::IdentityUnavailable)
+        );
+    }
+
+    #[test]
+    fn windows_filetime_conversion_preserves_all_64_bits() {
+        assert_eq!(
+            filetime_to_u64(FILETIME {
+                dwLowDateTime: 0x89ab_cdef,
+                dwHighDateTime: 0x0123_4567,
+            }),
+            0x0123_4567_89ab_cdef
+        );
+    }
+
+    #[test]
+    fn windows_wait_result_mapping_is_exact() {
+        assert_eq!(liveness_from_wait_result(WAIT_TIMEOUT), Ok(Liveness::Alive));
+        assert_eq!(
+            liveness_from_wait_result(WAIT_OBJECT_0),
+            Ok(Liveness::Exited)
+        );
+        assert_eq!(
+            liveness_from_wait_result(WAIT_FAILED),
+            Err(ObservationFailure::AccessDenied)
+        );
+        assert_eq!(
+            liveness_from_wait_result(windows::Win32::Foundation::WAIT_EVENT(17)),
+            Err(ObservationFailure::IdentityUnavailable)
+        );
+    }
+
+    #[test]
+    fn windows_open_observation_uses_exact_access_and_never_inherits() {
+        let mut captured = None;
+
+        let result = open_observation_with(
+            7_001,
+            ObservationAccess::SNAPSHOT,
+            |access, inherit, pid| {
+                captured = Some((access, inherit, pid));
+                Err::<(), _>(ObservationFailure::AccessDenied)
+            },
+        );
+
+        assert_eq!(result, Err(ObservationFailure::AccessDenied));
+        assert_eq!(
+            captured,
+            Some((
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                7_001,
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_process_names_use_ordinal_unicode_and_native_wide_values() {
+        let adapter = WindowsProcessAdapter;
+        assert!(adapter
+            .process_names_equivalent(OsStr::new("ÖRBIT.EXE"), OsStr::new("örbit.exe"))
+            .unwrap());
+
+        let unpaired = OsString::from_wide(&[0xd800, b'.' as u16, b'e' as u16]);
+        let same_unpaired = OsString::from_wide(&[0xd800, b'.' as u16, b'e' as u16]);
+        let other_unpaired = OsString::from_wide(&[0xd801, b'.' as u16, b'e' as u16]);
+        assert!(adapter
+            .process_names_equivalent(&unpaired, &same_unpaired)
+            .unwrap());
+        assert!(!adapter
+            .process_names_equivalent(&unpaired, &other_unpaired)
+            .unwrap());
+    }
+
+    #[test]
+    fn windows_current_process_path_reconciles_and_self_is_protected() {
+        let authority = ProcessAuthority::new().unwrap();
+        let current_pid = unsafe { GetCurrentProcessId() };
+        let record = snapshot_record_for_pid(&authority, current_pid, Duration::from_secs(5));
+
+        assert!(record.executable_path().is_some());
+        assert_eq!(record.pid(), current_pid);
+        assert_eq!(
+            authority
+                .admit(record.target(), ProcessIntent::Terminate)
+                .err(),
+            Some(ProcessError::ProtectedTarget)
+        );
+    }
+
+    #[test]
+    fn windows_current_process_critical_and_ppl_queries_are_readable_and_unprotected() {
+        let adapter = WindowsProcessAdapter;
+        let handle = adapter
+            .open_observation(
+                unsafe { GetCurrentProcessId() },
+                ObservationAccess::SNAPSHOT,
+            )
+            .unwrap();
+
+        assert_eq!(
+            adapter.protection(&handle),
+            Ok(ProcessProtection::new(false, false))
+        );
+    }
+
+    #[test]
+    fn windows_owned_process_handles_close_exactly_once() {
+        let adapter = WindowsProcessAdapter;
+        let pid = unsafe { GetCurrentProcessId() };
+        let before = current_process_handle_count();
+        let handles = (0..16)
+            .map(|_| {
+                adapter
+                    .open_observation(pid, ObservationAccess::SNAPSHOT)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let during = current_process_handle_count();
+
+        assert!(during >= before + handles.len() as u32);
+        drop(handles);
+        assert_eq!(current_process_handle_count(), before);
+    }
+
+    #[test]
+    fn windows_retained_ordinary_child_can_be_admitted_read_only() {
+        let mut child = FixtureChild::spawn(Duration::from_secs(30));
+        let authority = ProcessAuthority::new().unwrap();
+        let record = snapshot_record_for_pid(&authority, child.id(), Duration::from_secs(5));
+
+        let admission = authority
+            .admit(record.target(), ProcessIntent::Restart)
+            .unwrap();
+        drop(admission);
+
+        child.cleanup();
+    }
+
+    #[test]
+    fn windows_child_exit_code_259_is_target_exited_not_alive() {
+        let mut child = FixtureChild::spawn(Duration::from_secs(2));
+        let authority = ProcessAuthority::new().unwrap();
+        let record = snapshot_record_for_pid(&authority, child.id(), Duration::from_secs(1));
+        let admission = authority
+            .admit(record.target(), ProcessIntent::ForceTerminate)
+            .unwrap();
+        drop(admission);
+
+        let status = child
+            .wait_for_exit(Duration::from_secs(5))
+            .expect("fixture child did not exit in time");
+        assert_eq!(status.code(), Some(259));
+        assert_eq!(
+            authority
+                .admit(record.target(), ProcessIntent::ForceTerminate)
+                .err(),
+            Some(ProcessError::TargetExited)
+        );
+    }
+
+    #[test]
+    fn windows_inspectable_protected_target_is_rejected_or_environment_is_na() {
+        let authority = ProcessAuthority::new().unwrap();
+        let current_pid = unsafe { GetCurrentProcessId() };
+        let snapshot = authority.snapshot().unwrap();
+
+        if snapshot.processes().iter().any(|record| {
+            record.pid() != current_pid
+                && authority
+                    .admit(record.target(), ProcessIntent::Terminate)
+                    .err()
+                    == Some(ProcessError::ProtectedTarget)
+        }) {
+            return;
+        }
+
+        eprintln!("environment N/A: no inspectable protected process was present");
+    }
+
+    #[test]
+    fn windows_source_has_no_process_side_effect_or_fallback_path() {
+        let source = include_str!("windows.rs");
+        let module = include_str!("mod.rs");
+
+        for forbidden in [
+            "PowerShell",
+            "powershell",
+            "WMI",
+            "wmic",
+            "ShellExecute",
+            "NtQuery",
+            "SeDebugPrivilege",
+            "GetExitCodeProcess",
+            "TerminateProcess",
+            "PROCESS_ALL_ACCESS",
+            "PROCESS_TERMINATE",
+        ] {
+            assert!(!source.contains(forbidden), "found forbidden {forbidden}");
+        }
+        assert!(source.contains("BCryptGenRandom(None"));
+        assert!(source.contains("BCRYPT_USE_SYSTEM_PREFERRED_RNG"));
+        assert!(source.contains("OpenProcess(access, false, pid)"));
+        assert!(module.contains("cfg(not(windows))"));
+        assert!(!module.contains("raw_handle"));
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by Windows process-control tests"]
+    fn windows_fixture_child() {
+        assert_eq!(std::env::var(FIXTURE_MARKER).as_deref(), Ok("1"));
+        let delay = std::env::var("UIPILOT_PROCESS_CONTROL_TEST_DELAY_MS")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        thread::sleep(Duration::from_millis(delay));
+        std::process::exit(259);
+    }
+
+    fn snapshot_record_for_pid(
+        authority: &ProcessAuthority,
+        pid: u32,
+        timeout: Duration,
+    ) -> crate::process_control::ProcessRecord {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(record) = authority
+                .snapshot()
+                .unwrap()
+                .processes()
+                .iter()
+                .find(|record| record.pid() == pid)
+            {
+                return record.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process did not enter the catalog"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn current_process_handle_count() -> u32 {
+        let mut count = 0;
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.unwrap();
+        count
+    }
+
+    struct FixtureChild {
+        child: Child,
+    }
+
+    impl FixtureChild {
+        fn spawn(delay: Duration) -> Self {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", FIXTURE_TEST, "--test-threads=1"])
+                .env(FIXTURE_MARKER, "1")
+                .env(
+                    "UIPILOT_PROCESS_CONTROL_TEST_DELAY_MS",
+                    delay.as_millis().to_string(),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            Self { child }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => return Some(status),
+                    Err(_) => return None,
+                    Ok(None) => {}
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn cleanup(&mut self) {
+            assert!(
+                self.cleanup_inner(),
+                "fixture child cleanup did not complete"
+            );
+        }
+
+        fn cleanup_inner(&mut self) -> bool {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Err(_) => return false,
+                Ok(None) => {}
+            }
+            let _ = self.child.kill();
+            self.wait_for_exit(Duration::from_secs(5)).is_some()
+        }
+    }
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            let _ = self.cleanup_inner();
+        }
     }
 }
