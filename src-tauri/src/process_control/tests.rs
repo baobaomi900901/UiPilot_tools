@@ -968,6 +968,96 @@ fn admission_maps_exit_before_open_to_target_exited_without_a_handle() {
 }
 
 #[test]
+fn admission_maps_observation_open_denials_without_opening_or_continuing() {
+    for (offset, failure) in [
+        ObservationFailure::AccessDenied,
+        ObservationFailure::IdentityUnavailable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pid = 940 + offset as u32;
+        let creation_time = 9_400 + offset as u64;
+        let adapter = FakeProcessAdapter::default().with_process(
+            pid,
+            FakeProcessScript {
+                open: vec![Err(failure)].into(),
+                creation_times: vec![Ok(creation_time)].into(),
+                liveness: vec![Ok(Liveness::Alive)].into(),
+                protections: vec![Ok(ProcessProtection::new(false, false))].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+
+        assert_eq!(
+            authority(adapter.clone())
+                .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+                .err(),
+            Some(ProcessError::InspectionDenied)
+        );
+        assert_eq!(adapter.calls(), vec![FakeCall::Open(pid)]);
+        assert_eq!(
+            adapter.requested_access(),
+            vec![ObservationAccess::SNAPSHOT]
+        );
+        assert_eq!(adapter.opened(), 0);
+        assert_eq!(adapter.dropped(), 0);
+    }
+}
+
+#[test]
+fn admission_maps_creation_time_failures_and_closes_without_continuing() {
+    for (offset, (creation_result, expected_error)) in [
+        (
+            Err(ObservationFailure::AccessDenied),
+            ProcessError::InspectionDenied,
+        ),
+        (
+            Err(ObservationFailure::IdentityUnavailable),
+            ProcessError::InspectionDenied,
+        ),
+        (
+            Err(ObservationFailure::ExitedOrChanged),
+            ProcessError::TargetExited,
+        ),
+        (Ok(0), ProcessError::InspectionDenied),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pid = 950 + offset as u32;
+        let creation_time = 9_500 + offset as u64;
+        let adapter = FakeProcessAdapter::default().with_process(
+            pid,
+            FakeProcessScript {
+                open: vec![Ok(())].into(),
+                creation_times: vec![creation_result].into(),
+                liveness: vec![Ok(Liveness::Alive)].into(),
+                protections: vec![Ok(ProcessProtection::new(false, false))].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+
+        assert_eq!(
+            authority(adapter.clone())
+                .admit(&target(pid, creation_time), ProcessIntent::ForceTerminate)
+                .err(),
+            Some(expected_error)
+        );
+        assert_eq!(
+            adapter.calls(),
+            vec![FakeCall::Open(pid), FakeCall::CreationTime(pid)]
+        );
+        assert_eq!(
+            adapter.requested_access(),
+            vec![ObservationAccess::SNAPSHOT]
+        );
+        assert_eq!(adapter.opened(), 1);
+        assert_eq!(adapter.dropped(), 1);
+    }
+}
+
+#[test]
 fn admission_maps_exit_after_open_to_target_exited_and_closes_the_handle() {
     let pid = 95;
     let adapter = FakeProcessAdapter::default().with_process(
