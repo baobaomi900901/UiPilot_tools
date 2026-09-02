@@ -151,7 +151,7 @@ ProcessSnapshot
 ProcessAuthority.snapshot
   → ProcessPlatformAdapter creates one process enumeration snapshot
   → enumerate candidate PIDs
-  → open each candidate with minimum inspection access
+  → open each candidate with PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
   → read creation time and current display metadata
   → reconcile metadata while the process object is pinned by the handle
   → append ProcessRecord or increment one omission category
@@ -185,9 +185,9 @@ Restart
 ```text
 validate target structure
   → compare hostInstanceId
-  → open one admission handle with limited-query access
+  → open one admission handle with PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
   → compare creationTime on that process object
-  → verify that the process is still alive
+  → call WaitForSingleObject(handle, 0) to verify that the process object is nonsignaled
   → read critical and protection attributes
   → compare the exact current UiPilot host identity
   → apply protection policy
@@ -200,7 +200,7 @@ Stage 1 的 `admit` 只证明目标身份、存活状态和当前保护策略，
 
 ### 7.3 Least Access
 
-Stage 1 的 admission HANDLE 只申请 `PROCESS_QUERY_LIMITED_INFORMATION`。`ProcessIntent` 只绑定租约允许进入的后续操作种类，不改变 Stage 1 请求的 Windows 权限。
+Stage 1 的目录观察和 admission HANDLE 只申请 `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`。limited-query 用于身份与保护属性读取；`SYNCHRONIZE` 仅用于 `WaitForSingleObject(handle, 0)` 的无等待存活判断，不授予修改进程的能力。`ProcessIntent` 只绑定租约允许进入的后续操作种类，不改变 Stage 1 请求的 Windows 权限。
 
 Stage 1 禁止 `PROCESS_ALL_ACCESS`、`SeDebugPrivilege` 和任何操作权限。Stage 2 只有在具体终止与重启算法通过独立设计验收后，才能逐项定义实际 Win32 调用、最小访问掩码和对应稳定错误。例如 `TerminateProcess` 需要 `PROCESS_TERMINATE`；新建替代进程不需要在旧目标中创建线程，因此 Restart 不得无理由申请 `PROCESS_CREATE_THREAD`。
 
@@ -211,7 +211,7 @@ Stage 2 若改变某个意图的执行算法，必须在同一阶段重新证明
 `ProcessAdmission`：
 
 - 不实现 `Clone` 或序列化。
-- 持有 Stage 1 身份与保护策略复核使用的 limited-query HANDLE。
+- 持有 Stage 1 身份、存活与保护策略复核使用的 observation HANDLE，其权限仅为 `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`。
 - 绑定原始目标身份和单个 `ProcessIntent`。
 - 只能由 `process_control` Module 内部的对应 Stage 2 操作准备流程消费一次。
 - 不向 Module 外部暴露 PID 重开、原始 HANDLE 或访问掩码能力。
@@ -223,7 +223,7 @@ Stage 2 若改变某个意图的执行算法，必须在同一阶段重新证明
 
 ```text
 consume ProcessAdmission
-  → select the minimum access mask from the approved operation algorithm
+  → select observation access plus the minimum access mask from the approved operation algorithm
   → open one operation handle for the recorded PID
   → compare creationTime on the operation handle with ProcessTarget
   → repeat liveness, critical and protection checks on the operation handle
@@ -234,6 +234,8 @@ consume ProcessAdmission
 打开的 admission HANDLE 使旧进程对象在 Stage 2 交接期间仍可用于比较，但不能假设它阻止 Windows 在进程终止后复用 PID。安全性来自 operation HANDLE 上的完整 `creationTime` 和保护属性复核。若 PID 已复用，必须在任何副作用前返回目标变化错误。
 
 Stage 2 必须为 operation HANDLE 打开被 ACL 拒绝、交接期间目标退出或改变、最终保护属性变化分别定义稳定结果，并明确哪些结果允许在用户确认后通过提权从头重试。这些错误名称和重试策略属于 Stage 2，不在 Stage 1 提前冻结。
+
+Stage 1 和 Stage 2 的存活判断都使用 `WaitForSingleObject(handle, 0)`：`WAIT_TIMEOUT` 表示进程对象尚未 signal，`WAIT_OBJECT_0` 表示目标已退出，`WAIT_FAILED` 或对进程 HANDLE 不可能出现的其他结果在准入时返回 `InspectionDenied`，在目录中计入 `inspectionDenied`。不得使用 `GetExitCodeProcess == STILL_ACTIVE` 作为唯一存活判断，因为进程可以用数值 259 退出。
 
 ## 8. Protection Policy
 
@@ -297,10 +299,10 @@ target structure
 Windows 11 x64 是正式实现和验收基线。Adapter 使用公开 Win32 能力：
 
 - Tool Help process snapshot 枚举候选 PID、名称和观测父 PID。
-- `OpenProcess` 在 Stage 1 只以 `PROCESS_QUERY_LIMITED_INFORMATION` 打开候选。
+- `OpenProcess` 在 Stage 1 只以 `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE` 打开候选。
 - `QueryFullProcessImageNameW` 读取当前可执行路径。
 - `GetProcessTimes` 读取创建时间。
-- 存活检查判断已打开进程对象是否已经退出。
+- `WaitForSingleObject(handle, 0)` 对已打开进程对象执行无等待存活检查。
 - `IsProcessCritical` 读取 critical 状态。
 - `GetProcessInformation(ProcessProtectionLevelInfo)` 读取 Protected Process/PPL 状态。
 
@@ -321,9 +323,10 @@ Stage 1 不启用 `SeDebugPrivilege`，也不通过 PowerShell、WMI、Shell 命
 - 进程在枚举、打开或 Stage 1 准入检查阶段退出。
 - 当前宿主、critical、Protected Process/PPL 和保护属性不可读。
 - 多种错误并存时遵循固定优先级。
-- 成功准入保留 limited-query HANDLE；随后 PID 复用不改变该 HANDLE 指向的原进程对象。
+- 成功准入保留 observation HANDLE；随后 PID 复用不改变该 HANDLE 指向的原进程对象。
 - 所有失败路径关闭临时 HANDLE，副作用调用计数为零。
-- 每个 intent 的 Stage 1 admission HANDLE 都只申请 limited-query，且从不申请操作权限或 all-access。
+- 目录和每个 intent 的 Stage 1 admission HANDLE 都精确申请 limited-query 与 synchronize，且从不申请操作权限或 all-access。
+- 存活检查把 `WAIT_TIMEOUT`、`WAIT_OBJECT_0`、`WAIT_FAILED` 映射为确定结果，并覆盖“进程以 259 退出”的回归场景。
 - 刷新目录不会使仍存活的同一身份失效。
 - 快照顺序和遗漏摘要可重复。
 - `ProcessAdmission` Drop 关闭 HANDLE，消费后不能再次使用。
@@ -377,6 +380,8 @@ Stage 1 人工验收前不得编写 Stage 2 的详细设计、实施计划或产
 - [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess)
 - [Process Handles and Identifiers](https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers)
 - [Process Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
+- [GetExitCodeProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess)
+- [WaitForSingleObject](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
 - [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
 - [GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
 - [IsProcessCritical](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocesscritical)
