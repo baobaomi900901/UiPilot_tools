@@ -30,15 +30,15 @@ enum FakeCall {
 
 #[derive(Clone)]
 enum FakeMutation {
-    ReplaceCreationTimes {
+    CreationTimes {
         pid: u32,
         values: Vec<Result<u64, ObservationFailure>>,
     },
-    ReplaceLiveness {
+    Liveness {
         pid: u32,
         values: Vec<Result<Liveness, ObservationFailure>>,
     },
-    ReplaceNames {
+    Names {
         pid: u32,
         values: Vec<Result<Option<String>, ObservationFailure>>,
     },
@@ -50,6 +50,7 @@ struct MutationHook {
     mutation: FakeMutation,
 }
 
+#[derive(Default)]
 struct FakeProcessScript {
     open: VecDeque<Result<(), ObservationFailure>>,
     creation_times: VecDeque<Result<u64, ObservationFailure>>,
@@ -57,19 +58,6 @@ struct FakeProcessScript {
     observations: VecDeque<Result<ProcessObservation, ObservationFailure>>,
     reenumerated_names: VecDeque<Result<Option<String>, ObservationFailure>>,
     protections: VecDeque<Result<ProcessProtection, ObservationFailure>>,
-}
-
-impl Default for FakeProcessScript {
-    fn default() -> Self {
-        Self {
-            open: VecDeque::new(),
-            creation_times: VecDeque::new(),
-            liveness: VecDeque::new(),
-            observations: VecDeque::new(),
-            reenumerated_names: VecDeque::new(),
-            protections: VecDeque::new(),
-        }
-    }
 }
 
 struct FakeState {
@@ -202,21 +190,21 @@ impl FakeProcessAdapter {
     fn apply_mutation(&self, mutation: FakeMutation) {
         let mut state = self.state.borrow_mut();
         match mutation {
-            FakeMutation::ReplaceCreationTimes { pid, values } => {
+            FakeMutation::CreationTimes { pid, values } => {
                 state
                     .processes
                     .get_mut(&pid)
                     .expect("fake process must exist")
                     .creation_times = values.into();
             }
-            FakeMutation::ReplaceLiveness { pid, values } => {
+            FakeMutation::Liveness { pid, values } => {
                 state
                     .processes
                     .get_mut(&pid)
                     .expect("fake process must exist")
                     .liveness = values.into();
             }
-            FakeMutation::ReplaceNames { pid, values } => {
+            FakeMutation::Names { pid, values } => {
                 state
                     .processes
                     .get_mut(&pid)
@@ -567,7 +555,7 @@ fn snapshot_path_fallback_omits_a_handle_that_changes_after_name_reenumeration()
         .mutate_after(
             FakeCall::ReenumerateName(12),
             1,
-            FakeMutation::ReplaceCreationTimes {
+            FakeMutation::CreationTimes {
                 pid: 12,
                 values: vec![Ok(1201)],
             },
@@ -862,7 +850,7 @@ fn snapshot_fake_mutation_hooks_can_change_each_scripted_identity_signal() {
         .mutate_after(
             FakeCall::Observation(80),
             1,
-            FakeMutation::ReplaceNames {
+            FakeMutation::Names {
                 pid: 80,
                 values: vec![Ok(Some("after.exe".into()))],
             },
@@ -870,7 +858,7 @@ fn snapshot_fake_mutation_hooks_can_change_each_scripted_identity_signal() {
         .mutate_after(
             FakeCall::ReenumerateName(80),
             1,
-            FakeMutation::ReplaceLiveness {
+            FakeMutation::Liveness {
                 pid: 80,
                 values: vec![Ok(Liveness::Exited)],
             },
@@ -1543,6 +1531,31 @@ mod windows_tests {
                 .admit(record.target(), ProcessIntent::Terminate)
                 .err(),
             Some(ProcessError::ProtectedTarget)
+        );
+    }
+
+    #[test]
+    fn windows_current_process_changed_creation_time_is_target_changed() {
+        let authority = ProcessAuthority::new().unwrap();
+        let current_pid = unsafe { GetCurrentProcessId() };
+        let record = snapshot_record_for_pid(&authority, current_pid, Duration::from_secs(5));
+        let creation_time = record.target().creation_time();
+        let changed_creation_time = if creation_time == u64::MAX {
+            creation_time - 1
+        } else {
+            creation_time + 1
+        };
+        let changed_target = ProcessTarget::from_parts_for_test(
+            record.target().host_instance_id().as_bytes(),
+            record.pid(),
+            changed_creation_time,
+        );
+
+        assert_eq!(
+            authority
+                .admit(&changed_target, ProcessIntent::Terminate)
+                .err(),
+            Some(ProcessError::TargetChanged)
         );
     }
 
