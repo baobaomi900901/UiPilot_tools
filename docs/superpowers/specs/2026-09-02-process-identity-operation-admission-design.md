@@ -25,7 +25,7 @@
 - 每次宿主生命周期唯一的 `hostInstanceId`。
 - 最小只读进程快照和结构化遗漏统计。
 - `ProcessTarget` 值对象和 PID 复用防护。
-- `Terminate`、`ForceTerminate`、`Restart` 三种操作意图的最终准入。
+- 绑定 `Terminate`、`ForceTerminate`、`Restart` 意图的身份与保护策略准入租约。
 - Windows 11 x64 Adapter。
 - Fake Adapter 合同测试和无副作用的真实 Windows 验证。
 - 稳定、脱敏、可分类的内部错误合同。
@@ -51,7 +51,7 @@
 
 采用值对象身份和最终复核，不使用宿主目标注册表，也不为整个快照长期保留 Windows HANDLE。
 
-该方案避免注册表容量、过期和清理状态；同时通过 `pid + creationTime` 与最终打开的同一进程对象防止 PID 复用。
+该方案避免注册表容量、过期和清理状态；同时通过 `pid + creationTime` 与最终 HANDLE 上的重复比较，防止 PID 复用把请求重定向到其他进程。
 
 ### 3.3 Fail Closed Protection
 
@@ -78,7 +78,7 @@ fn admit(
     &self,
     target: &ProcessTarget,
     intent: ProcessIntent,
-) -> Result<AdmittedProcess, ProcessError>;
+) -> Result<ProcessAdmission, ProcessError>;
 ```
 
 `ProcessPlatformAdapter` 是 Module 内部的测试和平台接缝：
@@ -126,7 +126,7 @@ observedParentPid?
 
 `observedParentPid` 只描述快照时观测结果。Stage 2 的进程树操作必须重新枚举并对展开后的每个具体目标执行最终准入，不能把旧父 PID 当作授权关系。
 
-Windows Adapter 优先使用已打开进程对象查询到的完整可执行路径和 basename。若路径不可用，它必须在保持已打开句柄、从而阻止 PID 被复用的期间再次核对当前枚举名称；无法把展示元数据与已打开对象可靠对应时，省略该候选。
+Windows Adapter 优先使用已打开进程对象查询到的完整可执行路径和 basename。若路径不可用，它必须在 HANDLE 仍打开时再次核对当前枚举名称，并在核对后重新确认原 HANDLE 的对象仍存活且创建时间不变；无法把展示元数据与该对象可靠对应时，省略该候选。
 
 ### 5.4 Process Snapshot
 
@@ -164,7 +164,7 @@ ProcessAuthority.snapshot
 
 `ProcessCatalog` 不缓存 HANDLE，也不承诺快照是系统全局原子视图。它承诺的是每条已返回记录在签发时具有可靠身份，且后续操作仍必须最终复核。
 
-## 7. Final Admission
+## 7. Stage 1 Admission Lease
 
 ### 7.1 Intent
 
@@ -185,42 +185,55 @@ Restart
 ```text
 validate target structure
   → compare hostInstanceId
-  → open one inspection handle with limited-query access
-  → compare creationTime on the pinned process object
+  → open one admission handle with limited-query access
+  → compare creationTime on that process object
   → verify that the process is still alive
   → read critical and protection attributes
   → compare the exact current UiPilot host identity
   → apply protection policy
-  → while retaining the inspection handle, open one final handle with the access profile selected for intent
-  → repeat identity, liveness, critical and protection checks on the final handle
-  → close the inspection handle
-  → return AdmittedProcess owning the final handle
+  → return ProcessAdmission owning the admission handle
 ```
 
 创建时间不一致时必须返回 `TargetChanged`，不能自动为新进程签发目标或继续检查新进程是否允许操作。
 
-第一次 HANDLE 在第二次打开和复核完成前始终保持进程对象存活，因此 PID 不能在两次打开之间被另一个进程复用。第二次打开仍属于同一次最终 `admit`；`admit` 返回后任何调用者都不得再按 PID 打开目标。
+Stage 1 的 `admit` 只证明目标身份、存活状态和当前保护策略，并把这一结论绑定到一个仍然打开的进程对象。它不声称已经取得未来操作所需权限，也不在本阶段打开第二个 HANDLE。
 
 ### 7.3 Least Access
 
-检查 HANDLE 只申请 `PROCESS_QUERY_LIMITED_INFORMATION`。最终 HANDLE 根据意图申请“身份复核所需权限 + 该意图实际执行所需的最小权限”。禁止 `PROCESS_ALL_ACCESS`、`SeDebugPrivilege` 或与意图无关的权限。
+Stage 1 的 admission HANDLE 只申请 `PROCESS_QUERY_LIMITED_INFORMATION`。`ProcessIntent` 只绑定租约允许进入的后续操作种类，不改变 Stage 1 请求的 Windows 权限。
 
-Stage 1 冻结最小权限原则、按意图选择权限的接缝和禁止项，但不提前冻结 Stage 2 的具体终止与重启算法。Stage 2 的设计必须逐项列出最终 Win32 调用与访问掩码。例如 `TerminateProcess` 需要 `PROCESS_TERMINATE`；新建替代进程不需要在旧目标中创建线程，因此 Restart 不得无理由申请 `PROCESS_CREATE_THREAD`。
+Stage 1 禁止 `PROCESS_ALL_ACCESS`、`SeDebugPrivilege` 和任何操作权限。Stage 2 只有在具体终止与重启算法通过独立设计验收后，才能逐项定义实际 Win32 调用、最小访问掩码和对应稳定错误。例如 `TerminateProcess` 需要 `PROCESS_TERMINATE`；新建替代进程不需要在旧目标中创建线程，因此 Restart 不得无理由申请 `PROCESS_CREATE_THREAD`。
 
 Stage 2 若改变某个意图的执行算法，必须在同一阶段重新证明其访问掩码仍是该算法的最小集合。不得通过先申请宽权限来规避设计决策。
 
-### 7.4 Admitted Process
+### 7.4 Process Admission
 
-`AdmittedProcess`：
+`ProcessAdmission`：
 
 - 不实现 `Clone` 或序列化。
-- 持有最终复核使用的同一个系统句柄。
+- 持有 Stage 1 身份与保护策略复核使用的 limited-query HANDLE。
 - 绑定原始目标身份和单个 `ProcessIntent`。
-- 只能被对应的 Stage 2 操作消费一次。
-- 不提供按 PID 重新打开目标的方法。
+- 只能由 `process_control` Module 内部的对应 Stage 2 操作准备流程消费一次。
+- 不向 Module 外部暴露 PID 重开、原始 HANDLE 或访问掩码能力。
 - Drop 时总是关闭句柄。
 
-宿主确认必须发生在最终 `admit` 之前。确认结束后不得插入新的用户交互或无界等待；Stage 2 在产生副作用前还必须在同一 HANDLE 上检查存活和动态保护属性。该检查失败时终止操作，不能按 PID 重试到另一个对象。
+### 7.5 Stage 2 Handoff Contract
+
+宿主确认必须发生在 Stage 2 的最终操作准入之前。确认结束后不得插入新的用户交互或无界等待。Stage 2 必须在 `ProcessAdmission` 的 HANDLE 仍然打开时，在 `process_control` Module 内执行以下不可拆分流程：
+
+```text
+consume ProcessAdmission
+  → select the minimum access mask from the approved operation algorithm
+  → open one operation handle for the recorded PID
+  → compare creationTime on the operation handle with ProcessTarget
+  → repeat liveness, critical and protection checks on the operation handle
+  → on any failure, close both handles and return a Stage 2 stable error
+  → otherwise close the admission handle and immediately invoke the side-effect adapter with the operation handle
+```
+
+打开的 admission HANDLE 使旧进程对象在 Stage 2 交接期间仍可用于比较，但不能假设它阻止 Windows 在进程终止后复用 PID。安全性来自 operation HANDLE 上的完整 `creationTime` 和保护属性复核。若 PID 已复用，必须在任何副作用前返回目标变化错误。
+
+Stage 2 必须为 operation HANDLE 打开被 ACL 拒绝、交接期间目标退出或改变、最终保护属性变化分别定义稳定结果，并明确哪些结果允许在用户确认后通过提权从头重试。这些错误名称和重试策略属于 Stage 2，不在 Stage 1 提前冻结。
 
 ## 8. Protection Policy
 
@@ -263,19 +276,19 @@ target structure
 
 所有错误只向普通调用者和日志暴露稳定 code。原始 Win32 code 可以在受控诊断上下文中转换为分类，但普通日志不得包含可执行路径、命令行、用户数据、HANDLE 或原始系统错误。
 
-所有失败保证不返回 `AdmittedProcess`、不调用任何进程副作用，并在返回前关闭临时句柄。
+所有 Stage 1 失败保证不返回 `ProcessAdmission`、不调用任何进程副作用，并在返回前关闭临时句柄。operation HANDLE 的打开和对应错误不属于本错误表；它们由第 7.5 节要求的 Stage 2 设计定义。
 
 ## 10. Concurrency And Security Invariants
 
 - `hostInstanceId` 在 `ProcessAuthority` 生命周期内不可变。
 - 快照签发和准入之间不共享可变目标注册表。
 - PID 只定位，`pid + creationTime` 才识别目标。
-- 检查 HANDLE 在最终 HANDLE 打开并完成复核前始终存活，阻止两次打开之间发生 PID 复用。
-- `admit` 返回后的所有最终检查和 Stage 2 操作都针对返回的最终 HANDLE；不能关闭后再按 PID 打开执行。
-- 持有 HANDLE 会使已退出进程对象保持可识别；它不能把租约转换成后来复用相同 PID 的进程。
-- `AdmittedProcess` 不跨宿主重启、不序列化、不克隆且单次消费。
-- 确认、提权或其他可能等待的流程必须在最终准入之前完成。
-- Stage 2 的副作用必须紧跟最终准入，并在同一 HANDLE 上再次检查存活和动态保护属性。
+- `ProcessAdmission` 保留原进程对象供 Stage 2 交接比较，但不假设 HANDLE 能阻止 PID 复用。
+- Stage 2 只能在 admission HANDLE 仍打开时由 `process_control` 内部打开 operation HANDLE，并在任何副作用前比较完整身份和保护属性。
+- operation HANDLE 命中新进程时返回目标变化；不能把租约转换成后来复用相同 PID 的进程。
+- `ProcessAdmission` 不跨宿主重启、不序列化、不克隆且单次消费。
+- 确认、提权或其他可能等待的流程必须在 Stage 2 最终操作准入之前完成；operation HANDLE 打开失败后若需要提权，必须关闭当前租约并从确认与准入链起点重新开始。
+- Stage 2 的副作用必须紧跟 operation HANDLE 的最终复核，并使用该 operation HANDLE。
 - 任何取消、拒绝、过期或最终检查失败都不得调用副作用 Adapter。
 - overflow、随机源失败或无法分类的系统状态均失败闭合。
 
@@ -284,7 +297,7 @@ target structure
 Windows 11 x64 是正式实现和验收基线。Adapter 使用公开 Win32 能力：
 
 - Tool Help process snapshot 枚举候选 PID、名称和观测父 PID。
-- `OpenProcess` 以最小访问权限打开候选。
+- `OpenProcess` 在 Stage 1 只以 `PROCESS_QUERY_LIMITED_INFORMATION` 打开候选。
 - `QueryFullProcessImageNameW` 读取当前可执行路径。
 - `GetProcessTimes` 读取创建时间。
 - 存活检查判断已打开进程对象是否已经退出。
@@ -305,16 +318,15 @@ Stage 1 不启用 `SeDebugPrivilege`，也不通过 PowerShell、WMI、Shell 命
 - 三种遗漏类别互斥且计数确定。
 - 旧 `hostInstanceId` 返回 `ExpiredTarget`，且不打开 PID。
 - 快照后 PID 复用返回 `TargetChanged`。
-- 进程在枚举、打开或最终检查阶段退出。
-- 检查 HANDLE 在最终 HANDLE 打开前保持存活，第二次打开不能命中复用 PID。
+- 进程在枚举、打开或 Stage 1 准入检查阶段退出。
 - 当前宿主、critical、Protected Process/PPL 和保护属性不可读。
 - 多种错误并存时遵循固定优先级。
-- 成功准入保留原 HANDLE；随后 PID 复用不改变租约目标。
+- 成功准入保留 limited-query HANDLE；随后 PID 复用不改变该 HANDLE 指向的原进程对象。
 - 所有失败路径关闭临时 HANDLE，副作用调用计数为零。
-- 检查 HANDLE 只申请 limited-query；每个 intent 的最终 HANDLE 只申请测试策略声明的权限，且从不申请 all-access。
+- 每个 intent 的 Stage 1 admission HANDLE 都只申请 limited-query，且从不申请操作权限或 all-access。
 - 刷新目录不会使仍存活的同一身份失效。
 - 快照顺序和遗漏摘要可重复。
-- `AdmittedProcess` Drop 关闭 HANDLE，消费后不能再次使用。
+- `ProcessAdmission` Drop 关闭 HANDLE，消费后不能再次使用。
 - 错误显示和普通日志不包含路径、原始系统错误或 HANDLE。
 
 ### 12.2 Windows Tests
@@ -324,7 +336,7 @@ Stage 1 不启用 `SeDebugPrivilege`，也不通过 PowerShell、WMI、Shell 命
 - 快照识别当前测试进程和受控临时辅助进程。
 - 当前宿主目标返回 `ProtectedTarget`。
 - 修改创建时间后返回 `TargetChanged`。
-- 辅助进程存活时可获得 `AdmittedProcess`；退出后旧目标返回 `TargetExited`。
+- 辅助进程存活时可获得 `ProcessAdmission`；在测试夹具仍持有其原生子进程 HANDLE 的情况下让进程退出，旧目标稳定返回 `TargetExited`。
 - 当前测试进程的 critical/PPL 查询成功并报告未保护。
 - 如果验收机存在可检查的受保护目标，它返回 `ProtectedTarget`。
 - 测试结束后没有残留辅助进程或 HANDLE。
@@ -363,6 +375,7 @@ Stage 1 人工验收前不得编写 Stage 2 的详细设计、实施计划或产
 
 - [CreateToolhelp32Snapshot](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot)
 - [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess)
+- [Process Handles and Identifiers](https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers)
 - [Process Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
 - [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
 - [GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
