@@ -1,6 +1,6 @@
 # Stage 1 Process Identity And Operation Admission Design
 
-**Date:** 2026-09-02  
+**Date:** 2026-09-02
 **Status:** Review — conversational design approved; written specification awaits user acceptance
 
 **Related:**
