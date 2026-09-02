@@ -258,13 +258,13 @@ Plugin Package
 User-selected development directory or package
   → Static structure and schema validation
   → Host/platform compatibility check
-  → Permission diff and user consent
-  → Explicit development identity
+  → Explicit development identity and trust-level display
+  → Development-scoped permission diff and user consent
   → Staging Runtime readiness
   → Atomic development generation activation
 ```
 
-开发加载是独立信任路径，不是生产签名校验的旁路。开发 generation 必须持续显示开发身份，不能发布到商店、接收自动更新或转化为受信任生产包；Runtime、Capability、权限和资源限制不得因开发模式放宽。
+开发加载是独立信任路径，不是生产签名校验的旁路。用户必须在授权前看到开发身份与信任级别，授权记录绑定开发信任域且不能被生产安装复用。开发 generation 必须持续显示开发身份，不能发布到商店、接收自动更新或转化为受信任生产包；Runtime、Capability、权限和资源限制不得因开发模式放宽。
 
 ### 11.3 Invocation
 
@@ -273,14 +273,15 @@ Command / Action / AI Tool
   → Request ownership
   → Runtime handling
   → Capability facade
-  → Permission and policy admission
+  → Initial permission and policy admission
   → Host confirmation when required
+  → Final request, generation, permission, and target identity admission
   → Platform adapter
   → Stable outcome or stable error
   → Host UI feedback
 ```
 
-Command、Action 和 AI Tool 只能改变入口，不能绕过中间的权限、准入与宿主确认链。用户拒绝或取消确认必须产生不调用 Platform Adapter、不产生系统副作用的稳定 outcome。
+Command、Action 和 AI Tool 只能改变入口，不能绕过中间的权限、准入与宿主确认链。最终准入发生在确认完成之后、Platform Adapter 调用之前，必须重新验证插件 ID、generation、请求所有权、当前权限和目标身份；任一状态变化都终止调用。用户拒绝或取消确认以及最终准入失败必须产生不调用 Platform Adapter、不产生系统副作用的稳定 outcome。
 
 ### 11.4 Update
 
