@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-02
-**Status:** Review — implementation plan awaits user acceptance
+**Status:** Approved — accepted by the user on 2026-09-02
 
 **Goal:** Deliver the host-internal, read-only process catalog and identity/protection admission lease defined by Stage 1, with deterministic fake-adapter contracts and read-only Windows 11 verification.
 
