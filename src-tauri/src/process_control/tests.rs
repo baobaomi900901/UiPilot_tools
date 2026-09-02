@@ -7,12 +7,14 @@ use std::{
 };
 
 use super::core::{
-    CoreAuthority, EnumerationFailure, HostInstanceId, Liveness, ObservationAccess,
-    ObservationFailure, ProcessCandidate, ProcessError, ProcessObservation, ProcessPlatformAdapter,
-    ProcessProtection, ProcessTarget,
+    CoreAdmission, CoreAuthority, EnumerationFailure, HostInstanceId, Liveness, ObservationAccess,
+    ObservationFailure, ProcessCandidate, ProcessError, ProcessIntent, ProcessObservation,
+    ProcessPlatformAdapter, ProcessProtection, ProcessTarget,
 };
 
 const HOST: [u8; 16] = [0x41; 16];
+const SELF_PID: u32 = 9_999;
+const SELF_CREATION_TIME: u64 = 99_990;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeCall {
@@ -344,7 +346,35 @@ fn successful_script(creation_time: u64, name: &str, path: &str) -> FakeProcessS
 }
 
 fn authority(adapter: FakeProcessAdapter) -> CoreAuthority<FakeProcessAdapter> {
-    CoreAuthority::new(HostInstanceId::new(HOST).unwrap(), adapter)
+    authority_with_self(adapter, SELF_PID, SELF_CREATION_TIME)
+}
+
+fn authority_with_self(
+    adapter: FakeProcessAdapter,
+    self_pid: u32,
+    self_creation_time: u64,
+) -> CoreAuthority<FakeProcessAdapter> {
+    let host = HostInstanceId::new(HOST).unwrap();
+    let self_target = ProcessTarget::new(host, self_pid, self_creation_time).unwrap();
+    CoreAuthority::new(host, self_target, adapter)
+}
+
+fn target(pid: u32, creation_time: u64) -> ProcessTarget {
+    ProcessTarget::new(HostInstanceId::new(HOST).unwrap(), pid, creation_time).unwrap()
+}
+
+fn admission_script(
+    creation_time: u64,
+    liveness: Result<Liveness, ObservationFailure>,
+    protection: Result<ProcessProtection, ObservationFailure>,
+) -> FakeProcessScript {
+    FakeProcessScript {
+        open: vec![Ok(())].into(),
+        creation_times: vec![Ok(creation_time)].into(),
+        liveness: vec![liveness].into(),
+        protections: vec![protection].into(),
+        ..FakeProcessScript::default()
+    }
 }
 
 #[test]
@@ -851,4 +881,386 @@ fn snapshot_fake_mutation_hooks_can_change_each_scripted_identity_signal() {
     assert!(snapshot.processes().is_empty());
     assert_eq!(snapshot.omissions().exited_or_changed(), 1);
     assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+#[test]
+fn admission_rejects_invalid_target_structure_before_any_adapter_call() {
+    for invalid in [
+        ProcessTarget::from_parts_for_test([0; 16], 91, 9_100),
+        ProcessTarget::from_parts_for_test(HOST, 0, 9_100),
+        ProcessTarget::from_parts_for_test(HOST, 91, 0),
+    ] {
+        let adapter = FakeProcessAdapter::default();
+
+        assert_eq!(
+            authority(adapter.clone())
+                .admit(&invalid, ProcessIntent::Terminate)
+                .err(),
+            Some(ProcessError::InvalidTarget)
+        );
+        assert!(adapter.calls().is_empty());
+        assert_eq!(adapter.opened(), 0);
+        assert_eq!(adapter.dropped(), 0);
+    }
+}
+
+#[test]
+fn admission_rejects_an_expired_host_without_calling_the_adapter() {
+    let adapter = FakeProcessAdapter::default();
+    let stale = ProcessTarget::new(HostInstanceId::new([0x42; 16]).unwrap(), 92, 9_200).unwrap();
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(&stale, ProcessIntent::Terminate)
+            .err(),
+        Some(ProcessError::ExpiredTarget)
+    );
+    assert!(adapter.calls().is_empty());
+    assert!(adapter.requested_access().is_empty());
+    assert_eq!(adapter.opened(), 0);
+    assert_eq!(adapter.dropped(), 0);
+}
+
+#[test]
+fn admission_rejects_pid_reuse_before_liveness_or_replacement_protection() {
+    let pid = 93;
+    let script = admission_script(
+        9_301,
+        Ok(Liveness::Exited),
+        Ok(ProcessProtection::new(true, true)),
+    );
+    let adapter = FakeProcessAdapter::default().with_process(pid, script);
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(&target(pid, 9_300), ProcessIntent::ForceTerminate)
+            .err(),
+        Some(ProcessError::TargetChanged)
+    );
+    assert_eq!(
+        adapter.calls(),
+        vec![FakeCall::Open(pid), FakeCall::CreationTime(pid)]
+    );
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn admission_maps_exit_before_open_to_target_exited_without_a_handle() {
+    let pid = 94;
+    let adapter = FakeProcessAdapter::default().with_process(
+        pid,
+        FakeProcessScript {
+            open: vec![Err(ObservationFailure::ExitedOrChanged)].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(&target(pid, 9_400), ProcessIntent::Restart)
+            .err(),
+        Some(ProcessError::TargetExited)
+    );
+    assert_eq!(adapter.calls(), vec![FakeCall::Open(pid)]);
+    assert_eq!(adapter.opened(), 0);
+    assert_eq!(adapter.dropped(), 0);
+}
+
+#[test]
+fn admission_maps_exit_after_open_to_target_exited_and_closes_the_handle() {
+    let pid = 95;
+    let adapter = FakeProcessAdapter::default().with_process(
+        pid,
+        admission_script(
+            9_500,
+            Ok(Liveness::Exited),
+            Ok(ProcessProtection::new(false, false)),
+        ),
+    );
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(&target(pid, 9_500), ProcessIntent::Terminate)
+            .err(),
+        Some(ProcessError::TargetExited)
+    );
+    assert_eq!(
+        adapter.calls(),
+        vec![
+            FakeCall::Open(pid),
+            FakeCall::CreationTime(pid),
+            FakeCall::Liveness(pid),
+        ]
+    );
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn admission_maps_liveness_inspection_failures_to_inspection_denied() {
+    for (offset, failure) in [
+        ObservationFailure::AccessDenied,
+        ObservationFailure::IdentityUnavailable,
+        ObservationFailure::ExitedOrChanged,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pid = 960 + offset as u32;
+        let creation_time = 9_600 + offset as u64;
+        let adapter = FakeProcessAdapter::default().with_process(
+            pid,
+            admission_script(
+                creation_time,
+                Err(failure),
+                Ok(ProcessProtection::new(false, false)),
+            ),
+        );
+
+        assert_eq!(
+            authority(adapter.clone())
+                .admit(&target(pid, creation_time), ProcessIntent::ForceTerminate,)
+                .err(),
+            Some(ProcessError::InspectionDenied)
+        );
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                FakeCall::Open(pid),
+                FakeCall::CreationTime(pid),
+                FakeCall::Liveness(pid),
+            ]
+        );
+        assert_eq!(adapter.opened(), 1);
+        assert_eq!(adapter.dropped(), 1);
+    }
+}
+
+#[test]
+fn admission_fails_closed_when_protection_is_unreadable() {
+    let pid = 97;
+    let adapter = FakeProcessAdapter::default().with_process(
+        pid,
+        admission_script(
+            9_700,
+            Ok(Liveness::Alive),
+            Err(ObservationFailure::AccessDenied),
+        ),
+    );
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(&target(pid, 9_700), ProcessIntent::Restart)
+            .err(),
+        Some(ProcessError::InspectionDenied)
+    );
+    assert_eq!(
+        adapter.calls(),
+        vec![
+            FakeCall::Open(pid),
+            FakeCall::CreationTime(pid),
+            FakeCall::Liveness(pid),
+            FakeCall::Protection(pid),
+        ]
+    );
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn admission_checks_protection_readability_before_rejecting_self() {
+    let adapter = FakeProcessAdapter::default().with_process(
+        SELF_PID,
+        admission_script(
+            SELF_CREATION_TIME,
+            Ok(Liveness::Alive),
+            Err(ObservationFailure::IdentityUnavailable),
+        ),
+    );
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(
+                &target(SELF_PID, SELF_CREATION_TIME),
+                ProcessIntent::Terminate,
+            )
+            .err(),
+        Some(ProcessError::InspectionDenied)
+    );
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn admission_rejects_the_exact_current_host_identity() {
+    let adapter = FakeProcessAdapter::default().with_process(
+        SELF_PID,
+        admission_script(
+            SELF_CREATION_TIME,
+            Ok(Liveness::Alive),
+            Ok(ProcessProtection::new(false, false)),
+        ),
+    );
+
+    assert_eq!(
+        authority(adapter.clone())
+            .admit(
+                &target(SELF_PID, SELF_CREATION_TIME),
+                ProcessIntent::Terminate,
+            )
+            .err(),
+        Some(ProcessError::ProtectedTarget)
+    );
+    assert_eq!(
+        adapter.calls(),
+        vec![
+            FakeCall::Open(SELF_PID),
+            FakeCall::CreationTime(SELF_PID),
+            FakeCall::Liveness(SELF_PID),
+            FakeCall::Protection(SELF_PID),
+        ]
+    );
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn admission_rejects_critical_and_protected_processes() {
+    for (offset, protection) in [
+        ProcessProtection::new(true, false),
+        ProcessProtection::new(false, true),
+        ProcessProtection::new(true, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pid = 980 + offset as u32;
+        let creation_time = 9_800 + offset as u64;
+        let adapter = FakeProcessAdapter::default().with_process(
+            pid,
+            admission_script(creation_time, Ok(Liveness::Alive), Ok(protection)),
+        );
+
+        assert_eq!(
+            authority(adapter.clone())
+                .admit(&target(pid, creation_time), ProcessIntent::ForceTerminate,)
+                .err(),
+            Some(ProcessError::ProtectedTarget)
+        );
+        assert_eq!(adapter.opened(), 1);
+        assert_eq!(adapter.dropped(), 1);
+    }
+}
+
+#[test]
+fn admission_binds_each_intent_and_uses_only_snapshot_observation_access() {
+    let pid = 99;
+    let creation_time = 9_900;
+    let adapter = FakeProcessAdapter::default().with_process(
+        pid,
+        FakeProcessScript {
+            open: vec![Ok(()), Ok(()), Ok(())].into(),
+            creation_times: vec![Ok(creation_time), Ok(creation_time), Ok(creation_time)].into(),
+            liveness: vec![
+                Ok(Liveness::Alive),
+                Ok(Liveness::Alive),
+                Ok(Liveness::Alive),
+            ]
+            .into(),
+            protections: vec![
+                Ok(ProcessProtection::new(false, false)),
+                Ok(ProcessProtection::new(false, false)),
+                Ok(ProcessProtection::new(false, false)),
+            ]
+            .into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    let authority = authority(adapter.clone());
+    let target = target(pid, creation_time);
+
+    for intent in [
+        ProcessIntent::Terminate,
+        ProcessIntent::ForceTerminate,
+        ProcessIntent::Restart,
+    ] {
+        let admission = authority.admit(&target, intent).unwrap();
+        assert_eq!(admission.target(), &target);
+        assert_eq!(admission.intent(), intent);
+        drop(admission);
+    }
+
+    assert_eq!(
+        adapter.requested_access(),
+        vec![
+            ObservationAccess::SNAPSHOT,
+            ObservationAccess::SNAPSHOT,
+            ObservationAccess::SNAPSHOT,
+        ]
+    );
+    assert!(adapter
+        .requested_access()
+        .into_iter()
+        .all(|access| access.query_limited_information() && access.synchronize()));
+    assert_eq!(adapter.opened(), 3);
+    assert_eq!(adapter.dropped(), 3);
+}
+
+#[test]
+fn admission_lease_retains_its_handle_until_single_consumption() {
+    fn consume_once<H>(admission: CoreAdmission<H>) {
+        drop(admission);
+    }
+
+    let pid = 100;
+    let adapter = FakeProcessAdapter::default().with_process(
+        pid,
+        admission_script(
+            10_000,
+            Ok(Liveness::Alive),
+            Ok(ProcessProtection::new(false, false)),
+        ),
+    );
+    let admission = authority(adapter.clone())
+        .admit(&target(pid, 10_000), ProcessIntent::Restart)
+        .unwrap();
+
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 0);
+    consume_once(admission);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn admission_source_keeps_the_lease_opaque_and_has_no_side_effect_adapter() {
+    let process_module = include_str!("mod.rs");
+    let process_core = include_str!("core.rs");
+
+    assert!(!process_module.contains("CoreAdmission"));
+    for forbidden in [
+        "derive(Clone",
+        "Serialize for CoreAdmission",
+        "raw_handle",
+        "open_operation",
+        "terminate_process",
+        "force_terminate",
+        "restart_process",
+    ] {
+        let lease_source = process_core
+            .split("struct CoreAdmission")
+            .nth(1)
+            .expect("CoreAdmission must be defined");
+        assert!(!lease_source.contains(forbidden));
+    }
+    let adapter_source = process_core
+        .split("trait ProcessPlatformAdapter")
+        .nth(1)
+        .expect("ProcessPlatformAdapter must be defined")
+        .split("struct CoreAuthority")
+        .next()
+        .expect("CoreAuthority must follow the Adapter");
+    for forbidden in ["terminate", "restart", "operation", "side_effect"] {
+        assert!(!adapter_source.contains(forbidden));
+    }
 }

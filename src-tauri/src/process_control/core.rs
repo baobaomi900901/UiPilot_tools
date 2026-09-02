@@ -58,6 +58,23 @@ impl ProcessTarget {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn from_parts_for_test(
+        host_instance_id: [u8; 16],
+        pid: u32,
+        creation_time: u64,
+    ) -> Self {
+        Self {
+            host_instance_id: HostInstanceId(host_instance_id),
+            pid,
+            creation_time,
+        }
+    }
+
+    fn is_structurally_valid(&self) -> bool {
+        self.host_instance_id.0 != [0; 16] && self.pid != 0 && self.creation_time != 0
+    }
+
     pub(crate) fn host_instance_id(&self) -> HostInstanceId {
         self.host_instance_id
     }
@@ -167,6 +184,13 @@ impl ProcessOmissions {
 pub(crate) struct ProcessSnapshot {
     processes: Vec<ProcessRecord>,
     omissions: ProcessOmissions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessIntent {
+    Terminate,
+    ForceTerminate,
+    Restart,
 }
 
 impl ProcessSnapshot {
@@ -335,13 +359,21 @@ pub(super) trait ProcessPlatformAdapter {
 
 pub(super) struct CoreAuthority<A: ProcessPlatformAdapter> {
     host_instance_id: HostInstanceId,
+    self_pid: u32,
+    self_creation_time: u64,
     adapter: A,
 }
 
 impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
-    pub(super) fn new(host_instance_id: HostInstanceId, adapter: A) -> Self {
+    pub(super) fn new(
+        host_instance_id: HostInstanceId,
+        self_target: ProcessTarget,
+        adapter: A,
+    ) -> Self {
         Self {
             host_instance_id,
+            self_pid: self_target.pid,
+            self_creation_time: self_target.creation_time,
             adapter,
         }
     }
@@ -389,6 +421,57 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
         Ok(ProcessSnapshot {
             processes,
             omissions,
+        })
+    }
+
+    pub(super) fn admit(
+        &self,
+        target: &ProcessTarget,
+        intent: ProcessIntent,
+    ) -> Result<CoreAdmission<A::Handle>, ProcessError> {
+        if !target.is_structurally_valid() {
+            return Err(ProcessError::InvalidTarget);
+        }
+        if target.host_instance_id != self.host_instance_id {
+            return Err(ProcessError::ExpiredTarget);
+        }
+
+        let handle = self
+            .adapter
+            .open_observation(target.pid, ObservationAccess::SNAPSHOT)
+            .map_err(admission_identity_failure)?;
+        let creation_time = self
+            .adapter
+            .creation_time(&handle)
+            .map_err(admission_identity_failure)?;
+        if creation_time == 0 {
+            return Err(ProcessError::InspectionDenied);
+        }
+        if creation_time != target.creation_time {
+            return Err(ProcessError::TargetChanged);
+        }
+
+        match self.adapter.liveness(&handle) {
+            Ok(Liveness::Alive) => {}
+            Ok(Liveness::Exited) => return Err(ProcessError::TargetExited),
+            Err(_) => return Err(ProcessError::InspectionDenied),
+        }
+
+        let protection = self
+            .adapter
+            .protection(&handle)
+            .map_err(|_| ProcessError::InspectionDenied)?;
+        if target.pid == self.self_pid && target.creation_time == self.self_creation_time {
+            return Err(ProcessError::ProtectedTarget);
+        }
+        if protection.is_critical() || protection.is_protected() {
+            return Err(ProcessError::ProtectedTarget);
+        }
+
+        Ok(CoreAdmission {
+            target: *target,
+            intent,
+            _handle: handle,
         })
     }
 
@@ -548,6 +631,31 @@ impl FailureAccumulator {
 
     fn result(self) -> Option<OmissionKind> {
         self.highest
+    }
+}
+
+pub(super) struct CoreAdmission<H> {
+    target: ProcessTarget,
+    intent: ProcessIntent,
+    _handle: H,
+}
+
+impl<H> CoreAdmission<H> {
+    pub(super) fn target(&self) -> &ProcessTarget {
+        &self.target
+    }
+
+    pub(super) fn intent(&self) -> ProcessIntent {
+        self.intent
+    }
+}
+
+fn admission_identity_failure(failure: ObservationFailure) -> ProcessError {
+    match failure {
+        ObservationFailure::ExitedOrChanged => ProcessError::TargetExited,
+        ObservationFailure::AccessDenied | ObservationFailure::IdentityUnavailable => {
+            ProcessError::InspectionDenied
+        }
     }
 }
 
