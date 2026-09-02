@@ -2126,6 +2126,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.searchPending = false
     model.status = ''
     clearResults()
+    if (value !== '/find' && fileCommand(value) !== null) model.commandHint = '请输入信息回车'
     scheduleSearch()
     publish(true)
   }

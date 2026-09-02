@@ -176,6 +176,25 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                   aria-pressed={snapshot.category === category}
                   disabled={disabled || !snapshot.invocationId}
                   onClick={() => core.setCategory(category)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key !== 'Tab' ||
+                      event.ctrlKey ||
+                      event.altKey ||
+                      event.metaKey
+                    ) return
+                    const offset = event.shiftKey ? -1 : 1
+                    const nextIndex = (
+                      FIND_CATEGORY_ORDER.indexOf(category) + offset + FIND_CATEGORY_ORDER.length
+                    ) % FIND_CATEGORY_ORDER.length
+                    const nextCategory = FIND_CATEGORY_ORDER[nextIndex]!
+                    const next = event.currentTarget.parentElement
+                      ?.querySelectorAll<HTMLButtonElement>('.find-category')[nextIndex]
+                    if (!next || next.disabled) return
+                    event.preventDefault()
+                    next.focus()
+                    core.setCategory(nextCategory)
+                  }}
                 >
                   {CATEGORY_LABELS[category]}
                 </button>

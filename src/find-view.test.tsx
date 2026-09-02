@@ -458,6 +458,92 @@ describe('FindView', () => {
     expect(core.getSnapshot().category).toBe('all')
   })
 
+  it('activates the next file category on forward Tab', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
+    const categories = [...host.querySelectorAll<HTMLButtonElement>('.find-category')]
+    const first = categories[0]!
+    const second = categories[1]!
+    first.focus()
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    await act(async () => first.dispatchEvent(tab))
+
+    expect(tab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(second)
+    expect(core.getSnapshot().category).toBe('folder')
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'folder' }))
+  })
+
+  it('activates the previous file category on Shift+Tab', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
+    const categories = [...host.querySelectorAll<HTMLButtonElement>('.find-category')]
+    const first = categories[0]!
+    const second = categories[1]!
+    await act(async () => second.click())
+    second.focus()
+
+    const shiftTab = new KeyboardEvent('keydown', {
+      key: 'Tab', shiftKey: true, bubbles: true, cancelable: true,
+    })
+    await act(async () => second.dispatchEvent(shiftTab))
+
+    expect(shiftTab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(first)
+    expect(core.getSnapshot().category).toBe('all')
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'all' }))
+  })
+
+  it('wraps Shift+Tab from the first file category to the last', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
+    const categories = [...host.querySelectorAll<HTMLButtonElement>('.find-category')]
+    const first = categories[0]!
+    const last = categories[categories.length - 1]!
+    first.focus()
+
+    const shiftTab = new KeyboardEvent('keydown', {
+      key: 'Tab', shiftKey: true, bubbles: true, cancelable: true,
+    })
+    await act(async () => first.dispatchEvent(shiftTab))
+
+    expect(shiftTab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(last)
+    expect(core.getSnapshot().category).toBe('archive')
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'archive' }))
+  })
+
+  it('wraps forward Tab from the last file category to the first', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'windows' }))
+    const categories = [...host.querySelectorAll<HTMLButtonElement>('.find-category')]
+    const first = categories[0]!
+    const last = categories[categories.length - 1]!
+    await act(async () => last.click())
+    last.focus()
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    await act(async () => last.dispatchEvent(tab))
+
+    expect(tab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(first)
+    expect(core.getSnapshot().category).toBe('all')
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ category: 'all' }))
+  })
+
   it('navigates file results with arrow keys from any focused control', async () => {
     const fake = fakeClient()
     const first = response()

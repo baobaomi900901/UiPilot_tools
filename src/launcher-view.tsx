@@ -778,8 +778,19 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       ? snapshot.messageCenter.unreadCount ?? 0
       : 0
   const indexedLauncherResults = snapshot.results.map((item, index) => ({ item, index }))
-  const launcherResultSections = snapshot.queryControlValue === ''
-    ? [
+  const hasLauncherQuery = snapshot.queryControlValue !== ''
+  const isApplicationResult = ({ item }: (typeof indexedLauncherResults)[number]) =>
+    item.favorite === undefined && item.iconKind === undefined && item.pluginIconUrl === undefined
+  const launcherResultSections = snapshot.mainResultCommand
+    ? undefined
+    : [
+        ...(hasLauncherQuery
+          ? [{
+              key: 'applications',
+              title: '应用',
+              results: indexedLauncherResults.filter(isApplicationResult),
+            }]
+          : []),
         {
           key: 'favorites',
           title: '常用',
@@ -788,10 +799,10 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         {
           key: 'all',
           title: '所有功能',
-          results: indexedLauncherResults.filter(({ item }) => item.favorite?.favorite !== true),
+          results: indexedLauncherResults.filter((result) =>
+            result.item.favorite?.favorite !== true && (!hasLauncherQuery || !isApplicationResult(result))),
         },
       ].filter(({ results }) => results.length > 0)
-    : undefined
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (

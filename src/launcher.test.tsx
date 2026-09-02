@@ -4911,7 +4911,7 @@ describe('execute and hide continuation', () => {
 })
 
 describe('React view and accessibility', () => {
-  it('groups empty-query favorites without duplicating results and keeps nonempty searches flat', async () => {
+  it('groups nonempty searches into applications, favorites, and all features', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -4942,7 +4942,22 @@ describe('React view and accessibility', () => {
           favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite: false },
         },
         { resultId: 'app', title: 'Demo App', activation: executeActivation },
-      ] : [{ resultId: 'app-search', title: 'Matched App', activation: executeActivation }],
+      ] : [
+        { resultId: 'app-search', title: 'Matched App', activation: executeActivation },
+        {
+          resultId: 'favorite-search-plugin',
+          title: '/favorite-plugin',
+          activation: {
+            kind: 'pluginCompletion', completionText: '/favorite-plugin ',
+            pluginId: 'com.uipilot.favorite-plugin', favorite: true,
+          },
+          favorite: {
+            target: { kind: 'publicPlugin', pluginId: 'com.uipilot.favorite-plugin' },
+            favorite: true,
+          },
+        },
+        findLauncherItem(request.query),
+      ],
     } as unknown as SearchResponse))
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -4971,9 +4986,14 @@ describe('React view and accessibility', () => {
       kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
       value: 'matched', inputType: 'insertText',
     }))
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
-    expect(mounted.host.querySelector('.result-section')).toBeNull()
-    expect(mounted.host.querySelector('[role="option"]')?.textContent).toContain('Matched App')
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(3))
+    const searchSections = [...mounted.host.querySelectorAll<HTMLElement>('.result-section')]
+    expect(searchSections.map((section) => section.querySelector('.result-section-title')?.textContent)).toEqual([
+      '应用', '常用', '所有功能',
+    ])
+    expect(searchSections.map((section) => section.querySelector('.result-title')?.textContent)).toEqual([
+      'Matched App', '/favorite-plugin', '/find',
+    ])
     await mounted.unmount()
   })
 
@@ -5328,6 +5348,31 @@ describe('React view and accessibility', () => {
     })))
     expect(fake.client.executeResult).not.toHaveBeenCalled()
     expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await mounted.unmount()
+  })
+
+  it('shows an unselectable usage hint while entering an explicit find query', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('find-command-hint')))
+    const control = core.getSnapshot().queryControl
+    vi.mocked(fake.client.searchApps).mockClear()
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control, value: '/find ', inputType: 'insertText',
+    }))
+    expect(mounted.host.querySelector('.command-hint')?.textContent).toBe('请输入信息回车')
+    expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(0)
+    expect(fake.client.searchApps).not.toHaveBeenCalled()
+
+    await act(async () => core.text({
+      kind: 'ordinaryInput', control, value: '/find 微信', inputType: 'insertText',
+    }))
+    expect(mounted.host.querySelector('.command-hint')?.textContent).toBe('请输入信息回车')
+    expect(fake.client.searchApps).not.toHaveBeenCalled()
     await mounted.unmount()
   })
 
@@ -5829,10 +5874,12 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(7))
 
     const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
-    const find = rows[0]!.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
-    const quicklinks = rows[1]!.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
-    const calculator = rows[2]!.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
-    const web = rows[3]!.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
+    const rowWithTitle = (title: string) =>
+      rows.find((row) => row.querySelector('.result-title')?.textContent === title)
+    const find = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
+    const quicklinks = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
+    const calculator = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
+    const web = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
     expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
     expect(quicklinks?.querySelector('.lucide-link-2')).toBeTruthy()
     expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
@@ -5841,9 +5888,9 @@ describe('React view and accessibility', () => {
     for (const icon of [find, quicklinks, calculator, web]) {
       expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
     }
-    expect(rows[4]!.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
-    expect(rows[5]!.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
-    expect(rows[6]!.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
+    expect(rowWithTitle('/demo-win')?.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rowWithTitle('App')?.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rowWithTitle('Fallback')?.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
     await mounted.unmount()
@@ -5883,12 +5930,14 @@ describe('React view and accessibility', () => {
       await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(4))
 
       const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
-      const image = rows[1]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const fallback = rows[1]!.querySelector<HTMLElement>('.result-icon .app-mark')
-      const siblingImage = rows[2]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const siblingFallback = rows[2]!.querySelector<HTMLElement>('.result-icon .app-mark')
-      const missingImage = rows[3]!.querySelector<HTMLImageElement>('.result-icon-image')
-      const missingFallback = rows[3]!.querySelector<HTMLElement>('.result-icon .app-mark')
+      const rowWithTitle = (title: string) =>
+        rows.find((row) => row.querySelector('.result-title')?.textContent === title)
+      const image = rowWithTitle('With icon')?.querySelector<HTMLImageElement>('.result-icon-image') ?? null
+      const fallback = rowWithTitle('With icon')?.querySelector<HTMLElement>('.result-icon .app-mark') ?? null
+      const siblingImage = rowWithTitle('Sibling icon')?.querySelector<HTMLImageElement>('.result-icon-image') ?? null
+      const siblingFallback = rowWithTitle('Sibling icon')?.querySelector<HTMLElement>('.result-icon .app-mark') ?? null
+      const missingImage = rowWithTitle('Without icon')?.querySelector<HTMLImageElement>('.result-icon-image') ?? null
+      const missingFallback = rowWithTitle('Without icon')?.querySelector<HTMLElement>('.result-icon .app-mark') ?? null
       expect(image).toBeInstanceOf(HTMLImageElement)
       expect(fallback).toBeInstanceOf(HTMLElement)
       expect(siblingImage).toBeInstanceOf(HTMLImageElement)
@@ -5916,7 +5965,8 @@ describe('React view and accessibility', () => {
       await vi.waitFor(() =>
         expect(mounted.host.querySelector<HTMLImageElement>('.result-icon-image')?.src).toContain(secondIcon),
       )
-      const nextRow = mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!
+      const nextRow = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
+        .find((row) => row.querySelector('.result-title')?.textContent === 'New icon')!
       const nextImage = nextRow.querySelector<HTMLImageElement>('.result-icon-image')!
       const nextFallback = nextRow.querySelector<HTMLElement>('.result-icon .app-mark')!
       expect(nextImage).not.toBe(image)
@@ -5933,9 +5983,9 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.searchApps).mockImplementation(async (request) => ({
       requestId: 'private-request',
       items: request.query === 'app' ? [
-        findLauncherItem('app'),
         { resultId: 'private-one', title: '<b>literal</b>', activation: executeActivation },
         { resultId: 'private-two', title: '非常长的第二个应用名称', subtitle: 'Long subtitle value', activation: executeActivation },
+        findLauncherItem('app'),
       ] : [],
     }))
     const core = createLauncherCore(fake.client)
@@ -5957,10 +6007,11 @@ describe('React view and accessibility', () => {
     expect(mounted.host.querySelector('[role="listbox"]')?.id).toBe('launcher-results')
     expect(input.getAttribute('aria-expanded')).toBe('true')
     expect(options[0]!.getAttribute('aria-selected')).toBe('true')
-    expect(options[0]!.textContent).toContain('/find')
-    expect(options[0]!.textContent).toContain('搜索文件：app')
-    expect(options[1]!.textContent).toContain('<b>literal</b>')
-    expect(options[1]!.querySelector('b')).toBeNull()
+    expect(options[0]!.textContent).toContain('<b>literal</b>')
+    expect(options[0]!.querySelector('b')).toBeNull()
+    expect(options[1]!.textContent).toContain('非常长的第二个应用名称')
+    expect(options[2]!.textContent).toContain('/find')
+    expect(options[2]!.textContent).toContain('搜索文件：app')
     expect(mounted.host.innerHTML).not.toContain('private-request')
     expect(mounted.host.innerHTML).not.toContain('private-one')
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toContain('3 个结果')
