@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     error::Error,
+    ffi::OsStr,
     fmt,
     path::{Path, PathBuf},
 };
@@ -323,6 +324,12 @@ pub(super) trait ProcessPlatformAdapter {
 
     fn reenumerate_name(&self, pid: u32) -> Result<Option<String>, ObservationFailure>;
 
+    fn process_names_equivalent(
+        &self,
+        left: &OsStr,
+        right: &OsStr,
+    ) -> Result<bool, ObservationFailure>;
+
     fn protection(&self, handle: &Self::Handle) -> Result<ProcessProtection, ObservationFailure>;
 }
 
@@ -353,12 +360,16 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
         let mut omissions = ProcessOmissions::default();
 
         for candidate in candidates {
-            if !valid_candidate(&candidate) {
+            if candidate.pid == 0 {
                 omissions.increment(OmissionKind::IdentityUnavailable)?;
                 continue;
             }
             if !seen_pids.insert(candidate.pid) {
                 omissions.increment(OmissionKind::ExitedOrChanged)?;
+                continue;
+            }
+            if !valid_name(&candidate.name) {
+                omissions.increment(OmissionKind::IdentityUnavailable)?;
                 continue;
             }
             match self.snapshot_candidate(candidate) {
@@ -409,7 +420,7 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
 
         let (name, executable_path) = match observation {
             Ok(observation) => {
-                failures.validate_path_observation(&candidate, &observation);
+                failures.validate_path_observation(&self.adapter, &candidate, &observation);
                 (Some(observation.name), Some(observation.executable_path))
             }
             Err(ObservationFailure::IdentityUnavailable) => {
@@ -441,9 +452,10 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
     ) -> (Option<String>, Option<PathBuf>) {
         let name = match self.adapter.reenumerate_name(candidate.pid) {
             Ok(Some(name)) if valid_name(&name) => {
-                if !same_name(&candidate.name, &name) {
-                    failures.record(OmissionKind::ExitedOrChanged);
-                }
+                failures.record_name_equivalence(
+                    self.adapter
+                        .process_names_equivalent(OsStr::new(&candidate.name), OsStr::new(&name)),
+                );
                 Some(name)
             }
             Ok(Some(_)) | Ok(None) => {
@@ -505,8 +517,9 @@ impl FailureAccumulator {
         }
     }
 
-    fn validate_path_observation(
+    fn validate_path_observation<A: ProcessPlatformAdapter>(
         &mut self,
+        adapter: &A,
         candidate: &ProcessCandidate,
         observation: &ProcessObservation,
     ) {
@@ -514,32 +527,28 @@ impl FailureAccumulator {
             self.record(OmissionKind::IdentityUnavailable);
             return;
         }
-        let Some(path_name) = observation
-            .executable_path
-            .file_name()
-            .and_then(|name| name.to_str())
-        else {
+        let Some(path_name) = observation.executable_path.file_name() else {
             self.record(OmissionKind::IdentityUnavailable);
             return;
         };
-        if !same_name(&candidate.name, &observation.name)
-            || !same_name(path_name, &observation.name)
-        {
-            self.record(OmissionKind::ExitedOrChanged);
+        let observation_name = OsStr::new(&observation.name);
+        self.record_name_equivalence(
+            adapter.process_names_equivalent(OsStr::new(&candidate.name), observation_name),
+        );
+        self.record_name_equivalence(adapter.process_names_equivalent(path_name, observation_name));
+    }
+
+    fn record_name_equivalence(&mut self, equivalence: Result<bool, ObservationFailure>) {
+        match equivalence {
+            Ok(true) => {}
+            Ok(false) => self.record(OmissionKind::ExitedOrChanged),
+            Err(failure) => self.record(failure.into()),
         }
     }
 
     fn result(self) -> Option<OmissionKind> {
         self.highest
     }
-}
-
-fn same_name(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
-}
-
-fn valid_candidate(candidate: &ProcessCandidate) -> bool {
-    candidate.pid != 0 && valid_name(&candidate.name)
 }
 
 fn valid_name(name: &str) -> bool {

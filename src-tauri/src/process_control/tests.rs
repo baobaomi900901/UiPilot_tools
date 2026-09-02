@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
+    ffi::OsStr,
     path::PathBuf,
     rc::Rc,
 };
@@ -21,6 +22,7 @@ enum FakeCall {
     Liveness(u32),
     Observation(u32),
     ReenumerateName(u32),
+    ProcessNamesEquivalent,
     Protection(u32),
 }
 
@@ -75,6 +77,7 @@ struct FakeState {
     calls: Vec<FakeCall>,
     hooks: Vec<MutationHook>,
     requested_access: Vec<ObservationAccess>,
+    process_name_equivalences: VecDeque<Result<bool, ObservationFailure>>,
     opened: usize,
     next_handle_id: u64,
     dropped: BTreeSet<u64>,
@@ -88,6 +91,7 @@ impl Default for FakeState {
             calls: Vec::new(),
             hooks: Vec::new(),
             requested_access: Vec::new(),
+            process_name_equivalences: VecDeque::new(),
             opened: 0,
             next_handle_id: 1,
             dropped: BTreeSet::new(),
@@ -139,6 +143,11 @@ impl FakeProcessAdapter {
 
     fn with_process(self, pid: u32, script: FakeProcessScript) -> Self {
         self.state.borrow_mut().processes.insert(pid, script);
+        self
+    }
+
+    fn with_process_name_equivalences(self, values: Vec<Result<bool, ObservationFailure>>) -> Self {
+        self.state.borrow_mut().process_name_equivalences = values.into();
         self
     }
 
@@ -294,6 +303,21 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
         result
     }
 
+    fn process_names_equivalent(
+        &self,
+        left: &OsStr,
+        right: &OsStr,
+    ) -> Result<bool, ObservationFailure> {
+        let result = self
+            .state
+            .borrow_mut()
+            .process_name_equivalences
+            .pop_front()
+            .unwrap_or_else(|| Ok(left == right));
+        self.finish_call(FakeCall::ProcessNamesEquivalent);
+        result
+    }
+
     fn protection(&self, handle: &Self::Handle) -> Result<ProcessProtection, ObservationFailure> {
         let result = self.pop_process_value(handle.pid, |script| &mut script.protections);
         self.finish_call(FakeCall::Protection(handle.pid));
@@ -363,6 +387,29 @@ fn snapshot_orders_reliable_records_by_pid_and_requests_only_observation_access(
 }
 
 #[test]
+fn snapshot_accepts_platform_equivalent_non_ascii_candidate_and_path_names() {
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(6, "ÖRBIT.EXE", None))])
+        .with_process(6, successful_script(600, "örbit.exe", r"C:\Apps\Örbit.Exe"))
+        .with_process_name_equivalences(vec![Ok(true), Ok(true)]);
+
+    let snapshot = authority(adapter.clone()).snapshot().unwrap();
+
+    assert_eq!(snapshot.processes().len(), 1);
+    assert_eq!(snapshot.processes()[0].name(), "örbit.exe");
+    assert_eq!(snapshot.omissions().total(), 0);
+    assert_eq!(
+        adapter
+            .calls()
+            .iter()
+            .filter(|call| **call == FakeCall::ProcessNamesEquivalent)
+            .count(),
+        2
+    );
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+#[test]
 fn snapshot_duplicate_candidate_is_one_changed_omission_without_a_second_open() {
     let adapter = FakeProcessAdapter::default()
         .with_enumeration(vec![
@@ -378,6 +425,64 @@ fn snapshot_duplicate_candidate_is_one_changed_omission_without_a_second_open() 
     assert_eq!(snapshot.omissions().total(), 1);
     assert_eq!(adapter.opened(), 1);
     assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn snapshot_duplicate_candidate_valid_then_invalid_prioritizes_changed() {
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(9, "same.exe", None)),
+            Ok(candidate(9, "", None)),
+        ])
+        .with_process(9, successful_script(900, "same.exe", r"C:\Apps\same.exe"));
+
+    let snapshot = authority(adapter.clone()).snapshot().unwrap();
+
+    assert_eq!(snapshot.processes().len(), 1);
+    assert_eq!(snapshot.omissions().exited_or_changed(), 1);
+    assert_eq!(snapshot.omissions().identity_unavailable(), 0);
+    assert_eq!(
+        snapshot.processes().len() as u64 + snapshot.omissions().total(),
+        2
+    );
+    assert_eq!(adapter.opened(), 1);
+    assert_eq!(adapter.dropped(), 1);
+}
+
+#[test]
+fn snapshot_duplicate_candidate_invalid_then_valid_records_both_as_omissions() {
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(10, "", None)),
+            Ok(candidate(10, "same.exe", None)),
+        ])
+        .with_process(10, successful_script(1000, "same.exe", r"C:\Apps\same.exe"));
+
+    let snapshot = authority(adapter.clone()).snapshot().unwrap();
+
+    assert!(snapshot.processes().is_empty());
+    assert_eq!(snapshot.omissions().exited_or_changed(), 1);
+    assert_eq!(snapshot.omissions().identity_unavailable(), 1);
+    assert_eq!(snapshot.omissions().total(), 2);
+    assert_eq!(adapter.opened(), 0);
+    assert_eq!(adapter.dropped(), 0);
+}
+
+#[test]
+fn snapshot_zero_pid_candidates_remain_identity_unavailable_not_duplicates() {
+    let adapter = FakeProcessAdapter::default().with_enumeration(vec![
+        Ok(candidate(0, "", None)),
+        Ok(candidate(0, "special.exe", None)),
+    ]);
+
+    let snapshot = authority(adapter.clone()).snapshot().unwrap();
+
+    assert!(snapshot.processes().is_empty());
+    assert_eq!(snapshot.omissions().exited_or_changed(), 0);
+    assert_eq!(snapshot.omissions().identity_unavailable(), 2);
+    assert_eq!(snapshot.omissions().total(), 2);
+    assert_eq!(adapter.opened(), 0);
+    assert_eq!(adapter.dropped(), 0);
 }
 
 #[test]
@@ -408,6 +513,7 @@ fn snapshot_path_unavailable_reenumerates_name_then_revalidates_the_open_handle(
             FakeCall::Liveness(11),
             FakeCall::Observation(11),
             FakeCall::ReenumerateName(11),
+            FakeCall::ProcessNamesEquivalent,
             FakeCall::Liveness(11),
             FakeCall::CreationTime(11),
         ]
