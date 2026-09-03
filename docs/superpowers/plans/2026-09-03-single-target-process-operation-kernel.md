@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** In progress — approved on 2026-09-03; Tasks 1-4 complete
+**Status:** Implementation complete — Tasks 1-5 complete; final review and user acceptance pending
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
@@ -137,12 +137,12 @@ The design specification remains canonical for interface semantics, event order,
 
 **Dependencies:** Tasks 1-4; approved design sections `7.1 HWND Identity Limitation`, `12. Logging And Data Handling`, `14. Verification`, and `15. Exit Gate`.
 
-- [ ] Run the focused admission, graceful, force, Windows-operation, and complete `process_control` suites; record exact commands, exit codes, counts, durations, and helper cleanup results.
-- [ ] Run format, default/all-feature test, and both Clippy gates. Compare any failure with the Stage 1 accepted baseline, prove there is no new `process_control` diagnostic, and record facts rather than silently treating an inherited failure as success.
-- [ ] In a Windows 11 x64 standard-user session, record graceful GUI close, windowless rejection, ignored-close five-second timeout, force termination, no residual helper/HANDLE, and ordinary-log redaction. Record exact OS build, architecture, elevation state, Rust, and Cargo versions.
-- [ ] Record the HWND/PID residual race, asynchronous `TerminateProcess` completion boundary, no auto-force/retry/elevation, and no action against existing user/system processes.
-- [ ] Record the final changed-file list and prove Cargo files, Tauri wiring, frontend, public plugin contracts, persistence, Restart, target expansion, and elevation remain unchanged.
-- [ ] Stop at the Stage 2A acceptance gate. Do not mark the subsystem accepted and do not design or implement the next Stage 2 subsystem without explicit user acceptance of the evidence.
+- [x] Run the focused admission, graceful, force, Windows-operation, and complete `process_control` suites; record exact commands, exit codes, counts, durations, and helper cleanup results.
+- [x] Run format, default/all-feature test, and both Clippy gates. Compare any failure with the Stage 1 accepted baseline, prove there is no new `process_control` diagnostic, and record facts rather than silently treating an inherited failure as success.
+- [x] In a Windows 11 x64 standard-user session, record graceful GUI close, windowless rejection, ignored-close five-second timeout, force termination, no residual helper/HANDLE, and ordinary-log redaction. Record exact OS build, architecture, elevation state, Rust, and Cargo versions.
+- [x] Record the HWND/PID residual race, asynchronous `TerminateProcess` completion boundary, no auto-force/retry/elevation, and no action against existing user/system processes.
+- [x] Record the final changed-file list and prove Cargo files, Tauri wiring, frontend, public plugin contracts, persistence, Restart, target expansion, and elevation remain unchanged.
+- [x] Stop at the Stage 2A acceptance gate. Do not mark the subsystem accepted and do not design or implement the next Stage 2 subsystem without explicit user acceptance of the evidence.
 
 **Distinct test coverage:** This task owns aggregate regression, standard-user manual evidence, baseline comparison, changed-scope proof, and the acceptance record only; it adds no product behavior.
 
@@ -170,9 +170,9 @@ Expected: format, all focused suites, complete `process_control`, and default fu
 
 ## Final Acceptance Checklist
 
-- [ ] Design sections `4-6` are owned by Task 1.
-- [ ] Design sections `7` and `7.1` are owned by Task 2 and completed by the Windows portion of Task 4.
-- [ ] Design section `8` is owned by Task 3 and completed by the Windows portion of Task 4.
-- [ ] Design sections `9-13` are covered by Tasks 1-4 without leaking platform resources or adding wider rights.
-- [ ] Design section `14` and every item in `15. Exit Gate` are evidenced by Task 5.
+- [x] Design sections `4-6` are owned by Task 1.
+- [x] Design sections `7` and `7.1` are owned by Task 2 and completed by the Windows portion of Task 4.
+- [x] Design section `8` is owned by Task 3 and completed by the Windows portion of Task 4.
+- [x] Design sections `9-13` are covered by Tasks 1-4 without leaking platform resources or adding wider rights.
+- [x] Design section `14` and every item in `15. Exit Gate` are evidenced by Task 5.
 - [ ] The user reviewed the verification record and explicitly accepted Stage 2A before any later Stage 2 design, plan, or code began.
