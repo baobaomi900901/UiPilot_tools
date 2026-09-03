@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** In progress — approved on 2026-09-03; Task 1 complete
+**Status:** In progress — approved on 2026-09-03; Tasks 1-2 complete
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
@@ -87,11 +87,11 @@ The design specification remains canonical for interface semantics, event order,
 
 **Dependencies:** Task 1; approved design sections `3.2 Ordinary Termination Means GUI Graceful Close`, `3.3 Success Means Exit Was Observed`, `3.4 Fixed Five-Second Monotonic Deadline`, `7. Ordinary Termination Flow`, `7.1 HWND Identity Limitation`, `10. Resource Ownership And Concurrency`, and `11. Stable Error Contract`.
 
-- [ ] Implement `terminate_with_clock` through the shared final-operation helper using `OperationAccess::GRACEFUL`; never invoke the force primitive.
-- [ ] Start one five-second deadline after final admission, enumerate candidates once, filter enumeration facts by exact PID/visible/no-owner, and perform zero-time process plus current PID/visibility/owner revalidation immediately before each post.
-- [ ] Post `WM_CLOSE` at most once to every still-eligible token in enumeration order, stop on target exit or deadline, and apply the exact zero-window, changed/gone window, all-denied, all-unavailable, partial-success, pre-first-post deadline, timeout, and completion-unknown aggregation rules.
-- [ ] Wait only for the deadline's remaining duration and perform the mandatory final zero-time poll; return `Ok(())` only after observing the operation HANDLE signaled.
-- [ ] Keep the narrow HWND/PID reuse limitation explicit in source comments at the final window-facts/post seam without claiming HANDLE-equivalent targeting.
+- [x] Implement `terminate_with_clock` through the shared final-operation helper using `OperationAccess::GRACEFUL`; never invoke the force primitive.
+- [x] Start one five-second deadline after final admission, enumerate candidates once, filter enumeration facts by exact PID/visible/no-owner, and perform zero-time process plus current PID/visibility/owner revalidation immediately before each post.
+- [x] Post `WM_CLOSE` at most once to every still-eligible token in enumeration order, stop on target exit or deadline, and apply the exact zero-window, changed/gone window, all-denied, all-unavailable, partial-success, pre-first-post deadline, timeout, and completion-unknown aggregation rules.
+- [x] Wait only for the deadline's remaining duration and perform the mandatory final zero-time poll; return `Ok(())` only after observing the operation HANDLE signaled.
+- [x] Keep the narrow HWND/PID reuse limitation explicit in source comments at the final window-facts/post seam without claiming HANDLE-equivalent targeting.
 
 **Distinct test coverage:** Hidden, owned, and other-PID candidates are excluded; the Adapter contract supplies no child or message-only candidate; multiple valid windows each receive one post; facts changing between enumeration and post are skipped; a gone candidate is not retargeted; no initial/remaining candidate maps to `GracefulCloseUnavailable` unless the process has exited; exit before first or between posts stops side effects and succeeds; all access failures versus mixed/other failures; partial post success waits and ignores later post failures for classification; Fake Clock consumption before first post and between posts; successful exit, `GracefulCloseTimedOut`, and `CompletionUnknown`; exact event order and proof that the terminate primitive is never called.
 
