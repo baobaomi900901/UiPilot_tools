@@ -1,4 +1,8 @@
+pub(crate) mod cache;
 pub(crate) mod provider;
+
+#[cfg(test)]
+mod cache_tests;
 
 use rust_decimal::{Decimal, RoundingStrategy};
 use time::Date;
