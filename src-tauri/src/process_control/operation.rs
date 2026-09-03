@@ -207,6 +207,7 @@ impl MonotonicClock for SystemMonotonicClock {
 }
 
 const GRACEFUL_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+const FORCE_TERMINATION_DEADLINE: Duration = Duration::from_secs(5);
 
 impl<A: ProcessOperationAdapter> CoreAuthority<A> {
     pub(super) fn terminate_with_clock<C: MonotonicClock>(
@@ -221,6 +222,21 @@ impl<A: ProcessOperationAdapter> CoreAuthority<A> {
             |adapter, operation_handle| {
                 let deadline = clock.now() + GRACEFUL_CLOSE_DEADLINE;
                 terminate_gracefully(adapter, operation_handle, target_pid, clock, deadline)
+            },
+        )
+    }
+
+    pub(super) fn force_terminate_with_clock<C: MonotonicClock>(
+        &self,
+        admission: CoreAdmission<A::Handle>,
+        clock: &C,
+    ) -> Result<(), ProcessOperationError> {
+        self.with_final_operation_admission(
+            admission,
+            ProcessIntent::ForceTerminate,
+            |adapter, operation_handle| {
+                let deadline = clock.now() + FORCE_TERMINATION_DEADLINE;
+                force_terminate(adapter, operation_handle, clock, deadline)
             },
         )
     }
@@ -389,6 +405,39 @@ fn terminate_gracefully<A: ProcessOperationAdapter, C: MonotonicClock>(
         return Err(ProcessOperationError::CompletionUnknown);
     }
     Err(ProcessOperationError::GracefulCloseTimedOut)
+}
+
+fn force_terminate<A: ProcessOperationAdapter, C: MonotonicClock>(
+    adapter: &A,
+    operation_handle: &A::Handle,
+    clock: &C,
+    deadline: Instant,
+) -> Result<(), ProcessOperationError> {
+    match adapter.wait_for_exit(operation_handle, Duration::ZERO) {
+        Ok(ExitWait::Exited) => return Ok(()),
+        Ok(ExitWait::TimedOut) => {}
+        Err(failure) => return Err(side_effect_availability_failure(failure)),
+    }
+
+    match adapter.terminate_process(operation_handle, 1) {
+        Ok(()) => {
+            let remaining = deadline.saturating_duration_since(clock.now());
+            let wait = adapter.wait_for_exit(operation_handle, remaining);
+            let final_poll = adapter.wait_for_exit(operation_handle, Duration::ZERO);
+            if matches!(wait, Ok(ExitWait::Exited)) || matches!(final_poll, Ok(ExitWait::Exited)) {
+                return Ok(());
+            }
+            if wait.is_err() || final_poll.is_err() {
+                return Err(ProcessOperationError::CompletionUnknown);
+            }
+            Err(ProcessOperationError::TerminationPending)
+        }
+        Err(failure) => match adapter.wait_for_exit(operation_handle, Duration::ZERO) {
+            Ok(ExitWait::Exited) => Ok(()),
+            Ok(ExitWait::TimedOut) => Err(side_effect_availability_failure(failure)),
+            Err(_) => Err(ProcessOperationError::CompletionUnknown),
+        },
+    }
 }
 
 fn unavailable_unless_exited<A: ProcessOperationAdapter>(
