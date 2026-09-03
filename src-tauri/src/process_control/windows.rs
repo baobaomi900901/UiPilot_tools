@@ -301,7 +301,7 @@ impl ProcessOperationAdapter for WindowsProcessAdapter {
         wait_result_with(
             timeout,
             |timeout| unsafe { WaitForSingleObject(handle.0.get(), timeout) },
-            || windows::core::Error::from_win32(),
+            windows::core::Error::from_win32,
         )
     }
 }
@@ -430,7 +430,8 @@ pub(super) fn finite_timeout_millis(timeout: Duration) -> u32 {
         return 0;
     }
     let whole_millis = timeout.as_millis();
-    let rounded_millis = whole_millis + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    let rounded_millis =
+        whole_millis + u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000));
     rounded_millis.min(u128::from(u32::MAX - 1)) as u32
 }
 
