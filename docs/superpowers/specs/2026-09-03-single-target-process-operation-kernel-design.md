@@ -1,7 +1,7 @@
 # Stage 2A Single-Target Process Operation Kernel Design
 
 **Date:** 2026-09-03
-**Status:** Proposed — sections approved in conversation; awaiting written-spec acceptance
+**Status:** Approved — accepted by the user on 2026-09-03
 
 **Related:**
 
