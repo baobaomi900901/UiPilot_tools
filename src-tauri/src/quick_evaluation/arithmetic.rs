@@ -1,4 +1,28 @@
+use super::{
+    number::{canonicalize_number, NumberGrammar},
+    QuickKind, QuickOutput,
+};
+
 const MAX_EXPRESSION_LENGTH: usize = 400;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArithmeticIntent {
+    result: String,
+}
+
+pub(crate) fn classify(source: &str) -> Option<ArithmeticIntent> {
+    evaluate(source).map(|result| ArithmeticIntent { result })
+}
+
+pub(crate) fn output(intent: ArithmeticIntent) -> QuickOutput {
+    QuickOutput {
+        kind: QuickKind::Arithmetic,
+        title: intent.result.clone(),
+        subtitle: Some("复制结果".into()),
+        copy_text: intent.result,
+        refresh_at_utc: None,
+    }
+}
 
 pub(crate) fn evaluate(source: &str) -> Option<String> {
     if source.len() > MAX_EXPRESSION_LENGTH {
@@ -113,7 +137,7 @@ impl Parser<'_> {
         if literal.is_empty() || literal == "." {
             return None;
         }
-        literal
+        canonicalize_number(literal, NumberGrammar::Number)?
             .parse::<f64>()
             .ok()
             .filter(|value| value.is_finite())

@@ -1,3 +1,4 @@
+mod arithmetic;
 mod date;
 mod number;
 
@@ -7,6 +8,7 @@ const MAX_QUERY_BYTES: usize = 400;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QuickKind {
+    Arithmetic,
     Date,
 }
 
@@ -19,6 +21,7 @@ pub(crate) enum QuickClassification {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QuickIntent {
+    Arithmetic(arithmetic::ArithmeticIntent),
     Date(date::DateIntent),
 }
 
@@ -36,6 +39,37 @@ pub(crate) struct QuickOutput {
     pub(crate) subtitle: Option<String>,
     pub(crate) copy_text: String,
     pub(crate) refresh_at_utc: Option<OffsetDateTime>,
+}
+
+pub(crate) fn classify(source: &str) -> QuickClassification {
+    let date = date::classify(source);
+    if !matches!(date, QuickClassification::NoMatch) {
+        return date;
+    }
+    arithmetic::classify(source).map_or(QuickClassification::NoMatch, |intent| {
+        QuickClassification::Ready(QuickIntent::Arithmetic(intent))
+    })
+}
+
+pub(crate) fn evaluate<L>(intent: QuickIntent, local_today: L) -> Result<QuickOutput, QuickFailure>
+where
+    L: FnOnce() -> Result<time::Date, ()>,
+{
+    match intent {
+        QuickIntent::Arithmetic(intent) => Ok(arithmetic::output(intent)),
+        QuickIntent::Date(intent) => {
+            let today = local_today().map_err(|()| local_date_unavailable())?;
+            date::evaluate(intent, today)
+        }
+    }
+}
+
+fn local_date_unavailable() -> QuickFailure {
+    QuickFailure {
+        kind: QuickKind::Date,
+        title: "无法读取本地日期".into(),
+        explanation: "请检查 Windows 日期和时区设置".into(),
+    }
 }
 
 fn normalize_query(source: &str) -> Option<String> {
@@ -62,7 +96,67 @@ fn normalize_query(source: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_query, QuickClassification, QuickFailure, QuickKind, QuickOutput};
+    use std::cell::Cell;
+
+    use time::{Date, Month};
+
+    use super::{
+        classify, evaluate, normalize_query, QuickClassification, QuickFailure, QuickIntent,
+        QuickKind, QuickOutput,
+    };
+
+    #[test]
+    fn dispatcher_keeps_date_ahead_of_legacy_arithmetic() {
+        assert!(matches!(
+            classify("2026-08-16 + 1 day"),
+            QuickClassification::Ready(QuickIntent::Date(_))
+        ));
+        assert!(matches!(
+            classify("2026-08-16"),
+            QuickClassification::Ready(QuickIntent::Arithmetic(_))
+        ));
+        assert!(matches!(classify("1+"), QuickClassification::NoMatch));
+    }
+
+    #[test]
+    fn dispatcher_reads_local_date_once_only_for_date_intents() {
+        let arithmetic_calls = Cell::new(0);
+        let QuickClassification::Ready(arithmetic) = classify(".5*8") else {
+            panic!("expected arithmetic intent");
+        };
+        let arithmetic_output = evaluate(arithmetic, || {
+            arithmetic_calls.set(arithmetic_calls.get() + 1);
+            Err(())
+        })
+        .unwrap();
+        assert_eq!(arithmetic_output.kind, QuickKind::Arithmetic);
+        assert_eq!(arithmetic_output.title, "4");
+        assert_eq!(arithmetic_calls.get(), 0);
+
+        let date_calls = Cell::new(0);
+        let QuickClassification::Ready(date) = classify("today + 1 day") else {
+            panic!("expected date intent");
+        };
+        let date_output = evaluate(date, || {
+            date_calls.set(date_calls.get() + 1);
+            Date::from_calendar_date(2026, Month::September, 3).map_err(|_| ())
+        })
+        .unwrap();
+        assert_eq!(date_output.title, "2026-09-04");
+        assert_eq!(date_calls.get(), 1);
+    }
+
+    #[test]
+    fn dispatcher_reports_local_date_failure_without_a_utc_fallback() {
+        let QuickClassification::Ready(intent) = classify("today + 1 day") else {
+            panic!("expected date intent");
+        };
+        let failure = evaluate(intent, || Err(())).unwrap_err();
+
+        assert_eq!(failure.kind, QuickKind::Date);
+        assert_eq!(failure.title, "无法读取本地日期");
+        assert_eq!(failure.explanation, "请检查 Windows 日期和时区设置");
+    }
 
     #[test]
     fn shared_contract_keeps_presentation_data_independent_of_launcher_dtos() {

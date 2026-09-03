@@ -28,9 +28,6 @@ mod native_attention;
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
-mod calculator;
-
-#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod quick_evaluation;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -1567,7 +1564,10 @@ mod tests {
     fn host_uses_builtin_calculator_without_legacy_math_command() {
         let lib_source = include_str!("lib.rs").replace("\r\n", "\n");
         let product_lib = lib_source.split("#[cfg(test)]\nmod tests").next().unwrap();
-        assert!(product_lib.contains("mod calculator;"));
+        assert!(product_lib.contains("mod quick_evaluation;"));
+        assert!(!product_lib.contains("mod calculator;"));
+        let quick_evaluation_source = include_str!("quick_evaluation/mod.rs");
+        assert!(quick_evaluation_source.contains("mod arithmetic;"));
         let plugin_source = include_str!("plugins.rs");
         assert!(plugin_source.contains("fn retired_plugin_id("));
         let forbidden_command = ["/", "math"].concat();

@@ -3276,14 +3276,20 @@ pub(crate) async fn search_apps(
         PluginQueryStart::Rejected => return Ok(None),
         PluginQueryStart::NoRoute => {}
     }
-    Ok(search_apps_with(
+    Ok(search_apps_with_catalog(
         registry,
-        &normalized_query,
-        &invocation_id,
-        query_sequence,
+        CatalogSearchRequest {
+            query: &normalized_query,
+            invocation_id: &invocation_id,
+            query_sequence,
+            submit,
+            web_search_engine,
+            favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+            quicklinks: &quicklink_items,
+        },
+        |_| Ok(Vec::new()),
         || cache.snapshot(),
         |applications| settings.decorate_applications(applications),
-        web_search_engine,
     ))
 }
 
@@ -3533,6 +3539,7 @@ struct CatalogSearchRequest<'a> {
     quicklinks: &'a [QuicklinkView],
 }
 
+#[cfg(test)]
 fn search_apps_with<S, D>(
     registry: &ResultRegistry,
     query: &str,
@@ -3546,8 +3553,36 @@ where
     S: FnOnce() -> Vec<Application>,
     D: FnOnce(&mut [Application]),
 {
+    search_apps_with_local_date(
+        registry,
+        query,
+        invocation_id,
+        query_sequence,
+        snapshot,
+        decorate,
+        web_search_engine,
+        || time::Date::from_calendar_date(2026, time::Month::September, 3).map_err(|_| ()),
+    )
+}
+
+#[cfg(test)]
+fn search_apps_with_local_date<S, D, L>(
+    registry: &ResultRegistry,
+    query: &str,
+    invocation_id: &str,
+    query_sequence: u64,
+    snapshot: S,
+    decorate: D,
+    web_search_engine: WebSearchEngine,
+    local_today: L,
+) -> Option<SearchResponse>
+where
+    S: FnOnce() -> Vec<Application>,
+    D: FnOnce(&mut [Application]),
+    L: FnOnce() -> Result<time::Date, ()>,
+{
     let favorite_builtin_features = BTreeSet::new();
-    search_apps_with_catalog(
+    search_apps_with_catalog_with_local_date(
         registry,
         CatalogSearchRequest {
             query,
@@ -3561,6 +3596,7 @@ where
         |_| Ok(Vec::new()),
         snapshot,
         decorate,
+        local_today,
     )
 }
 
@@ -3822,6 +3858,12 @@ fn public_plugin_completion_result(
     ))
 }
 
+fn windows_local_today() -> Result<time::Date, ()> {
+    time::OffsetDateTime::now_local()
+        .map(|now| now.date())
+        .map_err(|_| ())
+}
+
 fn search_apps_with_catalog<S, D, P>(
     registry: &ResultRegistry,
     request: CatalogSearchRequest<'_>,
@@ -3839,46 +3881,145 @@ where
         PublicPluginManagementError,
     >,
 {
+    search_apps_with_catalog_with_local_date(
+        registry,
+        request,
+        plugin_catalog,
+        snapshot,
+        decorate,
+        windows_local_today,
+    )
+}
+
+fn publish_quick_evaluation<L>(
+    registry: &ResultRegistry,
+    token: QueryToken,
+    classification: crate::quick_evaluation::QuickClassification,
+    local_today: L,
+) -> Option<SearchResponse>
+where
+    L: FnOnce() -> Result<time::Date, ()>,
+{
+    let evaluated = match classification {
+        crate::quick_evaluation::QuickClassification::NoMatch => return None,
+        crate::quick_evaluation::QuickClassification::Invalid(failure) => Err(failure),
+        crate::quick_evaluation::QuickClassification::Ready(intent) => {
+            crate::quick_evaluation::evaluate(intent, local_today)
+        }
+    };
+    let (item, action) = match evaluated {
+        Ok(output) => {
+            let crate::quick_evaluation::QuickOutput {
+                kind,
+                title,
+                subtitle,
+                copy_text,
+                refresh_at_utc,
+            } = output;
+            debug_assert!(refresh_at_utc.is_none());
+            let icon_kind = match kind {
+                crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
+                crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
+            };
+            (
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    activation: LauncherResultActivation::ExecuteResult,
+                    title,
+                    subtitle,
+                    icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: Some(icon_kind),
+                    detail: None,
+                    favorite: None,
+                    has_default_action: true,
+                },
+                Some(ResultAction::CopyBuiltInText { text: copy_text }),
+            )
+        }
+        Err(failure) => {
+            let icon_kind = match failure.kind {
+                crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
+                crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
+            };
+            (
+                crate::model::ResultItem {
+                    result_id: String::new(),
+                    activation: LauncherResultActivation::Informational,
+                    title: failure.title,
+                    subtitle: Some(failure.explanation),
+                    icon: None,
+                    plugin_icon_url: None,
+                    icon_kind: Some(icon_kind),
+                    detail: None,
+                    favorite: None,
+                    has_default_action: false,
+                },
+                None,
+            )
+        }
+    };
+    registry.publish_if_latest(
+        token,
+        vec![(item, action)],
+        || true,
+        |request_id, items| SearchResponse {
+            request_id,
+            items: items
+                .into_iter()
+                .map(|(result_id, mut item)| {
+                    item.result_id = result_id;
+                    item
+                })
+                .collect(),
+            command_hint: None,
+            main_result_command: None,
+            window_transfer_token: None,
+            auto_execute_result_id: None,
+            replace_local_results: true,
+        },
+    )
+}
+
+fn search_apps_with_catalog_with_local_date<S, D, P, L>(
+    registry: &ResultRegistry,
+    request: CatalogSearchRequest<'_>,
+    plugin_catalog: P,
+    snapshot: S,
+    decorate: D,
+    local_today: L,
+) -> Option<SearchResponse>
+where
+    S: FnOnce() -> Vec<Application>,
+    D: FnOnce(&mut [Application]),
+    P: FnOnce(
+        &str,
+    ) -> Result<
+        Vec<crate::public_plugins::PublicCommandSuggestion>,
+        PublicPluginManagementError,
+    >,
+    L: FnOnce() -> Result<time::Date, ()>,
+{
     let query = request.query.trim();
+    if !query.starts_with('/') {
+        let classification = crate::quick_evaluation::classify(query);
+        if !matches!(
+            classification,
+            crate::quick_evaluation::QuickClassification::NoMatch
+        ) {
+            let token = registry.begin_query(
+                QueryDomain::Application,
+                request.invocation_id,
+                request.query_sequence,
+            )?;
+            return publish_quick_evaluation(registry, token, classification, local_today);
+        }
+    }
     let token = registry.begin_query(
         QueryDomain::Application,
         request.invocation_id,
         request.query_sequence,
     )?;
-    if let Some(result) = crate::calculator::evaluate(query) {
-        let item = crate::model::ResultItem {
-            result_id: String::new(),
-            activation: LauncherResultActivation::ExecuteResult,
-            title: result.clone(),
-            subtitle: Some("复制结果".into()),
-            icon: None,
-            plugin_icon_url: None,
-            icon_kind: Some(ResultIconKind::Calculator),
-            detail: None,
-            favorite: None,
-            has_default_action: true,
-        };
-        return registry.publish_if_latest(
-            token,
-            vec![(item, Some(ResultAction::CopyBuiltInText { text: result }))],
-            || true,
-            |request_id, items| SearchResponse {
-                request_id,
-                items: items
-                    .into_iter()
-                    .map(|(result_id, mut item)| {
-                        item.result_id = result_id;
-                        item
-                    })
-                    .collect(),
-                command_hint: None,
-                main_result_command: None,
-                window_transfer_token: None,
-                auto_execute_result_id: None,
-                replace_local_results: true,
-            },
-        );
-    }
 
     let mut command_hint = None;
     let mut replace_local_results = false;
@@ -5103,12 +5244,13 @@ mod tests {
         public_plugin_search_decision, publish_everything_search,
         publish_public_command_suggestions, require_find_label, require_main_label,
         resolve_invocation_theme, save_settings_core, save_settings_with,
-        save_settings_worker_with, search_apps_with, search_apps_with_catalog, search_files_with,
-        select_public_plugin_source_with, set_file_preview_preference_with, start_host_input_focus,
-        submitted_main_result_command, CatalogSearchRequest, CommandError, CompletionOriginInput,
-        CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome,
-        HostInputFocusStart, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
-        ThemePreferenceUpdate, UserSettingsUpdate,
+        save_settings_worker_with, search_apps_with, search_apps_with_catalog,
+        search_apps_with_local_date, search_files_with, select_public_plugin_source_with,
+        set_file_preview_preference_with, start_host_input_focus, submitted_main_result_command,
+        CatalogSearchRequest, CommandError, CompletionOriginInput, CompletionOriginPhase,
+        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HostInputFocusStart,
+        HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate,
+        UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -7606,7 +7748,7 @@ mod tests {
     fn math_search_replaces_app_results_and_keeps_copy_private() {
         let registry = ResultRegistry::default();
         registry.on_show("invocation".into());
-        let response = search_apps_with(
+        let response = search_apps_with_local_date(
             &registry,
             "2*(3+4)",
             "invocation",
@@ -7614,6 +7756,7 @@ mod tests {
             || panic!("math search must not read the app cache"),
             |_| panic!("math search must not decorate applications"),
             WebSearchEngine::Bing,
+            || panic!("arithmetic must not read the local date"),
         )
         .unwrap();
 
@@ -7632,6 +7775,182 @@ mod tests {
                 .unwrap(),
             ResultAction::CopyBuiltInText { text: "14".into() }
         );
+    }
+
+    #[test]
+    fn date_search_publishes_one_executable_row_with_private_copy_text() {
+        let registry = ResultRegistry::default();
+        registry.on_show("date".into());
+        let local_date_calls = Cell::new(0);
+        let response = search_apps_with_local_date(
+            &registry,
+            "today + 7 days",
+            "date",
+            1,
+            || panic!("date search must not read the app cache"),
+            |_| panic!("date search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || {
+                local_date_calls.set(local_date_calls.get() + 1);
+                time::Date::from_calendar_date(2026, time::Month::September, 3).map_err(|_| ())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(local_date_calls.get(), 1);
+        assert!(response.replace_local_results);
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.title, "2026-09-10");
+        assert_eq!(item.subtitle.as_deref(), Some("Thursday · today + 7 days"));
+        assert_eq!(item.icon_kind, Some(crate::model::ResultIconKind::Date));
+        assert_eq!(
+            item.activation,
+            crate::model::LauncherResultActivation::ExecuteResult
+        );
+        assert!(item.has_default_action);
+        assert_eq!(item.favorite, None);
+        assert_eq!(item.detail, None);
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Ok(ResultAction::CopyBuiltInText {
+                text: "2026-09-10".into()
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_date_search_is_informational_and_registers_no_action() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invalid-date".into());
+        let response = search_apps_with_local_date(
+            &registry,
+            "today + 1 fortnight",
+            "invalid-date",
+            1,
+            || panic!("invalid date search must not read the app cache"),
+            |_| panic!("invalid date search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || panic!("classified invalid dates must not read the local date"),
+        )
+        .unwrap();
+
+        assert!(response.replace_local_results);
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.title, "日期表达式无效");
+        assert_eq!(
+            item.subtitle.as_deref(),
+            Some("请使用 today 或 YYYY-MM-DD 加减非负整数日期单位")
+        );
+        assert_eq!(
+            item.activation,
+            crate::model::LauncherResultActivation::Informational
+        );
+        assert!(!item.has_default_action);
+        assert_eq!(item.favorite, None);
+        assert_eq!(item.detail, None);
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Err(RegistryError::UnknownResult)
+        );
+    }
+
+    #[test]
+    fn local_date_failure_publishes_explicit_information_without_utc_fallback() {
+        let registry = ResultRegistry::default();
+        registry.on_show("clock-failure".into());
+        let calls = Cell::new(0);
+        let response = search_apps_with_local_date(
+            &registry,
+            "today + 1 day",
+            "clock-failure",
+            1,
+            || panic!("clock failure must not read the app cache"),
+            |_| panic!("clock failure must not decorate applications"),
+            WebSearchEngine::Bing,
+            || {
+                calls.set(calls.get() + 1);
+                Err(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].title, "无法读取本地日期");
+        assert_eq!(
+            response.items[0].subtitle.as_deref(),
+            Some("请检查 Windows 日期和时区设置")
+        );
+        assert_eq!(
+            response.items[0].activation,
+            crate::model::LauncherResultActivation::Informational
+        );
+        assert_eq!(
+            registry.resolve(&response.request_id, &response.items[0].result_id),
+            Err(RegistryError::UnknownResult)
+        );
+    }
+
+    #[test]
+    fn incomplete_date_expression_keeps_the_ordinary_catalog() {
+        let registry = ResultRegistry::default();
+        registry.on_show("incomplete-date".into());
+        let mut matching_application = application(1);
+        matching_application.display_name = "today + 1".into();
+        let response = search_apps_with_catalog(
+            &registry,
+            CatalogSearchRequest {
+                query: "today + 1",
+                invocation_id: "incomplete-date",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &BTreeSet::new(),
+                quicklinks: &[],
+            },
+            |query| {
+                assert_eq!(query, "today + 1");
+                Ok(vec![command_suggestion("demo")])
+            },
+            || vec![matching_application],
+            |_| {},
+        )
+        .unwrap();
+
+        let titles = response
+            .items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"today + 1"));
+        assert!(titles.contains(&"/find"));
+        assert!(titles.contains(&"Bing 搜索"));
+        assert!(titles.contains(&"/demo"));
+        assert!(!response.replace_local_results);
+    }
+
+    #[test]
+    fn stale_date_publication_cannot_replace_a_newer_application_owner() {
+        let registry = ResultRegistry::default();
+        registry.on_show("stale-date".into());
+        assert!(search_apps_with_local_date(
+            &registry,
+            "today + 1 day",
+            "stale-date",
+            1,
+            || panic!("stale date must not read the app cache"),
+            |_| panic!("stale date must not decorate applications"),
+            WebSearchEngine::Bing,
+            || {
+                assert!(registry
+                    .begin_query(QueryDomain::Application, "stale-date", 2)
+                    .is_some());
+                time::Date::from_calendar_date(2026, time::Month::September, 3).map_err(|_| ())
+            },
+        )
+        .is_none());
     }
     #[test]
     fn slash_input_does_not_offer_browser_search() {

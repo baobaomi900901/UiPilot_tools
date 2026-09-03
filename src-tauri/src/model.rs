@@ -8,6 +8,7 @@ pub(crate) enum ResultIconKind {
     Find,
     Quicklinks,
     Calculator,
+    Date,
     WebSearch,
 }
 
@@ -82,6 +83,7 @@ pub(crate) enum LauncherResultActivation {
     OpenFind {
         query: String,
     },
+    Informational,
     ExecuteResult,
 }
 
@@ -227,6 +229,14 @@ pub(crate) struct ResultItem {
 #[cfg(test)]
 mod tests {
     use super::{valid_launcher_completion, LauncherResultActivation};
+
+    #[test]
+    fn informational_activation_serializes_as_an_exact_unit_variant() {
+        assert_eq!(
+            serde_json::to_value(LauncherResultActivation::Informational).unwrap(),
+            serde_json::json!({ "kind": "informational" })
+        );
+    }
 
     #[test]
     fn launcher_completion_accepts_only_the_frozen_single_line_grammar() {
