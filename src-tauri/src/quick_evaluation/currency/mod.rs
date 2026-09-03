@@ -155,6 +155,112 @@ fn format_decimal(value: Decimal) -> String {
     }
 }
 
+pub(super) fn parse_decimal_exact(source: &str) -> Option<Decimal> {
+    const MAX_DECIMAL_SOURCE_BYTES: usize = 64 * 1024;
+    if source.is_empty() || source.len() > MAX_DECIMAL_SOURCE_BYTES {
+        return None;
+    }
+
+    let (mantissa, exponent) =
+        if let Some(index) = source.bytes().position(|byte| matches!(byte, b'e' | b'E')) {
+            (&source[..index], parse_exponent(&source[index + 1..])?)
+        } else {
+            (source, 0)
+        };
+    let (negative, mantissa) = mantissa.strip_prefix('-').map_or_else(
+        || {
+            mantissa
+                .strip_prefix('+')
+                .map_or((false, mantissa), |value| (false, value))
+        },
+        |value| (true, value),
+    );
+    let (integer, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, ""), |(integer, fraction)| (integer, fraction));
+    if integer.len().checked_add(fraction.len())? == 0
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let mut digits = String::with_capacity(integer.len().checked_add(fraction.len())?);
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    let Some(first_nonzero) = digits.bytes().position(|byte| byte != b'0') else {
+        return Some(Decimal::ZERO);
+    };
+    let last_nonzero = digits
+        .bytes()
+        .rposition(|byte| byte != b'0')
+        .expect("nonzero digit exists");
+    let significant = &digits[first_nonzero..=last_nonzero];
+    let decimal_position = i64::try_from(integer.len())
+        .ok()?
+        .checked_add(exponent)?
+        .checked_sub(i64::try_from(first_nonzero).ok()?)?;
+
+    let mut fixed = String::with_capacity(32);
+    if negative {
+        fixed.push('-');
+    }
+    if decimal_position <= 0 {
+        let leading_fractional_zeroes = usize::try_from(decimal_position.checked_neg()?).ok()?;
+        let scale = leading_fractional_zeroes.checked_add(significant.len())?;
+        if scale > 28 {
+            return None;
+        }
+        fixed.push_str("0.");
+        fixed.extend(std::iter::repeat_n('0', leading_fractional_zeroes));
+        fixed.push_str(significant);
+    } else {
+        let decimal_position = usize::try_from(decimal_position).ok()?;
+        if decimal_position > 29 {
+            return None;
+        }
+        if decimal_position >= significant.len() {
+            fixed.push_str(significant);
+            fixed.extend(std::iter::repeat_n(
+                '0',
+                decimal_position - significant.len(),
+            ));
+        } else {
+            let scale = significant.len() - decimal_position;
+            if scale > 28 {
+                return None;
+            }
+            fixed.push_str(&significant[..decimal_position]);
+            fixed.push('.');
+            fixed.push_str(&significant[decimal_position..]);
+        }
+    }
+
+    Decimal::from_str_exact(&fixed).ok()
+}
+
+fn parse_exponent(source: &str) -> Option<i64> {
+    let (negative, digits) = source.strip_prefix('-').map_or_else(
+        || {
+            source
+                .strip_prefix('+')
+                .map_or((false, source), |value| (false, value))
+        },
+        |value| (true, value),
+    );
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits.bytes().try_fold(0_i64, |value, byte| {
+        value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))
+    })?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
 pub(crate) fn classify(source: &str) -> CurrencyClassification {
     let Some(normalized) = normalize_query(source) else {
         return CurrencyClassification::NoMatch;
@@ -179,7 +285,7 @@ pub(crate) fn classify(source: &str) -> CurrencyClassification {
             CurrencyClassification::NoMatch
         };
     };
-    let Ok(amount) = Decimal::from_str_exact(&canonical_amount) else {
+    let Some(amount) = parse_decimal_exact(&canonical_amount) else {
         return CurrencyClassification::Invalid(CurrencyFailure::InvalidNumber);
     };
 
@@ -247,7 +353,7 @@ mod tests {
             ("-1. cad to MXN", "-1", "CAD", "MXN"),
         ] {
             let intent = ready(source);
-            assert_eq!(intent.amount, amount.parse::<Decimal>().unwrap());
+            assert_eq!(intent.amount, Decimal::from_str_exact(amount).unwrap());
             assert_eq!(intent.base.as_str(), base);
             assert_eq!(intent.quote.as_str(), quote);
         }
@@ -274,6 +380,23 @@ mod tests {
             ready("79228162514264337593543950335 USD to CNY").amount,
             Decimal::MAX
         );
+
+        for (source, expected) in [
+            ("1.00000000000000000000000000000 USD to CNY", Decimal::ONE),
+            (
+                "0.00000000000000000000000000010 USD to CNY",
+                Decimal::from_str_exact("0.0000000000000000000000000001").unwrap(),
+            ),
+            (
+                "00079228162514264337593543950335.0000 USD to CNY",
+                Decimal::MAX,
+            ),
+            ("+.5000 USD to CNY", Decimal::new(5, 1)),
+            ("-1. USD to CNY", Decimal::new(-1, 0)),
+            ("-.5000 USD to CNY", Decimal::new(-5, 1)),
+        ] {
+            assert_eq!(ready(source).amount, expected, "{source}");
+        }
     }
 
     #[test]

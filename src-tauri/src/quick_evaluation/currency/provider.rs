@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use time::{Date, Month};
 
-use super::{ExchangeRateError, ExchangeRateRequest, ExchangeRateResult};
+use super::{parse_decimal_exact, ExchangeRateError, ExchangeRateRequest, ExchangeRateResult};
 
 #[derive(Deserialize)]
 struct FrankfurterRate<'a> {
@@ -31,7 +31,7 @@ pub(crate) fn parse_response(
         return Err(ExchangeRateError::Unavailable);
     }
     let effective_date = parse_iso_date(response.date).ok_or(ExchangeRateError::Unavailable)?;
-    let rate = parse_exact_decimal(response.rate.get())
+    let rate = parse_decimal_exact(response.rate.get())
         .filter(|rate| *rate > Decimal::ZERO)
         .ok_or(ExchangeRateError::Unavailable)?;
 
@@ -41,108 +41,6 @@ pub(crate) fn parse_response(
         rate,
         effective_date,
     })
-}
-
-fn parse_exact_decimal(source: &str) -> Option<Decimal> {
-    const MAX_PROVIDER_NUMBER_BYTES: usize = 64 * 1024;
-    if source.len() > MAX_PROVIDER_NUMBER_BYTES {
-        return None;
-    }
-    let Some(exponent_index) = source.bytes().position(|byte| matches!(byte, b'e' | b'E')) else {
-        return Decimal::from_str_exact(source).ok();
-    };
-
-    let mantissa = &source[..exponent_index];
-    let exponent = parse_exponent(&source[exponent_index + 1..])?;
-    let (negative, mantissa) = mantissa
-        .strip_prefix('-')
-        .map_or((false, mantissa), |value| (true, value));
-    let (integer, fraction) = mantissa
-        .split_once('.')
-        .map_or((mantissa, ""), |(integer, fraction)| (integer, fraction));
-    if integer.is_empty()
-        || !integer.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || (mantissa.contains('.') && fraction.is_empty())
-    {
-        return None;
-    }
-
-    let mut digits = String::with_capacity(integer.len().checked_add(fraction.len())?);
-    digits.push_str(integer);
-    digits.push_str(fraction);
-    let first_nonzero = digits.bytes().position(|byte| byte != b'0');
-    let Some(first_nonzero) = first_nonzero else {
-        return Some(Decimal::ZERO);
-    };
-    let last_nonzero = digits
-        .bytes()
-        .rposition(|byte| byte != b'0')
-        .expect("nonzero digit exists");
-    let significant = &digits[first_nonzero..=last_nonzero];
-    let decimal_position = i64::try_from(integer.len())
-        .ok()?
-        .checked_add(exponent)?
-        .checked_sub(i64::try_from(first_nonzero).ok()?)?;
-
-    let mut fixed = String::with_capacity(32);
-    if negative {
-        fixed.push('-');
-    }
-    if decimal_position <= 0 {
-        let leading_fractional_zeroes = usize::try_from(decimal_position.checked_neg()?).ok()?;
-        let scale = leading_fractional_zeroes.checked_add(significant.len())?;
-        if scale > 28 {
-            return None;
-        }
-        fixed.push_str("0.");
-        fixed.extend(std::iter::repeat_n('0', leading_fractional_zeroes));
-        fixed.push_str(significant);
-    } else {
-        let decimal_position = usize::try_from(decimal_position).ok()?;
-        if decimal_position > 29 {
-            return None;
-        }
-        if decimal_position >= significant.len() {
-            fixed.push_str(significant);
-            fixed.extend(std::iter::repeat_n(
-                '0',
-                decimal_position - significant.len(),
-            ));
-        } else {
-            let scale = significant.len() - decimal_position;
-            if scale > 28 {
-                return None;
-            }
-            fixed.push_str(&significant[..decimal_position]);
-            fixed.push('.');
-            fixed.push_str(&significant[decimal_position..]);
-        }
-    }
-
-    Decimal::from_str_exact(&fixed).ok()
-}
-
-fn parse_exponent(source: &str) -> Option<i64> {
-    let (negative, digits) = source.strip_prefix('-').map_or_else(
-        || {
-            source
-                .strip_prefix('+')
-                .map_or((false, source), |value| (false, value))
-        },
-        |value| (true, value),
-    );
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let magnitude = digits.bytes().try_fold(0_i64, |value, byte| {
-        value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))
-    })?;
-    if negative {
-        magnitude.checked_neg()
-    } else {
-        Some(magnitude)
-    }
 }
 
 fn parse_iso_date(source: &str) -> Option<Date> {
@@ -190,7 +88,7 @@ mod tests {
         assert_eq!(parsed.quote.as_str(), "CNY");
         assert_eq!(
             parsed.rate,
-            "7.1324500000000001".parse::<Decimal>().unwrap()
+            Decimal::from_str_exact("7.1324500000000001").unwrap()
         );
         assert_eq!(
             parsed.effective_date,
@@ -198,11 +96,28 @@ mod tests {
         );
 
         for (rate, expected) in [
+            ("1.00000000000000000000000000000", "1"),
+            (
+                "0.00000000000000000000000000010",
+                "0.0000000000000000000000000001",
+            ),
+            (
+                "79228162514264337593543950335.0000",
+                "79228162514264337593543950335",
+            ),
             ("1e3", "1000"),
             ("7.13245e0", "7.13245"),
             ("713245e-5", "7.13245"),
             ("1e-28", "0.0000000000000000000000000001"),
             ("10e-29", "0.0000000000000000000000000001"),
+            (
+                "0.00000000000000000000000000010e0",
+                "0.0000000000000000000000000001",
+            ),
+            (
+                "792281625142643375935439503350000e-4",
+                "79228162514264337593543950335",
+            ),
         ] {
             let body =
                 format!(r#"{{"date":"2026-09-03","base":"USD","quote":"CNY","rate":{rate}}}"#);
