@@ -231,13 +231,21 @@ pub(crate) fn evaluate(intent: UnitIntent) -> Result<UnitOutput, UnitInvalid> {
         return Err(failure(UnitFailure::DimensionMismatch));
     }
 
+    let source_definition = intent.source.definition();
+    let target_definition = intent.target.definition();
+    if let UnitDefinition::Temperature(source) = source_definition {
+        if decimal_below_absolute_zero(&intent.canonical_value, source) {
+            return Err(below_absolute_zero());
+        }
+    }
+
     let value = intent
         .canonical_value
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
         .ok_or_else(|| failure(UnitFailure::InvalidNumber))?;
-    let converted = match (intent.source.definition(), intent.target.definition()) {
+    let converted = match (source_definition, target_definition) {
         (UnitDefinition::Linear(source), UnitDefinition::Linear(target)) => {
             value * (source.0 / target.0)
         }
@@ -266,6 +274,57 @@ pub(crate) fn evaluate(intent: UnitIntent) -> Result<UnitOutput, UnitInvalid> {
         title,
         refresh_at_utc: None,
     })
+}
+
+fn decimal_below_absolute_zero(source: &str, scale: TemperatureScale) -> bool {
+    let Some(magnitude) = source.strip_prefix('-') else {
+        return false;
+    };
+    match scale {
+        TemperatureScale::Celsius => decimal_magnitude_exceeds(magnitude, "273.15"),
+        TemperatureScale::Fahrenheit => decimal_magnitude_exceeds(magnitude, "459.67"),
+        TemperatureScale::Kelvin => magnitude
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() && byte != b'0'),
+    }
+}
+
+fn decimal_magnitude_exceeds(value: &str, limit: &str) -> bool {
+    let (value_integer, value_fraction) = value.split_once('.').unwrap_or((value, ""));
+    let (limit_integer, limit_fraction) = limit.split_once('.').unwrap_or((limit, ""));
+    let value_integer = value_integer.trim_start_matches('0');
+    let limit_integer = limit_integer.trim_start_matches('0');
+
+    match value_integer.len().cmp(&limit_integer.len()) {
+        std::cmp::Ordering::Greater => return true,
+        std::cmp::Ordering::Less => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    match value_integer.cmp(limit_integer) {
+        std::cmp::Ordering::Greater => return true,
+        std::cmp::Ordering::Less => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+
+    let digits = value_fraction.len().max(limit_fraction.len());
+    for index in 0..digits {
+        let value_digit = value_fraction
+            .as_bytes()
+            .get(index)
+            .copied()
+            .unwrap_or(b'0');
+        let limit_digit = limit_fraction
+            .as_bytes()
+            .get(index)
+            .copied()
+            .unwrap_or(b'0');
+        match value_digit.cmp(&limit_digit) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    false
 }
 
 pub(crate) fn failure(reason: UnitFailure) -> UnitInvalid {
@@ -550,6 +609,45 @@ mod tests {
             assert_eq!(invalid.title, "温度低于绝对零度", "source={source}");
             assert_eq!(
                 invalid.explanation, "输入温度不能低于绝对零度",
+                "source={source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_sub_boundary_decimals_that_round_or_underflow_at_f64_precision() {
+        let tiny_negative_kelvin = format!("-0.{}1 K to C", "0".repeat(386));
+        assert_eq!(tiny_negative_kelvin.len(), 397);
+
+        for source in [
+            "-273.150000000000001 C to K".to_owned(),
+            "-459.67000000000001 F to K".to_owned(),
+            tiny_negative_kelvin,
+        ] {
+            let UnitClassification::Ready(intent) = classify(&source) else {
+                panic!("expected parsed temperature intent for {source}");
+            };
+            let invalid = evaluate(intent).unwrap_err();
+            assert_eq!(
+                invalid.reason,
+                UnitFailure::BelowAbsoluteZero,
+                "source={source}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_decimal_zero_and_absolute_zero_forms_remain_valid() {
+        for (source, expected_title) in [
+            ("-273.150000000000000 C to K", "0 K"),
+            ("-459.67000000000000 F to K", "0 K"),
+            ("-.0 K to C", "-273.15 °C"),
+            ("+0 K to C", "-273.15 °C"),
+            ("-000,000.000 K to C", "-273.15 °C"),
+        ] {
+            assert_eq!(
+                evaluate_ready(source).title,
+                expected_title,
                 "source={source}"
             );
         }
