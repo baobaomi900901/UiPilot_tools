@@ -320,7 +320,7 @@ pub(super) fn liveness_from_wait_result(
         WAIT_TIMEOUT => Ok(Liveness::Alive),
         WAIT_OBJECT_0 => Ok(Liveness::Exited),
         WAIT_FAILED => Err(ObservationFailure::AccessDenied),
-        _ => Err(ObservationFailure::IdentityUnavailable),
+        _ => Err(ObservationFailure::AccessDenied),
     }
 }
 

@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::core::{
-    CoreAdmission, CoreAuthority, EnumerationFailure, HostInstanceId, Liveness, ObservationAccess,
+    CoreAuthority, EnumerationFailure, HostInstanceId, Liveness, ObservationAccess,
     ObservationFailure, ProcessCandidate, ProcessError, ProcessIntent, ProcessObservation,
     ProcessPlatformAdapter, ProcessProtection, ProcessTarget,
 };
@@ -60,17 +60,38 @@ struct FakeProcessScript {
     protections: VecDeque<Result<ProcessProtection, ObservationFailure>>,
 }
 
+struct FakeProcessObject {
+    id: u64,
+    script: FakeProcessScript,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FakeHandleEvent {
+    Opened {
+        handle_id: u64,
+        object_id: u64,
+        pid: u32,
+    },
+    Dropped {
+        handle_id: u64,
+        object_id: u64,
+        pid: u32,
+    },
+}
+
 struct FakeState {
     enumerations:
         VecDeque<Result<Vec<Result<ProcessCandidate, EnumerationFailure>>, EnumerationFailure>>,
-    processes: BTreeMap<u32, FakeProcessScript>,
+    processes: BTreeMap<u32, Rc<RefCell<FakeProcessObject>>>,
     calls: Vec<FakeCall>,
     hooks: Vec<MutationHook>,
     requested_access: Vec<ObservationAccess>,
     process_name_equivalences: VecDeque<Result<bool, ObservationFailure>>,
     opened: usize,
     next_handle_id: u64,
+    next_object_id: u64,
     dropped: BTreeSet<u64>,
+    handle_events: Vec<FakeHandleEvent>,
 }
 
 impl Default for FakeState {
@@ -84,7 +105,9 @@ impl Default for FakeState {
             process_name_equivalences: VecDeque::new(),
             opened: 0,
             next_handle_id: 1,
+            next_object_id: 1,
             dropped: BTreeSet::new(),
+            handle_events: Vec::new(),
         }
     }
 }
@@ -97,17 +120,25 @@ struct FakeProcessAdapter {
 struct FakeHandle {
     id: u64,
     pid: u32,
+    object: Rc<RefCell<FakeProcessObject>>,
     state: Rc<RefCell<FakeState>>,
 }
 
 impl Drop for FakeHandle {
     fn drop(&mut self) {
-        let inserted = self.state.borrow_mut().dropped.insert(self.id);
+        let object_id = self.object.borrow().id;
+        let mut state = self.state.borrow_mut();
+        let inserted = state.dropped.insert(self.id);
         assert!(
             inserted,
             "fake handle {} was dropped more than once",
             self.id
         );
+        state.handle_events.push(FakeHandleEvent::Dropped {
+            handle_id: self.id,
+            object_id,
+            pid: self.pid,
+        });
     }
 }
 
@@ -132,8 +163,22 @@ impl FakeProcessAdapter {
     }
 
     fn with_process(self, pid: u32, script: FakeProcessScript) -> Self {
-        self.state.borrow_mut().processes.insert(pid, script);
+        self.replace_process(pid, script);
         self
+    }
+
+    fn replace_process(&self, pid: u32, script: FakeProcessScript) -> u64 {
+        let mut state = self.state.borrow_mut();
+        let object_id = state.next_object_id;
+        state.next_object_id += 1;
+        state.processes.insert(
+            pid,
+            Rc::new(RefCell::new(FakeProcessObject {
+                id: object_id,
+                script,
+            })),
+        );
+        object_id
     }
 
     fn with_process_name_equivalences(self, values: Vec<Result<bool, ObservationFailure>>) -> Self {
@@ -162,6 +207,10 @@ impl FakeProcessAdapter {
         self.state.borrow().dropped.len()
     }
 
+    fn handle_events(&self) -> Vec<FakeHandleEvent> {
+        self.state.borrow().handle_events.clone()
+    }
+
     fn requested_access(&self) -> Vec<ObservationAccess> {
         self.state.borrow().requested_access.clone()
     }
@@ -188,46 +237,47 @@ impl FakeProcessAdapter {
     }
 
     fn apply_mutation(&self, mutation: FakeMutation) {
-        let mut state = self.state.borrow_mut();
         match mutation {
             FakeMutation::CreationTimes { pid, values } => {
-                state
-                    .processes
-                    .get_mut(&pid)
-                    .expect("fake process must exist")
-                    .creation_times = values.into();
+                self.current_process(pid).borrow_mut().script.creation_times = values.into();
             }
             FakeMutation::Liveness { pid, values } => {
-                state
-                    .processes
-                    .get_mut(&pid)
-                    .expect("fake process must exist")
-                    .liveness = values.into();
+                self.current_process(pid).borrow_mut().script.liveness = values.into();
             }
             FakeMutation::Names { pid, values } => {
-                state
-                    .processes
-                    .get_mut(&pid)
-                    .expect("fake process must exist")
+                self.current_process(pid)
+                    .borrow_mut()
+                    .script
                     .reenumerated_names = values.into();
             }
         }
     }
 
+    fn current_process(&self, pid: u32) -> Rc<RefCell<FakeProcessObject>> {
+        Rc::clone(
+            self.state
+                .borrow()
+                .processes
+                .get(&pid)
+                .expect("fake process must exist"),
+        )
+    }
+
     fn pop_process_value<T>(
+        object: &Rc<RefCell<FakeProcessObject>>,
+        select: impl FnOnce(&mut FakeProcessScript) -> &mut VecDeque<Result<T, ObservationFailure>>,
+    ) -> Result<T, ObservationFailure> {
+        select(&mut object.borrow_mut().script)
+            .pop_front()
+            .unwrap_or(Err(ObservationFailure::IdentityUnavailable))
+    }
+
+    fn pop_current_process_value<T>(
         &self,
         pid: u32,
         select: impl FnOnce(&mut FakeProcessScript) -> &mut VecDeque<Result<T, ObservationFailure>>,
     ) -> Result<T, ObservationFailure> {
-        let mut state = self.state.borrow_mut();
-        select(
-            state
-                .processes
-                .get_mut(&pid)
-                .expect("fake process must exist"),
-        )
-        .pop_front()
-        .unwrap_or(Err(ObservationFailure::IdentityUnavailable))
+        Self::pop_process_value(&self.current_process(pid), select)
     }
 }
 
@@ -253,15 +303,23 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
         access: ObservationAccess,
     ) -> Result<Self::Handle, ObservationFailure> {
         self.state.borrow_mut().requested_access.push(access);
-        let outcome = self.pop_process_value(pid, |script| &mut script.open);
+        let object = self.current_process(pid);
+        let outcome = Self::pop_process_value(&object, |script| &mut script.open);
         let result = outcome.map(|()| {
+            let object_id = object.borrow().id;
             let mut state = self.state.borrow_mut();
             let id = state.next_handle_id;
             state.next_handle_id += 1;
             state.opened += 1;
+            state.handle_events.push(FakeHandleEvent::Opened {
+                handle_id: id,
+                object_id,
+                pid,
+            });
             FakeHandle {
                 id,
                 pid,
+                object,
                 state: Rc::clone(&self.state),
             }
         });
@@ -270,25 +328,25 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
     }
 
     fn creation_time(&self, handle: &Self::Handle) -> Result<u64, ObservationFailure> {
-        let result = self.pop_process_value(handle.pid, |script| &mut script.creation_times);
+        let result = Self::pop_process_value(&handle.object, |script| &mut script.creation_times);
         self.finish_call(FakeCall::CreationTime(handle.pid));
         result
     }
 
     fn liveness(&self, handle: &Self::Handle) -> Result<Liveness, ObservationFailure> {
-        let result = self.pop_process_value(handle.pid, |script| &mut script.liveness);
+        let result = Self::pop_process_value(&handle.object, |script| &mut script.liveness);
         self.finish_call(FakeCall::Liveness(handle.pid));
         result
     }
 
     fn observation(&self, handle: &Self::Handle) -> Result<ProcessObservation, ObservationFailure> {
-        let result = self.pop_process_value(handle.pid, |script| &mut script.observations);
+        let result = Self::pop_process_value(&handle.object, |script| &mut script.observations);
         self.finish_call(FakeCall::Observation(handle.pid));
         result
     }
 
     fn reenumerate_name(&self, pid: u32) -> Result<Option<String>, ObservationFailure> {
-        let result = self.pop_process_value(pid, |script| &mut script.reenumerated_names);
+        let result = self.pop_current_process_value(pid, |script| &mut script.reenumerated_names);
         self.finish_call(FakeCall::ReenumerateName(pid));
         result
     }
@@ -309,7 +367,7 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
     }
 
     fn protection(&self, handle: &Self::Handle) -> Result<ProcessProtection, ObservationFailure> {
-        let result = self.pop_process_value(handle.pid, |script| &mut script.protections);
+        let result = Self::pop_process_value(&handle.object, |script| &mut script.protections);
         self.finish_call(FakeCall::Protection(handle.pid));
         result
     }
@@ -1286,11 +1344,7 @@ fn admission_binds_each_intent_and_uses_only_snapshot_observation_access() {
 }
 
 #[test]
-fn admission_lease_retains_its_handle_until_single_consumption() {
-    fn consume_once<H>(admission: CoreAdmission<H>) {
-        drop(admission);
-    }
-
+fn admission_lease_retains_original_process_object_after_pid_reuse() {
     let pid = 100;
     let adapter = FakeProcessAdapter::default().with_process(
         pid,
@@ -1300,14 +1354,120 @@ fn admission_lease_retains_its_handle_until_single_consumption() {
             Ok(ProcessProtection::new(false, false)),
         ),
     );
-    let admission = authority(adapter.clone())
-        .admit(&target(pid, 10_000), ProcessIntent::Restart)
+    let authority = authority(adapter.clone());
+    let original_target = target(pid, 10_000);
+    let admission = authority
+        .admit(&original_target, ProcessIntent::Restart)
         .unwrap();
 
     assert_eq!(adapter.opened(), 1);
     assert_eq!(adapter.dropped(), 0);
-    consume_once(admission);
+    let initial_events = adapter.handle_events();
+    let [FakeHandleEvent::Opened {
+        handle_id: original_handle_id,
+        object_id: original_object_id,
+        pid: opened_pid,
+    }] = initial_events.as_slice()
+    else {
+        panic!("admission must retain exactly one original fake handle");
+    };
+    assert_eq!(*opened_pid, pid);
+
+    let replacement_object_id = adapter.replace_process(
+        pid,
+        admission_script(
+            10_001,
+            Ok(Liveness::Alive),
+            Ok(ProcessProtection::new(false, false)),
+        ),
+    );
+    assert_ne!(replacement_object_id, *original_object_id);
+
+    let replacement_handle = adapter
+        .open_observation(pid, ObservationAccess::SNAPSHOT)
+        .unwrap();
+    assert_eq!(adapter.creation_time(&replacement_handle), Ok(10_001));
+    assert_eq!(admission.target(), &original_target);
+    assert_eq!(admission.intent(), ProcessIntent::Restart);
+    assert_eq!(adapter.dropped(), 0);
+    assert_eq!(
+        adapter.handle_events(),
+        vec![
+            FakeHandleEvent::Opened {
+                handle_id: *original_handle_id,
+                object_id: *original_object_id,
+                pid,
+            },
+            FakeHandleEvent::Opened {
+                handle_id: 2,
+                object_id: replacement_object_id,
+                pid,
+            },
+        ]
+    );
+
+    drop(replacement_handle);
     assert_eq!(adapter.dropped(), 1);
+    assert_eq!(
+        adapter.handle_events(),
+        vec![
+            FakeHandleEvent::Opened {
+                handle_id: *original_handle_id,
+                object_id: *original_object_id,
+                pid,
+            },
+            FakeHandleEvent::Opened {
+                handle_id: 2,
+                object_id: replacement_object_id,
+                pid,
+            },
+            FakeHandleEvent::Dropped {
+                handle_id: 2,
+                object_id: replacement_object_id,
+                pid,
+            },
+        ]
+    );
+
+    drop(admission);
+    assert_eq!(adapter.opened(), 2);
+    assert_eq!(adapter.dropped(), 2);
+    assert_eq!(
+        adapter.handle_events(),
+        vec![
+            FakeHandleEvent::Opened {
+                handle_id: *original_handle_id,
+                object_id: *original_object_id,
+                pid,
+            },
+            FakeHandleEvent::Opened {
+                handle_id: 2,
+                object_id: replacement_object_id,
+                pid,
+            },
+            FakeHandleEvent::Dropped {
+                handle_id: 2,
+                object_id: replacement_object_id,
+                pid,
+            },
+            FakeHandleEvent::Dropped {
+                handle_id: *original_handle_id,
+                object_id: *original_object_id,
+                pid,
+            },
+        ]
+    );
+    assert_eq!(
+        adapter.calls(),
+        vec![
+            FakeCall::Open(pid),
+            FakeCall::CreationTime(pid),
+            FakeCall::Liveness(pid),
+            FakeCall::Protection(pid),
+            FakeCall::Open(pid),
+            FakeCall::CreationTime(pid),
+        ]
+    );
 }
 
 #[test]
@@ -1479,8 +1639,37 @@ mod windows_tests {
         );
         assert_eq!(
             liveness_from_wait_result(windows::Win32::Foundation::WAIT_EVENT(17)),
-            Err(ObservationFailure::IdentityUnavailable)
+            Err(ObservationFailure::AccessDenied)
         );
+    }
+
+    #[test]
+    fn windows_unexpected_wait_result_is_a_snapshot_inspection_denial() {
+        let pid = 7_000;
+        let unexpected_wait_failure =
+            liveness_from_wait_result(windows::Win32::Foundation::WAIT_EVENT(17)).unwrap_err();
+        let adapter = FakeProcessAdapter::default()
+            .with_enumeration(vec![Ok(candidate(pid, "wait.exe", None))])
+            .with_process(
+                pid,
+                FakeProcessScript {
+                    open: vec![Ok(())].into(),
+                    creation_times: vec![Ok(70_000)].into(),
+                    liveness: vec![Err(unexpected_wait_failure)].into(),
+                    observations: vec![Ok(path_observation("wait.exe", r"C:\Apps\wait.exe"))]
+                        .into(),
+                    ..FakeProcessScript::default()
+                },
+            );
+
+        let snapshot = authority(adapter.clone()).snapshot().unwrap();
+
+        assert!(snapshot.processes().is_empty());
+        assert_eq!(snapshot.omissions().inspection_denied(), 1);
+        assert_eq!(snapshot.omissions().identity_unavailable(), 0);
+        assert_eq!(snapshot.omissions().total(), 1);
+        assert_eq!(adapter.opened(), 1);
+        assert_eq!(adapter.dropped(), 1);
     }
 
     #[test]
