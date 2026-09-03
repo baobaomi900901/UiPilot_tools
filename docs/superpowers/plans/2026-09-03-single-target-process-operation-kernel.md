@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** In progress — approved on 2026-09-03; Tasks 1-2 complete
+**Status:** In progress — approved on 2026-09-03; Tasks 1-3 complete
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
@@ -103,11 +103,11 @@ The design specification remains canonical for interface semantics, event order,
 
 **Dependencies:** Tasks 1-2; approved design sections `3.3 Success Means Exit Was Observed`, `3.4 Fixed Five-Second Monotonic Deadline`, `6. Least-Privilege Operation Access`, `8. Force-Termination Flow`, `10. Resource Ownership And Concurrency`, and `11. Stable Error Contract`.
 
-- [ ] Implement `force_terminate_with_clock` through the shared final-operation helper using `OperationAccess::FORCE` and fixed exit code `1`.
-- [ ] Poll immediately before the side effect, call the terminate primitive at most once, wait only for the deadline's remaining duration, and perform the final zero-time poll.
-- [ ] On terminate-call failure, re-poll the same operation HANDLE before mapping access versus other failures; a signaled handle returns success, an unobservable terminal state returns `CompletionUnknown`.
-- [ ] Preserve the post-side-effect uncertainty boundary: successful terminate plus timeout is `TerminationPending`, wait failure is `CompletionUnknown`, and neither can retry, elevate, or invoke terminate again.
-- [ ] Verify two independent leases against the same fake object follow the approved final-admission versus post-admission concurrent-exit outcomes without global locks or deduplication.
+- [x] Implement `force_terminate_with_clock` through the shared final-operation helper using `OperationAccess::FORCE` and fixed exit code `1`.
+- [x] Poll immediately before the side effect, call the terminate primitive at most once, wait only for the deadline's remaining duration, and perform the final zero-time poll.
+- [x] On terminate-call failure, re-poll the same operation HANDLE before mapping access versus other failures; a signaled handle returns success, an unobservable terminal state returns `CompletionUnknown`.
+- [x] Preserve the post-side-effect uncertainty boundary: successful terminate plus timeout is `TerminationPending`, wait failure is `CompletionUnknown`, and neither can retry, elevate, or invoke terminate again.
+- [x] Verify two independent leases against the same fake object follow the approved final-admission versus post-admission concurrent-exit outcomes without global locks or deduplication.
 
 **Distinct test coverage:** Pre-call concurrent exit produces success without terminate; terminate is called once with exit code `1`; immediate/delayed exit succeeds; successful terminate plus deadline exhaustion is `TerminationPending`; successful terminate plus wait-inspection failure is `CompletionUnknown`; failed terminate plus signaled re-poll succeeds; failed terminate plus alive maps access to `OperationAccessDenied` and other failure to `OperationUnavailable`; failed terminate plus failed re-poll is `CompletionUnknown`; no automatic retry/elevation; independent lease ordering and exact HANDLE drops.
 
