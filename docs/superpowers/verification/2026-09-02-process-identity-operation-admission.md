@@ -1,8 +1,8 @@
 # Stage 1 Process Identity And Operation Admission Verification Record
 
 **Date:** 2026-09-03
-**Status:** AWAITING USER ACCEPTANCE（等待用户验收）
-**Verification outcome:** `DONE_WITH_CONCERNS` — focused and default tests pass, but the all-feature test gate and both Clippy gates are not green.
+**Status:** ACCEPTED WITH RECORDED DEVIATIONS（已验收，保留已记录偏差）
+**Verification outcome:** `DONE_WITH_CONCERNS` — accepted by the user on 2026-09-03; focused and default tests pass, while the all-feature test gate and both Clippy gates remain red as accepted deviations.
 **Scope:** Stage 1 aggregate regression, Windows read-only/admission evidence, changed-file audit, and exit-gate evidence only. This record adds no product behavior.
 
 ## Revision Under Verification
@@ -46,7 +46,7 @@ Every command below was freshly run from the worktree root at source HEAD `33c32
 | `rustc --version` | 0 | Version recorded above. |
 | `cargo --version` | 0 | Version recorded above. |
 
-The required expectation that every Cargo command exit 0 is therefore **not met**. Stage 1's verification/exit gate is not all green.
+The required expectation that every Cargo command exit 0 is therefore **not met**. The user explicitly accepted this Stage 1 deviation on 2026-09-03; the repository-wide gates remain unresolved and must not be represented as green.
 
 The exact remaining Clippy sites are:
 
@@ -115,7 +115,7 @@ The changed-file audit plus focused source guards confirm there is no new Tauri 
 |---|---|---|
 | 12.1 Fake Adapter contract | 18 snapshot + 15 admission tests passed; identity, omissions, fixed precedence, protection, access, liveness, redaction, no-side-effect, and handle ownership covered with exact counts above. The retained-object regression proves PID remapping cannot retarget an admitted Fake handle and that original/replacement objects close separately and exactly once. | PASS |
 | 12.2 Windows tests | 19 Windows tests passed; the real modified-creation-time case returned `TargetChanged` through the Windows facade, and current self, exact child admission, code-259 exit / `TargetExited`, unexpected-wait inspection telemetry, context-specific path-query fallback with same-HANDLE revalidation, critical/PPL readability, access mask, Tool Help traversal, ordinal names, CNG, and RAII are covered. Real protected target is environment N/A as permitted. | PASS with allowed environment N/A |
-| 12.3 Manual acceptance evidence | Standard-user OS/toolchain/elevation, live aggregate snapshot/omissions, self denial, live helper, stale target, redaction, and zero residual helper/probe counts are recorded above. | EVIDENCE RECORDED; USER REVIEW PENDING |
+| 12.3 Manual acceptance evidence | Standard-user OS/toolchain/elevation, live aggregate snapshot/omissions, self denial, live helper, stale target, redaction, and zero residual helper/probe counts are recorded above. | EVIDENCE RECORDED; USER ACCEPTED WITH RECORDED DEVIATIONS |
 | 13: design and independent plan approved | Both tracked documents state user-approved status. | PASS |
 | 13: catalog/admit Fake contracts | Focused Fake/core results above, including stable-object identity retention across PID remapping and separate exact-once original/replacement handle cleanup. | PASS |
 | 13: Windows 11 read-only/admission validation | Focused Windows results and standard-user evidence above. | PASS with protected-target environment N/A |
@@ -124,13 +124,15 @@ The changed-file audit plus focused source guards confirm there is no new Tauri 
 | 13: no prohibited product/API surface | Changed-file audit and source guards above. | PASS |
 | 13: changes and limitations recorded | File list, toolchain drift, protected-target N/A, and failed aggregate gates are recorded here. | PASS |
 | Task 4 aggregate Cargo gate | Default/focused tests and fmt pass; all-feature test and both Clippy commands reproducibly fail. | **FAIL — exit gate not all green** |
-| User acceptance before Stage 2 | This record has not yet been reviewed and accepted by the user. | **PENDING** |
+| User acceptance before Stage 2 | The user reviewed this record and selected acceptance option 1 on 2026-09-03, explicitly accepting the disclosed gate failures, toolchain drift, and permitted environment N/A. | **ACCEPTED WITH RECORDED DEVIATIONS** |
 
-## Limitations And Stop Gate
+## Accepted Deviations And Stage Boundary
 
 1. The required all-feature test command fails during schema-generator compilation under the all-feature cfg combination.
 2. Both required Clippy commands fail with `-D warnings`. Task 3 removed the two Stage-1-owned test lints, leaving zero diagnostics in `process_control`; the remaining 12 library / 13 library-test diagnostics are in unrelated host areas. Fixing them requires source edits outside this evidence-only task.
 3. The host uses Rust/Cargo 1.96.1 rather than the plan's stated 1.96.0.
 4. A real inspectable protected target was unavailable; this is environment N/A, with deterministic Fake coverage retained.
 
-This record does **not** mark Stage 1 accepted. Stage 1 remains **AWAITING USER ACCEPTANCE**, and its aggregate exit gate is not all green. **Do not begin Stage 2 design, planning, or implementation** unless the failed gates are dispositioned and the user explicitly accepts the Stage 1 evidence.
+The user explicitly accepted Stage 1 and the disclosed deviations on 2026-09-03. Stage 1 is therefore **ACCEPTED WITH RECORDED DEVIATIONS**; the aggregate gate remains factually red and the unresolved repository-wide failures remain follow-up work.
+
+This acceptance closes Stage 1 only. Stage 2 design, planning, and implementation have **not** started and require a separate explicit user instruction under the roadmap's step-by-step acceptance process.

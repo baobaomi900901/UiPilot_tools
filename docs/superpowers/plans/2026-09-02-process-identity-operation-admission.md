@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-02
-**Status:** Approved — accepted by the user on 2026-09-02
+**Status:** Completed — plan approved on 2026-09-02; Stage 1 accepted by the user on 2026-09-03 with the deviations recorded in the verification record
 
 **Goal:** Deliver the host-internal, read-only process catalog and identity/protection admission lease defined by Stage 1, with deterministic fake-adapter contracts and read-only Windows 11 verification.
 
@@ -60,12 +60,12 @@ The production facade wraps `CoreAuthority<WindowsProcessAdapter>`. Tests instan
 
 **Dependencies:** Approved design sections `3 Decisions`, `4 Module And Seam`, `5 Domain Contract`, `6 Snapshot Flow`, `9 Stable Error Contract`, and `10 Concurrency And Security Invariants`.
 
-- [ ] Declare `process_control` beside the other host modules under the existing production/test cfg. Limit the intentional Stage 1 dead-code exception to this one module declaration with a reason stating that Stage 2 supplies the first production caller; do not construct or manage the module merely to silence lints.
-- [ ] Define the value types, private fields, strict constructors, omission counters, stable error enum/display strings, deterministic record ordering, and the private generic Adapter/core contract from `Core Contract Overview`.
-- [ ] Implement `CoreAuthority::snapshot()` so global snapshot creation/traversal failure returns `CatalogUnavailable`, while each candidate contributes either one reliable record or exactly one omission in the design's priority order.
-- [ ] Keep a candidate record only after the HANDLE-derived creation time, liveness, and display metadata agree. Path-unavailable fallback must re-enumerate the name and then recheck the original HANDLE's liveness and creation time before publishing.
-- [ ] Build `FakeProcessAdapter` with scripted call outcomes, requested-access capture, open/drop counters, and mutation hooks between calls; it must not embed core error precedence inside the fake.
-- [ ] Add a `lib.rs` source guard proving the module has the single scoped dead-code exception and has no `.manage(...)`, invoke handler, command, build capability, or frontend wiring.
+- [x] Declare `process_control` beside the other host modules under the existing production/test cfg. Limit the intentional Stage 1 dead-code exception to this one module declaration with a reason stating that Stage 2 supplies the first production caller; do not construct or manage the module merely to silence lints.
+- [x] Define the value types, private fields, strict constructors, omission counters, stable error enum/display strings, deterministic record ordering, and the private generic Adapter/core contract from `Core Contract Overview`.
+- [x] Implement `CoreAuthority::snapshot()` so global snapshot creation/traversal failure returns `CatalogUnavailable`, while each candidate contributes either one reliable record or exactly one omission in the design's priority order.
+- [x] Keep a candidate record only after the HANDLE-derived creation time, liveness, and display metadata agree. Path-unavailable fallback must re-enumerate the name and then recheck the original HANDLE's liveness and creation time before publishing.
+- [x] Build `FakeProcessAdapter` with scripted call outcomes, requested-access capture, open/drop counters, and mutation hooks between calls; it must not embed core error precedence inside the fake.
+- [x] Add a `lib.rs` source guard proving the module has the single scoped dead-code exception and has no `.manage(...)`, invoke handler, command, build capability, or frontend wiring.
 
 **Distinct test coverage:** Successful deterministic PID ordering; duplicate/changed candidates; optional path fallback; each omission category is mutually exclusive; per-entry failure preserves other records; mid-enumeration/global failure publishes no partial snapshot; refresh preserves an unchanged target; metadata never participates in target equality; every temporary fake HANDLE closes exactly once; no Tauri wiring exists.
 
@@ -77,11 +77,11 @@ The production facade wraps `CoreAuthority<WindowsProcessAdapter>`. Tests instan
 
 **Dependencies:** Task 1; approved design sections `7 Stage 1 Admission Lease`, `8 Protection Policy`, `9 Stable Error Contract`, and `10 Concurrency And Security Invariants`.
 
-- [ ] Add `ProcessIntent` and private generic `CoreAdmission<H>` without exposing raw HANDLE, PID reopening, serialization, cloning, or operation access. Task 3 alone wraps the Windows specialization in the concrete crate-private `ProcessAdmission`.
-- [ ] Implement `CoreAuthority::admit()` in the exact design order: target structure, host instance, observation open, creation time, zero-time liveness, protection readability, self identity, protection policy.
-- [ ] Bind the accepted intent and original target to the lease; all three intents request the same observation access and no operation right.
-- [ ] Map missing/exited targets, changed creation time, observation denial, liveness inspection failure, self, critical, PPL, and unreadable protection to the approved stable error. Close every temporary HANDLE on failure and close the retained HANDLE exactly once on lease Drop.
-- [ ] Keep error priority in the core so a changed PID returns `TargetChanged` before inspecting the replacement process's protection state, and an expired host instance performs no platform open.
+- [x] Add `ProcessIntent` and private generic `CoreAdmission<H>` without exposing raw HANDLE, PID reopening, serialization, cloning, or operation access. Task 3 alone wraps the Windows specialization in the concrete crate-private `ProcessAdmission`.
+- [x] Implement `CoreAuthority::admit()` in the exact design order: target structure, host instance, observation open, creation time, zero-time liveness, protection readability, self identity, protection policy.
+- [x] Bind the accepted intent and original target to the lease; all three intents request the same observation access and no operation right.
+- [x] Map missing/exited targets, changed creation time, observation denial, liveness inspection failure, self, critical, PPL, and unreadable protection to the approved stable error. Close every temporary HANDLE on failure and close the retained HANDLE exactly once on lease Drop.
+- [x] Keep error priority in the core so a changed PID returns `TargetChanged` before inspecting the replacement process's protection state, and an expired host instance performs no platform open.
 
 **Distinct test coverage:** Invalid target; host restart/instance mismatch with zero Adapter calls; PID reuse; exit before/after open; `WAIT_TIMEOUT`, `WAIT_OBJECT_0`, `WAIT_FAILED`, and unexpected wait values; self, critical, PPL, and protection-query failure; simultaneous failure priority; all intents use only observation access; lease is consumed once; drop and all failure paths close exact handles; no side-effect Adapter exists or is called.
 
@@ -93,14 +93,14 @@ The production facade wraps `CoreAuthority<WindowsProcessAdapter>`. Tests instan
 
 **Dependencies:** Tasks 1-2; approved design sections `5.1 Host Instance`, `5.3 Process Record`, `7.2 Admission Order`, `7.3 Least Access`, `8 Protection Policy`, `11 Windows Adapter`, and `12 Verification`.
 
-- [ ] Implement `WindowsProcessAdapter` and `OwnedProcessHandle` using existing `windows 0.61.3` features: Tool Help enumeration, `OpenProcess`, `QueryFullProcessImageNameW`, `GetProcessTimes`, `WaitForSingleObject`, `IsProcessCritical`, and `GetProcessInformation(ProcessProtectionLevelInfo)`.
-- [ ] Open every catalog/admission HANDLE with exactly `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`, non-inheritable. Map `WAIT_TIMEOUT` to alive, `WAIT_OBJECT_0` to exited, and `WAIT_FAILED`/unexpected results to inspection failure.
-- [ ] Generate `HostInstanceId` with `BCryptGenRandom(None, ..., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`; any non-success `NTSTATUS` returns redacted `ProcessAuthorityInitError::Unavailable`. Isolate the fill call behind private `generate_host_instance_with` so tests can inject success/failure without replacing the Windows Adapter. Do not add `rand`, `getrandom`, UUID, or another dependency.
-- [ ] Canonicalize HANDLE-derived `FILETIME` to `u64`; preserve paths as `PathBuf`/UTF-16-derived Windows values until the crate-private record conversion; compare basenames with ordinal case-insensitive Windows semantics.
-- [ ] Implement the Windows facade and concrete opaque `ProcessAdmission` around `CoreAdmission<OwnedProcessHandle>`. Add a non-Windows facade whose constructors/operations return `PlatformUnsupported` without defining a usable admission HANDLE. The Windows facade stores current host `pid + creationTime` as the exact self identity and delegates ordering to the core.
-- [ ] Add real Windows tests that find the current test process, reject it as `ProtectedTarget`, admit a retained child while alive, then observe `TargetExited` after that same child exits. Spawn the child from the current Rust test executable through an ignored fixture test, not PowerShell or a product helper binary.
-- [ ] Make the fixture exit with numeric code 259 after a bounded delay and retain the parent `Child` HANDLE through the stale-target check, proving `WaitForSingleObject` does not confuse it with `STILL_ACTIVE`. Cleanup is bounded to that exact child.
-- [ ] Verify current-process critical/PPL queries return readable, unprotected results; classify unavailable protected-target inspection without enabling `SeDebugPrivilege`.
+- [x] Implement `WindowsProcessAdapter` and `OwnedProcessHandle` using existing `windows 0.61.3` features: Tool Help enumeration, `OpenProcess`, `QueryFullProcessImageNameW`, `GetProcessTimes`, `WaitForSingleObject`, `IsProcessCritical`, and `GetProcessInformation(ProcessProtectionLevelInfo)`.
+- [x] Open every catalog/admission HANDLE with exactly `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`, non-inheritable. Map `WAIT_TIMEOUT` to alive, `WAIT_OBJECT_0` to exited, and `WAIT_FAILED`/unexpected results to inspection failure.
+- [x] Generate `HostInstanceId` with `BCryptGenRandom(None, ..., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`; any non-success `NTSTATUS` returns redacted `ProcessAuthorityInitError::Unavailable`. Isolate the fill call behind private `generate_host_instance_with` so tests can inject success/failure without replacing the Windows Adapter. Do not add `rand`, `getrandom`, UUID, or another dependency.
+- [x] Canonicalize HANDLE-derived `FILETIME` to `u64`; preserve paths as `PathBuf`/UTF-16-derived Windows values until the crate-private record conversion; compare basenames with ordinal case-insensitive Windows semantics.
+- [x] Implement the Windows facade and concrete opaque `ProcessAdmission` around `CoreAdmission<OwnedProcessHandle>`. Add a non-Windows facade whose constructors/operations return `PlatformUnsupported` without defining a usable admission HANDLE. The Windows facade stores current host `pid + creationTime` as the exact self identity and delegates ordering to the core.
+- [x] Add real Windows tests that find the current test process, reject it as `ProtectedTarget`, admit a retained child while alive, then observe `TargetExited` after that same child exits. Spawn the child from the current Rust test executable through an ignored fixture test, not PowerShell or a product helper binary.
+- [x] Make the fixture exit with numeric code 259 after a bounded delay and retain the parent `Child` HANDLE through the stale-target check, proving `WaitForSingleObject` does not confuse it with `STILL_ACTIVE`. Cleanup is bounded to that exact child.
+- [x] Verify current-process critical/PPL queries return readable, unprotected results; classify unavailable protected-target inspection without enabling `SeDebugPrivilege`.
 
 **Distinct test coverage:** CNG generation success/failure seam; Tool Help end versus traversal failure; path/name reconciliation; FILETIME conversion; exact access mask and non-inheritance; current-process self denial; ordinary child lease; code-259 child exit; Windows HANDLE drop counts; no PowerShell/WMI/Shell/undocumented NT fallback.
 
@@ -112,11 +112,11 @@ The production facade wraps `CoreAuthority<WindowsProcessAdapter>`. Tests instan
 
 **Dependencies:** Tasks 1-3; approved design sections `12 Verification` and `13 Exit Gate`.
 
-- [ ] Run the focused process-control suite and record test counts plus the exact Windows OS build, architecture, elevation state, and Rust toolchain.
-- [ ] Run the full default/all-feature test, format, and Clippy gates below and record commands, exit codes, and any environment-only limitations.
-- [ ] In a standard-user Windows 11 session, record current-process self denial, live helper admission, code-259 helper exit, stale-target rejection, omission counts, helper cleanup, and ordinary-log redaction. If no inspectable protected target exists, record that item as environment N/A while retaining the mandatory Fake Adapter contract result.
-- [ ] Record the final changed-file list and confirm no Tauri command/state/capability/frontend/public plugin contract, process side effect, dependency, or lockfile change.
-- [ ] Stop at the Stage 1 manual-acceptance gate. Do not mark Stage 1 accepted or begin Stage 2 without the user's explicit acceptance of the evidence.
+- [x] Run the focused process-control suite and record test counts plus the exact Windows OS build, architecture, elevation state, and Rust toolchain.
+- [x] Run the full default/all-feature test, format, and Clippy gates below and record commands, exit codes, and any environment-only limitations.
+- [x] In a standard-user Windows 11 session, record current-process self denial, live helper admission, code-259 helper exit, stale-target rejection, omission counts, helper cleanup, and ordinary-log redaction. If no inspectable protected target exists, record that item as environment N/A while retaining the mandatory Fake Adapter contract result.
+- [x] Record the final changed-file list and confirm no Tauri command/state/capability/frontend/public plugin contract, process side effect, dependency, or lockfile change.
+- [x] Stop at the Stage 1 manual-acceptance gate. Do not mark Stage 1 accepted or begin Stage 2 without the user's explicit acceptance of the evidence.
 
 **Distinct test coverage:** This task owns aggregate regression and manual evidence only; it does not add product behavior.
 
@@ -140,8 +140,8 @@ Expected: every Cargo command exits 0; the dependency diff is empty; the verific
 
 ## Final Acceptance Checklist
 
-- [ ] Design section `12.1 Fake Adapter Contract Tests` is covered by Tasks 1-2.
-- [ ] Design section `12.2 Windows Tests` is covered by Task 3.
-- [ ] Design section `12.3 Manual Acceptance` and every item in `13 Exit Gate` are recorded by Task 4.
-- [ ] Stage 1 contains no Stage 2 operation HANDLE, side effect, error name, elevation path, UI, Runtime, or public plugin contract.
-- [ ] The user has reviewed the verification record and explicitly accepted Stage 1 before any Stage 2 design or implementation begins.
+- [x] Design section `12.1 Fake Adapter Contract Tests` is covered by Tasks 1-2.
+- [x] Design section `12.2 Windows Tests` is covered by Task 3.
+- [x] Design section `12.3 Manual Acceptance` and every item in `13 Exit Gate` are recorded by Task 4.
+- [x] Stage 1 contains no Stage 2 operation HANDLE, side effect, error name, elevation path, UI, Runtime, or public plugin contract.
+- [x] The user reviewed the verification record and explicitly accepted Stage 1 with its recorded deviations on 2026-09-03, before any Stage 2 design or implementation began.
