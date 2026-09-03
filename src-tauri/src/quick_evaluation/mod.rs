@@ -1,6 +1,7 @@
 mod arithmetic;
 mod date;
 mod number;
+mod time_zone;
 mod units;
 
 use time::OffsetDateTime;
