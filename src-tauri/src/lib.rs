@@ -31,6 +31,9 @@ mod commands;
 mod calculator;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod quick_evaluation;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod browser_open;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
