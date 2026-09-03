@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** In progress — approved on 2026-09-03; Tasks 1-3 complete
+**Status:** In progress — approved on 2026-09-03; Tasks 1-4 complete
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
@@ -119,13 +119,13 @@ The design specification remains canonical for interface semantics, event order,
 
 **Dependencies:** Tasks 1-3; approved design sections `4. Module Interface`, `6. Least-Privilege Operation Access`, `7. Ordinary Termination Flow`, `7.1 HWND Identity Limitation`, `8. Force-Termination Flow`, `9. Private Adapter And Clock Seams`, `12. Logging And Data Handling`, `13. Windows Adapter`, and `14.2 Real Windows Tests`.
 
-- [ ] Implement `ProcessOperationAdapter` for `WindowsProcessAdapter` with public Win32 APIs only: exact non-inheritable `OpenProcess`, `EnumWindows`, `GetWindowThreadProcessId`, `IsWindowVisible`, `GetWindow(GW_OWNER)`, `PostMessageW(WM_CLOSE)`, `TerminateProcess`, and `WaitForSingleObject`.
-- [ ] Add narrow native helper seams for exact access-mask conversion, window collection/fact refresh, remaining-duration conversion, wait-result mapping, and context-specific error classification. Round a positive remaining duration up to a finite millisecond value, never pass `INFINITE`, and map UIPI `ERROR_ACCESS_DENIED` without exposing raw codes.
-- [ ] Add the two production facade methods in `mod.rs`, consume the concrete admission inner value, and supply `SystemMonotonicClock`; keep equivalent non-Windows methods returning `PlatformUnsupported` without manufacturing an admission.
-- [ ] Replace the Stage 1 “no side-effect source” guard with Stage 2A scope guards that require the approved primitives while rejecting `PROCESS_ALL_ACCESS`, `PROCESS_CREATE_THREAD`, `SeDebugPrivilege`, `EndTask`, taskkill, PowerShell, WMI, Shell execution, and undocumented NT APIs.
-- [ ] Extend the ignored current-test-executable fixture with bounded `sleep`, `graceful-window`, and `ignore-close-window` modes. The two window modes create one visible, no-owner, non-activating top-level window and run a message loop without stealing focus; the first destroys the window and exits on `WM_CLOSE`, while the second keeps pumping and ignores it.
-- [ ] Add readiness polling through the Adapter's read-only window facts before invoking product operations. Every real test retains the exact `Child` and uses only its bounded fixture cleanup path.
-- [ ] Add real Windows tests for graceful exit, no-window unavailable, five-second ignored-close timeout, and force termination. Reuse the existing real changed-creation-time and self-protection admission tests as proof that those targets cannot produce a Stage 2A lease or side effect; do not manufacture an invalid operation lease. No test discovers an arbitrary process and then performs an operation on it.
+- [x] Implement `ProcessOperationAdapter` for `WindowsProcessAdapter` with public Win32 APIs only: exact non-inheritable `OpenProcess`, `EnumWindows`, `GetWindowThreadProcessId`, `IsWindowVisible`, `GetWindow(GW_OWNER)`, `PostMessageW(WM_CLOSE)`, `TerminateProcess`, and `WaitForSingleObject`.
+- [x] Add narrow native helper seams for exact access-mask conversion, window collection/fact refresh, remaining-duration conversion, wait-result mapping, and context-specific error classification. Round a positive remaining duration up to a finite millisecond value, never pass `INFINITE`, and map UIPI `ERROR_ACCESS_DENIED` without exposing raw codes.
+- [x] Add the two production facade methods in `mod.rs`, consume the concrete admission inner value, and supply `SystemMonotonicClock`; keep equivalent non-Windows methods returning `PlatformUnsupported` without manufacturing an admission.
+- [x] Replace the Stage 1 “no side-effect source” guard with Stage 2A scope guards that require the approved primitives while rejecting `PROCESS_ALL_ACCESS`, `PROCESS_CREATE_THREAD`, `SeDebugPrivilege`, `EndTask`, taskkill, PowerShell, WMI, Shell execution, and undocumented NT APIs.
+- [x] Extend the ignored current-test-executable fixture with bounded `sleep`, `graceful-window`, and `ignore-close-window` modes. The two window modes create one visible, no-owner, non-activating top-level window and run a message loop without stealing focus; the first destroys the window and exits on `WM_CLOSE`, while the second keeps pumping and ignores it.
+- [x] Add readiness polling through the Adapter's read-only window facts before invoking product operations. Every real test retains the exact `Child` and uses only its bounded fixture cleanup path.
+- [x] Add real Windows tests for graceful exit, no-window unavailable, five-second ignored-close timeout, and force termination. Reuse the existing real changed-creation-time and self-protection admission tests as proof that those targets cannot produce a Stage 2A lease or side effect; do not manufacture an invalid operation lease. No test discovers an arbitrary process and then performs an operation on it.
 
 **Distinct test coverage:** Exact native access masks and non-inheritance for both profiles; HWND wrapper/fact conversion and `Gone`/access/unavailable classification; wait mapping for zero and bounded waits; current helper window eligibility; graceful helper exits through `WM_CLOSE`; windowless helper receives no side effect; ignore-close helper times out and is cleaned by its retained child; force helper exits and signals its exact operation HANDLE; changed target and self make zero side-effect calls; fixture readiness and cleanup are bounded; source contains no forbidden fallback or wider right.
 
