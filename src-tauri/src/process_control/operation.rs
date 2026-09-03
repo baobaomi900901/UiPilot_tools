@@ -296,7 +296,12 @@ fn terminate_gracefully<A: ProcessOperationAdapter, C: MonotonicClock>(
         .collect::<Vec<_>>();
 
     if candidates.is_empty() {
-        return unavailable_unless_exited(adapter, operation_handle);
+        let unavailable = if clock.now() >= deadline {
+            ProcessOperationError::OperationUnavailable
+        } else {
+            ProcessOperationError::GracefulCloseUnavailable
+        };
+        return unavailable_unless_exited(adapter, operation_handle, unavailable);
     }
 
     let mut posted = false;
@@ -320,7 +325,12 @@ fn terminate_gracefully<A: ProcessOperationAdapter, C: MonotonicClock>(
             break;
         }
 
-        let facts = match adapter.window_facts(candidate.token()) {
+        let facts = adapter.window_facts(candidate.token());
+        if clock.now() >= deadline {
+            deadline_exhausted = true;
+            break;
+        }
+        let facts = match facts {
             Ok(facts) if facts.pid() == target_pid && facts.visible() && !facts.has_owner() => {
                 facts
             }
@@ -384,10 +394,11 @@ fn terminate_gracefully<A: ProcessOperationAdapter, C: MonotonicClock>(
 fn unavailable_unless_exited<A: ProcessOperationAdapter>(
     adapter: &A,
     operation_handle: &A::Handle,
+    unavailable: ProcessOperationError,
 ) -> Result<(), ProcessOperationError> {
     match adapter.wait_for_exit(operation_handle, Duration::ZERO) {
         Ok(ExitWait::Exited) => Ok(()),
-        Ok(ExitWait::TimedOut) => Err(ProcessOperationError::GracefulCloseUnavailable),
+        Ok(ExitWait::TimedOut) => Err(unavailable),
         Err(failure) => Err(side_effect_availability_failure(failure)),
     }
 }

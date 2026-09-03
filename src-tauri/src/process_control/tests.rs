@@ -2815,6 +2815,31 @@ mod operation_terminate {
     }
 
     #[test]
+    fn enumeration_consuming_deadline_without_eligible_candidates_is_operation_unavailable() {
+        let pid = 72;
+        let creation_time = 7_200;
+        let base = Instant::now();
+        let clock =
+            FakeMonotonicClock::with_readings(base, vec![Duration::ZERO, Duration::from_secs(5)]);
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(creation_time, vec![Ok(ExitWait::TimedOut)]),
+            )
+            .with_window_enumeration(Ok(vec![WindowCandidate::new(1, pid + 1, true, false)]));
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Err(ProcessOperationError::OperationUnavailable));
+        assert_eq!(clock.reads(), 2);
+        assert_eq!(adapter.post_close_calls(), 0);
+        assert_eq!(
+            adapter.calls().last(),
+            Some(&FakeCall::WaitForExit(pid, Duration::ZERO))
+        );
+    }
+
+    #[test]
     fn deadline_consumed_before_first_post_returns_operation_unavailable() {
         let pid = 66;
         let creation_time = 6_600;
@@ -2847,13 +2872,55 @@ mod operation_terminate {
     }
 
     #[test]
+    fn facts_revalidation_crossing_deadline_never_posts_and_is_operation_unavailable() {
+        let pid = 73;
+        let creation_time = 7_300;
+        let base = Instant::now();
+        let clock = FakeMonotonicClock::with_readings(
+            base,
+            vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(5)],
+        );
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                    ],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![WindowCandidate::new(1, pid, true, false)]))
+            .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_post_close_outcomes(1, vec![Ok(())]);
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Err(ProcessOperationError::OperationUnavailable));
+        assert_eq!(clock.reads(), 3);
+        assert_eq!(adapter.post_close_calls(), 0);
+        assert_eq!(
+            adapter.calls().last(),
+            Some(&FakeCall::WaitForExit(pid, Duration::ZERO))
+        );
+    }
+
+    #[test]
     fn deadline_consumed_between_posts_stops_posting_and_times_out_after_success() {
         let pid = 67;
         let creation_time = 6_700;
         let base = Instant::now();
         let clock = FakeMonotonicClock::with_readings(
             base,
-            vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(5)],
+            vec![
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::from_secs(5),
+            ],
         );
         let adapter = FakeProcessAdapter::default()
             .with_process(
@@ -2926,7 +2993,7 @@ mod operation_terminate {
         assert!(adapter
             .calls()
             .contains(&FakeCall::WaitForExit(pid, Duration::from_secs(3))));
-        assert_eq!(clock.reads(), 3);
+        assert_eq!(clock.reads(), 4);
         assert_eq!(adapter.terminate_calls(), 0);
     }
 
