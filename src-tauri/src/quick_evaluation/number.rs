@@ -72,11 +72,7 @@ pub(crate) fn canonicalize_number(source: &str, grammar: NumberGrammar) -> Optio
     } else {
         source.to_owned()
     };
-    canonical
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite())
-        .map(|_| canonical)
+    Some(canonical)
 }
 
 #[cfg(test)]
@@ -123,18 +119,18 @@ mod tests {
     }
 
     #[test]
-    fn enforces_finite_and_bounded_number_literals() {
-        let finite_at_limit = "0".repeat(400);
-        let overflowing_at_limit = "9".repeat(400);
+    fn leaves_typed_range_checks_to_consumers_and_enforces_the_byte_bound() {
+        let zero_at_limit = "0".repeat(400);
+        let digits_at_limit = "9".repeat(400);
         let beyond_limit = "0".repeat(401);
 
         assert_eq!(
-            canonicalize_number(&finite_at_limit, NumberGrammar::Number).as_deref(),
-            Some(finite_at_limit.as_str())
+            canonicalize_number(&zero_at_limit, NumberGrammar::Number).as_deref(),
+            Some(zero_at_limit.as_str())
         );
         assert_eq!(
-            canonicalize_number(&overflowing_at_limit, NumberGrammar::Number),
-            None
+            canonicalize_number(&digits_at_limit, NumberGrammar::Number).as_deref(),
+            Some(digits_at_limit.as_str())
         );
         assert_eq!(
             canonicalize_number(&beyond_limit, NumberGrammar::Number),

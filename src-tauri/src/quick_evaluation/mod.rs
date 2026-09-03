@@ -1,5 +1,4 @@
 mod arithmetic;
-#[allow(dead_code)] // Currency is intentionally registered with the async dispatcher in task C5.
 mod currency;
 mod date;
 mod number;

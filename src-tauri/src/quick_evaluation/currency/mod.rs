@@ -165,26 +165,35 @@ pub(crate) fn classify(source: &str) -> CurrencyClassification {
     }
 
     let (amount_source, base_source, quote_source) = (parts[0], parts[1], parts[3]);
+    if super::units::owns_both_unit_operands(&normalized) {
+        return CurrencyClassification::NoMatch;
+    }
+
+    let Some(canonical_amount) = canonicalize_number(amount_source, NumberGrammar::Number) else {
+        return if looks_like_invalid_number(amount_source)
+            && CurrencyCode::new(base_source).is_some()
+            && CurrencyCode::new(quote_source).is_some()
+        {
+            CurrencyClassification::Invalid(CurrencyFailure::InvalidNumber)
+        } else {
+            CurrencyClassification::NoMatch
+        };
+    };
+    let Ok(amount) = Decimal::from_str_exact(&canonical_amount) else {
+        return CurrencyClassification::Invalid(CurrencyFailure::InvalidNumber);
+    };
+
     let base = CurrencyCode::new(base_source);
     let quote = CurrencyCode::new(quote_source);
     if base.is_none() || quote.is_none() {
-        return if code_like(base_source) && code_like(quote_source) {
+        return if (base.is_some() && short_code_like(quote_source))
+            || (quote.is_some() && short_code_like(base_source))
+        {
             CurrencyClassification::Invalid(CurrencyFailure::InvalidCode)
         } else {
             CurrencyClassification::NoMatch
         };
     }
-
-    let Some(canonical_amount) = canonicalize_number(amount_source, NumberGrammar::Number) else {
-        return if currency_symbol_prefixed(amount_source) {
-            CurrencyClassification::NoMatch
-        } else {
-            CurrencyClassification::Invalid(CurrencyFailure::InvalidNumber)
-        };
-    };
-    let Ok(amount) = canonical_amount.parse::<Decimal>() else {
-        return CurrencyClassification::Invalid(CurrencyFailure::InvalidNumber);
-    };
 
     CurrencyClassification::Ready(CurrencyIntent {
         amount,
@@ -193,19 +202,29 @@ pub(crate) fn classify(source: &str) -> CurrencyClassification {
     })
 }
 
-fn code_like(source: &str) -> bool {
-    (1..=3).contains(&source.len()) && source.bytes().all(|byte| byte.is_ascii_alphabetic())
+fn short_code_like(source: &str) -> bool {
+    (1..3).contains(&source.len()) && source.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-fn currency_symbol_prefixed(source: &str) -> bool {
-    matches!(source.chars().next(), Some('$' | '¥' | '€' | '£' | '元'))
-        || source.starts_with("美元")
+fn looks_like_invalid_number(source: &str) -> bool {
+    source.eq_ignore_ascii_case("nan")
+        || source.eq_ignore_ascii_case("inf")
+        || source.eq_ignore_ascii_case("infinity")
+        || (source
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b'+' | b'-' | b'.') || byte.is_ascii_digit())
+            && source.bytes().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b',' | b'e' | b'E')
+            }))
 }
 
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
     use time::{Date, Month};
+
+    use crate::quick_evaluation::units::UnitClassification;
 
     use super::{
         classify, evaluate_provider_result, evaluate_same_code, CurrencyClassification,
@@ -235,6 +254,29 @@ mod tests {
     }
 
     #[test]
+    fn currency_amounts_require_exact_decimal_representation() {
+        for source in [
+            "0.12345678901234567890123456789 USD to CNY",
+            "79228162514264337593543950336 USD to CNY",
+        ] {
+            assert_eq!(
+                classify(source),
+                CurrencyClassification::Invalid(CurrencyFailure::InvalidNumber),
+                "{source}"
+            );
+        }
+
+        assert_eq!(
+            ready("0.1234567890123456789012345678 USD to CNY").amount,
+            Decimal::from_str_exact("0.1234567890123456789012345678").unwrap()
+        );
+        assert_eq!(
+            ready("79228162514264337593543950335 USD to CNY").amount,
+            Decimal::MAX
+        );
+    }
+
+    #[test]
     fn incomplete_or_non_currency_forms_fall_through() {
         for source in [
             "100 USD",
@@ -242,6 +284,9 @@ mod tests {
             "100 dollars to CNY",
             "100 USD to yuan",
             "100 USD to CNYY",
+            "add pdf to zip",
+            "add US to CNY",
+            "100 US to CN",
             "$100 USD to CNY",
             "¥100 JPY to USD",
             "元100 CNY to USD",
@@ -273,6 +318,28 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn two_known_unit_operands_defer_before_currency_code_shapes() {
+        for source in ["1 kg to lb", "1 tsp to cup", "1 kg to m", "1 CUP to CUP"] {
+            assert_eq!(
+                classify(source),
+                CurrencyClassification::NoMatch,
+                "{source}"
+            );
+            assert!(
+                !matches!(
+                    crate::quick_evaluation::units::classify(source),
+                    UnitClassification::NoMatch
+                ),
+                "unit recognizer must own {source}"
+            );
+        }
+
+        let currency = ready("1 USD to CUP");
+        assert_eq!(currency.base.as_str(), "USD");
+        assert_eq!(currency.quote.as_str(), "CUP");
     }
 
     #[test]

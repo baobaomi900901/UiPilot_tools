@@ -227,6 +227,20 @@ pub(crate) fn classify(source: &str) -> UnitClassification {
     })
 }
 
+pub(super) fn owns_both_unit_operands(source: &str) -> bool {
+    let Some(normalized) = normalize_query(source) else {
+        return false;
+    };
+    let Some((source_operand, target_alias)) = split_conversion(&normalized) else {
+        return false;
+    };
+
+    matches!(
+        parse_source_operand(source_operand),
+        SourceOperand::Ready { .. } | SourceOperand::KnownUnitInvalidNumber
+    ) && catalog::resolve_alias(target_alias).is_some()
+}
+
 pub(crate) fn evaluate(intent: UnitIntent) -> Result<UnitOutput, UnitInvalid> {
     if intent.source.dimension() != intent.target.dimension() {
         return Err(failure(UnitFailure::DimensionMismatch));
