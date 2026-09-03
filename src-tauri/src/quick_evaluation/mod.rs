@@ -13,6 +13,7 @@ pub(crate) enum QuickKind {
     Unit,
     Arithmetic,
     Date,
+    TimeZone,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +28,7 @@ pub(crate) enum QuickIntent {
     Unit(units::UnitIntent),
     Arithmetic(arithmetic::ArithmeticIntent),
     Date(date::DateIntent),
+    TimeZone(time_zone::TimeZoneIntent),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +52,24 @@ pub(crate) fn classify(source: &str) -> QuickClassification {
     if !matches!(date, QuickClassification::NoMatch) {
         return date;
     }
+    match time_zone::classify(source) {
+        time_zone::TimeZoneClassification::NoMatch => {}
+        time_zone::TimeZoneClassification::Invalid(invalid) => {
+            let time_zone::TimeZoneInvalid {
+                reason: _reason,
+                title,
+                explanation,
+            } = invalid;
+            return QuickClassification::Invalid(QuickFailure {
+                kind: QuickKind::TimeZone,
+                title,
+                explanation,
+            });
+        }
+        time_zone::TimeZoneClassification::Ready(intent) => {
+            return QuickClassification::Ready(QuickIntent::TimeZone(intent));
+        }
+    }
     match units::classify(source) {
         units::UnitClassification::NoMatch => {}
         units::UnitClassification::Invalid(reason) => {
@@ -69,9 +89,14 @@ pub(crate) fn classify(source: &str) -> QuickClassification {
     })
 }
 
-pub(crate) fn evaluate<L>(intent: QuickIntent, local_today: L) -> Result<QuickOutput, QuickFailure>
+pub(crate) fn evaluate<L, U>(
+    intent: QuickIntent,
+    local_today: L,
+    utc_now: U,
+) -> Result<QuickOutput, QuickFailure>
 where
     L: FnOnce() -> Result<time::Date, ()>,
+    U: FnOnce() -> Result<OffsetDateTime, ()>,
 {
     match intent {
         QuickIntent::Unit(intent) => units::evaluate(intent)
@@ -91,6 +116,40 @@ where
         QuickIntent::Date(intent) => {
             let today = local_today().map_err(|()| local_date_unavailable())?;
             date::evaluate(intent, today)
+        }
+        QuickIntent::TimeZone(intent) => {
+            let utc_now = utc_now().map_err(|()| {
+                let time_zone::TimeZoneInvalid {
+                    reason: _reason,
+                    title,
+                    explanation,
+                } = time_zone::local_clock_unavailable();
+                QuickFailure {
+                    kind: QuickKind::TimeZone,
+                    title,
+                    explanation,
+                }
+            })?;
+            time_zone::evaluate(intent, utc_now)
+                .map(|output| QuickOutput {
+                    kind: QuickKind::TimeZone,
+                    title: output.title,
+                    subtitle: output.subtitle,
+                    copy_text: output.copy_text,
+                    refresh_at_utc: output.refresh_at_utc,
+                })
+                .map_err(|invalid| {
+                    let time_zone::TimeZoneInvalid {
+                        reason: _reason,
+                        title,
+                        explanation,
+                    } = invalid;
+                    QuickFailure {
+                        kind: QuickKind::TimeZone,
+                        title,
+                        explanation,
+                    }
+                })
         }
     }
 }
@@ -150,11 +209,78 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_orders_date_then_time_zone_then_unit_then_arithmetic() {
+        assert!(matches!(
+            classify("2026-08-16 + 1 day"),
+            QuickClassification::Ready(QuickIntent::Date(_))
+        ));
+        assert!(matches!(
+            classify("New York time"),
+            QuickClassification::Ready(QuickIntent::TimeZone(_))
+        ));
+        assert!(matches!(
+            classify("1000 mm to in"),
+            QuickClassification::Ready(QuickIntent::Unit(_))
+        ));
+        assert!(matches!(
+            classify(".5*8"),
+            QuickClassification::Ready(QuickIntent::Arithmetic(_))
+        ));
+    }
+
+    #[test]
+    fn time_zone_evaluation_reads_one_injected_utc_instant_and_not_the_local_date() {
+        let calls = Cell::new(0);
+        let QuickClassification::Ready(intent) = classify("Mumbai time") else {
+            panic!("expected time-zone intent");
+        };
+        let utc_now = Date::from_calendar_date(2026, Month::January, 15)
+            .unwrap()
+            .with_hms(5, 5, 20)
+            .unwrap()
+            .assume_utc();
+
+        let output = evaluate(
+            intent,
+            || panic!("time-zone evaluation must not read the local date"),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(utc_now)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(output.kind, QuickKind::TimeZone);
+        assert_eq!(output.title, "10:35");
+        assert_eq!(output.copy_text, output.title);
+        assert_eq!(
+            output.subtitle.as_deref(),
+            Some("2026-01-15 · Mumbai · UTC+05:30 (IST)")
+        );
+        assert_eq!(
+            output.refresh_at_utc,
+            Some(
+                Date::from_calendar_date(2026, Month::January, 15)
+                    .unwrap()
+                    .with_hms(5, 6, 0)
+                    .unwrap()
+                    .assume_utc()
+            )
+        );
+    }
+
+    #[test]
     fn dispatcher_routes_units_immediately_before_legacy_arithmetic() {
         let QuickClassification::Ready(intent) = classify("1000 mm to in") else {
             panic!("expected unit intent");
         };
-        let output = evaluate(intent, || panic!("units must not read the local date")).unwrap();
+        let output = evaluate(
+            intent,
+            || panic!("units must not read the local date"),
+            || panic!("units must not read the UTC clock"),
+        )
+        .unwrap();
 
         assert_eq!(output.kind, QuickKind::Unit);
         assert_eq!(output.title, "39.3701 in");
@@ -167,10 +293,14 @@ mod tests {
         let QuickClassification::Ready(arithmetic) = classify(".5*8") else {
             panic!("expected arithmetic intent");
         };
-        let arithmetic_output = evaluate(arithmetic, || {
-            arithmetic_calls.set(arithmetic_calls.get() + 1);
-            Err(())
-        })
+        let arithmetic_output = evaluate(
+            arithmetic,
+            || {
+                arithmetic_calls.set(arithmetic_calls.get() + 1);
+                Err(())
+            },
+            || panic!("arithmetic must not read the UTC clock"),
+        )
         .unwrap();
         assert_eq!(arithmetic_output.kind, QuickKind::Arithmetic);
         assert_eq!(arithmetic_output.title, "4");
@@ -180,10 +310,14 @@ mod tests {
         let QuickClassification::Ready(date) = classify("today + 1 day") else {
             panic!("expected date intent");
         };
-        let date_output = evaluate(date, || {
-            date_calls.set(date_calls.get() + 1);
-            Date::from_calendar_date(2026, Month::September, 3).map_err(|_| ())
-        })
+        let date_output = evaluate(
+            date,
+            || {
+                date_calls.set(date_calls.get() + 1);
+                Date::from_calendar_date(2026, Month::September, 3).map_err(|_| ())
+            },
+            || panic!("date arithmetic must not read the UTC clock"),
+        )
         .unwrap();
         assert_eq!(date_output.title, "2026-09-04");
         assert_eq!(date_calls.get(), 1);
@@ -194,7 +328,12 @@ mod tests {
         let QuickClassification::Ready(intent) = classify("today + 1 day") else {
             panic!("expected date intent");
         };
-        let failure = evaluate(intent, || Err(())).unwrap_err();
+        let failure = evaluate(
+            intent,
+            || Err(()),
+            || panic!("date arithmetic must not read the UTC clock"),
+        )
+        .unwrap_err();
 
         assert_eq!(failure.kind, QuickKind::Date);
         assert_eq!(failure.title, "无法读取本地日期");

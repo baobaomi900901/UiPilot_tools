@@ -802,6 +802,7 @@ mod tests {
                 window_transfer_token: None,
                 auto_execute_result_id: None,
                 replace_local_results: false,
+                refresh_at_utc: None,
             },
         )
     }
@@ -1699,6 +1700,7 @@ mod tests {
         .unwrap();
 
         let json: Value = serde_json::to_value(response).unwrap();
+        assert!(json.get("refreshAtUtc").is_none());
         assert!(json.get("requestId").is_some());
         assert!(json.get("request_id").is_none());
         let result = &json["items"][0];

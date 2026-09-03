@@ -406,6 +406,7 @@ impl PluginManager {
                 window_transfer_token: None,
                 auto_execute_result_id: None,
                 replace_local_results: false,
+                refresh_at_utc: None,
             },
         )
     }
@@ -7614,7 +7615,7 @@ mod tests {
             else {
                 panic!("plugin route must start");
             };
-            let (request_id, result_id) = manager
+            let response = manager
                 .publish_results(
                     &registry,
                     token,
@@ -7639,13 +7640,14 @@ mod tests {
                         },
                     )],
                 )
-                .map(|response| {
-                    (
-                        response.request_id,
-                        response.items.into_iter().next().unwrap().result_id,
-                    )
-                })
                 .unwrap();
+            assert_eq!(response.refresh_at_utc, None);
+            assert!(serde_json::to_value(&response)
+                .unwrap()
+                .get("refreshAtUtc")
+                .is_none());
+            let request_id = response.request_id;
+            let result_id = response.items.into_iter().next().unwrap().result_id;
             let action = registry.resolve(&request_id, &result_id).unwrap();
 
             manager.advance_generation_for_test(&registry, "plugin");

@@ -242,6 +242,21 @@ mod tests {
     }
 
     #[test]
+    fn formats_mumbai_with_its_half_hour_offset() {
+        let TimeZoneClassification::Ready(intent) = classify("Mumbai time") else {
+            unreachable!()
+        };
+        let output = evaluate(intent, instant("2026-01-15T05:05:20Z")).unwrap();
+
+        assert_eq!(output.title, "10:35");
+        assert_eq!(output.copy_text, "10:35");
+        assert_eq!(
+            output.subtitle.as_deref(),
+            Some("2026-01-15 · Mumbai · UTC+05:30 (IST)")
+        );
+    }
+
+    #[test]
     fn observes_both_new_york_dst_transition_boundaries() {
         for (now, expected_title, expected_offset, expected_abbreviation) in [
             ("2026-03-08T06:59:00Z", "01:59", "UTC−05:00", "EST"),
@@ -301,6 +316,7 @@ mod tests {
     #[test]
     fn next_minute_is_checked_and_crosses_date_and_year_in_strict_utc_form() {
         for (now, expected) in [
+            ("2026-09-03T14:35:00Z", "2026-09-03T14:36:00Z"),
             ("2026-09-03T23:59:59.999999999Z", "2026-09-04T00:00:00Z"),
             ("2026-12-31T23:59:59.999999999Z", "2027-01-01T00:00:00Z"),
         ] {

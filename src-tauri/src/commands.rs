@@ -3249,6 +3249,7 @@ pub(crate) async fn search_apps(
                     window_transfer_token: Some(prepared.transfer_token),
                     auto_execute_result_id: None,
                     replace_local_results: false,
+                    refresh_at_utc: None,
                 }))
             }
             PublicPluginResponse::Panel(_) => {
@@ -3424,6 +3425,7 @@ fn public_plugin_prompt(
             window_transfer_token: None,
             auto_execute_result_id: None,
             replace_local_results: false,
+            refresh_at_utc: None,
         },
     )
 }
@@ -3505,6 +3507,7 @@ fn search_response(
         window_transfer_token: None,
         auto_execute_result_id: None,
         replace_local_results: false,
+        refresh_at_utc: None,
     }
 }
 #[tauri::command]
@@ -3581,8 +3584,39 @@ where
     D: FnOnce(&mut [Application]),
     L: FnOnce() -> Result<time::Date, ()>,
 {
+    search_apps_with_clocks(
+        registry,
+        query,
+        invocation_id,
+        query_sequence,
+        snapshot,
+        decorate,
+        web_search_engine,
+        local_today,
+        || Ok(time::OffsetDateTime::UNIX_EPOCH),
+    )
+}
+
+#[cfg(test)]
+fn search_apps_with_clocks<S, D, L, U>(
+    registry: &ResultRegistry,
+    query: &str,
+    invocation_id: &str,
+    query_sequence: u64,
+    snapshot: S,
+    decorate: D,
+    web_search_engine: WebSearchEngine,
+    local_today: L,
+    utc_now: U,
+) -> Option<SearchResponse>
+where
+    S: FnOnce() -> Vec<Application>,
+    D: FnOnce(&mut [Application]),
+    L: FnOnce() -> Result<time::Date, ()>,
+    U: FnOnce() -> Result<time::OffsetDateTime, ()>,
+{
     let favorite_builtin_features = BTreeSet::new();
-    search_apps_with_catalog_with_local_date(
+    search_apps_with_catalog_with_clocks(
         registry,
         CatalogSearchRequest {
             query,
@@ -3597,6 +3631,7 @@ where
         snapshot,
         decorate,
         local_today,
+        utc_now,
     )
 }
 
@@ -3864,6 +3899,10 @@ fn windows_local_today() -> Result<time::Date, ()> {
         .map_err(|_| ())
 }
 
+fn utc_now() -> Result<time::OffsetDateTime, ()> {
+    Ok(time::OffsetDateTime::now_utc())
+}
+
 fn search_apps_with_catalog<S, D, P>(
     registry: &ResultRegistry,
     request: CatalogSearchRequest<'_>,
@@ -3881,33 +3920,36 @@ where
         PublicPluginManagementError,
     >,
 {
-    search_apps_with_catalog_with_local_date(
+    search_apps_with_catalog_with_clocks(
         registry,
         request,
         plugin_catalog,
         snapshot,
         decorate,
         windows_local_today,
+        utc_now,
     )
 }
 
-fn publish_quick_evaluation<L>(
+fn publish_quick_evaluation<L, U>(
     registry: &ResultRegistry,
     token: QueryToken,
     classification: crate::quick_evaluation::QuickClassification,
     local_today: L,
+    utc_now: U,
 ) -> Option<SearchResponse>
 where
     L: FnOnce() -> Result<time::Date, ()>,
+    U: FnOnce() -> Result<time::OffsetDateTime, ()>,
 {
     let evaluated = match classification {
         crate::quick_evaluation::QuickClassification::NoMatch => return None,
         crate::quick_evaluation::QuickClassification::Invalid(failure) => Err(failure),
         crate::quick_evaluation::QuickClassification::Ready(intent) => {
-            crate::quick_evaluation::evaluate(intent, local_today)
+            crate::quick_evaluation::evaluate(intent, local_today, utc_now)
         }
     };
-    let (item, action) = match evaluated {
+    let (item, action, refresh_at_utc) = match evaluated {
         Ok(output) => {
             let crate::quick_evaluation::QuickOutput {
                 kind,
@@ -3916,11 +3958,21 @@ where
                 copy_text,
                 refresh_at_utc,
             } = output;
-            debug_assert!(refresh_at_utc.is_none());
+            let refresh_at_utc = match kind {
+                crate::quick_evaluation::QuickKind::TimeZone => {
+                    refresh_at_utc.and_then(|instant| {
+                        instant
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .ok()
+                    })
+                }
+                _ => None,
+            };
             let icon_kind = match kind {
                 crate::quick_evaluation::QuickKind::Unit => ResultIconKind::Unit,
                 crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
                 crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
+                crate::quick_evaluation::QuickKind::TimeZone => ResultIconKind::TimeZone,
             };
             (
                 crate::model::ResultItem {
@@ -3936,6 +3988,7 @@ where
                     has_default_action: true,
                 },
                 Some(ResultAction::CopyBuiltInText { text: copy_text }),
+                refresh_at_utc,
             )
         }
         Err(failure) => {
@@ -3943,6 +3996,7 @@ where
                 crate::quick_evaluation::QuickKind::Unit => ResultIconKind::Unit,
                 crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
                 crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
+                crate::quick_evaluation::QuickKind::TimeZone => ResultIconKind::TimeZone,
             };
             (
                 crate::model::ResultItem {
@@ -3957,6 +4011,7 @@ where
                     favorite: None,
                     has_default_action: false,
                 },
+                None,
                 None,
             )
         }
@@ -3979,17 +4034,19 @@ where
             window_transfer_token: None,
             auto_execute_result_id: None,
             replace_local_results: true,
+            refresh_at_utc,
         },
     )
 }
 
-fn search_apps_with_catalog_with_local_date<S, D, P, L>(
+fn search_apps_with_catalog_with_clocks<S, D, P, L, U>(
     registry: &ResultRegistry,
     request: CatalogSearchRequest<'_>,
     plugin_catalog: P,
     snapshot: S,
     decorate: D,
     local_today: L,
+    utc_now: U,
 ) -> Option<SearchResponse>
 where
     S: FnOnce() -> Vec<Application>,
@@ -4001,6 +4058,7 @@ where
         PublicPluginManagementError,
     >,
     L: FnOnce() -> Result<time::Date, ()>,
+    U: FnOnce() -> Result<time::OffsetDateTime, ()>,
 {
     let query = request.query.trim();
     if !query.starts_with('/') {
@@ -4014,7 +4072,7 @@ where
                 request.invocation_id,
                 request.query_sequence,
             )?;
-            return publish_quick_evaluation(registry, token, classification, local_today);
+            return publish_quick_evaluation(registry, token, classification, local_today, utc_now);
         }
     }
     let token = registry.begin_query(
@@ -4191,6 +4249,7 @@ where
                 window_transfer_token: None,
                 auto_execute_result_id,
                 replace_local_results,
+                refresh_at_utc: None,
             }
         },
     )
@@ -5247,12 +5306,12 @@ mod tests {
         publish_public_command_suggestions, publish_quick_evaluation, require_find_label,
         require_main_label, resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_apps_with_catalog,
-        search_apps_with_local_date, search_files_with, select_public_plugin_source_with,
-        set_file_preview_preference_with, start_host_input_focus, submitted_main_result_command,
-        CatalogSearchRequest, CommandError, CompletionOriginInput, CompletionOriginPhase,
-        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HostInputFocusStart,
-        HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate,
-        UserSettingsUpdate,
+        search_apps_with_clocks, search_apps_with_local_date, search_files_with,
+        select_public_plugin_source_with, set_file_preview_preference_with, start_host_input_focus,
+        submitted_main_result_command, CatalogSearchRequest, CommandError, CompletionOriginInput,
+        CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome,
+        HostInputFocusStart, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
+        ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -7729,6 +7788,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(response.items[1].title, expected_title);
+            assert_eq!(response.refresh_at_utc, None);
             assert_eq!(response.items[1].subtitle.as_deref(), Some("搜索：windows"));
             assert_eq!(
                 response.items[1].icon_kind,
@@ -7763,6 +7823,11 @@ mod tests {
         .unwrap();
 
         assert!(response.replace_local_results);
+        assert_eq!(response.refresh_at_utc, None);
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("refreshAtUtc")
+            .is_none());
         assert_eq!(response.items.len(), 1);
         assert_eq!(response.items[0].title, "14");
         assert_eq!(response.items[0].subtitle.as_deref(), Some("复制结果"));
@@ -7796,6 +7861,11 @@ mod tests {
         .unwrap();
 
         assert!(response.replace_local_results);
+        assert_eq!(response.refresh_at_utc, None);
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("refreshAtUtc")
+            .is_none());
         assert_eq!(response.items.len(), 1);
         let item = &response.items[0];
         assert_eq!(item.title, "39.3701 in");
@@ -7921,12 +7991,136 @@ mod tests {
             .begin_query(QueryDomain::Application, "stale-unit", 2)
             .is_some());
 
-        assert!(
-            publish_quick_evaluation(&registry, stale, classification, || panic!(
-                "unit publication must not read the local date"
-            ),)
-            .is_none()
+        assert!(publish_quick_evaluation(
+            &registry,
+            stale,
+            classification,
+            || panic!("unit publication must not read the local date"),
+            || panic!("unit publication must not read the UTC clock"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn time_search_uses_one_utc_instant_for_row_copy_and_refresh_metadata() {
+        let registry = ResultRegistry::default();
+        registry.on_show("time".into());
+        let utc_clock_calls = Cell::new(0);
+        let utc_now = time::Date::from_calendar_date(2026, time::Month::January, 15)
+            .unwrap()
+            .with_hms(5, 5, 20)
+            .unwrap()
+            .assume_utc();
+        let response = search_apps_with_clocks(
+            &registry,
+            "Mumbai time",
+            "time",
+            1,
+            || panic!("time search must not read the app cache"),
+            |_| panic!("time search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || panic!("time search must not read the local date"),
+            || {
+                utc_clock_calls.set(utc_clock_calls.get() + 1);
+                Ok(utc_now)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(utc_clock_calls.get(), 1);
+        assert!(response.replace_local_results);
+        assert_eq!(
+            response.refresh_at_utc.as_deref(),
+            Some("2026-01-15T05:06:00Z")
         );
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.title, "10:35");
+        assert_eq!(
+            item.subtitle.as_deref(),
+            Some("2026-01-15 · Mumbai · UTC+05:30 (IST)")
+        );
+        assert_eq!(item.icon_kind, Some(crate::model::ResultIconKind::TimeZone));
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Ok(ResultAction::CopyBuiltInText {
+                text: item.title.clone()
+            })
+        );
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["refreshAtUtc"], "2026-01-15T05:06:00Z");
+        assert_eq!(wire["items"][0]["iconKind"], "timeZone");
+        assert!(!wire.to_string().contains("CopyBuiltInText"));
+        assert!(!wire.to_string().contains("Asia/Kolkata"));
+    }
+
+    #[test]
+    fn time_invalid_search_has_no_action_or_refresh_metadata() {
+        let registry = ResultRegistry::default();
+        registry.on_show("invalid-time".into());
+        let response = search_apps_with_clocks(
+            &registry,
+            "Atlantis time",
+            "invalid-time",
+            1,
+            || panic!("invalid time search must not read the app cache"),
+            |_| panic!("invalid time search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || panic!("invalid time search must not read the local date"),
+            || panic!("invalid time search must not read the UTC clock"),
+        )
+        .unwrap();
+
+        assert_eq!(response.refresh_at_utc, None);
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("refreshAtUtc")
+            .is_none());
+        let item = &response.items[0];
+        assert_eq!(item.title, "无法识别时区");
+        assert_eq!(item.icon_kind, Some(crate::model::ResultIconKind::TimeZone));
+        assert_eq!(
+            item.activation,
+            crate::model::LauncherResultActivation::Informational
+        );
+        assert!(!item.has_default_action);
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Err(RegistryError::UnknownResult)
+        );
+    }
+
+    #[test]
+    fn time_stale_publication_returns_no_response_or_refresh_metadata() {
+        let registry = ResultRegistry::default();
+        registry.on_show("stale-time".into());
+        let utc_clock_calls = Cell::new(0);
+        let utc_now = time::Date::from_calendar_date(2026, time::Month::September, 3)
+            .unwrap()
+            .with_hms(14, 35, 20)
+            .unwrap()
+            .assume_utc();
+
+        let response = search_apps_with_clocks(
+            &registry,
+            "UTC time",
+            "stale-time",
+            1,
+            || panic!("time search must not read the app cache"),
+            |_| panic!("time search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || panic!("time search must not read the local date"),
+            || {
+                utc_clock_calls.set(utc_clock_calls.get() + 1);
+                assert!(registry
+                    .begin_query(QueryDomain::Application, "stale-time", 2)
+                    .is_some());
+                Ok(utc_now)
+            },
+        );
+
+        assert_eq!(utc_clock_calls.get(), 1);
+        assert!(response.is_none());
     }
 
     #[test]
@@ -7951,6 +8145,11 @@ mod tests {
 
         assert_eq!(local_date_calls.get(), 1);
         assert!(response.replace_local_results);
+        assert_eq!(response.refresh_at_utc, None);
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("refreshAtUtc")
+            .is_none());
         assert_eq!(response.items.len(), 1);
         let item = &response.items[0];
         assert_eq!(item.title, "2026-09-10");

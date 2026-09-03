@@ -9,6 +9,7 @@ pub(crate) enum ResultIconKind {
     Quicklinks,
     Calculator,
     Date,
+    TimeZone,
     Unit,
     WebSearch,
 }
@@ -203,6 +204,8 @@ pub(crate) struct SearchResponse {
     pub(crate) auto_execute_result_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) replace_local_results: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh_at_utc: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -229,7 +232,42 @@ pub(crate) struct ResultItem {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_launcher_completion, LauncherResultActivation, ResultIconKind};
+    use super::{
+        valid_launcher_completion, LauncherResultActivation, ResultIconKind, SearchResponse,
+    };
+
+    #[test]
+    fn search_response_omits_missing_refresh_and_serializes_present_refresh_as_camel_case() {
+        let response = |refresh_at_utc| SearchResponse {
+            request_id: "request".into(),
+            items: Vec::new(),
+            command_hint: None,
+            main_result_command: None,
+            window_transfer_token: None,
+            auto_execute_result_id: None,
+            replace_local_results: false,
+            refresh_at_utc,
+        };
+
+        let missing = serde_json::to_value(response(None)).unwrap();
+        assert!(missing.get("refreshAtUtc").is_none());
+        assert!(missing.get("refresh_at_utc").is_none());
+
+        let present = serde_json::to_value(response(Some("2026-09-03T14:36:00Z".into()))).unwrap();
+        assert_eq!(
+            present["refreshAtUtc"],
+            serde_json::json!("2026-09-03T14:36:00Z")
+        );
+        assert!(present.get("refresh_at_utc").is_none());
+    }
+
+    #[test]
+    fn time_zone_icon_kind_serializes_as_exact_host_wire_value() {
+        assert_eq!(
+            serde_json::to_value(ResultIconKind::TimeZone).unwrap(),
+            serde_json::json!("timeZone")
+        );
+    }
 
     #[test]
     fn unit_icon_kind_serializes_as_exact_host_wire_value() {
