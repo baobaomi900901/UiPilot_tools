@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** Implementation complete — Tasks 1-5 complete; final review and user acceptance pending
+**Status:** Implementation and final review complete — user acceptance pending
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
