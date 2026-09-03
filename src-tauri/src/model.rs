@@ -9,6 +9,7 @@ pub(crate) enum ResultIconKind {
     Quicklinks,
     Calculator,
     Date,
+    Unit,
     WebSearch,
 }
 
@@ -228,7 +229,15 @@ pub(crate) struct ResultItem {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_launcher_completion, LauncherResultActivation};
+    use super::{valid_launcher_completion, LauncherResultActivation, ResultIconKind};
+
+    #[test]
+    fn unit_icon_kind_serializes_as_exact_host_wire_value() {
+        assert_eq!(
+            serde_json::to_value(ResultIconKind::Unit).unwrap(),
+            serde_json::json!("unit")
+        );
+    }
 
     #[test]
     fn informational_activation_serializes_as_an_exact_unit_variant() {

@@ -84,6 +84,7 @@ pub(crate) enum Unit {
 }
 
 impl Unit {
+    #[cfg(test)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Millimeter,
         Self::Centimeter,

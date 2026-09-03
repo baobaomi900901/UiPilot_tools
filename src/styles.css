@@ -1900,6 +1900,11 @@ label,
   background: var(--uipilot-ui-icon-blue-soft);
 }
 
+.launcher-view .built-in-result-icon-unit {
+  color: var(--uipilot-ui-icon-red);
+  background: var(--uipilot-ui-icon-red-soft);
+}
+
 .launcher-view .built-in-result-icon-find,
 .launcher-view .built-in-result-icon-quicklinks {
   color: var(--uipilot-ui-icon-blue);

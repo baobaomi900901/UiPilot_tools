@@ -48,6 +48,7 @@ import {
 import protocolSource from './protocol.ts?raw'
 
 const stylesSource = readFileSync('src/styles.css', 'utf8')
+const uiThemeSource = readFileSync('src/ui-theme.css', 'utf8')
 const publicPluginPanelSource = readFileSync('src/public-plugin-panel.tsx', 'utf8')
 
 it('provides a browser-only launcher preview outside the production entry', () => {
@@ -2088,7 +2089,7 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().selectedIndex).toBe(0)
   })
 
-  it('carries exact result icon kinds and falls back for injected unknown values', async () => {
+  it('carries exact result icon kinds including the unit icon and falls back for injected unknown values', async () => {
     const { core, client, emit } = await startedCore()
     const response = deferred<SearchResponse | null>()
     vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
@@ -2104,6 +2105,7 @@ describe('shown and search ownership', () => {
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
+        { resultId: 'unit', title: '39.3701 in', iconKind: 'unit', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==', activation: executeActivation },
         {
@@ -2124,6 +2126,7 @@ describe('shown and search ownership', () => {
       { title: '/quicklinks', iconKind: 'quicklinks', icon: undefined, pluginIconUrl: undefined },
       { title: '2', iconKind: 'calculator', icon: undefined, pluginIconUrl: undefined },
       { title: '2026-09-10', iconKind: 'date', icon: undefined, pluginIconUrl: undefined },
+      { title: '39.3701 in', iconKind: 'unit', icon: undefined, pluginIconUrl: undefined },
       { title: 'Bing 搜索', iconKind: 'webSearch', icon: undefined, pluginIconUrl: undefined },
       { title: 'App', iconKind: undefined, icon: 'data:image/png;base64,AA==', pluginIconUrl: undefined },
       {
@@ -2133,6 +2136,56 @@ describe('shown and search ownership', () => {
       { title: 'Forged', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
       { title: 'Unknown', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
     ])
+  })
+
+  it('keeps unit conversion query and result ownership under rapid edits', async () => {
+    const { core, client, emit } = await startedCore()
+    const staleUnit = deferred<SearchResponse | null>()
+    const currentOrdinary = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps)
+      .mockReturnValueOnce(staleUnit.promise)
+      .mockReturnValueOnce(currentOrdinary.promise)
+    emit(shown('rapid-unit-edit'))
+
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: '1000 mm to in', inputType: 'insertText',
+    })
+    core.text({
+      kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+      value: 'notes', inputType: 'insertText',
+    })
+    currentOrdinary.resolve({
+      requestId: 'current-ordinary-request',
+      items: [{ resultId: 'current-ordinary-result', title: 'Notes', activation: executeActivation }],
+    })
+    await currentOrdinary.promise
+    await vi.waitFor(() => expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Notes']))
+
+    staleUnit.resolve({
+      requestId: 'stale-unit-request',
+      items: [{
+        resultId: 'stale-unit-result',
+        title: '39.3701 in',
+        iconKind: 'unit',
+        hasDefaultAction: true,
+        activation: executeActivation,
+      }],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    await staleUnit.promise
+    await Promise.resolve()
+
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual(['Notes'])
+    core.keyDown('Enter', false)
+    expect(client.executeResult).toHaveBeenCalledWith({
+      requestId: 'current-ordinary-request',
+      resultId: 'current-ordinary-result',
+    })
+    expect(client.executeResult).not.toHaveBeenCalledWith({
+      requestId: 'stale-unit-request',
+      resultId: 'stale-unit-result',
+    })
   })
 
   it('retains only well-formed informational quick evaluation rows and non-empty execute ids', async () => {
@@ -5944,7 +5997,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.os-theme-uipilot\s*\{[^}]*--os-handle-bg:\s*ButtonText;/s)
   })
 
-  it('renders the date icon and existing result icons with stable decorative dimensions', async () => {
+  it('renders the unit icon and existing result icons with stable decorative dimensions', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -5955,6 +6008,7 @@ describe('React view and accessibility', () => {
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
+        { resultId: 'unit', title: '39.3701 in', iconKind: 'unit', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         {
           resultId: 'plugin',
@@ -5963,9 +6017,10 @@ describe('React view and accessibility', () => {
           pluginIconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.uipilot.demo-win/1/icon.png',
         },
         { resultId: 'app', title: 'App', icon: 'data:image/png;base64,iVBORw==', activation: executeActivation },
+        { resultId: 'unknown', title: 'Unknown icon', iconKind: 'unknown', activation: executeActivation },
         { resultId: 'fallback', title: 'Fallback', activation: executeActivation },
       ] : [],
-    }))
+    } as unknown as SearchResponse))
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -5973,7 +6028,7 @@ describe('React view and accessibility', () => {
     await act(async () =>
       core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
     )
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(8))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(10))
 
     const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     const rowWithTitle = (title: string) =>
@@ -5982,28 +6037,146 @@ describe('React view and accessibility', () => {
     const quicklinks = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
     const calculator = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
     const date = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="date"]')
+    const unit = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="unit"]')
     const web = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
     expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
     expect(quicklinks?.querySelector('.lucide-link-2')).toBeTruthy()
     expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
     expect(date?.querySelector('.lucide-calendar')?.getAttribute('aria-hidden')).toBe('true')
+    expect(unit?.querySelector('.lucide-ruler')?.getAttribute('aria-hidden')).toBe('true')
     expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
     expect(web?.querySelector('.lucide-search')).toBeTruthy()
-    for (const icon of [find, quicklinks, calculator, date, web]) {
+    for (const icon of [find, quicklinks, calculator, date, unit, web]) {
       expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
     }
     expect(rowWithTitle('/demo-win')?.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
     expect(rowWithTitle('App')?.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
+    expect(rowWithTitle('Unknown icon')?.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(rowWithTitle('Fallback')?.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(
       /\.launcher-view \.built-in-result-icon-date\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-blue\);[^}]*background:\s*var\(--uipilot-ui-icon-blue-soft\);/s,
     )
     expect(stylesSource).toMatch(
+      /\.launcher-view \.built-in-result-icon-unit\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-red\);[^}]*background:\s*var\(--uipilot-ui-icon-red-soft\);/s,
+    )
+    expect(uiThemeSource.match(/--uipilot-ui-icon-red:/g)).toHaveLength(2)
+    expect(uiThemeSource.match(/--uipilot-ui-icon-red-soft:/g)).toHaveLength(2)
+    expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.built-in-result-icon,[\s\S]*forced-color-adjust:\s*none;/s,
     )
+    expect(stylesSource).toMatch(
+      /@media \(forced-colors: active\)[\s\S]*\.result-row\.is-selected \.built-in-result-icon,[\s\S]*color:\s*HighlightText !important;/s,
+    )
+    expect(launcherViewSource).toMatch(/import \{[^}]*\bRuler\b[^}]*\} from 'lucide-react'/s)
     expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
     await mounted.unmount()
+  })
+
+  it('activates a successful unit conversion by Enter and click without favorite context UI', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const longSubtitle = `${'1234567890'.repeat(28)} mm · 长度换算`
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === '1000 mm to in'
+      ? {
+          requestId: 'unit-copy-request',
+          items: [{
+            resultId: 'opaque-unit-copy-id',
+            title: '39.3701 in',
+            subtitle: longSubtitle,
+            iconKind: 'unit',
+            activation: executeActivation,
+            hasDefaultAction: true,
+          }],
+          replaceLocalResults: true,
+        } as unknown as SearchResponse
+      : { requestId: 'unit-empty', items: [] })
+    vi.mocked(fake.client.executeResult).mockResolvedValue({ status: 'textCopied' })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('unit-copy')))
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '1000 mm to in',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const option = mounted.host.querySelector<HTMLElement>('[role="option"]')!
+    expect(option.getAttribute('aria-selected')).toBe('true')
+    expect(input.getAttribute('aria-activedescendant')).toBe(option.id)
+    expect(option.querySelector('.result-subtitle')?.textContent).toBe(longSubtitle)
+    expect(option.querySelector('.result-favorite-star')).toBeNull()
+    expect(core.getSnapshot().results[0]?.favorite).toBeUndefined()
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
+      `1 个结果。39.3701 in，${longSubtitle}`,
+    )
+
+    const contextEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    await act(async () => { option.dispatchEvent(contextEvent) })
+    expect(contextEvent.defaultPrevented).toBe(false)
+    expect(document.querySelector('[role="menuitem"]')).toBeNull()
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(fake.client.executeResult).toHaveBeenLastCalledWith({
+      requestId: 'unit-copy-request',
+      resultId: 'opaque-unit-copy-id',
+    })
+    await act(async () => option.click())
+    await vi.waitFor(() => expect(fake.client.executeResult).toHaveBeenCalledTimes(2))
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('keeps an invalid unit conversion informational and inert', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === '1 kg to L'
+      ? {
+          requestId: 'unit-information',
+          items: [{
+            resultId: 'opaque-information-id',
+            title: '无法转换单位',
+            subtitle: '源单位与目标单位的维度不同',
+            iconKind: 'unit',
+            activation: { kind: 'informational' },
+            hasDefaultAction: false,
+          }],
+          replaceLocalResults: true,
+        } as unknown as SearchResponse
+      : { requestId: 'unit-information-empty', items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('unit-information')))
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '1 kg to L',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const option = mounted.host.querySelector<HTMLElement>('[role="option"]')!
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await act(async () => option.click())
+
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    expect(option.getAttribute('aria-selected')).toBe('true')
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
+      '1 个结果。无法转换单位，源单位与目标单位的维度不同',
+    )
+    await mounted.unmount()
+    core.destroy()
   })
 
   it('keeps informational quick evaluation Enter and click inert while announcing the row', async () => {

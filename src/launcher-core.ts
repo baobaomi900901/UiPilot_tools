@@ -437,7 +437,7 @@ function safeApplicationIcon(value: unknown): string | undefined {
 }
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
-  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'date' || value === 'webSearch'
+  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'date' || value === 'unit' || value === 'webSearch'
     ? value
     : undefined
 }

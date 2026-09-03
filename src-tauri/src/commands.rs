@@ -3918,6 +3918,7 @@ where
             } = output;
             debug_assert!(refresh_at_utc.is_none());
             let icon_kind = match kind {
+                crate::quick_evaluation::QuickKind::Unit => ResultIconKind::Unit,
                 crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
                 crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
             };
@@ -3939,6 +3940,7 @@ where
         }
         Err(failure) => {
             let icon_kind = match failure.kind {
+                crate::quick_evaluation::QuickKind::Unit => ResultIconKind::Unit,
                 crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
                 crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
             };
@@ -5242,8 +5244,8 @@ mod tests {
         parse_window_storage_session_generation, plugin_discovery_prefix, prepare_file_query,
         prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
         public_plugin_search_decision, publish_everything_search,
-        publish_public_command_suggestions, require_find_label, require_main_label,
-        resolve_invocation_theme, save_settings_core, save_settings_with,
+        publish_public_command_suggestions, publish_quick_evaluation, require_find_label,
+        require_main_label, resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_apps_with_catalog,
         search_apps_with_local_date, search_files_with, select_public_plugin_source_with,
         set_file_preview_preference_with, start_host_input_focus, submitted_main_result_command,
@@ -7774,6 +7776,156 @@ mod tests {
                 .resolve(&response.request_id, &response.items[0].result_id)
                 .unwrap(),
             ResultAction::CopyBuiltInText { text: "14".into() }
+        );
+    }
+
+    #[test]
+    fn unit_search_is_exclusive_and_keeps_exact_copy_private_without_reading_apps() {
+        let registry = ResultRegistry::default();
+        registry.on_show("unit".into());
+        let response = search_apps_with_local_date(
+            &registry,
+            "1000 mm to in",
+            "unit",
+            1,
+            || panic!("unit search must not read the app cache"),
+            |_| panic!("unit search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || panic!("unit search must not read the local date"),
+        )
+        .unwrap();
+
+        assert!(response.replace_local_results);
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.title, "39.3701 in");
+        assert_eq!(item.subtitle.as_deref(), Some("1000 mm · 长度换算"));
+        assert_eq!(
+            serde_json::to_value(item).unwrap()["iconKind"],
+            serde_json::json!("unit")
+        );
+        assert_eq!(
+            item.activation,
+            crate::model::LauncherResultActivation::ExecuteResult
+        );
+        assert!(item.has_default_action);
+        assert_eq!(item.favorite, None);
+        assert_eq!(item.detail, None);
+        assert!(!item.result_id.is_empty());
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Ok(ResultAction::CopyBuiltInText {
+                text: "39.3701 in".into()
+            })
+        );
+    }
+
+    #[test]
+    fn unit_owned_failures_are_informational_and_register_no_action() {
+        for (sequence, query, title, explanation) in [
+            (1, "1 kg to L", "无法转换单位", "源单位与目标单位的维度不同"),
+            (
+                2,
+                "1 kg to parsec",
+                "无法识别单位",
+                "请检查源单位和目标单位",
+            ),
+            (
+                3,
+                "-1 K to C",
+                "温度低于绝对零度",
+                "输入温度不能低于绝对零度",
+            ),
+        ] {
+            let registry = ResultRegistry::default();
+            registry.on_show(format!("unit-failure-{sequence}"));
+            let response = search_apps_with_local_date(
+                &registry,
+                query,
+                &format!("unit-failure-{sequence}"),
+                sequence,
+                || panic!("owned unit failure must not read the app cache"),
+                |_| panic!("owned unit failure must not decorate applications"),
+                WebSearchEngine::Bing,
+                || panic!("owned unit failure must not read the local date"),
+            )
+            .unwrap();
+
+            assert!(response.replace_local_results, "query={query}");
+            assert_eq!(response.items.len(), 1, "query={query}");
+            let item = &response.items[0];
+            assert_eq!(item.title, title, "query={query}");
+            assert_eq!(item.subtitle.as_deref(), Some(explanation), "query={query}");
+            assert_eq!(item.icon_kind, Some(crate::model::ResultIconKind::Unit));
+            assert_eq!(
+                item.activation,
+                crate::model::LauncherResultActivation::Informational
+            );
+            assert!(!item.has_default_action);
+            assert_eq!(item.favorite, None);
+            assert_eq!(item.detail, None);
+            assert_eq!(
+                registry.resolve(&response.request_id, &item.result_id),
+                Err(RegistryError::UnknownResult),
+                "query={query}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_partial_and_unowned_text_keep_ordinary_results() {
+        for (sequence, query) in [(1, "1 m to"), (2, "weather to forecast")] {
+            let registry = ResultRegistry::default();
+            let invocation_id = format!("ordinary-unit-{sequence}");
+            registry.on_show(invocation_id.clone());
+            let mut matching_application = application(sequence);
+            matching_application.display_name = query.into();
+            let response = search_apps_with_catalog(
+                &registry,
+                CatalogSearchRequest {
+                    query,
+                    invocation_id: &invocation_id,
+                    query_sequence: sequence as u64,
+                    submit: false,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &BTreeSet::new(),
+                    quicklinks: &[],
+                },
+                |_| Ok(vec![command_suggestion("demo")]),
+                || vec![matching_application],
+                |_| {},
+            )
+            .unwrap();
+
+            assert!(!response.replace_local_results, "query={query}");
+            assert!(
+                response.items.iter().any(|item| item.title == query),
+                "query={query}"
+            );
+            assert!(
+                response.items.iter().any(|item| item.title == "Bing 搜索"),
+                "query={query}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_stale_publication_cannot_replace_a_newer_query_owner() {
+        let registry = ResultRegistry::default();
+        registry.on_show("stale-unit".into());
+        let stale = registry
+            .begin_query(QueryDomain::Application, "stale-unit", 1)
+            .unwrap();
+        let classification = crate::quick_evaluation::classify("1000 mm to in");
+        assert!(registry
+            .begin_query(QueryDomain::Application, "stale-unit", 2)
+            .is_some());
+
+        assert!(
+            publish_quick_evaluation(&registry, stale, classification, || panic!(
+                "unit publication must not read the local date"
+            ),)
+            .is_none()
         );
     }
 

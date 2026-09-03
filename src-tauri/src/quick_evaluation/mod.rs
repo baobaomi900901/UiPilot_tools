@@ -9,6 +9,7 @@ const MAX_QUERY_BYTES: usize = 400;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QuickKind {
+    Unit,
     Arithmetic,
     Date,
 }
@@ -22,6 +23,7 @@ pub(crate) enum QuickClassification {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QuickIntent {
+    Unit(units::UnitIntent),
     Arithmetic(arithmetic::ArithmeticIntent),
     Date(date::DateIntent),
 }
@@ -47,6 +49,20 @@ pub(crate) fn classify(source: &str) -> QuickClassification {
     if !matches!(date, QuickClassification::NoMatch) {
         return date;
     }
+    match units::classify(source) {
+        units::UnitClassification::NoMatch => {}
+        units::UnitClassification::Invalid(reason) => {
+            let invalid = units::failure(reason);
+            return QuickClassification::Invalid(QuickFailure {
+                kind: QuickKind::Unit,
+                title: invalid.title,
+                explanation: invalid.explanation,
+            });
+        }
+        units::UnitClassification::Ready(intent) => {
+            return QuickClassification::Ready(QuickIntent::Unit(intent));
+        }
+    }
     arithmetic::classify(source).map_or(QuickClassification::NoMatch, |intent| {
         QuickClassification::Ready(QuickIntent::Arithmetic(intent))
     })
@@ -57,6 +73,19 @@ where
     L: FnOnce() -> Result<time::Date, ()>,
 {
     match intent {
+        QuickIntent::Unit(intent) => units::evaluate(intent)
+            .map(|output| QuickOutput {
+                kind: QuickKind::Unit,
+                title: output.title,
+                subtitle: output.subtitle,
+                copy_text: output.copy_text,
+                refresh_at_utc: output.refresh_at_utc,
+            })
+            .map_err(|invalid| QuickFailure {
+                kind: QuickKind::Unit,
+                title: invalid.title,
+                explanation: invalid.explanation,
+            }),
         QuickIntent::Arithmetic(intent) => Ok(arithmetic::output(intent)),
         QuickIntent::Date(intent) => {
             let today = local_today().map_err(|()| local_date_unavailable())?;
@@ -117,6 +146,18 @@ mod tests {
             QuickClassification::Ready(QuickIntent::Arithmetic(_))
         ));
         assert!(matches!(classify("1+"), QuickClassification::NoMatch));
+    }
+
+    #[test]
+    fn dispatcher_routes_units_immediately_before_legacy_arithmetic() {
+        let QuickClassification::Ready(intent) = classify("1000 mm to in") else {
+            panic!("expected unit intent");
+        };
+        let output = evaluate(intent, || panic!("units must not read the local date")).unwrap();
+
+        assert_eq!(output.kind, QuickKind::Unit);
+        assert_eq!(output.title, "39.3701 in");
+        assert_eq!(output.copy_text, "39.3701 in");
     }
 
     #[test]
