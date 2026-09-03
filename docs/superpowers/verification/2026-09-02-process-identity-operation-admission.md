@@ -9,8 +9,8 @@
 
 - Branch: `codex/plugin-platform-roadmap`
 - Approved-design base: `890fdbdd5b38747852109a184d66e3c4e0238a74`
-- Task 4 refresh execution-start HEAD: `0e0ef2c9ae49fd2d50d75a42751e71467710ae93`
-- Final implementation/source HEAD under test: `0e0ef2c9ae49fd2d50d75a42751e71467710ae93`
+- Task 4 refresh execution-start HEAD: `33c32fce9107df157641ecce2d7ce71236905708`
+- Final implementation/source HEAD under test: `33c32fce9107df157641ecce2d7ce71236905708`
 - The earlier documentation commits remain in history. This refresh is a new documentation-only commit after the tested source revision and does not alter that source.
 
 ## Environment
@@ -30,13 +30,13 @@ The approved plan names Rust 1.96.0, while this verification host provides 1.96.
 
 ## Required Command Results
 
-Every command below was freshly run from the worktree root. A failed command was rerun once with the same arguments to distinguish a transient failure; all three failing gates reproduced.
+Every command below was freshly run from the worktree root at source HEAD `33c32fc`. A failed command was rerun once with the same arguments to distinguish a transient failure; all three failing gates reproduced. The default full-test command passed on its first attempt, so there was no transient default-test failure.
 
 | Command | Exit | Result |
 |---|---:|---|
 | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 0 | Clean. |
-| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control -- --nocapture --test-threads=1` | 0 | Main test target: **52 passed, 0 failed, 1 ignored, 976 filtered**. This includes **18 passed Windows tests plus 1 ignored fixture**. Other unit targets ran 0 tests; the integration target had 1 filtered test. The ignored item is the child fixture, which the live-child tests spawn explicitly. |
-| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline` | 0 | Main library: **1026 passed, 0 failed, 3 ignored, 0 filtered**; integration: **1 passed, 0 failed**; remaining unit/doc targets: 0 tests. |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control -- --nocapture --test-threads=1` | 0 | Main test target: **53 passed, 0 failed, 1 ignored, 976 filtered**. This includes **19 passed Windows tests plus 1 ignored fixture**. Other unit targets ran 0 tests; the integration target had 1 filtered test. The ignored item is the child fixture, which the live-child tests spawn explicitly. |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline` | 0 | Passed on the first attempt with no transient failure. Main library: **1027 passed, 0 failed, 3 ignored, 0 filtered**; integration: **1 passed, 0 failed**; remaining unit/doc targets: 0 tests. |
 | `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline --all-features` | 101 | Reproduced on the required retry before tests ran: the schema-generator binary cannot resolve its schema function when `test-instrumentation` is enabled because that function is cfg-excluded. Source correction is outside Task 4. |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets -- -D warnings` | 101 | Reproduced on retry. Clippy reported **12 library** and **13 library-test** deny-warning diagnostics at 13 distinct sites, all outside `process_control`; the test-only thirteenth site is in `clipboard_history`. There were **0 diagnostics in `process_control` paths** after the Task 3 lint cleanup. No unrelated fix was made. |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-targets --all-features -- -D warnings` | 101 | Reproduced on retry. The shared library subset is the same **12** unrelated diagnostics and the library-test target reports the same **13** sites; there are **0 diagnostics in `process_control` paths**. The schema `E0425` is additionally emitted for both the schema-generator binary and its binary-test target. No clean Clippy result exists for this revision/toolchain. |
@@ -72,15 +72,18 @@ Additional exact omission examples passed: reliable success `0/0/0`; changed fal
 
 Admission coverage includes invalid and expired targets before Adapter access, PID reuse as `TargetChanged`, exit before/after open, observation and creation-time inspection failures, zero creation time, exact liveness mapping, self/critical/PPL/unreadable protection, error priority, all three intents, retained lease ownership, and single consumption. Every intent requested only snapshot observation access; failure and Drop assertions showed exact open/drop balance and no side-effect Adapter.
 
+The deterministic Design 12.1 retained-object regression adds the missing post-admission PID-reuse proof. Successful `Restart` admission opens one Fake handle pinned to the original process object's stable object ID and retains the original `ProcessTarget` and intent. Replacing the PID mapping creates a distinct object ID without retargeting that handle. A separately opened replacement handle resolves creation time `10001`, closes first against only the replacement object, and leaves the original open. Dropping the admission then closes the original handle exactly once against its original object ID. The exact trace contains only original open/creation/liveness/protection plus replacement open/creation; the source guard confirms there is no side-effect Adapter or side-effect call.
+
 ## Windows Standard-User Evidence
 
-The focused command passed **18 Windows tests**, with the dedicated fixture ignored in the parent harness and invoked only as an exact child by the live tests.
+The focused command passed **19 Windows tests**, with the dedicated fixture ignored in the parent harness and invoked only as an exact child by the live tests.
 
-- **Live snapshot and omissions:** because the earlier numeric snapshot was stale, a temporary read-only aggregate probe compiled the tracked `process_control` module directly. Its five payload lines emitted counts only, and its source and build outputs were deleted immediately. The fresh snapshot returned **284 process records** with omissions `exitedOrChanged = 0`, `inspectionDenied = 126`, `identityUnavailable = 1`, `total = 127`. These are a point-in-time observation and may vary with the host process set.
+- **Live snapshot and omissions:** because the earlier numeric snapshot was stale, a temporary read-only aggregate probe compiled the tracked `process_control` module directly. Its five payload lines emitted counts only, and its source and matching build outputs were deleted immediately. The fresh snapshot returned **310 process records** with omissions `exitedOrChanged = 0`, `inspectionDenied = 125`, `identityUnavailable = 1`, `total = 126`. These are a point-in-time observation and may vary with the host process set.
 - **Current self:** the snapshot found the exact current test-process identity; `Terminate` admission returned `ProtectedTarget`. Its critical/PPL queries were readable and reported unprotected, so the denial is the exact-self policy rather than a name rule.
 - **Modified real creation time:** the new real-Windows facade test retained the current process's real host-instance ID and PID, changed only its nonzero creation time, and admission returned exactly `TargetChanged`. It exercised `WindowsProcessAdapter` `OpenProcess` / `GetProcessTimes`; no Fake Adapter was used.
 - **Live exact child admission:** a child created from the current Rust test executable entered the catalog and received a read-only `Restart` admission while the test retained that exact `Child`; dropping the admission and bounded child cleanup succeeded.
 - **Numeric 259 and stale identity:** another retained exact child first received a read-only `ForceTerminate` admission, exited naturally with numeric code **259**, and the old target then returned `TargetExited`. This proves zero-time HANDLE signaling, not `STILL_ACTIVE`, decides liveness.
+- **Unexpected-wait telemetry:** the defensive classifier maps both `WAIT_FAILED` and an unexpected `WAIT_EVENT(17)` to the inspection-failure representation `AccessDenied`. The snapshot regression produced no record, `inspectionDenied = 1`, `identityUnavailable = 0`, `total = 1`, and one exact temporary-handle close. The named mappings remain unchanged: `WAIT_TIMEOUT` is alive and `WAIT_OBJECT_0` is exited; admission continues to map liveness inspection failures to `InspectionDenied`.
 - **Context-specific path-query fallback:** the production path-query classifier mapped `QueryFullProcessImageNameW` access denial to path-unavailable fallback. The core re-enumerated the name, compared it with Windows ordinal case-insensitive semantics, then rechecked liveness and creation time on the same retained HANDLE before publishing one pathless record with zero omissions, one open, and one close. The companion regression retained invalid-parameter/not-found as exited-or-changed and retained generic `OpenProcess`/admission access denial as `AccessDenied`, so those paths remain fail closed.
 - **Protected target:** no inspectable real Protected Process/PPL was present. This item is explicitly **environment N/A**. Deterministic Fake Adapter coverage for critical, PPL, combined protection, and unreadable protection passed and remains mandatory evidence.
 - **Helper cleanup:** after all commands, the count of matching fixture helper processes was **0**. Temporary aggregate-probe source residuals were **0**, and matching build-output residuals were **0**.
@@ -110,11 +113,11 @@ The changed-file audit plus focused source guards confirm there is no new Tauri 
 
 | Requirement | Evidence | Result |
 |---|---|---|
-| 12.1 Fake Adapter contract | 18 snapshot + 15 admission tests passed; identity, omissions, fixed precedence, protection, access, liveness, redaction, no-side-effect, and handle ownership covered with exact counts above. | PASS |
-| 12.2 Windows tests | 18 Windows tests passed; the real modified-creation-time case returned `TargetChanged` through the Windows facade, and current self, exact child admission, code-259 exit / `TargetExited`, context-specific path-query fallback with same-HANDLE revalidation, critical/PPL readability, access mask, Tool Help traversal, ordinal names, CNG, and RAII are covered. Real protected target is environment N/A as permitted. | PASS with allowed environment N/A |
+| 12.1 Fake Adapter contract | 18 snapshot + 15 admission tests passed; identity, omissions, fixed precedence, protection, access, liveness, redaction, no-side-effect, and handle ownership covered with exact counts above. The retained-object regression proves PID remapping cannot retarget an admitted Fake handle and that original/replacement objects close separately and exactly once. | PASS |
+| 12.2 Windows tests | 19 Windows tests passed; the real modified-creation-time case returned `TargetChanged` through the Windows facade, and current self, exact child admission, code-259 exit / `TargetExited`, unexpected-wait inspection telemetry, context-specific path-query fallback with same-HANDLE revalidation, critical/PPL readability, access mask, Tool Help traversal, ordinal names, CNG, and RAII are covered. Real protected target is environment N/A as permitted. | PASS with allowed environment N/A |
 | 12.3 Manual acceptance evidence | Standard-user OS/toolchain/elevation, live aggregate snapshot/omissions, self denial, live helper, stale target, redaction, and zero residual helper/probe counts are recorded above. | EVIDENCE RECORDED; USER REVIEW PENDING |
 | 13: design and independent plan approved | Both tracked documents state user-approved status. | PASS |
-| 13: catalog/admit Fake contracts | Focused Fake/core results above. | PASS |
+| 13: catalog/admit Fake contracts | Focused Fake/core results above, including stable-object identity retention across PID remapping and separate exact-once original/replacement handle cleanup. | PASS |
 | 13: Windows 11 read-only/admission validation | Focused Windows results and standard-user evidence above. | PASS with protected-target environment N/A |
 | 13: deterministic PID reuse, exit, self, protection | Fake PID-reuse and real-Windows modified-creation-time cases returned `TargetChanged`; the live code-259 child returned `TargetExited`; exact-self `ProtectedTarget` and Fake protected/unreadable cases passed. | PASS |
 | 13: failure paths have no process side effect or HANDLE leak | Fake exact counters, real RAII exact-close test, source guards, exact-child cleanup, and residual helper count 0. | PASS |
