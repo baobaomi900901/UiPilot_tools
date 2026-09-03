@@ -1814,6 +1814,8 @@ fn admission_source_keeps_the_lease_opaque_and_has_no_side_effect_adapter() {
 }
 
 mod operation_admission {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     use super::*;
 
     fn successful_final_script(creation_time: u64) -> FakeProcessScript {
@@ -2397,6 +2399,107 @@ mod operation_admission {
         assert!(final_protection < admission_drop);
         assert!(admission_drop < closure);
         assert!(closure < operation_drop);
+        assert_eq!(adapter.opened(), 2);
+        assert_eq!(adapter.dropped(), 2);
+    }
+
+    #[test]
+    fn operation_admission_unwind_drops_handles_exactly_once_in_order() {
+        let pid = 53;
+        let creation_time = 5_300;
+        let adapter =
+            FakeProcessAdapter::default().with_process(pid, successful_final_script(creation_time));
+        let authority = authority(adapter.clone());
+        let admission = authority
+            .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+            .unwrap();
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _: Result<(), ProcessOperationError> = authority.with_final_operation_admission(
+                admission,
+                ProcessIntent::Terminate,
+                |adapter, handle| {
+                    adapter.record_operation_closure(handle);
+                    std::panic::resume_unwind(Box::new("operation closure unwind"));
+                },
+            );
+        }));
+
+        assert!(unwind.is_err(), "operation closure unwind must be caught");
+        let events = adapter.events();
+        let admission_drop = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Handle(FakeHandleEvent::Dropped {
+                        handle_id: 1,
+                        kind: FakeHandleKind::Observation,
+                        ..
+                    })
+                )
+            })
+            .expect("admission handle must drop before the closure");
+        let closure = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FakeEvent::OperationClosure {
+                        operation_handle_id: 2,
+                        active_handles,
+                    } if active_handles == &[2]
+                )
+            })
+            .expect("closure must retain only the operation handle");
+        let operation_drop = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Handle(FakeHandleEvent::Dropped {
+                        handle_id: 2,
+                        kind: FakeHandleKind::Operation,
+                        ..
+                    })
+                )
+            })
+            .expect("operation handle must drop during unwind");
+
+        assert!(admission_drop < closure);
+        assert!(closure < operation_drop);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        FakeEvent::Handle(FakeHandleEvent::Dropped {
+                            handle_id: 1,
+                            kind: FakeHandleKind::Observation,
+                            ..
+                        })
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        FakeEvent::Handle(FakeHandleEvent::Dropped {
+                            handle_id: 2,
+                            kind: FakeHandleKind::Operation,
+                            ..
+                        })
+                    )
+                })
+                .count(),
+            1
+        );
         assert_eq!(adapter.opened(), 2);
         assert_eq!(adapter.dropped(), 2);
     }
