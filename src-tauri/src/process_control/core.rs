@@ -378,6 +378,14 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
         }
     }
 
+    pub(super) fn adapter(&self) -> &A {
+        &self.adapter
+    }
+
+    pub(super) fn self_identity(&self) -> (u32, u64) {
+        (self.self_pid, self.self_creation_time)
+    }
+
     pub(super) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError> {
         let enumerated = self
             .adapter
@@ -471,7 +479,7 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
         Ok(CoreAdmission {
             target: *target,
             intent,
-            _handle: handle,
+            handle,
         })
     }
 
@@ -637,7 +645,7 @@ impl FailureAccumulator {
 pub(super) struct CoreAdmission<H> {
     target: ProcessTarget,
     intent: ProcessIntent,
-    _handle: H,
+    handle: H,
 }
 
 impl<H> CoreAdmission<H> {
@@ -647,6 +655,10 @@ impl<H> CoreAdmission<H> {
 
     pub(super) fn intent(&self) -> ProcessIntent {
         self.intent
+    }
+
+    pub(super) fn into_parts(self) -> (ProcessTarget, ProcessIntent, H) {
+        (self.target, self.intent, self.handle)
     }
 }
 

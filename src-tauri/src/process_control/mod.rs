@@ -1,4 +1,5 @@
 mod core;
+mod operation;
 
 #[cfg(windows)]
 mod windows;
@@ -9,6 +10,7 @@ pub(crate) type ProcessError = core::ProcessError;
 pub(crate) type ProcessOmissions = core::ProcessOmissions;
 pub(crate) type ProcessRecord = core::ProcessRecord;
 pub(crate) type ProcessIntent = core::ProcessIntent;
+pub(crate) type ProcessOperationError = operation::ProcessOperationError;
 pub(crate) type ProcessSnapshot = core::ProcessSnapshot;
 pub(crate) type ProcessTarget = core::ProcessTarget;
 

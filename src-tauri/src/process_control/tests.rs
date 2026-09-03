@@ -1,9 +1,10 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsStr,
     path::PathBuf,
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use super::core::{
@@ -11,6 +12,11 @@ use super::core::{
     ObservationFailure, ProcessCandidate, ProcessError, ProcessIntent, ProcessObservation,
     ProcessPlatformAdapter, ProcessProtection, ProcessTarget,
 };
+use super::operation::{
+    ExitWait, MonotonicClock, OperationAccess, OperationFailure, ProcessOperationAdapter,
+    WindowCandidate, WindowFacts, WindowFailure,
+};
+use super::ProcessOperationError;
 
 const HOST: [u8; 16] = [0x41; 16];
 const SELF_PID: u32 = 9_999;
@@ -19,13 +25,19 @@ const SELF_CREATION_TIME: u64 = 99_990;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeCall {
     Enumerate,
-    Open(u32),
+    OpenObservation(u32),
+    OpenOperation(u32),
     CreationTime(u32),
     Liveness(u32),
     Observation(u32),
     ReenumerateName(u32),
     ProcessNamesEquivalent,
     Protection(u32),
+    EnumerateTopLevelWindows,
+    WindowFacts(u64),
+    PostClose(u64),
+    TerminateProcess(u32),
+    WaitForExit(u32, Duration),
 }
 
 #[derive(Clone)]
@@ -53,11 +65,14 @@ struct MutationHook {
 #[derive(Default)]
 struct FakeProcessScript {
     open: VecDeque<Result<(), ObservationFailure>>,
+    operation_open: VecDeque<Result<(), OperationFailure>>,
     creation_times: VecDeque<Result<u64, ObservationFailure>>,
     liveness: VecDeque<Result<Liveness, ObservationFailure>>,
     observations: VecDeque<Result<ProcessObservation, ObservationFailure>>,
     reenumerated_names: VecDeque<Result<Option<String>, ObservationFailure>>,
     protections: VecDeque<Result<ProcessProtection, ObservationFailure>>,
+    terminations: VecDeque<Result<(), OperationFailure>>,
+    waits: VecDeque<Result<ExitWait, OperationFailure>>,
 }
 
 struct FakeProcessObject {
@@ -66,16 +81,37 @@ struct FakeProcessObject {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FakeHandleKind {
+    Observation,
+    Operation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeHandleEvent {
     Opened {
         handle_id: u64,
         object_id: u64,
         pid: u32,
+        kind: FakeHandleKind,
     },
     Dropped {
         handle_id: u64,
         object_id: u64,
         pid: u32,
+        kind: FakeHandleKind,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FakeEvent {
+    Call {
+        call: FakeCall,
+        active_handles: Vec<u64>,
+    },
+    Handle(FakeHandleEvent),
+    OperationClosure {
+        operation_handle_id: u64,
+        active_handles: Vec<u64>,
     },
 }
 
@@ -86,12 +122,20 @@ struct FakeState {
     calls: Vec<FakeCall>,
     hooks: Vec<MutationHook>,
     requested_access: Vec<ObservationAccess>,
+    requested_operation_access: Vec<OperationAccess>,
     process_name_equivalences: VecDeque<Result<bool, ObservationFailure>>,
+    window_enumerations: VecDeque<Result<Vec<WindowCandidate<u64>>, OperationFailure>>,
+    window_facts: BTreeMap<u64, VecDeque<Result<WindowFacts, WindowFailure>>>,
+    post_close_outcomes: BTreeMap<u64, VecDeque<Result<(), WindowFailure>>>,
+    post_close_calls: usize,
+    terminate_calls: usize,
     opened: usize,
     next_handle_id: u64,
     next_object_id: u64,
     dropped: BTreeSet<u64>,
+    active_handles: BTreeSet<u64>,
     handle_events: Vec<FakeHandleEvent>,
+    events: Vec<FakeEvent>,
 }
 
 impl Default for FakeState {
@@ -102,12 +146,20 @@ impl Default for FakeState {
             calls: Vec::new(),
             hooks: Vec::new(),
             requested_access: Vec::new(),
+            requested_operation_access: Vec::new(),
             process_name_equivalences: VecDeque::new(),
+            window_enumerations: VecDeque::new(),
+            window_facts: BTreeMap::new(),
+            post_close_outcomes: BTreeMap::new(),
+            post_close_calls: 0,
+            terminate_calls: 0,
             opened: 0,
             next_handle_id: 1,
             next_object_id: 1,
             dropped: BTreeSet::new(),
+            active_handles: BTreeSet::new(),
             handle_events: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -120,6 +172,7 @@ struct FakeProcessAdapter {
 struct FakeHandle {
     id: u64,
     pid: u32,
+    kind: FakeHandleKind,
     object: Rc<RefCell<FakeProcessObject>>,
     state: Rc<RefCell<FakeState>>,
 }
@@ -134,11 +187,15 @@ impl Drop for FakeHandle {
             "fake handle {} was dropped more than once",
             self.id
         );
-        state.handle_events.push(FakeHandleEvent::Dropped {
+        assert!(state.active_handles.remove(&self.id));
+        let event = FakeHandleEvent::Dropped {
             handle_id: self.id,
             object_id,
             pid: self.pid,
-        });
+            kind: self.kind,
+        };
+        state.handle_events.push(event);
+        state.events.push(FakeEvent::Handle(event));
     }
 }
 
@@ -186,6 +243,34 @@ impl FakeProcessAdapter {
         self
     }
 
+    fn with_window_enumeration(
+        self,
+        value: Result<Vec<WindowCandidate<u64>>, OperationFailure>,
+    ) -> Self {
+        self.state.borrow_mut().window_enumerations.push_back(value);
+        self
+    }
+
+    fn with_window_facts(
+        self,
+        window: u64,
+        values: Vec<Result<WindowFacts, WindowFailure>>,
+    ) -> Self {
+        self.state
+            .borrow_mut()
+            .window_facts
+            .insert(window, values.into());
+        self
+    }
+
+    fn with_post_close_outcomes(self, window: u64, values: Vec<Result<(), WindowFailure>>) -> Self {
+        self.state
+            .borrow_mut()
+            .post_close_outcomes
+            .insert(window, values.into());
+        self
+    }
+
     fn mutate_after(self, after: FakeCall, occurrence: usize, mutation: FakeMutation) -> Self {
         self.state.borrow_mut().hooks.push(MutationHook {
             after,
@@ -215,10 +300,40 @@ impl FakeProcessAdapter {
         self.state.borrow().requested_access.clone()
     }
 
+    fn requested_operation_access(&self) -> Vec<OperationAccess> {
+        self.state.borrow().requested_operation_access.clone()
+    }
+
+    fn post_close_calls(&self) -> usize {
+        self.state.borrow().post_close_calls
+    }
+
+    fn terminate_calls(&self) -> usize {
+        self.state.borrow().terminate_calls
+    }
+
+    fn events(&self) -> Vec<FakeEvent> {
+        self.state.borrow().events.clone()
+    }
+
+    fn record_operation_closure(&self, handle: &FakeHandle) {
+        let mut state = self.state.borrow_mut();
+        let active_handles = state.active_handles.iter().copied().collect();
+        state.events.push(FakeEvent::OperationClosure {
+            operation_handle_id: handle.id,
+            active_handles,
+        });
+    }
+
     fn finish_call(&self, call: FakeCall) {
         let mutations = {
             let mut state = self.state.borrow_mut();
             state.calls.push(call);
+            let active_handles = state.active_handles.iter().copied().collect();
+            state.events.push(FakeEvent::Call {
+                call,
+                active_handles,
+            });
             let occurrence = state.calls.iter().filter(|entry| **entry == call).count();
             let mut mutations = Vec::new();
             let mut index = 0;
@@ -279,6 +394,44 @@ impl FakeProcessAdapter {
     ) -> Result<T, ObservationFailure> {
         Self::pop_process_value(&self.current_process(pid), select)
     }
+
+    fn make_handle(
+        &self,
+        pid: u32,
+        object: Rc<RefCell<FakeProcessObject>>,
+        kind: FakeHandleKind,
+    ) -> FakeHandle {
+        let object_id = object.borrow().id;
+        let mut state = self.state.borrow_mut();
+        let id = state.next_handle_id;
+        state.next_handle_id += 1;
+        state.opened += 1;
+        assert!(state.active_handles.insert(id));
+        let event = FakeHandleEvent::Opened {
+            handle_id: id,
+            object_id,
+            pid,
+            kind,
+        };
+        state.handle_events.push(event);
+        state.events.push(FakeEvent::Handle(event));
+        FakeHandle {
+            id,
+            pid,
+            kind,
+            object,
+            state: Rc::clone(&self.state),
+        }
+    }
+
+    fn pop_operation_value<T>(
+        object: &Rc<RefCell<FakeProcessObject>>,
+        select: impl FnOnce(&mut FakeProcessScript) -> &mut VecDeque<Result<T, OperationFailure>>,
+    ) -> Result<T, OperationFailure> {
+        select(&mut object.borrow_mut().script)
+            .pop_front()
+            .unwrap_or(Err(OperationFailure::Unavailable))
+    }
 }
 
 impl ProcessPlatformAdapter for FakeProcessAdapter {
@@ -305,25 +458,8 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
         self.state.borrow_mut().requested_access.push(access);
         let object = self.current_process(pid);
         let outcome = Self::pop_process_value(&object, |script| &mut script.open);
-        let result = outcome.map(|()| {
-            let object_id = object.borrow().id;
-            let mut state = self.state.borrow_mut();
-            let id = state.next_handle_id;
-            state.next_handle_id += 1;
-            state.opened += 1;
-            state.handle_events.push(FakeHandleEvent::Opened {
-                handle_id: id,
-                object_id,
-                pid,
-            });
-            FakeHandle {
-                id,
-                pid,
-                object,
-                state: Rc::clone(&self.state),
-            }
-        });
-        self.finish_call(FakeCall::Open(pid));
+        let result = outcome.map(|()| self.make_handle(pid, object, FakeHandleKind::Observation));
+        self.finish_call(FakeCall::OpenObservation(pid));
         result
     }
 
@@ -373,6 +509,111 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
     }
 }
 
+impl ProcessOperationAdapter for FakeProcessAdapter {
+    type WindowToken = u64;
+
+    fn open_operation(
+        &self,
+        pid: u32,
+        access: OperationAccess,
+    ) -> Result<Self::Handle, OperationFailure> {
+        self.state
+            .borrow_mut()
+            .requested_operation_access
+            .push(access);
+        let object = self.current_process(pid);
+        let outcome = Self::pop_operation_value(&object, |script| &mut script.operation_open);
+        let result = outcome.map(|()| self.make_handle(pid, object, FakeHandleKind::Operation));
+        self.finish_call(FakeCall::OpenOperation(pid));
+        result
+    }
+
+    fn enumerate_top_level_windows(
+        &self,
+    ) -> Result<Vec<WindowCandidate<Self::WindowToken>>, OperationFailure> {
+        let result = self
+            .state
+            .borrow_mut()
+            .window_enumerations
+            .pop_front()
+            .unwrap_or(Err(OperationFailure::Unavailable));
+        self.finish_call(FakeCall::EnumerateTopLevelWindows);
+        result
+    }
+
+    fn window_facts(&self, window: Self::WindowToken) -> Result<WindowFacts, WindowFailure> {
+        let result = self
+            .state
+            .borrow_mut()
+            .window_facts
+            .get_mut(&window)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(Err(WindowFailure::Unavailable));
+        self.finish_call(FakeCall::WindowFacts(window));
+        result
+    }
+
+    fn post_close(&self, window: Self::WindowToken) -> Result<(), WindowFailure> {
+        let result = {
+            let mut state = self.state.borrow_mut();
+            state.post_close_calls += 1;
+            state
+                .post_close_outcomes
+                .get_mut(&window)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(Err(WindowFailure::Unavailable))
+        };
+        self.finish_call(FakeCall::PostClose(window));
+        result
+    }
+
+    fn terminate_process(
+        &self,
+        handle: &Self::Handle,
+        _exit_code: u32,
+    ) -> Result<(), OperationFailure> {
+        let result = {
+            self.state.borrow_mut().terminate_calls += 1;
+            Self::pop_operation_value(&handle.object, |script| &mut script.terminations)
+        };
+        self.finish_call(FakeCall::TerminateProcess(handle.pid));
+        result
+    }
+
+    fn wait_for_exit(
+        &self,
+        handle: &Self::Handle,
+        timeout: Duration,
+    ) -> Result<ExitWait, OperationFailure> {
+        let result = Self::pop_operation_value(&handle.object, |script| &mut script.waits);
+        self.finish_call(FakeCall::WaitForExit(handle.pid, timeout));
+        result
+    }
+}
+
+#[derive(Clone)]
+struct FakeMonotonicClock {
+    now: Rc<Cell<Instant>>,
+}
+
+impl FakeMonotonicClock {
+    fn at(now: Instant) -> Self {
+        Self {
+            now: Rc::new(Cell::new(now)),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        self.now.set(self.now.get() + duration);
+    }
+}
+
+impl MonotonicClock for FakeMonotonicClock {
+    fn now(&self) -> Instant {
+        self.now.get()
+    }
+}
+
 fn candidate(pid: u32, name: &str, parent_pid: Option<u32>) -> ProcessCandidate {
     ProcessCandidate::new(pid, name.into(), parent_pid)
 }
@@ -419,6 +660,27 @@ fn admission_script(
         creation_times: vec![Ok(creation_time)].into(),
         liveness: vec![liveness].into(),
         protections: vec![protection].into(),
+        ..FakeProcessScript::default()
+    }
+}
+
+fn final_admission_script(
+    creation_time: u64,
+    operation_open: Result<(), OperationFailure>,
+    operation_creation_time: Result<u64, ObservationFailure>,
+    operation_liveness: Result<Liveness, ObservationFailure>,
+    operation_protection: Result<ProcessProtection, ObservationFailure>,
+) -> FakeProcessScript {
+    FakeProcessScript {
+        open: vec![Ok(())].into(),
+        operation_open: vec![operation_open].into(),
+        creation_times: vec![Ok(creation_time), operation_creation_time].into(),
+        liveness: vec![Ok(Liveness::Alive), operation_liveness].into(),
+        protections: vec![
+            Ok(ProcessProtection::new(false, false)),
+            operation_protection,
+        ]
+        .into(),
         ..FakeProcessScript::default()
     }
 }
@@ -584,7 +846,7 @@ fn snapshot_path_unavailable_reenumerates_name_then_revalidates_the_open_handle(
         adapter.calls(),
         vec![
             FakeCall::Enumerate,
-            FakeCall::Open(11),
+            FakeCall::OpenObservation(11),
             FakeCall::CreationTime(11),
             FakeCall::Liveness(11),
             FakeCall::Observation(11),
@@ -985,7 +1247,7 @@ fn admission_rejects_pid_reuse_before_liveness_or_replacement_protection() {
     );
     assert_eq!(
         adapter.calls(),
-        vec![FakeCall::Open(pid), FakeCall::CreationTime(pid)]
+        vec![FakeCall::OpenObservation(pid), FakeCall::CreationTime(pid),]
     );
     assert_eq!(adapter.opened(), 1);
     assert_eq!(adapter.dropped(), 1);
@@ -1008,7 +1270,7 @@ fn admission_maps_exit_before_open_to_target_exited_without_a_handle() {
             .err(),
         Some(ProcessError::TargetExited)
     );
-    assert_eq!(adapter.calls(), vec![FakeCall::Open(pid)]);
+    assert_eq!(adapter.calls(), vec![FakeCall::OpenObservation(pid)]);
     assert_eq!(adapter.opened(), 0);
     assert_eq!(adapter.dropped(), 0);
 }
@@ -1041,7 +1303,7 @@ fn admission_maps_observation_open_denials_without_opening_or_continuing() {
                 .err(),
             Some(ProcessError::InspectionDenied)
         );
-        assert_eq!(adapter.calls(), vec![FakeCall::Open(pid)]);
+        assert_eq!(adapter.calls(), vec![FakeCall::OpenObservation(pid)]);
         assert_eq!(
             adapter.requested_access(),
             vec![ObservationAccess::SNAPSHOT]
@@ -1092,7 +1354,7 @@ fn admission_maps_creation_time_failures_and_closes_without_continuing() {
         );
         assert_eq!(
             adapter.calls(),
-            vec![FakeCall::Open(pid), FakeCall::CreationTime(pid)]
+            vec![FakeCall::OpenObservation(pid), FakeCall::CreationTime(pid),]
         );
         assert_eq!(
             adapter.requested_access(),
@@ -1124,7 +1386,7 @@ fn admission_maps_exit_after_open_to_target_exited_and_closes_the_handle() {
     assert_eq!(
         adapter.calls(),
         vec![
-            FakeCall::Open(pid),
+            FakeCall::OpenObservation(pid),
             FakeCall::CreationTime(pid),
             FakeCall::Liveness(pid),
         ]
@@ -1163,7 +1425,7 @@ fn admission_maps_liveness_inspection_failures_to_inspection_denied() {
         assert_eq!(
             adapter.calls(),
             vec![
-                FakeCall::Open(pid),
+                FakeCall::OpenObservation(pid),
                 FakeCall::CreationTime(pid),
                 FakeCall::Liveness(pid),
             ]
@@ -1194,7 +1456,7 @@ fn admission_fails_closed_when_protection_is_unreadable() {
     assert_eq!(
         adapter.calls(),
         vec![
-            FakeCall::Open(pid),
+            FakeCall::OpenObservation(pid),
             FakeCall::CreationTime(pid),
             FakeCall::Liveness(pid),
             FakeCall::Protection(pid),
@@ -1251,7 +1513,7 @@ fn admission_rejects_the_exact_current_host_identity() {
     assert_eq!(
         adapter.calls(),
         vec![
-            FakeCall::Open(SELF_PID),
+            FakeCall::OpenObservation(SELF_PID),
             FakeCall::CreationTime(SELF_PID),
             FakeCall::Liveness(SELF_PID),
             FakeCall::Protection(SELF_PID),
@@ -1367,6 +1629,7 @@ fn admission_lease_retains_original_process_object_after_pid_reuse() {
         handle_id: original_handle_id,
         object_id: original_object_id,
         pid: opened_pid,
+        kind: FakeHandleKind::Observation,
     }] = initial_events.as_slice()
     else {
         panic!("admission must retain exactly one original fake handle");
@@ -1397,11 +1660,13 @@ fn admission_lease_retains_original_process_object_after_pid_reuse() {
                 handle_id: *original_handle_id,
                 object_id: *original_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
             FakeHandleEvent::Opened {
                 handle_id: 2,
                 object_id: replacement_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
         ]
     );
@@ -1415,16 +1680,19 @@ fn admission_lease_retains_original_process_object_after_pid_reuse() {
                 handle_id: *original_handle_id,
                 object_id: *original_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
             FakeHandleEvent::Opened {
                 handle_id: 2,
                 object_id: replacement_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
             FakeHandleEvent::Dropped {
                 handle_id: 2,
                 object_id: replacement_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
         ]
     );
@@ -1439,32 +1707,36 @@ fn admission_lease_retains_original_process_object_after_pid_reuse() {
                 handle_id: *original_handle_id,
                 object_id: *original_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
             FakeHandleEvent::Opened {
                 handle_id: 2,
                 object_id: replacement_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
             FakeHandleEvent::Dropped {
                 handle_id: 2,
                 object_id: replacement_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
             FakeHandleEvent::Dropped {
                 handle_id: *original_handle_id,
                 object_id: *original_object_id,
                 pid,
+                kind: FakeHandleKind::Observation,
             },
         ]
     );
     assert_eq!(
         adapter.calls(),
         vec![
-            FakeCall::Open(pid),
+            FakeCall::OpenObservation(pid),
             FakeCall::CreationTime(pid),
             FakeCall::Liveness(pid),
             FakeCall::Protection(pid),
-            FakeCall::Open(pid),
+            FakeCall::OpenObservation(pid),
             FakeCall::CreationTime(pid),
         ]
     );
@@ -1507,6 +1779,631 @@ fn admission_source_keeps_the_lease_opaque_and_has_no_side_effect_adapter() {
         .expect("CoreAuthority must follow the Adapter");
     for forbidden in ["terminate", "restart", "operation", "side_effect"] {
         assert!(!adapter_source.contains(forbidden));
+    }
+}
+
+mod operation_admission {
+    use super::*;
+
+    fn successful_final_script(creation_time: u64) -> FakeProcessScript {
+        final_admission_script(
+            creation_time,
+            Ok(()),
+            Ok(creation_time),
+            Ok(Liveness::Alive),
+            Ok(ProcessProtection::new(false, false)),
+        )
+    }
+
+    #[test]
+    fn operation_error_display_is_exact_and_redacted() {
+        let cases = [
+            (ProcessOperationError::IntentMismatch, "IntentMismatch"),
+            (ProcessOperationError::TargetExited, "TargetExited"),
+            (ProcessOperationError::TargetChanged, "TargetChanged"),
+            (ProcessOperationError::InspectionDenied, "InspectionDenied"),
+            (ProcessOperationError::ProtectedTarget, "ProtectedTarget"),
+            (
+                ProcessOperationError::OperationAccessDenied,
+                "OperationAccessDenied",
+            ),
+            (
+                ProcessOperationError::GracefulCloseUnavailable,
+                "GracefulCloseUnavailable",
+            ),
+            (
+                ProcessOperationError::GracefulCloseTimedOut,
+                "GracefulCloseTimedOut",
+            ),
+            (
+                ProcessOperationError::OperationUnavailable,
+                "OperationUnavailable",
+            ),
+            (
+                ProcessOperationError::TerminationPending,
+                "TerminationPending",
+            ),
+            (
+                ProcessOperationError::CompletionUnknown,
+                "CompletionUnknown",
+            ),
+            (
+                ProcessOperationError::PlatformUnsupported,
+                "PlatformUnsupported",
+            ),
+        ];
+
+        for (error, code) in cases {
+            let display = error.to_string();
+            assert_eq!(display, code);
+            for sensitive in ["424242", "sensitive.exe", "raw-win32-5"] {
+                assert!(!display.contains(sensitive));
+            }
+        }
+    }
+
+    #[test]
+    fn private_contract_values_and_fake_seams_are_exact_and_scriptable() {
+        assert!(OperationAccess::GRACEFUL.query_limited_information());
+        assert!(OperationAccess::GRACEFUL.synchronize());
+        assert!(!OperationAccess::GRACEFUL.terminate());
+        assert!(OperationAccess::FORCE.query_limited_information());
+        assert!(OperationAccess::FORCE.synchronize());
+        assert!(OperationAccess::FORCE.terminate());
+
+        let candidate = WindowCandidate::new(7_u64, 41, true, false);
+        assert_eq!(candidate.token(), 7);
+        assert_eq!(candidate.pid(), 41);
+        assert!(candidate.visible());
+        assert!(!candidate.has_owner());
+        let facts = WindowFacts::new(41, true, false);
+        assert_eq!(facts.pid(), 41);
+        assert!(facts.visible());
+        assert!(!facts.has_owner());
+
+        let pid = 41;
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                FakeProcessScript {
+                    operation_open: vec![Ok(())].into(),
+                    terminations: vec![Ok(())].into(),
+                    waits: vec![Ok(ExitWait::Exited)].into(),
+                    ..FakeProcessScript::default()
+                },
+            )
+            .with_window_enumeration(Ok(vec![candidate]))
+            .with_window_facts(7, vec![Ok(facts)])
+            .with_post_close_outcomes(7, vec![Ok(())]);
+        let handle = adapter.open_operation(pid, OperationAccess::FORCE).unwrap();
+        assert_eq!(adapter.enumerate_top_level_windows(), Ok(vec![candidate]));
+        assert_eq!(adapter.window_facts(7), Ok(facts));
+        assert_eq!(adapter.post_close(7), Ok(()));
+        assert_eq!(adapter.terminate_process(&handle, 1), Ok(()));
+        assert_eq!(
+            adapter.wait_for_exit(&handle, Duration::from_millis(25)),
+            Ok(ExitWait::Exited)
+        );
+        assert_eq!(adapter.post_close_calls(), 1);
+        assert_eq!(adapter.terminate_calls(), 1);
+        drop(handle);
+
+        let base = Instant::now();
+        let clock = FakeMonotonicClock::at(base);
+        assert_eq!(clock.now(), base);
+        clock.advance(Duration::from_millis(25));
+        assert_eq!(clock.now(), base + Duration::from_millis(25));
+    }
+
+    #[test]
+    fn intent_mismatch_drops_the_lease_before_any_operation_call() {
+        let pid = 42;
+        let creation_time = 4_200;
+        let adapter =
+            FakeProcessAdapter::default().with_process(pid, successful_final_script(creation_time));
+        let authority = authority(adapter.clone());
+        let admission = authority
+            .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+            .unwrap();
+        let closure_calls = Cell::new(0);
+
+        let result = authority.with_final_operation_admission(
+            admission,
+            ProcessIntent::ForceTerminate,
+            |_adapter, _handle| {
+                closure_calls.set(closure_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(ProcessOperationError::IntentMismatch));
+        assert_eq!(closure_calls.get(), 0);
+        assert!(adapter.requested_operation_access().is_empty());
+        assert_eq!(adapter.post_close_calls(), 0);
+        assert_eq!(adapter.terminate_calls(), 0);
+        assert_eq!(adapter.opened(), 1);
+        assert_eq!(adapter.dropped(), 1);
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                FakeCall::OpenObservation(pid),
+                FakeCall::CreationTime(pid),
+                FakeCall::Liveness(pid),
+                FakeCall::Protection(pid),
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_intents_select_only_their_exact_operation_access() {
+        for (intent, expected_access) in [
+            (ProcessIntent::Terminate, OperationAccess::GRACEFUL),
+            (ProcessIntent::ForceTerminate, OperationAccess::FORCE),
+        ] {
+            let pid = 43;
+            let creation_time = 4_300;
+            let adapter = FakeProcessAdapter::default()
+                .with_process(pid, successful_final_script(creation_time));
+            let authority = authority(adapter.clone());
+            let admission = authority
+                .admit(&target(pid, creation_time), intent)
+                .unwrap();
+            let closure_calls = Cell::new(0);
+
+            let result =
+                authority.with_final_operation_admission(admission, intent, |adapter, handle| {
+                    closure_calls.set(closure_calls.get() + 1);
+                    adapter.record_operation_closure(handle);
+                    Ok(())
+                });
+
+            assert_eq!(result, Ok(()));
+            assert_eq!(closure_calls.get(), 1);
+            assert_eq!(adapter.requested_operation_access(), vec![expected_access]);
+            assert_eq!(adapter.opened(), 2);
+            assert_eq!(adapter.dropped(), 2);
+        }
+    }
+
+    #[test]
+    fn operation_open_failures_have_stable_classifications_and_no_closure() {
+        for (failure, expected) in [
+            (
+                OperationFailure::ExitedOrChanged,
+                ProcessOperationError::TargetExited,
+            ),
+            (
+                OperationFailure::AccessDenied,
+                ProcessOperationError::OperationAccessDenied,
+            ),
+            (
+                OperationFailure::Unavailable,
+                ProcessOperationError::OperationUnavailable,
+            ),
+        ] {
+            let pid = 44;
+            let creation_time = 4_400;
+            let adapter = FakeProcessAdapter::default().with_process(
+                pid,
+                final_admission_script(
+                    creation_time,
+                    Err(failure),
+                    Ok(creation_time),
+                    Ok(Liveness::Alive),
+                    Ok(ProcessProtection::new(false, false)),
+                ),
+            );
+            let authority = authority(adapter.clone());
+            let admission = authority
+                .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+                .unwrap();
+            let closure_calls = Cell::new(0);
+
+            let result = authority.with_final_operation_admission(
+                admission,
+                ProcessIntent::Terminate,
+                |_adapter, _handle| {
+                    closure_calls.set(closure_calls.get() + 1);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Err(expected));
+            assert_eq!(closure_calls.get(), 0);
+            assert_eq!(adapter.opened(), 1);
+            assert_eq!(adapter.dropped(), 1);
+            assert_eq!(
+                adapter.requested_operation_access(),
+                vec![OperationAccess::GRACEFUL]
+            );
+            assert_eq!(adapter.calls().last(), Some(&FakeCall::OpenOperation(pid)));
+        }
+    }
+
+    #[test]
+    fn replacement_creation_time_stops_before_replacement_liveness_or_protection() {
+        let pid = 45;
+        let creation_time = 4_500;
+        let adapter = FakeProcessAdapter::default().with_process(
+            pid,
+            admission_script(
+                creation_time,
+                Ok(Liveness::Alive),
+                Ok(ProcessProtection::new(false, false)),
+            ),
+        );
+        let authority = authority(adapter.clone());
+        let admission = authority
+            .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+            .unwrap();
+        adapter.replace_process(
+            pid,
+            FakeProcessScript {
+                operation_open: vec![Ok(())].into(),
+                creation_times: vec![Ok(4_501)].into(),
+                liveness: vec![Ok(Liveness::Alive)].into(),
+                protections: vec![Err(ObservationFailure::AccessDenied)].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+        let closure_calls = Cell::new(0);
+
+        let result = authority.with_final_operation_admission(
+            admission,
+            ProcessIntent::Terminate,
+            |_adapter, _handle| {
+                closure_calls.set(closure_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(ProcessOperationError::TargetChanged));
+        let display = result.unwrap_err().to_string();
+        assert_eq!(display, "TargetChanged");
+        assert!(!display.contains("4501"));
+        assert_eq!(closure_calls.get(), 0);
+        assert_eq!(adapter.opened(), 2);
+        assert_eq!(adapter.dropped(), 2);
+        assert_eq!(
+            &adapter.calls()[4..],
+            [FakeCall::OpenOperation(pid), FakeCall::CreationTime(pid),]
+        );
+    }
+
+    #[test]
+    fn final_creation_and_liveness_failures_preserve_exit_then_inspection_precedence() {
+        for (creation_result, expected) in [
+            (
+                Err(ObservationFailure::ExitedOrChanged),
+                ProcessOperationError::TargetExited,
+            ),
+            (
+                Err(ObservationFailure::AccessDenied),
+                ProcessOperationError::InspectionDenied,
+            ),
+            (
+                Err(ObservationFailure::IdentityUnavailable),
+                ProcessOperationError::InspectionDenied,
+            ),
+        ] {
+            let pid = 46;
+            let creation_time = 4_600;
+            let adapter = FakeProcessAdapter::default().with_process(
+                pid,
+                final_admission_script(
+                    creation_time,
+                    Ok(()),
+                    creation_result,
+                    Ok(Liveness::Alive),
+                    Ok(ProcessProtection::new(false, false)),
+                ),
+            );
+            let authority = authority(adapter.clone());
+            let admission = authority
+                .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+                .unwrap();
+            let closure_calls = Cell::new(0);
+
+            let result = authority.with_final_operation_admission(
+                admission,
+                ProcessIntent::Terminate,
+                |_adapter, _handle| {
+                    closure_calls.set(closure_calls.get() + 1);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Err(expected));
+            assert_eq!(closure_calls.get(), 0);
+            assert_eq!(adapter.opened(), 2);
+            assert_eq!(adapter.dropped(), 2);
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, FakeCall::Liveness(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, FakeCall::Protection(_)))
+                    .count(),
+                1
+            );
+        }
+
+        for (liveness, expected) in [
+            (Ok(Liveness::Exited), ProcessOperationError::TargetExited),
+            (
+                Err(ObservationFailure::ExitedOrChanged),
+                ProcessOperationError::InspectionDenied,
+            ),
+            (
+                Err(ObservationFailure::AccessDenied),
+                ProcessOperationError::InspectionDenied,
+            ),
+        ] {
+            let pid = 47;
+            let creation_time = 4_700;
+            let adapter = FakeProcessAdapter::default().with_process(
+                pid,
+                final_admission_script(
+                    creation_time,
+                    Ok(()),
+                    Ok(creation_time),
+                    liveness,
+                    Err(ObservationFailure::IdentityUnavailable),
+                ),
+            );
+            let authority = authority(adapter.clone());
+            let admission = authority
+                .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+                .unwrap();
+            let closure_calls = Cell::new(0);
+
+            let result = authority.with_final_operation_admission(
+                admission,
+                ProcessIntent::Terminate,
+                |_adapter, _handle| {
+                    closure_calls.set(closure_calls.get() + 1);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Err(expected));
+            assert_eq!(closure_calls.get(), 0);
+            assert_eq!(adapter.opened(), 2);
+            assert_eq!(adapter.dropped(), 2);
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, FakeCall::Protection(_)))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_protection_precedes_self_and_every_protected_class_fails_closed() {
+        let pid = 48;
+        let creation_time = 4_800;
+        let adapter = FakeProcessAdapter::default().with_process(
+            pid,
+            final_admission_script(
+                creation_time,
+                Ok(()),
+                Ok(creation_time),
+                Ok(Liveness::Alive),
+                Err(ObservationFailure::IdentityUnavailable),
+            ),
+        );
+        let admitting_authority = authority(adapter.clone());
+        let admission = admitting_authority
+            .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+            .unwrap();
+        let self_authority = authority_with_self(adapter.clone(), pid, creation_time);
+        let closure_calls = Cell::new(0);
+        let result = self_authority.with_final_operation_admission(
+            admission,
+            ProcessIntent::Terminate,
+            |_adapter, _handle| {
+                closure_calls.set(closure_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(ProcessOperationError::InspectionDenied));
+        assert_eq!(closure_calls.get(), 0);
+        assert_eq!(adapter.opened(), 2);
+        assert_eq!(adapter.dropped(), 2);
+
+        for (pid, protection, exact_self) in [
+            (49, ProcessProtection::new(false, false), true),
+            (50, ProcessProtection::new(true, false), false),
+            (51, ProcessProtection::new(false, true), false),
+        ] {
+            let creation_time = u64::from(pid) * 100;
+            let adapter = FakeProcessAdapter::default().with_process(
+                pid,
+                final_admission_script(
+                    creation_time,
+                    Ok(()),
+                    Ok(creation_time),
+                    Ok(Liveness::Alive),
+                    Ok(protection),
+                ),
+            );
+            let admitting_authority = authority(adapter.clone());
+            let admission = admitting_authority
+                .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+                .unwrap();
+            let operation_authority = if exact_self {
+                authority_with_self(adapter.clone(), pid, creation_time)
+            } else {
+                authority(adapter.clone())
+            };
+            let closure_calls = Cell::new(0);
+
+            let result = operation_authority.with_final_operation_admission(
+                admission,
+                ProcessIntent::Terminate,
+                |_adapter, _handle| {
+                    closure_calls.set(closure_calls.get() + 1);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Err(ProcessOperationError::ProtectedTarget));
+            assert_eq!(closure_calls.get(), 0);
+            assert_eq!(adapter.opened(), 2);
+            assert_eq!(adapter.dropped(), 2);
+        }
+    }
+
+    #[test]
+    fn handle_timeline_keeps_both_handles_through_checks_then_only_operation_in_closure() {
+        let pid = 52;
+        let creation_time = 5_200;
+        let adapter =
+            FakeProcessAdapter::default().with_process(pid, successful_final_script(creation_time));
+        let authority = authority(adapter.clone());
+        let admission = authority
+            .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+            .unwrap();
+
+        let result = authority.with_final_operation_admission(
+            admission,
+            ProcessIntent::Terminate,
+            |adapter, handle| {
+                adapter.record_operation_closure(handle);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        let events = adapter.events();
+        let final_creation = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Call {
+                        call: FakeCall::CreationTime(52),
+                        active_handles,
+                    } if active_handles == &[1, 2]
+                )
+            })
+            .expect("final creation check must retain both handles");
+        let final_liveness = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Call {
+                        call: FakeCall::Liveness(52),
+                        active_handles,
+                    } if active_handles == &[1, 2]
+                )
+            })
+            .expect("final liveness check must retain both handles");
+        let final_protection = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Call {
+                        call: FakeCall::Protection(52),
+                        active_handles,
+                    } if active_handles == &[1, 2]
+                )
+            })
+            .expect("final protection check must retain both handles");
+        let admission_drop = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Handle(FakeHandleEvent::Dropped {
+                        handle_id: 1,
+                        kind: FakeHandleKind::Observation,
+                        ..
+                    })
+                )
+            })
+            .expect("admission handle must drop");
+        let closure = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FakeEvent::OperationClosure {
+                        operation_handle_id: 2,
+                        active_handles,
+                    } if active_handles == &[2]
+                )
+            })
+            .expect("closure must retain only the operation handle");
+        let operation_drop = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    FakeEvent::Handle(FakeHandleEvent::Dropped {
+                        handle_id: 2,
+                        kind: FakeHandleKind::Operation,
+                        ..
+                    })
+                )
+            })
+            .expect("operation handle must drop after the closure");
+
+        assert!(final_creation < final_liveness);
+        assert!(final_liveness < final_protection);
+        assert!(final_protection < admission_drop);
+        assert!(admission_drop < closure);
+        assert!(closure < operation_drop);
+        assert_eq!(adapter.opened(), 2);
+        assert_eq!(adapter.dropped(), 2);
+    }
+
+    #[test]
+    fn operation_contract_isolated_from_stage_one_core_and_module_exports() {
+        let process_core = include_str!("core.rs");
+        let process_module = include_str!("mod.rs");
+
+        for forbidden in [
+            "OperationAccess",
+            "OperationFailure",
+            "ProcessOperationAdapter",
+            "open_operation",
+            "WindowToken",
+            "HANDLE",
+            "HWND",
+        ] {
+            assert!(
+                !process_core.contains(forbidden),
+                "core contains {forbidden}"
+            );
+        }
+        assert!(process_module.contains("mod operation;"));
+        assert!(process_module
+            .contains("pub(crate) type ProcessOperationError = operation::ProcessOperationError;"));
+        for private_contract in [
+            "OperationAccess",
+            "OperationFailure",
+            "WindowFailure",
+            "WindowCandidate",
+            "WindowFacts",
+            "ExitWait",
+            "ProcessOperationAdapter",
+            "MonotonicClock",
+        ] {
+            assert!(!process_module.contains(&format!("pub(crate) type {private_contract}")));
+        }
     }
 }
 
@@ -1726,7 +2623,7 @@ mod windows_tests {
             adapter.calls(),
             vec![
                 FakeCall::Enumerate,
-                FakeCall::Open(pid),
+                FakeCall::OpenObservation(pid),
                 FakeCall::CreationTime(pid),
                 FakeCall::Liveness(pid),
                 FakeCall::Observation(pid),
