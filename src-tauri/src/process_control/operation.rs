@@ -206,7 +206,25 @@ impl MonotonicClock for SystemMonotonicClock {
     }
 }
 
+const GRACEFUL_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
 impl<A: ProcessOperationAdapter> CoreAuthority<A> {
+    pub(super) fn terminate_with_clock<C: MonotonicClock>(
+        &self,
+        admission: CoreAdmission<A::Handle>,
+        clock: &C,
+    ) -> Result<(), ProcessOperationError> {
+        let target_pid = admission.target().pid();
+        self.with_final_operation_admission(
+            admission,
+            ProcessIntent::Terminate,
+            |adapter, operation_handle| {
+                let deadline = clock.now() + GRACEFUL_CLOSE_DEADLINE;
+                terminate_gracefully(adapter, operation_handle, target_pid, clock, deadline)
+            },
+        )
+    }
+
     pub(super) fn with_final_operation_admission<T>(
         &self,
         admission: CoreAdmission<A::Handle>,
@@ -258,6 +276,128 @@ impl<A: ProcessOperationAdapter> CoreAuthority<A> {
 
         drop(admission_handle);
         operation(self.adapter(), &operation_handle)
+    }
+}
+
+fn terminate_gracefully<A: ProcessOperationAdapter, C: MonotonicClock>(
+    adapter: &A,
+    operation_handle: &A::Handle,
+    target_pid: u32,
+    clock: &C,
+    deadline: Instant,
+) -> Result<(), ProcessOperationError> {
+    let candidates = adapter
+        .enumerate_top_level_windows()
+        .map_err(side_effect_availability_failure)?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.pid() == target_pid && candidate.visible() && !candidate.has_owner()
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return unavailable_unless_exited(adapter, operation_handle);
+    }
+
+    let mut posted = false;
+    let mut access_denied = false;
+    let mut unavailable = false;
+    let mut deadline_exhausted = false;
+    let mut completion_observation_failed = false;
+
+    for candidate in candidates {
+        match adapter.wait_for_exit(operation_handle, Duration::ZERO) {
+            Ok(ExitWait::Exited) => return Ok(()),
+            Ok(ExitWait::TimedOut) => {}
+            Err(_failure) if posted => {
+                completion_observation_failed = true;
+                break;
+            }
+            Err(failure) => return Err(side_effect_availability_failure(failure)),
+        }
+        if clock.now() >= deadline {
+            deadline_exhausted = true;
+            break;
+        }
+
+        let facts = match adapter.window_facts(candidate.token()) {
+            Ok(facts) if facts.pid() == target_pid && facts.visible() && !facts.has_owner() => {
+                facts
+            }
+            Ok(_) | Err(WindowFailure::Gone) => continue,
+            Err(WindowFailure::AccessDenied) => {
+                access_denied = true;
+                continue;
+            }
+            Err(WindowFailure::Unavailable) => {
+                unavailable = true;
+                continue;
+            }
+        };
+        debug_assert_eq!(facts.pid(), target_pid);
+
+        // This token is HWND-like, not HANDLE-backed identity. Even after the
+        // zero-time process poll and immediate PID/visibility/owner revalidation,
+        // a narrow target-exit plus HWND/PID-reuse race remains before post_close.
+        // Never retarget a changed or gone token; graceful close cannot claim the
+        // operation HANDLE's stronger identity guarantee.
+        match adapter.post_close(candidate.token()) {
+            Ok(()) => posted = true,
+            Err(WindowFailure::Gone) => {}
+            Err(WindowFailure::AccessDenied) => access_denied = true,
+            Err(WindowFailure::Unavailable) => unavailable = true,
+        }
+    }
+
+    match adapter.wait_for_exit(operation_handle, Duration::ZERO) {
+        Ok(ExitWait::Exited) => return Ok(()),
+        Ok(ExitWait::TimedOut) => {}
+        Err(_failure) if posted => completion_observation_failed = true,
+        Err(failure) => return Err(side_effect_availability_failure(failure)),
+    }
+
+    if deadline_exhausted && !posted {
+        return Err(ProcessOperationError::OperationUnavailable);
+    }
+    if !posted {
+        return Err(if unavailable {
+            ProcessOperationError::OperationUnavailable
+        } else if access_denied {
+            ProcessOperationError::OperationAccessDenied
+        } else {
+            ProcessOperationError::GracefulCloseUnavailable
+        });
+    }
+
+    let remaining = deadline.saturating_duration_since(clock.now());
+    let wait = adapter.wait_for_exit(operation_handle, remaining);
+    let final_poll = adapter.wait_for_exit(operation_handle, Duration::ZERO);
+    if matches!(wait, Ok(ExitWait::Exited)) || matches!(final_poll, Ok(ExitWait::Exited)) {
+        return Ok(());
+    }
+    if completion_observation_failed || wait.is_err() || final_poll.is_err() {
+        return Err(ProcessOperationError::CompletionUnknown);
+    }
+    Err(ProcessOperationError::GracefulCloseTimedOut)
+}
+
+fn unavailable_unless_exited<A: ProcessOperationAdapter>(
+    adapter: &A,
+    operation_handle: &A::Handle,
+) -> Result<(), ProcessOperationError> {
+    match adapter.wait_for_exit(operation_handle, Duration::ZERO) {
+        Ok(ExitWait::Exited) => Ok(()),
+        Ok(ExitWait::TimedOut) => Err(ProcessOperationError::GracefulCloseUnavailable),
+        Err(failure) => Err(side_effect_availability_failure(failure)),
+    }
+}
+
+fn side_effect_availability_failure(failure: OperationFailure) -> ProcessOperationError {
+    match failure {
+        OperationFailure::AccessDenied => ProcessOperationError::OperationAccessDenied,
+        OperationFailure::ExitedOrChanged | OperationFailure::Unavailable => {
+            ProcessOperationError::OperationUnavailable
+        }
     }
 }
 

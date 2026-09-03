@@ -594,22 +594,44 @@ impl ProcessOperationAdapter for FakeProcessAdapter {
 #[derive(Clone)]
 struct FakeMonotonicClock {
     now: Rc<Cell<Instant>>,
+    scripted: Rc<RefCell<VecDeque<Instant>>>,
+    reads: Rc<Cell<usize>>,
 }
 
 impl FakeMonotonicClock {
     fn at(now: Instant) -> Self {
         Self {
             now: Rc::new(Cell::new(now)),
+            scripted: Rc::new(RefCell::new(VecDeque::new())),
+            reads: Rc::new(Cell::new(0)),
         }
+    }
+
+    fn with_readings(base: Instant, offsets: Vec<Duration>) -> Self {
+        let clock = Self::at(base);
+        clock.scripted.borrow_mut().extend(
+            offsets
+                .into_iter()
+                .map(|offset| base.checked_add(offset).unwrap()),
+        );
+        clock
     }
 
     fn advance(&self, duration: Duration) {
         self.now.set(self.now.get() + duration);
     }
+
+    fn reads(&self) -> usize {
+        self.reads.get()
+    }
 }
 
 impl MonotonicClock for FakeMonotonicClock {
     fn now(&self) -> Instant {
+        self.reads.set(self.reads.get() + 1);
+        if let Some(now) = self.scripted.borrow_mut().pop_front() {
+            self.now.set(now);
+        }
         self.now.get()
     }
 }
@@ -2404,6 +2426,672 @@ mod operation_admission {
         ] {
             assert!(!process_module.contains(&format!("pub(crate) type {private_contract}")));
         }
+    }
+}
+
+mod operation_terminate {
+    use super::*;
+
+    fn graceful_script(
+        creation_time: u64,
+        waits: Vec<Result<ExitWait, OperationFailure>>,
+    ) -> FakeProcessScript {
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            operation_open: vec![Ok(())].into(),
+            creation_times: vec![Ok(creation_time), Ok(creation_time)].into(),
+            liveness: vec![Ok(Liveness::Alive), Ok(Liveness::Alive)].into(),
+            protections: vec![
+                Ok(ProcessProtection::new(false, false)),
+                Ok(ProcessProtection::new(false, false)),
+            ]
+            .into(),
+            waits: waits.into(),
+            ..FakeProcessScript::default()
+        }
+    }
+
+    fn terminate(
+        adapter: FakeProcessAdapter,
+        pid: u32,
+        creation_time: u64,
+        clock: &FakeMonotonicClock,
+    ) -> Result<(), ProcessOperationError> {
+        let authority = authority(adapter);
+        let admission = authority
+            .admit(&target(pid, creation_time), ProcessIntent::Terminate)
+            .unwrap();
+        authority.terminate_with_clock(admission, clock)
+    }
+
+    #[test]
+    fn filters_enumeration_facts_and_posts_each_valid_window_once_in_order() {
+        let pid = 60;
+        let creation_time = 6_000;
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::Exited),
+                        Ok(ExitWait::Exited),
+                    ],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![
+                WindowCandidate::new(1, pid, true, false),
+                WindowCandidate::new(2, pid + 1, true, false),
+                WindowCandidate::new(3, pid, false, false),
+                WindowCandidate::new(4, pid, true, true),
+                WindowCandidate::new(5, pid, true, false),
+            ]))
+            .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_window_facts(5, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_post_close_outcomes(1, vec![Ok(())])
+            .with_post_close_outcomes(5, vec![Ok(())]);
+        let clock = FakeMonotonicClock::at(Instant::now());
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(adapter.post_close_calls(), 2);
+        assert_eq!(adapter.terminate_calls(), 0);
+        assert_eq!(
+            adapter.requested_operation_access(),
+            vec![OperationAccess::GRACEFUL]
+        );
+        assert_eq!(
+            adapter
+                .calls()
+                .into_iter()
+                .filter(|call| matches!(call, FakeCall::WindowFacts(_) | FakeCall::PostClose(_)))
+                .collect::<Vec<_>>(),
+            vec![
+                FakeCall::WindowFacts(1),
+                FakeCall::PostClose(1),
+                FakeCall::WindowFacts(5),
+                FakeCall::PostClose(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn adapter_candidate_contract_has_no_child_or_message_only_classification() {
+        let source = include_str!("operation.rs");
+        let candidate_contract = source
+            .split("pub(super) struct WindowCandidate")
+            .nth(1)
+            .unwrap()
+            .split("impl<W: Copy>")
+            .next()
+            .unwrap();
+        let adapter_contract = source
+            .split("pub(super) trait ProcessOperationAdapter")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) trait MonotonicClock")
+            .next()
+            .unwrap();
+
+        for unsupported_candidate_class in ["child", "message_only", "message-only"] {
+            assert!(!candidate_contract.contains(unsupported_candidate_class));
+            assert!(!adapter_contract.contains(unsupported_candidate_class));
+        }
+        assert!(adapter_contract.contains("enumerate_top_level_windows"));
+    }
+
+    #[test]
+    fn no_initial_candidate_is_unavailable_unless_the_process_has_exited() {
+        for (poll, expected) in [
+            (
+                ExitWait::TimedOut,
+                Err(ProcessOperationError::GracefulCloseUnavailable),
+            ),
+            (ExitWait::Exited, Ok(())),
+        ] {
+            let pid = 61;
+            let creation_time = 6_100;
+            let adapter = FakeProcessAdapter::default()
+                .with_process(pid, graceful_script(creation_time, vec![Ok(poll)]))
+                .with_window_enumeration(Ok(vec![
+                    WindowCandidate::new(1, pid + 1, true, false),
+                    WindowCandidate::new(2, pid, false, false),
+                    WindowCandidate::new(3, pid, true, true),
+                ]));
+            let clock = FakeMonotonicClock::at(Instant::now());
+
+            let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+            assert_eq!(result, expected);
+            assert_eq!(adapter.post_close_calls(), 0);
+            assert_eq!(adapter.terminate_calls(), 0);
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, FakeCall::EnumerateTopLevelWindows))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                adapter.calls().last(),
+                Some(&FakeCall::WaitForExit(pid, Duration::ZERO))
+            );
+        }
+    }
+
+    #[test]
+    fn changed_and_gone_candidates_are_skipped_without_retargeting() {
+        for (final_poll, expected) in [
+            (
+                ExitWait::TimedOut,
+                Err(ProcessOperationError::GracefulCloseUnavailable),
+            ),
+            (ExitWait::Exited, Ok(())),
+        ] {
+            let pid = 62;
+            let creation_time = 6_200;
+            let adapter = FakeProcessAdapter::default()
+                .with_process(
+                    pid,
+                    graceful_script(
+                        creation_time,
+                        vec![
+                            Ok(ExitWait::TimedOut),
+                            Ok(ExitWait::TimedOut),
+                            Ok(ExitWait::TimedOut),
+                            Ok(ExitWait::TimedOut),
+                            Ok(ExitWait::TimedOut),
+                            Ok(final_poll),
+                        ],
+                    ),
+                )
+                .with_window_enumeration(Ok(vec![
+                    WindowCandidate::new(10, pid, true, false),
+                    WindowCandidate::new(11, pid, true, false),
+                    WindowCandidate::new(12, pid, true, false),
+                    WindowCandidate::new(13, pid, true, false),
+                    WindowCandidate::new(14, pid, true, false),
+                ]))
+                .with_window_facts(10, vec![Ok(WindowFacts::new(pid + 1, true, false))])
+                .with_window_facts(11, vec![Ok(WindowFacts::new(pid, false, false))])
+                .with_window_facts(12, vec![Ok(WindowFacts::new(pid, true, true))])
+                .with_window_facts(13, vec![Err(WindowFailure::Gone)])
+                .with_window_facts(14, vec![Ok(WindowFacts::new(pid, true, false))])
+                .with_post_close_outcomes(14, vec![Err(WindowFailure::Gone)]);
+            let clock = FakeMonotonicClock::at(Instant::now());
+
+            let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+            assert_eq!(result, expected);
+            assert_eq!(adapter.post_close_calls(), 1);
+            assert_eq!(adapter.terminate_calls(), 0);
+            assert_eq!(
+                adapter
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, FakeCall::EnumerateTopLevelWindows))
+                    .count(),
+                1
+            );
+            assert!(!adapter.calls().iter().any(|call| {
+                matches!(
+                    call,
+                    FakeCall::PostClose(10)
+                        | FakeCall::PostClose(11)
+                        | FakeCall::PostClose(12)
+                        | FakeCall::PostClose(13)
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn exit_before_the_first_or_between_posts_stops_side_effects_and_succeeds() {
+        let pid = 63;
+        let creation_time = 6_300;
+        let before = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(creation_time, vec![Ok(ExitWait::Exited)]),
+            )
+            .with_window_enumeration(Ok(vec![WindowCandidate::new(1, pid, true, false)]));
+        let clock = FakeMonotonicClock::at(Instant::now());
+
+        assert_eq!(
+            terminate(before.clone(), pid, creation_time, &clock),
+            Ok(())
+        );
+        assert_eq!(before.post_close_calls(), 0);
+        assert!(!before
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::WindowFacts(_))));
+
+        let between = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![Ok(ExitWait::TimedOut), Ok(ExitWait::Exited)],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![
+                WindowCandidate::new(1, pid, true, false),
+                WindowCandidate::new(2, pid, true, false),
+            ]))
+            .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_post_close_outcomes(1, vec![Ok(())]);
+
+        assert_eq!(
+            terminate(between.clone(), pid, creation_time, &clock),
+            Ok(())
+        );
+        assert_eq!(between.post_close_calls(), 1);
+        assert!(!between
+            .calls()
+            .iter()
+            .any(|call| { matches!(call, FakeCall::WindowFacts(2) | FakeCall::PostClose(2)) }));
+        assert_eq!(before.terminate_calls() + between.terminate_calls(), 0);
+    }
+
+    #[test]
+    fn all_denied_failures_are_distinct_from_mixed_or_unavailable_failures() {
+        let pid = 64;
+        let creation_time = 6_400;
+        let cases = [
+            (
+                vec![
+                    Ok(WindowFacts::new(pid, true, false)),
+                    Ok(WindowFacts::new(pid, true, false)),
+                ],
+                vec![
+                    (1, Err(WindowFailure::AccessDenied)),
+                    (2, Err(WindowFailure::AccessDenied)),
+                ],
+                ProcessOperationError::OperationAccessDenied,
+            ),
+            (
+                vec![
+                    Ok(WindowFacts::new(pid, true, false)),
+                    Ok(WindowFacts::new(pid, true, false)),
+                ],
+                vec![
+                    (1, Err(WindowFailure::AccessDenied)),
+                    (2, Err(WindowFailure::Unavailable)),
+                ],
+                ProcessOperationError::OperationUnavailable,
+            ),
+            (
+                vec![
+                    Ok(WindowFacts::new(pid, true, false)),
+                    Ok(WindowFacts::new(pid, true, false)),
+                ],
+                vec![
+                    (1, Err(WindowFailure::Unavailable)),
+                    (2, Err(WindowFailure::Unavailable)),
+                ],
+                ProcessOperationError::OperationUnavailable,
+            ),
+        ];
+
+        for (facts, posts, expected) in cases {
+            let adapter = FakeProcessAdapter::default()
+                .with_process(
+                    pid,
+                    graceful_script(
+                        creation_time,
+                        vec![
+                            Ok(ExitWait::TimedOut),
+                            Ok(ExitWait::TimedOut),
+                            Ok(ExitWait::TimedOut),
+                        ],
+                    ),
+                )
+                .with_window_enumeration(Ok(vec![
+                    WindowCandidate::new(1, pid, true, false),
+                    WindowCandidate::new(2, pid, true, false),
+                ]))
+                .with_window_facts(1, vec![facts[0]])
+                .with_window_facts(2, vec![facts[1]]);
+            let adapter = posts
+                .into_iter()
+                .fold(adapter, |adapter, (window, outcome)| {
+                    adapter.with_post_close_outcomes(window, vec![outcome])
+                });
+            let clock = FakeMonotonicClock::at(Instant::now());
+
+            assert_eq!(
+                terminate(adapter.clone(), pid, creation_time, &clock),
+                Err(expected)
+            );
+            assert_eq!(adapter.terminate_calls(), 0);
+        }
+    }
+
+    #[test]
+    fn partial_post_success_waits_and_later_failures_do_not_override_timeout() {
+        let pid = 65;
+        let creation_time = 6_500;
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                    ],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![
+                WindowCandidate::new(1, pid, true, false),
+                WindowCandidate::new(2, pid, true, false),
+                WindowCandidate::new(3, pid, true, false),
+            ]))
+            .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_window_facts(2, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_window_facts(3, vec![Err(WindowFailure::Unavailable)])
+            .with_post_close_outcomes(1, vec![Ok(())])
+            .with_post_close_outcomes(2, vec![Err(WindowFailure::AccessDenied)]);
+        let clock = FakeMonotonicClock::at(Instant::now());
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Err(ProcessOperationError::GracefulCloseTimedOut));
+        assert_eq!(adapter.post_close_calls(), 2);
+        assert!(adapter.calls().iter().any(|call| {
+            matches!(call, FakeCall::WaitForExit(_, timeout) if *timeout > Duration::ZERO)
+        }));
+        assert_eq!(adapter.terminate_calls(), 0);
+    }
+
+    #[test]
+    fn deadline_consumed_before_first_post_returns_operation_unavailable() {
+        let pid = 66;
+        let creation_time = 6_600;
+        let base = Instant::now();
+        let clock =
+            FakeMonotonicClock::with_readings(base, vec![Duration::ZERO, Duration::from_secs(5)]);
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![Ok(ExitWait::TimedOut), Ok(ExitWait::TimedOut)],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![WindowCandidate::new(1, pid, true, false)]));
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Err(ProcessOperationError::OperationUnavailable));
+        assert_eq!(clock.reads(), 2);
+        assert_eq!(adapter.post_close_calls(), 0);
+        assert!(!adapter
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::WindowFacts(_))));
+        assert_eq!(
+            adapter.calls().last(),
+            Some(&FakeCall::WaitForExit(pid, Duration::ZERO))
+        );
+    }
+
+    #[test]
+    fn deadline_consumed_between_posts_stops_posting_and_times_out_after_success() {
+        let pid = 67;
+        let creation_time = 6_700;
+        let base = Instant::now();
+        let clock = FakeMonotonicClock::with_readings(
+            base,
+            vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(5)],
+        );
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                    ],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![
+                WindowCandidate::new(1, pid, true, false),
+                WindowCandidate::new(2, pid, true, false),
+            ]))
+            .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_post_close_outcomes(1, vec![Ok(())]);
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Err(ProcessOperationError::GracefulCloseTimedOut));
+        assert_eq!(adapter.post_close_calls(), 1);
+        assert!(!adapter
+            .calls()
+            .iter()
+            .any(|call| { matches!(call, FakeCall::WindowFacts(2) | FakeCall::PostClose(2)) }));
+        assert!(adapter.calls().iter().any(|call| {
+            matches!(call, FakeCall::WaitForExit(_, timeout) if *timeout == Duration::ZERO)
+        }));
+        assert_eq!(adapter.terminate_calls(), 0);
+    }
+
+    #[test]
+    fn completion_wait_uses_only_the_shared_deadline_remaining_time() {
+        let pid = 71;
+        let creation_time = 7_100;
+        let base = Instant::now();
+        let clock = FakeMonotonicClock::with_readings(
+            base,
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ],
+        );
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                    ],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![WindowCandidate::new(1, pid, true, false)]))
+            .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_post_close_outcomes(1, vec![Ok(())]);
+
+        let result = terminate(adapter.clone(), pid, creation_time, &clock);
+
+        assert_eq!(result, Err(ProcessOperationError::GracefulCloseTimedOut));
+        assert!(adapter
+            .calls()
+            .contains(&FakeCall::WaitForExit(pid, Duration::from_secs(3))));
+        assert_eq!(clock.reads(), 3);
+        assert_eq!(adapter.terminate_calls(), 0);
+    }
+
+    #[test]
+    fn completion_requires_observed_exit_and_always_finishes_with_a_zero_poll() {
+        let pid = 68;
+        let creation_time = 6_800;
+        let cases = [
+            (
+                vec![
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::Exited),
+                    Ok(ExitWait::TimedOut),
+                ],
+                Ok(()),
+            ),
+            (
+                vec![
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::Exited),
+                ],
+                Ok(()),
+            ),
+            (
+                vec![
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                ],
+                Err(ProcessOperationError::GracefulCloseTimedOut),
+            ),
+            (
+                vec![
+                    Ok(ExitWait::TimedOut),
+                    Ok(ExitWait::TimedOut),
+                    Err(OperationFailure::Unavailable),
+                    Err(OperationFailure::Unavailable),
+                ],
+                Err(ProcessOperationError::CompletionUnknown),
+            ),
+        ];
+
+        for (waits, expected) in cases {
+            let adapter = FakeProcessAdapter::default()
+                .with_process(pid, graceful_script(creation_time, waits))
+                .with_window_enumeration(Ok(vec![WindowCandidate::new(1, pid, true, false)]))
+                .with_window_facts(1, vec![Ok(WindowFacts::new(pid, true, false))])
+                .with_post_close_outcomes(1, vec![Ok(())]);
+            let clock = FakeMonotonicClock::at(Instant::now());
+
+            assert_eq!(
+                terminate(adapter.clone(), pid, creation_time, &clock),
+                expected
+            );
+            assert_eq!(
+                adapter.calls().last(),
+                Some(&FakeCall::WaitForExit(pid, Duration::ZERO))
+            );
+            assert_eq!(adapter.post_close_calls(), 1);
+            assert_eq!(adapter.terminate_calls(), 0);
+        }
+    }
+
+    #[test]
+    fn enumeration_failures_keep_access_denied_distinct_from_unavailable() {
+        for (failure, expected) in [
+            (
+                OperationFailure::AccessDenied,
+                ProcessOperationError::OperationAccessDenied,
+            ),
+            (
+                OperationFailure::ExitedOrChanged,
+                ProcessOperationError::OperationUnavailable,
+            ),
+            (
+                OperationFailure::Unavailable,
+                ProcessOperationError::OperationUnavailable,
+            ),
+        ] {
+            let pid = 69;
+            let creation_time = 6_900;
+            let adapter = FakeProcessAdapter::default()
+                .with_process(pid, graceful_script(creation_time, vec![]))
+                .with_window_enumeration(Err(failure));
+            let clock = FakeMonotonicClock::at(Instant::now());
+
+            assert_eq!(
+                terminate(adapter.clone(), pid, creation_time, &clock),
+                Err(expected)
+            );
+            assert_eq!(adapter.post_close_calls(), 0);
+            assert_eq!(adapter.terminate_calls(), 0);
+        }
+    }
+
+    #[test]
+    fn graceful_close_event_order_is_exact_and_retains_only_the_operation_handle() {
+        let pid = 70;
+        let creation_time = 7_000;
+        let adapter = FakeProcessAdapter::default()
+            .with_process(
+                pid,
+                graceful_script(
+                    creation_time,
+                    vec![
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::TimedOut),
+                        Ok(ExitWait::Exited),
+                    ],
+                ),
+            )
+            .with_window_enumeration(Ok(vec![WindowCandidate::new(7, pid, true, false)]))
+            .with_window_facts(7, vec![Ok(WindowFacts::new(pid, true, false))])
+            .with_post_close_outcomes(7, vec![Ok(())]);
+        let clock = FakeMonotonicClock::at(Instant::now());
+
+        assert_eq!(
+            terminate(adapter.clone(), pid, creation_time, &clock),
+            Ok(())
+        );
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                FakeCall::OpenObservation(pid),
+                FakeCall::CreationTime(pid),
+                FakeCall::Liveness(pid),
+                FakeCall::Protection(pid),
+                FakeCall::OpenOperation(pid),
+                FakeCall::CreationTime(pid),
+                FakeCall::Liveness(pid),
+                FakeCall::Protection(pid),
+                FakeCall::EnumerateTopLevelWindows,
+                FakeCall::WaitForExit(pid, Duration::ZERO),
+                FakeCall::WindowFacts(7),
+                FakeCall::PostClose(7),
+                FakeCall::WaitForExit(pid, Duration::ZERO),
+                FakeCall::WaitForExit(pid, Duration::from_secs(5)),
+                FakeCall::WaitForExit(pid, Duration::ZERO),
+            ]
+        );
+        for event in adapter.events() {
+            if let FakeEvent::Call {
+                call:
+                    FakeCall::EnumerateTopLevelWindows
+                    | FakeCall::WindowFacts(_)
+                    | FakeCall::PostClose(_)
+                    | FakeCall::WaitForExit(_, _),
+                active_handles,
+            } = event
+            {
+                assert_eq!(active_handles, vec![2]);
+            }
+        }
+        assert_eq!(
+            adapter.requested_operation_access(),
+            vec![OperationAccess::GRACEFUL]
+        );
+        assert_eq!(adapter.terminate_calls(), 0);
+        assert_eq!(adapter.opened(), 2);
+        assert_eq!(adapter.dropped(), 2);
     }
 }
 
