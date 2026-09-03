@@ -1900,6 +1900,11 @@ label,
   background: var(--uipilot-ui-icon-blue-soft);
 }
 
+.launcher-view .built-in-result-icon-time-zone {
+  color: var(--uipilot-ui-icon-blue);
+  background: var(--uipilot-ui-icon-blue-soft);
+}
+
 .launcher-view .built-in-result-icon-unit {
   color: var(--uipilot-ui-icon-red);
   background: var(--uipilot-ui-icon-red-soft);

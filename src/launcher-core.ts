@@ -4,6 +4,7 @@ import {
   parseLauncherShown,
   parsePluginPanelErrorEvent,
   parsePluginPanelFocusHostInputEvent,
+  parseRefreshAtUtc,
   type ClassifiedTextRecord,
   type CommandErrorCode,
   type ControlKey,
@@ -110,6 +111,7 @@ interface PrivateApplicationResult extends ViewResult {
   kind: 'application'
   resultId: string
   activation: LauncherResultActivation
+  refreshDisabled?: true
 }
 
 type PrivateResult = PrivateApplicationResult
@@ -332,6 +334,16 @@ interface ApplicationSearchOwner {
   }
 }
 
+interface MinuteRefreshOwner {
+  timeout: ReturnType<typeof setTimeout>
+  epoch: number
+  invocationId: string
+  control: ControlKey
+  value: string
+  querySequence: number
+  acceptedResponseToken: number
+}
+
 interface FavoriteInteractionOwner {
   token: number
   epoch: number
@@ -437,9 +449,16 @@ function safeApplicationIcon(value: unknown): string | undefined {
 }
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
-  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'date' || value === 'unit' || value === 'webSearch'
+  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'date' || value === 'timeZone' || value === 'unit' || value === 'webSearch'
     ? value
     : undefined
+}
+
+function safeRefreshDeadline(value: unknown): number | undefined {
+  const refreshAtUtc = parseRefreshAtUtc(value)
+  if (refreshAtUtc === null) return undefined
+  const deadline = Date.parse(refreshAtUtc)
+  return deadline > Date.now() ? deadline : undefined
 }
 
 function safeResultFavorite(value: unknown): ResultFavorite | undefined {
@@ -887,6 +906,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     query: string
     completion: Promise<SearchResponse | null>
   } | undefined
+  let minuteRefresh: MinuteRefreshOwner | undefined
   let pendingDefaultActivation: {
     epoch: number
     invocationId: string
@@ -975,6 +995,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function setControlDraft(control: ControlKey, value: string): boolean {
     if (control === model.queryControl) {
       const changed = model.queryControlValue !== value
+      if (changed) cancelMinuteRefresh()
       model.queryControlValue = value
       return changed
     }
@@ -1729,6 +1750,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function enterSequenceExhausted(): void {
+    cancelMinuteRefresh()
     sequenceExhausted = true
     cancelSlashSearch()
     searchToken = ++token
@@ -1784,7 +1806,61 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
   })
 
-  function beginSearch(submit = false, showPending = true): void {
+  function cancelMinuteRefresh(): void {
+    if (!minuteRefresh) return
+    clearTimeout(minuteRefresh.timeout)
+    minuteRefresh = undefined
+  }
+
+  function ownsMinuteRefresh(owner: MinuteRefreshOwner): boolean {
+    return (
+      !destroyed &&
+      minuteRefresh === owner &&
+      model.view === 'launcher' &&
+      model.launcherMode === 'applications' &&
+      owner.epoch === model.viewEpoch &&
+      owner.invocationId === model.invocationId &&
+      owner.control === model.queryControl &&
+      owner.value === model.query &&
+      owner.value === model.queryControlValue &&
+      owner.querySequence === model.querySequence &&
+      owner.acceptedResponseToken === searchToken
+    )
+  }
+
+  function scheduleMinuteRefresh(captured: ApplicationSearchOwner, value: unknown): void {
+    cancelMinuteRefresh()
+    const deadline = safeRefreshDeadline(value)
+    if (deadline === undefined) return
+    let owner: MinuteRefreshOwner
+    const timeout = setTimeout(() => {
+      const ownsRefresh = ownsMinuteRefresh(owner)
+      if (minuteRefresh === owner) minuteRefresh = undefined
+      if (!ownsRefresh) return
+      if (!advanceApplicationSequence()) return
+      invalidateFavoriteInteraction()
+      model.results = model.results.map((result) => ({
+        ...result,
+        hasDefaultAction: false,
+        refreshDisabled: true,
+      }))
+      beginSearch(false, false, true)
+      publish(true)
+    }, deadline - Date.now())
+    owner = {
+      timeout,
+      epoch: captured.epoch,
+      invocationId: captured.invocationId,
+      control: model.queryControl,
+      value: captured.query,
+      querySequence: captured.sequence,
+      acceptedResponseToken: captured.token,
+    }
+    minuteRefresh = owner
+  }
+
+  function beginSearch(submit = false, showPending = true, quietRefresh = false): void {
+    if (!quietRefresh) cancelMinuteRefresh()
     const invocationId = model.invocationId
     if (!invocationId || (model.query !== '/find' && fileCommand(model.query) !== null) || sequenceExhausted) return
     let ownedOrigin: ApplicationSearchOwner['completionOrigin']
@@ -1983,6 +2059,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.results = applications
       model.selectedIndex = model.results.length ? 0 : -1
       model.status = model.results.length || model.commandHint ? '' : '未找到应用'
+      scheduleMinuteRefresh(captured, response.refreshAtUtc)
       const autoExecuteIndex = captured.submit && typeof response.autoExecuteResultId === 'string'
         ? applications.findIndex((item) =>
             item.resultId === response.autoExecuteResultId &&
@@ -2101,6 +2178,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function applyEdit(value: string): void {
+    cancelMinuteRefresh()
     invalidateFavoriteInteraction()
     if (model.launcherMode === 'files') {
       applyFileEdit(value)
@@ -2289,6 +2367,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     notice: import('./protocol').LifecycleNotice | null,
     source: 'native' | 'local',
   ): void {
+    cancelMinuteRefresh()
     invalidateFavoriteInteraction()
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
     const nextSettingsTab: SettingsTabKey =
@@ -2799,6 +2878,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function hidden(): void {
     if (destroyed) return
+    cancelMinuteRefresh()
     const discardedPanel = discardPanelUi()
     const discardedQuicklinks = discardQuicklinksUi()
     const wasHiding = model.hidePending
@@ -3210,7 +3290,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     let resultId: string | undefined
     if (model.launcherMode === 'applications') {
       const selected = model.results[model.selectedIndex]
-      if (!selected) return
+      if (!selected || selected.refreshDisabled) return
       if (selected.activation.kind === 'completion') {
         applyEdit(selected.activation.completionText)
         return
@@ -3390,6 +3470,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   async function requestHide(): Promise<void> {
     if (destroyed || model.hidePending) return
+    cancelMinuteRefresh()
     model.shownNotice = undefined
     model.status = ''
     model.hidePending = true
@@ -3643,6 +3724,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function destroy(): void {
     if (destroyed) return
+    cancelMinuteRefresh()
     destroyed = true
     cancelSlashSearch()
     searchToken = ++token

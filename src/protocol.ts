@@ -1,6 +1,6 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
-export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'date' | 'unit' | 'webSearch'
+export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'date' | 'timeZone' | 'unit' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string }>
@@ -58,6 +58,7 @@ export interface ResultItem {
 export interface SearchResponse {
   requestId: string
   items: ResultItem[]
+  refreshAtUtc?: string
   windowTransferToken?: string
   replaceLocalResults?: boolean
   commandHint?: string
@@ -1299,6 +1300,10 @@ function strictUtcRfc3339(value: string): boolean {
     instant.getUTCMinutes() === Number(minute) &&
     instant.getUTCSeconds() === Number(second)
   )
+}
+
+export function parseRefreshAtUtc(value: unknown): string | null {
+  return typeof value === 'string' && strictUtcRfc3339(value) ? value : null
 }
 
 function parseFileResultItem(value: unknown): FileResultItem | null {

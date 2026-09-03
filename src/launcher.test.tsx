@@ -22,6 +22,7 @@ import launcherViewSource from './launcher-view.tsx?raw'
 import {
   compareDecimalRevision,
   parseFileSearchResponse,
+  parseRefreshAtUtc,
   parseLauncherShown,
   parsePluginInventorySnapshot,
   parsePluginPanelCommandResult,
@@ -3734,6 +3735,498 @@ describe('shown and search ownership', () => {
   })
 })
 
+describe('minute refresh ownership', () => {
+  const currentTime = '2026-09-03T14:34:30Z'
+  const firstBoundary = '2026-09-03T14:35:00Z'
+
+  function timeZoneResponse(
+    requestId: string,
+    title: string,
+    refreshAtUtc?: unknown,
+  ): SearchResponse {
+    return {
+      requestId,
+      ...(refreshAtUtc === undefined ? {} : { refreshAtUtc }),
+      items: [{
+        resultId: `${requestId}-result`,
+        title,
+        subtitle: '2026-09-03 · New York · UTC−04:00 (EDT)',
+        iconKind: 'timeZone',
+        activation: executeActivation,
+        hasDefaultAction: true,
+      }],
+    } as unknown as SearchResponse
+  }
+
+  async function scheduledTimeCore(maximumQuerySequence = Number.MAX_SAFE_INTEGER) {
+    const fake = fakeClient()
+    const quiet = deferred<SearchResponse | null>()
+    let timeSearches = 0
+    vi.mocked(fake.client.searchApps).mockImplementation((request) => {
+      if (request.query !== 'NewYork time') {
+        return Promise.resolve(timeZoneResponse('ordinary-latest', request.query || 'empty'))
+      }
+      timeSearches += 1
+      return timeSearches === 1
+        ? Promise.resolve(timeZoneResponse('time-initial', '10:34', firstBoundary))
+        : quiet.promise
+    })
+    const core = createLauncherCore(fake.client, maximumQuerySequence)
+    await core.start()
+    fake.emit(shown('minute-owner'))
+    await vi.advanceTimersByTimeAsync(0)
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'NewYork time',
+      inputType: 'insertText',
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    vi.mocked(fake.client.searchApps).mockClear()
+    return { core, fake, quiet }
+  }
+
+  it('sanitizes only real strict UTC RFC3339 Z minute refresh values', () => {
+    expect(parseRefreshAtUtc('2026-09-03T14:35:00Z')).toBe('2026-09-03T14:35:00Z')
+    expect(parseRefreshAtUtc('2026-09-03T14:35:00.125Z')).toBe('2026-09-03T14:35:00.125Z')
+    for (const invalid of [
+      '2026-02-30T14:35:00Z',
+      '2026-09-03T14:35:00+00:00',
+      '2026-09-03t14:35:00Z',
+      '2026-09-03T14:35:00z',
+      '2026-9-03T14:35:00Z',
+      '2026-09-03T24:00:00Z',
+      1_788_442_500_000,
+      null,
+    ]) expect(parseRefreshAtUtc(invalid)).toBeNull()
+  })
+
+  it('accepts a strict future UTC refresh timestamp and fires exactly at the time zone minute boundary', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-03T14:34:30Z'))
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === 'NewYork time'
+        ? {
+            requestId: `time-${request.querySequence}`,
+            refreshAtUtc: request.querySequence === 2
+              ? '2026-09-03T14:35:00Z'
+              : '2026-09-03T14:36:00Z',
+            items: [{
+              resultId: `time-result-${request.querySequence}`,
+              title: request.querySequence === 2 ? '10:34' : '10:35',
+              subtitle: '2026-09-03 · New York · UTC−04:00 (EDT)',
+              iconKind: 'timeZone',
+              activation: executeActivation,
+              hasDefaultAction: true,
+            }],
+          } as unknown as SearchResponse
+        : { requestId: 'empty', items: [] })
+      await core.start()
+      fake.emit(shown('minute-boundary'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(fake.client.searchApps).mockClear()
+
+      core.text({
+        kind: 'ordinaryInput',
+        control: core.getSnapshot().queryControl,
+        value: 'NewYork time',
+        inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot()).toMatchObject({
+        querySequence: 2,
+        searchPending: false,
+        results: [{ title: '10:34', iconKind: 'timeZone', hasDefaultAction: true }],
+      })
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(29_999)
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(2)
+      expect(fake.client.searchApps).toHaveBeenLastCalledWith({
+        query: 'NewYork time',
+        invocationId: 'minute-boundary',
+        querySequence: 3,
+      })
+      expect(core.getSnapshot()).toMatchObject({
+        querySequence: 3,
+        searchPending: false,
+        results: [{ title: '10:35', iconKind: 'timeZone', hasDefaultAction: true }],
+      })
+    } finally {
+      core.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([
+    ['an impossible calendar date', '2026-02-30T14:35:00Z'],
+    ['a non-UTC offset', '2026-09-03T14:35:00+00:00'],
+    ['a lowercase zone suffix', '2026-09-03T14:35:00z'],
+    ['a stale instant', currentTime],
+  ])('ignores %s in minute refresh metadata while retaining the valid row', async (_label, refreshAtUtc) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === 'NewYork time'
+        ? timeZoneResponse('time-invalid-refresh', '10:34', refreshAtUtc)
+        : { requestId: 'empty', items: [] })
+      await core.start()
+      fake.emit(shown('invalid-refresh'))
+      await vi.advanceTimersByTimeAsync(0)
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'NewYork time', inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot().results).toMatchObject([{
+        title: '10:34', iconKind: 'timeZone', hasDefaultAction: true,
+      }])
+
+      vi.mocked(fake.client.searchApps).mockClear()
+      await vi.advanceTimersByTimeAsync(10 * 60_000)
+      expect(fake.client.searchApps).not.toHaveBeenCalled()
+    } finally {
+      core.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('never infers minute refresh work from the time zone icon or visible text', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === 'NewYork time'
+        ? timeZoneResponse('time-without-refresh', '10:34')
+        : { requestId: 'empty', items: [] })
+      await core.start()
+      fake.emit(shown('no-inferred-refresh'))
+      await vi.advanceTimersByTimeAsync(0)
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'NewYork time', inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(fake.client.searchApps).mockClear()
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(fake.client.searchApps).not.toHaveBeenCalled()
+      expect(core.getSnapshot().results).toMatchObject([{ title: '10:34', iconKind: 'timeZone' }])
+    } finally {
+      core.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('suppresses minute refresh when the raw control value changes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const started = await scheduledTimeCore()
+      core = started.core
+      const control = core.getSnapshot().queryControl
+      core.text({ kind: 'compositionStart', control })
+      core.text({ kind: 'compositionInput', control, value: 'NewYork timex', inputType: 'insertCompositionText' })
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(started.fake.client.searchApps).not.toHaveBeenCalled()
+      expect(core.getSnapshot().queryControlValue).toBe('NewYork timex')
+    } finally {
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('suppresses minute refresh when a newer invocation takes ownership', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const started = await scheduledTimeCore()
+      core = started.core
+      started.fake.emit(shown('minute-owner-new'))
+      await vi.advanceTimersByTimeAsync(0)
+      vi.mocked(started.fake.client.searchApps).mockClear()
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(started.fake.client.searchApps).not.toHaveBeenCalled()
+      expect(core.getSnapshot().invocationId).toBe('minute-owner-new')
+    } finally {
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('suppresses minute refresh after navigating away from the launcher view', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const started = await scheduledTimeCore()
+      core = started.core
+      core.navigate('settings')
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(started.fake.client.searchApps).not.toHaveBeenCalled()
+      expect(core.getSnapshot().view).toBe('settings')
+    } finally {
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('suppresses minute refresh when the query sequence is exhausted', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const started = await scheduledTimeCore(2)
+      core = started.core
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(started.fake.client.searchApps).not.toHaveBeenCalled()
+      expect(core.getSnapshot()).toMatchObject({
+        querySequence: 2,
+        results: [],
+        selectedIndex: -1,
+        status: '查询次数已达上限，请重新打开主界面。',
+      })
+    } finally {
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels minute refresh on hide request and native hidden notification', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let firstCore: ReturnType<typeof createLauncherCore> | undefined
+    let secondCore: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const requested = await scheduledTimeCore()
+      firstCore = requested.core
+      await firstCore.requestHide()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(requested.fake.client.searchApps).not.toHaveBeenCalled()
+
+      vi.setSystemTime(new Date(currentTime))
+      const notified = await scheduledTimeCore()
+      secondCore = notified.core
+      notified.fake.emitHidden()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(notified.fake.client.searchApps).not.toHaveBeenCalled()
+    } finally {
+      firstCore?.destroy()
+      secondCore?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels minute refresh when the launcher core is destroyed', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    try {
+      const started = await scheduledTimeCore()
+      started.core.destroy()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(started.fake.client.searchApps).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('performs one minute refresh after a late wake without replaying missed minutes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const started = await scheduledTimeCore()
+      core = started.core
+      vi.setSystemTime(new Date('2026-09-03T14:40:00Z'))
+      await vi.runOnlyPendingTimersAsync()
+
+      expect(started.fake.client.searchApps).toHaveBeenCalledTimes(1)
+      expect(started.fake.client.searchApps).toHaveBeenCalledWith({
+        query: 'NewYork time', invocationId: 'minute-owner', querySequence: 3,
+      })
+      await vi.runOnlyPendingTimersAsync()
+      expect(started.fake.client.searchApps).toHaveBeenCalledTimes(1)
+    } finally {
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the retained minute row inert without a spinner until the matching replacement arrives', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    let mounted: Awaited<ReturnType<typeof mountLauncherView>> | undefined
+    try {
+      const started = await scheduledTimeCore()
+      core = started.core
+      mounted = await mountLauncherView(core)
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(started.fake.client.searchApps).toHaveBeenCalledOnce()
+      expect(core.getSnapshot()).toMatchObject({
+        querySequence: 3,
+        searchPending: false,
+        results: [{ title: '10:34', hasDefaultAction: false }],
+      })
+      expect(mounted.host.querySelector('.ant-spin-spinning')).toBeNull()
+      expect(mounted.host.querySelector('.result-title')?.textContent).toBe('10:34')
+      core.keyDown('Enter', false)
+      await act(async () => mounted?.host.querySelector<HTMLElement>('[role="option"]')?.click())
+      expect(started.fake.client.executeResult).not.toHaveBeenCalled()
+
+      started.quiet.resolve(timeZoneResponse('time-replacement', '10:35', '2026-09-03T14:36:00Z'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot()).toMatchObject({
+        searchPending: false,
+        results: [{ title: '10:35', hasDefaultAction: true }],
+      })
+      expect(mounted.host.querySelector('.result-title')?.textContent).toBe('10:35')
+      core.keyDown('Enter', false)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(started.fake.client.executeResult).toHaveBeenCalledWith({
+        requestId: 'time-replacement', resultId: 'time-replacement-result',
+      })
+    } finally {
+      await mounted?.unmount()
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps every retained default action kind inert during a minute refresh', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    const fake = fakeClient()
+    const quiet = deferred<SearchResponse | null>()
+    const core = createLauncherCore(fake.client)
+    try {
+      vi.mocked(fake.client.searchApps).mockImplementation((request) => {
+        if (request.query !== 'NewYork time') return Promise.resolve({ requestId: 'empty', items: [] })
+        if (request.querySequence > 2) return quiet.promise
+        return Promise.resolve({
+          requestId: 'retired-completion',
+          refreshAtUtc: firstBoundary,
+          items: [{
+            resultId: 'retired-completion-result',
+            title: '10:34',
+            iconKind: 'timeZone',
+            activation: { kind: 'completion', completionText: '/web-search retired' },
+            hasDefaultAction: true,
+          }],
+        } as unknown as SearchResponse)
+      })
+      await core.start()
+      fake.emit(shown('retired-action-kind'))
+      await vi.advanceTimersByTimeAsync(0)
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'NewYork time', inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(core.getSnapshot().results).toMatchObject([{ title: '10:34', hasDefaultAction: false }])
+      core.keyDown('Enter', false)
+      core.activateResult(0)
+      expect(core.getSnapshot().query).toBe('NewYork time')
+      expect(fake.client.searchApps).toHaveBeenCalledTimes(3)
+    } finally {
+      core.destroy()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['rejects', 'throws'] as const)(
+    '%s a quiet minute refresh without hiding or reviving its retired action',
+    async (failureMode) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date(currentTime))
+      const fake = fakeClient()
+      const core = createLauncherCore(fake.client)
+      try {
+        vi.mocked(fake.client.searchApps).mockImplementation((request) => {
+          if (request.query !== 'NewYork time') return Promise.resolve({ requestId: 'empty', items: [] })
+          if (request.querySequence === 2) {
+            return Promise.resolve(timeZoneResponse('time-before-failure', '10:34', firstBoundary))
+          }
+          if (failureMode === 'throws') throw new Error('quiet refresh threw')
+          return Promise.reject(new Error('quiet refresh rejected'))
+        })
+        await core.start()
+        fake.emit(shown(`quiet-${failureMode}`))
+        await vi.advanceTimersByTimeAsync(0)
+        core.text({
+          kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+          value: 'NewYork time', inputType: 'insertText',
+        })
+        await vi.advanceTimersByTimeAsync(30_000)
+
+        expect(core.getSnapshot()).toMatchObject({
+          view: 'launcher',
+          query: 'NewYork time',
+          searchPending: false,
+          results: [{ title: '10:34', hasDefaultAction: false }],
+        })
+        core.keyDown('Enter', false)
+        core.activateResult(0)
+        expect(fake.client.executeResult).not.toHaveBeenCalled()
+        expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+      } finally {
+        core.destroy()
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('does not let an old quiet minute response replace newer ordinary text', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(currentTime))
+    let core: ReturnType<typeof createLauncherCore> | undefined
+    try {
+      const started = await scheduledTimeCore()
+      core = started.core
+      await vi.advanceTimersByTimeAsync(30_000)
+      core.text({
+        kind: 'ordinaryInput', control: core.getSnapshot().queryControl,
+        value: 'latest text', inputType: 'insertText',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot()).toMatchObject({
+        query: 'latest text',
+        results: [{ title: 'latest text' }],
+      })
+
+      const current = core.getSnapshot()
+      started.quiet.resolve(timeZoneResponse('stale-time', '10:35', '2026-09-03T14:36:00Z'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(core.getSnapshot()).toBe(current)
+      expect(core.getSnapshot()).toMatchObject({
+        query: 'latest text',
+        results: [{ title: 'latest text' }],
+      })
+    } finally {
+      core?.destroy()
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe('execute and hide ownership', () => {
   it('executes the private current mapping once and never asks the frontend to hide on success', async () => {
     const { core, client, emit } = await startedCore()
@@ -5997,7 +6490,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.os-theme-uipilot\s*\{[^}]*--os-handle-bg:\s*ButtonText;/s)
   })
 
-  it('renders the unit icon and existing result icons with stable decorative dimensions', async () => {
+  it('renders the exact time icon and existing result icons with stable decorative dimensions', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -6008,6 +6501,7 @@ describe('React view and accessibility', () => {
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
         { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
+        { resultId: 'time-zone', title: '10:35', iconKind: 'timeZone', activation: executeActivation },
         { resultId: 'unit', title: '39.3701 in', iconKind: 'unit', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         {
@@ -6028,7 +6522,7 @@ describe('React view and accessibility', () => {
     await act(async () =>
       core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
     )
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(10))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(11))
 
     const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     const rowWithTitle = (title: string) =>
@@ -6037,16 +6531,18 @@ describe('React view and accessibility', () => {
     const quicklinks = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
     const calculator = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
     const date = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="date"]')
+    const timeZone = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="timeZone"]')
     const unit = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="unit"]')
     const web = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
     expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
     expect(quicklinks?.querySelector('.lucide-link-2')).toBeTruthy()
     expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
     expect(date?.querySelector('.lucide-calendar')?.getAttribute('aria-hidden')).toBe('true')
+    expect(timeZone?.querySelector('.lucide-clock')?.getAttribute('aria-hidden')).toBe('true')
     expect(unit?.querySelector('.lucide-ruler')?.getAttribute('aria-hidden')).toBe('true')
     expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
     expect(web?.querySelector('.lucide-search')).toBeTruthy()
-    for (const icon of [find, quicklinks, calculator, date, unit, web]) {
+    for (const icon of [find, quicklinks, calculator, date, timeZone, unit, web]) {
       expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
     }
     expect(rowWithTitle('/demo-win')?.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
@@ -6056,6 +6552,9 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(
       /\.launcher-view \.built-in-result-icon-date\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-blue\);[^}]*background:\s*var\(--uipilot-ui-icon-blue-soft\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /\.launcher-view \.built-in-result-icon-time-zone\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-blue\);[^}]*background:\s*var\(--uipilot-ui-icon-blue-soft\);/s,
     )
     expect(stylesSource).toMatch(
       /\.launcher-view \.built-in-result-icon-unit\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-red\);[^}]*background:\s*var\(--uipilot-ui-icon-red-soft\);/s,
@@ -6068,7 +6567,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.result-row\.is-selected \.built-in-result-icon,[\s\S]*color:\s*HighlightText !important;/s,
     )
-    expect(launcherViewSource).toMatch(/import \{[^}]*\bRuler\b[^}]*\} from 'lucide-react'/s)
+    expect(launcherViewSource).toMatch(/import \{[^}]*\bClock\b[^}]*\bRuler\b[^}]*\} from 'lucide-react'/s)
     expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
     await mounted.unmount()
   })
