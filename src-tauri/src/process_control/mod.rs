@@ -40,6 +40,22 @@ impl ProcessAuthority {
             .admit(target, intent)
             .map(|inner| ProcessAdmission { _inner: inner })
     }
+
+    pub(crate) fn terminate(
+        &self,
+        admission: ProcessAdmission,
+    ) -> Result<(), ProcessOperationError> {
+        self.inner
+            .terminate_with_clock(admission._inner, &operation::SystemMonotonicClock)
+    }
+
+    pub(crate) fn force_terminate(
+        &self,
+        admission: ProcessAdmission,
+    ) -> Result<(), ProcessOperationError> {
+        self.inner
+            .force_terminate_with_clock(admission._inner, &operation::SystemMonotonicClock)
+    }
 }
 
 #[cfg(windows)]
@@ -66,6 +82,20 @@ impl ProcessAuthority {
         _intent: ProcessIntent,
     ) -> Result<ProcessAdmission, ProcessError> {
         Err(ProcessError::PlatformUnsupported)
+    }
+
+    pub(crate) fn terminate(
+        &self,
+        _admission: ProcessAdmission,
+    ) -> Result<(), ProcessOperationError> {
+        Err(ProcessOperationError::PlatformUnsupported)
+    }
+
+    pub(crate) fn force_terminate(
+        &self,
+        _admission: ProcessAdmission,
+    ) -> Result<(), ProcessOperationError> {
+        Err(ProcessOperationError::PlatformUnsupported)
     }
 }
 

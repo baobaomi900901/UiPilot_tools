@@ -3,15 +3,16 @@ use std::{
     mem::size_of,
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
+    time::Duration,
 };
 
 use windows::{
     core::{BOOL, HRESULT, PWSTR},
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND,
-            ERROR_NO_MORE_FILES, FILETIME, HANDLE, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            CloseHandle, SetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+            ERROR_INVALID_WINDOW_HANDLE, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, FILETIME, HANDLE,
+            HWND, LPARAM, NO_ERROR, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL},
         Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
@@ -23,10 +24,14 @@ use windows::{
             Threading::{
                 GetCurrentProcessId, GetProcessInformation, GetProcessTimes, IsProcessCritical,
                 OpenProcess, ProcessProtectionLevelInfo, QueryFullProcessImageNameW,
-                WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+                TerminateProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
                 PROCESS_PROTECTION_LEVEL_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, PROTECTION_LEVEL_NONE,
+                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROTECTION_LEVEL_NONE,
             },
+        },
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+            GW_OWNER, WM_CLOSE,
         },
     },
 };
@@ -35,6 +40,10 @@ use super::core::{
     CoreAuthority, EnumerationFailure, HostInstanceId, Liveness, ObservationAccess,
     ObservationFailure, ProcessAuthorityInitError, ProcessCandidate, ProcessObservation,
     ProcessPlatformAdapter, ProcessProtection, ProcessTarget,
+};
+use super::operation::{
+    ExitWait, OperationAccess, OperationFailure, ProcessOperationAdapter, WindowCandidate,
+    WindowFacts, WindowFailure,
 };
 
 const IMAGE_PATH_CAPACITY: usize = 32_768;
@@ -95,6 +104,19 @@ impl<C: HandleCloser> Drop for OwnedHandle<C> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct WindowsProcessAdapter;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct WindowsWindowToken(HWND);
+
+impl WindowsWindowToken {
+    pub(super) fn from_raw(window: HWND) -> Self {
+        Self(window)
+    }
+
+    pub(super) fn raw(self) -> HWND {
+        self.0
+    }
+}
 
 impl ProcessPlatformAdapter for WindowsProcessAdapter {
     type Handle = OwnedProcessHandle;
@@ -223,6 +245,67 @@ impl ProcessPlatformAdapter for WindowsProcessAdapter {
     }
 }
 
+impl ProcessOperationAdapter for WindowsProcessAdapter {
+    type WindowToken = WindowsWindowToken;
+
+    fn open_operation(
+        &self,
+        pid: u32,
+        access: OperationAccess,
+    ) -> Result<Self::Handle, OperationFailure> {
+        open_operation_with(access, pid, |access, inherit, pid| {
+            debug_assert!(!inherit);
+            unsafe { OpenProcess(access, false, pid) }
+                .map(|handle| OwnedProcessHandle(OwnedHandle::new(handle)))
+                .map_err(classify_operation_error)
+        })
+    }
+
+    fn enumerate_top_level_windows(
+        &self,
+    ) -> Result<Vec<WindowCandidate<Self::WindowToken>>, OperationFailure> {
+        collect_window_candidates_with(enumerate_native_top_level_windows()?, |window| {
+            self.window_facts(window)
+        })
+    }
+
+    fn window_facts(&self, window: Self::WindowToken) -> Result<WindowFacts, WindowFailure> {
+        window_facts_with(window, read_native_window_facts)
+    }
+
+    fn post_close(&self, window: Self::WindowToken) -> Result<(), WindowFailure> {
+        unsafe {
+            PostMessageW(
+                Some(window.raw()),
+                WM_CLOSE,
+                Default::default(),
+                Default::default(),
+            )
+        }
+        .map_err(classify_window_error)
+    }
+
+    fn terminate_process(
+        &self,
+        handle: &Self::Handle,
+        exit_code: u32,
+    ) -> Result<(), OperationFailure> {
+        unsafe { TerminateProcess(handle.0.get(), exit_code) }.map_err(classify_operation_error)
+    }
+
+    fn wait_for_exit(
+        &self,
+        handle: &Self::Handle,
+        timeout: Duration,
+    ) -> Result<ExitWait, OperationFailure> {
+        wait_result_with(
+            timeout,
+            |timeout| unsafe { WaitForSingleObject(handle.0.get(), timeout) },
+            || windows::core::Error::from_win32(),
+        )
+    }
+}
+
 pub(super) fn create_authority(
 ) -> Result<CoreAuthority<WindowsProcessAdapter>, ProcessAuthorityInitError> {
     let host_instance_id = generate_host_instance()?;
@@ -296,6 +379,74 @@ pub(super) fn open_observation_with<H>(
     open(desired_access, false, pid)
 }
 
+pub(super) fn open_operation_with<H>(
+    access: OperationAccess,
+    pid: u32,
+    open: impl FnOnce(PROCESS_ACCESS_RIGHTS, bool, u32) -> Result<H, OperationFailure>,
+) -> Result<H, OperationFailure> {
+    let mut desired_access = PROCESS_ACCESS_RIGHTS(0);
+    if access.query_limited_information() {
+        desired_access |= PROCESS_QUERY_LIMITED_INFORMATION;
+    }
+    if access.synchronize() {
+        desired_access |= PROCESS_SYNCHRONIZE;
+    }
+    if access.terminate() {
+        desired_access |= PROCESS_TERMINATE;
+    }
+    open(desired_access, false, pid)
+}
+
+pub(super) fn collect_window_candidates_with<W: Copy>(
+    windows: Vec<W>,
+    mut facts: impl FnMut(W) -> Result<WindowFacts, WindowFailure>,
+) -> Result<Vec<WindowCandidate<W>>, OperationFailure> {
+    let mut candidates = Vec::with_capacity(windows.len());
+    for window in windows {
+        match facts(window) {
+            Ok(facts) => candidates.push(WindowCandidate::new(
+                window,
+                facts.pid(),
+                facts.visible(),
+                facts.has_owner(),
+            )),
+            Err(WindowFailure::Gone) => {}
+            Err(WindowFailure::AccessDenied) => return Err(OperationFailure::AccessDenied),
+            Err(WindowFailure::Unavailable) => return Err(OperationFailure::Unavailable),
+        }
+    }
+    Ok(candidates)
+}
+
+pub(super) fn window_facts_with<W: Copy>(
+    window: W,
+    read: impl FnOnce(W) -> Result<(u32, bool, bool), WindowFailure>,
+) -> Result<WindowFacts, WindowFailure> {
+    read(window).map(|(pid, visible, has_owner)| WindowFacts::new(pid, visible, has_owner))
+}
+
+pub(super) fn finite_timeout_millis(timeout: Duration) -> u32 {
+    if timeout.is_zero() {
+        return 0;
+    }
+    let whole_millis = timeout.as_millis();
+    let rounded_millis = whole_millis + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    rounded_millis.min(u128::from(u32::MAX - 1)) as u32
+}
+
+pub(super) fn wait_result_with(
+    timeout: Duration,
+    wait: impl FnOnce(u32) -> WAIT_EVENT,
+    last_error: impl FnOnce() -> windows::core::Error,
+) -> Result<ExitWait, OperationFailure> {
+    match wait(finite_timeout_millis(timeout)) {
+        WAIT_OBJECT_0 => Ok(ExitWait::Exited),
+        WAIT_TIMEOUT => Ok(ExitWait::TimedOut),
+        WAIT_FAILED => Err(classify_wait_error(last_error())),
+        _ => Err(OperationFailure::Unavailable),
+    }
+}
+
 pub(super) fn filetime_to_u64(value: FILETIME) -> u64 {
     (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
@@ -367,6 +518,44 @@ fn enumerate_native_candidates(
     }))
 }
 
+fn enumerate_native_top_level_windows() -> Result<Vec<WindowsWindowToken>, OperationFailure> {
+    let mut windows = Vec::new();
+    unsafe {
+        EnumWindows(
+            Some(collect_native_top_level_window),
+            LPARAM((&mut windows as *mut Vec<WindowsWindowToken>) as isize),
+        )
+    }
+    .map_err(classify_enumeration_error)?;
+    Ok(windows)
+}
+
+unsafe extern "system" fn collect_native_top_level_window(window: HWND, state: LPARAM) -> BOOL {
+    let windows = unsafe { &mut *(state.0 as *mut Vec<WindowsWindowToken>) };
+    windows.push(WindowsWindowToken::from_raw(window));
+    BOOL(1)
+}
+
+fn read_native_window_facts(
+    window: WindowsWindowToken,
+) -> Result<(u32, bool, bool), WindowFailure> {
+    unsafe { SetLastError(NO_ERROR) };
+    let mut pid = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(window.raw(), Some(&mut pid)) };
+    if thread_id == 0 || pid == 0 {
+        return Err(classify_window_error(windows::core::Error::from_win32()));
+    }
+
+    let visible = unsafe { IsWindowVisible(window.raw()) }.as_bool();
+    unsafe { SetLastError(NO_ERROR) };
+    let has_owner = match unsafe { GetWindow(window.raw(), GW_OWNER) } {
+        Ok(_) => true,
+        Err(error) if error.code() == HRESULT::from_win32(NO_ERROR.0) => false,
+        Err(error) => return Err(classify_window_error(error)),
+    };
+    Ok((pid, visible, has_owner))
+}
+
 fn native_candidate_from_entry(entry: &PROCESSENTRY32W) -> NativeCandidate {
     let name_units = nul_terminated_slice(&entry.szExeFile);
     let name = String::from_utf16(name_units).unwrap_or_default();
@@ -404,5 +593,45 @@ pub(super) fn classify_observation_error(error: windows::core::Error) -> Observa
         ObservationFailure::ExitedOrChanged
     } else {
         ObservationFailure::IdentityUnavailable
+    }
+}
+
+pub(super) fn classify_operation_error(error: windows::core::Error) -> OperationFailure {
+    let code = error.code();
+    if code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        OperationFailure::AccessDenied
+    } else if code == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0)
+        || code == HRESULT::from_win32(ERROR_NOT_FOUND.0)
+    {
+        OperationFailure::ExitedOrChanged
+    } else {
+        OperationFailure::Unavailable
+    }
+}
+
+pub(super) fn classify_window_error(error: windows::core::Error) -> WindowFailure {
+    let code = error.code();
+    if code == HRESULT::from_win32(ERROR_INVALID_WINDOW_HANDLE.0) {
+        WindowFailure::Gone
+    } else if code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        WindowFailure::AccessDenied
+    } else {
+        WindowFailure::Unavailable
+    }
+}
+
+fn classify_enumeration_error(error: windows::core::Error) -> OperationFailure {
+    if error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        OperationFailure::AccessDenied
+    } else {
+        OperationFailure::Unavailable
+    }
+}
+
+fn classify_wait_error(error: windows::core::Error) -> OperationFailure {
+    if error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        OperationFailure::AccessDenied
+    } else {
+        OperationFailure::Unavailable
     }
 }

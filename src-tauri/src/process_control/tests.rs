@@ -3794,36 +3794,51 @@ mod windows_tests {
         ffi::OsString,
         os::windows::ffi::OsStringExt,
         process::{Child, Command, ExitStatus, Stdio},
+        sync::atomic::{AtomicBool, Ordering},
         thread,
         time::{Duration, Instant},
     };
 
     use windows::{
-        core::{Error as WindowsError, HRESULT},
+        core::{w, Error as WindowsError, HRESULT, PCWSTR},
         Win32::{
             Foundation::{
-                ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, FILETIME, HANDLE,
-                WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+                ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_INVALID_WINDOW_HANDLE,
+                ERROR_NOT_FOUND, FILETIME, HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED,
+                WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
             },
             System::Threading::{
                 GetCurrentProcessId, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                PROCESS_TERMINATE,
+            },
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+                PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, CW_USEDEFAULT, MSG,
+                SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WNDCLASSW, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
 
     use super::*;
     use crate::process_control::windows::{
-        classify_observation_error, classify_path_query_error, collect_candidates_with,
-        filetime_to_u64, find_reenumerated_name, generate_host_instance_with,
-        liveness_from_wait_result, open_observation_with, EnumerationStep, OwnedHandle,
-        WindowsProcessAdapter,
+        classify_observation_error, classify_operation_error, classify_path_query_error,
+        classify_window_error, collect_candidates_with, collect_window_candidates_with,
+        filetime_to_u64, find_reenumerated_name, finite_timeout_millis,
+        generate_host_instance_with, liveness_from_wait_result, open_observation_with,
+        open_operation_with, wait_result_with, window_facts_with, EnumerationStep, OwnedHandle,
+        WindowsProcessAdapter, WindowsWindowToken,
     };
     use crate::process_control::{
         ProcessAuthority, ProcessAuthorityInitError, ProcessError, ProcessIntent,
+        ProcessOperationError,
     };
 
     const FIXTURE_TEST: &str = "process_control::tests::windows_tests::windows_fixture_child";
     const FIXTURE_MARKER: &str = "UIPILOT_PROCESS_CONTROL_TEST_CHILD";
+    const FIXTURE_MODE: &str = "UIPILOT_PROCESS_CONTROL_TEST_MODE";
+    const FIXTURE_WINDOW_CLASS: PCWSTR = w!("UiPilotProcessControlTestWindow");
+    static FIXTURE_IGNORES_CLOSE: AtomicBool = AtomicBool::new(false);
 
     #[test]
     fn windows_cng_generation_seam_accepts_successful_fill() {
@@ -3973,6 +3988,135 @@ mod windows_tests {
     }
 
     #[test]
+    fn windows_operation_open_uses_exact_access_and_never_inherits() {
+        let cases = [
+            (
+                OperationAccess::GRACEFUL,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            ),
+            (
+                OperationAccess::FORCE,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+            ),
+        ];
+
+        for (profile, expected_access) in cases {
+            let mut captured = None;
+            let result = open_operation_with(profile, 7_003, |access, inherit, pid| {
+                captured = Some((access, inherit, pid));
+                Err::<(), _>(OperationFailure::AccessDenied)
+            });
+
+            assert_eq!(result, Err(OperationFailure::AccessDenied));
+            assert_eq!(captured, Some((expected_access, false, 7_003)));
+        }
+    }
+
+    #[test]
+    fn windows_operation_window_wrapper_collection_and_fact_refresh_are_exact() {
+        let first = WindowsWindowToken::from_raw(HWND(11usize as _));
+        let gone = WindowsWindowToken::from_raw(HWND(12usize as _));
+        let refreshed = window_facts_with(first, |window| {
+            assert_eq!(window.raw(), HWND(11usize as _));
+            Ok((7_004, true, false))
+        })
+        .unwrap();
+
+        assert_eq!(refreshed, WindowFacts::new(7_004, true, false));
+        assert_eq!(first.raw(), HWND(11usize as _));
+        assert_eq!(
+            collect_window_candidates_with(vec![first, gone], |window| {
+                if window == first {
+                    Ok(WindowFacts::new(7_004, true, false))
+                } else {
+                    Err(WindowFailure::Gone)
+                }
+            }),
+            Ok(vec![WindowCandidate::new(first, 7_004, true, false)])
+        );
+
+        for (failure, expected) in [
+            (WindowFailure::AccessDenied, OperationFailure::AccessDenied),
+            (WindowFailure::Unavailable, OperationFailure::Unavailable),
+        ] {
+            assert_eq!(
+                collect_window_candidates_with(vec![first], |_| Err(failure)),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn windows_operation_error_classification_is_context_specific_and_redacted() {
+        let error = |code| WindowsError::from_hresult(HRESULT::from_win32(code));
+
+        assert_eq!(
+            classify_operation_error(error(ERROR_ACCESS_DENIED.0)),
+            OperationFailure::AccessDenied
+        );
+        assert_eq!(
+            classify_operation_error(error(ERROR_INVALID_PARAMETER.0)),
+            OperationFailure::ExitedOrChanged
+        );
+        assert_eq!(
+            classify_window_error(error(ERROR_INVALID_WINDOW_HANDLE.0)),
+            WindowFailure::Gone
+        );
+        assert_eq!(
+            classify_window_error(error(ERROR_ACCESS_DENIED.0)),
+            WindowFailure::AccessDenied
+        );
+        assert_eq!(
+            classify_window_error(error(1234)),
+            WindowFailure::Unavailable
+        );
+    }
+
+    #[test]
+    fn windows_operation_waits_use_zero_or_rounded_finite_milliseconds() {
+        assert_eq!(finite_timeout_millis(Duration::ZERO), 0);
+        assert_eq!(finite_timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(finite_timeout_millis(Duration::from_millis(1250)), 1250);
+        assert_eq!(
+            finite_timeout_millis(Duration::from_millis(u64::from(u32::MAX))),
+            u32::MAX - 1
+        );
+
+        let mut captured = Vec::new();
+        assert_eq!(
+            wait_result_with(
+                Duration::ZERO,
+                |timeout| {
+                    captured.push(timeout);
+                    WAIT_TIMEOUT
+                },
+                || panic!("last error is not read for WAIT_TIMEOUT"),
+            ),
+            Ok(ExitWait::TimedOut)
+        );
+        assert_eq!(
+            wait_result_with(
+                Duration::from_micros(1_001),
+                |timeout| {
+                    captured.push(timeout);
+                    WAIT_OBJECT_0
+                },
+                || panic!("last error is not read for WAIT_OBJECT_0"),
+            ),
+            Ok(ExitWait::Exited)
+        );
+        assert_eq!(captured, vec![0, 2]);
+        assert_eq!(
+            wait_result_with(
+                Duration::from_secs(1),
+                |_| WAIT_FAILED,
+                || WindowsError::from_hresult(HRESULT::from_win32(ERROR_ACCESS_DENIED.0)),
+            ),
+            Err(OperationFailure::AccessDenied)
+        );
+    }
+
+    #[test]
     fn windows_path_query_access_denied_enters_revalidated_pathless_fallback() {
         let pid = 7_002;
         let path_query_failure = classify_path_query_error(WindowsError::from_hresult(
@@ -4053,7 +4197,7 @@ mod windows_tests {
     }
 
     #[test]
-    fn windows_current_process_path_reconciles_and_self_is_protected() {
+    fn windows_operation_current_process_path_reconciles_and_self_is_protected() {
         let authority = ProcessAuthority::new().unwrap();
         let current_pid = unsafe { GetCurrentProcessId() };
         let record = snapshot_record_for_pid(&authority, current_pid, Duration::from_secs(5));
@@ -4069,7 +4213,7 @@ mod windows_tests {
     }
 
     #[test]
-    fn windows_current_process_changed_creation_time_is_target_changed() {
+    fn windows_operation_current_process_changed_creation_time_is_target_changed() {
         let authority = ProcessAuthority::new().unwrap();
         let current_pid = unsafe { GetCurrentProcessId() };
         let record = snapshot_record_for_pid(&authority, current_pid, Duration::from_secs(5));
@@ -4177,29 +4321,126 @@ mod windows_tests {
     }
 
     #[test]
-    fn windows_source_has_no_process_side_effect_or_fallback_path() {
+    fn windows_operation_graceful_helper_exits_through_wm_close() {
+        let mut child = FixtureChild::spawn_mode("graceful-window");
+        let authority = ProcessAuthority::new().unwrap();
+        let record = snapshot_record_for_pid(&authority, child.id(), Duration::from_secs(5));
+        wait_for_eligible_window(child.id(), Duration::from_secs(5));
+        let admission = authority
+            .admit(record.target(), ProcessIntent::Terminate)
+            .unwrap();
+
+        assert_eq!(authority.terminate(admission), Ok(()));
+        assert!(child.wait_for_exit(Duration::from_secs(2)).is_some());
+        child.cleanup();
+    }
+
+    #[test]
+    fn windows_operation_windowless_helper_is_unavailable_without_side_effect() {
+        let mut child = FixtureChild::spawn(Duration::from_secs(30));
+        let authority = ProcessAuthority::new().unwrap();
+        let record = snapshot_record_for_pid(&authority, child.id(), Duration::from_secs(5));
+        wait_for_no_eligible_window(child.id(), Duration::from_millis(200));
+        let admission = authority
+            .admit(record.target(), ProcessIntent::Terminate)
+            .unwrap();
+
+        assert_eq!(
+            authority.terminate(admission),
+            Err(ProcessOperationError::GracefulCloseUnavailable)
+        );
+        assert!(matches!(child.child.try_wait(), Ok(None)));
+        child.cleanup();
+    }
+
+    #[test]
+    fn windows_operation_ignored_close_times_out_then_owned_child_is_cleaned() {
+        let mut child = FixtureChild::spawn_mode("ignore-close-window");
+        let authority = ProcessAuthority::new().unwrap();
+        let record = snapshot_record_for_pid(&authority, child.id(), Duration::from_secs(5));
+        wait_for_eligible_window(child.id(), Duration::from_secs(5));
+        let admission = authority
+            .admit(record.target(), ProcessIntent::Terminate)
+            .unwrap();
+        let started = Instant::now();
+
+        assert_eq!(
+            authority.terminate(admission),
+            Err(ProcessOperationError::GracefulCloseTimedOut)
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(4_500),
+            "elapsed {elapsed:?}"
+        );
+        assert!(elapsed <= Duration::from_secs(8), "elapsed {elapsed:?}");
+        assert!(matches!(child.child.try_wait(), Ok(None)));
+        child.cleanup();
+        assert!(child.wait_for_exit(Duration::ZERO).is_some());
+    }
+
+    #[test]
+    fn windows_operation_force_terminates_and_exact_child_signals() {
+        let mut child = FixtureChild::spawn(Duration::from_secs(30));
+        let authority = ProcessAuthority::new().unwrap();
+        let record = snapshot_record_for_pid(&authority, child.id(), Duration::from_secs(5));
+        wait_for_no_eligible_window(child.id(), Duration::from_millis(200));
+        let admission = authority
+            .admit(record.target(), ProcessIntent::ForceTerminate)
+            .unwrap();
+
+        assert_eq!(authority.force_terminate(admission), Ok(()));
+        assert!(child.wait_for_exit(Duration::from_secs(2)).is_some());
+        child.cleanup();
+    }
+
+    #[test]
+    fn windows_operation_source_requires_scoped_primitives_and_forbids_fallbacks() {
         let source = include_str!("windows.rs");
         let module = include_str!("mod.rs");
 
+        for required in [
+            "OpenProcess(access, false, pid)",
+            "EnumWindows(",
+            "GetWindowThreadProcessId(window.raw(), Some(&mut pid))",
+            "IsWindowVisible(window.raw())",
+            "GetWindow(window.raw(), GW_OWNER)",
+            "PostMessageW(",
+            "WM_CLOSE,",
+            "TerminateProcess(handle.0.get(), exit_code)",
+            "WaitForSingleObject(handle.0.get(), timeout)",
+            "PROCESS_QUERY_LIMITED_INFORMATION",
+            "PROCESS_SYNCHRONIZE",
+            "PROCESS_TERMINATE",
+        ] {
+            assert!(source.contains(required), "missing required {required}");
+        }
         for forbidden in [
             "PowerShell",
             "powershell",
             "WMI",
             "wmic",
+            "taskkill",
             "ShellExecute",
+            "std::process::Command",
             "NtQuery",
+            "NtTerminate",
+            "ZwTerminate",
+            "EndTask",
+            "endtask",
             "SeDebugPrivilege",
             "GetExitCodeProcess",
-            "TerminateProcess",
             "PROCESS_ALL_ACCESS",
-            "PROCESS_TERMINATE",
+            "PROCESS_CREATE_THREAD",
         ] {
             assert!(!source.contains(forbidden), "found forbidden {forbidden}");
         }
         assert!(source.contains("BCryptGenRandom(None"));
         assert!(source.contains("BCRYPT_USE_SYSTEM_PREFERRED_RNG"));
-        assert!(source.contains("OpenProcess(access, false, pid)"));
         assert!(module.contains("cfg(not(windows))"));
+        assert!(module.contains("SystemMonotonicClock"));
+        assert!(module.contains("terminate_with_clock"));
+        assert!(module.contains("force_terminate_with_clock"));
         assert!(!module.contains("raw_handle"));
     }
 
@@ -4207,12 +4448,82 @@ mod windows_tests {
     #[ignore = "spawned explicitly by Windows process-control tests"]
     fn windows_fixture_child() {
         assert_eq!(std::env::var(FIXTURE_MARKER).as_deref(), Ok("1"));
-        let delay = std::env::var("UIPILOT_PROCESS_CONTROL_TEST_DELAY_MS")
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        thread::sleep(Duration::from_millis(delay));
-        std::process::exit(259);
+        match std::env::var(FIXTURE_MODE).as_deref() {
+            Ok("sleep") => {
+                let delay = std::env::var("UIPILOT_PROCESS_CONTROL_TEST_DELAY_MS")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                thread::sleep(Duration::from_millis(delay));
+                std::process::exit(259);
+            }
+            Ok("graceful-window") => run_fixture_window(false),
+            Ok("ignore-close-window") => run_fixture_window(true),
+            mode => panic!("unsupported fixture mode {mode:?}"),
+        }
+    }
+
+    fn run_fixture_window(ignore_close: bool) {
+        FIXTURE_IGNORES_CLOSE.store(ignore_close, Ordering::Relaxed);
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(fixture_window_proc),
+            lpszClassName: FIXTURE_WINDOW_CLASS,
+            ..Default::default()
+        };
+        assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+        let window = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                FIXTURE_WINDOW_CLASS,
+                w!("UiPilot process control fixture"),
+                WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                320,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+        }
+
+        let mut message = MSG::default();
+        loop {
+            let result = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+            assert_ne!(result, -1, "fixture message loop failed");
+            if result == 0 {
+                break;
+            }
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    unsafe extern "system" fn fixture_window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CLOSE if FIXTURE_IGNORES_CLOSE.load(Ordering::Relaxed) => LRESULT(0),
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
     }
 
     fn snapshot_record_for_pid(
@@ -4239,18 +4550,69 @@ mod windows_tests {
         }
     }
 
+    fn wait_for_eligible_window(pid: u32, timeout: Duration) {
+        let adapter = WindowsProcessAdapter;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let eligible = adapter
+                .enumerate_top_level_windows()
+                .unwrap()
+                .into_iter()
+                .filter(|candidate| candidate.pid() == pid)
+                .filter_map(|candidate| adapter.window_facts(candidate.token()).ok())
+                .filter(|facts| facts.pid() == pid && facts.visible() && !facts.has_owner())
+                .count();
+            if eligible == 1 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not expose exactly one eligible window; found {eligible}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_no_eligible_window(pid: u32, settle: Duration) {
+        let adapter = WindowsProcessAdapter;
+        let deadline = Instant::now() + settle;
+        loop {
+            let eligible = adapter
+                .enumerate_top_level_windows()
+                .unwrap()
+                .into_iter()
+                .filter(|candidate| candidate.pid() == pid)
+                .filter_map(|candidate| adapter.window_facts(candidate.token()).ok())
+                .any(|facts| facts.pid() == pid && facts.visible() && !facts.has_owner());
+            assert!(!eligible, "windowless fixture exposed an eligible window");
+            if Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     struct FixtureChild {
         child: Child,
     }
 
     impl FixtureChild {
         fn spawn(delay: Duration) -> Self {
+            Self::spawn_with("sleep", Some(delay))
+        }
+
+        fn spawn_mode(mode: &str) -> Self {
+            Self::spawn_with(mode, None)
+        }
+
+        fn spawn_with(mode: &str, delay: Option<Duration>) -> Self {
             let child = Command::new(std::env::current_exe().unwrap())
                 .args(["--ignored", "--exact", FIXTURE_TEST, "--test-threads=1"])
                 .env(FIXTURE_MARKER, "1")
+                .env(FIXTURE_MODE, mode)
                 .env(
                     "UIPILOT_PROCESS_CONTROL_TEST_DELAY_MS",
-                    delay.as_millis().to_string(),
+                    delay.unwrap_or(Duration::ZERO).as_millis().to_string(),
                 )
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
