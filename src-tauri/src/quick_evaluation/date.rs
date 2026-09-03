@@ -50,6 +50,11 @@ pub(crate) fn classify(source: &str) -> QuickClassification {
     if parts.len() < 4 {
         return QuickClassification::NoMatch;
     }
+    let operation = match parts[1] {
+        "+" => DateOperation::Add,
+        "-" => DateOperation::Subtract,
+        _ => return QuickClassification::NoMatch,
+    };
     if parts.len() != 4 {
         return QuickClassification::Invalid(invalid_syntax());
     }
@@ -61,11 +66,6 @@ pub(crate) fn classify(source: &str) -> QuickClassification {
             return QuickClassification::Invalid(invalid_date());
         };
         DateBase::Explicit(date)
-    };
-    let operation = match parts[1] {
-        "+" => DateOperation::Add,
-        "-" => DateOperation::Subtract,
-        _ => return QuickClassification::Invalid(invalid_syntax()),
     };
     let Some(canonical_quantity) = canonicalize_number(parts[2], NumberGrammar::NonNegativeInteger)
     else {
@@ -299,6 +299,9 @@ mod tests {
             "2026-02-30 + 1",
             "tomorrow + 1 day",
             "today+1 day",
+            "today * 1 day",
+            "today top news from london",
+            "2026-09-03 release notes from team",
         ] {
             assert!(
                 matches!(classify(source), QuickClassification::NoMatch),
@@ -314,7 +317,6 @@ mod tests {
     #[test]
     fn complete_date_signatures_report_typed_invalid_failures() {
         for source in [
-            "today * 1 day",
             "today + 1.5 days",
             "today + -1 days",
             "today + +1 days",
