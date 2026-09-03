@@ -437,7 +437,7 @@ function safeApplicationIcon(value: unknown): string | undefined {
 }
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
-  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'webSearch'
+  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'date' || value === 'webSearch'
     ? value
     : undefined
 }
@@ -486,6 +486,9 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
     : undefined
   if (candidate?.kind === 'executeResult') {
     return exactPlainRecord(value, ['kind']) ? { kind: 'executeResult' } : undefined
+  }
+  if (candidate?.kind === 'informational') {
+    return exactPlainRecord(value, ['kind']) ? { kind: 'informational' } : undefined
   }
   if (candidate?.kind === 'openFind') {
     const record = exactPlainRecord(value, ['kind', 'query'])
@@ -1952,7 +1955,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
         const activation = safeLauncherActivation(item.activation)
         if (activation === undefined || typeof item.resultId !== 'string' ||
-            (activation.kind === 'executeResult' && item.resultId.length === 0)) return []
+            (activation.kind === 'executeResult' && item.resultId.length === 0) ||
+            (activation.kind === 'informational' && item.hasDefaultAction !== false)) return []
         const icon = safeApplicationIcon(item.icon)
         const pluginIconUrl = safePublicPluginIconUrl(item.pluginIconUrl)
         const iconKind = safeResultIconKind(item.iconKind)
@@ -3235,6 +3239,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         openQuicklinks()
         return
       }
+      if (selected.activation.kind === 'informational') return
       if (selected.hasDefaultAction === false) return
       resultId = selected.resultId
     } else {

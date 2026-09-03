@@ -1683,6 +1683,12 @@ describe('shown and search ownership', () => {
     for (const activation of invalid) expect(safeLauncherActivation(activation)).toBeUndefined()
   })
 
+  it('accepts only the strict informational quick evaluation activation', () => {
+    expect(safeLauncherActivation({ kind: 'informational' })).toEqual({ kind: 'informational' })
+    expect(safeLauncherActivation({ kind: 'informational', query: 'borrowed' })).toBeUndefined()
+    expect(safeLauncherActivation({ kind: 'Informational' })).toBeUndefined()
+  })
+
   it('drops one malformed launcher activation while retaining valid sibling rows', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.searchApps).mockResolvedValueOnce({
@@ -2097,6 +2103,7 @@ describe('shown and search ownership', () => {
         findLauncherItem('alpha'),
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         { resultId: 'app', title: 'App', icon: 'data:image/png;base64,AA==', activation: executeActivation },
         {
@@ -2116,6 +2123,7 @@ describe('shown and search ownership', () => {
       { title: '/find', iconKind: 'find', icon: undefined, pluginIconUrl: undefined },
       { title: '/quicklinks', iconKind: 'quicklinks', icon: undefined, pluginIconUrl: undefined },
       { title: '2', iconKind: 'calculator', icon: undefined, pluginIconUrl: undefined },
+      { title: '2026-09-10', iconKind: 'date', icon: undefined, pluginIconUrl: undefined },
       { title: 'Bing 搜索', iconKind: 'webSearch', icon: undefined, pluginIconUrl: undefined },
       { title: 'App', iconKind: undefined, icon: 'data:image/png;base64,AA==', pluginIconUrl: undefined },
       {
@@ -2125,6 +2133,55 @@ describe('shown and search ownership', () => {
       { title: 'Forged', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
       { title: 'Unknown', iconKind: undefined, icon: undefined, pluginIconUrl: undefined },
     ])
+  })
+
+  it('retains only well-formed informational quick evaluation rows and non-empty execute ids', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'informational-filtering',
+      items: [
+        {
+          resultId: '',
+          title: '日期表达式无效',
+          activation: { kind: 'informational' },
+          hasDefaultAction: false,
+        },
+        {
+          resultId: '',
+          title: 'Missing flag',
+          activation: { kind: 'informational' },
+        },
+        {
+          resultId: '',
+          title: 'Executable information',
+          activation: { kind: 'informational' },
+          hasDefaultAction: true,
+        },
+        {
+          resultId: '',
+          title: 'Malformed information',
+          activation: { kind: 'informational', query: 'borrowed' },
+          hasDefaultAction: false,
+        },
+        { resultId: '', title: 'Empty execute id', activation: executeActivation },
+        { resultId: 'opaque-copy-id', title: '2026-09-10', activation: executeActivation },
+      ],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    emit(shown('informational-filtering'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'today + 1 fortnight',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+
+    expect(core.getSnapshot().results.map((item) => item.title)).toEqual([
+      '日期表达式无效',
+      '2026-09-10',
+    ])
+    expect(core.getSnapshot().selectedIndex).toBe(0)
   })
   it('releases a current null without inventing status and leaves stale null zero-effect', async () => {
     const { core, client, emit } = await startedCore()
@@ -3691,6 +3748,50 @@ describe('execute and hide ownership', () => {
 
     expect(client.executeResult).toHaveBeenCalledWith({ requestId: 'copy-request', resultId: 'copy-result' })
     expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('keeps a date quick evaluation visible when exact ISO copy fails', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'date-copy-request',
+      items: [{
+        resultId: 'opaque-date-copy-id',
+        title: '2026-09-10',
+        subtitle: 'Thursday · today + 7 days',
+        iconKind: 'date',
+        hasDefaultAction: true,
+        activation: executeActivation,
+      }],
+      replaceLocalResults: true,
+    })
+    vi.mocked(client.executeResult).mockRejectedValueOnce({
+      code: 'clipboardWriteFailed',
+      message: 'private clipboard detail',
+    })
+    emit(shown('date-copy-failure'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'today + 7 days',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+
+    expect(client.executeResult).toHaveBeenCalledWith({
+      requestId: 'date-copy-request',
+      resultId: 'opaque-date-copy-id',
+    })
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      query: 'today + 7 days',
+      status: '无法复制到剪贴板。',
+      results: [{ title: '2026-09-10' }],
+    })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private clipboard detail')
   })
 
   it('shares one hide owner, ignores composing Escape, and keeps current state on rejection', async () => {
@@ -5843,7 +5944,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.os-theme-uipilot\s*\{[^}]*--os-handle-bg:\s*ButtonText;/s)
   })
 
-  it('renders built-in, public plugin, application, and fallback result icons', async () => {
+  it('renders the date icon and existing result icons with stable decorative dimensions', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -5853,6 +5954,7 @@ describe('React view and accessibility', () => {
         findLauncherItem('icons'),
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
         {
           resultId: 'plugin',
@@ -5871,7 +5973,7 @@ describe('React view and accessibility', () => {
     await act(async () =>
       core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
     )
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(7))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(8))
 
     const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     const rowWithTitle = (title: string) =>
@@ -5879,20 +5981,81 @@ describe('React view and accessibility', () => {
     const find = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
     const quicklinks = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
     const calculator = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
+    const date = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="date"]')
     const web = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="webSearch"]')
     expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
     expect(quicklinks?.querySelector('.lucide-link-2')).toBeTruthy()
     expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
+    expect(date?.querySelector('.lucide-calendar')?.getAttribute('aria-hidden')).toBe('true')
     expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
     expect(web?.querySelector('.lucide-search')).toBeTruthy()
-    for (const icon of [find, quicklinks, calculator, web]) {
+    for (const icon of [find, quicklinks, calculator, date, web]) {
       expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
     }
     expect(rowWithTitle('/demo-win')?.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
     expect(rowWithTitle('App')?.querySelector('.result-icon-image')).toBeInstanceOf(HTMLImageElement)
     expect(rowWithTitle('Fallback')?.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(
+      /\.launcher-view \.built-in-result-icon-date\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-blue\);[^}]*background:\s*var\(--uipilot-ui-icon-blue-soft\);/s,
+    )
+    expect(stylesSource).toMatch(
+      /@media \(forced-colors: active\)[\s\S]*\.built-in-result-icon,[\s\S]*forced-color-adjust:\s*none;/s,
+    )
     expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
+    await mounted.unmount()
+  })
+
+  it('keeps informational quick evaluation Enter and click inert while announcing the row', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === 'today + 1 fortnight'
+      ? {
+          requestId: 'informational-date',
+          items: [{
+            resultId: '',
+            title: '日期表达式无效',
+            subtitle: '请使用 today 或 YYYY-MM-DD 加减非负整数日期单位',
+            iconKind: 'date',
+            activation: { kind: 'informational' },
+            hasDefaultAction: false,
+          }],
+          replaceLocalResults: true,
+        }
+      : { requestId: 'informational-empty', items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('informational-date')))
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: 'today + 1 fortnight',
+      inputType: 'insertText',
+    }))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const option = mounted.host.querySelector<HTMLElement>('[role="option"]')!
+    expect(option.getAttribute('aria-selected')).toBe('true')
+    expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
+      '1 个结果。日期表达式无效，请使用 today 或 YYYY-MM-DD 加减非负整数日期单位',
+    )
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await act(async () => option.click())
+
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.openFind).not.toHaveBeenCalled()
+    expect(fake.client.openPluginPanel).not.toHaveBeenCalled()
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      query: 'today + 1 fortnight',
+      selectedIndex: 0,
+      results: [{ title: '日期表达式无效', hasDefaultAction: false }],
+    })
+    expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1)
     await mounted.unmount()
   })
 

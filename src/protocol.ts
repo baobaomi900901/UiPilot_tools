@@ -1,6 +1,6 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
-export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'webSearch'
+export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'date' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string }>
@@ -28,6 +28,7 @@ export type LauncherResultActivation =
   | { kind: 'openFind'; query: string }
   | { kind: 'openQuicklinks' }
   | { kind: 'executeResult' }
+  | { kind: 'informational' }
 
 export type CompletionOrigin = Readonly<{
   phase: 'preview' | 'commit'
