@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** Approved — accepted by the user on 2026-09-03
+**Status:** In progress — approved on 2026-09-03; Task 1 complete
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
@@ -70,12 +70,12 @@ The design specification remains canonical for interface semantics, event order,
 
 **Dependencies:** Approved design sections `3.1 Separate Operation Core`, `4. Module Interface`, `5. Shared Final Operation Admission`, `6. Least-Privilege Operation Access`, `9. Private Adapter And Clock Seams`, `10. Resource Ownership And Concurrency`, `11. Stable Error Contract`, and `12. Logging And Data Handling`.
 
-- [ ] Define `ProcessOperationError` with stable redacted Display values and the private shared values/Seams from `File Structure And Core Contract`; expose only the error type through `mod.rs`.
-- [ ] Add narrow `CoreAuthority` accessors for its Adapter and exact self identity, plus `CoreAdmission::into_parts`; do not expose a raw HANDLE, PID-reopen facility, public fields, Clone, or serialization.
-- [ ] Implement one shared final-operation helper that consumes the admission, validates intent before operation calls, opens exactly one operation HANDLE while the admission HANDLE remains alive, then checks creation time, liveness, protection readability, self, critical, and PPL in the approved order.
-- [ ] Make the helper drop the admission HANDLE immediately before invoking a passed operation closure and keep the operation HANDLE alive through that closure; every rejection must skip the closure and close all owned handles exactly once.
-- [ ] Extend the existing Fake Adapter with separate observation/open-operation call events, operation-access capture, scripted window/termination/wait outcomes, side-effect counters, and ordered handle events. Add a Fake Clock that advances from a fixed `Instant` without real waiting.
-- [ ] Preserve the existing Stage 1 Adapter contract and source guards; `core.rs` remains free of operation primitives and platform types.
+- [x] Define `ProcessOperationError` with stable redacted Display values and the private shared values/Seams from `File Structure And Core Contract`; expose only the error type through `mod.rs`.
+- [x] Add narrow `CoreAuthority` accessors for its Adapter and exact self identity, plus `CoreAdmission::into_parts`; do not expose a raw HANDLE, PID-reopen facility, public fields, Clone, or serialization.
+- [x] Implement one shared final-operation helper that consumes the admission, validates intent before operation calls, opens exactly one operation HANDLE while the admission HANDLE remains alive, then checks creation time, liveness, protection readability, self, critical, and PPL in the approved order.
+- [x] Make the helper drop the admission HANDLE immediately before invoking a passed operation closure and keep the operation HANDLE alive through that closure; every rejection must skip the closure and close all owned handles exactly once.
+- [x] Extend the existing Fake Adapter with separate observation/open-operation call events, operation-access capture, scripted window/termination/wait outcomes, side-effect counters, and ordered handle events. Add a Fake Clock that advances from a fixed `Instant` without real waiting.
+- [x] Preserve the existing Stage 1 Adapter contract and source guards; `core.rs` remains free of operation primitives and platform types.
 
 **Distinct test coverage:** Intent mismatch drops the lease with zero operation calls; each supported operation intent selects only its exact access profile; operation-open exited/access/unavailable classifications; replacement creation time returns `TargetChanged` before replacement protection; exit and inspection failure precedence; self/critical/PPL fail closed; event log proves admission HANDLE open during final checks, dropped immediately before the closure, and operation HANDLE retained through closure; all early failures call the closure zero times and close handles once; error Display output is exactly the stable code and contains no scripted sensitive values.
 
