@@ -240,14 +240,27 @@ impl ExchangeRateCache {
         self.finish_persistence(outcome);
     }
 
+    #[cfg(test)]
     pub(super) fn prepare_store(
         &mut self,
         result: ExchangeRateResult,
         fetched_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Option<CachePersistence> {
-        if fetched_at > now {
+        if !self.store_in_memory(result, fetched_at, now) {
             return None;
+        }
+        self.prepare_persistence()
+    }
+
+    pub(super) fn store_in_memory(
+        &mut self,
+        result: ExchangeRateResult,
+        fetched_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> bool {
+        if fetched_at > now {
+            return false;
         }
         let now = self.observe(now);
         self.prune(now);
@@ -255,7 +268,7 @@ impl ExchangeRateCache {
             || result.base == result.quote
             || result.rate <= Decimal::ZERO
         {
-            return None;
+            return false;
         }
         let key = PairKey::new(&result.base, &result.quote);
         self.entries.insert(
@@ -269,7 +282,7 @@ impl ExchangeRateCache {
             },
         );
         self.evict_oldest();
-        self.prepare_persistence()
+        true
     }
 
     fn observe(&mut self, now: OffsetDateTime) -> OffsetDateTime {
@@ -300,7 +313,7 @@ impl ExchangeRateCache {
         }
     }
 
-    fn prepare_persistence(&mut self) -> Option<CachePersistence> {
+    pub(super) fn prepare_persistence(&mut self) -> Option<CachePersistence> {
         if !self.persistence_available {
             return None;
         }

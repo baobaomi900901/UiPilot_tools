@@ -63,14 +63,27 @@ impl CacheCommitter for NoopCommitter {
     }
 }
 
-#[derive(Default)]
 struct CaptureCommitter {
     commits: Mutex<Vec<(Option<Vec<u8>>, Vec<u8>)>>,
+    finished: Semaphore,
+}
+
+impl Default for CaptureCommitter {
+    fn default() -> Self {
+        Self {
+            commits: Mutex::new(Vec::new()),
+            finished: Semaphore::new(0),
+        }
+    }
 }
 
 impl CaptureCommitter {
     fn commits(&self) -> Vec<(Option<Vec<u8>>, Vec<u8>)> {
         self.commits.lock().unwrap().clone()
+    }
+
+    async fn wait_for_commits(&self, count: u32) {
+        self.finished.acquire_many(count).await.unwrap().forget();
     }
 }
 
@@ -85,6 +98,7 @@ impl CacheCommitter for CaptureCommitter {
             .lock()
             .unwrap()
             .push((previous.map(<[u8]>::to_vec), candidate.to_vec()));
+        self.finished.add_permits(1);
         Ok(())
     }
 }
@@ -216,6 +230,7 @@ impl UtcClock for ScriptedBlockingClock {
 
 struct BlockingCommitter {
     entered: Semaphore,
+    finished: Semaphore,
     released: Mutex<bool>,
     release_signal: Condvar,
     commits: Mutex<Vec<(Option<Vec<u8>>, Vec<u8>)>>,
@@ -225,6 +240,7 @@ impl BlockingCommitter {
     fn new() -> Self {
         Self {
             entered: Semaphore::new(0),
+            finished: Semaphore::new(0),
             released: Mutex::new(false),
             release_signal: Condvar::new(),
             commits: Mutex::new(Vec::new()),
@@ -233,6 +249,10 @@ impl BlockingCommitter {
 
     async fn wait_until_entered(&self) {
         self.entered.acquire().await.unwrap().forget();
+    }
+
+    async fn wait_until_finished(&self) {
+        self.finished.acquire().await.unwrap().forget();
     }
 
     fn release(&self) {
@@ -264,6 +284,7 @@ impl CacheCommitter for BlockingCommitter {
                 released = self.release_signal.wait(released).unwrap();
             }
         }
+        self.finished.add_permits(1);
         Ok(())
     }
 }
@@ -754,35 +775,42 @@ async fn provider_wait_does_not_hold_cache_or_inflight_locks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disk_commit_does_not_hold_cache_or_inflight_locks() {
+async fn provider_success_returns_before_blocked_persistence_and_populates_memory_first() {
     let dir = TestDir::new("disk-locks");
     let now = instant(12);
     let provider = Arc::new(QueueProvider::new(vec![Ok(result("USD", "CNY", "8"))]));
     let committer = Arc::new(BlockingCommitter::new());
     let service = Arc::new(ExchangeRateService::with_dependencies(
-        provider,
+        provider.clone(),
         cache_with_committer(&dir, now, committer.clone()),
         Arc::new(ManualClock::new(now)),
     ));
 
     let first_service = service.clone();
-    let first = tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
+    let mut first =
+        tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
     committer.wait_until_entered().await;
-    let fresh_service = service.clone();
-    let mut fresh =
-        tokio::spawn(async move { fresh_service.resolve(intent("3 USD to CNY")).await });
-    let prompt = tokio::time::timeout(StdDuration::from_millis(100), &mut fresh).await;
+    let prompt = tokio::time::timeout(StdDuration::from_millis(100), &mut first).await;
     let completed_promptly = prompt.is_ok();
+    let first_output = prompt.ok().map(|output| output.unwrap().unwrap());
+    let fresh_output = tokio::time::timeout(
+        StdDuration::from_millis(100),
+        service.resolve(intent("3 USD to CNY")),
+    )
+    .await
+    .expect("same-pair memory lookup must not wait for persistence")
+    .unwrap();
+    assert_eq!(provider.calls(), 1);
     committer.release();
-    let first_output = first.await.unwrap().unwrap();
-    let fresh_output = match prompt {
-        Ok(output) => output.unwrap().unwrap(),
-        Err(_) => fresh.await.unwrap().unwrap(),
+    committer.wait_until_finished().await;
+    let first_output = match first_output {
+        Some(output) => output,
+        None => first.await.unwrap().unwrap(),
     };
 
     assert!(
         completed_promptly,
-        "fresh cache lookup was blocked by disk I/O"
+        "provider success waited for blocked cache persistence"
     );
     assert_eq!(first_output.title, "16 CNY");
     assert_eq!(fresh_output.title, "24 CNY");
@@ -858,6 +886,8 @@ async fn concurrent_completions_persist_serial_snapshots_without_lost_entries() 
     let second = tokio::spawn(async move { second_service.resolve(intent("2 EUR to JPY")).await });
     tokio::task::yield_now().await;
     committer.release();
+    committer.wait_until_finished().await;
+    committer.wait_until_finished().await;
     assert_eq!(first.await.unwrap().unwrap().title, "16 CNY");
     assert_eq!(second.await.unwrap().unwrap().title, "320 JPY");
 
@@ -1047,6 +1077,7 @@ async fn successful_fetch_persists_the_completion_time_not_request_start() {
     clock.set(completed_at);
     provider.release(1);
     assert_eq!(resolve.await.unwrap().unwrap().title, "16 CNY");
+    committer.wait_for_commits(1).await;
 
     let commits = committer.commits();
     let persisted = serde_json::from_slice::<serde_json::Value>(&commits[0].1).unwrap();
@@ -1148,6 +1179,7 @@ async fn coalesced_followers_share_one_completion_timestamp() {
         3,
         "two request reads and one shared completion read"
     );
+    committer.wait_for_commits(1).await;
     let commits = committer.commits();
     let persisted = serde_json::from_slice::<serde_json::Value>(&commits[0].1).unwrap();
     assert_eq!(persisted["entries"][0]["fetchedAt"], "2026-09-03T12:30:00Z");
@@ -1304,6 +1336,7 @@ async fn delayed_older_completion_persists_without_dropping_a_newer_pair() {
     let newer = service.resolve(intent("2 EUR to JPY")).await.unwrap();
     clock.release();
     let older = older.await.unwrap().unwrap();
+    committer.wait_for_commits(2).await;
 
     assert_eq!(newer.title, "320 JPY");
     assert_eq!(older.title, "16 CNY");
@@ -1312,9 +1345,7 @@ async fn delayed_older_completion_persists_without_dropping_a_newer_pair() {
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[0].0, None);
     assert_eq!(commits[1].0.as_deref(), Some(commits[0].1.as_slice()));
-    let first = serde_json::from_slice::<serde_json::Value>(&commits[0].1).unwrap();
     let second = serde_json::from_slice::<serde_json::Value>(&commits[1].1).unwrap();
-    assert_eq!(first["entries"].as_array().unwrap().len(), 1);
     assert_eq!(second["entries"].as_array().unwrap().len(), 2);
     assert!(second["entries"]
         .as_array()

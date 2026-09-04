@@ -241,10 +241,14 @@ impl ExchangeRateService {
         } else {
             Err(ExchangeRateError::Unavailable)
         };
-        if let (Ok(result), Some(completed_at)) = (&result, completed_at) {
-            self.store_provider_result(result.clone(), completed_at)
-                .await;
-        }
+        let should_persist = if let (Ok(result), Some(completed_at)) = (&result, completed_at) {
+            self.cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .store_in_memory(result.clone(), completed_at, completed_at)
+        } else {
+            false
+        };
         let terminal = ProviderTerminal {
             result,
             completed_at,
@@ -258,15 +262,21 @@ impl ExchangeRateService {
         for waiter in waiters {
             let _ = waiter.send(terminal.clone());
         }
+        if should_persist {
+            let service = self.clone();
+            tokio::spawn(async move {
+                service.persist_cache().await;
+            });
+        }
     }
 
-    async fn store_provider_result(&self, result: ExchangeRateResult, fetched_at: OffsetDateTime) {
+    async fn persist_cache(&self) {
         let _persistence = self.persistence.lock().await;
         let persistence = self
             .cache
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .prepare_store(result, fetched_at, fetched_at);
+            .prepare_persistence();
         let Some(persistence) = persistence else {
             return;
         };
