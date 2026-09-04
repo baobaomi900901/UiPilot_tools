@@ -1,9 +1,63 @@
+use std::{future::Future, pin::Pin, sync::Arc};
+
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use time::{Date, Month};
 
-use super::{parse_decimal_exact, ExchangeRateError, ExchangeRateRequest, ExchangeRateResult};
+use super::{
+    parse_decimal_exact,
+    transport::{NativeProviderTransport, ProviderHttpRequest, ProviderTransport},
+    ExchangeRateError, ExchangeRateRequest, ExchangeRateResult,
+};
+
+pub(crate) type ExchangeRateProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ExchangeRateResult, ExchangeRateError>> + Send + 'a>>;
+
+pub(crate) trait ExchangeRateProvider: Send + Sync {
+    fn fetch_rate<'a>(&'a self, request: &'a ExchangeRateRequest)
+        -> ExchangeRateProviderFuture<'a>;
+}
+
+pub(crate) struct FrankfurterProvider {
+    transport: Arc<dyn ProviderTransport>,
+}
+
+impl FrankfurterProvider {
+    pub(crate) fn new() -> Result<Self, ExchangeRateError> {
+        NativeProviderTransport::new()
+            .map(|transport| Self::with_transport(Arc::new(transport)))
+            .map_err(|_| ExchangeRateError::Unavailable)
+    }
+
+    pub(crate) fn with_transport(transport: Arc<dyn ProviderTransport>) -> Self {
+        Self { transport }
+    }
+
+    async fn fetch(
+        &self,
+        request: &ExchangeRateRequest,
+    ) -> Result<ExchangeRateResult, ExchangeRateError> {
+        let outgoing =
+            ProviderHttpRequest::for_exchange(request).ok_or(ExchangeRateError::Unavailable)?;
+        let response = self
+            .transport
+            .execute(outgoing)
+            .await
+            .map_err(|_| ExchangeRateError::Unavailable)?;
+        map_status(response.status())?;
+        parse_response(request, response.body())
+    }
+}
+
+impl ExchangeRateProvider for FrankfurterProvider {
+    fn fetch_rate<'a>(
+        &'a self,
+        request: &'a ExchangeRateRequest,
+    ) -> ExchangeRateProviderFuture<'a> {
+        Box::pin(self.fetch(request))
+    }
+}
 
 #[derive(Deserialize)]
 struct FrankfurterRate<'a> {
