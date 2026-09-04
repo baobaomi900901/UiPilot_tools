@@ -28,6 +28,64 @@ pub fn durable_temp_name(stem: &str, transaction_id: &OperationId) -> String {
     format!("{stem}.{}.tmp", transaction_id.as_str().replace('-', ""))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionArtifactCleanupStep {
+    RemoveRuntimeTemp,
+    RemoveTransactionTemp,
+    DeleteJournal,
+}
+
+pub fn transaction_artifact_cleanup_plan(
+    entries: &[&str],
+    transaction_id: &OperationId,
+) -> Result<Vec<TransactionArtifactCleanupStep>, &'static str> {
+    let runtime_temp = durable_temp_name("managed-runtime", transaction_id);
+    let transaction_temp = durable_temp_name("managed-transaction", transaction_id);
+    let mut runtime_temp_present = false;
+    let mut transaction_temp_present = false;
+    let mut journal_present = false;
+    for entry in entries {
+        match *entry {
+            name if name == runtime_temp => {
+                if runtime_temp_present {
+                    return Err("duplicate-runtime-temp");
+                }
+                runtime_temp_present = true;
+            }
+            name if name == transaction_temp => {
+                if transaction_temp_present {
+                    return Err("duplicate-transaction-temp");
+                }
+                transaction_temp_present = true;
+            }
+            "managed-transaction.json" => {
+                if journal_present {
+                    return Err("duplicate-transaction-journal");
+                }
+                journal_present = true;
+            }
+            "managed-runtime.json" => {}
+            name if name.starts_with("managed-runtime.")
+                || name.starts_with("managed-transaction.") =>
+            {
+                return Err("foreign-transaction-temp")
+            }
+            _ => {}
+        }
+    }
+    let mut plan = Vec::new();
+    if runtime_temp_present {
+        plan.push(TransactionArtifactCleanupStep::RemoveRuntimeTemp);
+    }
+    if transaction_temp_present {
+        plan.push(TransactionArtifactCleanupStep::RemoveTransactionTemp);
+    }
+    if journal_present {
+        plan.push(TransactionArtifactCleanupStep::DeleteJournal);
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 pub fn temp_belongs_to(name: &str, stem: &str, transaction_id: &OperationId) -> bool {
     name == durable_temp_name(stem, transaction_id)
@@ -1640,6 +1698,20 @@ mod tests {
             ),
             PreUninstallResidueDecision::FailClosed
         );
+        assert_eq!(
+            post_uninstall_residue_decision(
+                ManagedRootResidue::Untrusted,
+                PrivateServiceResidue::Absent,
+            ),
+            PostUninstallResidueDecision::FailClosed
+        );
+        assert_eq!(
+            post_uninstall_residue_decision(
+                ManagedRootResidue::ProtectedEmpty,
+                PrivateServiceResidue::Present,
+            ),
+            PostUninstallResidueDecision::FailClosed
+        );
     }
 
     #[test]
@@ -1702,5 +1774,87 @@ mod tests {
             "managed-transaction",
             &transaction
         ));
+    }
+
+    #[test]
+    fn transaction_artifact_cleanup_covers_runtime_temp_retry_matrix() {
+        let transaction = OperationId::parse("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let runtime_temp = durable_temp_name("managed-runtime", &transaction);
+        let transaction_temp = durable_temp_name("managed-transaction", &transaction);
+        for (scenario, base_entries) in [
+            (
+                "fresh",
+                vec![transaction_temp.as_str(), "managed-transaction.json"],
+            ),
+            (
+                "update",
+                vec![
+                    "1.4.1.1031",
+                    "1.4.1.1032",
+                    "managed-runtime.json",
+                    transaction_temp.as_str(),
+                    "managed-transaction.json",
+                ],
+            ),
+            (
+                "repair",
+                vec![
+                    "1.4.1.1032",
+                    "managed-runtime.json",
+                    transaction_temp.as_str(),
+                    "managed-transaction.json",
+                ],
+            ),
+        ] {
+            for interruption in ["create", "flush", "replace"] {
+                let mut entries = base_entries.clone();
+                let mut expected = Vec::new();
+                if interruption != "create" {
+                    entries.push(runtime_temp.as_str());
+                    expected.push(TransactionArtifactCleanupStep::RemoveRuntimeTemp);
+                }
+                expected.extend([
+                    TransactionArtifactCleanupStep::RemoveTransactionTemp,
+                    TransactionArtifactCleanupStep::DeleteJournal,
+                ]);
+                let plan = transaction_artifact_cleanup_plan(&entries, &transaction).unwrap();
+                assert_eq!(plan, expected, "{scenario}/{interruption}");
+                for step in plan {
+                    let removed = match step {
+                        TransactionArtifactCleanupStep::RemoveRuntimeTemp => runtime_temp.as_str(),
+                        TransactionArtifactCleanupStep::RemoveTransactionTemp => {
+                            transaction_temp.as_str()
+                        }
+                        TransactionArtifactCleanupStep::DeleteJournal => "managed-transaction.json",
+                    };
+                    entries.retain(|entry| *entry != removed);
+                }
+                assert!(!entries.contains(&runtime_temp.as_str()));
+                assert!(!entries.contains(&transaction_temp.as_str()));
+                if scenario == "fresh" {
+                    assert_eq!(
+                        classify_bootstrap(&entries),
+                        BootstrapDisposition::RecoverableEmpty
+                    );
+                }
+            }
+        }
+
+        assert!(transaction_artifact_cleanup_plan(
+            &[
+                "managed-runtime.10112233445566778899aabbccddeeff.tmp",
+                "managed-transaction.json",
+            ],
+            &transaction,
+        )
+        .is_err());
+        assert!(transaction_artifact_cleanup_plan(
+            &[
+                "managed-transaction.10112233445566778899aabbccddeeff.tmp",
+                "managed-transaction.json",
+            ],
+            &transaction,
+        )
+        .is_err());
     }
 }

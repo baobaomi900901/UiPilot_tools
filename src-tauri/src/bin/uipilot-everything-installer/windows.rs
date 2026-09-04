@@ -22,6 +22,8 @@ type Bool = i32;
 
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 const FALSE: Bool = 0;
+const ERROR_FILE_NOT_FOUND: Dword = 2;
+const ERROR_PATH_NOT_FOUND: Dword = 3;
 const ERROR_INSUFFICIENT_BUFFER: Dword = 122;
 const ERROR_SERVICE_DOES_NOT_EXIST: Dword = 1060;
 const WAIT_OBJECT_0: Dword = 0;
@@ -78,6 +80,46 @@ pub const STAGING_DACL_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
 pub const STAGING_FILE_DACL_SDDL: &str = "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)";
 pub const NAMED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
 pub const MANAGED_ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPresence {
+    Missing,
+    Present,
+    Untrusted,
+}
+
+fn classify_path_presence(open_succeeded: bool, error: Dword) -> PathPresence {
+    if open_succeeded {
+        PathPresence::Present
+    } else if matches!(error, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+        PathPresence::Missing
+    } else {
+        PathPresence::Untrusted
+    }
+}
+
+pub fn path_presence(path: &Path) -> PathPresence {
+    let name = wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        classify_path_presence(false, unsafe { GetLastError() })
+    } else {
+        unsafe {
+            CloseHandle(handle);
+        }
+        classify_path_presence(true, 0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -1955,6 +1997,33 @@ mod tests {
         assert!(!staging_file_dacl_is_exact(
             "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)(A;ID;GR;;;BU)"
         ));
+    }
+
+    #[test]
+    fn path_presence_only_maps_explicit_not_found_to_missing() {
+        assert_eq!(classify_path_presence(true, 0), PathPresence::Present);
+        for error in [2, 3] {
+            assert_eq!(classify_path_presence(false, error), PathPresence::Missing);
+        }
+        for error in [5, 32, 87, 4390] {
+            assert_eq!(
+                classify_path_presence(false, error),
+                PathPresence::Untrusted
+            );
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "uipilot-path-presence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(path_presence(&path), PathPresence::Missing);
+        File::create(&path).unwrap();
+        assert_eq!(path_presence(&path), PathPresence::Present);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

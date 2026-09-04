@@ -18,9 +18,9 @@ use transaction::{
     CandidateDirectoryDisposition, ConvergenceDecision, ConvergenceInput, ForwardAction,
     LiveService, ManagedRootResidue, OldRecoveryState, PostUninstallResidueDecision,
     PreUninstallResidueDecision, PrivateServiceResidue, RollbackCleanupStep, RollbackDecision,
-    ServiceActivity, UninstallStep,
+    ServiceActivity, TransactionArtifactCleanupStep, UninstallStep,
 };
-use windows::{AdmissionLease, ExitCode, ServiceState};
+use windows::{AdmissionLease, ExitCode, PathPresence, ServiceState};
 
 #[derive(Debug)]
 struct Cli {
@@ -137,6 +137,14 @@ fn fail<T>(code: ExitCode, reason: impl Into<String>) -> HelperResult<T> {
     Err((code, reason.into()))
 }
 
+fn managed_path_is_present(path: &Path) -> HelperResult<bool> {
+    match windows::path_presence(path) {
+        PathPresence::Missing => Ok(false),
+        PathPresence::Present => Ok(true),
+        PathPresence::Untrusted => fail(ExitCode::ForeignState, "managed-path-presence-untrusted"),
+    }
+}
+
 fn run() -> HelperResult<()> {
     let cli = Cli::parse().map_err(|reason| (ExitCode::InvalidInvocation, reason))?;
     let executable = env::current_exe()
@@ -195,7 +203,7 @@ fn atomic_json<T: serde::Serialize>(
         .and_then(|name| name.to_str())
         .unwrap_or("managed-transaction");
     let temp = parent.join(transaction::durable_temp_name(stem, temp_id));
-    if temp.exists() {
+    if managed_path_is_present(&temp)? {
         windows::verify_managed_file(&temp).map_err(|reason| (ExitCode::ForeignState, reason))?;
         fs::remove_file(&temp).map_err(|_| {
             (
@@ -227,7 +235,7 @@ fn atomic_json<T: serde::Serialize>(
 
 fn read_runtime_manifest(root: &Path) -> HelperResult<Option<RuntimeManifest>> {
     let path = root.join(RUNTIME_MANIFEST_NAME);
-    if !path.exists() {
+    if !managed_path_is_present(&path)? {
         return Ok(None);
     }
     windows::verify_managed_file(&path).map_err(|reason| (ExitCode::ForeignState, reason))?;
@@ -344,11 +352,12 @@ fn service_matches(manifest: &RuntimeManifest) -> HelperResult<bool> {
 
 fn prepare_install(request: &Request) -> HelperResult<()> {
     let root = windows::managed_root().map_err(|reason| (ExitCode::NativeFailure, reason))?;
-    if root.exists() {
+    let root_present = managed_path_is_present(&root)?;
+    if root_present {
         windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
     }
     let durable = root.join(TRANSACTION_MANIFEST_NAME);
-    if durable.exists() {
+    if managed_path_is_present(&durable)? {
         windows::verify_managed_file(&durable)
             .map_err(|reason| (ExitCode::ForeignState, reason))?;
         let journal: TransactionJournal = read_json(&durable)?;
@@ -360,7 +369,7 @@ fn prepare_install(request: &Request) -> HelperResult<()> {
         write_staging_text(&request.journal_path, journal.transaction_id.as_str())?;
         return fail(ExitCode::RecoveryRequired, "recovery-required");
     }
-    let old_manifest = if root.exists() {
+    let old_manifest = if root_present {
         match read_runtime_manifest(&root)? {
             Some(manifest) => {
                 windows::validate_managed_binary(&manifest.service_binary_path, &manifest)
@@ -461,7 +470,7 @@ fn recover_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()
     let root = windows::managed_root().map_err(|reason| (ExitCode::NativeFailure, reason))?;
     windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
     let durable_path = root.join(TRANSACTION_MANIFEST_NAME);
-    if durable_path.exists() {
+    if managed_path_is_present(&durable_path)? {
         windows::verify_managed_file(&durable_path)
             .map_err(|reason| (ExitCode::ForeignState, reason))?;
         let durable: TransactionJournal = read_json(&durable_path)?;
@@ -520,28 +529,49 @@ fn recover_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()
     prepare_install(&fresh)
 }
 
-fn remove_durable_temp_if_present(root: &Path, id: &OperationId) -> HelperResult<()> {
-    let path = root.join(transaction::durable_temp_name("managed-transaction", id));
-    if path.exists() {
-        windows::verify_managed_file(&path).map_err(|reason| (ExitCode::ForeignState, reason))?;
-        fs::remove_file(path)
-            .map_err(|_| (ExitCode::NativeFailure, "durable-temp-delete-failed".into()))?;
-    }
-    Ok(())
-}
-
 fn remove_transaction_artifacts(root: &Path, id: &OperationId) -> HelperResult<()> {
-    remove_durable_temp_if_present(root, id)?;
-    let durable = root.join(TRANSACTION_MANIFEST_NAME);
-    if durable.exists() {
-        windows::verify_managed_file(&durable)
-            .map_err(|reason| (ExitCode::ForeignState, reason))?;
-        fs::remove_file(&durable).map_err(|_| {
+    let entries = fs::read_dir(root)
+        .map_err(|_| {
             (
-                ExitCode::NativeFailure,
-                "durable-journal-delete-failed".into(),
+                ExitCode::ForeignState,
+                "transaction-root-read-failed".into(),
             )
-        })?;
+        })?
+        .map(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .ok_or_else(|| {
+                    (
+                        ExitCode::ForeignState,
+                        "transaction-root-entry-invalid".into(),
+                    )
+                })
+        })
+        .collect::<HelperResult<Vec<_>>>()?;
+    let names = entries.iter().map(String::as_str).collect::<Vec<_>>();
+    let plan = transaction::transaction_artifact_cleanup_plan(&names, id)
+        .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
+    for step in plan {
+        let (path, failure) = match step {
+            TransactionArtifactCleanupStep::RemoveRuntimeTemp => (
+                root.join(transaction::durable_temp_name("managed-runtime", id)),
+                "runtime-temp-delete-failed",
+            ),
+            TransactionArtifactCleanupStep::RemoveTransactionTemp => (
+                root.join(transaction::durable_temp_name("managed-transaction", id)),
+                "durable-temp-delete-failed",
+            ),
+            TransactionArtifactCleanupStep::DeleteJournal => (
+                root.join(TRANSACTION_MANIFEST_NAME),
+                "durable-journal-delete-failed",
+            ),
+        };
+        if managed_path_is_present(&path)? {
+            windows::verify_managed_file(&path)
+                .map_err(|reason| (ExitCode::ForeignState, reason))?;
+            fs::remove_file(path).map_err(|_| (ExitCode::NativeFailure, failure.into()))?;
+        }
     }
     Ok(())
 }
@@ -578,11 +608,11 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
     lease
         .ensure_parent_alive()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
-    if !program_data_root.exists() {
+    if !managed_path_is_present(&program_data_root)? {
         let parent = program_data_root
             .parent()
             .ok_or_else(|| (ExitCode::NativeFailure, "managed-parent-missing".into()))?;
-        if !parent.exists() {
+        if !managed_path_is_present(parent)? {
             windows::create_protected_directory(parent, windows::MANAGED_ROOT_SDDL)
                 .map_err(|reason| (ExitCode::ForeignState, reason))?;
         } else {
@@ -626,7 +656,7 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         &request.operation_id,
     )?;
     let result = (|| {
-        if version_dir.exists() {
+        if managed_path_is_present(&version_dir)? {
             let disposition = candidate_directory_disposition(
                 durable
                     .old_manifest
@@ -897,7 +927,7 @@ fn cleanup_committed_old(root: &Path, journal: &TransactionJournal) -> HelperRes
                 .service_binary_path
                 .parent()
                 .ok_or_else(|| (ExitCode::ForeignState, "old-version-parent-missing".into()))?;
-            if old_dir.exists() {
+            if managed_path_is_present(old_dir)? {
                 windows::verify_managed_directory(old_dir)
                     .map_err(|reason| (ExitCode::ForeignState, reason))?;
                 fs::remove_dir_all(old_dir)
@@ -970,13 +1000,18 @@ fn converge_precommit_rollback(
             old,
             &journal.transaction_id,
         )?;
-    } else if root.join(RUNTIME_MANIFEST_NAME).exists() {
-        fs::remove_file(root.join(RUNTIME_MANIFEST_NAME)).map_err(|_| {
-            (
-                ExitCode::RollbackFailed,
-                "rollback-manifest-delete-failed".into(),
-            )
-        })?;
+    } else {
+        let runtime_manifest = root.join(RUNTIME_MANIFEST_NAME);
+        if managed_path_is_present(&runtime_manifest)? {
+            windows::verify_managed_file(&runtime_manifest)
+                .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
+            fs::remove_file(runtime_manifest).map_err(|_| {
+                (
+                    ExitCode::RollbackFailed,
+                    "rollback-manifest-delete-failed".into(),
+                )
+            })?;
+        }
     }
     cleanup_rollback_candidate(root, journal)?;
     checkpoint("rollback-complete")
@@ -998,7 +1033,11 @@ fn cleanup_rollback_candidate(root: &Path, journal: &TransactionJournal) -> Help
         .as_ref()
         .is_some_and(|old| old.service_binary_path.parent() == Some(candidate_dir));
     let unreferenced = !referenced_by_old;
-    match rollback_cleanup_step(candidate_dir.exists(), unreferenced, referenced_by_old) {
+    match rollback_cleanup_step(
+        managed_path_is_present(candidate_dir)?,
+        unreferenced,
+        referenced_by_old,
+    ) {
         RollbackCleanupStep::RemoveCandidateDirectory => {
             validate_persisted_manifest_identity(root, &journal.new_manifest)?;
             windows::verify_managed_directory(candidate_dir)
@@ -1095,8 +1134,14 @@ fn rollback_install(request: &Request, lease: &AdmissionLease) -> HelperResult<(
 }
 
 fn managed_root_residue(root: &Path) -> HelperResult<ManagedRootResidue> {
-    if !root.exists() {
-        return Ok(ManagedRootResidue::Missing);
+    match windows::path_presence(root) {
+        PathPresence::Missing => return Ok(ManagedRootResidue::Missing),
+        PathPresence::Untrusted => return Ok(ManagedRootResidue::Untrusted),
+        PathPresence::Present => {
+            if windows::verify_managed_root(root).is_err() {
+                return Ok(ManagedRootResidue::Untrusted);
+            }
+        }
     }
     let mut entries = fs::read_dir(root)
         .map_err(|_| (ExitCode::ForeignState, "managed-root-read-failed".into()))?;
@@ -1119,12 +1164,20 @@ fn pre_uninstall(request: &Request, lease: &AdmissionLease) -> HelperResult<()> 
         .ensure_parent_alive()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
     let root = windows::managed_root().map_err(|reason| (ExitCode::NativeFailure, reason))?;
-    if root.exists() {
-        windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
+    if managed_root_residue(&root)? == ManagedRootResidue::Untrusted {
+        return match transaction::pre_uninstall_residue_decision(
+            ManagedRootResidue::Untrusted,
+            PrivateServiceResidue::Absent,
+            request.recovered_transaction_id.is_some(),
+        ) {
+            PreUninstallResidueDecision::Continue | PreUninstallResidueDecision::FailClosed => {
+                fail(ExitCode::ForeignState, "uninstall-root-untrusted")
+            }
+        };
     }
     let mut recovered_handoff_consumed = false;
     let durable = root.join(TRANSACTION_MANIFEST_NAME);
-    if durable.exists() {
+    if managed_path_is_present(&durable)? {
         windows::verify_managed_file(&durable)
             .map_err(|reason| (ExitCode::ForeignState, reason))?;
         let journal: TransactionJournal = read_json(&durable)?;
@@ -1185,8 +1238,17 @@ fn post_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()
         .ensure_parent_alive()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
     let root = windows::managed_root().map_err(|reason| (ExitCode::NativeFailure, reason))?;
-    if root.exists() {
-        windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
+    if managed_root_residue(&root)? == ManagedRootResidue::Untrusted {
+        return match transaction::post_uninstall_residue_decision(
+            ManagedRootResidue::Untrusted,
+            PrivateServiceResidue::Absent,
+        ) {
+            PostUninstallResidueDecision::RemoveEmptyRoot
+            | PostUninstallResidueDecision::Complete
+            | PostUninstallResidueDecision::FailClosed => {
+                fail(ExitCode::ForeignState, "post-uninstall-root-untrusted")
+            }
+        };
     }
     let Some(manifest) = read_runtime_manifest(&root)? else {
         return match transaction::post_uninstall_residue_decision(
@@ -1215,7 +1277,11 @@ fn post_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()
     })?;
     let manifest_path = root.join(RUNTIME_MANIFEST_NAME);
     loop {
-        match transaction::uninstall_step(version_dir.exists(), false, manifest_path.exists()) {
+        match transaction::uninstall_step(
+            managed_path_is_present(version_dir)?,
+            false,
+            managed_path_is_present(&manifest_path)?,
+        ) {
             UninstallStep::DeleteNewDirectory => {
                 lease
                     .ensure_parent_alive()
