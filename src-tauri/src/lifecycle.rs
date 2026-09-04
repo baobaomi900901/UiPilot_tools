@@ -29,6 +29,7 @@ use windows::Win32::{
 use crate::{
     commands::clear_and_hide,
     file_index::FileIndex,
+    file_search::everything_runtime::EverythingRuntimeSupervisor,
     find_window::{
         FindWindowController, FocusEffect, ForegroundWindow, ForwardFinish, NativeFocusSnapshot,
         TransferFocusResult,
@@ -1764,10 +1765,14 @@ impl LifecycleCoordinator {
 
     fn run_system_end(&self, app: &AppHandle) {
         let terminal_index = Arc::clone(app.state::<Arc<FileIndex>>().inner());
+        let runtime = Arc::clone(app.state::<Arc<EverythingRuntimeSupervisor>>().inner());
         let _ = self.run_system_end_nonblocking_with(
             Instant::now(),
             || CleanResult::Succeeded,
-            move || terminal_index.enter_terminal(),
+            move || {
+                runtime.shutdown();
+                terminal_index.enter_terminal();
+            },
         );
     }
 
@@ -1805,6 +1810,9 @@ impl LifecycleCoordinator {
 }
 
 fn prepare_application_shutdown(app: &AppHandle) {
+    if let Some(runtime) = app.try_state::<Arc<EverythingRuntimeSupervisor>>() {
+        runtime.shutdown();
+    }
     if let Some(controller) = app.try_state::<Arc<PluginWindowController>>() {
         plugin_window::destroy_all_for_exit(app, controller.inner().as_ref());
     }
@@ -4184,6 +4192,29 @@ mod tests {
             .expect("tray quit source markers are missing");
         assert!(tray.contains("ExitState::Clean | ExitState::SystemEnding"));
         assert!(tray.contains("prepare_application_shutdown(&exit_app)"));
+    }
+
+    #[test]
+    fn every_application_exit_path_stops_the_owned_everything_runtime() {
+        let source = include_str!("lifecycle.rs").replace("\r\n", "\n");
+        let prepare = source
+            .split("fn prepare_application_shutdown(app: &AppHandle) {")
+            .nth(1)
+            .and_then(|tail| tail.split("fn handle_session_message_with").next())
+            .expect("application shutdown helper is missing");
+        assert!(prepare.contains("EverythingRuntimeSupervisor"));
+        assert!(prepare.contains("runtime.shutdown();"));
+
+        let system_end = source
+            .split("fn run_system_end(&self, app: &AppHandle) {")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn should_prevent_exit").next())
+            .expect("system-end path is missing");
+        assert!(system_end.contains("runtime.shutdown();"));
+        assert!(
+            system_end.find("runtime.shutdown();").unwrap()
+                < system_end.find("enter_terminal();").unwrap()
+        );
     }
 
     #[test]

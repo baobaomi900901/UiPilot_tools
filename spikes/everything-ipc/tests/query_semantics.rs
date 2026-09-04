@@ -86,13 +86,15 @@ impl IsolatedEverything {
     fn start(&mut self, deadline: Instant) -> Result<(), Box<dyn Error>> {
         self.write_isolated_config()?;
         let child = self.base_command().arg("-startup").spawn()?;
+        let child_pid = child.id();
         self.child = Some(child);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("Everything startup deadline elapsed".into());
         }
-        self.client = Some(EverythingClient::connect(
+        self.client = Some(EverythingClient::connect_owned(
             &self.instance,
+            child_pid,
             remaining.min(Duration::from_secs(10)),
         )?);
         Ok(())

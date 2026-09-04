@@ -77,6 +77,13 @@ it('provides a browser-only launcher preview outside the production entry', () =
   expect(readFileSync('index.html', 'utf8')).not.toContain('launcher-browser-preview')
 })
 
+it('keeps managed Everything startup and unavailable messages fixed in the launcher compatibility path', () => {
+  expect(protocolSource).toContain("| 'fileSearchStarting'")
+  expect(launcherCoreSource).toContain("fileSearchStarting: '文件搜索正在准备'")
+  expect(launcherCoreSource).toContain("searchUnavailable: '文件搜索服务不可用'")
+  expect(launcherCoreSource).not.toContain("fileSearchStarting: 'private runtime diagnostic'")
+})
+
 describe('retired validation settings contract', () => {
   it('contains no research, rescan, export, or validation-clear surface', () => {
     const productionSources = [protocolSource, launcherCoreSource, launcherViewSource, mainSource]

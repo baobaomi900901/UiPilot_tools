@@ -1,14 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use everything_ipc::client::{EverythingClient, EverythingClientError};
+use everything_ipc::client::EverythingClientError;
 use everything_ipc::protocol::{
     EverythingQueryResult, EverythingQuerySpec, EverythingResultItem, EverythingSort,
 };
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
+use super::everything_runtime::{EverythingRuntimeStatus, ReadyClientProvider};
 use super::windows::path_auth::{authenticate_path, AuthenticatedPathSnapshot};
 use super::{
     EverythingPathAction, FileCategory, FileExecutionError, FilePathKind, FileResultKind,
@@ -16,20 +17,21 @@ use super::{
 };
 
 pub(crate) struct EverythingSearchState {
-    client: Mutex<Option<Arc<EverythingClient>>>,
+    provider: Arc<dyn ReadyClientProvider>,
     revision: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EverythingSearchError {
+    Starting,
     Unavailable,
     RevisionExhausted,
 }
 
 impl EverythingSearchState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn with_provider(provider: Arc<dyn ReadyClientProvider>) -> Self {
         Self {
-            client: Mutex::new(None),
+            provider,
             revision: AtomicU64::new(0),
         }
     }
@@ -39,56 +41,34 @@ impl EverythingSearchState {
         query: &str,
         category: FileCategory,
     ) -> Result<PublishedFileBatch, EverythingSearchError> {
-        run_search_with_category(
+        let lease = self
+            .provider
+            .ready_client()
+            .map_err(|status| match status {
+                EverythingRuntimeStatus::Starting => EverythingSearchError::Starting,
+                EverythingRuntimeStatus::Ready
+                | EverythingRuntimeStatus::Unavailable
+                | EverythingRuntimeStatus::Stopping => EverythingSearchError::Unavailable,
+            })?;
+        let generation = lease.generation();
+        let mut query_error = None;
+        let result = run_search_with_category(
             query,
             category,
             &self.revision,
-            |spec| {
-                query_cached_with(
-                    &self.client,
-                    spec,
-                    || {
-                        connect_ready_with(
-                            || EverythingClient::connect("", Duration::from_millis(250)),
-                            EverythingClient::query,
-                        )
-                    },
-                    EverythingClient::query,
-                )
-                .map_err(|_| EverythingClientError::IpcUnavailable)
+            |spec| match lease.query(spec) {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    query_error = Some(error.clone());
+                    Err(error)
+                }
             },
             authenticate_everything_item,
-        )
-    }
-}
-
-fn everything_index_probe_spec() -> Result<EverythingQuerySpec, EverythingClientError> {
-    Ok(EverythingQuerySpec {
-        search: Vec::new(),
-        offset: 0,
-        max_results: 1,
-        request_flags: 0x155,
-        sort: EverythingSort::DateModifiedDescending,
-        deadline: Instant::now()
-            .checked_add(Duration::from_secs(1))
-            .ok_or(EverythingClientError::IpcUnavailable)?,
-    })
-}
-
-fn connect_ready_with<C, Connect, Probe>(
-    connect: Connect,
-    probe: Probe,
-) -> Result<C, EverythingClientError>
-where
-    Connect: FnOnce() -> Result<C, EverythingClientError>,
-    Probe: FnOnce(&C, EverythingQuerySpec) -> Result<EverythingQueryResult, EverythingClientError>,
-{
-    let client = connect()?;
-    let result = probe(&client, everything_index_probe_spec()?)?;
-    if result.total == 0 {
-        Err(EverythingClientError::IpcUnavailable)
-    } else {
-        Ok(client)
+        );
+        if query_error.as_ref().is_some_and(evicts_cached_client) {
+            self.provider.invalidate_if_current(generation);
+        }
+        result
     }
 }
 
@@ -243,48 +223,6 @@ fn filetime_to_rfc3339(filetime: u64) -> Result<String, EverythingSearchError> {
     ))
 }
 
-fn query_cached_with<C, Connect, Query>(
-    slot: &Mutex<Option<Arc<C>>>,
-    spec: EverythingQuerySpec,
-    connect: Connect,
-    query: Query,
-) -> Result<EverythingQueryResult, EverythingSearchError>
-where
-    Connect: FnOnce() -> Result<C, EverythingClientError>,
-    Query: FnOnce(&C, EverythingQuerySpec) -> Result<EverythingQueryResult, EverythingClientError>,
-{
-    let client = {
-        let mut cached = slot
-            .lock()
-            .map_err(|_| EverythingSearchError::Unavailable)?;
-        if let Some(client) = cached.as_ref() {
-            Arc::clone(client)
-        } else {
-            let client = Arc::new(connect().map_err(|_| EverythingSearchError::Unavailable)?);
-            *cached = Some(Arc::clone(&client));
-            client
-        }
-    };
-
-    match query(client.as_ref(), spec) {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            if evicts_cached_client(&error) {
-                let mut cached = slot
-                    .lock()
-                    .map_err(|_| EverythingSearchError::Unavailable)?;
-                if cached
-                    .as_ref()
-                    .is_some_and(|cached| Arc::ptr_eq(cached, &client))
-                {
-                    *cached = None;
-                }
-            }
-            Err(EverythingSearchError::Unavailable)
-        }
-    }
-}
-
 fn evicts_cached_client(error: &EverythingClientError) -> bool {
     matches!(
         error,
@@ -302,7 +240,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use everything_ipc::client::EverythingClientError;
     use everything_ipc::protocol::{
@@ -312,12 +250,16 @@ mod tests {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows::Win32::System::Time::SystemTimeToFileTime;
 
+    use super::super::everything_runtime::{
+        EverythingRuntimeClient, EverythingRuntimeStatus, ReadyClientLease, ReadyClientProvider,
+    };
     use super::super::windows::path_auth::{AuthenticatedPathIdentity, AuthenticatedPathSnapshot};
-    use super::super::{FileExecutionAction, FileExecutionError, FilePathKind, FileResultKind};
+    use super::super::{
+        FileCategory, FileExecutionAction, FileExecutionError, FilePathKind, FileResultKind,
+    };
     use super::{
-        connect_ready_with, encode_literal_query, file_path_kind_for_attributes,
-        filetime_to_rfc3339, query_cached_with, run_search_with, EverythingSearchError,
-        EverythingSearchState,
+        encode_literal_query, file_path_kind_for_attributes, filetime_to_rfc3339, run_search_with,
+        EverythingSearchError, EverythingSearchState,
     };
 
     const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
@@ -382,17 +324,6 @@ mod tests {
         ))
     }
 
-    fn query_spec_for_test() -> EverythingQuerySpec {
-        EverythingQuerySpec {
-            search: Vec::new(),
-            offset: 0,
-            max_results: 200,
-            request_flags: 0x155,
-            sort: EverythingSort::DateModifiedDescending,
-            deadline: Instant::now() + Duration::from_secs(1),
-        }
-    }
-
     fn run_successful_search_for_test(
         revision: &AtomicU64,
     ) -> Result<super::super::PublishedFileBatch, EverythingSearchError> {
@@ -404,12 +335,77 @@ mod tests {
         )
     }
 
-    #[test]
-    fn new_state_is_lazy_and_starts_at_revision_zero() {
-        let state = EverythingSearchState::new();
+    struct ProviderClient {
+        result: Mutex<Result<EverythingQueryResult, EverythingClientError>>,
+        queries: AtomicU64,
+    }
 
-        assert!(state.client.lock().unwrap().is_none());
+    impl EverythingRuntimeClient for ProviderClient {
+        fn database_loaded(&self, _timeout: Duration) -> Result<bool, EverythingClientError> {
+            Ok(true)
+        }
+
+        fn query(
+            &self,
+            _spec: EverythingQuerySpec,
+        ) -> Result<EverythingQueryResult, EverythingClientError> {
+            self.queries.fetch_add(1, Ordering::AcqRel);
+            self.result.lock().unwrap().clone()
+        }
+    }
+
+    struct TestProvider {
+        status: Mutex<EverythingRuntimeStatus>,
+        generation: u64,
+        client: Arc<ProviderClient>,
+        invalidated: Mutex<Vec<u64>>,
+    }
+
+    impl TestProvider {
+        fn new(
+            status: EverythingRuntimeStatus,
+            result: Result<EverythingQueryResult, EverythingClientError>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                status: Mutex::new(status),
+                generation: 7,
+                client: Arc::new(ProviderClient {
+                    result: Mutex::new(result),
+                    queries: AtomicU64::new(0),
+                }),
+                invalidated: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ReadyClientProvider for TestProvider {
+        fn ready_client(&self) -> Result<ReadyClientLease, EverythingRuntimeStatus> {
+            let status = *self.status.lock().unwrap();
+            if status != EverythingRuntimeStatus::Ready {
+                return Err(status);
+            }
+            Ok(ReadyClientLease::new(
+                self.generation,
+                Arc::clone(&self.client) as Arc<dyn EverythingRuntimeClient>,
+            ))
+        }
+
+        fn invalidate_if_current(&self, generation: u64) {
+            self.invalidated.lock().unwrap().push(generation);
+        }
+    }
+
+    #[test]
+    fn new_state_uses_provider_and_starts_at_revision_zero() {
+        let provider = TestProvider::new(
+            EverythingRuntimeStatus::Starting,
+            Ok(query_result_for_test(0)),
+        );
+        let state =
+            EverythingSearchState::with_provider(provider.clone() as Arc<dyn ReadyClientProvider>);
+
         assert_eq!(state.revision.load(Ordering::Acquire), 0);
+        assert_eq!(provider.client.queries.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -688,101 +684,8 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct TestClient {
-        id: usize,
-    }
-
     #[test]
-    fn connection_requires_a_nonempty_loaded_index() {
-        let captured = RefCell::new(None);
-        let empty = connect_ready_with(
-            || Ok(TestClient { id: 1 }),
-            |_, spec| {
-                *captured.borrow_mut() = Some(spec);
-                Ok(EverythingQueryResult {
-                    total: 0,
-                    request_flags: 0x155,
-                    sort_type: 14,
-                    items: Vec::new(),
-                })
-            },
-        );
-        assert!(matches!(empty, Err(EverythingClientError::IpcUnavailable)));
-        let spec = captured.borrow();
-        let spec = spec.as_ref().unwrap();
-        assert!(spec.search.is_empty());
-        assert_eq!(spec.max_results, 1);
-
-        assert_eq!(
-            connect_ready_with(
-                || Ok(TestClient { id: 2 }),
-                |_, _| Ok(EverythingQueryResult {
-                    total: 1,
-                    request_flags: 0x155,
-                    sort_type: 14,
-                    items: Vec::new(),
-                }),
-            )
-            .unwrap()
-            .id,
-            2
-        );
-    }
-
-    #[test]
-    fn failed_readiness_probe_is_not_cached() {
-        let slot = Mutex::new(None);
-        let result = query_cached_with(
-            &slot,
-            query_spec_for_test(),
-            || {
-                connect_ready_with(
-                    || Ok(TestClient { id: 1 }),
-                    |_, _| {
-                        Ok(EverythingQueryResult {
-                            total: 0,
-                            request_flags: 0x155,
-                            sort_type: 14,
-                            items: Vec::new(),
-                        })
-                    },
-                )
-            },
-            |_, _| unreachable!(),
-        );
-
-        assert_eq!(result, Err(EverythingSearchError::Unavailable));
-        assert!(slot.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn cached_client_connects_lazily_reuses_and_is_not_locked_during_query() {
-        let slot = Mutex::new(None);
-        let connects = Cell::new(0);
-
-        for _ in 0..2 {
-            let result = query_cached_with(
-                &slot,
-                query_spec_for_test(),
-                || {
-                    connects.set(connects.get() + 1);
-                    Ok(TestClient { id: connects.get() })
-                },
-                |client, _| {
-                    assert!(slot.try_lock().is_ok());
-                    assert_eq!(client.id, 1);
-                    Ok(query_result_for_test(0))
-                },
-            );
-            assert!(result.is_ok());
-        }
-
-        assert_eq!(connects.get(), 1);
-    }
-
-    #[test]
-    fn query_error_cache_matrix_evicts_only_reconnectable_failures() {
+    fn query_error_invalidation_matrix_preserves_existing_classification() {
         let cases = [
             (
                 "invalid instance",
@@ -806,95 +709,70 @@ mod tests {
             ("overload", EverythingClientError::Overloaded, false),
         ];
 
-        for (label, error, evicts) in cases {
-            let slot = Mutex::new(Some(Arc::new(TestClient { id: 1 })));
-            let connects = Cell::new(0);
-            let first = query_cached_with(
-                &slot,
-                query_spec_for_test(),
-                || {
-                    connects.set(connects.get() + 1);
-                    Ok(TestClient { id: 2 })
-                },
-                |_, _| Err(error),
+        for (label, error, invalidates) in cases {
+            let provider = TestProvider::new(EverythingRuntimeStatus::Ready, Err(error));
+            let state = EverythingSearchState::with_provider(
+                provider.clone() as Arc<dyn ReadyClientProvider>
             );
-            assert_eq!(first, Err(EverythingSearchError::Unavailable), "{label}");
-            assert_eq!(connects.get(), 0, "{label}");
-
-            let queried_client = Cell::new(0);
-            let second = query_cached_with(
-                &slot,
-                query_spec_for_test(),
-                || {
-                    connects.set(connects.get() + 1);
-                    Ok(TestClient { id: 2 })
-                },
-                |client, _| {
-                    queried_client.set(client.id);
-                    Ok(query_result_for_test(0))
-                },
+            assert_eq!(
+                state.search("x", FileCategory::All),
+                Err(EverythingSearchError::Unavailable),
+                "{label}"
             );
-            assert!(second.is_ok(), "{label}");
-            assert_eq!(connects.get(), usize::from(evicts), "{label}");
-            assert_eq!(queried_client.get(), if evicts { 2 } else { 1 }, "{label}");
+            assert_eq!(
+                provider.invalidated.lock().unwrap().as_slice(),
+                if invalidates { &[7][..] } else { &[][..] },
+                "{label}"
+            );
         }
     }
 
     #[test]
-    fn connection_failure_is_not_cached_and_next_call_reconnects() {
-        let slot = Mutex::new(None);
-        let connects = Cell::new(0);
-
-        assert_eq!(
-            query_cached_with(
-                &slot,
-                query_spec_for_test(),
-                || {
-                    connects.set(connects.get() + 1);
-                    Err(EverythingClientError::ConnectionTimedOut)
-                },
-                |_, _| unreachable!()
+    fn searches_are_admitted_only_from_ready_runtime_snapshots() {
+        for (status, expected) in [
+            (
+                EverythingRuntimeStatus::Starting,
+                EverythingSearchError::Starting,
             ),
-            Err(EverythingSearchError::Unavailable)
-        );
-        assert!(slot.lock().unwrap().is_none());
+            (
+                EverythingRuntimeStatus::Unavailable,
+                EverythingSearchError::Unavailable,
+            ),
+            (
+                EverythingRuntimeStatus::Stopping,
+                EverythingSearchError::Unavailable,
+            ),
+        ] {
+            let provider = TestProvider::new(status, Ok(query_result_for_test(0)));
+            let state = EverythingSearchState::with_provider(
+                provider.clone() as Arc<dyn ReadyClientProvider>
+            );
+            assert_eq!(state.search("x", FileCategory::All), Err(expected));
+            assert_eq!(provider.client.queries.load(Ordering::Acquire), 0);
+        }
 
-        let result = query_cached_with(
-            &slot,
-            query_spec_for_test(),
-            || {
-                connects.set(connects.get() + 1);
-                Ok(TestClient { id: 2 })
-            },
-            |client, _| {
-                assert_eq!(client.id, 2);
-                Ok(query_result_for_test(0))
-            },
+        let provider = TestProvider::new(
+            EverythingRuntimeStatus::Ready,
+            Ok(EverythingQueryResult {
+                total: 0,
+                request_flags: 0x155,
+                sort_type: 14,
+                items: Vec::new(),
+            }),
         );
-        assert!(result.is_ok());
-        assert_eq!(connects.get(), 2);
+        let state =
+            EverythingSearchState::with_provider(provider.clone() as Arc<dyn ReadyClientProvider>);
+        assert_eq!(state.search("x", FileCategory::All).unwrap().items.len(), 0);
+        assert_eq!(provider.client.queries.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn failed_client_does_not_evict_a_concurrently_installed_replacement() {
-        let original = Arc::new(TestClient { id: 1 });
-        let replacement = Arc::new(TestClient { id: 2 });
-        let slot = Mutex::new(Some(Arc::clone(&original)));
-
-        let result = query_cached_with(
-            &slot,
-            query_spec_for_test(),
-            || unreachable!(),
-            |client, _| {
-                assert_eq!(client.id, 1);
-                *slot.lock().unwrap() = Some(Arc::clone(&replacement));
-                Err(EverythingClientError::IpcSendFailed)
-            },
-        );
-
-        assert_eq!(result, Err(EverythingSearchError::Unavailable));
-        let cached = slot.lock().unwrap();
-        assert!(Arc::ptr_eq(cached.as_ref().unwrap(), &replacement));
+    fn production_search_source_never_connects_to_the_default_instance() {
+        let source = include_str!("everything.rs").replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("EverythingClient::connect("));
+        assert!(!production.contains("connect_ready_with"));
+        assert!(!production.contains("query_cached_with"));
     }
 }
 #[cfg(test)]

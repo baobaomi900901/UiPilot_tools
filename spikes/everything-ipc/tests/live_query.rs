@@ -19,11 +19,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IsWindow,
     PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, TranslateMessage,
     UnregisterClassW, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COPYDATA, WM_DESTROY,
-    WNDCLASSW,
+    WM_USER, WNDCLASSW,
 };
 
 const EVERYTHING_IPC_DEFAULT_WINDOW_CLASS: &str = "EVERYTHING_TASKBAR_NOTIFICATION";
 const EVERYTHING_COPYDATA_QUERY2W: usize = 18;
+const EVERYTHING_IPC_IS_DB_LOADED: usize = 401;
 const QUERY2_REPLY_HWND_OFFSET: usize = 0;
 const QUERY2_REPLY_MESSAGE_OFFSET: usize = 4;
 const QUERY2_REQUEST_FLAGS_OFFSET: usize = 20;
@@ -59,6 +60,7 @@ struct FakeState {
     active_request_id: Mutex<Option<u32>>,
     cancelled_request_ids: Mutex<HashSet<u32>>,
     cancellation_count: AtomicUsize,
+    database_loaded: AtomicBool,
 }
 
 struct FakeEverything {
@@ -85,6 +87,7 @@ impl FakeEverything {
             active_request_id: Mutex::new(None),
             cancelled_request_ids: Mutex::new(HashSet::new()),
             cancellation_count: AtomicUsize::new(0),
+            database_loaded: AtomicBool::new(false),
         });
         *fake_state_slot().lock().expect("fake state mutex poisoned") = Some(Arc::clone(&state));
         let thread_window_class = HSTRING::from(&window_class);
@@ -158,6 +161,10 @@ impl FakeEverything {
             EverythingClient::connect(&self.instance, CONNECT_TIMEOUT)
                 .expect("client should find the isolated fake Everything instance"),
         )
+    }
+
+    fn set_database_loaded(&self, loaded: bool) {
+        self.state.database_loaded.store(loaded, Ordering::Release);
     }
 
     fn send_valid_empty_reply(&self, query: &CapturedQuery) {
@@ -395,6 +402,14 @@ unsafe extern "system" fn fake_window_proc(
             }
             LRESULT(1)
         }
+        WM_USER if wparam.0 == EVERYTHING_IPC_IS_DB_LOADED => fake_state_slot()
+            .lock()
+            .expect("fake state mutex poisoned")
+            .as_ref()
+            .filter(|state| state.recipient_hwnd.load(Ordering::Acquire) == hwnd_bits(hwnd))
+            .map_or(LRESULT(0), |state| {
+                LRESULT(isize::from(state.database_loaded.load(Ordering::Acquire)))
+            }),
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -405,6 +420,38 @@ unsafe extern "system" fn fake_window_proc(
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
+}
+
+#[test]
+fn owned_connection_rejects_wrong_pid_and_revalidates_each_connection() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let expected_pid = std::process::id();
+    let wrong_pid = expected_pid.checked_add(1).expect("test pid overflow");
+
+    assert!(EverythingClient::connect_owned(&fake.instance, expected_pid, CONNECT_TIMEOUT).is_ok());
+    assert!(matches!(
+        EverythingClient::connect_owned(&fake.instance, wrong_pid, CONNECT_TIMEOUT),
+        Err(EverythingClientError::IpcOwnerMismatch)
+    ));
+    assert!(EverythingClient::connect_owned(&fake.instance, expected_pid, CONNECT_TIMEOUT).is_ok());
+}
+
+#[test]
+fn owned_connection_exposes_database_loaded_state() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    let client =
+        EverythingClient::connect_owned(&fake.instance, std::process::id(), CONNECT_TIMEOUT)
+            .expect("owned client should connect to the expected PID");
+
+    assert!(!client
+        .database_loaded(CONNECT_TIMEOUT)
+        .expect("database probe should complete"));
+    fake.set_database_loaded(true);
+    assert!(client
+        .database_loaded(CONNECT_TIMEOUT)
+        .expect("database probe should complete"));
 }
 
 unsafe fn capture_query(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<CapturedQuery> {

@@ -278,6 +278,7 @@ export type CommandErrorCode =
   | 'windowFailed'
   | 'invalidFileQuery'
   | 'fileSearchWorkerFailed'
+  | 'fileSearchStarting'
   | 'searchUnavailable'
   | 'clipboardWriteFailed'
   | 'pluginPermissionDenied'

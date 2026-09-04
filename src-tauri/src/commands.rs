@@ -353,6 +353,13 @@ impl CommandError {
         }
     }
 
+    fn file_search_starting() -> Self {
+        Self {
+            code: "fileSearchStarting",
+            message: "file search is starting",
+        }
+    }
+
     fn plugin_query_failed() -> Self {
         Self {
             code: "pluginQueryFailed",
@@ -4478,8 +4485,13 @@ where
         .flatten())
 }
 
-fn map_everything_search_error(_: EverythingSearchError) -> CommandError {
-    CommandError::search_unavailable()
+fn map_everything_search_error(error: EverythingSearchError) -> CommandError {
+    match error {
+        EverythingSearchError::Starting => CommandError::file_search_starting(),
+        EverythingSearchError::Unavailable | EverythingSearchError::RevisionExhausted => {
+            CommandError::search_unavailable()
+        }
+    }
 }
 
 fn publish_everything_search(
@@ -9023,7 +9035,7 @@ mod tests {
     }
 
     #[test]
-    fn everything_search_failures_map_to_path_free_unavailable_errors() {
+    fn search_files_everything_failures_map_to_stable_path_free_errors() {
         for error in [
             EverythingSearchError::Unavailable,
             EverythingSearchError::RevisionExhausted,
@@ -9033,6 +9045,10 @@ mod tests {
             assert!(!command.message.contains('\\'));
             assert!(!command.message.contains(':'));
         }
+        let starting = map_everything_search_error(EverythingSearchError::Starting);
+        assert_eq!(starting, CommandError::file_search_starting());
+        assert_ne!(starting, CommandError::search_unavailable());
+        assert!(!starting.message.contains("runtime"));
     }
 
     #[test]

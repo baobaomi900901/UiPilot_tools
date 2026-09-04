@@ -45,6 +45,7 @@ pub enum EverythingClientError {
     InvalidInstance,
     ConnectionTimedOut,
     IpcUnavailable,
+    IpcOwnerMismatch,
     IpcSendFailed,
     Overloaded,
     RequestIdExhausted,
@@ -59,6 +60,7 @@ impl fmt::Display for EverythingClientError {
             Self::InvalidInstance => "invalid Everything instance",
             Self::ConnectionTimedOut => "Everything IPC connection timed out",
             Self::IpcUnavailable => "Everything IPC is unavailable",
+            Self::IpcOwnerMismatch => "Everything IPC window owner does not match",
             Self::IpcSendFailed => "Everything IPC send failed",
             Self::Overloaded => "Everything IPC query capacity is exhausted",
             Self::RequestIdExhausted => "Everything IPC request id exhausted",
@@ -86,7 +88,7 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
 
     use super::{
         try_acquire_query_permit, EverythingClientError, EverythingQueryResult, EverythingQuerySpec,
@@ -100,6 +102,7 @@ mod imp {
         command_tx: mpsc::SyncSender<WorkerCommand>,
         shutdown_tx: mpsc::SyncSender<()>,
         reply_hwnd_bits: usize,
+        everything_hwnd_bits: usize,
         closed: Arc<AtomicBool>,
         outstanding_queries: Arc<AtomicUsize>,
         worker: Mutex<Option<JoinHandle<()>>>,
@@ -112,7 +115,31 @@ mod imp {
             let class_name = everything_window_class(instance)?;
             let started = Instant::now();
             let everything_hwnd_bits = find_everything_window(&class_name, timeout)?;
-            let worker_timeout = timeout.saturating_sub(started.elapsed());
+            Self::connect_to_window(
+                everything_hwnd_bits,
+                timeout.saturating_sub(started.elapsed()),
+            )
+        }
+
+        pub fn connect_owned(
+            instance: &str,
+            expected_pid: u32,
+            timeout: Duration,
+        ) -> Result<Self, EverythingClientError> {
+            let class_name = everything_window_class(instance)?;
+            let started = Instant::now();
+            let everything_hwnd_bits =
+                find_owned_everything_window(&class_name, expected_pid, timeout)?;
+            Self::connect_to_window(
+                everything_hwnd_bits,
+                timeout.saturating_sub(started.elapsed()),
+            )
+        }
+
+        fn connect_to_window(
+            everything_hwnd_bits: usize,
+            worker_timeout: Duration,
+        ) -> Result<Self, EverythingClientError> {
             let closed = Arc::new(AtomicBool::new(false));
             let outstanding_queries = Arc::new(AtomicUsize::new(0));
             let worker =
@@ -121,10 +148,18 @@ mod imp {
                 command_tx: worker.command_tx,
                 shutdown_tx: worker.shutdown_tx,
                 reply_hwnd_bits: worker.reply_hwnd_bits,
+                everything_hwnd_bits,
                 closed,
                 outstanding_queries,
                 worker: Mutex::new(Some(worker.join)),
             })
+        }
+
+        pub fn database_loaded(&self, timeout: Duration) -> Result<bool, EverythingClientError> {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(EverythingClientError::ClientClosed);
+            }
+            window::database_loaded(self.everything_hwnd_bits, timeout)
         }
 
         pub fn query(
@@ -200,6 +235,37 @@ mod imp {
             std::thread::sleep(FIND_WINDOW_POLL_INTERVAL.min(remaining));
         }
     }
+
+    fn find_owned_everything_window(
+        class_name: &HSTRING,
+        expected_pid: u32,
+        timeout: Duration,
+    ) -> Result<usize, EverythingClientError> {
+        if expected_pid == 0 {
+            return Err(EverythingClientError::IpcOwnerMismatch);
+        }
+        let started = Instant::now();
+        loop {
+            if let Ok(hwnd) = unsafe { FindWindowW(class_name, PCWSTR::null()) } {
+                let bits = hwnd.0 as usize;
+                if bits != 0 {
+                    let mut actual_pid = 0;
+                    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual_pid)) } == 0 {
+                        return Err(EverythingClientError::IpcUnavailable);
+                    }
+                    if actual_pid != expected_pid {
+                        return Err(EverythingClientError::IpcOwnerMismatch);
+                    }
+                    return Ok(bits);
+                }
+            }
+            if started.elapsed() >= timeout {
+                return Err(EverythingClientError::ConnectionTimedOut);
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            std::thread::sleep(FIND_WINDOW_POLL_INTERVAL.min(remaining));
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -213,6 +279,18 @@ impl EverythingClient {
     pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
     pub fn connect(_instance: &str, _timeout: Duration) -> Result<Self, EverythingClientError> {
+        Err(EverythingClientError::IpcUnavailable)
+    }
+
+    pub fn connect_owned(
+        _instance: &str,
+        _expected_pid: u32,
+        _timeout: Duration,
+    ) -> Result<Self, EverythingClientError> {
+        Err(EverythingClientError::IpcUnavailable)
+    }
+
+    pub fn database_loaded(&self, _timeout: Duration) -> Result<bool, EverythingClientError> {
         Err(EverythingClientError::IpcUnavailable)
     }
 

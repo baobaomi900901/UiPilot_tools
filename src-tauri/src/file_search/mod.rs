@@ -155,6 +155,7 @@ pub(crate) enum FileExecutionError {
 }
 
 pub(crate) mod everything;
+pub(crate) mod everything_runtime;
 pub(crate) mod windows;
 
 #[cfg(test)]

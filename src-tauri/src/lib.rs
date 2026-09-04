@@ -375,9 +375,6 @@ pub fn run() {
     ));
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
-    let everything_search = Arc::new(file_search::everything::EverythingSearchState::new());
-
-    #[cfg(any(test, not(feature = "test-instrumentation")))]
     let plugin_manager = Arc::new(PluginManager::new());
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -419,7 +416,6 @@ pub fn run() {
         .manage(Arc::clone(&app_cache))
         .manage(Arc::clone(&coordinator))
         .manage(Arc::clone(&file_index))
-        .manage(everything_search)
         .manage(Arc::clone(&plugin_manager))
         .register_uri_scheme_protocol("uipilot-public-plugin", {
             let public_plugin_service = Arc::clone(&public_plugin_service);
@@ -547,13 +543,32 @@ pub fn run() {
             security_probe::setup(_app)?;
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
-            setup_production_lifecycle(
-                _app,
-                &app_cache,
-                &coordinator,
-                &plugin_manager,
-                &public_plugin_service,
-            )?;
+            {
+                let resource_directory = _app.path().resource_dir()?;
+                let everything_runtime = Arc::new(
+                    file_search::everything_runtime::EverythingRuntimeSupervisor::production(
+                        resource_directory,
+                    ),
+                );
+                let everything_search = Arc::new(
+                    file_search::everything::EverythingSearchState::with_provider(Arc::clone(
+                        &everything_runtime,
+                    )
+                        as Arc<dyn file_search::everything_runtime::ReadyClientProvider>),
+                );
+                if !_app.manage(Arc::clone(&everything_runtime)) || !_app.manage(everything_search)
+                {
+                    return Err(lifecycle_setup_error().into());
+                }
+                setup_production_lifecycle(
+                    _app,
+                    &app_cache,
+                    &coordinator,
+                    &plugin_manager,
+                    &public_plugin_service,
+                )?;
+                everything_runtime.start_async();
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -566,6 +581,12 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                if let Some(everything_runtime) = _app
+                    .try_state::<Arc<file_search::everything_runtime::EverythingRuntimeSupervisor>>(
+                    )
+                {
+                    everything_runtime.shutdown();
+                }
                 run_public_plugin_service.shutdown();
                 _app.state::<Arc<message_center::MessageCenterService>>()
                     .shutdown();
@@ -1743,16 +1764,26 @@ mod lib {
                     .count(),
                 1
             );
+            let runtime = production
+                .find("EverythingRuntimeSupervisor::production(")
+                .expect("production Everything supervisor is missing");
+            let search = production
+                .find("EverythingSearchState::with_provider(")
+                .expect("owned-client search provider wiring is missing");
+            assert!(runtime < search);
             assert_eq!(
                 production
-                    .matches("file_search::everything::EverythingSearchState::new()")
+                    .matches(".manage(Arc::clone(&everything_runtime))")
                     .count(),
                 1
             );
-            assert!(production.contains(
-                "let everything_search = Arc::new(file_search::everything::EverythingSearchState::new());"
-            ));
             assert_eq!(production.matches(".manage(everything_search)").count(), 1);
+            assert_eq!(
+                production
+                    .matches("everything_runtime.start_async();")
+                    .count(),
+                1
+            );
             assert_eq!(
                 production
                     .matches("let run_file_index = Arc::clone(&file_index);")
@@ -1769,6 +1800,7 @@ mod lib {
                 .and_then(|tail| tail.split("_ => {}").next())
                 .expect("run exit branch is missing");
             assert!(run_exit.contains("run_file_index.enter_terminal();"));
+            assert!(run_exit.contains("everything_runtime.shutdown();"));
             assert!(run_exit.contains("run_coordinator.uninstall_hook_for_exit();"));
             assert!(run_exit.contains("run_coordinator.observe_run_exit();"));
             assert!(

@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageTimeoutW, SetTimer, SetWindowLongPtrW, TranslateMessage, UnregisterClassW,
     CREATESTRUCTW, GWLP_USERDATA, MSG, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_TIMER,
-    WNDCLASSW,
+    WM_USER, WNDCLASSW,
 };
 
 use crate::client::{EverythingClientError, QueryPermit, MAX_OUTSTANDING_QUERIES};
@@ -27,6 +27,7 @@ use crate::protocol::{
 };
 
 const EVERYTHING_COPYDATA_QUERY2W: usize = 18;
+const EVERYTHING_IPC_IS_DB_LOADED: usize = 401;
 const WORKER_WAKE_MESSAGE: u32 = WM_APP + 0x31;
 const WORKER_TIMER_ID: usize = 1;
 const WORKER_TIMER_INTERVAL_MS: u32 = 5;
@@ -208,6 +209,37 @@ pub(crate) fn wake_worker(reply_hwnd_bits: usize) -> Result<(), EverythingClient
         )
     }
     .map_err(|_| EverythingClientError::IpcSendFailed)
+}
+
+pub(crate) fn database_loaded(
+    everything_hwnd_bits: usize,
+    timeout: Duration,
+) -> Result<bool, EverythingClientError> {
+    if everything_hwnd_bits == 0 {
+        return Err(EverythingClientError::IpcUnavailable);
+    }
+    let hwnd = hwnd_from_bits(everything_hwnd_bits);
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return Err(EverythingClientError::IpcUnavailable);
+    }
+    let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+    let mut result = 0usize;
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_USER,
+            WPARAM(EVERYTHING_IPC_IS_DB_LOADED),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            timeout_ms,
+            Some(&mut result),
+        )
+    };
+    if sent.0 == 0 {
+        Err(EverythingClientError::IpcSendFailed)
+    } else {
+        Ok(result != 0)
+    }
 }
 
 fn run_worker(

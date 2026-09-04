@@ -178,6 +178,22 @@ describe('find readiness', () => {
 })
 
 describe('find forwarding and query ownership', () => {
+  it.each([
+    ['fileSearchStarting', '文件搜索正在准备'],
+    ['searchUnavailable', '文件搜索服务不可用'],
+  ])('maps %s to fixed text without exposing backend diagnostics', async (code, expected) => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockRejectedValueOnce({ code, message: 'private runtime diagnostic' })
+    const core = createFindCore(fake.client)
+    await core.start()
+    fake.emitForward({ invocationId: `inv-${code}`, forwardSequence: '1', query: 'report' })
+
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().status).toBe(expected)
+    expect(core.getSnapshot().status).not.toContain('diagnostic')
+    core.destroy()
+  })
+
   it('ignores malformed, duplicate, stale, and overflow forwards', async () => {
     const fake = fakeClient()
     const core = createFindCore(fake.client)
