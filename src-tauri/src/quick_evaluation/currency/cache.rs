@@ -100,6 +100,32 @@ pub(crate) struct ExchangeRateCache {
     committer: Arc<dyn CacheCommitter>,
 }
 
+pub(super) struct CachePersistence {
+    paths: AtomicPaths,
+    previous: Option<Vec<u8>>,
+    candidate: Vec<u8>,
+    committer: Arc<dyn CacheCommitter>,
+}
+
+pub(super) enum CachePersistenceOutcome {
+    Committed(Vec<u8>),
+    Failed,
+}
+
+impl CachePersistence {
+    pub(super) fn commit(self) -> CachePersistenceOutcome {
+        if self
+            .committer
+            .commit(&self.paths, self.previous.as_deref(), &self.candidate)
+            .is_ok()
+        {
+            CachePersistenceOutcome::Committed(self.candidate)
+        } else {
+            CachePersistenceOutcome::Failed
+        }
+    }
+}
+
 impl ExchangeRateCache {
     pub(crate) fn load(root: &Path, now: OffsetDateTime) -> Self {
         Self::load_with(
@@ -200,13 +226,26 @@ impl ExchangeRateCache {
         fetched_at: OffsetDateTime,
         now: OffsetDateTime,
     ) {
+        let Some(persistence) = self.prepare_store(result, fetched_at, now) else {
+            return;
+        };
+        let outcome = persistence.commit();
+        self.finish_persistence(outcome);
+    }
+
+    pub(super) fn prepare_store(
+        &mut self,
+        result: ExchangeRateResult,
+        fetched_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Option<CachePersistence> {
         self.prune(now);
         if fetched_at > now
             || now - fetched_at > RETAIN_FOR
             || result.base == result.quote
             || result.rate <= Decimal::ZERO
         {
-            return;
+            return None;
         }
         let key = PairKey::new(&result.base, &result.quote);
         self.entries.insert(
@@ -220,7 +259,7 @@ impl ExchangeRateCache {
             },
         );
         self.evict_oldest();
-        self.persist();
+        self.prepare_persistence()
     }
 
     fn prune(&mut self, now: OffsetDateTime) {
@@ -244,27 +283,36 @@ impl ExchangeRateCache {
         }
     }
 
-    fn persist(&mut self) {
+    fn prepare_persistence(&mut self) -> Option<CachePersistence> {
         if !self.persistence_available {
-            return;
+            return None;
         }
         let Some(candidate) = serialize_document(&self.entries) else {
             self.persistence_available = false;
-            return;
+            return None;
         };
-        if self
-            .committer
-            .commit(
-                &self.paths,
-                self.validated_current_raw.as_deref(),
-                &candidate,
-            )
-            .is_err()
-        {
-            self.persistence_available = false;
-            return;
+        let directory = self
+            .paths
+            .current()
+            .parent()
+            .expect("cache file has a parent directory");
+        Some(CachePersistence {
+            paths: AtomicPaths::new(directory, CACHE_FILE_NAME),
+            previous: self.validated_current_raw.clone(),
+            candidate,
+            committer: self.committer.clone(),
+        })
+    }
+
+    pub(super) fn finish_persistence(&mut self, outcome: CachePersistenceOutcome) {
+        match outcome {
+            CachePersistenceOutcome::Committed(candidate) => {
+                self.validated_current_raw = Some(candidate);
+            }
+            CachePersistenceOutcome::Failed => {
+                self.persistence_available = false;
+            }
         }
-        self.validated_current_raw = Some(candidate);
     }
 
     fn empty(

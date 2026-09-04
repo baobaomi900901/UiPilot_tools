@@ -1,9 +1,12 @@
 pub(crate) mod cache;
 pub(crate) mod provider;
+pub(crate) mod service;
 pub(crate) mod transport;
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod service_tests;
 #[cfg(test)]
 mod transport_tests;
 
