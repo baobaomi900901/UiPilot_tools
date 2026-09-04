@@ -88,6 +88,7 @@ node_modules/
 .worktrees/
 artifacts/systemindex-spike/
 artifacts/find-local-file-search/
+/artifacts/managed-everything/
 /third-party/everything/artifacts/
 /third-party/everything/Everything.exe
 /third-party/everything/.uipilot-everything-txn-*/
