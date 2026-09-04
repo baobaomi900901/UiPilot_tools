@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const INSTANCE_NAME: &str = "UiPilot";
@@ -18,9 +18,19 @@ pub const EMBEDDED_LICENSE: &[u8] = include_bytes!("../../../resources/everythin
 pub const EMBEDDED_INI: &[u8] =
     include_bytes!("../../../resources/everything/Everything-UiPilot.ini");
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct OperationId(String);
+
+impl<'de> Deserialize<'de> for OperationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(D::Error::custom)
+    }
+}
 
 impl OperationId {
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -31,12 +41,11 @@ impl OperationId {
                 [8, 13, 18, 23].contains(&index)
                     || byte.is_ascii_digit()
                     || (b'a'..=b'f').contains(byte)
-                    || (b'A'..=b'F').contains(byte)
             });
         if !valid || value == "00000000-0000-0000-0000-000000000000" {
             return Err("invalid-operation-id".into());
         }
-        Ok(Self(value.to_ascii_lowercase()))
+        Ok(Self(value.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -93,7 +102,6 @@ impl Request {
             Action::CommitInstall
             | Action::PrepareInstall
             | Action::RollbackInstall
-            | Action::PreUninstall
             | Action::PostUninstall
                 if self.recovered_transaction_id.is_some() =>
             {
@@ -178,7 +186,7 @@ pub enum Phase {
     UninstallDirectoriesRemoved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeManifest {
     pub schema_version: u32,
@@ -386,6 +394,15 @@ mod tests {
         assert!(OperationId::parse("00112233-4455-6677-8899-aabbccddeeff").is_ok());
         assert!(OperationId::parse("{00112233-4455-6677-8899-aabbccddeeff}").is_err());
         assert!(OperationId::parse("00000000-0000-0000-0000-000000000000").is_err());
+        assert!(OperationId::parse("00112233-4455-6677-8899-AABBCCDDEEFF").is_err());
+        assert!(
+            serde_json::from_str::<OperationId>(r#""00000000-0000-0000-0000-000000000000""#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<OperationId>(r#""00112233-4455-6677-8899-AABBCCDDEEFF""#)
+                .is_err()
+        );
 
         let mut request = Request::fixture(Action::CommitInstall);
         request.install_dir = None;
@@ -394,6 +411,14 @@ mod tests {
         assert!(request.validate().is_ok());
         request.recovered_transaction_id = Some(OperationId::fixture(2));
         assert!(request.validate().is_err());
+
+        let mut pre_uninstall = Request::fixture(Action::PreUninstall);
+        pre_uninstall.recovered_transaction_id = Some(OperationId::fixture(2));
+        assert!(pre_uninstall.validate().is_ok());
+
+        let mut post_uninstall = Request::fixture(Action::PostUninstall);
+        post_uninstall.recovered_transaction_id = Some(OperationId::fixture(2));
+        assert!(post_uninstall.validate().is_err());
     }
 
     #[test]

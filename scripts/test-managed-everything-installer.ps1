@@ -92,7 +92,10 @@ Assert-SourceContains $hooks @(
     'Global\UiPilotManagedEverythingInstallerActivity',
     'CoCreateGuid', 'CreateMutexW', 'CreateEventW', 'CreateDirectoryW',
     'prepare-install', 'recover-install', 'commit-install', 'rollback-install',
-    'pre-uninstall', 'post-uninstall'
+    'pre-uninstall', 'post-uninstall',
+    '!insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "yes" "yes"',
+    '${StrCase} $UiPilotOperationId $UiPilotOperationId "L"',
+    '${UnStrCase} $UiPilotOperationId $UiPilotOperationId "L"'
 )
 Assert-SourceContains $template @(
     'TAURI_CLI_VERSION: 2.11.4', 'UIPILOT_REGION_REINSTALL_BEGIN',
@@ -138,13 +141,23 @@ Assert-OrderedUniqueTokens $uninstallSection.Value @(
     'Delete "$INSTDIR\uninstall.exe"',
     '; Remove registry information for add/remove programs'
 ) 'Uninstall continuation ordering must retain the app, uninstaller, and registration until post-uninstall succeeds'
+$hooksText = Get-Content -LiteralPath $hooks -Raw -Encoding utf8
+$preUninstallHook = [regex]::Match($hooksText, '(?ms)^!macro NSIS_HOOK_PREUNINSTALL\r?\n.*?^!macroend\r?\n')
+Assert-Condition $preUninstallHook.Success 'Could not locate the pre-uninstall hook'
+Assert-OrderedUniqueTokens $preUninstallHook.Value @(
+    '!insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "no" "yes"',
+    '${If} $UiPilotHelperExit = 15',
+    'FileRead $R5 $UiPilotRecoveryId',
+    '!insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "yes" "yes"',
+    '${If} $UiPilotHelperExit != 0'
+) 'Pre-uninstall recovery must bind the durable transaction id before convergence'
 $reinstallMatch = [regex]::Match($baselineText, '(?ms)^  ; Reinstalling the same version\r?\n.*?^  reinst_done:\r?\n')
 $uninstallMatch = [regex]::Match($baselineText, '(?ms)^  !ifmacrodef NSIS_HOOK_PREUNINSTALL\r?\n.*?^  !ifmacrodef NSIS_HOOK_POSTUNINSTALL\r?\n    !insertmacro NSIS_HOOK_POSTUNINSTALL\r?\n  !endif\r?\n')
 Assert-Condition $reinstallMatch.Success 'Could not locate the upstream reinstall snapshot region'
 Assert-Condition $uninstallMatch.Success 'Could not locate the upstream uninstall-gate snapshot region'
 $normalized = [regex]::Replace(
     $customText,
-    '(?ms)^; UIPILOT_REGION_HELPER_LIFETIME_BEGIN\r?\n\$\{StrCase\}\r?\n\$\{StrLoc\}\r?\n\$\{StrRep\}\r?\n\$\{UnStrRep\}\r?\n; UIPILOT_REGION_HELPER_LIFETIME_END\r?\n',
+    '(?ms)^; UIPILOT_REGION_HELPER_LIFETIME_BEGIN\r?\n\$\{StrCase\}\r?\n\$\{UnStrCase\}\r?\n\$\{StrLoc\}\r?\n\$\{StrRep\}\r?\n\$\{UnStrRep\}\r?\n; UIPILOT_REGION_HELPER_LIFETIME_END\r?\n',
     "`${StrCase}`n`${StrLoc}`n"
 )
 $normalized = [regex]::Replace(

@@ -30,6 +30,7 @@ ManifestDPIAwareness PerMonitorV2
 !include "StrFunc.nsh"
 ; UIPILOT_REGION_HELPER_LIFETIME_BEGIN
 ${StrCase}
+${UnStrCase}
 ${StrLoc}
 ${StrRep}
 ${UnStrRep}

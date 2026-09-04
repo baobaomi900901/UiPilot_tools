@@ -13,10 +13,11 @@ use model::{
     TransactionJournal, PIPE_SDDL_TEMPLATE, RUNTIME_MANIFEST_NAME, TRANSACTION_MANIFEST_NAME,
 };
 use transaction::{
-    candidate_directory_disposition, classify_matching_service, rollback_cleanup_step,
-    rollback_decision, validate_recovery_handoff, validate_same_transaction,
-    CandidateDirectoryDisposition, LiveService, RollbackCleanupStep, RollbackDecision,
-    ServiceActivity, UninstallStep,
+    candidate_directory_disposition, classify_matching_service, classify_runtime_manifest,
+    rollback_cleanup_step, validate_recovery_handoff, validate_same_transaction,
+    CandidateDirectoryDisposition, ConvergenceDecision, ConvergenceInput, ForwardAction,
+    LiveService, OldRecoveryState, RollbackCleanupStep, RollbackDecision, ServiceActivity,
+    UninstallStep,
 };
 use windows::{AdmissionLease, ExitCode, ServiceState};
 
@@ -280,12 +281,35 @@ fn validate_persisted_transaction_identity(
     root: &Path,
     journal: &TransactionJournal,
 ) -> HelperResult<()> {
-    if journal.schema_version != 1 {
+    if journal.schema_version != 1
+        || !matches!(
+            journal.phase,
+            Phase::JournalCreated
+                | Phase::NewBinaryVerified
+                | Phase::OldServiceStopped
+                | Phase::OldServiceRemoved
+                | Phase::NewServiceInstalled
+                | Phase::NewServiceRunning
+                | Phase::ManifestReplaced
+                | Phase::CleanupComplete
+        )
+    {
         return fail(ExitCode::ForeignState, "foreign-transaction-schema");
     }
     validate_persisted_manifest_identity(root, &journal.new_manifest)?;
     if let Some(old) = journal.old_manifest.as_ref() {
         validate_persisted_manifest_identity(root, old)?;
+        let same_service_identity = old.service_binary_path
+            == journal.new_manifest.service_binary_path
+            && old.instance == journal.new_manifest.instance
+            && old.pipe_name == journal.new_manifest.pipe_name
+            && old.expanded_sddl == journal.new_manifest.expanded_sddl;
+        if same_service_identity && old != &journal.new_manifest {
+            return fail(
+                ExitCode::ForeignState,
+                "incompatible-shared-service-identity",
+            );
+        }
     }
     Ok(())
 }
@@ -327,6 +351,11 @@ fn prepare_install(request: &Request) -> HelperResult<()> {
         windows::verify_managed_file(&durable)
             .map_err(|reason| (ExitCode::ForeignState, reason))?;
         let journal: TransactionJournal = read_json(&durable)?;
+        if transaction::convergence_decision(&inspect_convergence(&root, &journal)?)
+            == ConvergenceDecision::FailClosed
+        {
+            return fail(ExitCode::ForeignState, "recovery-state-invalid");
+        }
         write_staging_text(&request.journal_path, journal.transaction_id.as_str())?;
         return fail(ExitCode::RecoveryRequired, "recovery-required");
     }
@@ -441,14 +470,8 @@ fn recover_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()
             &durable.transaction_id,
         )
         .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
-        converge_rollback(&root, &durable)?;
-        fs::remove_file(&durable_path).map_err(|_| {
-            (
-                ExitCode::NativeFailure,
-                "durable-journal-delete-failed".into(),
-            )
-        })?;
-        remove_durable_temp_if_present(&root, &durable.transaction_id)?;
+        converge_transaction(&root, &durable)?;
+        remove_transaction_artifacts(&root, &durable.transaction_id)?;
     } else {
         if request.recovered_transaction_id.is_some() {
             return fail(
@@ -502,6 +525,22 @@ fn remove_durable_temp_if_present(root: &Path, id: &OperationId) -> HelperResult
         windows::verify_managed_file(&path).map_err(|reason| (ExitCode::ForeignState, reason))?;
         fs::remove_file(path)
             .map_err(|_| (ExitCode::NativeFailure, "durable-temp-delete-failed".into()))?;
+    }
+    Ok(())
+}
+
+fn remove_transaction_artifacts(root: &Path, id: &OperationId) -> HelperResult<()> {
+    remove_durable_temp_if_present(root, id)?;
+    let durable = root.join(TRANSACTION_MANIFEST_NAME);
+    if durable.exists() {
+        windows::verify_managed_file(&durable)
+            .map_err(|reason| (ExitCode::ForeignState, reason))?;
+        fs::remove_file(&durable).map_err(|_| {
+            (
+                ExitCode::NativeFailure,
+                "durable-journal-delete-failed".into(),
+            )
+        })?;
     }
     Ok(())
 }
@@ -704,33 +743,28 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
             lease,
         )?;
         checkpoint("runtime-manifest-replaced")?;
-        if let Some(old) = durable.old_manifest.as_ref() {
-            if old.service_binary_path != durable.new_manifest.service_binary_path {
-                let old_dir = old
-                    .service_binary_path
-                    .parent()
-                    .ok_or_else(|| (ExitCode::ForeignState, "old-version-parent-missing".into()))?;
-                windows::verify_managed_directory(old_dir)
-                    .map_err(|reason| (ExitCode::ForeignState, reason))?;
-                fs::remove_dir_all(old_dir)
-                    .map_err(|_| (ExitCode::NativeFailure, "old-version-delete-failed".into()))?;
-            }
-        }
-        fs::remove_file(program_data_root.join(TRANSACTION_MANIFEST_NAME)).map_err(|_| {
-            (
-                ExitCode::NativeFailure,
-                "durable-journal-delete-failed".into(),
-            )
-        })?;
+        cleanup_committed_old(&program_data_root, &durable)?;
+        persist_phase(
+            &program_data_root,
+            &mut durable,
+            Phase::CleanupComplete,
+            lease,
+        )?;
+        checkpoint("cleanup-complete")?;
+        remove_transaction_artifacts(&program_data_root, &durable.transaction_id)?;
         Ok(())
     })();
-    if result.is_err() {
-        let rollback = converge_rollback(&program_data_root, &durable);
-        if rollback.is_ok() {
-            let _ = fs::remove_file(program_data_root.join(TRANSACTION_MANIFEST_NAME));
+    if let Err(original) = result {
+        if let Ok(outcome) = converge_transaction(&program_data_root, &durable) {
+            if remove_transaction_artifacts(&program_data_root, &durable.transaction_id).is_ok()
+                && outcome == ConvergenceOutcome::FinishedForward
+            {
+                return Ok(());
+            }
         }
+        return Err(original);
     }
-    result
+    Ok(())
 }
 
 fn classify_live(journal: &TransactionJournal) -> HelperResult<LiveService> {
@@ -763,10 +797,123 @@ fn classify_live(journal: &TransactionJournal) -> HelperResult<LiveService> {
     }
 }
 
-fn converge_rollback(root: &Path, journal: &TransactionJournal) -> HelperResult<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvergenceOutcome {
+    RolledBack,
+    FinishedForward,
+}
+
+fn inspect_convergence(
+    root: &Path,
+    journal: &TransactionJournal,
+) -> HelperResult<ConvergenceInput> {
     validate_persisted_transaction_identity(root, journal)?;
+    let runtime = read_runtime_manifest(root)?;
+    let old_matches = runtime.as_ref().is_some_and(|runtime| {
+        journal
+            .old_manifest
+            .as_ref()
+            .is_some_and(|old| runtime == old)
+    });
+    let new_matches = runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime == &journal.new_manifest);
+    let runtime_manifest = classify_runtime_manifest(runtime.is_some(), old_matches, new_matches);
+    let shared_identity = journal
+        .old_manifest
+        .as_ref()
+        .is_some_and(|old| old == &journal.new_manifest);
+    let old_recovery = match journal.old_manifest.as_ref() {
+        None => OldRecoveryState::NotRequired,
+        Some(old) if validate_persisted_manifest(root, old).is_ok() => OldRecoveryState::Ready,
+        Some(_) => OldRecoveryState::Unavailable,
+    };
+    Ok(ConvergenceInput {
+        phase: journal.phase.clone(),
+        shared_identity,
+        runtime_manifest,
+        live_service: classify_live(journal)?,
+        old_recovery,
+    })
+}
+
+fn converge_transaction(
+    root: &Path,
+    journal: &TransactionJournal,
+) -> HelperResult<ConvergenceOutcome> {
+    match transaction::convergence_decision(&inspect_convergence(root, journal)?) {
+        ConvergenceDecision::Rollback(decision) => {
+            converge_precommit_rollback(root, journal, decision)?;
+            Ok(ConvergenceOutcome::RolledBack)
+        }
+        ConvergenceDecision::Forward(action) => {
+            converge_forward(root, journal, action)?;
+            Ok(ConvergenceOutcome::FinishedForward)
+        }
+        ConvergenceDecision::FailClosed => fail(
+            ExitCode::RollbackFailed,
+            "transaction-convergence-state-invalid",
+        ),
+    }
+}
+
+fn converge_forward(
+    root: &Path,
+    journal: &TransactionJournal,
+    action: ForwardAction,
+) -> HelperResult<()> {
+    validate_persisted_manifest(root, &journal.new_manifest)
+        .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+    if action == ForwardAction::StartNewAndCleanup {
+        invoke_validated_persisted_service_command(
+            root,
+            &journal.new_manifest,
+            "-start-service",
+            None,
+        )
+        .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+    }
+    match windows::query_service().map_err(|reason| (ExitCode::RollbackFailed, reason))? {
+        ServiceState::Running(command)
+            if windows::validate_service_command(&command, &journal.new_manifest) => {}
+        _ => return fail(ExitCode::RollbackFailed, "forward-service-not-running"),
+    }
+    let runtime = read_runtime_manifest(root)?;
+    if runtime.as_ref() != Some(&journal.new_manifest) {
+        return fail(
+            ExitCode::RollbackFailed,
+            "forward-runtime-manifest-mismatch",
+        );
+    }
+    cleanup_committed_old(root, journal)
+}
+
+fn cleanup_committed_old(root: &Path, journal: &TransactionJournal) -> HelperResult<()> {
+    if let Some(old) = journal.old_manifest.as_ref() {
+        validate_persisted_manifest_identity(root, old)?;
+        if old.service_binary_path != journal.new_manifest.service_binary_path {
+            let old_dir = old
+                .service_binary_path
+                .parent()
+                .ok_or_else(|| (ExitCode::ForeignState, "old-version-parent-missing".into()))?;
+            if old_dir.exists() {
+                windows::verify_managed_directory(old_dir)
+                    .map_err(|reason| (ExitCode::ForeignState, reason))?;
+                fs::remove_dir_all(old_dir)
+                    .map_err(|_| (ExitCode::NativeFailure, "old-version-delete-failed".into()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn converge_precommit_rollback(
+    root: &Path,
+    journal: &TransactionJournal,
+    decision: RollbackDecision,
+) -> HelperResult<()> {
     checkpoint("rollback-started")?;
-    match rollback_decision(classify_live(journal)?) {
+    match decision {
         RollbackDecision::StopAndRemoveNewThenRestoreOld => {
             invoke_validated_persisted_service_command(
                 root,
@@ -795,6 +942,22 @@ fn converge_rollback(root: &Path, journal: &TransactionJournal) -> HelperResult<
             restore_old(root, journal)?;
         }
         RollbackDecision::RestoreOld => restore_old(root, journal)?,
+        RollbackDecision::StartMatchingThenKeep => {
+            let old = journal.old_manifest.as_ref().ok_or_else(|| {
+                (
+                    ExitCode::RollbackFailed,
+                    "matching-repair-old-manifest-missing".into(),
+                )
+            })?;
+            invoke_validated_persisted_service_command(root, old, "-start-service", None)
+                .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+            match windows::query_service().map_err(|reason| (ExitCode::RollbackFailed, reason))? {
+                ServiceState::Running(command)
+                    if windows::validate_service_command(&command, old)
+                        && windows::validate_service_command(&command, &journal.new_manifest) => {}
+                _ => return fail(ExitCode::RollbackFailed, "matching-repair-start-mismatch"),
+            }
+        }
         RollbackDecision::KeepOld => {}
         RollbackDecision::FailClosedRetainAll => {
             return fail(ExitCode::RollbackFailed, "rollback-live-state-ambiguous")
@@ -926,17 +1089,11 @@ fn rollback_install(request: &Request, lease: &AdmissionLease) -> HelperResult<(
     let journal: TransactionJournal = read_json(&durable)?;
     validate_same_transaction(&request.operation_id, &journal.transaction_id)
         .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
-    converge_rollback(&root, &journal)?;
-    fs::remove_file(durable).map_err(|_| {
-        (
-            ExitCode::RollbackFailed,
-            "rollback-journal-delete-failed".into(),
-        )
-    })?;
-    remove_durable_temp_if_present(&root, &journal.transaction_id)
+    converge_transaction(&root, &journal)?;
+    remove_transaction_artifacts(&root, &journal.transaction_id)
 }
 
-fn pre_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()> {
+fn pre_uninstall(request: &Request, lease: &AdmissionLease) -> HelperResult<()> {
     lease
         .ensure_parent_alive()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
@@ -949,14 +1106,28 @@ fn pre_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         windows::verify_managed_file(&durable)
             .map_err(|reason| (ExitCode::ForeignState, reason))?;
         let journal: TransactionJournal = read_json(&durable)?;
-        converge_rollback(&root, &journal)?;
-        fs::remove_file(&durable).map_err(|_| {
-            (
-                ExitCode::RollbackFailed,
-                "uninstall-recovery-journal-delete-failed".into(),
-            )
-        })?;
-        remove_durable_temp_if_present(&root, &journal.transaction_id)?;
+        if transaction::convergence_decision(&inspect_convergence(&root, &journal)?)
+            == ConvergenceDecision::FailClosed
+        {
+            return fail(ExitCode::RollbackFailed, "uninstall-recovery-state-invalid");
+        }
+        let Some(recovered) = request.recovered_transaction_id.as_ref() else {
+            write_staging_text(&request.journal_path, journal.transaction_id.as_str())?;
+            return fail(ExitCode::RecoveryRequired, "uninstall-recovery-required");
+        };
+        validate_recovery_handoff(
+            &request.operation_id,
+            Some(recovered),
+            &journal.transaction_id,
+        )
+        .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
+        converge_transaction(&root, &journal)?;
+        remove_transaction_artifacts(&root, &journal.transaction_id)?;
+    } else if request.recovered_transaction_id.is_some() {
+        return fail(
+            ExitCode::ForeignState,
+            "unexpected-uninstall-transaction-id",
+        );
     }
     let Some(manifest) = read_runtime_manifest(&root)? else {
         return if root.exists() {
@@ -1132,6 +1303,16 @@ mod tests {
         assert!(validate_persisted_transaction_identity(root, &journal).is_err());
         journal.new_manifest = RuntimeManifest::fixture();
         journal.schema_version = 2;
+        assert!(validate_persisted_transaction_identity(root, &journal).is_err());
+
+        journal.schema_version = 1;
+        journal.phase = Phase::Prepared;
+        assert!(validate_persisted_transaction_identity(root, &journal).is_err());
+        journal.phase = Phase::RollbackComplete;
+        assert!(validate_persisted_transaction_identity(root, &journal).is_err());
+
+        journal.phase = Phase::NewBinaryVerified;
+        journal.new_manifest.sha256 = "b".repeat(64);
         assert!(validate_persisted_transaction_identity(root, &journal).is_err());
     }
 }

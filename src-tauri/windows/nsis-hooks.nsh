@@ -119,7 +119,7 @@ Var UiPilotRecoveryId
   ${EndIf}
 !macroend
 
-!macro UIPILOT_CREATE_STAGING
+!macro UIPILOT_CREATE_STAGING UNINSTALL
   ; SHGetKnownFolderPath(FOLDERID_LocalAppData) - never trust environment variables.
   System::Call 'shell32::SHGetKnownFolderPath(g "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}", i 0, p 0, *w .R7) i .R6'
   ${If} $R6 != 0
@@ -133,6 +133,11 @@ Var UiPilotRecoveryId
     Abort
   ${EndIf}
   StrCpy $UiPilotOperationId $R6 36 1
+  !if "${UNINSTALL}" == "yes"
+    ${UnStrCase} $UiPilotOperationId $UiPilotOperationId "L"
+  !else
+    ${StrCase} $UiPilotOperationId $UiPilotOperationId "L"
+  !endif
   StrCpy $UiPilotStaging "$R7\Temp\UiPilotManagedEverything-$UiPilotOperationId"
   !insertmacro UIPILOT_LOCAL_FREE $R7
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_STAGING_SDDL}" $R8 $R9
@@ -232,7 +237,7 @@ Var UiPilotRecoveryId
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro UIPILOT_ACQUIRE_LEASE
-  !insertmacro UIPILOT_CREATE_STAGING
+  !insertmacro UIPILOT_CREATE_STAGING "no"
   !insertmacro UIPILOT_RUN_HELPER "prepare-install" "no" "no" "no"
   ${If} $UiPilotHelperExit = 15
     FileOpen $R5 "$UiPilotJournal" r
@@ -265,8 +270,14 @@ Var UiPilotRecoveryId
 !macro NSIS_HOOK_PREUNINSTALL
   ${If} $UpdateMode != 1
     !insertmacro UIPILOT_ACQUIRE_LEASE
-    !insertmacro UIPILOT_CREATE_STAGING
+    !insertmacro UIPILOT_CREATE_STAGING "yes"
     !insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "no" "yes"
+    ${If} $UiPilotHelperExit = 15
+      FileOpen $R5 "$UiPilotJournal" r
+      FileRead $R5 $UiPilotRecoveryId
+      FileClose $R5
+      !insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "yes" "yes"
+    ${EndIf}
     ${If} $UiPilotHelperExit != 0
       !insertmacro UIPILOT_CLEANUP
       MessageBox MB_ICONSTOP "UiPilot's private search Service could not be removed safely."

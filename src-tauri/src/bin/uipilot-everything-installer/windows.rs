@@ -526,88 +526,196 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 fn manifest_text(bytes: &[u8]) -> Option<String> {
-    if bytes.starts_with(&[0xff, 0xfe]) {
+    let text = if bytes.starts_with(&[0xff, 0xfe]) {
+        if (bytes.len() - 2) % 2 != 0 {
+            return None;
+        }
         let words = bytes[2..]
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
-        String::from_utf16(&words).ok()
+        String::from_utf16(&words).ok()?
     } else {
-        std::str::from_utf8(bytes).ok().map(str::to_owned)
-    }
+        std::str::from_utf8(bytes).ok()?.to_owned()
+    };
+    Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned())
 }
 
-fn xml_attribute<'a>(tag: &'a str, wanted: &str) -> Option<&'a str> {
-    let bytes = tag.as_bytes();
-    let mut index = tag.find(char::is_whitespace)?;
-    let mut found = None;
+fn xml_name(bytes: &[u8], index: &mut usize) -> Option<std::ops::Range<usize>> {
+    let start = *index;
+    if !bytes
+        .get(*index)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return None;
+    }
+    *index += 1;
+    while bytes.get(*index).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.' | b':')
+    }) {
+        *index += 1;
+    }
+    Some(start..*index)
+}
+
+fn exact_manifest_xml_is_as_invoker(text: &str) -> bool {
+    const LINKER_XML_DECLARATION: &str =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>";
+    let text = text.strip_prefix(LINKER_XML_DECLARATION).unwrap_or(text);
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut stack: Vec<&str> = Vec::new();
+    let mut roots = 0;
+    let mut trust_infos = 0;
+    let mut security_elements = 0;
+    let mut requested_privileges = 0;
+    let mut requested_levels = 0;
+
     while index < bytes.len() {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        if bytes[index] != b'<' {
+            if !bytes[index].is_ascii_whitespace() {
+                return false;
+            }
             index += 1;
-        }
-        if index >= bytes.len() || matches!(bytes[index], b'/' | b'>') {
-            break;
-        }
-        let name_start = index;
-        while index < bytes.len()
-            && !bytes[index].is_ascii_whitespace()
-            && bytes[index] != b'='
-            && bytes[index] != b'>'
-        {
-            index += 1;
-        }
-        let name = &tag[name_start..index];
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] != b'=' {
-            return None;
+            continue;
         }
         index += 1;
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        if index >= bytes.len() || matches!(bytes[index], b'!' | b'?') {
+            return false;
+        }
+        if bytes[index] == b'/' {
             index += 1;
-        }
-        if index >= bytes.len() || !matches!(bytes[index], b'\'' | b'"') {
-            return None;
-        }
-        let quote = bytes[index];
-        index += 1;
-        let value_start = index;
-        while index < bytes.len() && bytes[index] != quote {
+            let Some(name_range) = xml_name(bytes, &mut index) else {
+                return false;
+            };
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b'>') {
+                return false;
+            }
             index += 1;
+            let name = &text[name_range];
+            if stack.pop() != Some(name) {
+                return false;
+            }
+            continue;
         }
-        if index >= bytes.len() {
-            return None;
+
+        let Some(name_range) = xml_name(bytes, &mut index) else {
+            return false;
+        };
+        let name = &text[name_range];
+        if stack.last() == Some(&"requestedExecutionLevel") {
+            return false;
         }
-        let value = &tag[value_start..index];
-        index += 1;
-        if name.eq_ignore_ascii_case(wanted) {
-            if found.replace(value).is_some() {
-                return None;
+        let mut attributes: Vec<(&str, &str)> = Vec::new();
+        let self_closing;
+        loop {
+            let before_whitespace = index;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'>') {
+                index += 1;
+                self_closing = false;
+                break;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'>') {
+                index += 2;
+                self_closing = true;
+                break;
+            }
+            if before_whitespace == index {
+                return false;
+            }
+            let Some(attribute_name_range) = xml_name(bytes, &mut index) else {
+                return false;
+            };
+            let attribute_name = &text[attribute_name_range];
+            if attributes
+                .iter()
+                .any(|(existing, _)| *existing == attribute_name)
+            {
+                return false;
+            }
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b'=') {
+                return false;
+            }
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let Some(quote @ (b'\'' | b'"')) = bytes.get(index).copied() else {
+                return false;
+            };
+            index += 1;
+            let value_start = index;
+            while index < bytes.len() && bytes[index] != quote {
+                if bytes[index] == b'<' {
+                    return false;
+                }
+                index += 1;
+            }
+            if index >= bytes.len() {
+                return false;
+            }
+            let value = &text[value_start..index];
+            index += 1;
+            attributes.push((attribute_name, value));
+        }
+
+        if stack.is_empty() {
+            roots += 1;
+            if name != "assembly" {
+                return false;
             }
         }
+        match name {
+            "trustInfo" => trust_infos += 1,
+            "security" => security_elements += 1,
+            "requestedPrivileges" => requested_privileges += 1,
+            _ => {}
+        }
+        if name == "requestedExecutionLevel" {
+            if stack != ["assembly", "trustInfo", "security", "requestedPrivileges"]
+                || attributes.len() != 2
+                || attributes
+                    .iter()
+                    .find(|(attribute, _)| *attribute == "level")
+                    .map(|(_, value)| *value)
+                    != Some("asInvoker")
+                || attributes
+                    .iter()
+                    .find(|(attribute, _)| *attribute == "uiAccess")
+                    .map(|(_, value)| *value)
+                    != Some("false")
+            {
+                return false;
+            }
+            requested_levels += 1;
+        }
+        if !self_closing {
+            stack.push(name);
+        }
     }
-    found
+
+    roots == 1
+        && stack.is_empty()
+        && trust_infos == 1
+        && security_elements == 1
+        && requested_privileges == 1
+        && requested_levels == 1
 }
 
 pub fn embedded_manifest_is_as_invoker(bytes: &[u8]) -> bool {
     let Some(text) = manifest_text(bytes) else {
         return false;
     };
-    let lower = text.to_ascii_lowercase();
-    let needle = "<requestedexecutionlevel";
-    let Some(start) = lower.find(needle) else {
-        return false;
-    };
-    if lower[start + needle.len()..].contains(needle) {
-        return false;
-    }
-    let Some(relative_end) = lower[start..].find('>') else {
-        return false;
-    };
-    let tag = &text[start + 1..start + relative_end];
-    xml_attribute(tag, "level") == Some("asInvoker")
-        && xml_attribute(tag, "uiAccess") == Some("false")
+    exact_manifest_xml_is_as_invoker(&text)
 }
 
 pub fn verify_current_image_as_invoker() -> Result<(), String> {
@@ -1772,6 +1880,30 @@ mod tests {
         ));
         let duplicate = [valid.as_slice(), valid.as_slice()].concat();
         assert!(!embedded_manifest_is_as_invoker(&duplicate));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly><trustInfo /><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<requestedExecutionLevelEvil level="asInvoker" uiAccess="false" />"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<!-- <requestedExecutionLevel level="asInvoker" uiAccess="false" /> -->"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<?probe value='<requestedExecutionLevel level="asInvoker" uiAccess="false" />'?><assembly />"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<?xml version="1.0"?><assembly><requestedExecutionLevel level="asInvoker" uiAccess="false" /></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly><requestedExecutionLevel level="asInvoker" uiAccess="false" /></wrong>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly><requestedExecutionLevel level="asInvoker" uiAccess="false" extra="x" /></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly><RequestedExecutionLevel level="asInvoker" uiAccess="false" /></assembly>"#
+        ));
     }
 
     #[cfg(feature = "installer-helper-build")]

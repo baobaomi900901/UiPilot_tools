@@ -86,13 +86,40 @@ pub fn next_effect(phase: Phase) -> Effect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    RollbackPreCommit,
+    FinishForward,
+    FailClosed,
+}
+
+pub fn failure_disposition(phase: Phase) -> FailureDisposition {
+    match phase {
+        Phase::JournalCreated
+        | Phase::NewBinaryVerified
+        | Phase::OldServiceStopped
+        | Phase::OldServiceRemoved
+        | Phase::NewServiceInstalled
+        | Phase::NewServiceRunning => FailureDisposition::RollbackPreCommit,
+        Phase::ManifestReplaced | Phase::CleanupComplete => FailureDisposition::FinishForward,
+        Phase::Prepared
+        | Phase::RollbackStarted
+        | Phase::RollbackComplete
+        | Phase::UninstallServiceRemoved
+        | Phase::UninstallDirectoriesRemoved => FailureDisposition::FailClosed,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveService {
     Absent,
     MatchingOldRunning,
     MatchingOldStopped,
     MatchingNewRunning,
     MatchingNewStopped,
+    MatchingBothRunning,
+    MatchingBothStopped,
     Foreign,
+    #[cfg_attr(not(test), allow(dead_code))]
     Ambiguous,
 }
 
@@ -113,7 +140,8 @@ pub fn classify_matching_service(
         (ServiceActivity::Running, false, true) => LiveService::MatchingNewRunning,
         (ServiceActivity::Stopped, false, true) => LiveService::MatchingNewStopped,
         (_, false, false) => LiveService::Foreign,
-        (_, true, true) => LiveService::Ambiguous,
+        (ServiceActivity::Running, true, true) => LiveService::MatchingBothRunning,
+        (ServiceActivity::Stopped, true, true) => LiveService::MatchingBothStopped,
     }
 }
 
@@ -122,7 +150,21 @@ pub enum RollbackDecision {
     StopAndRemoveNewThenRestoreOld,
     RemoveNewThenRestoreOld,
     RestoreOld,
+    StartMatchingThenKeep,
     KeepOld,
+    FailClosedRetainAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldRecoveryState {
+    NotRequired,
+    Ready,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackAuthorization {
+    Authorized(RollbackDecision),
     FailClosedRetainAll,
 }
 
@@ -133,7 +175,191 @@ pub fn rollback_decision(live: LiveService) -> RollbackDecision {
         LiveService::Absent => RollbackDecision::RestoreOld,
         LiveService::MatchingOldRunning => RollbackDecision::KeepOld,
         LiveService::MatchingOldStopped => RollbackDecision::RestoreOld,
+        LiveService::MatchingBothRunning => RollbackDecision::KeepOld,
+        LiveService::MatchingBothStopped => RollbackDecision::StartMatchingThenKeep,
         LiveService::Foreign | LiveService::Ambiguous => RollbackDecision::FailClosedRetainAll,
+    }
+}
+
+pub fn authorize_rollback(
+    decision: RollbackDecision,
+    old_recovery: OldRecoveryState,
+) -> RollbackAuthorization {
+    let authorized = match decision {
+        RollbackDecision::StopAndRemoveNewThenRestoreOld
+        | RollbackDecision::RemoveNewThenRestoreOld => {
+            matches!(
+                old_recovery,
+                OldRecoveryState::Ready | OldRecoveryState::NotRequired
+            )
+        }
+        RollbackDecision::RestoreOld => {
+            matches!(
+                old_recovery,
+                OldRecoveryState::Ready | OldRecoveryState::NotRequired
+            )
+        }
+        RollbackDecision::StartMatchingThenKeep | RollbackDecision::KeepOld => {
+            old_recovery == OldRecoveryState::Ready
+        }
+        RollbackDecision::FailClosedRetainAll => false,
+    };
+    if authorized {
+        RollbackAuthorization::Authorized(decision)
+    } else {
+        RollbackAuthorization::FailClosedRetainAll
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeManifestState {
+    Missing,
+    MatchingOld,
+    MatchingNew,
+    MatchingBoth,
+    Foreign,
+}
+
+pub fn classify_runtime_manifest(
+    present: bool,
+    old_matches: bool,
+    new_matches: bool,
+) -> RuntimeManifestState {
+    match (present, old_matches, new_matches) {
+        (false, false, false) => RuntimeManifestState::Missing,
+        (true, true, false) => RuntimeManifestState::MatchingOld,
+        (true, false, true) => RuntimeManifestState::MatchingNew,
+        (true, true, true) => RuntimeManifestState::MatchingBoth,
+        _ => RuntimeManifestState::Foreign,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardAction {
+    KeepNewAndCleanup,
+    StartNewAndCleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceDecision {
+    Rollback(RollbackDecision),
+    Forward(ForwardAction),
+    FailClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvergenceInput {
+    pub phase: Phase,
+    pub shared_identity: bool,
+    pub runtime_manifest: RuntimeManifestState,
+    pub live_service: LiveService,
+    pub old_recovery: OldRecoveryState,
+}
+
+fn forward_action(input: &ConvergenceInput) -> Option<ForwardAction> {
+    let phase_committed =
+        failure_disposition(input.phase.clone()) == FailureDisposition::FinishForward;
+    let manifest_write_won_phase_race = input.phase == Phase::NewServiceRunning
+        && input.runtime_manifest == RuntimeManifestState::MatchingNew
+        && !input.shared_identity;
+    if !phase_committed && !manifest_write_won_phase_race {
+        return None;
+    }
+    let runtime_is_new = (!input.shared_identity
+        && input.runtime_manifest == RuntimeManifestState::MatchingNew)
+        || (input.shared_identity && input.runtime_manifest == RuntimeManifestState::MatchingBoth);
+    if !runtime_is_new {
+        return None;
+    }
+    match input.live_service {
+        LiveService::MatchingNewRunning if !input.shared_identity => {
+            Some(ForwardAction::KeepNewAndCleanup)
+        }
+        LiveService::MatchingNewStopped if !input.shared_identity => {
+            Some(ForwardAction::StartNewAndCleanup)
+        }
+        LiveService::MatchingBothRunning if input.shared_identity => {
+            Some(ForwardAction::KeepNewAndCleanup)
+        }
+        LiveService::MatchingBothStopped if input.shared_identity => {
+            Some(ForwardAction::StartNewAndCleanup)
+        }
+        _ => None,
+    }
+}
+
+fn precommit_runtime_matches(input: &ConvergenceInput) -> bool {
+    match input.old_recovery {
+        OldRecoveryState::NotRequired => {
+            !input.shared_identity && input.runtime_manifest == RuntimeManifestState::Missing
+        }
+        OldRecoveryState::Ready | OldRecoveryState::Unavailable if input.shared_identity => {
+            input.runtime_manifest == RuntimeManifestState::MatchingBoth
+        }
+        OldRecoveryState::Ready | OldRecoveryState::Unavailable => {
+            input.runtime_manifest == RuntimeManifestState::MatchingOld
+        }
+    }
+}
+
+fn precommit_live_matches(input: &ConvergenceInput) -> bool {
+    let old = matches!(
+        input.live_service,
+        LiveService::MatchingOldRunning | LiveService::MatchingOldStopped
+    ) && !input.shared_identity
+        && input.old_recovery != OldRecoveryState::NotRequired;
+    let shared = matches!(
+        input.live_service,
+        LiveService::MatchingBothRunning | LiveService::MatchingBothStopped
+    ) && input.shared_identity
+        && input.old_recovery != OldRecoveryState::NotRequired;
+    let new = matches!(
+        input.live_service,
+        LiveService::MatchingNewRunning | LiveService::MatchingNewStopped
+    ) && !input.shared_identity;
+    match input.phase {
+        Phase::JournalCreated | Phase::NewBinaryVerified => {
+            input.live_service == LiveService::Absent || old || shared
+        }
+        Phase::OldServiceStopped => {
+            input.live_service == LiveService::Absent
+                || (old && input.live_service == LiveService::MatchingOldStopped)
+                || (shared && input.live_service == LiveService::MatchingBothStopped)
+        }
+        Phase::OldServiceRemoved => {
+            input.live_service == LiveService::Absent
+                || (new && input.live_service == LiveService::MatchingNewStopped)
+                || (shared && input.live_service == LiveService::MatchingBothStopped)
+        }
+        Phase::NewServiceInstalled => new || shared,
+        Phase::NewServiceRunning => {
+            (new && input.live_service == LiveService::MatchingNewRunning)
+                || (shared && input.live_service == LiveService::MatchingBothRunning)
+        }
+        _ => false,
+    }
+}
+
+pub fn convergence_decision(input: &ConvergenceInput) -> ConvergenceDecision {
+    let disposition = failure_disposition(input.phase.clone());
+    if disposition == FailureDisposition::FinishForward
+        || (input.phase == Phase::NewServiceRunning
+            && input.runtime_manifest == RuntimeManifestState::MatchingNew
+            && !input.shared_identity)
+    {
+        return forward_action(input)
+            .map(ConvergenceDecision::Forward)
+            .unwrap_or(ConvergenceDecision::FailClosed);
+    }
+    if disposition != FailureDisposition::RollbackPreCommit
+        || !precommit_runtime_matches(input)
+        || !precommit_live_matches(input)
+    {
+        return ConvergenceDecision::FailClosed;
+    }
+    match authorize_rollback(rollback_decision(input.live_service), input.old_recovery) {
+        RollbackAuthorization::Authorized(decision) => ConvergenceDecision::Rollback(decision),
+        RollbackAuthorization::FailClosedRetainAll => ConvergenceDecision::FailClosed,
     }
 }
 
@@ -307,6 +533,38 @@ mod tests {
     }
 
     #[test]
+    fn failure_disposition_switches_to_forward_only_at_manifest_commit() {
+        for phase in [
+            Phase::JournalCreated,
+            Phase::NewBinaryVerified,
+            Phase::OldServiceStopped,
+            Phase::OldServiceRemoved,
+            Phase::NewServiceInstalled,
+            Phase::NewServiceRunning,
+        ] {
+            assert_eq!(
+                failure_disposition(phase),
+                FailureDisposition::RollbackPreCommit
+            );
+        }
+        for phase in [Phase::ManifestReplaced, Phase::CleanupComplete] {
+            assert_eq!(
+                failure_disposition(phase),
+                FailureDisposition::FinishForward
+            );
+        }
+        for phase in [
+            Phase::Prepared,
+            Phase::RollbackStarted,
+            Phase::RollbackComplete,
+            Phase::UninstallServiceRemoved,
+            Phase::UninstallDirectoriesRemoved,
+        ] {
+            assert_eq!(failure_disposition(phase), FailureDisposition::FailClosed);
+        }
+    }
+
+    #[test]
     fn rollback_never_removes_ambiguous_service() {
         assert_eq!(
             rollback_decision(LiveService::MatchingNewRunning),
@@ -329,6 +587,14 @@ mod tests {
             RollbackDecision::RestoreOld
         );
         assert_eq!(
+            rollback_decision(LiveService::MatchingBothRunning),
+            RollbackDecision::KeepOld
+        );
+        assert_eq!(
+            rollback_decision(LiveService::MatchingBothStopped),
+            RollbackDecision::StartMatchingThenKeep
+        );
+        assert_eq!(
             rollback_decision(LiveService::Foreign),
             RollbackDecision::FailClosedRetainAll
         );
@@ -336,6 +602,786 @@ mod tests {
             rollback_decision(LiveService::Ambiguous),
             RollbackDecision::FailClosedRetainAll
         );
+    }
+
+    #[test]
+    fn rollback_requires_old_preflight_before_authorizing_new_service_removal() {
+        assert_eq!(
+            authorize_rollback(
+                RollbackDecision::StopAndRemoveNewThenRestoreOld,
+                OldRecoveryState::Unavailable,
+            ),
+            RollbackAuthorization::FailClosedRetainAll
+        );
+        assert_eq!(
+            authorize_rollback(
+                RollbackDecision::StopAndRemoveNewThenRestoreOld,
+                OldRecoveryState::Ready,
+            ),
+            RollbackAuthorization::Authorized(RollbackDecision::StopAndRemoveNewThenRestoreOld)
+        );
+        assert_eq!(
+            authorize_rollback(
+                RollbackDecision::RemoveNewThenRestoreOld,
+                OldRecoveryState::NotRequired,
+            ),
+            RollbackAuthorization::Authorized(RollbackDecision::RemoveNewThenRestoreOld)
+        );
+        assert_eq!(
+            authorize_rollback(
+                RollbackDecision::StartMatchingThenKeep,
+                OldRecoveryState::Unavailable,
+            ),
+            RollbackAuthorization::FailClosedRetainAll
+        );
+    }
+
+    #[test]
+    fn convergence_uses_phase_runtime_identity_and_repair_state() {
+        assert_eq!(
+            classify_runtime_manifest(false, false, false),
+            RuntimeManifestState::Missing
+        );
+        assert_eq!(
+            classify_runtime_manifest(true, true, false),
+            RuntimeManifestState::MatchingOld
+        );
+        assert_eq!(
+            classify_runtime_manifest(true, false, true),
+            RuntimeManifestState::MatchingNew
+        );
+        assert_eq!(
+            classify_runtime_manifest(true, true, true),
+            RuntimeManifestState::MatchingBoth
+        );
+        assert_eq!(
+            classify_runtime_manifest(true, false, false),
+            RuntimeManifestState::Foreign
+        );
+        let committed_update = ConvergenceInput {
+            phase: Phase::ManifestReplaced,
+            shared_identity: false,
+            runtime_manifest: RuntimeManifestState::MatchingNew,
+            live_service: LiveService::MatchingNewRunning,
+            old_recovery: OldRecoveryState::Unavailable,
+        };
+        assert_eq!(
+            convergence_decision(&committed_update),
+            ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup)
+        );
+        assert_eq!(
+            convergence_decision(&ConvergenceInput {
+                phase: Phase::NewServiceRunning,
+                ..committed_update
+            }),
+            ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup)
+        );
+        assert_eq!(
+            convergence_decision(&ConvergenceInput {
+                runtime_manifest: RuntimeManifestState::MatchingOld,
+                ..committed_update
+            }),
+            ConvergenceDecision::FailClosed
+        );
+
+        let repair_before_commit = ConvergenceInput {
+            phase: Phase::OldServiceStopped,
+            shared_identity: true,
+            runtime_manifest: RuntimeManifestState::MatchingBoth,
+            live_service: LiveService::MatchingBothStopped,
+            old_recovery: OldRecoveryState::Ready,
+        };
+        assert_eq!(
+            convergence_decision(&repair_before_commit),
+            ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep)
+        );
+        assert_eq!(
+            convergence_decision(&ConvergenceInput {
+                phase: Phase::ManifestReplaced,
+                ..repair_before_commit
+            }),
+            ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup)
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_covers_fresh_update_repair_and_impossible_states() {
+        let fresh = [
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceStopped,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+        ];
+        for (phase, runtime_manifest, live_service, expected) in fresh {
+            assert_eq!(
+                convergence_decision(&ConvergenceInput {
+                    phase,
+                    shared_identity: false,
+                    runtime_manifest,
+                    live_service,
+                    old_recovery: OldRecoveryState::NotRequired,
+                }),
+                expected
+            );
+        }
+
+        let update = [
+            (
+                Phase::JournalCreated,
+                LiveService::MatchingOldRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                LiveService::MatchingOldStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceStopped,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+        ];
+        for (phase, live_service, expected) in update {
+            assert_eq!(
+                convergence_decision(&ConvergenceInput {
+                    phase,
+                    shared_identity: false,
+                    runtime_manifest: RuntimeManifestState::MatchingOld,
+                    live_service,
+                    old_recovery: OldRecoveryState::Ready,
+                }),
+                expected
+            );
+        }
+        for (phase, live_service, expected) in [
+            (
+                Phase::ManifestReplaced,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+        ] {
+            assert_eq!(
+                convergence_decision(&ConvergenceInput {
+                    phase,
+                    shared_identity: false,
+                    runtime_manifest: RuntimeManifestState::MatchingNew,
+                    live_service,
+                    old_recovery: OldRecoveryState::Unavailable,
+                }),
+                expected
+            );
+        }
+
+        let repair = [
+            (
+                Phase::JournalCreated,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::OldServiceStopped,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::ManifestReplaced,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+        ];
+        for (phase, live_service, expected) in repair {
+            assert_eq!(
+                convergence_decision(&ConvergenceInput {
+                    phase,
+                    shared_identity: true,
+                    runtime_manifest: RuntimeManifestState::MatchingBoth,
+                    live_service,
+                    old_recovery: OldRecoveryState::Ready,
+                }),
+                expected
+            );
+        }
+
+        let install_phases = [
+            Phase::JournalCreated,
+            Phase::NewBinaryVerified,
+            Phase::OldServiceStopped,
+            Phase::OldServiceRemoved,
+            Phase::NewServiceInstalled,
+            Phase::NewServiceRunning,
+            Phase::ManifestReplaced,
+            Phase::CleanupComplete,
+        ];
+        for phase in install_phases {
+            for live_service in [LiveService::Foreign, LiveService::Ambiguous] {
+                assert_eq!(
+                    convergence_decision(&ConvergenceInput {
+                        phase: phase.clone(),
+                        shared_identity: false,
+                        runtime_manifest: RuntimeManifestState::MatchingOld,
+                        live_service,
+                        old_recovery: OldRecoveryState::Ready,
+                    }),
+                    ConvergenceDecision::FailClosed
+                );
+            }
+        }
+        for phase in [
+            Phase::Prepared,
+            Phase::RollbackStarted,
+            Phase::RollbackComplete,
+            Phase::UninstallServiceRemoved,
+            Phase::UninstallDirectoriesRemoved,
+        ] {
+            assert_eq!(
+                convergence_decision(&ConvergenceInput {
+                    phase,
+                    shared_identity: false,
+                    runtime_manifest: RuntimeManifestState::MatchingOld,
+                    live_service: LiveService::MatchingOldRunning,
+                    old_recovery: OldRecoveryState::Ready,
+                }),
+                ConvergenceDecision::FailClosed
+            );
+        }
+
+        for input in [
+            ConvergenceInput {
+                phase: Phase::NewServiceInstalled,
+                shared_identity: false,
+                runtime_manifest: RuntimeManifestState::MatchingOld,
+                live_service: LiveService::MatchingNewStopped,
+                old_recovery: OldRecoveryState::Unavailable,
+            },
+            ConvergenceInput {
+                phase: Phase::NewServiceRunning,
+                shared_identity: true,
+                runtime_manifest: RuntimeManifestState::MatchingBoth,
+                live_service: LiveService::MatchingBothRunning,
+                old_recovery: OldRecoveryState::Unavailable,
+            },
+            ConvergenceInput {
+                phase: Phase::OldServiceRemoved,
+                shared_identity: false,
+                runtime_manifest: RuntimeManifestState::MatchingNew,
+                live_service: LiveService::MatchingNewRunning,
+                old_recovery: OldRecoveryState::Ready,
+            },
+            ConvergenceInput {
+                phase: Phase::NewServiceRunning,
+                shared_identity: false,
+                runtime_manifest: RuntimeManifestState::MatchingOld,
+                live_service: LiveService::MatchingBothRunning,
+                old_recovery: OldRecoveryState::Ready,
+            },
+            ConvergenceInput {
+                phase: Phase::ManifestReplaced,
+                shared_identity: false,
+                runtime_manifest: RuntimeManifestState::Foreign,
+                live_service: LiveService::MatchingNewRunning,
+                old_recovery: OldRecoveryState::Ready,
+            },
+        ] {
+            assert_eq!(
+                convergence_decision(&input),
+                ConvergenceDecision::FailClosed
+            );
+        }
+    }
+
+    #[test]
+    fn convergence_matrix_defaults_every_unlisted_phase_runtime_live_tuple_to_fail_closed() {
+        type Case = (
+            Phase,
+            RuntimeManifestState,
+            LiveService,
+            ConvergenceDecision,
+        );
+
+        fn assert_complete_matrix(
+            shared_identity: bool,
+            old_recovery: OldRecoveryState,
+            allowed: &[Case],
+        ) {
+            for phase in [
+                Phase::JournalCreated,
+                Phase::NewBinaryVerified,
+                Phase::OldServiceStopped,
+                Phase::OldServiceRemoved,
+                Phase::NewServiceInstalled,
+                Phase::NewServiceRunning,
+                Phase::ManifestReplaced,
+                Phase::CleanupComplete,
+            ] {
+                for runtime_manifest in [
+                    RuntimeManifestState::Missing,
+                    RuntimeManifestState::MatchingOld,
+                    RuntimeManifestState::MatchingNew,
+                    RuntimeManifestState::MatchingBoth,
+                    RuntimeManifestState::Foreign,
+                ] {
+                    for live_service in [
+                        LiveService::Absent,
+                        LiveService::MatchingOldRunning,
+                        LiveService::MatchingOldStopped,
+                        LiveService::MatchingNewRunning,
+                        LiveService::MatchingNewStopped,
+                        LiveService::MatchingBothRunning,
+                        LiveService::MatchingBothStopped,
+                        LiveService::Foreign,
+                        LiveService::Ambiguous,
+                    ] {
+                        let expected = allowed
+                            .iter()
+                            .find(|(allowed_phase, allowed_runtime, allowed_live, _)| {
+                                allowed_phase == &phase
+                                    && allowed_runtime == &runtime_manifest
+                                    && allowed_live == &live_service
+                            })
+                            .map(|(_, _, _, decision)| *decision)
+                            .unwrap_or(ConvergenceDecision::FailClosed);
+                        assert_eq!(
+                            convergence_decision(&ConvergenceInput {
+                                phase: phase.clone(),
+                                shared_identity,
+                                runtime_manifest,
+                                live_service,
+                                old_recovery,
+                            }),
+                            expected,
+                            "unexpected decision for {phase:?}/{runtime_manifest:?}/{live_service:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let fresh = vec![
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceStopped,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::Missing,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::Missing,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+        ];
+        assert_complete_matrix(false, OldRecoveryState::NotRequired, &fresh);
+
+        let update = vec![
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::MatchingOld,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingOldRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingOldStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::MatchingOld,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingOldRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingOldStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceStopped,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingOldStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceStopped,
+                RuntimeManifestState::MatchingOld,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::MatchingOld,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::RemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingOld,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::StopAndRemoveNewThenRestoreOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingNew,
+                LiveService::MatchingNewRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+        ];
+        assert_complete_matrix(false, OldRecoveryState::Ready, &update);
+
+        let repair = vec![
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::JournalCreated,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::NewBinaryVerified,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::OldServiceStopped,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::OldServiceStopped,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::Absent,
+                ConvergenceDecision::Rollback(RollbackDecision::RestoreOld),
+            ),
+            (
+                Phase::OldServiceRemoved,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Rollback(RollbackDecision::StartMatchingThenKeep),
+            ),
+            (
+                Phase::NewServiceInstalled,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::NewServiceRunning,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Rollback(RollbackDecision::KeepOld),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::ManifestReplaced,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothStopped,
+                ConvergenceDecision::Forward(ForwardAction::StartNewAndCleanup),
+            ),
+            (
+                Phase::CleanupComplete,
+                RuntimeManifestState::MatchingBoth,
+                LiveService::MatchingBothRunning,
+                ConvergenceDecision::Forward(ForwardAction::KeepNewAndCleanup),
+            ),
+        ];
+        assert_complete_matrix(true, OldRecoveryState::Ready, &repair);
+
+        let update_without_old = update
+            .iter()
+            .filter(|(phase, runtime, _, _)| {
+                matches!(phase, Phase::ManifestReplaced | Phase::CleanupComplete)
+                    || (phase == &Phase::NewServiceRunning
+                        && runtime == &RuntimeManifestState::MatchingNew)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_complete_matrix(false, OldRecoveryState::Unavailable, &update_without_old);
+        let repair_without_old = repair
+            .iter()
+            .filter(|(phase, _, _, _)| {
+                matches!(phase, Phase::ManifestReplaced | Phase::CleanupComplete)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_complete_matrix(true, OldRecoveryState::Unavailable, &repair_without_old);
     }
 
     #[test]
@@ -362,7 +1408,11 @@ mod tests {
         );
         assert_eq!(
             classify_matching_service(ServiceActivity::Stopped, true, true),
-            LiveService::Ambiguous
+            LiveService::MatchingBothStopped
+        );
+        assert_eq!(
+            classify_matching_service(ServiceActivity::Running, true, true),
+            LiveService::MatchingBothRunning
         );
     }
 
