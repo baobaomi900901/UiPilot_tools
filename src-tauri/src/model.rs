@@ -227,14 +227,14 @@ pub(crate) struct ResultItem {
     pub(crate) detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) favorite: Option<ResultFavorite>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) has_default_action: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        valid_launcher_completion, LauncherResultActivation, ResultIconKind, SearchResponse,
+        valid_launcher_completion, LauncherResultActivation, ResultIconKind, ResultItem,
+        SearchResponse,
     };
 
     #[test]
@@ -284,6 +284,25 @@ mod tests {
             serde_json::to_value(LauncherResultActivation::Informational).unwrap(),
             serde_json::json!({ "kind": "informational" })
         );
+    }
+
+    #[test]
+    fn informational_result_serializes_explicit_false_default_action() {
+        let value = serde_json::to_value(ResultItem {
+            result_id: "info".into(),
+            activation: LauncherResultActivation::Informational,
+            title: "不支持的货币代码".into(),
+            subtitle: Some("请检查三字母 ISO 4217 代码".into()),
+            icon: None,
+            plugin_icon_url: None,
+            icon_kind: Some(ResultIconKind::Currency),
+            detail: None,
+            favorite: None,
+            has_default_action: false,
+        })
+        .unwrap();
+
+        assert_eq!(value["hasDefaultAction"], serde_json::json!(false));
     }
 
     #[test]
