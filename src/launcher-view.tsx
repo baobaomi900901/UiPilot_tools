@@ -16,7 +16,7 @@ import {
   type InputProps,
   type InputRef,
 } from 'antd'
-import { ArrowLeft, Calculator, Calendar, Clock, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Plus, Ruler, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
+import { ArrowLeft, ArrowRightLeft, Calculator, Calendar, Clock, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Plus, Ruler, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -171,6 +171,13 @@ function BuiltInResultIcon({ kind }: { kind: ResultIconKind }) {
     return (
       <span className="built-in-result-icon built-in-result-icon-calculator" data-result-icon-kind={kind}>
         <Calculator aria-hidden size={27} strokeWidth={1.8} />
+      </span>
+    )
+  }
+  if (kind === 'currency') {
+    return (
+      <span className="built-in-result-icon built-in-result-icon-currency" data-result-icon-kind={kind}>
+        <ArrowRightLeft aria-hidden size={26} strokeWidth={1.8} />
       </span>
     )
   }

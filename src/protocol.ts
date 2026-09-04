@@ -1,6 +1,6 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
-export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'date' | 'timeZone' | 'unit' | 'webSearch'
+export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'currency' | 'date' | 'timeZone' | 'unit' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string }>

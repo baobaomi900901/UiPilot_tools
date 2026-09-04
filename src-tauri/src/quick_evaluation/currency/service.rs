@@ -16,6 +16,17 @@ use super::{
     ExchangeRateResult,
 };
 
+struct UnavailableProvider;
+
+impl ExchangeRateProvider for UnavailableProvider {
+    fn fetch_rate<'a>(
+        &'a self,
+        _request: &'a ExchangeRateRequest,
+    ) -> super::provider::ExchangeRateProviderFuture<'a> {
+        Box::pin(async { Err(ExchangeRateError::Unavailable) })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CurrencyResolveError {
     Invalid(CurrencyFailure),
@@ -80,6 +91,18 @@ impl ExchangeRateService {
             ExchangeRateCache::load(root, now),
             clock,
         ))
+    }
+
+    pub(crate) fn load_or_unavailable(root: &Path) -> Self {
+        Self::load(root).unwrap_or_else(|_| {
+            let clock = Arc::new(SystemUtcClock);
+            let now = clock.now_utc().unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            Self::with_dependencies(
+                Arc::new(UnavailableProvider),
+                ExchangeRateCache::load(root, now),
+                clock,
+            )
+        })
     }
 
     pub(super) fn with_dependencies(

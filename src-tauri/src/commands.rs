@@ -3061,11 +3061,33 @@ pub(crate) async fn search_apps(
     let app = window.app_handle();
     let registries = app.state::<ResultRegistries>();
     let registry = registries.main();
+    let normalized_query = query.trim().to_owned();
+    if completion_origin.is_none() && !normalized_query.starts_with('/') {
+        match resolve_currency_search(
+            registry,
+            &normalized_query,
+            &invocation_id,
+            query_sequence,
+            |intent| {
+                let exchange_rate_service = Arc::clone(
+                    app.state::<Arc<
+                        crate::quick_evaluation::currency::service::ExchangeRateService,
+                    >>()
+                    .inner(),
+                );
+                async move { exchange_rate_service.resolve(intent).await }
+            },
+        )
+        .await
+        {
+            CurrencySearchResponse::Continue => {}
+            CurrencySearchResponse::Published(response) => return Ok(response),
+        }
+    }
     let cache = app.state::<Arc<AppCache>>();
     let settings = app.state::<SettingsStore>();
     let public = app.state::<Arc<PublicPluginService>>();
     let quicklinks = app.state::<Arc<QuicklinksStore>>();
-    let normalized_query = query.trim().to_owned();
     let settings_snapshot = settings.snapshot();
     let web_search_engine = settings_snapshot.web_search_engine;
     let quicklink_items = quicklinks.list().items;
@@ -3949,6 +3971,14 @@ where
             crate::quick_evaluation::evaluate(intent, local_today, utc_now)
         }
     };
+    publish_quick_evaluation_result(registry, token, evaluated)
+}
+
+fn publish_quick_evaluation_result(
+    registry: &ResultRegistry,
+    token: QueryToken,
+    evaluated: Result<crate::quick_evaluation::QuickOutput, crate::quick_evaluation::QuickFailure>,
+) -> Option<SearchResponse> {
     let (item, action, refresh_at_utc) = match evaluated {
         Ok(output) => {
             let crate::quick_evaluation::QuickOutput {
@@ -3969,6 +3999,7 @@ where
                 _ => None,
             };
             let icon_kind = match kind {
+                crate::quick_evaluation::QuickKind::Currency => ResultIconKind::Currency,
                 crate::quick_evaluation::QuickKind::Unit => ResultIconKind::Unit,
                 crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
                 crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
@@ -3993,6 +4024,7 @@ where
         }
         Err(failure) => {
             let icon_kind = match failure.kind {
+                crate::quick_evaluation::QuickKind::Currency => ResultIconKind::Currency,
                 crate::quick_evaluation::QuickKind::Unit => ResultIconKind::Unit,
                 crate::quick_evaluation::QuickKind::Arithmetic => ResultIconKind::Calculator,
                 crate::quick_evaluation::QuickKind::Date => ResultIconKind::Date,
@@ -4037,6 +4069,108 @@ where
             refresh_at_utc,
         },
     )
+}
+
+#[cfg(test)]
+async fn search_apps_with_catalog_and_currency<S, D, P, L, U, R, F>(
+    registry: &ResultRegistry,
+    request: CatalogSearchRequest<'_>,
+    plugin_catalog: P,
+    snapshot: S,
+    decorate: D,
+    local_today: L,
+    utc_now: U,
+    resolver: R,
+) -> Option<SearchResponse>
+where
+    S: FnOnce() -> Vec<Application>,
+    D: FnOnce(&mut [Application]),
+    P: FnOnce(
+        &str,
+    ) -> Result<
+        Vec<crate::public_plugins::PublicCommandSuggestion>,
+        PublicPluginManagementError,
+    >,
+    L: FnOnce() -> Result<time::Date, ()>,
+    U: FnOnce() -> Result<time::OffsetDateTime, ()>,
+    R: FnOnce(crate::quick_evaluation::currency::CurrencyIntent) -> F,
+    F: Future<
+        Output = Result<
+            crate::quick_evaluation::currency::CurrencyOutput,
+            crate::quick_evaluation::currency::service::CurrencyResolveError,
+        >,
+    >,
+{
+    match resolve_currency_search(
+        registry,
+        request.query,
+        request.invocation_id,
+        request.query_sequence,
+        resolver,
+    )
+    .await
+    {
+        CurrencySearchResponse::Published(response) => response,
+        CurrencySearchResponse::Continue => search_apps_with_catalog_with_clocks(
+            registry,
+            request,
+            plugin_catalog,
+            snapshot,
+            decorate,
+            local_today,
+            utc_now,
+        ),
+    }
+}
+
+enum CurrencySearchResponse {
+    Continue,
+    Published(Option<SearchResponse>),
+}
+
+async fn resolve_currency_search<R, F>(
+    registry: &ResultRegistry,
+    query: &str,
+    invocation_id: &str,
+    query_sequence: u64,
+    resolver: R,
+) -> CurrencySearchResponse
+where
+    R: FnOnce(crate::quick_evaluation::currency::CurrencyIntent) -> F,
+    F: Future<
+        Output = Result<
+            crate::quick_evaluation::currency::CurrencyOutput,
+            crate::quick_evaluation::currency::service::CurrencyResolveError,
+        >,
+    >,
+{
+    match crate::quick_evaluation::classify(query.trim()) {
+        crate::quick_evaluation::QuickClassification::Invalid(failure)
+            if failure.kind == crate::quick_evaluation::QuickKind::Currency =>
+        {
+            let token =
+                registry.begin_query(QueryDomain::Application, invocation_id, query_sequence);
+            CurrencySearchResponse::Published(
+                token.and_then(|token| {
+                    publish_quick_evaluation_result(registry, token, Err(failure))
+                }),
+            )
+        }
+        crate::quick_evaluation::QuickClassification::Ready(
+            crate::quick_evaluation::QuickIntent::Currency(intent),
+        ) => {
+            let Some(token) =
+                registry.begin_query(QueryDomain::Application, invocation_id, query_sequence)
+            else {
+                return CurrencySearchResponse::Published(None);
+            };
+            let evaluated = crate::quick_evaluation::evaluate_currency(intent, resolver).await;
+            CurrencySearchResponse::Published(publish_quick_evaluation_result(
+                registry, token, evaluated,
+            ))
+        }
+        _ => CurrencySearchResponse::Continue,
+    }
 }
 
 fn search_apps_with_catalog_with_clocks<S, D, P, L, U>(
@@ -5306,12 +5440,13 @@ mod tests {
         publish_public_command_suggestions, publish_quick_evaluation, require_find_label,
         require_main_label, resolve_invocation_theme, save_settings_core, save_settings_with,
         save_settings_worker_with, search_apps_with, search_apps_with_catalog,
-        search_apps_with_clocks, search_apps_with_local_date, search_files_with,
-        select_public_plugin_source_with, set_file_preview_preference_with, start_host_input_focus,
-        submitted_main_result_command, CatalogSearchRequest, CommandError, CompletionOriginInput,
-        CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome,
-        HostInputFocusStart, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
-        ThemePreferenceUpdate, UserSettingsUpdate,
+        search_apps_with_catalog_and_currency, search_apps_with_clocks,
+        search_apps_with_local_date, search_files_with, select_public_plugin_source_with,
+        set_file_preview_preference_with, start_host_input_focus, submitted_main_result_command,
+        CatalogSearchRequest, CommandError, CompletionOriginInput, CompletionOriginPhase,
+        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HostInputFocusStart,
+        HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate,
+        UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -5330,6 +5465,7 @@ mod tests {
             PluginInvocationTheme, PublicActivationMode, PublicCommandSuggestion, PublicOutputMode,
             PublicPluginRoute, TimerError, WindowStorageError,
         },
+        quick_evaluation::currency::{service::CurrencyResolveError, CurrencyOutput},
         quicklinks::QuicklinkView,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{
@@ -7803,6 +7939,280 @@ mod tests {
                     query: "windows".into(),
                 }
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn currency_search_is_exclusive_and_keeps_exact_copy_private_without_other_reads() {
+        let registry = ready_registry("currency");
+        let favorites = BTreeSet::new();
+        let response = search_apps_with_catalog_and_currency(
+            &registry,
+            CatalogSearchRequest {
+                query: "100 USD to CNY",
+                invocation_id: "currency",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &favorites,
+                quicklinks: &[],
+            },
+            |_| panic!("recognized currency must not read plugins"),
+            || panic!("recognized currency must not read the app cache"),
+            |_| panic!("recognized currency must not decorate applications"),
+            || panic!("recognized currency must not read the local date"),
+            || panic!("recognized currency must not read the UTC clock"),
+            |intent| async move {
+                assert_eq!(intent.base.as_str(), "USD");
+                assert_eq!(intent.quote.as_str(), "CNY");
+                Ok(CurrencyOutput {
+                    title: "713.245 CNY".into(),
+                    subtitle: "100 USD · 1 USD = 7.13245 CNY · Frankfurter · 汇率日期 2026-09-03"
+                        .into(),
+                    copy_text: "713.245 CNY".into(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.replace_local_results);
+        assert_eq!(response.refresh_at_utc, None);
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.title, "713.245 CNY");
+        assert_eq!(
+            item.subtitle.as_deref(),
+            Some("100 USD · 1 USD = 7.13245 CNY · Frankfurter · 汇率日期 2026-09-03")
+        );
+        assert_eq!(
+            serde_json::to_value(item).unwrap()["iconKind"],
+            serde_json::json!("currency")
+        );
+        assert_eq!(
+            item.activation,
+            crate::model::LauncherResultActivation::ExecuteResult
+        );
+        assert!(item.has_default_action);
+        assert_eq!(item.favorite, None);
+        assert_eq!(item.detail, None);
+        assert!(!item.result_id.is_empty());
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Ok(ResultAction::CopyBuiltInText {
+                text: "713.245 CNY".into()
+            })
+        );
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(wire.get("refreshAtUtc").is_none());
+        assert!(!wire.to_string().contains("CopyBuiltInText"));
+    }
+
+    #[test]
+    fn currency_command_routes_before_catalog_settings_quicklinks_apps_and_plugins() {
+        let source = include_str!("commands.rs").replace("\r\n", "\n");
+        let command = source
+            .split("pub(crate) async fn search_apps(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n#[tauri::command]").next())
+            .expect("search_apps command body is missing");
+        let currency = command
+            .find("resolve_currency_search(")
+            .expect("currency early route is missing");
+        for deferred in [
+            "app.state::<Arc<AppCache>>()",
+            "app.state::<SettingsStore>()",
+            "app.state::<Arc<PublicPluginService>>()",
+            "app.state::<Arc<QuicklinksStore>>()",
+            "settings.snapshot()",
+            "quicklinks.list()",
+        ] {
+            assert!(
+                currency < command.find(deferred).expect("catalog read is missing"),
+                "currency route must precede {deferred}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn currency_stale_fallback_dto_keeps_cache_date_and_fetch_time() {
+        let registry = ready_registry("stale-currency-cache");
+        let favorites = BTreeSet::new();
+        let response = search_apps_with_catalog_and_currency(
+            &registry,
+            CatalogSearchRequest {
+                query: "100 USD to CNY",
+                invocation_id: "stale-currency-cache",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &favorites,
+                quicklinks: &[],
+            },
+            |_| panic!("recognized currency must not read plugins"),
+            || panic!("recognized currency must not read the app cache"),
+            |_| panic!("recognized currency must not decorate applications"),
+            || panic!("recognized currency must not read the local date"),
+            || panic!("recognized currency must not read the UTC clock"),
+            |_| async {
+                Ok(CurrencyOutput {
+                    title: "713.245 CNY".into(),
+                    subtitle: "100 USD · 1 USD = 7.13245 CNY · Frankfurter · 汇率日期 2026-09-03 · 缓存 · 获取于 2026-09-04T01:02:03Z".into(),
+                    copy_text: "713.245 CNY".into(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.items[0].subtitle.as_deref(),
+            Some("100 USD · 1 USD = 7.13245 CNY · Frankfurter · 汇率日期 2026-09-03 · 缓存 · 获取于 2026-09-04T01:02:03Z")
+        );
+        assert_eq!(response.refresh_at_utc, None);
+    }
+
+    #[tokio::test]
+    async fn currency_partial_text_continues_the_existing_application_route() {
+        let registry = ready_registry("partial-currency");
+        let favorites = BTreeSet::new();
+        let mut matching_application = application(1);
+        matching_application.display_name = "100 USD".into();
+        let response = search_apps_with_catalog_and_currency(
+            &registry,
+            CatalogSearchRequest {
+                query: "100 USD",
+                invocation_id: "partial-currency",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &favorites,
+                quicklinks: &[],
+            },
+            |_| Ok(Vec::new()),
+            || vec![matching_application],
+            |_| {},
+            || panic!("partial currency must not become date arithmetic"),
+            || panic!("partial currency must not become time-zone evaluation"),
+            |_| async { panic!("partial currency must not call the resolver") },
+        )
+        .await
+        .unwrap();
+
+        assert!(!response.replace_local_results);
+        assert!(response.items.iter().any(|item| item.title == "100 USD"));
+        assert!(response.items.iter().any(|item| item.title == "Bing 搜索"));
+    }
+
+    #[tokio::test]
+    async fn currency_query_begins_owner_before_await_and_discards_a_late_response() {
+        let registry = ready_registry("late-currency");
+        let favorites = BTreeSet::new();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let pending = search_apps_with_catalog_and_currency(
+            &registry,
+            CatalogSearchRequest {
+                query: "100 USD to CNY",
+                invocation_id: "late-currency",
+                query_sequence: 1,
+                submit: false,
+                web_search_engine: WebSearchEngine::Bing,
+                favorite_builtin_features: &favorites,
+                quicklinks: &[],
+            },
+            |_| panic!("recognized currency must not read plugins"),
+            || panic!("recognized currency must not read the app cache"),
+            |_| panic!("recognized currency must not decorate applications"),
+            || panic!("recognized currency must not read the local date"),
+            || panic!("recognized currency must not read the UTC clock"),
+            |_| async move {
+                released.await.unwrap();
+                Ok(CurrencyOutput {
+                    title: "713.245 CNY".into(),
+                    subtitle: "fresh".into(),
+                    copy_text: "713.245 CNY".into(),
+                })
+            },
+        );
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(registry
+            .begin_query(QueryDomain::Application, "late-currency", 1)
+            .is_none());
+        assert!(registry
+            .begin_query(QueryDomain::Application, "late-currency", 2)
+            .is_some());
+
+        release.send(()).unwrap();
+        assert!(pending.await.is_none());
+    }
+
+    #[tokio::test]
+    async fn currency_unsupported_and_unavailable_rows_are_informational_without_metadata() {
+        for (sequence, error, title, subtitle) in [
+            (
+                1,
+                CurrencyResolveError::Invalid(
+                    crate::quick_evaluation::currency::CurrencyFailure::InvalidCode,
+                ),
+                "不支持的货币代码",
+                "请检查三字母 ISO 4217 代码",
+            ),
+            (
+                2,
+                CurrencyResolveError::Unavailable,
+                "汇率暂不可用",
+                "请稍后重试",
+            ),
+        ] {
+            let invocation_id = format!("currency-error-{sequence}");
+            let registry = ready_registry(&invocation_id);
+            let favorites = BTreeSet::new();
+            let response = search_apps_with_catalog_and_currency(
+                &registry,
+                CatalogSearchRequest {
+                    query: "100 USD to XYZ",
+                    invocation_id: &invocation_id,
+                    query_sequence: sequence,
+                    submit: false,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &favorites,
+                    quicklinks: &[],
+                },
+                |_| panic!("recognized currency must not read plugins"),
+                || panic!("recognized currency must not read the app cache"),
+                |_| panic!("recognized currency must not decorate applications"),
+                || panic!("recognized currency must not read the local date"),
+                || panic!("recognized currency must not read the UTC clock"),
+                |_| async move { Err(error) },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.items.len(), 1);
+            let item = &response.items[0];
+            assert_eq!(item.title, title);
+            assert_eq!(item.subtitle.as_deref(), Some(subtitle));
+            assert_eq!(
+                item.activation,
+                crate::model::LauncherResultActivation::Informational
+            );
+            assert_eq!(item.icon_kind, Some(crate::model::ResultIconKind::Currency));
+            assert!(!item.has_default_action);
+            assert_eq!(item.favorite, None);
+            assert_eq!(item.detail, None);
+            assert_eq!(
+                registry.resolve(&response.request_id, &item.result_id),
+                Err(RegistryError::UnknownResult)
+            );
+            let wire = serde_json::to_value(&response).unwrap();
+            assert!(wire.get("refreshAtUtc").is_none());
+            assert!(wire["items"][0].get("favorite").is_none());
+            assert!(wire["items"][0].get("detail").is_none());
         }
     }
 

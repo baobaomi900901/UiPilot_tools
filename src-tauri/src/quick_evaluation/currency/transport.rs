@@ -59,6 +59,7 @@ impl ProviderHttpRequest {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn method(&self) -> &str {
         self.method
     }
@@ -67,6 +68,7 @@ impl ProviderHttpRequest {
         &self.path_and_query
     }
 
+    #[cfg(test)]
     pub(crate) fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
     }
@@ -144,6 +146,7 @@ impl ProviderHttpResponse {
         &self.body
     }
 
+    #[cfg(test)]
     pub(crate) fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
     }

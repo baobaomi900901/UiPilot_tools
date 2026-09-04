@@ -104,6 +104,15 @@ fn load_settings_store(
 }
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+fn load_exchange_rate_service(
+    app_data_dir: &std::path::Path,
+) -> Arc<quick_evaluation::currency::service::ExchangeRateService> {
+    Arc::new(
+        quick_evaluation::currency::service::ExchangeRateService::load_or_unavailable(app_data_dir),
+    )
+}
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 fn lifecycle_setup_error() -> std::io::Error {
     std::io::Error::other("lifecycle setup failed")
 }
@@ -117,6 +126,10 @@ fn setup_production_lifecycle(
     public_plugin_service: &Arc<public_plugins::PublicPluginService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
+    let exchange_rate_service = load_exchange_rate_service(&app_data_dir);
+    if !app.manage(Arc::clone(&exchange_rate_service)) {
+        return Err(lifecycle_setup_error().into());
+    }
     plugin_manager.load(&app_data_dir, Version::new(0, 3, 0))?;
     plugin_manager.create_runtimes(app, &app_data_dir)?;
     let message_center = Arc::new(message_center::MessageCenterService::load(&app_data_dir));
@@ -576,7 +589,8 @@ mod tests {
 
     use super::{
         apps::{AppCache, Application, ApplicationLaunchTarget},
-        load_settings_store,
+        load_exchange_rate_service, load_settings_store,
+        quick_evaluation::currency::CurrencyClassification,
         settings::Settings,
     };
 
@@ -637,6 +651,47 @@ mod tests {
         };
 
         has_directive("allow") || has_directive("expect")
+    }
+
+    #[tokio::test]
+    async fn host_manages_exchange_rate_service_once_and_cache_failure_is_nonfatal() {
+        let dir = TestDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("exchange-rate-cache.json"),
+            b"not valid exchange-rate cache json",
+        )
+        .unwrap();
+
+        let service = load_exchange_rate_service(dir.path());
+        let CurrencyClassification::Ready(intent) =
+            super::quick_evaluation::currency::classify("12.5 USD to USD")
+        else {
+            panic!("expected same-code currency intent");
+        };
+        assert_eq!(service.resolve(intent).await.unwrap().title, "12.5 USD");
+
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("test module marker is missing");
+        assert_eq!(
+            production
+                .matches(".manage(Arc::clone(&exchange_rate_service))")
+                .count(),
+            1
+        );
+        let app_data_dir = production
+            .find("let app_data_dir = app.path().app_data_dir()?;")
+            .expect("app data directory must be loaded during setup");
+        let load = production
+            .find("let exchange_rate_service = load_exchange_rate_service(&app_data_dir);")
+            .expect("exchange-rate service must be loaded during setup");
+        let manage = production
+            .find(".manage(Arc::clone(&exchange_rate_service))")
+            .expect("exchange-rate service must be managed");
+        assert!(app_data_dir < load && load < manage);
     }
 
     #[test]

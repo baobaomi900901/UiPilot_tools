@@ -1895,6 +1895,11 @@ label,
   background: var(--uipilot-ui-icon-yellow-soft);
 }
 
+.launcher-view .built-in-result-icon-currency {
+  color: var(--uipilot-ui-icon-green);
+  background: var(--uipilot-ui-icon-green-soft);
+}
+
 .launcher-view .built-in-result-icon-date {
   color: var(--uipilot-ui-icon-blue);
   background: var(--uipilot-ui-icon-blue-soft);

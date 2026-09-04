@@ -137,6 +137,7 @@ impl ExchangeRateCache {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn load_with_reader(
         root: &Path,
         now: OffsetDateTime,
@@ -225,6 +226,7 @@ impl ExchangeRateCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn store(
         &mut self,
         result: ExchangeRateResult,

@@ -449,7 +449,7 @@ function safeApplicationIcon(value: unknown): string | undefined {
 }
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
-  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'date' || value === 'timeZone' || value === 'unit' || value === 'webSearch'
+  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'currency' || value === 'date' || value === 'timeZone' || value === 'unit' || value === 'webSearch'
     ? value
     : undefined
 }

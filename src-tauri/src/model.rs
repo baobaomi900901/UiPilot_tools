@@ -8,6 +8,7 @@ pub(crate) enum ResultIconKind {
     Find,
     Quicklinks,
     Calculator,
+    Currency,
     Date,
     TimeZone,
     Unit,

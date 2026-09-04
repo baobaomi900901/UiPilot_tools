@@ -2090,7 +2090,7 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().selectedIndex).toBe(0)
   })
 
-  it('carries exact result icon kinds including the unit icon and falls back for injected unknown values', async () => {
+  it('carries the exact currency icon kind and falls back for injected unknown values', async () => {
     const { core, client, emit } = await startedCore()
     const response = deferred<SearchResponse | null>()
     vi.mocked(client.searchApps).mockReturnValueOnce(response.promise)
@@ -2105,6 +2105,7 @@ describe('shown and search ownership', () => {
         findLauncherItem('alpha'),
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'currency', title: '713.245 CNY', iconKind: 'currency', activation: executeActivation },
         { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
         { resultId: 'unit', title: '39.3701 in', iconKind: 'unit', activation: executeActivation },
         { resultId: 'web', title: 'Bing 搜索', iconKind: 'webSearch', activation: executeActivation },
@@ -2126,6 +2127,7 @@ describe('shown and search ownership', () => {
       { title: '/find', iconKind: 'find', icon: undefined, pluginIconUrl: undefined },
       { title: '/quicklinks', iconKind: 'quicklinks', icon: undefined, pluginIconUrl: undefined },
       { title: '2', iconKind: 'calculator', icon: undefined, pluginIconUrl: undefined },
+      { title: '713.245 CNY', iconKind: 'currency', icon: undefined, pluginIconUrl: undefined },
       { title: '2026-09-10', iconKind: 'date', icon: undefined, pluginIconUrl: undefined },
       { title: '39.3701 in', iconKind: 'unit', icon: undefined, pluginIconUrl: undefined },
       { title: 'Bing 搜索', iconKind: 'webSearch', icon: undefined, pluginIconUrl: undefined },
@@ -6490,7 +6492,7 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(/@media \(forced-colors: active\)[\s\S]*\.os-theme-uipilot\s*\{[^}]*--os-handle-bg:\s*ButtonText;/s)
   })
 
-  it('renders the exact time icon and existing result icons with stable decorative dimensions', async () => {
+  it('renders the exact currency icon and existing result icons with stable decorative dimensions', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -6500,6 +6502,7 @@ describe('React view and accessibility', () => {
         findLauncherItem('icons'),
         { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
         { resultId: 'calculator', title: '2', iconKind: 'calculator', activation: executeActivation },
+        { resultId: 'currency', title: '713.245 CNY', iconKind: 'currency', activation: executeActivation },
         { resultId: 'date', title: '2026-09-10', iconKind: 'date', activation: executeActivation },
         { resultId: 'time-zone', title: '10:35', iconKind: 'timeZone', activation: executeActivation },
         { resultId: 'unit', title: '39.3701 in', iconKind: 'unit', activation: executeActivation },
@@ -6522,7 +6525,7 @@ describe('React view and accessibility', () => {
     await act(async () =>
       core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'icons', inputType: 'insertText' }),
     )
-    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(11))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(12))
 
     const rows = [...mounted.host.querySelectorAll<HTMLElement>('[role="option"]')]
     const rowWithTitle = (title: string) =>
@@ -6530,6 +6533,7 @@ describe('React view and accessibility', () => {
     const find = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="find"]')
     const quicklinks = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="quicklinks"]')
     const calculator = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="calculator"]')
+    const currency = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="currency"]')
     const date = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="date"]')
     const timeZone = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="timeZone"]')
     const unit = mounted.host.querySelector<HTMLElement>('[data-result-icon-kind="unit"]')
@@ -6537,12 +6541,13 @@ describe('React view and accessibility', () => {
     expect(find?.querySelector('.lucide-folder-search')).toBeTruthy()
     expect(quicklinks?.querySelector('.lucide-link-2')).toBeTruthy()
     expect(calculator?.querySelector('.lucide-calculator')).toBeTruthy()
+    expect(currency?.querySelector('.lucide-arrow-right-left')?.getAttribute('aria-hidden')).toBe('true')
     expect(date?.querySelector('.lucide-calendar')?.getAttribute('aria-hidden')).toBe('true')
     expect(timeZone?.querySelector('.lucide-clock')?.getAttribute('aria-hidden')).toBe('true')
     expect(unit?.querySelector('.lucide-ruler')?.getAttribute('aria-hidden')).toBe('true')
     expect(web?.querySelector('.lucide-panels-top-left')).toBeTruthy()
     expect(web?.querySelector('.lucide-search')).toBeTruthy()
-    for (const icon of [find, quicklinks, calculator, date, timeZone, unit, web]) {
+    for (const icon of [find, quicklinks, calculator, currency, date, timeZone, unit, web]) {
       expect(icon?.closest('.result-icon')?.getAttribute('aria-hidden')).toBe('true')
     }
     expect(rowWithTitle('/demo-win')?.querySelector('.plugin-icon-image')).toBeInstanceOf(HTMLImageElement)
@@ -6550,6 +6555,9 @@ describe('React view and accessibility', () => {
     expect(rowWithTitle('Unknown icon')?.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(rowWithTitle('Fallback')?.querySelector('.result-icon .app-mark:not([hidden])')).toBeTruthy()
     expect(stylesSource).toMatch(/\.built-in-result-icon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(
+      /\.launcher-view \.built-in-result-icon-currency\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-green\);[^}]*background:\s*var\(--uipilot-ui-icon-green-soft\);/s,
+    )
     expect(stylesSource).toMatch(
       /\.launcher-view \.built-in-result-icon-date\s*\{[^}]*color:\s*var\(--uipilot-ui-icon-blue\);[^}]*background:\s*var\(--uipilot-ui-icon-blue-soft\);/s,
     )
@@ -6567,9 +6575,125 @@ describe('React view and accessibility', () => {
     expect(stylesSource).toMatch(
       /@media \(forced-colors: active\)[\s\S]*\.result-row\.is-selected \.built-in-result-icon,[\s\S]*color:\s*HighlightText !important;/s,
     )
-    expect(launcherViewSource).toMatch(/import \{[^}]*\bClock\b[^}]*\bRuler\b[^}]*\} from 'lucide-react'/s)
+    expect(launcherViewSource).toMatch(/import \{[^}]*\bArrowRightLeft\b[^}]*\bClock\b[^}]*\bRuler\b[^}]*\} from 'lucide-react'/s)
     expect(stylesSource).toMatch(/\.built-in-result-icon-badge\s*\{[^}]*position:\s*absolute;/s)
     await mounted.unmount()
+  })
+
+  it('keeps a cold currency conversion pending then copies a long stale result without favorite UI', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const response = deferred<SearchResponse | null>()
+    const staleSubtitle = `${'100 USD · '.repeat(30)}1 USD = 7.13245 CNY · Frankfurter · 汇率日期 2026-09-03 · 缓存 · 获取于 2026-09-03T12:34:56Z`
+    vi.mocked(fake.client.searchApps).mockImplementation((request) =>
+      request.query === '100 USD to CNY'
+        ? response.promise
+        : Promise.resolve({ requestId: 'currency-empty', items: [] }),
+    )
+    vi.mocked(fake.client.executeResult).mockResolvedValue({ status: 'textCopied' })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('currency-copy')))
+    await act(async () => core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '100 USD to CNY',
+      inputType: 'insertText',
+    }))
+
+    await vi.waitFor(() => expect(core.getSnapshot()).toMatchObject({
+      searchPending: true,
+      results: [],
+      selectedIndex: -1,
+    }))
+    await act(async () => {
+      response.resolve({
+        requestId: 'currency-copy-request',
+        items: [{
+          resultId: 'opaque-currency-copy-id',
+          title: '713.245 CNY',
+          subtitle: staleSubtitle,
+          iconKind: 'currency',
+          activation: executeActivation,
+          hasDefaultAction: true,
+        }],
+        replaceLocalResults: true,
+      } as unknown as SearchResponse)
+      await response.promise
+    })
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+
+    const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const option = mounted.host.querySelector<HTMLElement>('[role="option"]')!
+    expect(core.getSnapshot()).toMatchObject({ searchPending: false, selectedIndex: 0 })
+    expect(option.querySelector('.result-subtitle')?.textContent).toBe(staleSubtitle)
+    expect(option.querySelector('.result-favorite-star')).toBeNull()
+    expect(core.getSnapshot().results[0]).toMatchObject({ iconKind: 'currency' })
+    expect(core.getSnapshot().results[0]).not.toHaveProperty('favorite')
+    expect(core.getSnapshot().results[0]).not.toHaveProperty('detail')
+
+    const contextEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    await act(async () => { option.dispatchEvent(contextEvent) })
+    expect(contextEvent.defaultPrevented).toBe(false)
+    expect(document.querySelector('[role="menuitem"]')).toBeNull()
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(fake.client.executeResult).toHaveBeenLastCalledWith({
+      requestId: 'currency-copy-request',
+      resultId: 'opaque-currency-copy-id',
+    })
+    await act(async () => option.click())
+    await vi.waitFor(() => expect(fake.client.executeResult).toHaveBeenCalledTimes(2))
+    expect(fake.client.hideLauncher).not.toHaveBeenCalled()
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('keeps a currency conversion visible with a Chinese error when clipboard copy fails', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'currency-copy-failure',
+      items: [{
+        resultId: 'opaque-currency-id',
+        title: '713.245 CNY',
+        subtitle: '100 USD · 1 USD = 7.13245 CNY · Frankfurter · 汇率日期 2026-09-03',
+        iconKind: 'currency',
+        hasDefaultAction: true,
+        activation: executeActivation,
+      }],
+      replaceLocalResults: true,
+    } as unknown as SearchResponse)
+    vi.mocked(client.executeResult).mockRejectedValueOnce({
+      code: 'clipboardWriteFailed',
+      message: 'private clipboard detail',
+    })
+    emit(shown('currency-copy-failure'))
+    core.text({
+      kind: 'ordinaryInput',
+      control: core.getSnapshot().queryControl,
+      value: '100 USD to CNY',
+      inputType: 'insertText',
+    })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+
+    expect(client.executeResult).toHaveBeenCalledWith({
+      requestId: 'currency-copy-failure',
+      resultId: 'opaque-currency-id',
+    })
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher',
+      query: '100 USD to CNY',
+      status: '无法复制到剪贴板。',
+      results: [{ title: '713.245 CNY' }],
+    })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private clipboard detail')
   })
 
   it('activates a successful unit conversion by Enter and click without favorite context UI', async () => {

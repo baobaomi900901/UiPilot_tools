@@ -1,5 +1,5 @@
 mod arithmetic;
-mod currency;
+pub(crate) mod currency;
 mod date;
 mod number;
 mod time_zone;
@@ -11,6 +11,7 @@ const MAX_QUERY_BYTES: usize = 400;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QuickKind {
+    Currency,
     Unit,
     Arithmetic,
     Date,
@@ -26,6 +27,7 @@ pub(crate) enum QuickClassification {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QuickIntent {
+    Currency(currency::CurrencyIntent),
     Unit(units::UnitIntent),
     Arithmetic(arithmetic::ArithmeticIntent),
     Date(date::DateIntent),
@@ -49,6 +51,15 @@ pub(crate) struct QuickOutput {
 }
 
 pub(crate) fn classify(source: &str) -> QuickClassification {
+    match currency::classify(source) {
+        currency::CurrencyClassification::NoMatch => {}
+        currency::CurrencyClassification::Invalid(reason) => {
+            return QuickClassification::Invalid(currency_failure(reason));
+        }
+        currency::CurrencyClassification::Ready(intent) => {
+            return QuickClassification::Ready(QuickIntent::Currency(intent));
+        }
+    }
     let date = date::classify(source);
     if !matches!(date, QuickClassification::NoMatch) {
         return date;
@@ -100,6 +111,7 @@ where
     U: FnOnce() -> Result<OffsetDateTime, ()>,
 {
     match intent {
+        QuickIntent::Currency(_) => Err(currency_unavailable()),
         QuickIntent::Unit(intent) => units::evaluate(intent)
             .map(|output| QuickOutput {
                 kind: QuickKind::Unit,
@@ -152,6 +164,54 @@ where
                     }
                 })
         }
+    }
+}
+
+pub(crate) async fn evaluate_currency<R, F>(
+    intent: currency::CurrencyIntent,
+    resolver: R,
+) -> Result<QuickOutput, QuickFailure>
+where
+    R: FnOnce(currency::CurrencyIntent) -> F,
+    F: std::future::Future<
+        Output = Result<currency::CurrencyOutput, currency::service::CurrencyResolveError>,
+    >,
+{
+    resolver(intent)
+        .await
+        .map(|output| QuickOutput {
+            kind: QuickKind::Currency,
+            title: output.title,
+            subtitle: Some(output.subtitle),
+            copy_text: output.copy_text,
+            refresh_at_utc: None,
+        })
+        .map_err(|error| match error {
+            currency::service::CurrencyResolveError::Invalid(reason) => currency_failure(reason),
+            currency::service::CurrencyResolveError::Unavailable => currency_unavailable(),
+        })
+}
+
+fn currency_failure(reason: currency::CurrencyFailure) -> QuickFailure {
+    let (title, explanation) = match reason {
+        currency::CurrencyFailure::InvalidNumber => ("货币换算无效", "请检查金额格式"),
+        currency::CurrencyFailure::InvalidCode => {
+            ("不支持的货币代码", "请检查三字母 ISO 4217 代码")
+        }
+        currency::CurrencyFailure::CalculationOverflow => ("货币换算超出范围", "请缩小金额后重试"),
+    };
+    QuickFailure {
+        kind: QuickKind::Currency,
+        title: title.into(),
+        explanation: explanation.into(),
+    }
+}
+
+fn currency_unavailable() -> QuickFailure {
+    QuickFailure {
+        kind: QuickKind::Currency,
+        title: "汇率暂不可用".into(),
+        explanation: "请稍后重试".into(),
     }
 }
 
@@ -212,6 +272,10 @@ mod tests {
     #[test]
     fn dispatcher_orders_date_then_time_zone_then_unit_then_arithmetic() {
         assert!(matches!(
+            classify("100 USD to CNY"),
+            QuickClassification::Ready(QuickIntent::Currency(_))
+        ));
+        assert!(matches!(
             classify("2026-08-16 + 1 day"),
             QuickClassification::Ready(QuickIntent::Date(_))
         ));
@@ -221,6 +285,10 @@ mod tests {
         ));
         assert!(matches!(
             classify("1000 mm to in"),
+            QuickClassification::Ready(QuickIntent::Unit(_))
+        ));
+        assert!(matches!(
+            classify("1 tsp to cup"),
             QuickClassification::Ready(QuickIntent::Unit(_))
         ));
         assert!(matches!(
