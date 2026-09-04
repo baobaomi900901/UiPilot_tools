@@ -1,8 +1,7 @@
 use std::{
-    fmt, fs,
-    fs::OpenOptions,
-    io,
-    io::Write,
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -71,6 +70,29 @@ pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, AtomicFileEr
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(AtomicFileError::Read),
     }
+}
+
+pub(crate) fn read_optional_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, AtomicFileError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(AtomicFileError::Read),
+    };
+    let read_limit = max_bytes.checked_add(1).ok_or(AtomicFileError::Read)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(read_limit)
+        .map_err(|_| AtomicFileError::Read)?;
+    file.take(u64::try_from(read_limit).map_err(|_| AtomicFileError::Read)?)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AtomicFileError::Read)?;
+    if bytes.len() > max_bytes {
+        return Err(AtomicFileError::Read);
+    }
+    Ok(Some(bytes))
 }
 
 pub(crate) fn quarantine_invalid(path: &Path) -> Result<(), AtomicFileError> {
@@ -444,6 +466,25 @@ mod tests {
         assert_eq!(
             read_optional(dir.path()).unwrap_err(),
             AtomicFileError::Read
+        );
+    }
+
+    #[test]
+    fn bounded_optional_read_accepts_the_exact_cap_and_rejects_one_byte_over() {
+        let dir = TestDir::new("bounded-read");
+        let path = dir.path().join("settings.json");
+
+        assert_eq!(read_optional_bounded(&path, 4).unwrap(), None);
+        fs::write(&path, b"1234").unwrap();
+        assert_eq!(
+            read_optional_bounded(&path, 4).unwrap(),
+            Some(b"1234".to_vec())
+        );
+        fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_optional_bounded(&path, 4), Err(AtomicFileError::Read));
+        assert_eq!(
+            read_optional_bounded(dir.path(), 4),
+            Err(AtomicFileError::Read)
         );
     }
 

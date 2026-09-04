@@ -12,7 +12,10 @@ use serde_json::{json, Value};
 use time::{Date, Duration, Month, OffsetDateTime};
 
 use super::{
-    cache::{AtomicCacheReader, CacheCommitter, CacheLookup, CacheReader, ExchangeRateCache},
+    cache::{
+        AtomicCacheReader, CacheCommitter, CacheLookup, CacheReader, ExchangeRateCache,
+        CACHE_FILE_MAX_BYTES,
+    },
     CurrencyCode, ExchangeRateRequest, ExchangeRateResult,
 };
 use crate::atomic_file::{commit_with_backup, AtomicFileError, AtomicPaths};
@@ -99,6 +102,13 @@ fn entry(base: &str, quote: &str, rate: &str, fetched_at: &str) -> Value {
 
 fn document(schema: u32, entries: Vec<Value>) -> Vec<u8> {
     serde_json::to_vec(&json!({ "schema": schema, "entries": entries })).unwrap()
+}
+
+fn padded_document(rate: &str, size: usize) -> Vec<u8> {
+    let mut bytes = document(1, vec![entry("USD", "CNY", rate, "2026-09-03T11:00:00Z")]);
+    assert!(bytes.len() <= size);
+    bytes.resize(size, b' ');
+    bytes
 }
 
 fn cached_rate(cache: &mut ExchangeRateCache, base: &str, quote: &str) -> Option<Decimal> {
@@ -356,6 +366,70 @@ fn two_unusable_files_and_unknown_schema_degrade_to_an_empty_cache() {
 }
 
 #[test]
+fn oversized_current_is_rejected_before_parse_and_load_falls_back_to_backup() {
+    let dir = TestDir::new("oversized-current");
+    let oversized = padded_document("7.1", CACHE_FILE_MAX_BYTES + 1);
+    let backup = document(1, vec![entry("USD", "CNY", "6.9", "2026-09-03T11:00:00Z")]);
+    fs::write(dir.current(), &oversized).unwrap();
+    fs::write(dir.backup(), &backup).unwrap();
+
+    let mut cache = ExchangeRateCache::load(dir.path(), instant(12, 0, 0));
+
+    assert_eq!(
+        cached_rate(&mut cache, "USD", "CNY"),
+        Some(Decimal::from_str_exact("6.9").unwrap())
+    );
+    assert_eq!(fs::read(dir.current()).unwrap(), oversized);
+    assert_eq!(fs::read(dir.backup()).unwrap(), backup);
+}
+
+#[test]
+fn two_oversized_parseable_files_degrade_to_an_empty_nonfatal_cache() {
+    let dir = TestDir::new("oversized-both");
+    fs::write(
+        dir.current(),
+        padded_document("7.1", CACHE_FILE_MAX_BYTES + 1),
+    )
+    .unwrap();
+    fs::write(
+        dir.backup(),
+        padded_document("6.9", CACHE_FILE_MAX_BYTES + 1),
+    )
+    .unwrap();
+
+    let mut cache = ExchangeRateCache::load(dir.path(), instant(12, 0, 0));
+
+    assert_eq!(cached_rate(&mut cache, "USD", "CNY"), None);
+}
+
+#[test]
+fn injected_reader_cannot_bypass_the_preparse_file_limit() {
+    let dir = TestDir::new("oversized-injected");
+    let reader = Arc::new(FixtureReader::new(
+        Ok(Some(padded_document("7.1", CACHE_FILE_MAX_BYTES + 1))),
+        Ok(Some(document(
+            1,
+            vec![entry("USD", "CNY", "6.9", "2026-09-03T11:00:00Z")],
+        ))),
+    ));
+
+    let mut cache =
+        ExchangeRateCache::load_with_reader(dir.path(), instant(12, 0, 0), reader.clone());
+
+    assert_eq!(
+        cached_rate(&mut cache, "USD", "CNY"),
+        Some(Decimal::from_str_exact("6.9").unwrap())
+    );
+    assert_eq!(
+        reader.calls(),
+        vec![
+            "exchange-rate-cache.json",
+            "exchange-rate-cache.json.backup"
+        ]
+    );
+}
+
+#[test]
 fn malformed_or_impossible_entry_fields_invalidate_the_document() {
     let cases = [
         (
@@ -601,6 +675,39 @@ fn write_prunes_expired_entries_and_evicts_the_oldest_fetch_beyond_256() {
     let (_, last_candidate) = commits.last().unwrap();
     let persisted = serde_json::from_slice::<Value>(last_candidate).unwrap();
     assert_eq!(persisted["entries"].as_array().unwrap().len(), 256);
+}
+
+#[test]
+fn maximum_valid_snapshot_fits_the_conservative_file_limit() {
+    let dir = TestDir::new("maximum-snapshot-size");
+    let committer = Arc::new(CaptureCommitter::default());
+    let fetched_at = instant(12, 0, 0) + Duration::nanoseconds(123_456_789);
+    let reader = Arc::new(FixtureReader::new(Ok(None), Ok(None)));
+    let mut cache = ExchangeRateCache::load_with(dir.path(), fetched_at, reader, committer.clone());
+    for index in 0..256 {
+        let middle = char::from(b'A' + u8::try_from(index / 26).unwrap());
+        let last = char::from(b'A' + u8::try_from(index % 26).unwrap());
+        cache.store(
+            result(
+                "AAA",
+                &format!("B{middle}{last}"),
+                "0.0000000000000000000000000001",
+            ),
+            fetched_at,
+            fetched_at,
+        );
+    }
+
+    let commits = committer.commits();
+    let (_, maximum_snapshot) = commits.last().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(maximum_snapshot).unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        256
+    );
+    assert!(maximum_snapshot.len() <= CACHE_FILE_MAX_BYTES);
 }
 
 #[test]

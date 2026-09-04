@@ -7,9 +7,11 @@ use time::{
 };
 
 use super::{parse_decimal_exact, CurrencyCode, ExchangeRateRequest, ExchangeRateResult};
-use crate::atomic_file::{commit_with_backup, read_optional, AtomicFileError, AtomicPaths};
+use crate::atomic_file::{commit_with_backup, read_optional_bounded, AtomicFileError, AtomicPaths};
 
 const CACHE_FILE_NAME: &str = "exchange-rate-cache.json";
+// A canonical 256-entry snapshot is below this conservative pre-parse read cap.
+pub(super) const CACHE_FILE_MAX_BYTES: usize = 64 * 1024;
 const CACHE_SCHEMA: u32 = 1;
 const MAX_ENTRIES: usize = 256;
 const FRESH_FOR: Duration = Duration::HOUR;
@@ -23,7 +25,7 @@ pub(super) struct AtomicCacheReader;
 
 impl CacheReader for AtomicCacheReader {
     fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AtomicFileError> {
-        read_optional(path)
+        read_optional_bounded(path, CACHE_FILE_MAX_BYTES)
     }
 }
 
@@ -310,6 +312,7 @@ enum Candidate {
 fn read_candidate(reader: &dyn CacheReader, path: &Path, now: OffsetDateTime) -> Candidate {
     match reader.read(path) {
         Ok(None) => Candidate::Missing,
+        Ok(Some(raw)) if raw.len() > CACHE_FILE_MAX_BYTES => Candidate::ReadFailed,
         Ok(Some(raw)) => match parse_document(&raw, now) {
             Some(entries) => Candidate::Valid { entries, raw },
             None => Candidate::Invalid,
