@@ -65,8 +65,8 @@ pub fn transaction_artifact_cleanup_plan(
                 journal_present = true;
             }
             "managed-runtime.json" => {}
-            name if name.starts_with("managed-runtime.")
-                || name.starts_with("managed-transaction.") =>
+            name if starts_with_ignore_ascii_case(name, "managed-runtime.")
+                || starts_with_ignore_ascii_case(name, "managed-transaction.") =>
             {
                 return Err("foreign-transaction-temp")
             }
@@ -84,6 +84,12 @@ pub fn transaction_artifact_cleanup_plan(
         plan.push(TransactionArtifactCleanupStep::DeleteJournal);
     }
     Ok(plan)
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 #[cfg(test)]
@@ -461,6 +467,62 @@ pub fn rollback_candidate_entries_are_scoped(
         }
         _ => false,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairCandidateCleanupStep {
+    ValidateFinalBinary,
+    RemoveCurrentTemp,
+}
+
+pub fn repair_candidate_cleanup_plan(
+    entries: &[&str],
+    transaction_id: &OperationId,
+) -> Result<Vec<RepairCandidateCleanupStep>, &'static str> {
+    let expected_temp = format!(
+        "Everything.{}.tmp",
+        transaction_id.as_str().replace('-', "")
+    );
+    let mut executable_seen = false;
+    let mut temp_seen = false;
+    for entry in entries {
+        match *entry {
+            "Everything.exe" if !executable_seen => executable_seen = true,
+            name if name == expected_temp && !temp_seen => temp_seen = true,
+            _ => return Err("foreign-repair-candidate-entry"),
+        }
+    }
+    if !executable_seen {
+        return Err("foreign-repair-candidate-entry");
+    }
+    let mut plan = vec![RepairCandidateCleanupStep::ValidateFinalBinary];
+    if temp_seen {
+        plan.extend([
+            RepairCandidateCleanupStep::RemoveCurrentTemp,
+            RepairCandidateCleanupStep::ValidateFinalBinary,
+        ]);
+    }
+    Ok(plan)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionDirectoryDeletionStep {
+    ValidateBinary,
+    DeleteBinary,
+    RemoveDirectory,
+}
+
+pub fn version_directory_deletion_plan(
+    entries: &[&str],
+) -> Result<Vec<VersionDirectoryDeletionStep>, &'static str> {
+    if entries != ["Everything.exe"] {
+        return Err("foreign-version-directory-entry");
+    }
+    Ok(vec![
+        VersionDirectoryDeletionStep::ValidateBinary,
+        VersionDirectoryDeletionStep::DeleteBinary,
+        VersionDirectoryDeletionStep::RemoveDirectory,
+    ])
 }
 
 pub fn validated_persisted_execution<T, E>(
@@ -1606,6 +1668,103 @@ mod tests {
     }
 
     #[test]
+    fn repair_copy_failures_remove_only_the_current_temp_and_preserve_the_binary() {
+        let transaction = OperationId::parse("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let temp = format!("Everything.{}.tmp", transaction.as_str().replace('-', ""));
+        for (failure, entries, expected) in [
+            (
+                "create",
+                vec!["Everything.exe"],
+                vec![RepairCandidateCleanupStep::ValidateFinalBinary],
+            ),
+            (
+                "copy",
+                vec!["Everything.exe", temp.as_str()],
+                vec![
+                    RepairCandidateCleanupStep::ValidateFinalBinary,
+                    RepairCandidateCleanupStep::RemoveCurrentTemp,
+                    RepairCandidateCleanupStep::ValidateFinalBinary,
+                ],
+            ),
+            (
+                "flush",
+                vec!["Everything.exe", temp.as_str()],
+                vec![
+                    RepairCandidateCleanupStep::ValidateFinalBinary,
+                    RepairCandidateCleanupStep::RemoveCurrentTemp,
+                    RepairCandidateCleanupStep::ValidateFinalBinary,
+                ],
+            ),
+            (
+                "replace",
+                vec!["Everything.exe", temp.as_str()],
+                vec![
+                    RepairCandidateCleanupStep::ValidateFinalBinary,
+                    RepairCandidateCleanupStep::RemoveCurrentTemp,
+                    RepairCandidateCleanupStep::ValidateFinalBinary,
+                ],
+            ),
+        ] {
+            let plan = repair_candidate_cleanup_plan(&entries, &transaction).unwrap();
+            assert_eq!(plan, expected, "{failure}");
+            let retry_entries = entries
+                .into_iter()
+                .filter(|entry| *entry != temp)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                repair_candidate_cleanup_plan(&retry_entries, &transaction).unwrap(),
+                vec![RepairCandidateCleanupStep::ValidateFinalBinary],
+                "{failure}/retry"
+            );
+        }
+
+        for foreign in [
+            "Everything.10112233445566778899aabbccddeeff.tmp",
+            "everything.00112233445566778899aabbccddeeff.tmp",
+            "EVERYTHING.00112233445566778899aabbccddeeff.TMP",
+            "foreign.txt",
+        ] {
+            assert_eq!(
+                repair_candidate_cleanup_plan(&["Everything.exe", foreign], &transaction),
+                Err("foreign-repair-candidate-entry"),
+                "{foreign}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_and_uninstall_version_deletion_requires_exact_binary_content() {
+        assert_eq!(
+            version_directory_deletion_plan(&["Everything.exe"]),
+            Ok(vec![
+                VersionDirectoryDeletionStep::ValidateBinary,
+                VersionDirectoryDeletionStep::DeleteBinary,
+                VersionDirectoryDeletionStep::RemoveDirectory,
+            ])
+        );
+        for entries in [
+            Vec::<&str>::new(),
+            vec!["everything.exe"],
+            vec!["Everything.exe", "foreign.txt"],
+            vec!["Everything.exe", "subdirectory"],
+            vec![
+                "Everything.exe",
+                "Everything.00112233445566778899aabbccddeeff.tmp",
+            ],
+            vec![
+                "Everything.exe",
+                "EVERYTHING.00112233445566778899AABBCCDDEEFF.TMP",
+            ],
+        ] {
+            assert_eq!(
+                version_directory_deletion_plan(&entries),
+                Err("foreign-version-directory-entry"),
+                "{entries:?}"
+            );
+        }
+    }
+
+    #[test]
     fn persisted_binary_is_validated_before_any_execution() {
         use std::cell::RefCell;
 
@@ -1856,5 +2015,20 @@ mod tests {
             &transaction,
         )
         .is_err());
+        for case_variant in [
+            "Managed-Runtime.00112233445566778899aabbccddeeff.tmp",
+            "MANAGED-TRANSACTION.00112233445566778899aabbccddeeff.tmp",
+            "Managed-Runtime.10112233445566778899aabbccddeeff.tmp",
+            "MANAGED-TRANSACTION.10112233445566778899aabbccddeeff.tmp",
+        ] {
+            assert_eq!(
+                transaction_artifact_cleanup_plan(
+                    &[case_variant, "managed-transaction.json"],
+                    &transaction,
+                ),
+                Err("foreign-transaction-temp"),
+                "{case_variant}"
+            );
+        }
     }
 }

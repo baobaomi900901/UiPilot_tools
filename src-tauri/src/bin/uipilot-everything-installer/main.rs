@@ -14,11 +14,12 @@ use model::{
 };
 use transaction::{
     candidate_directory_disposition, classify_matching_service, classify_runtime_manifest,
-    rollback_cleanup_step, validate_recovery_handoff, validate_same_transaction,
-    CandidateDirectoryDisposition, ConvergenceDecision, ConvergenceInput, ForwardAction,
-    LiveService, ManagedRootResidue, OldRecoveryState, PostUninstallResidueDecision,
-    PreUninstallResidueDecision, PrivateServiceResidue, RollbackCleanupStep, RollbackDecision,
-    ServiceActivity, TransactionArtifactCleanupStep, UninstallStep,
+    repair_candidate_cleanup_plan, rollback_cleanup_step, validate_recovery_handoff,
+    validate_same_transaction, version_directory_deletion_plan, CandidateDirectoryDisposition,
+    ConvergenceDecision, ConvergenceInput, ForwardAction, LiveService, ManagedRootResidue,
+    OldRecoveryState, PostUninstallResidueDecision, PreUninstallResidueDecision,
+    PrivateServiceResidue, RepairCandidateCleanupStep, RollbackCleanupStep, RollbackDecision,
+    ServiceActivity, TransactionArtifactCleanupStep, UninstallStep, VersionDirectoryDeletionStep,
 };
 use windows::{AdmissionLease, ExitCode, PathPresence, ServiceState};
 
@@ -928,10 +929,68 @@ fn cleanup_committed_old(root: &Path, journal: &TransactionJournal) -> HelperRes
                 .parent()
                 .ok_or_else(|| (ExitCode::ForeignState, "old-version-parent-missing".into()))?;
             if managed_path_is_present(old_dir)? {
-                windows::verify_managed_directory(old_dir)
+                remove_manifest_version_directory(
+                    root,
+                    old,
+                    "old-version-binary-delete-failed",
+                    "old-version-delete-failed",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_manifest_version_directory(
+    root: &Path,
+    manifest: &RuntimeManifest,
+    binary_delete_failure: &'static str,
+    directory_delete_failure: &'static str,
+) -> HelperResult<()> {
+    validate_persisted_manifest_identity(root, manifest)?;
+    let version_dir = manifest.service_binary_path.parent().ok_or_else(|| {
+        (
+            ExitCode::ForeignState,
+            "manifest-version-parent-missing".into(),
+        )
+    })?;
+    windows::verify_managed_directory(version_dir)
+        .map_err(|reason| (ExitCode::ForeignState, reason))?;
+    let entries = fs::read_dir(version_dir)
+        .map_err(|_| {
+            (
+                ExitCode::ForeignState,
+                "version-directory-read-failed".into(),
+            )
+        })?
+        .map(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .ok_or_else(|| {
+                    (
+                        ExitCode::ForeignState,
+                        "version-directory-entry-invalid".into(),
+                    )
+                })
+        })
+        .collect::<HelperResult<Vec<_>>>()?;
+    let names = entries.iter().map(String::as_str).collect::<Vec<_>>();
+    let plan = version_directory_deletion_plan(&names)
+        .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
+    for step in plan {
+        match step {
+            VersionDirectoryDeletionStep::ValidateBinary => {
+                windows::validate_managed_binary(&manifest.service_binary_path, manifest)
                     .map_err(|reason| (ExitCode::ForeignState, reason))?;
-                fs::remove_dir_all(old_dir)
-                    .map_err(|_| (ExitCode::NativeFailure, "old-version-delete-failed".into()))?;
+            }
+            VersionDirectoryDeletionStep::DeleteBinary => {
+                fs::remove_file(&manifest.service_binary_path)
+                    .map_err(|_| (ExitCode::NativeFailure, binary_delete_failure.into()))?;
+            }
+            VersionDirectoryDeletionStep::RemoveDirectory => {
+                fs::remove_dir(version_dir)
+                    .map_err(|_| (ExitCode::NativeFailure, directory_delete_failure.into()))?;
             }
         }
     }
@@ -1092,12 +1151,79 @@ fn cleanup_rollback_candidate(root: &Path, journal: &TransactionJournal) -> Help
                 )
             })
         }
-        RollbackCleanupStep::KeepReferencedCandidate | RollbackCleanupStep::Complete => Ok(()),
+        RollbackCleanupStep::KeepReferencedCandidate => {
+            cleanup_referenced_repair_candidate(root, journal, candidate_dir)
+        }
+        RollbackCleanupStep::Complete => Ok(()),
         RollbackCleanupStep::FailClosedRetainCandidate => fail(
             ExitCode::RollbackFailed,
             "rollback-candidate-reference-ambiguous",
         ),
     }
+}
+
+fn cleanup_referenced_repair_candidate(
+    root: &Path,
+    journal: &TransactionJournal,
+    candidate_dir: &Path,
+) -> HelperResult<()> {
+    let old = journal.old_manifest.as_ref().ok_or_else(|| {
+        (
+            ExitCode::RollbackFailed,
+            "repair-old-manifest-missing".into(),
+        )
+    })?;
+    if old.service_binary_path != journal.new_manifest.service_binary_path {
+        return fail(
+            ExitCode::RollbackFailed,
+            "repair-candidate-binary-reference-mismatch",
+        );
+    }
+    validate_persisted_manifest_identity(root, old)
+        .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+    windows::verify_managed_directory(candidate_dir)
+        .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
+    let entries = fs::read_dir(candidate_dir)
+        .map_err(|_| {
+            (
+                ExitCode::RollbackFailed,
+                "repair-candidate-read-failed".into(),
+            )
+        })?
+        .map(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .ok_or_else(|| {
+                    (
+                        ExitCode::RollbackFailed,
+                        "repair-candidate-entry-invalid".into(),
+                    )
+                })
+        })
+        .collect::<HelperResult<Vec<_>>>()?;
+    let names = entries.iter().map(String::as_str).collect::<Vec<_>>();
+    let plan = repair_candidate_cleanup_plan(&names, &journal.transaction_id)
+        .map_err(|reason| (ExitCode::RollbackFailed, reason.into()))?;
+    let temp = candidate_dir.join(format!(
+        "Everything.{}.tmp",
+        journal.transaction_id.as_str().replace('-', "")
+    ));
+    for step in plan {
+        match step {
+            RepairCandidateCleanupStep::ValidateFinalBinary => {
+                validate_persisted_manifest(root, old)
+                    .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+            }
+            RepairCandidateCleanupStep::RemoveCurrentTemp => {
+                windows::verify_managed_file(&temp)
+                    .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
+                fs::remove_file(&temp)
+                    .map_err(|_| (ExitCode::RollbackFailed, "repair-temp-delete-failed".into()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn restore_old(root: &Path, journal: &TransactionJournal) -> HelperResult<()> {
@@ -1286,14 +1412,12 @@ fn post_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()
                 lease
                     .ensure_parent_alive()
                     .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
-                windows::verify_managed_directory(version_dir)
-                    .map_err(|reason| (ExitCode::ForeignState, reason))?;
-                fs::remove_dir_all(version_dir).map_err(|_| {
-                    (
-                        ExitCode::NativeFailure,
-                        "referenced-version-delete-failed".into(),
-                    )
-                })?;
+                remove_manifest_version_directory(
+                    &root,
+                    &manifest,
+                    "referenced-binary-delete-failed",
+                    "referenced-version-delete-failed",
+                )?;
                 checkpoint("uninstall-referenced-directory-deleted")?;
             }
             UninstallStep::DeleteManifest => {

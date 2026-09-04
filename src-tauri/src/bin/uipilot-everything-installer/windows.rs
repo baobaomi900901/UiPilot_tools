@@ -1025,7 +1025,7 @@ pub fn managed_parent_descriptor_is_exact(descriptor: &str) -> bool {
     descriptor == MANAGED_ROOT_SDDL
 }
 
-pub fn verify_managed_root(path: &Path) -> Result<(), String> {
+fn verify_managed_root_directory(path: &Path) -> Result<(), String> {
     let directory = open_direct(path, FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ)?;
     let expected = canonical_program_data()?.join(MANAGED_RELATIVE_ROOT);
     if final_path(directory.0)? != expected {
@@ -1035,6 +1035,20 @@ pub fn verify_managed_root(path: &Path) -> Result<(), String> {
         return Err("managed-root-owner-dacl-mismatch".into());
     }
     Ok(())
+}
+
+fn verify_managed_root_with(
+    path: &Path,
+    verify_parent: impl FnOnce(&Path) -> Result<(), String>,
+    verify_root: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or("managed-parent-missing")?;
+    verify_parent(parent)?;
+    verify_root(path)
+}
+
+pub fn verify_managed_root(path: &Path) -> Result<(), String> {
+    verify_managed_root_with(path, verify_managed_parent, verify_managed_root_directory)
 }
 
 pub fn verify_managed_file(path: &Path) -> Result<(), String> {
@@ -1997,6 +2011,54 @@ mod tests {
         assert!(!staging_file_dacl_is_exact(
             "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)(A;ID;GR;;;BU)"
         ));
+    }
+
+    #[test]
+    fn managed_root_verification_requires_its_exact_parent_first() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let root = Path::new(r"C:\ProgramData\UiPilot_tools\everything");
+        verify_managed_root_with(
+            root,
+            |parent| {
+                events
+                    .borrow_mut()
+                    .push(format!("parent:{}", parent.display()));
+                Ok(())
+            },
+            |managed_root| {
+                events
+                    .borrow_mut()
+                    .push(format!("root:{}", managed_root.display()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                r"parent:C:\ProgramData\UiPilot_tools",
+                r"root:C:\ProgramData\UiPilot_tools\everything",
+            ]
+        );
+
+        let events = RefCell::new(Vec::new());
+        assert_eq!(
+            verify_managed_root_with(
+                root,
+                |_| {
+                    events.borrow_mut().push("parent");
+                    Err("parent-untrusted".into())
+                },
+                |_| {
+                    events.borrow_mut().push("root");
+                    Ok(())
+                },
+            ),
+            Err("parent-untrusted".into())
+        );
+        assert_eq!(*events.borrow(), vec!["parent"]);
     }
 
     #[test]
