@@ -167,6 +167,53 @@ impl UtcClock for BlockingClock {
     }
 }
 
+struct ScriptedBlockingClock {
+    values: Vec<OffsetDateTime>,
+    block_call: usize,
+    calls: AtomicUsize,
+    entered: Semaphore,
+    released: Mutex<bool>,
+    release_signal: Condvar,
+}
+
+impl ScriptedBlockingClock {
+    fn new(values: Vec<OffsetDateTime>, block_call: usize) -> Self {
+        assert!(!values.is_empty());
+        Self {
+            values,
+            block_call,
+            calls: AtomicUsize::new(0),
+            entered: Semaphore::new(0),
+            released: Mutex::new(false),
+            release_signal: Condvar::new(),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_signal.notify_all();
+    }
+}
+
+impl UtcClock for ScriptedBlockingClock {
+    fn now_utc(&self) -> Result<OffsetDateTime, ()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let value = self.values[call.saturating_sub(1).min(self.values.len() - 1)];
+        if call == self.block_call {
+            self.entered.add_permits(1);
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release_signal.wait(released).unwrap();
+            }
+        }
+        Ok(value)
+    }
+}
+
 struct BlockingCommitter {
     entered: Semaphore,
     released: Mutex<bool>,
@@ -1185,4 +1232,132 @@ async fn blocking_completion_clock_holds_no_cache_or_inflight_lock() {
     );
     assert_eq!(fresh_output.title, "320 JPY");
     assert_eq!(cold.await.unwrap().unwrap().title, "16 CNY");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn historical_request_time_does_not_delete_a_newer_completed_rate() {
+    let dir = TestDir::new("historical-request-time");
+    let started_at = instant(12);
+    let completed_at = instant(13);
+    let provider = Arc::new(QueueProvider::new(vec![
+        Ok(result("USD", "CNY", "8")),
+        Ok(result("USD", "CNY", "8")),
+    ]));
+    let clock = Arc::new(ScriptedBlockingClock::new(
+        vec![started_at, completed_at, completed_at, completed_at],
+        1,
+    ));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache(&dir, started_at),
+        clock.clone(),
+    ));
+
+    let historical_service = service.clone();
+    let historical =
+        tokio::spawn(async move { historical_service.resolve(intent("2 USD to CNY")).await });
+    clock.wait_until_entered().await;
+
+    let current = service.resolve(intent("3 USD to CNY")).await.unwrap();
+    clock.release();
+    let historical = historical.await.unwrap().unwrap();
+
+    assert_eq!(current.title, "24 CNY");
+    assert_eq!(historical.title, "16 CNY");
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the historical lookup must reuse the newer in-process rate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_older_completion_persists_without_dropping_a_newer_pair() {
+    let dir = TestDir::new("out-of-order-completions");
+    let started_at = instant(12);
+    let older_completion = instant(13);
+    let newer_completion = instant(14);
+    let provider = Arc::new(QueueProvider::new(vec![
+        Ok(result("USD", "CNY", "8")),
+        Ok(result("EUR", "JPY", "160")),
+    ]));
+    let committer = Arc::new(CaptureCommitter::default());
+    let clock = Arc::new(ScriptedBlockingClock::new(
+        vec![
+            started_at,
+            older_completion,
+            newer_completion,
+            newer_completion,
+        ],
+        2,
+    ));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache_with_committer(&dir, started_at, committer.clone()),
+        clock.clone(),
+    ));
+
+    let older_service = service.clone();
+    let older = tokio::spawn(async move { older_service.resolve(intent("2 USD to CNY")).await });
+    clock.wait_until_entered().await;
+
+    let newer = service.resolve(intent("2 EUR to JPY")).await.unwrap();
+    clock.release();
+    let older = older.await.unwrap().unwrap();
+
+    assert_eq!(newer.title, "320 JPY");
+    assert_eq!(older.title, "16 CNY");
+    assert_eq!(provider.calls(), 2);
+    let commits = committer.commits();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].0, None);
+    assert_eq!(commits[1].0.as_deref(), Some(commits[0].1.as_slice()));
+    let first = serde_json::from_slice::<serde_json::Value>(&commits[0].1).unwrap();
+    let second = serde_json::from_slice::<serde_json::Value>(&commits[1].1).unwrap();
+    assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(second["entries"].as_array().unwrap().len(), 2);
+    assert!(second["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| { entry["base"] == "EUR" && entry["quote"] == "JPY" }));
+}
+
+#[tokio::test]
+async fn historical_failure_fallback_reuses_a_later_success() {
+    let dir = TestDir::new("historical-failure-fallback");
+    let started_at = instant(12);
+    let completed_at = instant(13);
+    let provider = Arc::new(ControlledProvider::new(vec![
+        ControlledOutcome::Unavailable,
+        ControlledOutcome::Success,
+    ]));
+    let clock = Arc::new(ManualClock::new(started_at));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache(&dir, started_at),
+        clock.clone(),
+    ));
+
+    let historical = service.resolve(intent("2 USD to CNY"));
+    tokio::pin!(historical);
+    tokio::select! {
+        result = &mut historical => panic!("historical request completed before provider release: {result:?}"),
+        () = provider.wait_until_called() => {}
+    }
+    provider.release(1);
+    while clock.reads() < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    clock.set(completed_at);
+    let current_service = service.clone();
+    let current =
+        tokio::spawn(async move { current_service.resolve(intent("3 USD to CNY")).await });
+    provider.wait_until_called().await;
+    provider.release(1);
+    assert_eq!(current.await.unwrap().unwrap().title, "24 CNY");
+
+    assert_eq!(historical.await.unwrap().title, "16 CNY");
+    assert_eq!(provider.calls(), 2);
 }

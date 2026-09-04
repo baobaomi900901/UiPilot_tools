@@ -824,3 +824,54 @@ fn reverse_lookup_never_returns_a_zero_rate_after_decimal_underflow() {
     assert_eq!(cache.lookup(&request("CNY", "USD"), now), None);
     assert!(cache.lookup(&request("USD", "CNY"), now).is_some());
 }
+
+#[test]
+fn historical_prepare_preserves_newer_entries_and_still_rejects_future_input() {
+    let dir = TestDir::new("monotonic-observed-time");
+    let loaded_at = instant(12, 0, 0);
+    let older_completion = instant(13, 0, 0);
+    let newer_completion = instant(14, 0, 0);
+    let committer = Arc::new(CaptureCommitter::default());
+    let mut cache = ExchangeRateCache::load_with(
+        dir.path(),
+        loaded_at,
+        Arc::new(AtomicCacheReader),
+        committer.clone(),
+    );
+
+    let newer = cache
+        .prepare_store(
+            result("EUR", "JPY", "160"),
+            newer_completion,
+            newer_completion,
+        )
+        .expect("newer persistence work");
+    cache.finish_persistence(newer.commit());
+    let older = cache
+        .prepare_store(
+            result("USD", "CNY", "8"),
+            older_completion,
+            older_completion,
+        )
+        .expect("historical persistence work");
+    cache.finish_persistence(older.commit());
+
+    assert!(matches!(
+        cache.lookup(&request("EUR", "JPY"), older_completion),
+        Some(CacheLookup::Fresh(_))
+    ));
+    let commits = committer.commits();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[1].0.as_deref(), Some(commits[0].1.as_slice()));
+    let candidate = serde_json::from_slice::<Value>(&commits[1].1).unwrap();
+    assert_eq!(candidate["entries"].as_array().unwrap().len(), 2);
+
+    assert!(cache
+        .prepare_store(
+            result("GBP", "CAD", "1.8"),
+            newer_completion + Duration::SECOND,
+            newer_completion,
+        )
+        .is_none());
+    assert_eq!(cache.lookup(&request("GBP", "CAD"), newer_completion), None);
+}

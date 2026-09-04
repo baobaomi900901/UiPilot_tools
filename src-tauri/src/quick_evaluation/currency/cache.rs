@@ -95,6 +95,7 @@ struct CacheEntry {
 pub(crate) struct ExchangeRateCache {
     paths: AtomicPaths,
     entries: BTreeMap<PairKey, CacheEntry>,
+    latest_observed_at: OffsetDateTime,
     validated_current_raw: Option<Vec<u8>>,
     persistence_available: bool,
     committer: Arc<dyn CacheCommitter>,
@@ -152,7 +153,7 @@ impl ExchangeRateCache {
     ) -> Self {
         let paths = AtomicPaths::new(root, CACHE_FILE_NAME);
         if fs::create_dir_all(root).is_err() {
-            return Self::empty(paths, committer, false);
+            return Self::empty(paths, now, committer, false);
         }
 
         let current = read_candidate(reader.as_ref(), paths.current(), now);
@@ -160,6 +161,7 @@ impl ExchangeRateCache {
             return Self {
                 paths,
                 entries,
+                latest_observed_at: now,
                 validated_current_raw: Some(raw),
                 persistence_available: true,
                 committer,
@@ -172,6 +174,7 @@ impl ExchangeRateCache {
             return Self {
                 paths,
                 entries,
+                latest_observed_at: now,
                 validated_current_raw: None,
                 persistence_available: !current_read_failed && !backup_read_failed,
                 committer,
@@ -179,6 +182,7 @@ impl ExchangeRateCache {
         }
         Self::empty(
             paths,
+            now,
             committer,
             !current_read_failed && !backup_read_failed,
         )
@@ -189,6 +193,7 @@ impl ExchangeRateCache {
         request: &ExchangeRateRequest,
         now: OffsetDateTime,
     ) -> Option<CacheLookup> {
+        let now = self.observe(now);
         let key = PairKey::new(&request.base, &request.quote);
         let entry = self.entries.get(&key)?.clone();
         if now < entry.fetched_at || now - entry.fetched_at > RETAIN_FOR {
@@ -239,9 +244,12 @@ impl ExchangeRateCache {
         fetched_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Option<CachePersistence> {
+        if fetched_at > now {
+            return None;
+        }
+        let now = self.observe(now);
         self.prune(now);
-        if fetched_at > now
-            || now - fetched_at > RETAIN_FOR
+        if now - fetched_at > RETAIN_FOR
             || result.base == result.quote
             || result.rate <= Decimal::ZERO
         {
@@ -260,6 +268,13 @@ impl ExchangeRateCache {
         );
         self.evict_oldest();
         self.prepare_persistence()
+    }
+
+    fn observe(&mut self, now: OffsetDateTime) -> OffsetDateTime {
+        if now > self.latest_observed_at {
+            self.latest_observed_at = now;
+        }
+        self.latest_observed_at
     }
 
     fn prune(&mut self, now: OffsetDateTime) {
@@ -317,12 +332,14 @@ impl ExchangeRateCache {
 
     fn empty(
         paths: AtomicPaths,
+        now: OffsetDateTime,
         committer: Arc<dyn CacheCommitter>,
         persistence_available: bool,
     ) -> Self {
         Self {
             paths,
             entries: BTreeMap::new(),
+            latest_observed_at: now,
             validated_current_raw: None,
             persistence_available,
             committer,
