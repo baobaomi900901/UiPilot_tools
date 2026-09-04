@@ -8,12 +8,12 @@ use hyper::{
     Method, Request,
 };
 use hyper_util::rt::TokioIo;
-use native_tls::Protocol;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     task::JoinHandle,
 };
+use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 
 use super::{CurrencyCode, ExchangeRateRequest};
 
@@ -213,36 +213,41 @@ pub(super) type ProviderTlsConnectFuture =
     Pin<Box<dyn Future<Output = Result<BoxedIo, ProviderTransportError>> + Send + 'static>>;
 
 pub(super) trait ProviderTlsConnector: Send + Sync {
-    fn connect(&self, hostname: String, stream: BoxedIo) -> ProviderTlsConnectFuture;
+    fn connect(&self, stream: BoxedIo) -> ProviderTlsConnectFuture;
 }
 
-pub(super) struct NativeTlsConnector {
-    connector: tokio_native_tls::TlsConnector,
+pub(super) struct RustlsTlsConnector {
+    connector: tokio_rustls::TlsConnector,
+    server_name: ServerName<'static>,
 }
 
-impl NativeTlsConnector {
-    pub(super) fn from_connector(connector: tokio_native_tls::TlsConnector) -> Self {
-        Self { connector }
+impl RustlsTlsConnector {
+    pub(super) fn from_config(config: Arc<ClientConfig>) -> Result<Self, ProviderTransportError> {
+        let server_name = ServerName::try_from(PROVIDER_HOST.to_owned())
+            .map_err(|_| ProviderTransportError::Unavailable)?;
+        Ok(Self {
+            connector: tokio_rustls::TlsConnector::from(config),
+            server_name,
+        })
     }
 
     fn system() -> Result<Self, ProviderTransportError> {
-        let mut builder = native_tls::TlsConnector::builder();
-        builder.min_protocol_version(Some(Protocol::Tlsv12));
-        builder.use_sni(true);
-        builder
-            .build()
-            .map(tokio_native_tls::TlsConnector::from)
-            .map(Self::from_connector)
-            .map_err(|_| ProviderTransportError::Unavailable)
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Self::from_config(Arc::new(config))
     }
 }
 
-impl ProviderTlsConnector for NativeTlsConnector {
-    fn connect(&self, hostname: String, stream: BoxedIo) -> ProviderTlsConnectFuture {
+impl ProviderTlsConnector for RustlsTlsConnector {
+    fn connect(&self, stream: BoxedIo) -> ProviderTlsConnectFuture {
         let connector = self.connector.clone();
+        let server_name = self.server_name.clone();
         Box::pin(async move {
             connector
-                .connect(&hostname, stream)
+                .connect(server_name, stream)
                 .await
                 .map(|stream| Box::new(stream) as BoxedIo)
                 .map_err(|_| ProviderTransportError::Unavailable)
@@ -262,7 +267,7 @@ impl NativeProviderTransport {
         Ok(Self::with_dependencies(
             Arc::new(SystemDnsResolver),
             Arc::new(TokioTcpConnector),
-            Arc::new(NativeTlsConnector::system()?),
+            Arc::new(RustlsTlsConnector::system()?),
             PROVIDER_TIMEOUT,
         ))
     }
@@ -306,8 +311,7 @@ impl NativeProviderTransport {
             }
         }
         let stream = connected.ok_or(ProviderTransportError::Unavailable)?;
-        let tls = self.tls.connect(PROVIDER_HOST.to_owned(), stream);
-        let stream = poll_tls_on_blocking(tls).await?;
+        let stream = self.tls.connect(stream).await?;
 
         let mut builder = http1::Builder::new();
         builder
@@ -362,26 +366,6 @@ impl ProviderTransport for NativeProviderTransport {
     fn execute<'a>(&'a self, request: ProviderHttpRequest) -> ProviderTransportFuture<'a> {
         Box::pin(self.execute_with_deadline(request))
     }
-}
-
-async fn poll_tls_on_blocking(
-    tls: ProviderTlsConnectFuture,
-) -> Result<BoxedIo, ProviderTransportError> {
-    let runtime = tokio::runtime::Handle::current();
-    let (keep_worker_alive, cancel_worker) = tokio::sync::oneshot::channel::<()>();
-    let result = tokio::task::spawn_blocking(move || {
-        runtime.block_on(async move {
-            tokio::select! {
-                biased;
-                result = tls => result,
-                _ = cancel_worker => Err(ProviderTransportError::Unavailable),
-            }
-        })
-    })
-    .await
-    .map_err(|_| ProviderTransportError::Unavailable)?;
-    drop(keep_worker_alive);
-    result
 }
 
 fn map_hyper_error(_error: hyper::Error) -> ProviderTransportError {

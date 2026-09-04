@@ -4,15 +4,11 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant as StdInstant},
 };
 
-use native_tls::{Certificate, Protocol};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -22,7 +18,7 @@ use tokio::{
 use tokio_rustls::{
     rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-        ServerConfig,
+        ClientConfig, RootCertStore, ServerConfig,
     },
     TlsAcceptor,
 };
@@ -30,10 +26,10 @@ use tokio_rustls::{
 use super::{
     provider::{ExchangeRateProvider, FrankfurterProvider},
     transport::{
-        BoxedIo, NativeProviderTransport, NativeTlsConnector, ProviderDnsFuture,
-        ProviderDnsResolver, ProviderHttpRequest, ProviderHttpResponse, ProviderTcpConnectFuture,
-        ProviderTcpConnector, ProviderTlsConnectFuture, ProviderTlsConnector, ProviderTransport,
-        ProviderTransportError, ProviderTransportFuture, TokioTcpConnector, PROVIDER_TIMEOUT,
+        BoxedIo, NativeProviderTransport, ProviderDnsFuture, ProviderDnsResolver,
+        ProviderHttpRequest, ProviderHttpResponse, ProviderTcpConnectFuture, ProviderTcpConnector,
+        ProviderTlsConnectFuture, ProviderTlsConnector, ProviderTransport, ProviderTransportError,
+        ProviderTransportFuture, RustlsTlsConnector, TokioTcpConnector, PROVIDER_TIMEOUT,
     },
     CurrencyCode, ExchangeRateError, ExchangeRateRequest,
 };
@@ -90,52 +86,15 @@ impl ProviderTcpConnector for PendingConnector {
 struct PendingTlsConnector;
 
 impl ProviderTlsConnector for PendingTlsConnector {
-    fn connect(&self, _hostname: String, _stream: BoxedIo) -> ProviderTlsConnectFuture {
+    fn connect(&self, _stream: BoxedIo) -> ProviderTlsConnectFuture {
         Box::pin(pending())
-    }
-}
-
-struct BlockingPollTlsConnector {
-    entered: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
-    release: Arc<(Mutex<bool>, Condvar)>,
-}
-
-impl ProviderTlsConnector for BlockingPollTlsConnector {
-    fn connect(&self, _hostname: String, _stream: BoxedIo) -> ProviderTlsConnectFuture {
-        Box::pin(BlockingPollTlsFuture {
-            entered: self.entered.clone(),
-            finished: self.finished.clone(),
-            release: self.release.clone(),
-        })
-    }
-}
-
-struct BlockingPollTlsFuture {
-    entered: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
-    release: Arc<(Mutex<bool>, Condvar)>,
-}
-
-impl std::future::Future for BlockingPollTlsFuture {
-    type Output = Result<BoxedIo, ProviderTransportError>;
-
-    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.entered.store(true, Ordering::SeqCst);
-        let (lock, ready) = &*self.release;
-        let mut released = lock.lock().unwrap();
-        while !*released {
-            released = ready.wait(released).unwrap();
-        }
-        self.finished.store(true, Ordering::SeqCst);
-        Poll::Ready(Err(ProviderTransportError::Unavailable))
     }
 }
 
 struct PassthroughTlsConnector;
 
 impl ProviderTlsConnector for PassthroughTlsConnector {
-    fn connect(&self, _hostname: String, stream: BoxedIo) -> ProviderTlsConnectFuture {
+    fn connect(&self, stream: BoxedIo) -> ProviderTlsConnectFuture {
         Box::pin(async move { Ok(stream) })
     }
 }
@@ -234,14 +193,47 @@ async fn spawn_tls_server(
     (address, cert_der, request_rx, task)
 }
 
+async fn spawn_stalled_tls_server(
+    connections: usize,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<usize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        for _ in 0..connections {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut total = 0_usize;
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => total += read,
+                }
+            }
+            let _ = closed_tx.send(total);
+        }
+    });
+    (address, closed_rx, task)
+}
+
 fn tls_with_root(root: &[u8]) -> Arc<dyn ProviderTlsConnector> {
-    let root = Certificate::from_der(root).unwrap();
-    let mut builder = native_tls::TlsConnector::builder();
-    builder.min_protocol_version(Some(Protocol::Tlsv12));
-    builder.use_sni(true);
-    builder.add_root_certificate(root);
-    let connector = tokio_native_tls::TlsConnector::from(builder.build().unwrap());
-    Arc::new(NativeTlsConnector::from_connector(connector))
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(root.to_vec())).unwrap();
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Arc::new(RustlsTlsConnector::from_config(Arc::new(config)).unwrap())
+}
+
+fn tls_without_roots() -> Arc<dyn ProviderTlsConnector> {
+    let config = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    Arc::new(RustlsTlsConnector::from_config(Arc::new(config)).unwrap())
 }
 
 fn native_provider(
@@ -502,13 +494,10 @@ async fn native_https_rejects_wrong_hostname_and_untrusted_certificates() {
 
     let (untrusted_address, _, _, untrusted_server) =
         spawn_tls_server("api.frankfurter.dev", vec![empty()]).await;
-    let untrusted_tls = native_tls::TlsConnector::builder().build().unwrap();
     let untrusted_provider = native_provider(
         Arc::new(FixedResolver::new(untrusted_address)),
         Arc::new(TokioTcpConnector),
-        Arc::new(NativeTlsConnector::from_connector(
-            tokio_native_tls::TlsConnector::from(untrusted_tls),
-        )),
+        tls_without_roots(),
         Duration::from_secs(2),
     );
     assert_eq!(
@@ -571,45 +560,62 @@ async fn one_deadline_covers_dns_connect_tls_and_request_send() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_blocking_tls_future_poll_cannot_delay_the_end_to_end_deadline() {
-    let entered = Arc::new(AtomicBool::new(false));
-    let finished = Arc::new(AtomicBool::new(false));
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let releaser = std::thread::spawn({
-        let entered = entered.clone();
-        let release = release.clone();
-        move || {
-            while !entered.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            std::thread::sleep(Duration::from_millis(250));
-            let (lock, ready) = &*release;
-            *lock.lock().unwrap() = true;
-            ready.notify_all();
-        }
-    });
+#[tokio::test]
+async fn stalled_rustls_handshake_times_out_and_closes_the_stream() {
+    let (address, mut closed, server) = spawn_stalled_tls_server(1).await;
     let provider = native_provider(
-        Arc::new(FixedResolver::new(SocketAddr::from(([127, 0, 0, 1], 9)))),
-        Arc::new(PendingIoConnector),
-        Arc::new(BlockingPollTlsConnector {
-            entered,
-            finished: finished.clone(),
-            release,
-        }),
-        Duration::from_millis(30),
+        Arc::new(FixedResolver::new(address)),
+        Arc::new(TokioTcpConnector),
+        tls_without_roots(),
+        Duration::from_millis(50),
     );
 
     let started = StdInstant::now();
     let result = provider.fetch_rate(&request()).await;
     let elapsed = started.elapsed();
-    releaser.join().unwrap();
-    assert!(finished.load(Ordering::SeqCst));
     assert_eq!(result, Err(ExchangeRateError::Unavailable));
-    assert!(
-        elapsed < Duration::from_millis(150),
-        "blocking TLS poll delayed the deadline for {elapsed:?}"
+    assert!(elapsed < Duration::from_millis(500));
+    let client_hello_bytes = tokio::time::timeout(Duration::from_millis(500), closed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(client_hello_bytes > 0);
+    tokio::time::timeout(Duration::from_millis(500), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn repeated_timed_out_rustls_handshakes_release_every_stream() {
+    const ATTEMPTS: usize = 8;
+    let (address, mut closed, server) = spawn_stalled_tls_server(ATTEMPTS).await;
+    let provider = native_provider(
+        Arc::new(FixedResolver::new(address)),
+        Arc::new(TokioTcpConnector),
+        tls_without_roots(),
+        Duration::from_millis(50),
     );
+
+    for _ in 0..ATTEMPTS {
+        assert_eq!(
+            provider.fetch_rate(&request()).await,
+            Err(ExchangeRateError::Unavailable)
+        );
+    }
+    for _ in 0..ATTEMPTS {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), closed.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+    }
+    tokio::time::timeout(Duration::from_millis(500), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
