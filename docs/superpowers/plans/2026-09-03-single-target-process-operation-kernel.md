@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-03
-**Status:** Implementation and final review complete — user acceptance pending
+**Status:** Accepted — implementation and final review complete; user accepted Stage 2A on 2026-09-04
 
 **Goal:** Deliver the host-internal single-target Windows process operation kernel for graceful GUI close and force termination, with final identity/protection revalidation, exact minimum rights, bounded completion semantics, and no product or plugin entry point.
 
@@ -175,4 +175,4 @@ Expected: format, all focused suites, complete `process_control`, and default fu
 - [x] Design section `8` is owned by Task 3 and completed by the Windows portion of Task 4.
 - [x] Design sections `9-13` are covered by Tasks 1-4 without leaking platform resources or adding wider rights.
 - [x] Design section `14` and every item in `15. Exit Gate` are evidenced by Task 5.
-- [ ] The user reviewed the verification record and explicitly accepted Stage 2A before any later Stage 2 design, plan, or code began.
+- [x] The user reviewed the verification record and explicitly accepted Stage 2A on 2026-09-04 before any later Stage 2 design, plan, or code began.

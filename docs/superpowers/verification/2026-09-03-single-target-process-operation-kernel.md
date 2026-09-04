@@ -1,7 +1,7 @@
 # Stage 2A Single-Target Process Operation Kernel Verification Record
 
 **Date:** 2026-09-03
-**Status:** AWAITING USER ACCEPTANCE
+**Status:** ACCEPTED BY USER ON 2026-09-04
 **Verification outcome:** `DONE_WITH_CONCERNS` — all Stage 2A focused, Windows,
 format, complete `process_control`, default full-test, dependency, cleanup, and
 scope checks pass. Both required Clippy commands and the all-features test command
@@ -11,9 +11,9 @@ there are zero `process_control` Clippy diagnostics at the final source revision
 baseline comparison, changed-file audit, and exit-gate evidence only. This record
 adds no product behavior.
 
-Stage 2A is not accepted by this document. Explicit user review and acceptance of
-this record is the final exit-gate item, and no later Stage 2 subsystem work may
-begin before that acceptance.
+The user explicitly reviewed and accepted this Stage 2A verification record on
+2026-09-04. This satisfies the final exit-gate item; later Stage 2 work remains a
+separate, explicitly sequenced task.
 
 ## Revision Under Verification
 
@@ -266,7 +266,7 @@ verification record.
 | No out-of-scope product/platform work | Dependency and final changed-file audit above. | PASS |
 | Regression/environment/limitations/scope recorded | Exact command table, environment, baseline, protected-target N/A, HWND race, async force boundary, cleanup, logging, and changed files above. | PASS with recorded deviations/N/A |
 | Aggregate Cargo gates | Fmt, focused, `process_control`, and default full tests pass. All-features test and both Clippy commands remain red only for the accepted Stage 1 baseline; zero `process_control` diagnostics. | RECORDED DEVIATIONS — aggregate commands not all green |
-| User review and explicit Stage 2A acceptance | This record has not yet been reviewed and accepted by the user. | **PENDING — REQUIRED FINAL GATE** |
+| User review and explicit Stage 2A acceptance | The user explicitly accepted this record on 2026-09-04. | PASS |
 
 ## Known Deviations And Stop Gate
 
@@ -280,8 +280,7 @@ verification record.
 4. The graceful HWND/PID residual reuse race and asynchronous force completion
    boundary remain explicit platform limitations as described above.
 
-The evidence is complete enough to request user review, but Stage 2A remains
-**AWAITING USER ACCEPTANCE**. This document does not accept the subsystem. Do not
-create detailed design, plan, or code for process tree, same-name batch, Restart,
-elevation broker, or any later Stage 2 subsystem until the user explicitly accepts
-this verification record.
+The user explicitly accepted this evidence on 2026-09-04. Stage 2A is therefore
+**ACCEPTED**. Process tree, same-name batch, Restart, elevation broker, and every
+later Stage 2 subsystem remain outside Stage 2A and require their own ordered
+design and implementation work.
