@@ -35,14 +35,14 @@ impl<'de> Deserialize<'de> for OperationId {
 impl OperationId {
     pub fn parse(value: &str) -> Result<Self, String> {
         let bytes = value.as_bytes();
-        let valid = bytes.len() == 36
+        let valid_shape = bytes.len() == 36
             && [8, 13, 18, 23].iter().all(|&index| bytes[index] == b'-')
             && bytes.iter().enumerate().all(|(index, byte)| {
                 [8, 13, 18, 23].contains(&index)
                     || byte.is_ascii_digit()
                     || (b'a'..=b'f').contains(byte)
             });
-        if !valid || value == "00000000-0000-0000-0000-000000000000" {
+        if !valid_shape || !canonical_nonzero_lower_hex(&value.replace('-', "")) {
             return Err("invalid-operation-id".into());
         }
         Ok(Self(value.to_string()))
@@ -56,6 +56,14 @@ impl OperationId {
     pub fn fixture(seed: u8) -> Self {
         Self(format!("{seed:08x}-0000-4000-8000-000000000001"))
     }
+}
+
+pub fn canonical_nonzero_lower_hex(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

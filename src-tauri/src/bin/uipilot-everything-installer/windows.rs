@@ -550,9 +550,10 @@ fn xml_name(bytes: &[u8], index: &mut usize) -> Option<std::ops::Range<usize>> {
         return None;
     }
     *index += 1;
-    while bytes.get(*index).is_some_and(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.' | b':')
-    }) {
+    while bytes
+        .get(*index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.'))
+    {
         *index += 1;
     }
     Some(start..*index)
@@ -1903,6 +1904,18 @@ mod tests {
         ));
         assert!(!embedded_manifest_is_as_invoker(
             br#"<assembly><RequestedExecutionLevel level="asInvoker" uiAccess="false" /></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly xmlns:x="urn:foreign"><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo><x:trustInfo><x:security><x:requestedPrivileges><x:requestedExecutionLevel level="requireAdministrator" uiAccess="false" /></x:requestedPrivileges></x:security></x:trustInfo></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly xmlns:x="urn:foreign"><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo><x:requestedExecutionLevelEvil level="requireAdministrator" uiAccess="false" /></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" x:foreign="true"><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo></assembly>"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<assembly><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo></assembly>"#
         ));
     }
 

@@ -1,4 +1,4 @@
-use crate::model::{OperationId, Phase};
+use crate::model::{canonical_nonzero_lower_hex, OperationId, Phase};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,12 +21,7 @@ fn valid_transaction_temp_name(name: &str) -> bool {
     const SUFFIX: &str = ".tmp";
     name.strip_prefix(PREFIX)
         .and_then(|value| value.strip_suffix(SUFFIX))
-        .is_some_and(|id| {
-            id.len() == 32
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        })
+        .is_some_and(canonical_nonzero_lower_hex)
 }
 
 pub fn durable_temp_name(stem: &str, transaction_id: &OperationId) -> String {
@@ -457,6 +452,66 @@ pub fn uninstall_step(new_exists: bool, old_exists: bool, manifest_exists: bool)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedRootResidue {
+    Missing,
+    ProtectedEmpty,
+    HasContent,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateServiceResidue {
+    Absent,
+    Present,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreUninstallResidueDecision {
+    Continue,
+    FailClosed,
+}
+
+pub fn pre_uninstall_residue_decision(
+    root: ManagedRootResidue,
+    service: PrivateServiceResidue,
+    recovered_id_present: bool,
+) -> PreUninstallResidueDecision {
+    if matches!(
+        root,
+        ManagedRootResidue::Missing | ManagedRootResidue::ProtectedEmpty
+    ) && service == PrivateServiceResidue::Absent
+        && !recovered_id_present
+    {
+        PreUninstallResidueDecision::Continue
+    } else {
+        PreUninstallResidueDecision::FailClosed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostUninstallResidueDecision {
+    RemoveEmptyRoot,
+    Complete,
+    FailClosed,
+}
+
+pub fn post_uninstall_residue_decision(
+    root: ManagedRootResidue,
+    service: PrivateServiceResidue,
+) -> PostUninstallResidueDecision {
+    match (root, service) {
+        (ManagedRootResidue::ProtectedEmpty, PrivateServiceResidue::Absent) => {
+            PostUninstallResidueDecision::RemoveEmptyRoot
+        }
+        (ManagedRootResidue::Missing, PrivateServiceResidue::Absent) => {
+            PostUninstallResidueDecision::Complete
+        }
+        _ => PostUninstallResidueDecision::FailClosed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +528,18 @@ mod tests {
         );
         assert_eq!(
             classify_bootstrap(&["foreign.txt"]),
+            BootstrapDisposition::Foreign
+        );
+        assert_eq!(
+            classify_bootstrap(&["managed-transaction.00000000000000000000000000000000.tmp"]),
+            BootstrapDisposition::Foreign
+        );
+        assert_eq!(
+            classify_bootstrap(&["managed-transaction.00112233445566778899AABBCCDDEEFF.tmp"]),
+            BootstrapDisposition::Foreign
+        );
+        assert_eq!(
+            classify_bootstrap(&["managed-transaction.00112233445566778899aabbccddeef.tmp"]),
             BootstrapDisposition::Foreign
         );
         assert_eq!(
@@ -1528,6 +1595,94 @@ mod tests {
             UninstallStep::DeleteManifest
         );
         assert_eq!(uninstall_step(false, false, false), UninstallStep::Complete);
+    }
+
+    #[test]
+    fn pre_uninstall_residue_requires_absent_service_and_exact_empty_root() {
+        assert_eq!(
+            pre_uninstall_residue_decision(
+                ManagedRootResidue::ProtectedEmpty,
+                PrivateServiceResidue::Absent,
+                false,
+            ),
+            PreUninstallResidueDecision::Continue
+        );
+        assert_eq!(
+            pre_uninstall_residue_decision(
+                ManagedRootResidue::Missing,
+                PrivateServiceResidue::Absent,
+                false,
+            ),
+            PreUninstallResidueDecision::Continue
+        );
+        for root in [
+            ManagedRootResidue::HasContent,
+            ManagedRootResidue::Untrusted,
+        ] {
+            assert_eq!(
+                pre_uninstall_residue_decision(root, PrivateServiceResidue::Absent, false,),
+                PreUninstallResidueDecision::FailClosed
+            );
+        }
+        assert_eq!(
+            pre_uninstall_residue_decision(
+                ManagedRootResidue::ProtectedEmpty,
+                PrivateServiceResidue::Present,
+                false,
+            ),
+            PreUninstallResidueDecision::FailClosed
+        );
+        assert_eq!(
+            pre_uninstall_residue_decision(
+                ManagedRootResidue::ProtectedEmpty,
+                PrivateServiceResidue::Absent,
+                true,
+            ),
+            PreUninstallResidueDecision::FailClosed
+        );
+    }
+
+    #[test]
+    fn manifest_deletion_failure_composes_across_uninstall_retry() {
+        let mut referenced_directory_exists = true;
+        let mut manifest_exists = true;
+        assert_eq!(
+            uninstall_step(referenced_directory_exists, false, manifest_exists),
+            UninstallStep::DeleteNewDirectory
+        );
+        referenced_directory_exists = false;
+        assert_eq!(
+            uninstall_step(referenced_directory_exists, false, manifest_exists),
+            UninstallStep::DeleteManifest
+        );
+        manifest_exists = false;
+        assert_eq!(
+            uninstall_step(referenced_directory_exists, false, manifest_exists),
+            UninstallStep::Complete
+        );
+
+        assert_eq!(
+            pre_uninstall_residue_decision(
+                ManagedRootResidue::ProtectedEmpty,
+                PrivateServiceResidue::Absent,
+                false,
+            ),
+            PreUninstallResidueDecision::Continue
+        );
+        assert_eq!(
+            post_uninstall_residue_decision(
+                ManagedRootResidue::ProtectedEmpty,
+                PrivateServiceResidue::Absent,
+            ),
+            PostUninstallResidueDecision::RemoveEmptyRoot
+        );
+        assert_eq!(
+            post_uninstall_residue_decision(
+                ManagedRootResidue::Missing,
+                PrivateServiceResidue::Absent,
+            ),
+            PostUninstallResidueDecision::Complete
+        );
     }
 
     #[test]

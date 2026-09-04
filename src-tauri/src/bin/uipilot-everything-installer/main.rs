@@ -16,8 +16,9 @@ use transaction::{
     candidate_directory_disposition, classify_matching_service, classify_runtime_manifest,
     rollback_cleanup_step, validate_recovery_handoff, validate_same_transaction,
     CandidateDirectoryDisposition, ConvergenceDecision, ConvergenceInput, ForwardAction,
-    LiveService, OldRecoveryState, RollbackCleanupStep, RollbackDecision, ServiceActivity,
-    UninstallStep,
+    LiveService, ManagedRootResidue, OldRecoveryState, PostUninstallResidueDecision,
+    PreUninstallResidueDecision, PrivateServiceResidue, RollbackCleanupStep, RollbackDecision,
+    ServiceActivity, UninstallStep,
 };
 use windows::{AdmissionLease, ExitCode, ServiceState};
 
@@ -1093,6 +1094,26 @@ fn rollback_install(request: &Request, lease: &AdmissionLease) -> HelperResult<(
     remove_transaction_artifacts(&root, &journal.transaction_id)
 }
 
+fn managed_root_residue(root: &Path) -> HelperResult<ManagedRootResidue> {
+    if !root.exists() {
+        return Ok(ManagedRootResidue::Missing);
+    }
+    let mut entries = fs::read_dir(root)
+        .map_err(|_| (ExitCode::ForeignState, "managed-root-read-failed".into()))?;
+    match entries.next() {
+        None => Ok(ManagedRootResidue::ProtectedEmpty),
+        Some(Ok(_)) => Ok(ManagedRootResidue::HasContent),
+        Some(Err(_)) => fail(ExitCode::ForeignState, "managed-root-entry-invalid"),
+    }
+}
+
+fn private_service_residue() -> HelperResult<PrivateServiceResidue> {
+    match windows::query_service().map_err(|reason| (ExitCode::NativeFailure, reason))? {
+        ServiceState::Absent => Ok(PrivateServiceResidue::Absent),
+        ServiceState::Running(_) | ServiceState::Stopped(_) => Ok(PrivateServiceResidue::Present),
+    }
+}
+
 fn pre_uninstall(request: &Request, lease: &AdmissionLease) -> HelperResult<()> {
     lease
         .ensure_parent_alive()
@@ -1101,6 +1122,7 @@ fn pre_uninstall(request: &Request, lease: &AdmissionLease) -> HelperResult<()> 
     if root.exists() {
         windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
     }
+    let mut recovered_handoff_consumed = false;
     let durable = root.join(TRANSACTION_MANIFEST_NAME);
     if durable.exists() {
         windows::verify_managed_file(&durable)
@@ -1123,19 +1145,26 @@ fn pre_uninstall(request: &Request, lease: &AdmissionLease) -> HelperResult<()> 
         .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
         converge_transaction(&root, &journal)?;
         remove_transaction_artifacts(&root, &journal.transaction_id)?;
-    } else if request.recovered_transaction_id.is_some() {
+        recovered_handoff_consumed = true;
+    }
+    let Some(manifest) = read_runtime_manifest(&root)? else {
+        return match transaction::pre_uninstall_residue_decision(
+            managed_root_residue(&root)?,
+            private_service_residue()?,
+            request.recovered_transaction_id.is_some() && !recovered_handoff_consumed,
+        ) {
+            PreUninstallResidueDecision::Continue => Ok(()),
+            PreUninstallResidueDecision::FailClosed => {
+                fail(ExitCode::ForeignState, "uninstall-residue-invalid")
+            }
+        };
+    };
+    if request.recovered_transaction_id.is_some() && !recovered_handoff_consumed {
         return fail(
             ExitCode::ForeignState,
             "unexpected-uninstall-transaction-id",
         );
     }
-    let Some(manifest) = read_runtime_manifest(&root)? else {
-        return if root.exists() {
-            fail(ExitCode::ForeignState, "uninstall-manifest-missing")
-        } else {
-            Ok(())
-        };
-    };
     match windows::query_service().map_err(|reason| (ExitCode::NativeFailure, reason))? {
         ServiceState::Absent => Ok(()),
         ServiceState::Running(command) | ServiceState::Stopped(command)
@@ -1156,36 +1185,20 @@ fn post_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()
         .ensure_parent_alive()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
     let root = windows::managed_root().map_err(|reason| (ExitCode::NativeFailure, reason))?;
-    if !root.exists() {
-        return Ok(());
+    if root.exists() {
+        windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
     }
-    windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
     let Some(manifest) = read_runtime_manifest(&root)? else {
-        let names = fs::read_dir(&root)
-            .map_err(|_| {
-                (
-                    ExitCode::ForeignState,
-                    "post-uninstall-root-read-failed".into(),
-                )
-            })?
-            .map(|entry| {
-                entry
-                    .ok()
-                    .and_then(|entry| entry.file_name().into_string().ok())
-                    .ok_or(())
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| {
-                (
-                    ExitCode::ForeignState,
-                    "post-uninstall-entry-invalid".into(),
-                )
-            })?;
-        return if names.is_empty() {
-            fs::remove_dir(&root)
-                .map_err(|_| (ExitCode::NativeFailure, "empty-root-delete-failed".into()))
-        } else {
-            fail(ExitCode::ForeignState, "manifest-missing-with-content")
+        return match transaction::post_uninstall_residue_decision(
+            managed_root_residue(&root)?,
+            private_service_residue()?,
+        ) {
+            PostUninstallResidueDecision::RemoveEmptyRoot => fs::remove_dir(&root)
+                .map_err(|_| (ExitCode::NativeFailure, "empty-root-delete-failed".into())),
+            PostUninstallResidueDecision::Complete => Ok(()),
+            PostUninstallResidueDecision::FailClosed => {
+                fail(ExitCode::ForeignState, "post-uninstall-residue-invalid")
+            }
         };
     };
     if !matches!(
