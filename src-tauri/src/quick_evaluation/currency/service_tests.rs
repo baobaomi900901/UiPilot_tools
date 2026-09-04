@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 use super::{
     cache::{CacheCommitter, ExchangeRateCache},
     provider::{ExchangeRateProvider, ExchangeRateProviderFuture},
-    service::{CurrencyResolveError, ExchangeRateService},
+    service::{CurrencyResolveError, ExchangeRateService, UtcClock},
     CurrencyClassification, CurrencyCode, CurrencyFailure, CurrencyIntent, ExchangeRateError,
     ExchangeRateRequest, ExchangeRateResult,
 };
@@ -60,6 +60,110 @@ impl CacheCommitter for NoopCommitter {
         _candidate: &[u8],
     ) -> Result<(), AtomicFileError> {
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CaptureCommitter {
+    commits: Mutex<Vec<(Option<Vec<u8>>, Vec<u8>)>>,
+}
+
+impl CaptureCommitter {
+    fn commits(&self) -> Vec<(Option<Vec<u8>>, Vec<u8>)> {
+        self.commits.lock().unwrap().clone()
+    }
+}
+
+impl CacheCommitter for CaptureCommitter {
+    fn commit(
+        &self,
+        _paths: &AtomicPaths,
+        previous: Option<&[u8]>,
+        candidate: &[u8],
+    ) -> Result<(), AtomicFileError> {
+        self.commits
+            .lock()
+            .unwrap()
+            .push((previous.map(<[u8]>::to_vec), candidate.to_vec()));
+        Ok(())
+    }
+}
+
+struct ManualClock {
+    now: Mutex<Result<OffsetDateTime, ()>>,
+    reads: AtomicUsize,
+}
+
+impl ManualClock {
+    fn new(now: OffsetDateTime) -> Self {
+        Self {
+            now: Mutex::new(Ok(now)),
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn set(&self, now: OffsetDateTime) {
+        *self.now.lock().unwrap() = Ok(now);
+    }
+
+    fn fail(&self) {
+        *self.now.lock().unwrap() = Err(());
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl UtcClock for ManualClock {
+    fn now_utc(&self) -> Result<OffsetDateTime, ()> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        *self.now.lock().unwrap()
+    }
+}
+
+struct BlockingClock {
+    now: OffsetDateTime,
+    block_call: usize,
+    calls: AtomicUsize,
+    entered: Semaphore,
+    released: Mutex<bool>,
+    release_signal: Condvar,
+}
+
+impl BlockingClock {
+    fn new(now: OffsetDateTime, block_call: usize) -> Self {
+        Self {
+            now,
+            block_call,
+            calls: AtomicUsize::new(0),
+            entered: Semaphore::new(0),
+            released: Mutex::new(false),
+            release_signal: Condvar::new(),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_signal.notify_all();
+    }
+}
+
+impl UtcClock for BlockingClock {
+    fn now_utc(&self) -> Result<OffsetDateTime, ()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.block_call {
+            self.entered.add_permits(1);
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release_signal.wait(released).unwrap();
+            }
+        }
+        Ok(self.now)
     }
 }
 
@@ -316,14 +420,12 @@ async fn same_code_and_fresh_cache_return_without_provider_work() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache,
+        Arc::new(ManualClock::new(now)),
     ));
 
-    let same = service
-        .resolve(intent("12.5 USD to usd"), now)
-        .await
-        .unwrap();
-    let direct = service.resolve(intent("2 USD to CNY"), now).await.unwrap();
-    let reverse = service.resolve(intent("16 CNY to USD"), now).await.unwrap();
+    let same = service.resolve(intent("12.5 USD to usd")).await.unwrap();
+    let direct = service.resolve(intent("2 USD to CNY")).await.unwrap();
+    let reverse = service.resolve(intent("16 CNY to USD")).await.unwrap();
 
     assert_eq!(same.title, "12.5 USD");
     assert_eq!(direct.title, "16 CNY");
@@ -342,9 +444,10 @@ async fn stale_cache_refreshes_and_provider_success_wins() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache,
+        Arc::new(ManualClock::new(now)),
     ));
 
-    let output = service.resolve(intent("2 USD to CNY"), now).await.unwrap();
+    let output = service.resolve(intent("2 USD to CNY")).await.unwrap();
 
     assert_eq!(output.title, "16 CNY");
     assert!(!output.subtitle.contains("缓存"));
@@ -361,9 +464,13 @@ async fn unavailable_refresh_uses_reverse_stale_through_exact_seven_day_boundary
     )]));
     let mut cache = cache(&dir, now);
     cache.store(result("USD", "CNY", "8"), fetched_at, now);
-    let service = Arc::new(ExchangeRateService::with_dependencies(provider, cache));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider,
+        cache,
+        Arc::new(ManualClock::new(now)),
+    ));
 
-    let output = service.resolve(intent("16 CNY to USD"), now).await.unwrap();
+    let output = service.resolve(intent("16 CNY to USD")).await.unwrap();
 
     assert_eq!(output.title, "2 USD");
     assert!(output.subtitle.contains("缓存"));
@@ -387,12 +494,10 @@ async fn unsupported_code_never_uses_stale_fallback() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache,
+        Arc::new(ManualClock::new(now)),
     ));
 
-    let error = service
-        .resolve(intent("2 USD to XYZ"), now)
-        .await
-        .unwrap_err();
+    let error = service.resolve(intent("2 USD to XYZ")).await.unwrap_err();
 
     assert_eq!(
         error,
@@ -413,18 +518,17 @@ async fn direct_inverse_and_amount_only_callers_share_one_provider_task() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache(&dir, now),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let direct_service = service.clone();
-    let direct =
-        tokio::spawn(async move { direct_service.resolve(intent("2 USD to CNY"), now).await });
+    let direct = tokio::spawn(async move { direct_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     let inverse_service = service.clone();
     let inverse =
-        tokio::spawn(async move { inverse_service.resolve(intent("16 CNY to USD"), now).await });
+        tokio::spawn(async move { inverse_service.resolve(intent("16 CNY to USD")).await });
     let amount_service = service.clone();
-    let amount =
-        tokio::spawn(async move { amount_service.resolve(intent("3 USD to CNY"), now).await });
+    let amount = tokio::spawn(async move { amount_service.resolve(intent("3 USD to CNY")).await });
     tokio::task::yield_now().await;
     provider.release(3);
 
@@ -445,16 +549,16 @@ async fn cancelling_the_first_caller_does_not_cancel_the_shared_work() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache(&dir, now),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let leader_service = service.clone();
-    let leader =
-        tokio::spawn(async move { leader_service.resolve(intent("2 USD to CNY"), now).await });
+    let leader = tokio::spawn(async move { leader_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     leader.abort();
     let follower_service = service.clone();
     let follower =
-        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD"), now).await });
+        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD")).await });
     tokio::task::yield_now().await;
     provider.release(2);
 
@@ -466,11 +570,7 @@ async fn cancelling_the_first_caller_does_not_cancel_the_shared_work() {
     assert_eq!(output.title, "2 USD");
     assert_eq!(provider.calls(), 1);
     assert_eq!(
-        service
-            .resolve(intent("1 USD to CNY"), now)
-            .await
-            .unwrap()
-            .title,
+        service.resolve(intent("1 USD to CNY")).await.unwrap().title,
         "8 CNY"
     );
     assert_eq!(provider.calls(), 1);
@@ -484,15 +584,15 @@ async fn provider_panic_is_unavailable_and_does_not_strand_a_follower() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache(&dir, now),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let first_service = service.clone();
-    let first =
-        tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY"), now).await });
+    let first = tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     let follower_service = service.clone();
     let follower =
-        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD"), now).await });
+        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD")).await });
     tokio::task::yield_now().await;
     provider.release(1);
 
@@ -519,15 +619,15 @@ async fn terminal_failure_removes_inflight_state_and_allows_retry() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache(&dir, now),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let first_service = service.clone();
-    let first =
-        tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY"), now).await });
+    let first = tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     let follower_service = service.clone();
     let follower =
-        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD"), now).await });
+        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD")).await });
     tokio::task::yield_now().await;
     provider.release(2);
     assert_eq!(first.await.unwrap(), Err(CurrencyResolveError::Unavailable));
@@ -538,8 +638,7 @@ async fn terminal_failure_removes_inflight_state_and_allows_retry() {
     assert_eq!(provider.calls(), 1);
 
     let retry_service = service.clone();
-    let retry =
-        tokio::spawn(async move { retry_service.resolve(intent("2 USD to CNY"), now).await });
+    let retry = tokio::spawn(async move { retry_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     provider.release(1);
     assert_eq!(retry.await.unwrap().unwrap().title, "16 CNY");
@@ -559,10 +658,14 @@ async fn expired_or_missing_cache_returns_typed_unavailable() {
         now - Duration::days(7) - Duration::SECOND,
         now,
     );
-    let service = Arc::new(ExchangeRateService::with_dependencies(provider, cache));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider,
+        cache,
+        Arc::new(ManualClock::new(now)),
+    ));
 
     assert_eq!(
-        service.resolve(intent("2 USD to CNY"), now).await,
+        service.resolve(intent("2 USD to CNY")).await,
         Err(CurrencyResolveError::Unavailable)
     );
 }
@@ -577,14 +680,15 @@ async fn provider_wait_does_not_hold_cache_or_inflight_locks() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         seeded,
+        Arc::new(ManualClock::new(now)),
     ));
 
     let cold_service = service.clone();
-    let cold = tokio::spawn(async move { cold_service.resolve(intent("2 USD to CNY"), now).await });
+    let cold = tokio::spawn(async move { cold_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     let fresh_service = service.clone();
     let mut fresh =
-        tokio::spawn(async move { fresh_service.resolve(intent("2 EUR to JPY"), now).await });
+        tokio::spawn(async move { fresh_service.resolve(intent("2 EUR to JPY")).await });
     let prompt = tokio::time::timeout(StdDuration::from_millis(100), &mut fresh).await;
     let completed_promptly = prompt.is_ok();
     provider.release(1);
@@ -611,15 +715,15 @@ async fn disk_commit_does_not_hold_cache_or_inflight_locks() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider,
         cache_with_committer(&dir, now, committer.clone()),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let first_service = service.clone();
-    let first =
-        tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY"), now).await });
+    let first = tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
     committer.wait_until_entered().await;
     let fresh_service = service.clone();
     let mut fresh =
-        tokio::spawn(async move { fresh_service.resolve(intent("3 USD to CNY"), now).await });
+        tokio::spawn(async move { fresh_service.resolve(intent("3 USD to CNY")).await });
     let prompt = tokio::time::timeout(StdDuration::from_millis(100), &mut fresh).await;
     let completed_promptly = prompt.is_ok();
     committer.release();
@@ -645,11 +749,12 @@ async fn synchronous_committer_runs_off_the_async_runtime() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider,
         cache_with_committer(&dir, now, Arc::new(SleepingCommitter)),
+        Arc::new(ManualClock::new(now)),
     ));
     let started = Instant::now();
     let resolve_service = service.clone();
     let resolve =
-        tokio::spawn(async move { resolve_service.resolve(intent("2 USD to CNY"), now).await });
+        tokio::spawn(async move { resolve_service.resolve(intent("2 USD to CNY")).await });
 
     tokio::time::sleep(StdDuration::from_millis(25)).await;
     let heartbeat = started.elapsed();
@@ -670,22 +775,15 @@ async fn persistence_failure_keeps_provider_success_and_fresh_memory_rate() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache_with_committer(&dir, now, Arc::new(FailingCommitter)),
+        Arc::new(ManualClock::new(now)),
     ));
 
     assert_eq!(
-        service
-            .resolve(intent("2 USD to CNY"), now)
-            .await
-            .unwrap()
-            .title,
+        service.resolve(intent("2 USD to CNY")).await.unwrap().title,
         "16 CNY"
     );
     assert_eq!(
-        service
-            .resolve(intent("3 USD to CNY"), now)
-            .await
-            .unwrap()
-            .title,
+        service.resolve(intent("3 USD to CNY")).await.unwrap().title,
         "24 CNY"
     );
     assert_eq!(provider.calls(), 1);
@@ -703,15 +801,14 @@ async fn concurrent_completions_persist_serial_snapshots_without_lost_entries() 
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider,
         cache_with_committer(&dir, now, committer.clone()),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let first_service = service.clone();
-    let first =
-        tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY"), now).await });
+    let first = tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
     committer.wait_until_entered().await;
     let second_service = service.clone();
-    let second =
-        tokio::spawn(async move { second_service.resolve(intent("2 EUR to JPY"), now).await });
+    let second = tokio::spawn(async move { second_service.resolve(intent("2 EUR to JPY")).await });
     tokio::task::yield_now().await;
     committer.release();
     assert_eq!(first.await.unwrap().unwrap().title, "16 CNY");
@@ -730,13 +827,9 @@ async fn concurrent_completions_persist_serial_snapshots_without_lost_entries() 
 #[tokio::test]
 async fn production_constructor_loads_the_owned_cache_without_network_work() {
     let dir = TestDir::new("production-load");
-    let now = instant(12);
-    let service = Arc::new(ExchangeRateService::load(dir.path(), now).unwrap());
+    let service = Arc::new(ExchangeRateService::load(dir.path()).unwrap());
 
-    let output = service
-        .resolve(intent("12.5 USD to USD"), now)
-        .await
-        .unwrap();
+    let output = service.resolve(intent("12.5 USD to USD")).await.unwrap();
 
     assert_eq!(output.title, "12.5 USD");
 }
@@ -749,15 +842,15 @@ async fn inverse_leader_broadcasts_the_reciprocal_to_a_direct_follower() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache(&dir, now),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let inverse_service = service.clone();
     let inverse =
-        tokio::spawn(async move { inverse_service.resolve(intent("16 CNY to USD"), now).await });
+        tokio::spawn(async move { inverse_service.resolve(intent("16 CNY to USD")).await });
     provider.wait_until_called().await;
     let direct_service = service.clone();
-    let direct =
-        tokio::spawn(async move { direct_service.resolve(intent("2 USD to CNY"), now).await });
+    let direct = tokio::spawn(async move { direct_service.resolve(intent("2 USD to CNY")).await });
     tokio::task::yield_now().await;
     provider.release(1);
 
@@ -777,18 +870,19 @@ async fn cancelled_only_caller_still_allows_success_to_populate_cache() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache(&dir, now),
+        Arc::new(ManualClock::new(now)),
     ));
 
     let abandoned_service = service.clone();
     let abandoned =
-        tokio::spawn(async move { abandoned_service.resolve(intent("2 USD to CNY"), now).await });
+        tokio::spawn(async move { abandoned_service.resolve(intent("2 USD to CNY")).await });
     provider.wait_until_called().await;
     abandoned.abort();
     provider.release(2);
 
     let output = tokio::time::timeout(
         StdDuration::from_secs(1),
-        service.resolve(intent("3 USD to CNY"), now),
+        service.resolve(intent("3 USD to CNY")),
     )
     .await
     .expect("later cache lookup settled")
@@ -820,18 +914,19 @@ async fn unsupported_and_panicked_provider_terminals_each_allow_a_retry() {
         let service = Arc::new(ExchangeRateService::with_dependencies(
             provider.clone(),
             cache(&dir, now),
+            Arc::new(ManualClock::new(now)),
         ));
 
         let first_service = service.clone();
         let first =
-            tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY"), now).await });
+            tokio::spawn(async move { first_service.resolve(intent("2 USD to CNY")).await });
         provider.wait_until_called().await;
         provider.release(1);
         assert_eq!(first.await.unwrap(), Err(first_error));
 
         let retry_service = service.clone();
         let retry =
-            tokio::spawn(async move { retry_service.resolve(intent("2 USD to CNY"), now).await });
+            tokio::spawn(async move { retry_service.resolve(intent("2 USD to CNY")).await });
         provider.wait_until_called().await;
         provider.release(1);
         assert_eq!(retry.await.unwrap().unwrap().title, "16 CNY");
@@ -847,22 +942,15 @@ async fn persistence_worker_panic_does_not_change_provider_success() {
     let service = Arc::new(ExchangeRateService::with_dependencies(
         provider.clone(),
         cache_with_committer(&dir, now, Arc::new(PanickingCommitter)),
+        Arc::new(ManualClock::new(now)),
     ));
 
     assert_eq!(
-        service
-            .resolve(intent("2 USD to CNY"), now)
-            .await
-            .unwrap()
-            .title,
+        service.resolve(intent("2 USD to CNY")).await.unwrap().title,
         "16 CNY"
     );
     assert_eq!(
-        service
-            .resolve(intent("3 USD to CNY"), now)
-            .await
-            .unwrap()
-            .title,
+        service.resolve(intent("3 USD to CNY")).await.unwrap().title,
         "24 CNY"
     );
     assert_eq!(provider.calls(), 1);
@@ -880,12 +968,221 @@ async fn service_rejects_noncanonical_successes_from_an_injected_provider() {
         let service = Arc::new(ExchangeRateService::with_dependencies(
             provider.clone(),
             cache(&dir, now),
+            Arc::new(ManualClock::new(now)),
         ));
 
         assert_eq!(
-            service.resolve(intent("2 USD to CNY"), now).await,
+            service.resolve(intent("2 USD to CNY")).await,
             Err(CurrencyResolveError::Unavailable)
         );
         assert_eq!(provider.calls(), 1);
     }
+}
+
+#[tokio::test]
+async fn successful_fetch_persists_the_completion_time_not_request_start() {
+    let dir = TestDir::new("completion-fetch-time");
+    let started_at = instant(12);
+    let completed_at = started_at + Duration::minutes(30);
+    let provider = Arc::new(ControlledProvider::new(vec![ControlledOutcome::Success]));
+    let committer = Arc::new(CaptureCommitter::default());
+    let clock = Arc::new(ManualClock::new(started_at));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache_with_committer(&dir, started_at, committer.clone()),
+        clock.clone(),
+    ));
+
+    let resolve_service = service.clone();
+    let resolve =
+        tokio::spawn(async move { resolve_service.resolve(intent("2 USD to CNY")).await });
+    provider.wait_until_called().await;
+    clock.set(completed_at);
+    provider.release(1);
+    assert_eq!(resolve.await.unwrap().unwrap().title, "16 CNY");
+
+    let commits = committer.commits();
+    let persisted = serde_json::from_slice::<serde_json::Value>(&commits[0].1).unwrap();
+    assert_eq!(persisted["entries"][0]["fetchedAt"], "2026-09-03T12:30:00Z");
+}
+
+#[tokio::test]
+async fn stale_entry_crossing_seven_days_during_refresh_is_not_returned() {
+    let dir = TestDir::new("expires-during-refresh");
+    let started_at = instant(12);
+    let provider = Arc::new(ControlledProvider::new(vec![
+        ControlledOutcome::Unavailable,
+    ]));
+    let clock = Arc::new(ManualClock::new(started_at));
+    let mut seeded = cache(&dir, started_at);
+    seeded.store(
+        result("USD", "CNY", "8"),
+        started_at - Duration::days(7),
+        started_at,
+    );
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        seeded,
+        clock.clone(),
+    ));
+
+    let resolve_service = service.clone();
+    let resolve =
+        tokio::spawn(async move { resolve_service.resolve(intent("16 CNY to USD")).await });
+    provider.wait_until_called().await;
+    clock.set(started_at + Duration::SECOND);
+    provider.release(1);
+
+    assert_eq!(
+        resolve.await.unwrap(),
+        Err(CurrencyResolveError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn stale_entry_at_exactly_seven_days_on_completion_remains_eligible() {
+    let dir = TestDir::new("exact-seven-days-at-completion");
+    let started_at = instant(12);
+    let fetched_at = started_at - Duration::days(7) + Duration::SECOND;
+    let completed_at = started_at + Duration::SECOND;
+    let provider = Arc::new(ControlledProvider::new(vec![
+        ControlledOutcome::Unavailable,
+    ]));
+    let clock = Arc::new(ManualClock::new(started_at));
+    let mut seeded = cache(&dir, started_at);
+    seeded.store(result("USD", "CNY", "8"), fetched_at, started_at);
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        seeded,
+        clock.clone(),
+    ));
+
+    let resolve_service = service.clone();
+    let resolve =
+        tokio::spawn(async move { resolve_service.resolve(intent("16 CNY to USD")).await });
+    provider.wait_until_called().await;
+    clock.set(completed_at);
+    provider.release(1);
+
+    let output = resolve.await.unwrap().unwrap();
+    assert_eq!(output.title, "2 USD");
+    assert!(output.subtitle.contains("获取于 2026-08-27T12:00:01Z"));
+}
+
+#[tokio::test]
+async fn coalesced_followers_share_one_completion_timestamp() {
+    let dir = TestDir::new("shared-completion-time");
+    let started_at = instant(12);
+    let completed_at = started_at + Duration::minutes(30);
+    let provider = Arc::new(ControlledProvider::new(vec![ControlledOutcome::Success]));
+    let committer = Arc::new(CaptureCommitter::default());
+    let clock = Arc::new(ManualClock::new(started_at));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache_with_committer(&dir, started_at, committer.clone()),
+        clock.clone(),
+    ));
+
+    let leader_service = service.clone();
+    let leader = tokio::spawn(async move { leader_service.resolve(intent("2 USD to CNY")).await });
+    provider.wait_until_called().await;
+    let follower_service = service.clone();
+    let follower =
+        tokio::spawn(async move { follower_service.resolve(intent("16 CNY to USD")).await });
+    tokio::task::yield_now().await;
+    clock.set(completed_at);
+    provider.release(1);
+
+    assert_eq!(leader.await.unwrap().unwrap().title, "16 CNY");
+    assert_eq!(follower.await.unwrap().unwrap().title, "2 USD");
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(
+        clock.reads(),
+        3,
+        "two request reads and one shared completion read"
+    );
+    let commits = committer.commits();
+    let persisted = serde_json::from_slice::<serde_json::Value>(&commits[0].1).unwrap();
+    assert_eq!(persisted["entries"][0]["fetchedAt"], "2026-09-03T12:30:00Z");
+}
+
+#[tokio::test]
+async fn clock_failure_is_unavailable_while_same_code_stays_fully_local() {
+    let dir = TestDir::new("clock-failure");
+    let now = instant(12);
+    let provider = Arc::new(QueueProvider::new(Vec::new()));
+    let clock = Arc::new(ManualClock::new(now));
+    clock.fail();
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache(&dir, now),
+        clock.clone(),
+    ));
+
+    assert_eq!(
+        service.resolve(intent("2 USD to USD")).await.unwrap().title,
+        "2 USD"
+    );
+    assert_eq!(clock.reads(), 0);
+    assert_eq!(
+        service.resolve(intent("2 USD to CNY")).await,
+        Err(CurrencyResolveError::Unavailable)
+    );
+    assert_eq!(provider.calls(), 0);
+
+    let provider = Arc::new(ControlledProvider::new(vec![ControlledOutcome::Success]));
+    let clock = Arc::new(ManualClock::new(now));
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        cache(&dir, now),
+        clock.clone(),
+    ));
+    let resolve_service = service.clone();
+    let resolve =
+        tokio::spawn(async move { resolve_service.resolve(intent("2 USD to CNY")).await });
+    provider.wait_until_called().await;
+    clock.fail();
+    provider.release(1);
+    assert_eq!(
+        resolve.await.unwrap(),
+        Err(CurrencyResolveError::Unavailable)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_completion_clock_holds_no_cache_or_inflight_lock() {
+    let dir = TestDir::new("blocking-completion-clock");
+    let now = instant(12);
+    let provider = Arc::new(ControlledProvider::new(vec![ControlledOutcome::Success]));
+    let clock = Arc::new(BlockingClock::new(now, 2));
+    let mut seeded = cache(&dir, now);
+    seeded.store(result("EUR", "JPY", "160"), now, now);
+    let service = Arc::new(ExchangeRateService::with_dependencies(
+        provider.clone(),
+        seeded,
+        clock.clone(),
+    ));
+
+    let cold_service = service.clone();
+    let cold = tokio::spawn(async move { cold_service.resolve(intent("2 USD to CNY")).await });
+    provider.wait_until_called().await;
+    provider.release(1);
+    clock.wait_until_entered().await;
+    let fresh_service = service.clone();
+    let mut fresh =
+        tokio::spawn(async move { fresh_service.resolve(intent("2 EUR to JPY")).await });
+    let prompt = tokio::time::timeout(StdDuration::from_millis(100), &mut fresh).await;
+    let completed_promptly = prompt.is_ok();
+    clock.release();
+    let fresh_output = match prompt {
+        Ok(output) => output.unwrap().unwrap(),
+        Err(_) => fresh.await.unwrap().unwrap(),
+    };
+
+    assert!(
+        completed_promptly,
+        "fresh lookup was blocked by completion clock"
+    );
+    assert_eq!(fresh_output.title, "320 JPY");
+    assert_eq!(cold.await.unwrap().unwrap().title, "16 CNY");
 }

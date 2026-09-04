@@ -22,14 +22,31 @@ pub(crate) enum CurrencyResolveError {
     Unavailable,
 }
 
+pub(super) trait UtcClock: Send + Sync {
+    fn now_utc(&self) -> Result<OffsetDateTime, ()>;
+}
+
+struct SystemUtcClock;
+
+impl UtcClock for SystemUtcClock {
+    fn now_utc(&self) -> Result<OffsetDateTime, ()> {
+        Ok(OffsetDateTime::now_utc())
+    }
+}
+
 pub(crate) struct ExchangeRateService {
     provider: Arc<dyn ExchangeRateProvider>,
+    clock: Arc<dyn UtcClock>,
     cache: Mutex<ExchangeRateCache>,
     inflight: Mutex<BTreeMap<InFlightKey, Vec<oneshot::Sender<ProviderTerminal>>>>,
     persistence: tokio::sync::Mutex<()>,
 }
 
-type ProviderTerminal = Result<ExchangeRateResult, ExchangeRateError>;
+#[derive(Clone)]
+struct ProviderTerminal {
+    result: Result<ExchangeRateResult, ExchangeRateError>,
+    completed_at: Option<OffsetDateTime>,
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InFlightKey {
@@ -52,20 +69,27 @@ impl InFlightKey {
 }
 
 impl ExchangeRateService {
-    pub(crate) fn load(root: &Path, now: OffsetDateTime) -> Result<Self, ExchangeRateError> {
+    pub(crate) fn load(root: &Path) -> Result<Self, ExchangeRateError> {
+        let clock = Arc::new(SystemUtcClock);
+        let now = clock
+            .now_utc()
+            .map_err(|()| ExchangeRateError::Unavailable)?;
         let provider = Arc::new(FrankfurterProvider::new()?);
         Ok(Self::with_dependencies(
             provider,
             ExchangeRateCache::load(root, now),
+            clock,
         ))
     }
 
     pub(super) fn with_dependencies(
         provider: Arc<dyn ExchangeRateProvider>,
         cache: ExchangeRateCache,
+        clock: Arc<dyn UtcClock>,
     ) -> Self {
         Self {
             provider,
+            clock,
             cache: Mutex::new(cache),
             inflight: Mutex::new(BTreeMap::new()),
             persistence: tokio::sync::Mutex::new(()),
@@ -75,11 +99,14 @@ impl ExchangeRateService {
     pub(crate) async fn resolve(
         self: &Arc<Self>,
         intent: CurrencyIntent,
-        now: OffsetDateTime,
     ) -> Result<CurrencyOutput, CurrencyResolveError> {
         if let Some(output) = evaluate_same_code(&intent) {
             return output.map_err(CurrencyResolveError::Invalid);
         }
+        let now = self
+            .clock
+            .now_utc()
+            .map_err(|()| CurrencyResolveError::Unavailable)?;
         let request = intent
             .exchange_request()
             .expect("different currency codes have an exchange request");
@@ -88,16 +115,16 @@ impl ExchangeRateService {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .lookup(&request, now);
-        let stale = match cached {
+        match cached {
             Some(CacheLookup::Fresh(cached)) => {
                 return evaluate_provider_result(&intent, cached.result)
                     .map_err(CurrencyResolveError::Invalid);
             }
-            Some(CacheLookup::Stale(cached)) => Some(cached),
-            None => None,
-        };
+            Some(CacheLookup::Stale(_)) | None => {}
+        }
 
-        match self.join_or_start(request.clone(), now).await {
+        let terminal = self.join_or_start(request.clone(), now).await;
+        match terminal.result {
             Ok(result) => {
                 let result =
                     orient_result(&result, &request).ok_or(CurrencyResolveError::Unavailable)?;
@@ -106,11 +133,26 @@ impl ExchangeRateService {
             Err(ExchangeRateError::UnsupportedCode) => {
                 Err(CurrencyResolveError::Invalid(CurrencyFailure::InvalidCode))
             }
-            Err(ExchangeRateError::Unavailable) => stale
-                .map(|cached| evaluate_stale(&intent, cached))
-                .transpose()
-                .map_err(CurrencyResolveError::Invalid)?
-                .ok_or(CurrencyResolveError::Unavailable),
+            Err(ExchangeRateError::Unavailable) => {
+                let completed_at = terminal
+                    .completed_at
+                    .ok_or(CurrencyResolveError::Unavailable)?;
+                match self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .lookup(&request, completed_at)
+                {
+                    Some(CacheLookup::Fresh(cached)) => {
+                        evaluate_provider_result(&intent, cached.result)
+                            .map_err(CurrencyResolveError::Invalid)
+                    }
+                    Some(CacheLookup::Stale(cached)) => {
+                        evaluate_stale(&intent, cached).map_err(CurrencyResolveError::Invalid)
+                    }
+                    None => Err(CurrencyResolveError::Unavailable),
+                }
+            }
         }
     }
 
@@ -138,7 +180,10 @@ impl ExchangeRateService {
                         .unwrap_or_else(|error| error.into_inner())
                         .lookup(&request, now)
                     {
-                        return Ok(cached.result);
+                        return ProviderTerminal {
+                            result: Ok(cached.result),
+                            completed_at: Some(now),
+                        };
                     }
                     inflight.insert(key.clone(), vec![sender]);
                     true
@@ -148,32 +193,39 @@ impl ExchangeRateService {
         if should_start {
             let service = self.clone();
             tokio::spawn(async move {
-                service.coordinate(key, request, now).await;
+                service.coordinate(key, request).await;
             });
         }
-        receiver
-            .await
-            .unwrap_or(Err(ExchangeRateError::Unavailable))
+        receiver.await.unwrap_or(ProviderTerminal {
+            result: Err(ExchangeRateError::Unavailable),
+            completed_at: None,
+        })
     }
 
-    async fn coordinate(
-        self: Arc<Self>,
-        key: InFlightKey,
-        request: ExchangeRateRequest,
-        fetched_at: OffsetDateTime,
-    ) {
+    async fn coordinate(self: Arc<Self>, key: InFlightKey, request: ExchangeRateRequest) {
         let provider = self.provider.clone();
         let provider_request = request.clone();
         let provider_task =
             tokio::spawn(async move { provider.fetch_rate(&provider_request).await });
-        let terminal = match provider_task.await {
+        let provider_result = match provider_task.await {
             Ok(Ok(result)) if valid_provider_result(&request, &result) => Ok(result),
             Ok(Ok(_)) | Err(_) => Err(ExchangeRateError::Unavailable),
             Ok(Err(error)) => Err(error),
         };
-        if let Ok(result) = &terminal {
-            self.store_provider_result(result.clone(), fetched_at).await;
+        let completed_at = self.clock.now_utc().ok();
+        let result = if completed_at.is_some() {
+            provider_result
+        } else {
+            Err(ExchangeRateError::Unavailable)
+        };
+        if let (Ok(result), Some(completed_at)) = (&result, completed_at) {
+            self.store_provider_result(result.clone(), completed_at)
+                .await;
         }
+        let terminal = ProviderTerminal {
+            result,
+            completed_at,
+        };
         let waiters = self
             .inflight
             .lock()
