@@ -13,8 +13,10 @@ use model::{
     TransactionJournal, PIPE_SDDL_TEMPLATE, RUNTIME_MANIFEST_NAME, TRANSACTION_MANIFEST_NAME,
 };
 use transaction::{
-    rollback_decision, validate_recovery_handoff, validate_same_transaction, LiveService,
-    RollbackDecision,
+    candidate_directory_disposition, classify_matching_service, rollback_cleanup_step,
+    rollback_decision, validate_recovery_handoff, validate_same_transaction,
+    CandidateDirectoryDisposition, LiveService, RollbackCleanupStep, RollbackDecision,
+    ServiceActivity, UninstallStep,
 };
 use windows::{AdmissionLease, ExitCode, ServiceState};
 
@@ -137,6 +139,8 @@ fn run() -> HelperResult<()> {
     let cli = Cli::parse().map_err(|reason| (ExitCode::InvalidInvocation, reason))?;
     let executable = env::current_exe()
         .map_err(|_| (ExitCode::AdmissionDenied, "current-exe-unavailable".into()))?;
+    windows::verify_current_image_as_invoker()
+        .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
     windows::verify_staging_layout(
         &cli.staging_dir,
         &executable,
@@ -226,9 +230,21 @@ fn read_runtime_manifest(root: &Path) -> HelperResult<Option<RuntimeManifest>> {
     }
     windows::verify_managed_file(&path).map_err(|reason| (ExitCode::ForeignState, reason))?;
     let manifest: RuntimeManifest = read_json(&path)?;
+    validate_persisted_manifest_identity(root, &manifest)?;
+    Ok(Some(manifest))
+}
+
+fn validate_persisted_manifest_identity(
+    root: &Path,
+    manifest: &RuntimeManifest,
+) -> HelperResult<()> {
     manifest
         .validate_fixed_identity()
         .map_err(|reason| (ExitCode::ForeignState, reason))?;
+    validate_manifest_location(root, manifest)
+}
+
+fn validate_manifest_location(root: &Path, manifest: &RuntimeManifest) -> HelperResult<()> {
     if !model::is_within_managed_root(&manifest.service_binary_path, root)
         || manifest.service_binary_path.parent().and_then(Path::parent) != Some(root)
         || manifest
@@ -243,7 +259,50 @@ fn read_runtime_manifest(root: &Path) -> HelperResult<Option<RuntimeManifest>> {
             "manifest-binary-outside-managed-root",
         );
     }
-    Ok(Some(manifest))
+    Ok(())
+}
+
+fn validate_persisted_manifest(root: &Path, manifest: &RuntimeManifest) -> HelperResult<()> {
+    validate_persisted_manifest_identity(root, manifest)?;
+    let version_dir = manifest.service_binary_path.parent().ok_or_else(|| {
+        (
+            ExitCode::ForeignState,
+            "manifest-version-parent-missing".into(),
+        )
+    })?;
+    windows::verify_managed_directory(version_dir)
+        .map_err(|reason| (ExitCode::ForeignState, reason))?;
+    windows::validate_managed_binary(&manifest.service_binary_path, manifest)
+        .map_err(|reason| (ExitCode::ForeignState, reason))
+}
+
+fn validate_persisted_transaction_identity(
+    root: &Path,
+    journal: &TransactionJournal,
+) -> HelperResult<()> {
+    if journal.schema_version != 1 {
+        return fail(ExitCode::ForeignState, "foreign-transaction-schema");
+    }
+    validate_persisted_manifest_identity(root, &journal.new_manifest)?;
+    if let Some(old) = journal.old_manifest.as_ref() {
+        validate_persisted_manifest_identity(root, old)?;
+    }
+    Ok(())
+}
+
+fn invoke_validated_persisted_service_command(
+    root: &Path,
+    manifest: &RuntimeManifest,
+    verb: &str,
+    sddl: Option<&str>,
+) -> HelperResult<()> {
+    transaction::validated_persisted_execution(
+        || validate_persisted_manifest(root, manifest),
+        || {
+            windows::invoke_service_command(&manifest.service_binary_path, verb, sddl)
+                .map_err(|reason| (ExitCode::NativeFailure, reason))
+        },
+    )
 }
 
 fn service_matches(manifest: &RuntimeManifest) -> HelperResult<bool> {
@@ -528,11 +587,14 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
     )?;
     let result = (|| {
         if version_dir.exists() {
-            let expected_existing = durable
-                .old_manifest
-                .as_ref()
-                .is_some_and(|old| old.service_binary_path == target);
-            if !expected_existing {
+            let disposition = candidate_directory_disposition(
+                durable
+                    .old_manifest
+                    .as_ref()
+                    .map(|old| old.service_binary_path.as_path()),
+                &target,
+            );
+            if disposition == CandidateDirectoryDisposition::MustBeAbsent {
                 return fail(
                     ExitCode::ForeignState,
                     "foreign-preexisting-version-directory",
@@ -568,8 +630,12 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         checkpoint("new-binary-verified")?;
         if let Some(old) = durable.old_manifest.as_ref() {
             if service_matches(old)? {
-                windows::invoke_service_command(&old.service_binary_path, "-stop-service", None)
-                    .map_err(|reason| (ExitCode::NativeFailure, reason))?;
+                invoke_validated_persisted_service_command(
+                    &program_data_root,
+                    old,
+                    "-stop-service",
+                    None,
+                )?;
             }
         }
         persist_phase(
@@ -580,8 +646,12 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         )?;
         checkpoint("old-service-stopped")?;
         if let Some(old) = durable.old_manifest.as_ref() {
-            windows::invoke_service_command(&old.service_binary_path, "-uninstall-service", None)
-                .map_err(|reason| (ExitCode::NativeFailure, reason))?;
+            invoke_validated_persisted_service_command(
+                &program_data_root,
+                old,
+                "-uninstall-service",
+                None,
+            )?;
         }
         persist_phase(
             &program_data_root,
@@ -666,41 +736,65 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
 fn classify_live(journal: &TransactionJournal) -> HelperResult<LiveService> {
     match windows::query_service().map_err(|reason| (ExitCode::NativeFailure, reason))? {
         ServiceState::Absent => Ok(LiveService::Absent),
-        ServiceState::Running(command) | ServiceState::Stopped(command) => {
+        ServiceState::Running(command) => {
             let new_matches = windows::validate_service_command(&command, &journal.new_manifest);
             let old_matches = journal
                 .old_manifest
                 .as_ref()
                 .is_some_and(|old| windows::validate_service_command(&command, old));
-            match (old_matches, new_matches) {
-                (true, false) => Ok(LiveService::MatchingOld),
-                (false, true) => Ok(LiveService::MatchingNew),
-                (false, false) => Ok(LiveService::Foreign),
-                (true, true) => Ok(LiveService::Ambiguous),
-            }
+            Ok(classify_matching_service(
+                ServiceActivity::Running,
+                old_matches,
+                new_matches,
+            ))
+        }
+        ServiceState::Stopped(command) => {
+            let new_matches = windows::validate_service_command(&command, &journal.new_manifest);
+            let old_matches = journal
+                .old_manifest
+                .as_ref()
+                .is_some_and(|old| windows::validate_service_command(&command, old));
+            Ok(classify_matching_service(
+                ServiceActivity::Stopped,
+                old_matches,
+                new_matches,
+            ))
         }
     }
 }
 
 fn converge_rollback(root: &Path, journal: &TransactionJournal) -> HelperResult<()> {
+    validate_persisted_transaction_identity(root, journal)?;
     checkpoint("rollback-started")?;
     match rollback_decision(classify_live(journal)?) {
-        RollbackDecision::RemoveNewThenRestoreOld => {
-            windows::invoke_service_command(
-                &journal.new_manifest.service_binary_path,
+        RollbackDecision::StopAndRemoveNewThenRestoreOld => {
+            invoke_validated_persisted_service_command(
+                root,
+                &journal.new_manifest,
                 "-stop-service",
                 None,
             )
-            .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
-            windows::invoke_service_command(
-                &journal.new_manifest.service_binary_path,
+            .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+            invoke_validated_persisted_service_command(
+                root,
+                &journal.new_manifest,
                 "-uninstall-service",
                 None,
             )
-            .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
-            restore_old(journal)?;
+            .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+            restore_old(root, journal)?;
         }
-        RollbackDecision::RestoreOld => restore_old(journal)?,
+        RollbackDecision::RemoveNewThenRestoreOld => {
+            invoke_validated_persisted_service_command(
+                root,
+                &journal.new_manifest,
+                "-uninstall-service",
+                None,
+            )
+            .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+            restore_old(root, journal)?;
+        }
+        RollbackDecision::RestoreOld => restore_old(root, journal)?,
         RollbackDecision::KeepOld => {}
         RollbackDecision::FailClosedRetainAll => {
             return fail(ExitCode::RollbackFailed, "rollback-live-state-ambiguous")
@@ -720,19 +814,100 @@ fn converge_rollback(root: &Path, journal: &TransactionJournal) -> HelperResult<
             )
         })?;
     }
+    cleanup_rollback_candidate(root, journal)?;
     checkpoint("rollback-complete")
 }
 
-fn restore_old(journal: &TransactionJournal) -> HelperResult<()> {
+fn cleanup_rollback_candidate(root: &Path, journal: &TransactionJournal) -> HelperResult<()> {
+    let candidate_dir = journal
+        .new_manifest
+        .service_binary_path
+        .parent()
+        .ok_or_else(|| {
+            (
+                ExitCode::RollbackFailed,
+                "new-version-parent-missing".into(),
+            )
+        })?;
+    let referenced_by_old = journal
+        .old_manifest
+        .as_ref()
+        .is_some_and(|old| old.service_binary_path.parent() == Some(candidate_dir));
+    let unreferenced = !referenced_by_old;
+    match rollback_cleanup_step(candidate_dir.exists(), unreferenced, referenced_by_old) {
+        RollbackCleanupStep::RemoveCandidateDirectory => {
+            validate_persisted_manifest_identity(root, &journal.new_manifest)?;
+            windows::verify_managed_directory(candidate_dir)
+                .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
+            let entries = fs::read_dir(candidate_dir)
+                .map_err(|_| {
+                    (
+                        ExitCode::RollbackFailed,
+                        "rollback-candidate-read-failed".into(),
+                    )
+                })?
+                .map(|entry| {
+                    let entry = entry.map_err(|_| {
+                        (
+                            ExitCode::RollbackFailed,
+                            "rollback-candidate-entry-invalid".into(),
+                        )
+                    })?;
+                    let name = entry.file_name().into_string().map_err(|_| {
+                        (
+                            ExitCode::RollbackFailed,
+                            "rollback-candidate-entry-invalid".into(),
+                        )
+                    })?;
+                    Ok((name, entry.path()))
+                })
+                .collect::<HelperResult<Vec<_>>>()?;
+            let names = entries
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            if !transaction::rollback_candidate_entries_are_scoped(&names, &journal.transaction_id)
+            {
+                return fail(
+                    ExitCode::RollbackFailed,
+                    "rollback-candidate-content-ambiguous",
+                );
+            }
+            for (name, path) in &entries {
+                if name == "Everything.exe" {
+                    validate_persisted_manifest(root, &journal.new_manifest)
+                        .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+                } else {
+                    windows::verify_managed_file(path)
+                        .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
+                }
+            }
+            fs::remove_dir_all(candidate_dir).map_err(|_| {
+                (
+                    ExitCode::RollbackFailed,
+                    "rollback-candidate-delete-failed".into(),
+                )
+            })
+        }
+        RollbackCleanupStep::KeepReferencedCandidate | RollbackCleanupStep::Complete => Ok(()),
+        RollbackCleanupStep::FailClosedRetainCandidate => fail(
+            ExitCode::RollbackFailed,
+            "rollback-candidate-reference-ambiguous",
+        ),
+    }
+}
+
+fn restore_old(root: &Path, journal: &TransactionJournal) -> HelperResult<()> {
     if let Some(old) = journal.old_manifest.as_ref() {
-        windows::invoke_service_command(
-            &old.service_binary_path,
+        invoke_validated_persisted_service_command(
+            root,
+            old,
             "-install-service",
             Some(&old.expanded_sddl),
         )
-        .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
-        windows::invoke_service_command(&old.service_binary_path, "-start-service", None)
-            .map_err(|reason| (ExitCode::RollbackFailed, reason))?;
+        .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
+        invoke_validated_persisted_service_command(root, old, "-start-service", None)
+            .map_err(|(_, reason)| (ExitCode::RollbackFailed, reason))?;
         if !service_matches(old)? {
             return fail(ExitCode::RollbackFailed, "old-service-restore-mismatch");
         }
@@ -798,14 +973,8 @@ fn pre_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()>
             lease
                 .ensure_parent_alive()
                 .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
-            windows::invoke_service_command(&manifest.service_binary_path, "-stop-service", None)
-                .map_err(|reason| (ExitCode::NativeFailure, reason))?;
-            windows::invoke_service_command(
-                &manifest.service_binary_path,
-                "-uninstall-service",
-                None,
-            )
-            .map_err(|reason| (ExitCode::NativeFailure, reason))
+            invoke_validated_persisted_service_command(&root, &manifest, "-stop-service", None)?;
+            invoke_validated_persisted_service_command(&root, &manifest, "-uninstall-service", None)
         }
         _ => fail(ExitCode::ForeignState, "foreign-service-on-uninstall"),
     }
@@ -860,30 +1029,44 @@ fn post_uninstall(_request: &Request, lease: &AdmissionLease) -> HelperResult<()
             "manifest-version-parent-missing".into(),
         )
     })?;
-    if version_dir.exists() {
-        lease
-            .ensure_parent_alive()
-            .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
-        windows::verify_managed_directory(version_dir)
-            .map_err(|reason| (ExitCode::ForeignState, reason))?;
-        fs::remove_dir_all(version_dir).map_err(|_| {
-            (
-                ExitCode::NativeFailure,
-                "referenced-version-delete-failed".into(),
-            )
-        })?;
+    let manifest_path = root.join(RUNTIME_MANIFEST_NAME);
+    loop {
+        match transaction::uninstall_step(version_dir.exists(), false, manifest_path.exists()) {
+            UninstallStep::DeleteNewDirectory => {
+                lease
+                    .ensure_parent_alive()
+                    .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
+                windows::verify_managed_directory(version_dir)
+                    .map_err(|reason| (ExitCode::ForeignState, reason))?;
+                fs::remove_dir_all(version_dir).map_err(|_| {
+                    (
+                        ExitCode::NativeFailure,
+                        "referenced-version-delete-failed".into(),
+                    )
+                })?;
+                checkpoint("uninstall-referenced-directory-deleted")?;
+            }
+            UninstallStep::DeleteManifest => {
+                lease
+                    .ensure_parent_alive()
+                    .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
+                fs::remove_file(&manifest_path).map_err(|_| {
+                    (
+                        ExitCode::NativeFailure,
+                        "runtime-manifest-delete-failed".into(),
+                    )
+                })?;
+                checkpoint("uninstall-manifest-deleted")?;
+            }
+            UninstallStep::Complete => break,
+            UninstallStep::DeleteOldDirectory => {
+                return fail(
+                    ExitCode::ForeignState,
+                    "unexpected-second-manifest-reference",
+                )
+            }
+        }
     }
-    checkpoint("uninstall-referenced-directory-deleted")?;
-    lease
-        .ensure_parent_alive()
-        .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
-    fs::remove_file(root.join(RUNTIME_MANIFEST_NAME)).map_err(|_| {
-        (
-            ExitCode::NativeFailure,
-            "runtime-manifest-delete-failed".into(),
-        )
-    })?;
-    checkpoint("uninstall-manifest-deleted")?;
     fs::remove_dir(&root).map_err(|_| (ExitCode::ForeignState, "managed-root-not-empty".into()))
 }
 
@@ -913,6 +1096,44 @@ fn verify_vm_disposable_marker() -> HelperResult<()> {
 #[cfg(not(feature = "fault-injection"))]
 fn verify_vm_disposable_marker() -> HelperResult<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_manifest_semantics_and_location_are_validated_before_native_use() {
+        let root = Path::new(r"C:\ProgramData\UiPilot_tools\everything");
+        let manifest = RuntimeManifest::fixture();
+        assert!(validate_persisted_manifest_identity(root, &manifest).is_ok());
+
+        let mut foreign = manifest.clone();
+        foreign.service_name = "Everything".into();
+        assert!(validate_persisted_manifest_identity(root, &foreign).is_err());
+
+        let mut escaped = manifest;
+        escaped.service_binary_path = PathBuf::from(r"C:\foreign\Everything.exe");
+        assert!(validate_persisted_manifest_identity(root, &escaped).is_err());
+    }
+
+    #[test]
+    fn persisted_transaction_rejects_invalid_manifest_semantics_before_convergence() {
+        let root = Path::new(r"C:\ProgramData\UiPilot_tools\everything");
+        let mut journal = TransactionJournal {
+            schema_version: 1,
+            transaction_id: OperationId::fixture(1),
+            phase: Phase::NewBinaryVerified,
+            old_manifest: Some(RuntimeManifest::fixture()),
+            new_manifest: RuntimeManifest::fixture(),
+        };
+        assert!(validate_persisted_transaction_identity(root, &journal).is_ok());
+        journal.new_manifest.service_name = "Everything".into();
+        assert!(validate_persisted_transaction_identity(root, &journal).is_err());
+        journal.new_manifest = RuntimeManifest::fixture();
+        journal.schema_version = 2;
+        assert!(validate_persisted_transaction_identity(root, &journal).is_err());
+    }
 }
 
 #[cfg(not(feature = "fault-injection"))]

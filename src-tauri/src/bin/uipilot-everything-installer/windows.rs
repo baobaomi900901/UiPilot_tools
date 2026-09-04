@@ -53,6 +53,7 @@ const SC_MANAGER_CONNECT: Dword = 0x0001;
 const SERVICE_QUERY_CONFIG: Dword = 0x0001;
 const SERVICE_QUERY_STATUS: Dword = 0x0004;
 const SC_STATUS_PROCESS_INFO: Dword = 0;
+const SERVICE_STOPPED: Dword = 1;
 const SERVICE_RUNNING: Dword = 4;
 const OWNER_SECURITY_INFORMATION: Dword = 0x0000_0001;
 const GROUP_SECURITY_INFORMATION: Dword = 0x0000_0002;
@@ -74,6 +75,7 @@ const FOLDERID_PROGRAM_DATA: Guid = Guid::new(
 );
 
 pub const STAGING_DACL_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+pub const STAGING_FILE_DACL_SDDL: &str = "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)";
 pub const NAMED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
 pub const MANAGED_ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
 
@@ -312,6 +314,11 @@ struct VsFixedFileInfo {
 extern "system" {
     fn CloseHandle(handle: Handle) -> Bool;
     fn GetCurrentProcess() -> Handle;
+    fn GetModuleHandleW(name: *const u16) -> Handle;
+    fn FindResourceW(module: Handle, name: *const u16, resource_type: *const u16) -> Handle;
+    fn LoadResource(module: Handle, resource: Handle) -> Handle;
+    fn LockResource(resource: Handle) -> *mut c_void;
+    fn SizeofResource(module: Handle, resource: Handle) -> Dword;
     fn OpenProcess(access: Dword, inherit: Bool, pid: Dword) -> Handle;
     fn GetProcessTimes(
         process: Handle,
@@ -518,6 +525,123 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
+fn manifest_text(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let words = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&words).ok()
+    } else {
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    }
+}
+
+fn xml_attribute<'a>(tag: &'a str, wanted: &str) -> Option<&'a str> {
+    let bytes = tag.as_bytes();
+    let mut index = tag.find(char::is_whitespace)?;
+    let mut found = None;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || matches!(bytes[index], b'/' | b'>') {
+            break;
+        }
+        let name_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'='
+            && bytes[index] != b'>'
+        {
+            index += 1;
+        }
+        let name = &tag[name_start..index];
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            return None;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || !matches!(bytes[index], b'\'' | b'"') {
+            return None;
+        }
+        let quote = bytes[index];
+        index += 1;
+        let value_start = index;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        let value = &tag[value_start..index];
+        index += 1;
+        if name.eq_ignore_ascii_case(wanted) {
+            if found.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    found
+}
+
+pub fn embedded_manifest_is_as_invoker(bytes: &[u8]) -> bool {
+    let Some(text) = manifest_text(bytes) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    let needle = "<requestedexecutionlevel";
+    let Some(start) = lower.find(needle) else {
+        return false;
+    };
+    if lower[start + needle.len()..].contains(needle) {
+        return false;
+    }
+    let Some(relative_end) = lower[start..].find('>') else {
+        return false;
+    };
+    let tag = &text[start + 1..start + relative_end];
+    xml_attribute(tag, "level") == Some("asInvoker")
+        && xml_attribute(tag, "uiAccess") == Some("false")
+}
+
+pub fn verify_current_image_as_invoker() -> Result<(), String> {
+    const MANIFEST_RESOURCE_ID: usize = 1;
+    const RT_MANIFEST: usize = 24;
+    let module = unsafe { GetModuleHandleW(null()) };
+    if module.is_null() {
+        return Err("image-module-unavailable".into());
+    }
+    let resource = unsafe {
+        FindResourceW(
+            module,
+            MANIFEST_RESOURCE_ID as *const u16,
+            RT_MANIFEST as *const u16,
+        )
+    };
+    if resource.is_null() {
+        return Err("image-manifest-missing".into());
+    }
+    let size = unsafe { SizeofResource(module, resource) };
+    let loaded = unsafe { LoadResource(module, resource) };
+    if size == 0 || loaded.is_null() {
+        return Err("image-manifest-load-failed".into());
+    }
+    let bytes = unsafe { LockResource(loaded) }.cast::<u8>();
+    if bytes.is_null() {
+        return Err("image-manifest-lock-failed".into());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, size as usize) };
+    embedded_manifest_is_as_invoker(bytes)
+        .then_some(())
+        .ok_or_else(|| "image-manifest-not-as-invoker".into())
+}
+
 unsafe fn wide_ptr_to_string(mut value: *const u16) -> String {
     let start = value;
     while *value != 0 {
@@ -656,6 +780,14 @@ impl AdmissionLease {
     }
 }
 
+pub fn parent_identity_is_current(
+    actual_creation: u64,
+    expected_creation: u64,
+    wait_result: Dword,
+) -> bool {
+    actual_creation == expected_creation && wait_result == WAIT_TIMEOUT
+}
+
 fn descriptor_sddl_for(handle: Handle, object_type: Dword) -> Result<String, String> {
     let mut descriptor = null_mut();
     let information =
@@ -726,12 +858,20 @@ fn canonical_program_data() -> Result<PathBuf, String> {
 }
 
 pub fn verify_managed_parent(path: &Path) -> Result<(), String> {
-    let directory = open_direct(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ)?;
+    let directory = open_direct(path, FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ)?;
     let expected = canonical_program_data()?.join("UiPilot_tools");
     if final_path(directory.0)? != expected {
         return Err("managed-parent-reparse-or-location-mismatch".into());
     }
+    let descriptor = descriptor_sddl_for(directory.0, SE_FILE_OBJECT)?;
+    if !managed_parent_descriptor_is_exact(&descriptor) {
+        return Err("managed-parent-owner-dacl-mismatch".into());
+    }
     Ok(())
+}
+
+pub fn managed_parent_descriptor_is_exact(descriptor: &str) -> bool {
+    descriptor == MANAGED_ROOT_SDDL
 }
 
 pub fn verify_managed_root(path: &Path) -> Result<(), String> {
@@ -775,9 +915,11 @@ pub fn acquire_admission_lease(
         return Err("parent-open-failed".into());
     }
     let parent = OwnedHandle(parent);
-    if process_creation_time(parent.0)? != expected_creation
-        || unsafe { WaitForSingleObject(parent.0, 0) } != WAIT_TIMEOUT
-    {
+    if !parent_identity_is_current(
+        process_creation_time(parent.0)?,
+        expected_creation,
+        unsafe { WaitForSingleObject(parent.0, 0) },
+    ) {
         return Err("parent-identity-mismatch".into());
     }
     let event_name = wide(ACTIVITY_EVENT_NAME);
@@ -948,17 +1090,14 @@ fn verify_file_owner_and_acl(handle: Handle) -> Result<(), String> {
         }
         LocalFree(descriptor.cast());
     }
-    let ace_count = dacl.matches("(A;").count();
-    let trusted_only = ace_count == 2
-        && dacl.contains(";GA;;;SY)")
-        && dacl.contains(";GA;;;BA)")
-        && ![";;;WD)", ";;;AU)", ";;;IU)", ";;;BU)"]
-            .iter()
-            .any(|sid| dacl.contains(sid));
-    if !owner_matches || !trusted_only {
+    if !owner_matches || !staging_file_dacl_is_exact(&dacl) {
         return Err("staging-file-owner-dacl-mismatch".into());
     }
     Ok(())
+}
+
+pub fn staging_file_dacl_is_exact(dacl: &str) -> bool {
+    dacl == STAGING_FILE_DACL_SDDL
 }
 
 pub fn atomic_replace(existing: &Path, replacement: &Path) -> Result<(), String> {
@@ -1069,12 +1208,16 @@ pub struct HeldSource {
     path: PathBuf,
 }
 
+pub fn held_source_share_mode() -> Dword {
+    FILE_SHARE_READ
+}
+
 impl HeldSource {
     fn open(source: &Path) -> Result<Self, String> {
         let handle = open_direct(
             source,
             FILE_READ_DATA | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ,
+            held_source_share_mode(),
         )?;
         if final_path(handle.0)?
             != fs::canonicalize(source).map_err(|_| "source-canonicalize-failed")?
@@ -1466,6 +1609,20 @@ pub enum ServiceState {
     Stopped(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStatusClass {
+    Running,
+    Stopped,
+}
+
+pub fn classify_service_status(state: Dword) -> Result<ServiceStatusClass, &'static str> {
+    match state {
+        SERVICE_RUNNING => Ok(ServiceStatusClass::Running),
+        SERVICE_STOPPED => Ok(ServiceStatusClass::Stopped),
+        _ => Err("service-state-transitional-or-unsupported"),
+    }
+}
+
 pub fn query_service() -> Result<ServiceState, String> {
     let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
@@ -1527,10 +1684,9 @@ pub fn query_service() -> Result<ServiceState, String> {
     {
         return Err("service-status-query-failed".into());
     }
-    if status.current_state == SERVICE_RUNNING {
-        Ok(ServiceState::Running(command))
-    } else {
-        Ok(ServiceState::Stopped(command))
+    match classify_service_status(status.current_state)? {
+        ServiceStatusClass::Running => Ok(ServiceState::Running(command)),
+        ServiceStatusClass::Stopped => Ok(ServiceState::Stopped(command)),
     }
 }
 
@@ -1602,6 +1758,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_manifest_admission_requires_exact_as_invoker_policy() {
+        let valid = br#"<assembly><trustInfo><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo></assembly>"#;
+        assert!(embedded_manifest_is_as_invoker(valid));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<requestedExecutionLevel level="requireAdministrator" uiAccess="false" />"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<requestedExecutionLevel level="asInvoker" uiAccess="true" />"#
+        ));
+        assert!(!embedded_manifest_is_as_invoker(
+            br#"<requestedExecutionLevel level="asInvoker" />"#
+        ));
+        let duplicate = [valid.as_slice(), valid.as_slice()].concat();
+        assert!(!embedded_manifest_is_as_invoker(&duplicate));
+    }
+
+    #[cfg(feature = "installer-helper-build")]
+    #[test]
+    fn compiled_helper_image_is_as_invoker() {
+        assert!(verify_current_image_as_invoker().is_ok());
+    }
+
+    #[test]
     fn security_descriptors_are_protected_and_exact() {
         assert_eq!(STAGING_DACL_SDDL, "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)");
         assert_eq!(NAMED_OBJECT_SDDL, "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)");
@@ -1609,6 +1788,70 @@ mod tests {
             MANAGED_ROOT_SDDL,
             "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
         );
+    }
+
+    #[test]
+    fn managed_parent_and_staging_file_descriptors_are_compared_exactly() {
+        assert!(managed_parent_descriptor_is_exact(MANAGED_ROOT_SDDL));
+        assert!(!managed_parent_descriptor_is_exact(
+            "O:BAG:BAD:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+        ));
+        assert!(!managed_parent_descriptor_is_exact(
+            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GR;;;BU)"
+        ));
+
+        assert!(staging_file_dacl_is_exact(STAGING_FILE_DACL_SDDL));
+        assert!(!staging_file_dacl_is_exact(
+            "D:(A;ID;GA;;;SY)(A;ID;GA;;;BA)"
+        ));
+        assert!(!staging_file_dacl_is_exact(
+            "D:AI(A;;GA;;;SY)(A;ID;GA;;;BA)"
+        ));
+        assert!(!staging_file_dacl_is_exact(
+            "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)(A;ID;GR;;;BU)"
+        ));
+    }
+
+    #[test]
+    fn scm_transitional_and_paused_states_are_rejected() {
+        assert_eq!(classify_service_status(1), Ok(ServiceStatusClass::Stopped));
+        assert_eq!(classify_service_status(4), Ok(ServiceStatusClass::Running));
+        for state in [2, 3, 5, 6, 7, 0, 8] {
+            assert_eq!(
+                classify_service_status(state),
+                Err("service-state-transitional-or-unsupported")
+            );
+        }
+    }
+
+    #[test]
+    fn parent_identity_requires_creation_time_match_and_live_process() {
+        assert!(parent_identity_is_current(42, 42, WAIT_TIMEOUT));
+        assert!(!parent_identity_is_current(41, 42, WAIT_TIMEOUT));
+        assert!(!parent_identity_is_current(42, 42, WAIT_OBJECT_0));
+    }
+
+    #[test]
+    fn held_source_native_handle_denies_concurrent_write() {
+        use std::fs::OpenOptions;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        assert_eq!(held_source_share_mode(), FILE_SHARE_READ);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "uipilot-held-source-{}-{unique}.bin",
+            std::process::id()
+        ));
+        fs::write(&path, b"trusted-source").unwrap();
+        let held = HeldSource::open(&path).unwrap();
+        let error = OpenOptions::new().write(true).open(&path).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        drop(held);
+        assert!(OpenOptions::new().write(true).open(&path).is_ok());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

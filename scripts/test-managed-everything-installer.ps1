@@ -20,6 +20,18 @@ function Assert-SourceContains {
     }
 }
 
+function Assert-OrderedUniqueTokens {
+    param([string]$Text, [string[]]$Tokens, [string]$Message)
+    $previous = -1
+    foreach ($token in $Tokens) {
+        $index = $Text.IndexOf($token, [StringComparison]::Ordinal)
+        if ($index -lt 0 -or $Text.LastIndexOf($token, [StringComparison]::Ordinal) -ne $index -or $index -le $previous) {
+            throw $Message
+        }
+        $previous = $index
+    }
+}
+
 function Get-LowerSha256([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     try {
@@ -116,8 +128,18 @@ if ((Get-LowerSha256 $baseline) -cne $expectedBaselineHash) {
 }
 $baselineText = Get-Content -LiteralPath $baseline -Raw -Encoding utf8
 $customText = Get-Content -LiteralPath $template -Raw -Encoding utf8
+$uninstallSection = [regex]::Match($customText, '(?ms)^Section Uninstall\r?\n.*?^SectionEnd\r?\n')
+Assert-Condition $uninstallSection.Success 'Could not locate the custom uninstall section'
+Assert-OrderedUniqueTokens $uninstallSection.Value @(
+    '!insertmacro CheckIfAppIsRunning',
+    '!insertmacro NSIS_HOOK_PREUNINSTALL',
+    '!insertmacro NSIS_HOOK_POSTUNINSTALL',
+    'Delete "$INSTDIR\${MAINBINARYNAME}.exe"',
+    'Delete "$INSTDIR\uninstall.exe"',
+    '; Remove registry information for add/remove programs'
+) 'Uninstall continuation ordering must retain the app, uninstaller, and registration until post-uninstall succeeds'
 $reinstallMatch = [regex]::Match($baselineText, '(?ms)^  ; Reinstalling the same version\r?\n.*?^  reinst_done:\r?\n')
-$uninstallMatch = [regex]::Match($baselineText, '(?ms)^  !ifmacrodef NSIS_HOOK_PREUNINSTALL\r?\n.*?^  !insertmacro CheckIfAppIsRunning[^\r\n]*\r?\n')
+$uninstallMatch = [regex]::Match($baselineText, '(?ms)^  !ifmacrodef NSIS_HOOK_PREUNINSTALL\r?\n.*?^  !ifmacrodef NSIS_HOOK_POSTUNINSTALL\r?\n    !insertmacro NSIS_HOOK_POSTUNINSTALL\r?\n  !endif\r?\n')
 Assert-Condition $reinstallMatch.Success 'Could not locate the upstream reinstall snapshot region'
 Assert-Condition $uninstallMatch.Success 'Could not locate the upstream uninstall-gate snapshot region'
 $normalized = [regex]::Replace(
@@ -142,20 +164,18 @@ finally { $sha.Dispose() }
 Assert-Condition ($normalizedHash -ceq $expectedBaselineHash) 'Custom installer differs from Tauri CLI 2.11.4 outside the three approved regions'
 
 $productionHelper = Join-Path $root 'src-tauri\target\release\uipilot-everything-installer.exe'
-if (Test-Path -LiteralPath $productionHelper -PathType Leaf) {
-    Assert-Condition ((Get-PeMachine $productionHelper) -eq 0x8664) 'Production Helper must be x64'
-    $productionStrings = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($productionHelper))
-    Assert-Condition (-not $productionStrings.Contains('fault-injection:')) 'Production Helper contains VM fault-injection code'
-}
+Assert-Condition (Test-Path -LiteralPath $productionHelper -PathType Leaf) 'Production Helper is required for Source artifact isolation checks'
+Assert-Condition ((Get-PeMachine $productionHelper) -eq 0x8664) 'Production Helper must be x64'
+$productionStrings = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($productionHelper))
+Assert-Condition (-not $productionStrings.Contains('fault-injection:')) 'Production Helper contains VM fault-injection code'
 $installedHelperCopies = @(Get-ChildItem (Join-Path $root 'src-tauri\target\release\resources') -Recurse -Filter 'uipilot-everything-installer.exe' -File -ErrorAction SilentlyContinue)
 Assert-Condition ($installedHelperCopies.Count -eq 0) 'Helper must not be copied into installed runtime resources'
 
 $productionBundleRoot = Join-Path $root 'src-tauri\target\release\bundle\nsis'
-if (Test-Path -LiteralPath $productionBundleRoot -PathType Container) {
-    $setups = @(Get-ChildItem $productionBundleRoot -Filter '*.exe' -File)
-    Assert-Condition ($setups.Count -eq 1) 'Production bundle directory must contain exactly one Setup'
-    Assert-Condition (-not $setups[0].Name.Contains('VM Instrumented')) 'VM Instrumented Setup leaked into the production bundle path'
-    Assert-Condition ((Get-PeMachine $setups[0].FullName) -eq 0x014c) 'NSIS Setup must be a valid x86 bootstrapper PE for the x64 payload'
-}
+Assert-Condition (Test-Path -LiteralPath $productionBundleRoot -PathType Container) 'Production bundle directory is required for Source artifact isolation checks'
+$setups = @(Get-ChildItem $productionBundleRoot -Filter '*.exe' -File)
+Assert-Condition ($setups.Count -eq 1) 'Production bundle directory must contain exactly one Setup'
+Assert-Condition (-not $setups[0].Name.Contains('VM Instrumented')) 'VM Instrumented Setup leaked into the production bundle path'
+Assert-Condition ((Get-PeMachine $setups[0].FullName) -eq 0x014c) 'NSIS Setup must be a valid x86 bootstrapper PE for the x64 payload'
 
 Write-Output 'MANAGED_EVERYTHING_INSTALLER_SOURCE_PASS'

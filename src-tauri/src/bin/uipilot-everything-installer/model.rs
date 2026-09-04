@@ -201,7 +201,16 @@ impl RuntimeManifest {
             || self.service_name != SERVICE_NAME
             || self.pipe_name != PIPE_NAME
             || self.architecture != "x64"
-            || !self.service_binary_path.ends_with("Everything.exe")
+            || self.service_binary_path.file_name() != Some(std::ffi::OsStr::new("Everything.exe"))
+            || !canonical_version(&self.version)
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.publisher.is_empty()
+            || self.publisher.len() > 1024
+            || self.publisher.chars().any(char::is_control)
         {
             return Err("foreign-runtime-identity".into());
         }
@@ -231,6 +240,16 @@ impl RuntimeManifest {
             ),
         }
     }
+}
+
+fn canonical_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (*part == "0" || !part.starts_with('0'))
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +406,16 @@ mod tests {
         let mut weak = manifest;
         weak.expanded_sddl = "D:(A;;GA;;;WD)".into();
         assert!(weak.validate_fixed_identity().is_err());
+
+        let mut malformed = RuntimeManifest::fixture();
+        malformed.sha256 = "A".repeat(64);
+        assert!(malformed.validate_fixed_identity().is_err());
+        malformed = RuntimeManifest::fixture();
+        malformed.version = "../foreign".into();
+        assert!(malformed.validate_fixed_identity().is_err());
+        malformed = RuntimeManifest::fixture();
+        malformed.publisher.clear();
+        assert!(malformed.validate_fixed_identity().is_err());
     }
 
     #[test]

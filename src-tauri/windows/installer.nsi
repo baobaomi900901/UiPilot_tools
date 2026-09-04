@@ -781,7 +781,10 @@ Section Uninstall
   !ifmacrodef NSIS_HOOK_PREUNINSTALL
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
-  ; UIPILOT_REGION_UNINSTALL_GATE_END
+
+  !ifmacrodef NSIS_HOOK_POSTUNINSTALL
+    !insertmacro NSIS_HOOK_POSTUNINSTALL
+  !endif
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
@@ -885,9 +888,7 @@ Section Uninstall
     RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
   ${EndIf}
 
-  !ifmacrodef NSIS_HOOK_POSTUNINSTALL
-    !insertmacro NSIS_HOOK_POSTUNINSTALL
-  !endif
+  ; UIPILOT_REGION_UNINSTALL_GATE_END
 
   ; Auto close if passive mode or updating
   ${If} $PassiveMode = 1
