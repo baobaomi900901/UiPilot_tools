@@ -1,4 +1,4 @@
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
@@ -24,11 +24,20 @@ const MAX_RESPONSE_HEADER_FIELDS: usize = 64;
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ProviderHttpRequest {
     method: &'static str,
     path_and_query: String,
     headers: Vec<(String, Vec<u8>)>,
+}
+
+impl fmt::Debug for ProviderHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHttpRequest")
+            .field("redacted", &true)
+            .finish()
+    }
 }
 
 impl ProviderHttpRequest {
@@ -88,11 +97,21 @@ fn canonical_code(code: &CurrencyCode) -> bool {
         && CurrencyCode::new(code.as_str()).as_ref() == Some(code)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ProviderHttpResponse {
     status: u16,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
+}
+
+impl fmt::Debug for ProviderHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHttpResponse")
+            .field("status", &self.status)
+            .field("redacted", &true)
+            .finish()
+    }
 }
 
 impl ProviderHttpResponse {
@@ -190,11 +209,11 @@ impl ProviderTcpConnector for TokioTcpConnector {
     }
 }
 
-pub(super) type ProviderTlsConnectFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<BoxedIo, ProviderTransportError>> + Send + 'a>>;
+pub(super) type ProviderTlsConnectFuture =
+    Pin<Box<dyn Future<Output = Result<BoxedIo, ProviderTransportError>> + Send + 'static>>;
 
 pub(super) trait ProviderTlsConnector: Send + Sync {
-    fn connect<'a>(&'a self, hostname: &'a str, stream: BoxedIo) -> ProviderTlsConnectFuture<'a>;
+    fn connect(&self, hostname: String, stream: BoxedIo) -> ProviderTlsConnectFuture;
 }
 
 pub(super) struct NativeTlsConnector {
@@ -219,10 +238,11 @@ impl NativeTlsConnector {
 }
 
 impl ProviderTlsConnector for NativeTlsConnector {
-    fn connect<'a>(&'a self, hostname: &'a str, stream: BoxedIo) -> ProviderTlsConnectFuture<'a> {
+    fn connect(&self, hostname: String, stream: BoxedIo) -> ProviderTlsConnectFuture {
+        let connector = self.connector.clone();
         Box::pin(async move {
-            self.connector
-                .connect(hostname, stream)
+            connector
+                .connect(&hostname, stream)
                 .await
                 .map(|stream| Box::new(stream) as BoxedIo)
                 .map_err(|_| ProviderTransportError::Unavailable)
@@ -286,7 +306,8 @@ impl NativeProviderTransport {
             }
         }
         let stream = connected.ok_or(ProviderTransportError::Unavailable)?;
-        let stream = self.tls.connect(PROVIDER_HOST, stream).await?;
+        let tls = self.tls.connect(PROVIDER_HOST.to_owned(), stream);
+        let stream = poll_tls_on_blocking(tls).await?;
 
         let mut builder = http1::Builder::new();
         builder
@@ -341,6 +362,26 @@ impl ProviderTransport for NativeProviderTransport {
     fn execute<'a>(&'a self, request: ProviderHttpRequest) -> ProviderTransportFuture<'a> {
         Box::pin(self.execute_with_deadline(request))
     }
+}
+
+async fn poll_tls_on_blocking(
+    tls: ProviderTlsConnectFuture,
+) -> Result<BoxedIo, ProviderTransportError> {
+    let runtime = tokio::runtime::Handle::current();
+    let (keep_worker_alive, cancel_worker) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                result = tls => result,
+                _ = cancel_worker => Err(ProviderTransportError::Unavailable),
+            }
+        })
+    })
+    .await
+    .map_err(|_| ProviderTransportError::Unavailable)?;
+    drop(keep_worker_alive);
+    result
 }
 
 fn map_hyper_error(_error: hyper::Error) -> ProviderTransportError {

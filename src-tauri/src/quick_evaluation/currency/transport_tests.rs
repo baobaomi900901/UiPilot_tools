@@ -1,10 +1,13 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::pending,
     io,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
     task::{Context, Poll},
     time::{Duration, Instant as StdInstant},
 };
@@ -87,15 +90,52 @@ impl ProviderTcpConnector for PendingConnector {
 struct PendingTlsConnector;
 
 impl ProviderTlsConnector for PendingTlsConnector {
-    fn connect<'a>(&'a self, _hostname: &'a str, _stream: BoxedIo) -> ProviderTlsConnectFuture<'a> {
+    fn connect(&self, _hostname: String, _stream: BoxedIo) -> ProviderTlsConnectFuture {
         Box::pin(pending())
+    }
+}
+
+struct BlockingPollTlsConnector {
+    entered: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl ProviderTlsConnector for BlockingPollTlsConnector {
+    fn connect(&self, _hostname: String, _stream: BoxedIo) -> ProviderTlsConnectFuture {
+        Box::pin(BlockingPollTlsFuture {
+            entered: self.entered.clone(),
+            finished: self.finished.clone(),
+            release: self.release.clone(),
+        })
+    }
+}
+
+struct BlockingPollTlsFuture {
+    entered: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl std::future::Future for BlockingPollTlsFuture {
+    type Output = Result<BoxedIo, ProviderTransportError>;
+
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.entered.store(true, Ordering::SeqCst);
+        let (lock, ready) = &*self.release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+        self.finished.store(true, Ordering::SeqCst);
+        Poll::Ready(Err(ProviderTransportError::Unavailable))
     }
 }
 
 struct PassthroughTlsConnector;
 
 impl ProviderTlsConnector for PassthroughTlsConnector {
-    fn connect<'a>(&'a self, _hostname: &'a str, stream: BoxedIo) -> ProviderTlsConnectFuture<'a> {
+    fn connect(&self, _hostname: String, stream: BoxedIo) -> ProviderTlsConnectFuture {
         Box::pin(async move { Ok(stream) })
     }
 }
@@ -215,6 +255,30 @@ fn native_provider(
     )))
 }
 
+async fn execute_native_reply(
+    raw: Vec<u8>,
+) -> Result<ProviderHttpResponse, ProviderTransportError> {
+    let (address, root, _, server) = spawn_tls_server(
+        "api.frankfurter.dev",
+        vec![ServerReply {
+            chunks: vec![(Duration::ZERO, raw)],
+        }],
+    )
+    .await;
+    let transport = NativeProviderTransport::with_dependencies(
+        Arc::new(FixedResolver::new(address)),
+        Arc::new(TokioTcpConnector),
+        tls_with_root(&root),
+        Duration::from_secs(2),
+    );
+    let result = transport
+        .execute(ProviderHttpRequest::for_exchange(&request()).unwrap())
+        .await;
+    server.abort();
+    let _ = server.await;
+    result
+}
+
 async fn assert_deadline(provider: &FrankfurterProvider) {
     let started = StdInstant::now();
     assert_eq!(
@@ -317,6 +381,33 @@ fn transport_response_accepts_exactly_64_kib_and_rejects_the_sentinel_byte() {
     );
 }
 
+#[test]
+fn transport_request_and_response_debug_are_structurally_redacted() {
+    let outgoing = ProviderHttpRequest::for_exchange(&request()).unwrap();
+    assert_eq!(
+        format!("{outgoing:?}"),
+        "ProviderHttpRequest { redacted: true }"
+    );
+
+    let incoming = ProviderHttpResponse::try_new(
+        503,
+        vec![(
+            "x-private-sentinel".to_owned(),
+            b"header-secret-sentinel".to_vec(),
+        )],
+        b"body-secret-sentinel".to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        format!("{incoming:?}"),
+        "ProviderHttpResponse { status: 503, redacted: true }"
+    );
+    assert_eq!(
+        format!("{:?}", ProviderTransportError::ResponseTooLarge),
+        "ResponseTooLarge"
+    );
+}
+
 #[tokio::test]
 async fn provider_maps_only_422_to_unsupported_and_never_exposes_error_bodies() {
     for (status, expected) in [
@@ -373,16 +464,22 @@ async fn native_https_uses_fixed_dns_tls_http1_and_exact_wire_request() {
     let request = String::from_utf8(seen.recv().await.unwrap()).unwrap();
     let mut lines = request.split("\r\n");
     assert_eq!(lines.next(), Some("GET /v2/rate/USD/CNY HTTP/1.1"));
-    let headers = lines
+    let wire_headers = lines
         .take_while(|line| !line.is_empty())
-        .map(|line| line.to_ascii_lowercase())
+        .map(|line| {
+            let (name, value) = line.split_once(": ").unwrap();
+            (name.to_ascii_lowercase(), value.to_owned())
+        })
         .collect::<Vec<_>>();
-    assert!(headers
-        .iter()
-        .any(|line| line == "host: api.frankfurter.dev"));
-    assert!(headers
-        .iter()
-        .any(|line| line == "accept: application/json"));
+    assert_eq!(wire_headers.len(), 3);
+    assert_eq!(
+        wire_headers.into_iter().collect::<BTreeMap<_, _>>(),
+        BTreeMap::from([
+            ("accept".to_owned(), "application/json".to_owned()),
+            ("connection".to_owned(), "close".to_owned()),
+            ("host".to_owned(), "api.frankfurter.dev".to_owned()),
+        ])
+    );
     server.await.unwrap();
 }
 
@@ -474,6 +571,47 @@ async fn one_deadline_covers_dns_connect_tls_and_request_send() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_tls_future_poll_cannot_delay_the_end_to_end_deadline() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let releaser = std::thread::spawn({
+        let entered = entered.clone();
+        let release = release.clone();
+        move || {
+            while !entered.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    });
+    let provider = native_provider(
+        Arc::new(FixedResolver::new(SocketAddr::from(([127, 0, 0, 1], 9)))),
+        Arc::new(PendingIoConnector),
+        Arc::new(BlockingPollTlsConnector {
+            entered,
+            finished: finished.clone(),
+            release,
+        }),
+        Duration::from_millis(30),
+    );
+
+    let started = StdInstant::now();
+    let result = provider.fetch_rate(&request()).await;
+    let elapsed = started.elapsed();
+    releaser.join().unwrap();
+    assert!(finished.load(Ordering::SeqCst));
+    assert_eq!(result, Err(ExchangeRateError::Unavailable));
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "blocking TLS poll delayed the deadline for {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn the_same_deadline_covers_response_headers_and_body() {
     let (headers_address, headers_root, _, headers_server) = spawn_tls_server(
@@ -551,6 +689,40 @@ fn transport_response_bounds_header_count_and_bytes() {
             Vec::new(),
         ),
         Err(ProviderTransportError::ResponseTooLarge)
+    );
+}
+
+#[tokio::test]
+async fn native_http1_rejects_oversized_header_count_and_bytes_before_returning() {
+    let mut too_many = String::from("HTTP/1.1 200 OK\r\n");
+    for index in 0..65 {
+        too_many.push_str(&format!("X-Field-{index}: value\r\n"));
+    }
+    too_many.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let too_large = format!(
+        "HTTP/1.1 200 OK\r\nX-Large: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "a".repeat(33 * 1024)
+    );
+
+    for raw in [too_many.into_bytes(), too_large.into_bytes()] {
+        assert_eq!(
+            execute_native_reply(raw).await,
+            Err(ProviderTransportError::Unavailable)
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_http1_rejects_an_oversized_chunked_trailer_during_parse() {
+    let raw = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Large\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\nX-Large: {}\r\n\r\n",
+        "a".repeat(33 * 1024)
+    )
+    .into_bytes();
+
+    assert_eq!(
+        execute_native_reply(raw).await,
+        Err(ProviderTransportError::Unavailable)
     );
 }
 
