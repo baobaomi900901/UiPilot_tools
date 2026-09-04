@@ -125,23 +125,136 @@ function Resolve-VmInstrumentedSetup([string]$RepositoryRoot) {
     return $setup
 }
 
+function Add-InstallerPathScopeProbe {
+    if ('UiPilot.ManagedEverythingInstaller.PinnedDirectoryScope' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace UiPilot.ManagedEverythingInstaller {
+  public sealed class PinnedDirectoryScope : IDisposable {
+    const uint FILE_READ_ATTRIBUTES = 0x00000080;
+    const uint FILE_SHARE_READ = 0x00000001, FILE_SHARE_WRITE = 0x00000002;
+    const uint OPEN_EXISTING = 3;
+    const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010, FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000, FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME { public uint LowDateTime; public uint HighDateTime; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct BY_HANDLE_FILE_INFORMATION {
+      public uint FileAttributes;
+      public FILETIME CreationTime, LastAccessTime, LastWriteTime;
+      public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION information);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern uint GetFinalPathNameByHandle(IntPtr handle, StringBuilder path, uint length, uint flags);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+
+    readonly List<IntPtr> handles = new List<IntPtr>();
+    readonly List<string> expectedPaths = new List<string>();
+    public string Path { get; private set; }
+
+    PinnedDirectoryScope(string path) { Path = path; }
+
+    static string TrimDirectory(string path) {
+      string root = System.IO.Path.GetPathRoot(path);
+      return path.Length == root.Length ? path : path.TrimEnd('\\');
+    }
+
+    static string NormalizeFinalPath(string path) {
+      if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) return @"\\" + path.Substring(8);
+      if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) return path.Substring(4);
+      return path;
+    }
+
+    static void VerifyExactDirectory(IntPtr handle, string expectedPath) {
+      BY_HANDLE_FILE_INFORMATION information;
+      if (!GetFileInformationByHandle(handle, out information)) throw new Win32Exception();
+      if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) throw new InvalidOperationException("Custom install scope component is not a directory");
+      if ((information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) throw new InvalidOperationException("Custom install scope contains a reparse point");
+      var buffer = new StringBuilder(32768);
+      uint written = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0);
+      if (written == 0 || written >= buffer.Capacity) throw new Win32Exception();
+      string actual = TrimDirectory(System.IO.Path.GetFullPath(NormalizeFinalPath(buffer.ToString())));
+      string expected = TrimDirectory(System.IO.Path.GetFullPath(expectedPath));
+      if (!String.Equals(actual, expected, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Custom install scope canonical path mismatch");
+    }
+
+    void PinExactDirectory(string expectedPath) {
+      IntPtr handle = CreateFile(
+        expectedPath,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        IntPtr.Zero,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        IntPtr.Zero);
+      if (handle == INVALID_HANDLE_VALUE) throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not pin custom install directory component");
+      try {
+        VerifyExactDirectory(handle, expectedPath);
+        handles.Add(handle);
+        expectedPaths.Add(expectedPath);
+        handle = IntPtr.Zero;
+      } finally {
+        if (handle != IntPtr.Zero && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+      }
+    }
+
+    public void ValidateUnchanged() {
+      if (handles.Count == 0 || handles.Count != expectedPaths.Count) throw new ObjectDisposedException("PinnedDirectoryScope");
+      for (int index = 0; index < handles.Count; index++) VerifyExactDirectory(handles[index], expectedPaths[index]);
+    }
+
+    public static PinnedDirectoryScope Open(string rootPath, string candidatePath) {
+      if (String.IsNullOrWhiteSpace(rootPath) || String.IsNullOrWhiteSpace(candidatePath)) throw new ArgumentException("Custom install scope paths are required");
+      string root = TrimDirectory(System.IO.Path.GetFullPath(rootPath));
+      string candidate = TrimDirectory(System.IO.Path.GetFullPath(candidatePath));
+      string prefix = root + "\\";
+      if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Custom install directory escaped VmTestRoot");
+      if (!Directory.Exists(root) || !Directory.Exists(candidate)) throw new InvalidOperationException("Custom install scope directories must already exist");
+
+      var scope = new PinnedDirectoryScope(candidate);
+      try {
+        scope.PinExactDirectory(root);
+        string current = root;
+        foreach (string component in candidate.Substring(prefix.Length).Split(new[] {'\\'}, StringSplitOptions.RemoveEmptyEntries)) {
+          if (component == "." || component == "..") throw new InvalidOperationException("Custom install scope is not canonical");
+          current = System.IO.Path.Combine(current, component);
+          scope.PinExactDirectory(current);
+        }
+        return scope;
+      } catch {
+        scope.Dispose();
+        throw;
+      }
+    }
+
+    public void Dispose() {
+      for (int index = handles.Count - 1; index >= 0; index--) CloseHandle(handles[index]);
+      handles.Clear();
+      expectedPaths.Clear();
+    }
+  }
+}
+'@
+}
+
 function Resolve-ScopedInstallDirectory {
     if ([string]::IsNullOrWhiteSpace($InstallDirectory)) { return $null }
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($VmTestRoot)) 'A custom install directory requires VmTestRoot'
-    $testRoot = Get-Item -LiteralPath $VmTestRoot -Force -ErrorAction Stop
-    Assert-Condition $testRoot.PSIsContainer 'VmTestRoot must be a directory'
-    Assert-Condition (($testRoot.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'VmTestRoot must not be a reparse point'
-    $candidate = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\')
-    $prefix = $testRoot.FullName.TrimEnd('\') + '\'
-    Assert-Condition ($candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) 'Custom install directory escaped VmTestRoot'
-    $ancestor = Split-Path -Parent $candidate
-    while (-not [string]::IsNullOrWhiteSpace($ancestor) -and -not (Test-Path -LiteralPath $ancestor)) {
-        $ancestor = Split-Path -Parent $ancestor
-    }
-    $ancestorItem = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
-    Assert-Condition (($ancestorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Custom install ancestor is a reparse point'
-    Assert-Condition ($ancestorItem.FullName.StartsWith($testRoot.FullName, [StringComparison]::OrdinalIgnoreCase)) 'Custom install ancestor escaped VmTestRoot'
-    return $candidate
+    Add-InstallerPathScopeProbe
+    return [UiPilot.ManagedEverythingInstaller.PinnedDirectoryScope]::Open($VmTestRoot, $InstallDirectory)
 }
 
 function Assert-RedactedEvidence([string]$Json, [string]$RepositoryRoot) {
@@ -152,6 +265,7 @@ function Assert-RedactedEvidence([string]$Json, [string]$RepositoryRoot) {
     }
     Assert-Condition ($Json -notmatch '(?i)S-1-\d+(?:-\d+){1,14}') 'Installer evidence contains SID data'
     Assert-Condition ($Json -notmatch '(?i)[A-Z]:[\\/]') 'Installer evidence contains absolute path data'
+    Assert-Condition ($Json -notmatch '(?i)\\\\[^\\\s]+\\') 'Installer evidence contains UNC path data'
     Assert-Condition ($Json -notmatch '(?i)"(?:query|search_text|result_path)"\s*:') 'Installer evidence contains search or result data'
 }
 
@@ -195,6 +309,8 @@ function Invoke-OneVmSetup([string]$Setup, [string[]]$Arguments, [string]$Marker
 function Invoke-InstallerSelfTest {
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('uipilot-vm-guard-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
+    $savedVmTestRoot = $VmTestRoot
+    $savedInstallDirectory = $InstallDirectory
     try {
         $marker = Join-Path $tempRoot 'marker.txt'
         [IO.File]::WriteAllText($marker, 'not-an-acknowledgement')
@@ -204,11 +320,45 @@ function Invoke-InstallerSelfTest {
         [IO.File]::WriteAllText($marker, $script:DisposableMarkerText)
         Assert-Condition ((Assert-DisposableMarker $marker) -ceq $marker) 'Disposable marker guard rejected exact acknowledgement'
         $caught = $false
+        try { Assert-RedactedEvidence '{"value":"\\\\server\\share\\secret"}' (Split-Path -Parent $PSScriptRoot) } catch { $caught = $true }
+        Assert-Condition $caught 'Installer evidence redaction accepted a UNC path'
+        $caught = $false
         try { Resolve-VmInstrumentedSetup (Split-Path -Parent $PSScriptRoot) | Out-Null } catch { $caught = $true }
         Assert-Condition $caught 'VM Setup guard accepted a missing path'
+
+        $scopeRoot = Join-Path $tempRoot 'scope'
+        $junctionParent = Join-Path $scopeRoot 'nested'
+        $junctionTarget = Join-Path $tempRoot 'outside'
+        $junction = Join-Path $junctionParent 'redirect'
+        [IO.Directory]::CreateDirectory($junctionParent) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $junctionTarget 'deeper\install')) | Out-Null
+        New-Item -ItemType Junction -Path $junction -Target $junctionTarget | Out-Null
+        $script:VmTestRoot = $scopeRoot
+        $script:InstallDirectory = Join-Path $junction 'deeper\install'
+        $caught = $false
+        try {
+            $scope = Resolve-ScopedInstallDirectory
+            if ($scope -is [IDisposable]) { $scope.Dispose() }
+        } catch { $caught = $true }
+        Assert-Condition $caught 'Custom install scope accepted a nested junction escape'
+
+        $validInstall = Join-Path $scopeRoot 'valid\install'
+        [IO.Directory]::CreateDirectory($validInstall) | Out-Null
+        $script:InstallDirectory = $validInstall
+        $scope = Resolve-ScopedInstallDirectory
+        try {
+            Assert-Condition ($scope.Path -ceq [IO.Path]::GetFullPath($validInstall)) 'Custom install scope did not return its canonical path'
+            Move-Item -LiteralPath $validInstall -Destination (Join-Path $scopeRoot 'moved') -ErrorAction Stop
+            $caught = $false
+            try { $scope.ValidateUnchanged() } catch { $caught = $true }
+            Assert-Condition $caught 'Custom install scope did not detect a renamed directory identity'
+        }
+        finally { $scope.Dispose() }
         Write-Output 'MANAGED_EVERYTHING_INSTALLER_SELFTEST_PASS'
     }
     finally {
+        $script:VmTestRoot = $savedVmTestRoot
+        $script:InstallDirectory = $savedInstallDirectory
         if (Test-Path -LiteralPath $tempRoot -PathType Container) { Remove-Item -LiteralPath $tempRoot -Recurse -Force }
     }
 }
@@ -216,52 +366,61 @@ function Invoke-InstallerSelfTest {
 function Invoke-InstallerVmMode([string]$RepositoryRoot) {
     $marker = Assert-VmAdmission
     $setup = Resolve-VmInstrumentedSetup $RepositoryRoot
-    $scopedInstall = Resolve-ScopedInstallDirectory
+    $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
     $flow = switch ($Mode) {
         'VmUpdate' { 'TauriUpdate' }
         'VmExplicitUninstall' { 'MaintenanceUninstall' }
         'VmUninstallCheckpoint' { 'MaintenanceUninstall' }
         default { $SetupFlow }
     }
-    if ($Mode -ceq 'VmSourceReplacement') { Assert-Condition (-not [string]::IsNullOrWhiteSpace($scopedInstall)) 'VmSourceReplacement requires a scoped InstallDirectory' }
     if (@('VmFaultCheckpoint', 'VmUninstallCheckpoint') -contains $Mode) { Assert-Condition (-not [string]::IsNullOrWhiteSpace($Checkpoint)) "$Mode requires Checkpoint" }
     if ($Mode -ceq 'VmUninstallCheckpoint') { Assert-Condition $Checkpoint.StartsWith('uninstall-') 'VmUninstallCheckpoint accepts only uninstall checkpoints' }
-    $arguments = Get-SetupArguments $flow $scopedInstall
-    $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+    $installScope = Resolve-ScopedInstallDirectory
+    try {
+        $scopedInstall = if ($null -eq $installScope) { $null } else { $installScope.Path }
+        if ($Mode -ceq 'VmSourceReplacement') { Assert-Condition (-not [string]::IsNullOrWhiteSpace($scopedInstall)) 'VmSourceReplacement requires a scoped InstallDirectory' }
+        $arguments = Get-SetupArguments $flow $scopedInstall
 
-    if ($Mode -ceq 'VmConcurrency') {
-        $oldMarker = $env:UIPILOT_VM_DISPOSABLE_MARKER
-        try {
-            $env:UIPILOT_VM_DISPOSABLE_MARKER = $marker
-            $first = if ($arguments.Count -eq 0) { Start-Process -FilePath $setup -PassThru } else { Start-Process -FilePath $setup -ArgumentList $arguments -PassThru }
-            $second = if ($arguments.Count -eq 0) { Start-Process -FilePath $setup -PassThru } else { Start-Process -FilePath $setup -ArgumentList $arguments -PassThru }
-            $first.WaitForExit()
-            $second.WaitForExit()
-            $codes = @([int]$first.ExitCode, [int]$second.ExitCode)
-            $pass = @($codes | Where-Object { $_ -eq 0 }).Count -eq 1
-            Write-InstallerVmEvidence $RepositoryRoot ([ordered]@{
-                schema_version = 1; kind = 'installer-vm'; mode = $Mode.ToLowerInvariant(); outcome = $(if ($pass) { 'pass' } else { 'fail' })
-                setup_sha256 = $setupHash; one_winner = $pass; first_exit_code = $codes[0]; second_exit_code = $codes[1]
-            })
-            Assert-Condition $pass 'VM concurrency mode did not produce exactly one winner'
-            return
+        if ($Mode -ceq 'VmConcurrency') {
+            $oldMarker = $env:UIPILOT_VM_DISPOSABLE_MARKER
+            try {
+                $env:UIPILOT_VM_DISPOSABLE_MARKER = $marker
+                if ($null -ne $installScope) { $installScope.ValidateUnchanged() }
+                $first = if ($arguments.Count -eq 0) { Start-Process -FilePath $setup -PassThru } else { Start-Process -FilePath $setup -ArgumentList $arguments -PassThru }
+                if ($null -ne $installScope) { $installScope.ValidateUnchanged() }
+                $second = if ($arguments.Count -eq 0) { Start-Process -FilePath $setup -PassThru } else { Start-Process -FilePath $setup -ArgumentList $arguments -PassThru }
+                $first.WaitForExit()
+                $second.WaitForExit()
+                $codes = @([int]$first.ExitCode, [int]$second.ExitCode)
+                $pass = @($codes | Where-Object { $_ -eq 0 }).Count -eq 1
+                Write-InstallerVmEvidence $RepositoryRoot ([ordered]@{
+                    schema_version = 1; kind = 'installer-vm'; mode = $Mode.ToLowerInvariant(); outcome = $(if ($pass) { 'pass' } else { 'fail' })
+                    setup_sha256 = $setupHash; one_winner = $pass; first_exit_code = $codes[0]; second_exit_code = $codes[1]
+                })
+                Assert-Condition $pass 'VM concurrency mode did not produce exactly one winner'
+                return
+            }
+            finally {
+                if ($null -eq $oldMarker) { Remove-Item Env:UIPILOT_VM_DISPOSABLE_MARKER -ErrorAction SilentlyContinue } else { $env:UIPILOT_VM_DISPOSABLE_MARKER = $oldMarker }
+            }
         }
-        finally {
-            if ($null -eq $oldMarker) { Remove-Item Env:UIPILOT_VM_DISPOSABLE_MARKER -ErrorAction SilentlyContinue } else { $env:UIPILOT_VM_DISPOSABLE_MARKER = $oldMarker }
+
+        $fault = if (@('VmFaultCheckpoint', 'VmUninstallCheckpoint') -contains $Mode) { $Checkpoint } else { $null }
+        if ($null -ne $installScope) { $installScope.ValidateUnchanged() }
+        $exitCode = Invoke-OneVmSetup $setup $arguments $marker $fault
+        $pass = $exitCode -eq $ExpectedExitCode
+        Write-InstallerVmEvidence $RepositoryRoot ([ordered]@{
+            schema_version = 1; kind = 'installer-vm'; mode = $Mode.ToLowerInvariant(); flow = $flow.ToLowerInvariant()
+            checkpoint = $fault; outcome = $(if ($pass) { 'pass' } else { 'fail' }); setup_sha256 = $setupHash
+            expected_exit_code = $ExpectedExitCode; actual_exit_code = $exitCode
+        })
+        if (-not $pass) {
+            if ($exitCode -ne 0) { exit $exitCode }
+            exit 1
         }
     }
-
-    $fault = if (@('VmFaultCheckpoint', 'VmUninstallCheckpoint') -contains $Mode) { $Checkpoint } else { $null }
-    $exitCode = Invoke-OneVmSetup $setup $arguments $marker $fault
-    $pass = $exitCode -eq $ExpectedExitCode
-    Write-InstallerVmEvidence $RepositoryRoot ([ordered]@{
-        schema_version = 1; kind = 'installer-vm'; mode = $Mode.ToLowerInvariant(); flow = $flow.ToLowerInvariant()
-        checkpoint = $fault; outcome = $(if ($pass) { 'pass' } else { 'fail' }); setup_sha256 = $setupHash
-        expected_exit_code = $ExpectedExitCode; actual_exit_code = $exitCode
-    })
-    if (-not $pass) {
-        if ($exitCode -ne 0) { exit $exitCode }
-        exit 1
+    finally {
+        if ($null -ne $installScope) { $installScope.Dispose() }
     }
 }
 
@@ -292,7 +451,7 @@ Assert-SourceContains $runtimeGate @(
     'UIPILOT_DISPOSABLE_VM=I_UNDERSTAND_THIS_MACHINE_WILL_BE_MUTATED'
 )
 Assert-SourceContains $releaseGate @(
-    "[ValidateSet('Local', 'SelfTest')]",
+    "[ValidateSet('Local', 'Source', 'SelfTest')]",
     'Helper tests', 'Installer Source', 'Production NSIS',
     "Action = { Invoke-CapturedCommand 'cargo.exe' @('test', '--manifest-path', 'src-tauri/Cargo.toml') }"
 )

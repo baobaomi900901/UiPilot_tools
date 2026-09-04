@@ -14,6 +14,7 @@ Setup outside the VM run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode VmInstrumentedSetup
+cargo.exe build --manifest-path spikes/everything-ipc/Cargo.toml
 $VmSetup = (Resolve-Path 'src-tauri/target/vm-instrumented/release/bundle/nsis/UiPilot_tools VM Instrumented Setup_*_x64-setup.exe').Path
 $Marker = 'C:\UiPilot-disposable-vm.marker'
 [IO.File]::WriteAllText($Marker, 'UIPILOT_DISPOSABLE_VM=I_UNDERSTAND_THIS_MACHINE_WILL_BE_MUTATED')
@@ -99,14 +100,17 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
 ## Row 4 — both upgrade paths, cancellation, and writable source replacement
 
 - Prerequisites: old production UiPilot installed; old uninstaller, private Service, manifest, ProgramData,
-  and application hashes recorded; a standard-user-writable `$VmTestRoot` exists for the source race.
+  and application hashes recorded; a standard-user-writable `$VmTestRoot` and its intended install directory
+  already exist for the source race. Every existing path component must be non-reparse and is pinned and
+  final-path revalidated immediately before Setup launch.
 - Commands for manual replacement and Tauri `/UPDATE`, respectively:
 
   ```powershell
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmInstall -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-manual-replacement
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmUpdate -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-tauri-update
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmCancelBeforeInstall -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-cancel
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmSourceReplacement -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-source-race -VmTestRoot $VmTestRoot -InstallDirectory (Join-Path $VmTestRoot 'UiPilot-race')
+  $VmInstallDirectory = [IO.Directory]::CreateDirectory((Join-Path $VmTestRoot 'UiPilot-race')).FullName
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmSourceReplacement -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-source-race -VmTestRoot $VmTestRoot -InstallDirectory $VmInstallDirectory
   ```
 - Expected stable outcome: neither upgrade path calls the old uninstaller. Cancellation or failure before
   Install Section changes nothing. During the source race, replacement produces a share violation or the
@@ -124,13 +128,16 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
 - Commands:
 
   ```powershell
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmRecovery -DisposableVmMarker $Marker -EvidenceName row05-client-recovery -ClientProcessId $PrivateClientPid -RecoveryTarget Client -ExpectedTerminal Ready
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmRecovery -DisposableVmMarker $Marker -EvidenceName row05-service-unavailable -ClientProcessId $PrivateClientPid -RecoveryTarget Service -ExpectedTerminal Unavailable
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmRetryBudget -DisposableVmMarker $Marker -EvidenceName row05-client-retry-budget -ClientProcessId $PrivateClientPid
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmRecovery -DisposableVmMarker $Marker -EvidenceName row05-service-unavailable -ClientProcessId $PrivateClientPid -RecoveryTarget Service
   ```
-- Expected stable outcome: client death is retried only within the fixed three-restart budget and converges
-  to one Ready replacement or stable unavailable; Service death produces a bounded, stable unavailable state
-  until SCM/repair restores it. No unowned Everything process is terminated.
-- Evidence: `runtime-row05-client-recovery.json`, `runtime-row05-service-unavailable.json`.
+- Expected stable outcome: three successive exact private-client deaths each produce one PID/creation-bound,
+  DB-loaded, fixed-Query2 Ready replacement. Terminating that third replacement produces no fourth private
+  process and a stable unavailable observation while the exact host and Service remain alive. Service death
+  independently produces a bounded stable unavailable state until SCM/repair restores it. No unowned
+  Everything process is terminated.
+- Evidence: `runtime-row05-client-retry-budget.json`, `runtime-row05-service-unavailable.json`; only the
+  observed restart/termination counts and stable booleans are recorded.
 - Cleanup: revert the snapshot after each termination variant.
 - Status: `NOT RUN`
 
@@ -181,25 +188,31 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
 
 - Prerequisites: a verified old install; a separate snapshot per checkpoint/termination target; another
   elevated administrator credential for the recovery handoff variant.
-- Commands for every deterministic install/rollback/bootstrap checkpoint:
+- The currently available fault-return commands are listed below for diagnosis only; they do **not** satisfy
+  this row's termination and recovery variants:
 
   ```powershell
   $InstallCheckpoints = @('bootstrap-root-created','transaction-temp-created','transaction-temp-flushed','transaction-temp-renamed','new-binary-verified','old-service-stopped','old-service-removed','new-service-installed','new-service-started','runtime-manifest-replaced','cleanup-complete','rollback-started','rollback-complete')
   foreach ($Checkpoint in $InstallCheckpoints) {
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmFaultCheckpoint -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName ("row08-$Checkpoint") -Checkpoint $Checkpoint -ExpectedExitCode 1
   }
-  # After each forced Helper/parent-Setup termination or VM reset at the named phase, rerun trusted Setup:
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmInstall -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row08-recovery-rerun
   ```
+- Interface blocker: the independently named Instrumented Setup exposes only
+  `UIPILOT_VM_FAULT_CHECKPOINT`, which makes Helper return a failure. It has no synchronization/termination
+  control for Helper, parent Setup, or simulated restart at a named phase; no rollback-failure trigger; and
+  no protected operation/recovered-transaction-ID observation surface. Therefore no truthful executable
+  commands exist yet for those required variants within this five-file test-harness scope. Do not substitute
+  manual timing or edit this row to `PASS`.
 - Expected stable outcome: each Service-phase failure restores the verified old Service. A rollback fault
   retains the old manifest and every verified binary with a diagnostic failure. Helper/Setup termination or
   restart at each phase and bootstrap create/flush/rename boundary converges on rerun to exactly one verified
   old/new state before application copy. Only exact bootstrap residue is recoverable. Recovery under another
   elevated administrator records distinct operation and recovered-transaction IDs without exposing them.
-- Evidence: one `installer-row08-<checkpoint>.json` per named checkpoint,
-  `installer-row08-recovery-rerun.json`, and redacted operator phase/termination/recovery booleans.
+- Evidence: the checkpoint failure files are diagnostic only. Required Helper/Setup/system-termination,
+  rollback-failure, bootstrap-recovery, and cross-admin handoff evidence cannot be produced until the
+  Instrumented Setup gains the interfaces above.
 - Cleanup: revert after every independent checkpoint variant.
-- Status: `NOT RUN`
+- Status: `NOT RUN` — **BLOCKED: Instrumented Setup termination/recovery interface missing**
 
 ## Row 9 — process creation, readiness, logoff, and shutdown cleanup
 
@@ -282,20 +295,27 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmInstall -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row13-reinstall
   # Same-version explicit maintenance uninstall; select Uninstall application.
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmExplicitUninstall -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row13-explicit-uninstall
-  # Run once as Setup/Setup and once while a true uninstaller already owns the transaction.
+  # This covers Setup/Setup only; it must not be reused as evidence for the blocked variants below.
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmConcurrency -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row13-concurrency
   ```
+- Interface blocker: the Instrumented Setup provides no programmatic true-uninstall participant, no
+  standard-user mutex/activity-event precreate/hold/abandon/type/DACL harness, and no phase synchronization
+  that can kill the parent Setup while the Helper activity lease is known live. The existing
+  `VmConcurrency` mode starts two Setups and proves only that narrow variant. Cross-admin recovered IDs are
+  likewise not observable. These variants cannot be truthfully automated in the assigned five files; do not
+  infer them from two Setup exit codes or manual timing.
 - Expected stable outcome: upgrade/downgrade/repair never starts the old uninstaller; all cancellation/failure
   points before main copy preserve the old uninstall entry and managed state. Explicit uninstall exits after the
   old uninstaller and never enters install. Exactly one trusted transaction owns the mutex/activity event.
   Standard-user precreate/hold/abandon/type or DACL changes fail before managed reads. Abandoned trusted ownership
   recovers durably. If parent Setup dies while Helper holds the activity lease, a new Setup remains busy until the
   old Helper rolls back/exits, then recovers with distinct protected operation/recovered IDs.
-- Evidence: `installer-row13-reinstall.json`, `installer-row13-explicit-uninstall.json`,
-  `installer-row13-concurrency.json`, and redacted per-variant ownership/recovery booleans.
+- Evidence: `installer-row13-reinstall.json`, `installer-row13-explicit-uninstall.json`, and
+  `installer-row13-concurrency.json` cover only their named partial paths. Required true-uninstall,
+  object-squatting, abandoned-owner, and parent-death/activity-lease evidence remains unavailable.
 - Cleanup: release only operator-owned squatting handles, then revert the snapshot; never delete unknown objects
   through the product harness.
-- Status: `NOT RUN`
+- Status: `NOT RUN` — **BLOCKED: Instrumented Setup concurrency-control interface missing**
 
 ## Release decision
 

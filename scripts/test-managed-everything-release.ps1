@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Local', 'SelfTest')]
+    [ValidateSet('Local', 'Source', 'SelfTest')]
     [string]$Mode = 'Local'
 )
 
@@ -83,6 +83,7 @@ function Protect-ReleaseText([string]$Text) {
 function Assert-ReleaseTextRedacted([string]$Text) {
     Assert-Condition ($Text -notmatch '(?i)S-1-\d+(?:-\d+){1,14}') 'Release evidence contains SID data'
     Assert-Condition ($Text -notmatch '(?i)[A-Z]:[\\/]') 'Release evidence contains absolute path data'
+    Assert-Condition ($Text -notmatch '(?i)\\\\[^\\\s]+\\') 'Release evidence contains UNC path data'
     foreach ($value in @($env:USERPROFILE, $env:USERNAME, $env:COMPUTERNAME)) {
         if (-not [string]::IsNullOrWhiteSpace($value)) {
             Assert-Condition (-not $Text.Contains($value)) 'Release evidence contains machine or user data'
@@ -247,6 +248,30 @@ function Write-SetupHashEvidence([string]$Directory) {
     Write-Utf8 (Join-Path $Directory 'setup-sha256.json') $evidence
 }
 
+function Invoke-SourceGate {
+    $actualOrder = @((New-ReleaseStages) | ForEach-Object { $_.Name })
+    $expectedOrder = @(
+        'Helper tests', 'Production Helper build and inspection', 'Installer Source',
+        'Everything ResourceOnly', 'IPC full', 'Rust host full',
+        'Frontend tests and build', 'Production NSIS'
+    )
+    Assert-Condition (($actualOrder -join "`n") -ceq ($expectedOrder -join "`n")) 'Release stage ordering contract changed'
+    $source = Get-Content -LiteralPath $PSCommandPath -Raw -Encoding utf8
+    foreach ($contract in @(
+        "Invoke-CapturedCommand 'cargo.exe' @('test', '--manifest-path', 'src-tauri/Cargo.toml')",
+        'VM_MATRIX_NOT_RUN RELEASE_READY_FALSE',
+        "vm_matrix_status = 'NOT RUN'",
+        'release_ready = $false'
+    )) {
+        Assert-Condition $source.Contains($contract) "Release Source contract is missing: $contract"
+    }
+    $matrix = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'docs\testing\managed-everything-vm-matrix.md') -Raw -Encoding utf8
+    Assert-Condition ([regex]::Matches($matrix, '(?m)^## Row (?:[1-9]|1[0-3])\b').Count -eq 13) 'Release matrix must contain exactly 13 rows'
+    Assert-Condition $matrix.Contains('BLOCKED: Instrumented Setup termination/recovery interface missing') 'Release matrix hides the Row 8 interface blocker'
+    Assert-Condition $matrix.Contains('BLOCKED: Instrumented Setup concurrency-control interface missing') 'Release matrix hides the Row 13 interface blocker'
+    Write-Output 'MANAGED_EVERYTHING_RELEASE_SOURCE_PASS'
+}
+
 function Invoke-SelfTest {
     $directory = Join-Path $script:EvidenceRoot ('selftest-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($directory) | Out-Null
@@ -258,6 +283,9 @@ function Invoke-SelfTest {
             'Frontend tests and build', 'Production NSIS'
         )
         Assert-Condition (($actualOrder -join "`n") -ceq ($expectedOrder -join "`n")) 'Release stage ordering contract changed'
+        $caught = $false
+        try { Assert-ReleaseTextRedacted '\\server\share\secret' } catch { $caught = $true }
+        Assert-Condition $caught 'Release evidence assertion accepted a UNC path'
         $script:ThirdStageRan = $false
         $stages = @(
             [pscustomobject]@{ Name = 'one'; Action = { [pscustomobject]@{ ExitCode = 0; Output = 'ok' } } },
@@ -280,6 +308,10 @@ function Invoke-SelfTest {
 
 if ($Mode -ceq 'SelfTest') {
     Invoke-SelfTest
+    exit 0
+}
+if ($Mode -ceq 'Source') {
+    Invoke-SourceGate
     exit 0
 }
 
