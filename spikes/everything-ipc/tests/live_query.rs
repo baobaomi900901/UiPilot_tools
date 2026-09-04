@@ -454,6 +454,30 @@ fn owned_connection_exposes_database_loaded_state() {
         .expect("database probe should complete"));
 }
 
+#[test]
+fn explicit_close_is_idempotent_and_closes_retained_client_arcs() {
+    let _serial = TEST_SERIAL.lock().expect("test serial mutex poisoned");
+    let fake = FakeEverything::start();
+    fake.set_database_loaded(true);
+    let client = Arc::new(
+        EverythingClient::connect_owned(&fake.instance, std::process::id(), CONNECT_TIMEOUT)
+            .expect("owned client should connect to the expected PID"),
+    );
+    let retained = Arc::clone(&client);
+
+    client.close();
+    client.close();
+
+    assert!(matches!(
+        retained.database_loaded(CONNECT_TIMEOUT),
+        Err(EverythingClientError::ClientClosed)
+    ));
+    assert!(matches!(
+        retained.query(query_spec(CONNECT_TIMEOUT)),
+        Err(EverythingClientError::ClientClosed)
+    ));
+}
+
 unsafe fn capture_query(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<CapturedQuery> {
     let copydata = (lparam.0 as *const COPYDATASTRUCT).as_ref()?;
     let payload =

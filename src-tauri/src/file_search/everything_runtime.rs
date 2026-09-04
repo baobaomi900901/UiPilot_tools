@@ -14,10 +14,13 @@ const PROBE_SORT_TYPE: u32 = 14;
 pub(crate) const INSTANCE_NAME: &str = "UiPilot";
 pub(crate) const SERVICE_NAME: &str = "Everything (UiPilot)";
 pub(crate) const PIPE_NAME: &str = r"\\.\PIPE\UiPilotEverythingService";
+pub(crate) const PRIVATE_EVERYTHING_WINDOW_CLASS: &str =
+    "EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)";
 const RESOURCE_SUBDIRECTORY: &str = r"resources\everything";
 const EXECUTABLE_FILE_NAME: &str = "Everything.exe";
 const LOCK_FILE_NAME: &str = "everything.lock.json";
 const TEMPLATE_FILE_NAME: &str = "Everything-UiPilot.ini";
+const MANAGED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
 const REVIEWED_LOCK_BYTES: &[u8] =
     include_bytes!("../../resources/everything/everything.lock.json");
 const REVIEWED_INI_BYTES: &[u8] =
@@ -148,6 +151,26 @@ pub(crate) fn parse_runtime_manifest(
     Ok(manifest)
 }
 
+fn validate_manifest_binary_layout(
+    managed_root: &Path,
+    version: &str,
+    version_directory: &Path,
+    binary: &Path,
+    version_directory_is_reparse: bool,
+    binary_is_reparse: bool,
+) -> bool {
+    !version_directory_is_reparse
+        && !binary_is_reparse
+        && version_directory.parent() == Some(managed_root)
+        && version_directory.file_name().and_then(|name| name.to_str()) == Some(version)
+        && binary.parent() == Some(version_directory)
+        && binary.file_name().and_then(|name| name.to_str()) == Some(EXECUTABLE_FILE_NAME)
+}
+
+fn managed_descriptor_is_exact(descriptor: &str) -> bool {
+    descriptor == MANAGED_OBJECT_SDDL
+}
+
 pub(crate) fn managed_ini_bytes(bytes: &[u8]) -> Result<Vec<u8>, RuntimeUnavailableReason> {
     if bytes != REVIEWED_INI_BYTES {
         return Err(RuntimeUnavailableReason::InvalidResource);
@@ -213,6 +236,7 @@ pub(crate) trait EverythingRuntimeClient: Send + Sync {
         &self,
         spec: EverythingQuerySpec,
     ) -> Result<EverythingQueryResult, EverythingClientError>;
+    fn close(&self);
 }
 
 impl EverythingRuntimeClient for EverythingClient {
@@ -226,17 +250,113 @@ impl EverythingRuntimeClient for EverythingClient {
     ) -> Result<EverythingQueryResult, EverythingClientError> {
         EverythingClient::query(self, spec)
     }
+
+    fn close(&self) {
+        EverythingClient::close(self);
+    }
+}
+
+struct RuntimeQueryGateState {
+    open: bool,
+    admitted: usize,
+}
+
+struct RuntimeQueryGate {
+    state: Mutex<RuntimeQueryGateState>,
+    drained: Condvar,
+}
+
+impl RuntimeQueryGate {
+    fn open() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(RuntimeQueryGateState {
+                open: true,
+                admitted: 0,
+            }),
+            drained: Condvar::new(),
+        })
+    }
+
+    fn admit(&self) -> Result<RuntimeQueryAdmission<'_>, EverythingClientError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| EverythingClientError::ClientClosed)?;
+        if !state.open {
+            return Err(EverythingClientError::ClientClosed);
+        }
+        state.admitted = state
+            .admitted
+            .checked_add(1)
+            .ok_or(EverythingClientError::Overloaded)?;
+        Ok(RuntimeQueryAdmission { gate: self })
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.open = false;
+        if state.admitted == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    fn wait_drained(&self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(
+            self.drained
+                .wait_while(state, |state| state.admitted != 0)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+}
+
+struct RuntimeQueryAdmission<'a> {
+    gate: &'a RuntimeQueryGate,
+}
+
+impl Drop for RuntimeQueryAdmission<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.admitted = state.admitted.saturating_sub(1);
+        if state.admitted == 0 {
+            self.gate.drained.notify_all();
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct ReadyClientLease {
     generation: u64,
     client: Arc<dyn EverythingRuntimeClient>,
+    gate: Arc<RuntimeQueryGate>,
 }
 
 impl ReadyClientLease {
+    #[cfg(test)]
     pub(crate) fn new(generation: u64, client: Arc<dyn EverythingRuntimeClient>) -> Self {
-        Self { generation, client }
+        Self::with_gate(generation, client, RuntimeQueryGate::open())
+    }
+
+    fn with_gate(
+        generation: u64,
+        client: Arc<dyn EverythingRuntimeClient>,
+        gate: Arc<RuntimeQueryGate>,
+    ) -> Self {
+        Self {
+            generation,
+            client,
+            gate,
+        }
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -247,6 +367,7 @@ impl ReadyClientLease {
         &self,
         spec: EverythingQuerySpec,
     ) -> Result<EverythingQueryResult, EverythingClientError> {
+        let _admission = self.gate.admit()?;
         self.client.query(spec)
     }
 }
@@ -472,6 +593,7 @@ struct RuntimeState {
     reason: Option<RuntimeUnavailableReason>,
     generation: u64,
     client: Option<Arc<dyn EverythingRuntimeClient>>,
+    query_gate: Option<Arc<RuntimeQueryGate>>,
     restart_requested: Option<u64>,
     shutdown: bool,
 }
@@ -517,6 +639,7 @@ impl EverythingRuntimeSupervisor {
                     reason: None,
                     generation: 0,
                     client: None,
+                    query_gate: None,
                     restart_requested: None,
                     shutdown: false,
                 }),
@@ -570,14 +693,23 @@ impl EverythingRuntimeSupervisor {
     }
 
     pub(crate) fn shutdown(&self) {
-        {
+        let (gate, client) = {
             let mut state = self.inner.state.lock().expect("runtime state poisoned");
             state.shutdown = true;
             state.status = EverythingRuntimeStatus::Stopping;
             state.reason = None;
-            state.client = None;
+            if let Some(gate) = state.query_gate.as_ref() {
+                gate.close();
+            }
             state.restart_requested = None;
             self.inner.changed.notify_all();
+            (state.query_gate.take(), state.client.take())
+        };
+        if let Some(gate) = gate {
+            gate.wait_drained();
+        }
+        if let Some(client) = client {
+            client.close();
         }
         if let Some(worker) = self
             .worker
@@ -690,7 +822,12 @@ impl ReadyClientProvider for EverythingRuntimeSupervisor {
             .as_ref()
             .cloned()
             .ok_or(EverythingRuntimeStatus::Unavailable)?;
-        Ok(ReadyClientLease::new(state.generation, client))
+        let gate = state
+            .query_gate
+            .as_ref()
+            .cloned()
+            .ok_or(EverythingRuntimeStatus::Unavailable)?;
+        Ok(ReadyClientLease::with_gate(state.generation, client, gate))
     }
 
     fn invalidate_if_current(&self, generation: u64) {
@@ -699,8 +836,12 @@ impl ReadyClientProvider for EverythingRuntimeSupervisor {
             && state.status == EverythingRuntimeStatus::Ready
             && state.generation == generation
         {
+            if let Some(gate) = state.query_gate.as_ref() {
+                gate.close();
+            }
             state.status = EverythingRuntimeStatus::Starting;
             state.client = None;
+            state.query_gate = None;
             state.restart_requested = Some(generation);
             self.inner.changed.notify_all();
         }
@@ -735,6 +876,7 @@ fn run_supervisor_worker(
             state.status = EverythingRuntimeStatus::Starting;
             state.reason = None;
             state.client = None;
+            state.query_gate = None;
             state.restart_requested = None;
             generation
         };
@@ -761,32 +903,37 @@ fn run_supervisor_worker(
                 return;
             }
         };
+        let query_gate = RuntimeQueryGate::open();
+        {
+            let mut state = inner.state.lock().expect("runtime state poisoned");
+            if !state.shutdown {
+                state.client = Some(Arc::clone(&runtime.client));
+                state.query_gate = Some(Arc::clone(&query_gate));
+            }
+        }
 
         match await_readiness(&inner, &mut runtime, deadline, poll_interval) {
             Ok(()) => {
                 let mut state = inner.state.lock().expect("runtime state poisoned");
                 if state.shutdown {
                     drop(state);
-                    runtime.process.shutdown();
+                    retire_runtime(&mut runtime, &query_gate);
                     return;
                 }
                 state.status = EverythingRuntimeStatus::Ready;
                 state.reason = None;
-                state.client = Some(Arc::clone(&runtime.client));
             }
             Err(reason) => {
-                runtime.process.shutdown();
+                retire_runtime(&mut runtime, &query_gate);
                 let mut state = inner.state.lock().expect("runtime state poisoned");
-                if state.shutdown {
-                    state.status = EverythingRuntimeStatus::Stopping;
-                } else {
-                    publish_unavailable(&mut state, reason);
-                }
+                publish_unavailable(&mut state, reason);
                 return;
             }
         }
 
-        match monitor_runtime(&inner, &mut runtime, generation, poll_interval) {
+        let outcome = monitor_runtime(&inner, &mut runtime, generation, poll_interval);
+        retire_runtime(&mut runtime, &query_gate);
+        match outcome {
             MonitorOutcome::Stop => return,
             MonitorOutcome::Terminal(reason) => {
                 let mut state = inner.state.lock().expect("runtime state poisoned");
@@ -812,6 +959,13 @@ fn run_supervisor_worker(
             }
         }
     }
+}
+
+fn retire_runtime(runtime: &mut StartedRuntime, query_gate: &RuntimeQueryGate) {
+    query_gate.close();
+    query_gate.wait_drained();
+    runtime.client.close();
+    runtime.process.shutdown();
 }
 
 fn await_readiness(
@@ -875,15 +1029,13 @@ fn monitor_runtime(
             if state.shutdown {
                 state.status = EverythingRuntimeStatus::Stopping;
                 state.client = None;
-                drop(state);
-                runtime.process.shutdown();
+                state.query_gate = None;
                 return MonitorOutcome::Stop;
             }
             if state.restart_requested == Some(generation) {
                 state.restart_requested = None;
                 state.client = None;
-                drop(state);
-                runtime.process.shutdown();
+                state.query_gate = None;
                 return MonitorOutcome::Restart;
             }
         }
@@ -891,14 +1043,38 @@ fn monitor_runtime(
             Ok(false) => {}
             Ok(true) => {
                 let mut state = inner.state.lock().expect("runtime state poisoned");
+                if state.shutdown {
+                    state.status = EverythingRuntimeStatus::Stopping;
+                    state.client = None;
+                    state.query_gate = None;
+                    return MonitorOutcome::Stop;
+                }
                 if state.generation == generation {
+                    if let Some(gate) = state.query_gate.as_ref() {
+                        gate.close();
+                    }
                     state.status = EverythingRuntimeStatus::Starting;
                     state.client = None;
+                    state.query_gate = None;
                 }
                 return MonitorOutcome::Restart;
             }
             Err(reason) => {
-                runtime.process.shutdown();
+                let mut state = inner.state.lock().expect("runtime state poisoned");
+                if state.shutdown {
+                    state.status = EverythingRuntimeStatus::Stopping;
+                    state.client = None;
+                    state.query_gate = None;
+                    return MonitorOutcome::Stop;
+                }
+                if state.generation == generation {
+                    if let Some(gate) = state.query_gate.as_ref() {
+                        gate.close();
+                    }
+                    state.status = EverythingRuntimeStatus::Starting;
+                    state.client = None;
+                    state.query_gate = None;
+                }
                 return MonitorOutcome::Terminal(reason);
             }
         }
@@ -911,9 +1087,18 @@ fn monitor_runtime(
 }
 
 fn publish_unavailable(state: &mut RuntimeState, reason: RuntimeUnavailableReason) {
+    if state.shutdown {
+        state.status = EverythingRuntimeStatus::Stopping;
+        state.reason = None;
+        state.client = None;
+        state.query_gate = None;
+        state.restart_requested = None;
+        return;
+    }
     state.status = EverythingRuntimeStatus::Unavailable;
     state.reason = Some(reason);
     state.client = None;
+    state.query_gate = None;
     state.restart_requested = None;
 }
 
@@ -924,6 +1109,7 @@ mod windows_runtime {
     use std::io::Read;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::ptr;
     use std::sync::{Arc, Mutex};
@@ -932,10 +1118,13 @@ mod windows_runtime {
     use sha2::{Digest, Sha256};
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, HWND, LPARAM, WAIT_EVENT,
-        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+        CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, HWND, LPARAM,
+        WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
     };
-    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
     use windows::Win32::Security::Cryptography::{
         CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertStrToNameW,
         CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_FIND_SUBJECT_CERT,
@@ -949,10 +1138,16 @@ mod windows_runtime {
         WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_IGNORE, WTD_UI_NONE,
     };
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenElevation, TokenUser, DACL_SECURITY_INFORMATION,
+        GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+        CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, GetFileVersionInfoSizeW,
+        GetFileVersionInfoW, VerQueryValueW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
+        READ_CONTROL, VS_FIXEDFILEINFO,
     };
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -979,7 +1174,6 @@ mod windows_runtime {
     use crate::file_search::windows::everything_process::{self, EverythingProcess};
 
     const RUNTIME_MUTEX_NAME: &str = r"Local\UiPilotEverythingRuntime";
-    const PRIVATE_WINDOW_CLASS: &str = "EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)";
     const MANAGED_RELATIVE_ROOT: &str = r"UiPilot_tools\everything";
     const RUNTIME_MANIFEST_NAME: &str = "managed-runtime.json";
     const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -1083,16 +1277,34 @@ mod windows_runtime {
             {
                 return Err(RuntimeUnavailableReason::InvalidManifest);
             }
-            let expected = managed_root
-                .join(&manifest.version)
-                .join(EXECUTABLE_FILE_NAME);
-            let binary = canonical_regular_file(&manifest.service_binary_path, &managed_root)
+            let version_path = manifest
+                .service_binary_path
+                .parent()
+                .ok_or(RuntimeUnavailableReason::InvalidManifest)?;
+            let version_metadata = fs::symlink_metadata(version_path)
                 .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let expected = fs::canonicalize(expected)
+            let binary_metadata = fs::symlink_metadata(&manifest.service_binary_path)
                 .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            if binary != expected {
+            let version_directory = fs::canonicalize(version_path)
+                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
+            let binary = fs::canonicalize(&manifest.service_binary_path)
+                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
+            if !version_metadata.is_dir()
+                || !binary_metadata.is_file()
+                || !validate_manifest_binary_layout(
+                    &managed_root,
+                    &manifest.version,
+                    &version_directory,
+                    &binary,
+                    version_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
+                    binary_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
+                )
+            {
                 return Err(RuntimeUnavailableReason::InvalidManifest);
             }
+            let _version_handle = open_protected_managed_object(version_path, true)?;
+            let _binary_handle =
+                open_protected_managed_object(&manifest.service_binary_path, false)?;
             verify_binary_identity(
                 &binary,
                 &manifest.sha256,
@@ -1550,8 +1762,97 @@ mod windows_runtime {
             .ok_or(RuntimeUnavailableReason::ProcessLaunchFailed)
     }
 
+    fn open_protected_managed_object(
+        path: &Path,
+        expected_directory: bool,
+    ) -> Result<OwnedHandle, RuntimeUnavailableReason> {
+        let path = wide(path.as_os_str());
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                (FILE_READ_ATTRIBUTES | READ_CONTROL).0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
+        let handle = OwnedHandle(handle);
+        let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle.0,
+                FileAttributeTagInfo,
+                ptr::from_mut(&mut attributes).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        }
+        .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
+        let is_directory = attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || is_directory != expected_directory
+            || !managed_descriptor_is_exact(&security_descriptor_sddl(handle.0)?)
+        {
+            return Err(RuntimeUnavailableReason::InvalidManifest);
+        }
+        Ok(handle)
+    }
+
+    fn security_descriptor_sddl(handle: HANDLE) -> Result<String, RuntimeUnavailableReason> {
+        let information =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                information,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            )
+        };
+        if status.0 != 0 || descriptor.0.is_null() {
+            return Err(RuntimeUnavailableReason::InvalidManifest);
+        }
+        let mut sddl = PWSTR::null();
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                information,
+                &mut sddl,
+                None,
+            )
+        };
+        let result = converted
+            .map_err(|_| RuntimeUnavailableReason::InvalidManifest)
+            .and_then(|()| {
+                if sddl.is_null() {
+                    return Err(RuntimeUnavailableReason::InvalidManifest);
+                }
+                let mut length = 0usize;
+                while unsafe { *sddl.0.add(length) } != 0 {
+                    length += 1;
+                }
+                String::from_utf16(unsafe { std::slice::from_raw_parts(sddl.0, length) })
+                    .map_err(|_| RuntimeUnavailableReason::InvalidManifest)
+            });
+        unsafe {
+            if !sddl.is_null() {
+                LocalFree(Some(HLOCAL(sddl.0.cast())));
+            }
+            LocalFree(Some(HLOCAL(descriptor.0)));
+        }
+        result
+    }
+
     fn private_window() -> Result<Option<(HWND, u32)>, RuntimeUnavailableReason> {
-        let class = wide(OsStr::new(PRIVATE_WINDOW_CLASS));
+        let class = wide(OsStr::new(PRIVATE_EVERYTHING_WINDOW_CLASS));
         let window = match unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) } {
             Ok(window) => window,
             Err(_) => return Ok(None),
@@ -1749,19 +2050,20 @@ mod windows_runtime {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
     use everything_ipc::client::EverythingClientError;
     use everything_ipc::protocol::{EverythingQueryResult, EverythingQuerySpec, EverythingSort};
 
     use super::{
-        build_runtime_launch, managed_ini_bytes, parse_reviewed_lock, parse_runtime_manifest,
-        start_runtime_with, EverythingRuntimeClient, EverythingRuntimeStatus,
-        EverythingRuntimeSupervisor, OwnedRuntimeProcess, ReadyClientProvider, RuntimeBackend,
-        RuntimeLaunch, RuntimeResourcePaths, RuntimeSystem, RuntimeUnavailableReason,
-        StartedRuntime, ValidatedManifest, VerifiedResources, INSTANCE_NAME, PIPE_NAME,
-        REVIEWED_LOCK_BYTES, SERVICE_NAME,
+        build_runtime_launch, managed_descriptor_is_exact, managed_ini_bytes, parse_reviewed_lock,
+        parse_runtime_manifest, start_runtime_with, validate_manifest_binary_layout,
+        EverythingRuntimeClient, EverythingRuntimeStatus, EverythingRuntimeSupervisor,
+        OwnedRuntimeProcess, ReadyClientProvider, RuntimeBackend, RuntimeLaunch,
+        RuntimeResourcePaths, RuntimeSystem, RuntimeUnavailableReason, StartedRuntime,
+        ValidatedManifest, VerifiedResources, INSTANCE_NAME, PIPE_NAME, REVIEWED_LOCK_BYTES,
+        SERVICE_NAME,
     };
 
     const WAIT_LIMIT: Duration = Duration::from_secs(2);
@@ -1801,6 +2103,8 @@ mod tests {
             assert_eq!(spec.sort, EverythingSort::DateModifiedDescending);
             Ok(self.result.clone())
         }
+
+        fn close(&self) {}
     }
 
     #[derive(Default)]
@@ -1827,10 +2131,122 @@ mod tests {
         }
     }
 
+    struct BarrierClient {
+        block_at_query: usize,
+        query_count: AtomicUsize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        closed: AtomicBool,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BarrierClient {
+        fn new(
+            block_at_query: usize,
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+            events: Arc<Mutex<Vec<String>>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                block_at_query,
+                query_count: AtomicUsize::new(0),
+                entered,
+                release,
+                closed: AtomicBool::new(false),
+                events,
+            })
+        }
+
+        fn result() -> EverythingQueryResult {
+            EverythingQueryResult {
+                total: 0,
+                request_flags: 0x155,
+                sort_type: 14,
+                items: Vec::new(),
+            }
+        }
+    }
+
+    impl EverythingRuntimeClient for BarrierClient {
+        fn database_loaded(&self, _timeout: Duration) -> Result<bool, EverythingClientError> {
+            if self.closed.load(Ordering::Acquire) {
+                Err(EverythingClientError::ClientClosed)
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn query(
+            &self,
+            _spec: EverythingQuerySpec,
+        ) -> Result<EverythingQueryResult, EverythingClientError> {
+            let query = self.query_count.fetch_add(1, Ordering::AcqRel);
+            if query == self.block_at_query {
+                self.entered.wait();
+                self.release.wait();
+            }
+            if self.closed.load(Ordering::Acquire) {
+                Err(EverythingClientError::ClientClosed)
+            } else {
+                Ok(Self::result())
+            }
+        }
+
+        fn close(&self) {
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                self.events.lock().unwrap().push("client-close".into());
+            }
+        }
+    }
+
+    struct EventProcess {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl OwnedRuntimeProcess for EventProcess {
+        fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
+            Ok(false)
+        }
+
+        fn shutdown(&mut self) {
+            self.events.lock().unwrap().push("process-shutdown".into());
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BarrierPollOutcome {
+        Exited,
+        Terminal,
+    }
+
+    struct BarrierPollProcess {
+        poll_count: usize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        outcome: BarrierPollOutcome,
+    }
+
+    impl OwnedRuntimeProcess for BarrierPollProcess {
+        fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
+            self.poll_count += 1;
+            if self.poll_count <= 2 {
+                return Ok(false);
+            }
+            self.entered.wait();
+            self.release.wait();
+            match self.outcome {
+                BarrierPollOutcome::Exited => Ok(true),
+                BarrierPollOutcome::Terminal => Err(RuntimeUnavailableReason::ProcessWaitFailed),
+            }
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
     enum StartPlan {
         Ready {
             client: Arc<dyn EverythingRuntimeClient>,
-            process: Arc<ProcessControl>,
+            process: Box<dyn OwnedRuntimeProcess>,
         },
         Fail(RuntimeUnavailableReason),
     }
@@ -1882,9 +2298,7 @@ mod tests {
                 .pop_front()
                 .expect("missing start plan")
             {
-                StartPlan::Ready { client, process } => {
-                    Ok(StartedRuntime::new(client, Box::new(FakeProcess(process))))
-                }
+                StartPlan::Ready { client, process } => Ok(StartedRuntime::new(client, process)),
                 StartPlan::Fail(reason) => Err(reason),
             }
         }
@@ -1895,7 +2309,7 @@ mod tests {
         (
             StartPlan::Ready {
                 client: FakeClient::ready(total),
-                process: Arc::clone(&process),
+                process: Box::new(FakeProcess(Arc::clone(&process))),
             },
             process,
         )
@@ -1915,6 +2329,17 @@ mod tests {
         while !condition() {
             assert!(Instant::now() < deadline, "condition timed out");
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn probe_spec() -> EverythingQuerySpec {
+        EverythingQuerySpec {
+            search: Vec::new(),
+            offset: 0,
+            max_results: 1,
+            request_flags: 0x155,
+            sort: EverythingSort::DateModifiedDescending,
+            deadline: Instant::now() + Duration::from_secs(1),
         }
     }
 
@@ -1952,7 +2377,10 @@ mod tests {
                 items: Vec::new(),
             },
         });
-        let backend = FakeBackend::new(vec![StartPlan::Ready { client, process }]);
+        let backend = FakeBackend::new(vec![StartPlan::Ready {
+            client,
+            process: Box::new(FakeProcess(process)),
+        }]);
         let runtime = supervisor(Arc::clone(&backend) as Arc<dyn RuntimeBackend>);
 
         runtime.start_async();
@@ -2027,10 +2455,19 @@ mod tests {
 
         first_process.exit();
         wait_until(|| runtime.ready_client().map(|lease| lease.generation()).ok() == Some(2));
+        assert!(matches!(
+            first.query(probe_spec()),
+            Err(EverythingClientError::ClientClosed)
+        ));
         runtime.invalidate_if_current(first.generation());
-        assert_eq!(runtime.ready_client().unwrap().generation(), 2);
+        let second = runtime.ready_client().unwrap();
+        assert_eq!(second.generation(), 2);
 
         runtime.invalidate_if_current(2);
+        assert!(matches!(
+            second.query(probe_spec()),
+            Err(EverythingClientError::ClientClosed)
+        ));
         assert!(matches!(
             runtime.ready_client(),
             Err(EverythingRuntimeStatus::Starting)
@@ -2045,6 +2482,7 @@ mod tests {
         let runtime = supervisor(FakeBackend::new(vec![plan]) as Arc<dyn RuntimeBackend>);
         runtime.start_async();
         wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Ready);
+        let retained_lease = runtime.ready_client().unwrap();
 
         runtime.shutdown();
         assert_eq!(runtime.snapshot().status, EverythingRuntimeStatus::Stopping);
@@ -2052,8 +2490,162 @@ mod tests {
             runtime.ready_client(),
             Err(EverythingRuntimeStatus::Stopping)
         ));
+        assert!(matches!(
+            retained_lease.query(probe_spec()),
+            Err(EverythingClientError::ClientClosed)
+        ));
         runtime.shutdown();
         assert_eq!(process.shutdowns.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn shutdown_drains_an_admitted_query_then_closes_ipc_before_the_process() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let client = BarrierClient::new(
+            1,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&events),
+        );
+        let runtime = Arc::new(supervisor(FakeBackend::new(vec![StartPlan::Ready {
+            client: client as Arc<dyn EverythingRuntimeClient>,
+            process: Box::new(EventProcess {
+                events: Arc::clone(&events),
+            }),
+        }]) as Arc<dyn RuntimeBackend>));
+        runtime.start_async();
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Ready);
+        let lease = runtime.ready_client().unwrap();
+        let retained = lease.clone();
+        let query = std::thread::spawn(move || lease.query(probe_spec()));
+        entered.wait();
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let shutdown_runtime = Arc::clone(&runtime);
+        let shutdown_stopped = Arc::clone(&stopped);
+        let shutdown = std::thread::spawn(move || {
+            shutdown_runtime.shutdown();
+            shutdown_stopped.store(true, Ordering::Release);
+        });
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Stopping);
+        assert!(!stopped.load(Ordering::Acquire));
+        assert!(events.lock().unwrap().is_empty());
+        assert!(matches!(
+            retained.query(probe_spec()),
+            Err(EverythingClientError::ClientClosed)
+        ));
+
+        release.wait();
+        assert!(query.join().unwrap().is_ok());
+        shutdown.join().unwrap();
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["client-close", "process-shutdown"]
+        );
+    }
+
+    #[test]
+    fn shutdown_wins_a_capability_probe_ready_publication_race() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let client = BarrierClient::new(
+            0,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&events),
+        );
+        let runtime = Arc::new(supervisor(FakeBackend::new(vec![StartPlan::Ready {
+            client: client as Arc<dyn EverythingRuntimeClient>,
+            process: Box::new(EventProcess {
+                events: Arc::clone(&events),
+            }),
+        }]) as Arc<dyn RuntimeBackend>));
+        runtime.start_async();
+        entered.wait();
+
+        let shutdown_runtime = Arc::clone(&runtime);
+        let shutdown = std::thread::spawn(move || shutdown_runtime.shutdown());
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Stopping);
+        release.wait();
+        shutdown.join().unwrap();
+
+        assert_eq!(runtime.snapshot().status, EverythingRuntimeStatus::Stopping);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["client-close", "process-shutdown"]
+        );
+    }
+
+    #[test]
+    fn shutdown_wins_a_terminal_monitor_poll_race() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let runtime = Arc::new(supervisor(FakeBackend::new(vec![StartPlan::Ready {
+            client: FakeClient::ready(1),
+            process: Box::new(BarrierPollProcess {
+                poll_count: 0,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                outcome: BarrierPollOutcome::Terminal,
+            }),
+        }]) as Arc<dyn RuntimeBackend>));
+        runtime.start_async();
+        entered.wait();
+
+        let shutdown_runtime = Arc::clone(&runtime);
+        let shutdown = std::thread::spawn(move || shutdown_runtime.shutdown());
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Stopping);
+        release.wait();
+        shutdown.join().unwrap();
+
+        assert_eq!(runtime.snapshot().status, EverythingRuntimeStatus::Stopping);
+        assert_eq!(runtime.snapshot().reason, None);
+    }
+
+    #[test]
+    fn shutdown_wins_the_retries_exhausted_publication_race() {
+        let mut plans = Vec::new();
+        let mut processes = Vec::new();
+        for _ in 0..3 {
+            let (plan, process) = ready_plan(1);
+            plans.push(plan);
+            processes.push(process);
+        }
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        plans.push(StartPlan::Ready {
+            client: FakeClient::ready(1),
+            process: Box::new(BarrierPollProcess {
+                poll_count: 0,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                outcome: BarrierPollOutcome::Exited,
+            }),
+        });
+        let runtime = Arc::new(supervisor(
+            FakeBackend::new(plans) as Arc<dyn RuntimeBackend>
+        ));
+        runtime.start_async();
+        for (index, process) in processes.iter().enumerate() {
+            wait_until(|| {
+                runtime.ready_client().map(|lease| lease.generation()).ok()
+                    == Some((index + 1) as u64)
+            });
+            process.exit();
+        }
+        entered.wait();
+
+        let shutdown_runtime = Arc::clone(&runtime);
+        let shutdown = std::thread::spawn(move || shutdown_runtime.shutdown());
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Stopping);
+        release.wait();
+        shutdown.join().unwrap();
+
+        assert_eq!(runtime.snapshot().status, EverythingRuntimeStatus::Stopping);
+        assert_eq!(runtime.snapshot().reason, None);
     }
 
     struct PipelineGuard(Arc<Mutex<Vec<String>>>);
@@ -2345,6 +2937,66 @@ mod tests {
             .unwrap()
             .replace("1.4.1.1032", "01.4.1.1032");
         assert!(parse_reviewed_lock(noncanonical_lock.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn manifest_binary_layout_requires_a_direct_non_reparse_version_child() {
+        let root = std::path::Path::new(r"C:\ProgramData\UiPilot_tools\everything");
+        let version = root.join("1.4.1.1032");
+        let binary = version.join("Everything.exe");
+        assert!(validate_manifest_binary_layout(
+            root,
+            "1.4.1.1032",
+            &version,
+            &binary,
+            false,
+            false,
+        ));
+        assert!(!validate_manifest_binary_layout(
+            root,
+            "1.4.1.1032",
+            root,
+            &root.join("Everything.exe"),
+            false,
+            false,
+        ));
+        assert!(!validate_manifest_binary_layout(
+            root,
+            "1.4.1.1032",
+            &root.join("1.4.1.1031"),
+            &root.join(r"1.4.1.1031\Everything.exe"),
+            false,
+            false,
+        ));
+        assert!(!validate_manifest_binary_layout(
+            root,
+            "1.4.1.1032",
+            &version,
+            &binary,
+            true,
+            false,
+        ));
+        assert!(!validate_manifest_binary_layout(
+            root,
+            "1.4.1.1032",
+            &version,
+            &binary,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn managed_runtime_objects_require_the_exact_protected_descriptor() {
+        assert!(managed_descriptor_is_exact(
+            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+        ));
+        assert!(!managed_descriptor_is_exact(
+            "O:BAG:BAD:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+        ));
+        assert!(!managed_descriptor_is_exact(
+            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GR;;;BU)"
+        ));
     }
 
     #[cfg(windows)]

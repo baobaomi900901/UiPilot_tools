@@ -190,16 +190,21 @@ mod imp {
                 .recv()
                 .unwrap_or(Err(EverythingClientError::ClientClosed))
         }
+
+        pub fn close(&self) {
+            self.closed.store(true, Ordering::Release);
+            let _ = self.shutdown_tx.try_send(());
+            let _ = window::wake_worker(self.reply_hwnd_bits);
+            let mut worker = self.worker.lock().expect("worker mutex poisoned");
+            if let Some(join) = worker.take() {
+                let _ = join.join();
+            }
+        }
     }
 
     impl Drop for EverythingClient {
         fn drop(&mut self) {
-            self.closed.store(true, Ordering::Release);
-            let _ = self.shutdown_tx.try_send(());
-            let _ = window::wake_worker(self.reply_hwnd_bits);
-            if let Some(join) = self.worker.lock().expect("worker mutex poisoned").take() {
-                let _ = join.join();
-            }
+            self.close();
         }
     }
 
@@ -293,6 +298,8 @@ impl EverythingClient {
     pub fn database_loaded(&self, _timeout: Duration) -> Result<bool, EverythingClientError> {
         Err(EverythingClientError::IpcUnavailable)
     }
+
+    pub fn close(&self) {}
 
     pub fn query(
         &self,

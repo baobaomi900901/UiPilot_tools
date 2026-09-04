@@ -214,6 +214,8 @@ mod platform {
         SMTO_ERRORONEXIT, WM_USER,
     };
 
+    use crate::file_search::everything_runtime::PRIVATE_EVERYTHING_WINDOW_CLASS;
+
     use super::*;
 
     pub(crate) struct WindowsProcessApi;
@@ -345,7 +347,7 @@ mod platform {
         }
 
         fn request_graceful_exit(&mut self, pid: u32) {
-            let class = wide(OsStr::new("EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)"));
+            let class = wide(OsStr::new(PRIVATE_EVERYTHING_WINDOW_CLASS));
             let Ok(window) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) })
             else {
                 return;
@@ -714,5 +716,20 @@ mod tests {
         assert!(production.contains("PROC_THREAD_ATTRIBUTE_JOB_LIST"));
         assert!(production.contains("CREATE_SUSPENDED"));
         assert!(production.contains("EXTENDED_STARTUPINFO_PRESENT"));
+    }
+
+    #[test]
+    fn private_window_class_identity_is_defined_once_by_the_runtime() {
+        let process = include_str!("everything_process.rs").replace("\r\n", "\n");
+        let production = process.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let runtime = include_str!("../everything_runtime.rs").replace("\r\n", "\n");
+        assert!(production.contains("PRIVATE_EVERYTHING_WINDOW_CLASS"));
+        assert!(!production.contains("EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)"));
+        assert_eq!(
+            runtime
+                .matches("EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)")
+                .count(),
+            1
+        );
     }
 }

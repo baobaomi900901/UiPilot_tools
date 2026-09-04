@@ -352,6 +352,8 @@ mod tests {
             self.queries.fetch_add(1, Ordering::AcqRel);
             self.result.lock().unwrap().clone()
         }
+
+        fn close(&self) {}
     }
 
     struct TestProvider {
