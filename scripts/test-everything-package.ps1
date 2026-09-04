@@ -1,11 +1,57 @@
 param(
-    [switch]$SelfTestZipEntrySelection
+    [switch]$SelfTestZipEntrySelection,
+    [switch]$ResourceOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+if (-not ('UiPilot.NativeAuthenticode' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace UiPilot {
+  public static class NativeAuthenticode {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    private struct WINTRUST_FILE_INFO {
+      public uint cbStruct; public IntPtr pcwszFilePath; public IntPtr hFile; public IntPtr pgKnownSubject;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WINTRUST_DATA {
+      public uint cbStruct; public IntPtr pPolicyCallbackData; public IntPtr pSIPClientData;
+      public uint dwUIChoice; public uint fdwRevocationChecks; public uint dwUnionChoice;
+      public IntPtr pFile; public uint dwStateAction; public IntPtr hWVTStateData;
+      public IntPtr pwszURLReference; public uint dwProvFlags; public uint dwUIContext;
+    }
+    [DllImport("wintrust", ExactSpelling=true, PreserveSig=true)]
+    private static extern int WinVerifyTrust(IntPtr hwnd, [In] ref Guid action, [In] ref WINTRUST_DATA data);
+    public static int Verify(string path) {
+      IntPtr pathPointer = Marshal.StringToCoTaskMemUni(path);
+      IntPtr filePointer = IntPtr.Zero;
+      try {
+        WINTRUST_FILE_INFO file = new WINTRUST_FILE_INFO {
+          cbStruct = (uint)Marshal.SizeOf(typeof(WINTRUST_FILE_INFO)), pcwszFilePath = pathPointer,
+          hFile = IntPtr.Zero, pgKnownSubject = IntPtr.Zero
+        };
+        filePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WINTRUST_FILE_INFO)));
+        Marshal.StructureToPtr(file, filePointer, false);
+        WINTRUST_DATA data = new WINTRUST_DATA {
+          cbStruct = (uint)Marshal.SizeOf(typeof(WINTRUST_DATA)), dwUIChoice = 2,
+          fdwRevocationChecks = 1, dwUnionChoice = 1, pFile = filePointer, dwProvFlags = 0x80
+        };
+        Guid action = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+        return WinVerifyTrust(new IntPtr(-1), ref action, ref data);
+      } finally {
+        if (filePointer != IntPtr.Zero) Marshal.FreeHGlobal(filePointer);
+        Marshal.FreeCoTaskMem(pathPointer);
+      }
+    }
+  }
+}
+'@
+}
 
 $expectedLockProperties = @(
     'architecture'
@@ -62,7 +108,15 @@ function Get-LowerSha256 {
         [string]$LiteralPath
     )
 
-    return (Get-FileHash -LiteralPath $LiteralPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return (($sha256.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '')
+        }
+        finally { $sha256.Dispose() }
+    }
+    finally { $stream.Dispose() }
 }
 
 function Assert-LowerSha256 {
@@ -93,6 +147,24 @@ function Assert-ExactProperties {
     if ($difference.Count -ne 0) {
         $details = $difference | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" }
         throw "everything.lock.json properties differ from the exact schema: $($details -join ', ')"
+    }
+}
+
+function Get-NativeAuthenticodeSignature([string]$LiteralPath) {
+    $status = [UiPilot.NativeAuthenticode]::Verify($LiteralPath)
+    $certificate = $null
+    try {
+        $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($LiteralPath)
+        )
+        return [pscustomobject]@{
+            Status = if ($status -eq 0) { 'Valid' } else { "WinVerifyTrust:$status" }
+            SignerCertificate = $certificate
+        }
+    }
+    catch {
+        if ($null -ne $certificate) { $certificate.Dispose() }
+        return [pscustomobject]@{ Status = "WinVerifyTrust:$status"; SignerCertificate = $null }
     }
 }
 
@@ -224,6 +296,28 @@ try {
     $resourceLicensePath = Join-Path $resourceRoot 'LICENSE.txt'
     $resourceExecutablePath = Join-Path $resourceRoot 'Everything.exe'
 
+    if ($ResourceOnly) {
+        Assert-RequiredFile $resourceLockPath 'Resource lock copy'
+        Assert-RequiredFile $resourceLicensePath 'Resource License copy'
+        Assert-RequiredFile $resourceExecutablePath 'Resource Everything.exe copy'
+        $lock = Get-Content -LiteralPath $resourceLockPath -Raw -Encoding utf8 | ConvertFrom-Json
+        Assert-Condition ($null -ne $lock -and $lock -is [psobject]) 'everything.lock.json must contain one JSON object'
+        Assert-ExactProperties $lock $expectedLockProperties
+        Assert-Condition ([long]$lock.schemaVersion -eq 1) 'schemaVersion must be exactly 1'
+        Assert-Condition ([string]$lock.version -ceq $expectedVersion) "version must be exactly $expectedVersion"
+        Assert-Condition ([string]$lock.architecture -ceq $expectedArchitecture) "architecture must be exactly $expectedArchitecture"
+        Assert-LowerSha256 ([string]$lock.everythingExeSha256) 'everythingExeSha256'
+        Assert-LowerSha256 ([string]$lock.licenseSha256) 'licenseSha256'
+        Assert-Condition ((Get-LowerSha256 $resourceExecutablePath) -ceq [string]$lock.everythingExeSha256) 'Resource Everything.exe does not match the reviewed lock'
+        Assert-Condition ((Get-LowerSha256 $resourceLicensePath) -ceq [string]$lock.licenseSha256) 'Resource License does not match the reviewed lock'
+        $resourceSignature = Get-NativeAuthenticodeSignature $resourceExecutablePath
+        Assert-Condition ([string]$resourceSignature.Status -ceq 'Valid') "Resource Everything.exe Authenticode status must be Valid, got $($resourceSignature.Status)"
+        Assert-Condition ($null -ne $resourceSignature.SignerCertificate) 'Resource Everything.exe must have a signer certificate'
+        Assert-Condition ([string]$resourceSignature.SignerCertificate.Subject -ceq [string]$lock.authenticodePublisher) 'Resource Everything.exe Authenticode publisher does not match the reviewed lock'
+        Write-Output 'EVERYTHING_RESOURCE_PACKAGE_PASS'
+        exit 0
+    }
+
     Assert-RequiredFile $lockPath 'Reviewed lock'
     Assert-RequiredFile $licensePath 'Reviewed License'
     Assert-RequiredFile $artifactPath 'Reviewed artifact'
@@ -268,12 +362,12 @@ try {
     Assert-Condition ((Get-LowerSha256 $resourceLicensePath) -ceq [string]$lock.licenseSha256) 'Resource License does not match the reviewed lock'
     Assert-Condition ((Get-LowerSha256 $resourceLockPath) -ceq (Get-LowerSha256 $lockPath)) 'Resource lock is not an exact copy of the reviewed lock'
 
-    $signature = Get-AuthenticodeSignature -LiteralPath $stagedExecutablePath
+    $signature = Get-NativeAuthenticodeSignature $stagedExecutablePath
     Assert-Condition ([string]$signature.Status -ceq 'Valid') "Everything.exe Authenticode status must be Valid, got $($signature.Status)"
     Assert-Condition ($null -ne $signature.SignerCertificate) 'Everything.exe must have a signer certificate'
     Assert-Condition ([string]$signature.SignerCertificate.Subject -ceq $publisher) 'Everything.exe Authenticode publisher does not match the reviewed lock'
 
-    $resourceSignature = Get-AuthenticodeSignature -LiteralPath $resourceExecutablePath
+    $resourceSignature = Get-NativeAuthenticodeSignature $resourceExecutablePath
     Assert-Condition ([string]$resourceSignature.Status -ceq 'Valid') "Resource Everything.exe Authenticode status must be Valid, got $($resourceSignature.Status)"
     Assert-Condition ($null -ne $resourceSignature.SignerCertificate) 'Resource Everything.exe must have a signer certificate'
     Assert-Condition ([string]$resourceSignature.SignerCertificate.Subject -ceq $publisher) 'Resource Everything.exe Authenticode publisher does not match the reviewed lock'

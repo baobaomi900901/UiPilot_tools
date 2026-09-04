@@ -1,8 +1,29 @@
 fn main() {
+    let helper_build = std::env::var_os("CARGO_FEATURE_INSTALLER_HELPER_BUILD").is_some();
     #[cfg(target_os = "windows")]
-    println!(
-        "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
-    );
+    {
+        if helper_build {
+            let manifest = std::path::Path::new("windows/uipilot-everything-installer.manifest")
+                .canonicalize()
+                .expect("installer Helper manifest must exist");
+            println!("cargo:rerun-if-changed={}", manifest.display());
+            println!(
+                "cargo:rustc-link-arg-bin=uipilot-everything-installer=/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+            );
+            println!(
+                "cargo:rustc-link-arg-bin=uipilot-everything-installer=/MANIFESTINPUT:{}",
+                manifest.display()
+            );
+            println!("cargo:rustc-link-arg-bin=uipilot-everything-installer=/MANIFEST:EMBED");
+        } else {
+            println!(
+                "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+            );
+        }
+    }
+    if helper_build {
+        return;
+    }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "open_find_window",

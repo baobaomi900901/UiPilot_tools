@@ -1,0 +1,18 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "UiPilot_tools VM Instrumented Setup",
+  "identifier": "com.uipilot.launcher.vm-instrumented",
+  "build": {
+    "beforeBuildCommand": "npm run build"
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "windows/nsis-hooks.nsh",
+        "template": "windows/installer.nsi"
+      }
+    }
+  }
+}
