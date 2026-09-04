@@ -1197,7 +1197,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               />
             ) : null}
           </span>
-          {item.subtitle ? <span className="result-subtitle">{item.subtitle}</span> : null}
+          {item.subtitle ? <span className="result-subtitle" title={item.subtitle}>{item.subtitle}</span> : null}
           {item.detail ? <span className="result-detail">{item.detail}</span> : null}
         </span>
       </div>

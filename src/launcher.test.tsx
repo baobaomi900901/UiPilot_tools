@@ -6700,13 +6700,13 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
-    const longSubtitle = `${'1234567890'.repeat(28)} mm · 长度换算`
-    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === '1000 mm to in'
+    const longSubtitle = '1 gal · 体积换算 · 默认采用美制（US）。若需英制容量（加仑/夸脱/品脱/盎司），请在单位前加 imp，例如 100 imp gal to L。'
+    vi.mocked(fake.client.searchApps).mockImplementation(async (request) => request.query === '1 gal to L'
       ? {
           requestId: 'unit-copy-request',
           items: [{
             resultId: 'opaque-unit-copy-id',
-            title: '39.3701 in',
+            title: '3.78541 L',
             subtitle: longSubtitle,
             iconKind: 'unit',
             activation: executeActivation,
@@ -6723,7 +6723,7 @@ describe('React view and accessibility', () => {
     await act(async () => core.text({
       kind: 'ordinaryInput',
       control: core.getSnapshot().queryControl,
-      value: '1000 mm to in',
+      value: '1 gal to L',
       inputType: 'insertText',
     }))
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
@@ -6733,10 +6733,14 @@ describe('React view and accessibility', () => {
     expect(option.getAttribute('aria-selected')).toBe('true')
     expect(input.getAttribute('aria-activedescendant')).toBe(option.id)
     expect(option.querySelector('.result-subtitle')?.textContent).toBe(longSubtitle)
+    expect(option.querySelector('.result-subtitle')?.getAttribute('title')).toBe(longSubtitle)
+    expect(stylesSource).toMatch(
+      /\.launcher-view \.result-subtitle\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
+    )
     expect(option.querySelector('.result-favorite-star')).toBeNull()
     expect(core.getSnapshot().results[0]?.favorite).toBeUndefined()
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
-      `1 个结果。39.3701 in，${longSubtitle}`,
+      `1 个结果。3.78541 L，${longSubtitle}`,
     )
 
     const contextEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })

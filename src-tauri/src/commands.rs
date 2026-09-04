@@ -8105,6 +8105,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn currency_malformed_complete_codes_publish_exclusive_information_without_resolving() {
+        for (sequence, query) in [
+            (1, "100 USD to CNYY"),
+            (2, "100 CNYY to USD"),
+            (3, "100 USD to CN1"),
+            (4, "100 CN1 to USD"),
+        ] {
+            let invocation_id = format!("malformed-currency-{sequence}");
+            let registry = ready_registry(&invocation_id);
+            let favorites = BTreeSet::new();
+            let response = search_apps_with_catalog_and_currency(
+                &registry,
+                CatalogSearchRequest {
+                    query,
+                    invocation_id: &invocation_id,
+                    query_sequence: sequence,
+                    submit: false,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &favorites,
+                    quicklinks: &[],
+                },
+                |_| panic!("owned malformed currency must not read plugins"),
+                || panic!("owned malformed currency must not read the app cache"),
+                |_| panic!("owned malformed currency must not decorate applications"),
+                || panic!("owned malformed currency must not read the local date"),
+                || panic!("owned malformed currency must not read the UTC clock"),
+                |_| async { panic!("owned malformed currency must not call the resolver") },
+            )
+            .await
+            .unwrap();
+
+            assert!(response.replace_local_results, "query={query}");
+            assert_eq!(response.items.len(), 1, "query={query}");
+            let item = &response.items[0];
+            assert_eq!(item.title, "不支持的货币代码", "query={query}");
+            assert_eq!(
+                item.subtitle.as_deref(),
+                Some("请检查三字母 ISO 4217 代码"),
+                "query={query}"
+            );
+            assert_eq!(
+                item.activation,
+                crate::model::LauncherResultActivation::Informational,
+                "query={query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn currency_words_and_symbols_continue_the_application_route() {
+        for (sequence, query) in [
+            (1, "100 USD to yuan"),
+            (2, "100 dollars to CNY"),
+            (3, "$100 USD to CNY"),
+            (4, "¥100 JPY to USD"),
+        ] {
+            let invocation_id = format!("currency-fallthrough-{sequence}");
+            let registry = ready_registry(&invocation_id);
+            let favorites = BTreeSet::new();
+            let mut matching_application = application(sequence as usize);
+            matching_application.display_name = query.into();
+            let response = search_apps_with_catalog_and_currency(
+                &registry,
+                CatalogSearchRequest {
+                    query,
+                    invocation_id: &invocation_id,
+                    query_sequence: sequence,
+                    submit: false,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &favorites,
+                    quicklinks: &[],
+                },
+                |_| Ok(Vec::new()),
+                || vec![matching_application],
+                |_| {},
+                || panic!("currency fallthrough must not become date arithmetic"),
+                || panic!("currency fallthrough must not become time-zone evaluation"),
+                |_| async { panic!("currency fallthrough must not call the resolver") },
+            )
+            .await
+            .unwrap();
+
+            assert!(!response.replace_local_results, "query={query}");
+            assert!(
+                response.items.iter().any(|item| item.title == query),
+                "query={query}"
+            );
+            assert!(
+                response.items.iter().any(|item| item.title == "Bing 搜索"),
+                "query={query}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn currency_query_begins_owner_before_await_and_discards_a_late_response() {
         let registry = ready_registry("late-currency");
         let favorites = BTreeSet::new();
@@ -8297,6 +8392,44 @@ mod tests {
             Ok(ResultAction::CopyBuiltInText {
                 text: "39.3701 in".into()
             })
+        );
+    }
+
+    #[test]
+    fn unit_us_volume_explanation_is_visible_on_the_command_wire_without_changing_copy() {
+        const EXPLANATION: &str =
+            "默认采用美制（US）。若需英制容量（加仑/夸脱/品脱/盎司），请在单位前加 imp，例如 100 imp gal to L。";
+        let registry = ResultRegistry::default();
+        registry.on_show("us-volume-unit".into());
+        let response = search_apps_with_local_date(
+            &registry,
+            "1 gal to L",
+            "us-volume-unit",
+            1,
+            || panic!("unit search must not read the app cache"),
+            |_| panic!("unit search must not decorate applications"),
+            WebSearchEngine::Bing,
+            || panic!("unit search must not read the local date"),
+        )
+        .unwrap();
+
+        assert!(response.replace_local_results);
+        assert_eq!(response.items.len(), 1);
+        let item = &response.items[0];
+        assert_eq!(item.title, "3.78541 L");
+        assert_eq!(
+            item.subtitle.as_deref(),
+            Some(format!("1 gal · 体积换算 · {EXPLANATION}").as_str())
+        );
+        assert_eq!(
+            registry.resolve(&response.request_id, &item.result_id),
+            Ok(ResultAction::CopyBuiltInText {
+                text: "3.78541 L".into()
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["items"][0]["subtitle"],
+            format!("1 gal · 体积换算 · {EXPLANATION}")
         );
     }
 

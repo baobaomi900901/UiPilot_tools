@@ -302,8 +302,8 @@ pub(crate) fn classify(source: &str) -> CurrencyClassification {
     let base = CurrencyCode::new(base_source);
     let quote = CurrencyCode::new(quote_source);
     if base.is_none() || quote.is_none() {
-        return if (base.is_some() && short_code_like(quote_source))
-            || (quote.is_some() && short_code_like(base_source))
+        return if (base.is_some() && malformed_code_like(quote_source))
+            || (quote.is_some() && malformed_code_like(base_source))
         {
             CurrencyClassification::Invalid(CurrencyFailure::InvalidCode)
         } else {
@@ -318,8 +318,13 @@ pub(crate) fn classify(source: &str) -> CurrencyClassification {
     })
 }
 
-fn short_code_like(source: &str) -> bool {
-    (1..3).contains(&source.len()) && source.bytes().all(|byte| byte.is_ascii_alphabetic())
+fn malformed_code_like(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    ((1..=2).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_alphabetic))
+        || ((1..=4).contains(&bytes.len())
+            && bytes.iter().all(u8::is_ascii_alphanumeric)
+            && bytes.iter().any(u8::is_ascii_digit))
+        || (bytes.len() == 4 && bytes.iter().all(u8::is_ascii_uppercase))
 }
 
 fn looks_like_invalid_number(source: &str) -> bool {
@@ -416,7 +421,7 @@ mod tests {
             "100 USD to",
             "100 dollars to CNY",
             "100 USD to yuan",
-            "100 USD to CNYY",
+            "100 USD to cnyy",
             "add pdf to zip",
             "add US to CNY",
             "100 US to CN",
@@ -444,7 +449,14 @@ mod tests {
                 "{source}"
             );
         }
-        for source in ["100 US to CNY", "100 USD to C"] {
+        for source in [
+            "100 US to CNY",
+            "100 USD to C",
+            "100 USD to CNYY",
+            "100 CNYY to USD",
+            "100 USD to CN1",
+            "100 CN1 to USD",
+        ] {
             assert_eq!(
                 classify(source),
                 CurrencyClassification::Invalid(CurrencyFailure::InvalidCode),

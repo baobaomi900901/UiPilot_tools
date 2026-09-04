@@ -8,6 +8,9 @@ use super::{
     number::{canonicalize_number, NumberGrammar},
 };
 
+const US_VOLUME_EXPLANATION: &str =
+    "默认采用美制（US）。若需英制容量（加仑/夸脱/品脱/盎司），请在单位前加 imp，例如 100 imp gal to L。";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Dimension {
     Length,
@@ -278,17 +281,36 @@ pub(crate) fn evaluate(intent: UnitIntent) -> Result<UnitOutput, UnitInvalid> {
         format::format_number(converted),
         intent.target.symbol()
     );
+    let mut subtitle = format!(
+        "{} {} · {}",
+        intent.canonical_value,
+        intent.source.symbol(),
+        dimension_label(intent.source.dimension())
+    );
+    if is_us_customary_volume(intent.source) || is_us_customary_volume(intent.target) {
+        subtitle.push_str(" · ");
+        subtitle.push_str(US_VOLUME_EXPLANATION);
+    }
+
     Ok(UnitOutput {
-        subtitle: Some(format!(
-            "{} {} · {}",
-            intent.canonical_value,
-            intent.source.symbol(),
-            dimension_label(intent.source.dimension())
-        )),
+        subtitle: Some(subtitle),
         copy_text: title.clone(),
         title,
         refresh_at_utc: None,
     })
+}
+
+fn is_us_customary_volume(unit: Unit) -> bool {
+    matches!(
+        unit,
+        Unit::Teaspoon
+            | Unit::Tablespoon
+            | Unit::UsFluidOunce
+            | Unit::UsCup
+            | Unit::UsPint
+            | Unit::UsQuart
+            | Unit::UsGallon
+    )
 }
 
 fn decimal_below_absolute_zero(source: &str, scale: TemperatureScale) -> bool {
@@ -693,13 +715,49 @@ mod tests {
             ("1000 mm to in", "1000 mm · 长度换算"),
             ("1 kg to lb", "1 kg · 质量换算"),
             ("1 m² to ft²", "1 m² · 面积换算"),
-            ("1 L to gal", "1 L · 体积换算"),
             ("32 F to C", "32 °F · 温度换算"),
         ] {
             let output = evaluate_ready(source);
             assert_eq!(output.subtitle.as_deref(), Some(expected_subtitle));
             assert_eq!(output.copy_text, output.title);
             assert_eq!(output.refresh_at_utc, None);
+        }
+    }
+
+    #[test]
+    fn us_customary_volume_outputs_append_the_required_explanation() {
+        const EXPLANATION: &str =
+            "默认采用美制（US）。若需英制容量（加仑/夸脱/品脱/盎司），请在单位前加 imp，例如 100 imp gal to L。";
+
+        for (source, expected_prefix) in [
+            ("1 tsp to mL", "1 tsp · 体积换算"),
+            ("1 tbsp to mL", "1 tbsp · 体积换算"),
+            ("1 fl oz to mL", "1 fl oz · 体积换算"),
+            ("1 cup to mL", "1 cup · 体积换算"),
+            ("1 pt to mL", "1 pt · 体积换算"),
+            ("1 qt to mL", "1 qt · 体积换算"),
+            ("1 gal to L", "1 gal · 体积换算"),
+            ("1 us gal to L", "1 gal · 体积换算"),
+            ("1 L to gal", "1 L · 体积换算"),
+        ] {
+            let output = evaluate_ready(source);
+            assert_eq!(
+                output.subtitle.as_deref(),
+                Some(format!("{expected_prefix} · {EXPLANATION}").as_str()),
+                "source={source}"
+            );
+            assert_eq!(output.copy_text, output.title, "source={source}");
+        }
+
+        for source in ["1 L to mL", "1 imp gal to L", "1 L to imp gal"] {
+            assert!(
+                !evaluate_ready(source)
+                    .subtitle
+                    .as_deref()
+                    .unwrap()
+                    .contains(EXPLANATION),
+                "source={source}"
+            );
         }
     }
 

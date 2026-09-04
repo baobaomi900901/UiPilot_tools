@@ -110,6 +110,9 @@ fn parse_iso_date(source: &str) -> Option<Date> {
         return None;
     }
     let year = source[0..4].parse().ok()?;
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
     let month = Month::try_from(source[5..7].parse::<u8>().ok()?).ok()?;
     let day = source[8..10].parse().ok()?;
     Date::from_calendar_date(year, month, day).ok()
@@ -189,6 +192,7 @@ mod tests {
         for body in [
             br#"{"date":"2026-09-03","base":"EUR","quote":"CNY","rate":7.1}"#.as_slice(),
             br#"{"date":"2026-09-03","base":"USD","quote":"JPY","rate":7.1}"#,
+            br#"{"date":"0000-09-03","base":"USD","quote":"CNY","rate":7.1}"#,
             br#"{"date":"2026-02-30","base":"USD","quote":"CNY","rate":7.1}"#,
             br#"{"date":"2026-9-3","base":"USD","quote":"CNY","rate":7.1}"#,
             br#"{"date":"2026-09-03","base":"USD","quote":"CNY","rate":0}"#,

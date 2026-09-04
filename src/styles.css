@@ -1944,6 +1944,12 @@ label,
   font-weight: 500;
 }
 
+.launcher-view .result-subtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .launcher-view .result-favorite-star {
   color: var(--uipilot-ui-icon-yellow);
 }
