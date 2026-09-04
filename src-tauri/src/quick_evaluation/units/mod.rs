@@ -310,6 +310,8 @@ fn is_us_customary_volume(unit: Unit) -> bool {
             | Unit::UsPint
             | Unit::UsQuart
             | Unit::UsGallon
+            | Unit::CubicInch
+            | Unit::CubicFoot
     )
 }
 
@@ -747,6 +749,22 @@ mod tests {
                 "source={source}"
             );
             assert_eq!(output.copy_text, output.title, "source={source}");
+        }
+
+        for (source, expected_prefix, expected_title) in [
+            ("1 in³ to mL", "1 in³ · 体积换算", "16.3871 mL"),
+            ("1 mL to in³", "1 mL · 体积换算", "0.0610237 in³"),
+            ("1 ft³ to L", "1 ft³ · 体积换算", "28.3168 L"),
+            ("1 mL to ft³", "1 mL · 体积换算", "0.0000353147 ft³"),
+        ] {
+            let output = evaluate_ready(source);
+            assert_eq!(
+                output.subtitle.as_deref(),
+                Some(format!("{expected_prefix} · {EXPLANATION}").as_str()),
+                "source={source}"
+            );
+            assert_eq!(output.title, expected_title, "source={source}");
+            assert_eq!(output.copy_text, expected_title, "source={source}");
         }
 
         for source in ["1 L to mL", "1 imp gal to L", "1 L to imp gal"] {
