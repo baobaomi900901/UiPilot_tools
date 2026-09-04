@@ -1,7 +1,7 @@
 # Stage 2B Process Target Expansion And Batch Orchestration Design
 
 **Date:** 2026-09-04
-**Status:** Draft — section design approved; written-spec review pending
+**Status:** Approved — accepted by the user on 2026-09-04
 
 **Related:**
 
