@@ -652,6 +652,12 @@ Assert-Condition $createStagingMacro.Value.Contains('lstrcpynW(w .R4, p R7') 'NS
 Assert-Condition $createStagingMacro.Value.Contains('ole32::CoTaskMemFree(p R7)') 'NSIS known-folder buffer must use CoTaskMemFree'
 Assert-Condition (-not $createStagingMacro.Value.Contains('UIPILOT_LOCAL_FREE $R7')) 'NSIS known-folder buffer must not use LocalFree'
 Assert-Condition $createStagingMacro.Value.Contains('CreateDirectoryW(w "$UiPilotStaging", p R9)') 'NSIS protected staging directory must use the named variable value'
+$acquireLeaseMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_ACQUIRE_LEASE\r?\n.*?^!macroend')
+Assert-Condition $acquireLeaseMacro.Success 'NSIS installer lease macro is missing'
+$createMutexBlock = $acquireLeaseMacro.Value.Substring(0, $acquireLeaseMacro.Value.IndexOf('WaitForSingleObject', [StringComparison]::Ordinal))
+Assert-Condition $createMutexBlock.Contains('${If} $UiPilotMutexHandle = 0') 'NSIS mutex creation must reject a null handle'
+Assert-Condition $createMutexBlock.Contains('${If} $R6 = 183') 'NSIS mutex creation must validate an existing named mutex'
+Assert-Condition (-not $createMutexBlock.Contains('${ElseIf} $R6 != 0')) 'NSIS mutex creation must not reject a valid new handle based on an unspecified success LastError'
 $systemCalls = (($hooksSource -split '\r?\n') | Where-Object { $_.Contains('System::Call') }) -join "`n"
 foreach ($invalidSystemToken in @('.UiPilot', 'p UiPilot', 'w UiPilot', '*l .UiPilot', '*w .R9')) {
     Assert-Condition (-not $systemCalls.Contains($invalidSystemToken)) "NSIS System call contains an invalid source/destination token: $invalidSystemToken"

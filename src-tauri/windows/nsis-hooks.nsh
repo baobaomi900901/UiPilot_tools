@@ -142,7 +142,6 @@ Var UiPilotOwnerSid
 
 !macro UIPILOT_ACQUIRE_LEASE
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
-  System::Call 'kernel32::SetLastError(i 0)'
   System::Call 'kernel32::CreateMutexW(p R9, i 0, w "${UIPILOT_MUTEX_NAME}") p .R5'
   System::Call 'kernel32::GetLastError() i .R6'
   StrCpy $UiPilotMutexHandle $R5
@@ -151,13 +150,9 @@ Var UiPilotOwnerSid
     MessageBox MB_ICONSTOP "The installer transaction lock could not be created."
     Abort
   ${EndIf}
+  ; With a valid handle, LastError is meaningful only when the named mutex already existed.
   ${If} $R6 = 183
     !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $UiPilotMutexHandle
-  ${ElseIf} $R6 != 0
-    System::Call 'kernel32::CloseHandle(p $UiPilotMutexHandle)'
-    StrCpy $UiPilotMutexHandle 0
-    MessageBox MB_ICONSTOP "The installer transaction lock could not be verified."
-    Abort
   ${EndIf}
   System::Call 'kernel32::WaitForSingleObject(p $UiPilotMutexHandle, i 0) i .R6'
   ${If} $R6 = 258
