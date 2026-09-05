@@ -152,6 +152,8 @@ fn run() -> HelperResult<()> {
         .map_err(|_| (ExitCode::AdmissionDenied, "current-exe-unavailable".into()))?;
     windows::verify_current_image_as_invoker()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
+    let elevated =
+        windows::begin_admission().map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
     windows::verify_staging_layout(
         &cli.staging_dir,
         &executable,
@@ -159,8 +161,9 @@ fn run() -> HelperResult<()> {
         &cli.journal_path,
     )
     .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
-    let _lease = windows::acquire_admission_lease(cli.parent_pid, cli.parent_creation_time)
-        .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
+    let lease =
+        windows::acquire_admission_lease(elevated, cli.parent_pid, cli.parent_creation_time)
+            .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
     verify_vm_disposable_marker()?;
     let request = parse_request(
         &windows::read_direct_file(&cli.request_path)
@@ -170,7 +173,7 @@ fn run() -> HelperResult<()> {
     if request != cli.request() {
         return fail(ExitCode::InvalidInvocation, "request-cli-mismatch");
     }
-    dispatch(&request, &_lease)
+    dispatch(&request, &lease)
 }
 
 fn dispatch(request: &Request, lease: &AdmissionLease) -> HelperResult<()> {
@@ -1525,6 +1528,29 @@ fn verify_vm_disposable_marker() -> HelperResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_admission_order_is_bound_to_the_real_entrypoint() {
+        let source = include_str!("main.rs");
+        let run = source
+            .split("fn run() -> HelperResult<()> {")
+            .nth(1)
+            .and_then(|source| source.split("\n}\n\nfn dispatch(").next())
+            .expect("run entrypoint source must be present");
+        let mut previous = 0;
+        for token in [
+            "windows::verify_current_image_as_invoker()",
+            "windows::begin_admission()",
+            "windows::verify_staging_layout(",
+            "windows::acquire_admission_lease(",
+            "windows::read_direct_file(&cli.request_path)",
+            "dispatch(&request, &lease)",
+        ] {
+            let index = run.find(token).expect("admission step must be present");
+            assert!(index >= previous, "admission step is out of order: {token}");
+            previous = index;
+        }
+    }
 
     #[test]
     fn persisted_manifest_semantics_and_location_are_validated_before_native_use() {

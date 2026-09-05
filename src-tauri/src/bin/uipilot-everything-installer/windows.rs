@@ -159,36 +159,6 @@ impl ExitCode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdmissionCheck {
-    AsInvokerImage,
-    ElevatedHighIntegrityAdmin,
-    StagingCanonicalOwnerDacl,
-    DirectNonReparseFiles,
-    ParentProcessIdentity,
-    TrustedActivityEvent,
-    MutexHeldByParent,
-    ReadRequest,
-}
-
-pub const ADMISSION_ORDER: [AdmissionCheck; 8] = [
-    AdmissionCheck::AsInvokerImage,
-    AdmissionCheck::ElevatedHighIntegrityAdmin,
-    AdmissionCheck::StagingCanonicalOwnerDacl,
-    AdmissionCheck::DirectNonReparseFiles,
-    AdmissionCheck::ParentProcessIdentity,
-    AdmissionCheck::TrustedActivityEvent,
-    AdmissionCheck::MutexHeldByParent,
-    AdmissionCheck::ReadRequest,
-];
-
-pub fn position(check: AdmissionCheck) -> usize {
-    ADMISSION_ORDER
-        .iter()
-        .position(|candidate| *candidate == check)
-        .unwrap()
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Guid {
@@ -933,7 +903,7 @@ fn enabled_ba(token: Handle) -> Result<bool, String> {
     Ok(found)
 }
 
-pub fn verify_elevated_high_integrity_admin() -> Result<(), String> {
+fn verify_elevated_high_integrity_admin() -> Result<(), String> {
     let token = current_process_token()?;
     let elevation = token_information(token.0, TOKEN_ELEVATION_CLASS)?;
     if unsafe { (*(elevation.as_ptr().cast::<TokenElevation>())).elevated } == 0
@@ -956,6 +926,13 @@ pub fn verify_elevated_high_integrity_admin() -> Result<(), String> {
         return Err("integrity-below-high".into());
     }
     Ok(())
+}
+
+pub struct ElevatedAdmission(());
+
+pub fn begin_admission() -> Result<ElevatedAdmission, String> {
+    verify_elevated_high_integrity_admin()?;
+    Ok(ElevatedAdmission(()))
 }
 
 fn process_creation_time(process: Handle) -> Result<u64, String> {
@@ -1121,10 +1098,10 @@ pub fn verify_managed_file(path: &Path) -> Result<(), String> {
 }
 
 pub fn acquire_admission_lease(
+    _elevated: ElevatedAdmission,
     parent_pid: u32,
     expected_creation: u64,
 ) -> Result<AdmissionLease, String> {
-    verify_elevated_high_integrity_admin()?;
     let parent = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
@@ -2068,27 +2045,6 @@ pub fn validate_service_command(command: &str, manifest: &RuntimeManifest) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn admission_order_fails_before_input_reads() {
-        assert_eq!(ADMISSION_ORDER[0], AdmissionCheck::AsInvokerImage);
-        assert_eq!(
-            ADMISSION_ORDER[1],
-            AdmissionCheck::ElevatedHighIntegrityAdmin
-        );
-        assert!(
-            position(AdmissionCheck::ParentProcessIdentity) < position(AdmissionCheck::ReadRequest)
-        );
-        assert!(
-            position(AdmissionCheck::TrustedActivityEvent) < position(AdmissionCheck::ReadRequest)
-        );
-        assert!(
-            position(AdmissionCheck::MutexHeldByParent) < position(AdmissionCheck::ReadRequest)
-        );
-        assert!(
-            position(AdmissionCheck::DirectNonReparseFiles) < position(AdmissionCheck::ReadRequest)
-        );
-    }
 
     #[test]
     fn runtime_manifest_admission_requires_exact_as_invoker_policy() {

@@ -1627,9 +1627,11 @@ mod windows_runtime {
 
     fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, ()> {
         let value = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.map_err(|_| ())?;
-        let path = unsafe { value.to_string() }.map_err(|_| ())?;
+        let path = unsafe { value.to_string() }
+            .map(PathBuf::from)
+            .map_err(|_| ());
         unsafe { CoTaskMemFree(Some(value.0.cast())) };
-        Ok(PathBuf::from(path))
+        path
     }
 
     fn current_user_sid() -> Result<String, ()> {
@@ -1657,9 +1659,9 @@ mod windows_runtime {
         let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
         let mut sid = PWSTR::null();
         unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) }.map_err(|_| ())?;
-        let value = unsafe { sid.to_string() }.map_err(|_| ())?;
+        let value = unsafe { sid.to_string() }.map_err(|_| ());
         let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(sid.0.cast()))) };
-        Ok(value)
+        value
     }
 
     fn ensure_current_process_not_elevated() -> Result<(), RuntimeUnavailableReason> {

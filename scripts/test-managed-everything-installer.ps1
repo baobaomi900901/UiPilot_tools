@@ -59,6 +59,16 @@ function Assert-OrderedUniqueTokens {
     }
 }
 
+function Assert-OrderedTokens {
+    param([string]$Text, [string[]]$Tokens, [string]$Message)
+    $start = 0
+    foreach ($token in $Tokens) {
+        $index = $Text.IndexOf($token, $start, [StringComparison]::Ordinal)
+        if ($index -lt 0) { throw $Message }
+        $start = $index + $token.Length
+    }
+}
+
 function Get-LowerSha256([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     try {
@@ -673,18 +683,37 @@ $pageLeaveReinstall = [regex]::Match($customText, '(?ms)^Function PageLeaveReins
 Assert-Condition $pageLeaveReinstall.Success 'Could not locate the custom reinstall leave function'
 $reinstallDecision = $pageLeaveReinstall.Value.Substring(0, $pageLeaveReinstall.Value.IndexOf('reinst_uninstall:', [StringComparison]::Ordinal))
 Assert-Condition (-not $reinstallDecision.Contains('$WixMode')) 'WiX upgrade/downgrade must not select the old uninstaller before the explicit same-version uninstall branch'
-Assert-OrderedUniqueTokens $reinstallDecision @(
-    '${If} $UpdateMode = 1',
-    '${If} $R0 = 0',
-    '${If} $R1 = 1',
-    '${Else}',
-    'Goto reinst_uninstall',
-    '${ElseIf} $R0 = 1',
-    '${ElseIf} $R0 = -1'
-) 'Update, reinstall, upgrade, and downgrade decisions must preserve the approved in-place ordering'
+$updateInPlace = [regex]::Match($reinstallDecision, '(?ms)\$\{If\} \$UpdateMode = 1\s+Goto reinst_done\s+\$\{EndIf\}')
+$sameVersionChoice = [regex]::Match($reinstallDecision, '(?ms)\$\{If\} \$R0 = 0[^\r\n]*\s+\$\{If\} \$R1 = 1[^\r\n]*\s+Goto reinst_done\s+\$\{Else\}[^\r\n]*\s+Goto reinst_uninstall\s+\$\{EndIf\}')
+$upgradeInPlace = [regex]::Match($reinstallDecision, '(?ms)\$\{ElseIf\} \$R0 = 1[^\r\n]*\s+Goto reinst_done')
+$downgradeInPlace = [regex]::Match($reinstallDecision, '(?ms)\$\{ElseIf\} \$R0 = -1[^\r\n]*\s+Goto reinst_done')
+Assert-Condition ($updateInPlace.Success -and $sameVersionChoice.Success -and $upgradeInPlace.Success -and $downgradeInPlace.Success) 'Update, repair, upgrade, and downgrade must each take the approved explicit branch'
 $explicitUninstall = $pageLeaveReinstall.Value.Substring($pageLeaveReinstall.Value.IndexOf('reinst_uninstall:', [StringComparison]::Ordinal))
-Assert-Condition ($explicitUninstall.IndexOf('Quit', [StringComparison]::Ordinal) -gt 0) 'Explicit same-version uninstall must terminate the installer'
-Assert-Condition ($explicitUninstall.IndexOf('Quit', [StringComparison]::Ordinal) -lt $explicitUninstall.IndexOf('reinst_done:', [StringComparison]::Ordinal)) 'Explicit same-version uninstall must quit before the install continuation label'
+$wixUninstall = [regex]::Match($explicitUninstall, '(?ms)\$\{If\} \$WixMode = 1\s+ReadRegStr \$R1 HKLM "\$R6" "UninstallString"\s+ExecWait ''\$R1'' \$0\s+\$\{Else\}')
+$nsisUninstall = [regex]::Match($explicitUninstall, '(?ms)\$\{Else\}\s+ReadRegStr \$4 SHCTX "\$\{MANUPRODUCTKEY\}" ""\s+ReadRegStr \$R1 SHCTX "\$\{UNINSTKEY\}" "UninstallString".*?ExecWait ''\$R1'' \$0\s+\$\{EndIf\}')
+Assert-Condition ($wixUninstall.Success -and $nsisUninstall.Success) 'Explicit same-version uninstall must execute the registered old uninstaller'
+Assert-Condition (-not $explicitUninstall.Contains('/UPDATE')) 'Explicit same-version uninstall must not invoke the old uninstaller in update mode'
+$lastExecWait = $explicitUninstall.LastIndexOf('ExecWait ''$R1'' $0', [StringComparison]::Ordinal)
+$failureCheck = $explicitUninstall.IndexOf('${If} $0 <> 0', [StringComparison]::Ordinal)
+$quit = $explicitUninstall.IndexOf('Quit', [StringComparison]::Ordinal)
+$continue = $explicitUninstall.IndexOf('reinst_done:', [StringComparison]::Ordinal)
+Assert-Condition ($lastExecWait -ge 0 -and $lastExecWait -lt $failureCheck -and $failureCheck -lt $quit -and $quit -lt $continue) 'Explicit uninstall must check failure before quitting and never continue into installation'
+Assert-OrderedTokens $explicitUninstall @(
+    '${If} $0 <> 0',
+    '${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"',
+    '${If} $WixMode = 1',
+    '${AndIf} $0 = 1602',
+    'Abort',
+    '${EndIf}',
+    '${If} $0 = 1',
+    'Abort',
+    '${EndIf}',
+    'MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"',
+    'Abort',
+    '${EndIf}',
+    'Quit',
+    'reinst_done:'
+) 'Explicit uninstall must abort every failed/cancelled old-uninstaller outcome and quit only after success'
 $uninstallSection = [regex]::Match($customText, '(?ms)^Section Uninstall\r?\n.*?^SectionEnd\r?\n')
 Assert-Condition $uninstallSection.Success 'Could not locate the custom uninstall section'
 Assert-OrderedUniqueTokens $uninstallSection.Value @(
