@@ -887,7 +887,7 @@ function Invoke-RecoveryProbe {
             $serviceContext = Get-ServiceProcessContext $managed $true
             $clientContext = Get-PrivateClientContext $ClientProcessId $managed $null $false $false $true
             $serviceContext.Lease.TerminateAndWait(1, 5000)
-            $terminalMatches = Wait-Until {
+            $readinessUnavailable = Wait-Until {
                 $service = Get-CimInstance Win32_Service -Filter "Name='Everything (UiPilot)'" -ErrorAction SilentlyContinue
                 $serviceStopped = $null -eq $service -or [string]$service.State -cne 'Running' -or [uint32]$service.ProcessId -eq 0
                 if (-not $serviceStopped) { return $false }
@@ -895,11 +895,12 @@ function Invoke-RecoveryProbe {
                 return -not (Invoke-PrivateReadinessProbe $clientContext 500).Ready
             }
             Write-ManagedEvidence $EvidenceName ([ordered]@{
-                schema_version = 1; kind = 'runtime-recovery'; outcome = $(if ($terminalMatches) { 'pass' } else { 'fail' })
-                target = 'service'; expected_terminal = 'unavailable'; terminal_matches = $terminalMatches
-                verified_handle_termination = $true; service_stopped = $terminalMatches
+                schema_version = 1; kind = 'runtime-recovery'; outcome = $(if ($readinessUnavailable) { 'pass' } else { 'fail' })
+                target = 'service'; expected_readiness = 'unavailable'; readiness_unavailable = $readinessUnavailable
+                supervisor_terminal_state_observed = $false
+                verified_handle_termination = $true; service_stopped = $readinessUnavailable
             })
-            Assert-Condition $terminalMatches 'Runtime did not become unavailable after exact Service termination'
+            Assert-Condition $readinessUnavailable 'Private readiness remained available after exact Service termination'
         }
         finally {
             if ($null -ne $clientContext) { Close-PrivateClientContext $clientContext }

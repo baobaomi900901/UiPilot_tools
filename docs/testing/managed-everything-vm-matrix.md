@@ -100,10 +100,9 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
 ## Row 4 — both upgrade paths, cancellation, and writable source replacement
 
 - Prerequisites: old production UiPilot installed for the two upgrade paths, with old uninstaller, private
-  Service, manifest, ProgramData, and application hashes recorded. Run the source race from a separate clean
-  snapshot where the reviewed protected version target does not yet exist; a standard-user-writable
-  `$VmTestRoot` and its intended install directory already exist. Every existing path component must be
-  non-reparse and is pinned and final-path revalidated immediately before Setup launch.
+  Service, manifest, ProgramData, and application hashes recorded. The source-race variant additionally needs
+  a standard-user-writable `$VmTestRoot` and a synchronized low-privilege actor supplied by a future
+  Instrumented Setup interface.
 - Commands for manual replacement and Tauri `/UPDATE`, respectively:
 
   ```powershell
@@ -113,16 +112,19 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
   $VmInstallDirectory = [IO.Directory]::CreateDirectory((Join-Path $VmTestRoot 'UiPilot-race')).FullName
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmSourceReplacement -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-source-race -VmTestRoot $VmTestRoot -InstallDirectory $VmInstallDirectory
   ```
+- Interface blocker: `VmSourceReplacement` fails closed before launching Setup. The current Instrumented Setup
+  has no synchronization point after Helper opens the source and before protected copy, and the five-file
+  harness has no safely scoped low-privilege actor token. A post-copy administrator replacement would not prove
+  the required held-source identity boundary and must not be accepted as evidence.
 - Expected stable outcome: neither upgrade path calls the old uninstaller. Cancellation or failure before
-  Install Section changes nothing. `VmSourceReplacement` starts a coordinated actor only after the reviewed
-  protected copy appears; the actor attempts to replace the fixed scoped source before Setup completes. It
-  observes a share violation or a source identity replacement, while the protected target remains the reviewed
-  hash. An already running UiPilot/private client causes no executable write error after Install Section, and
+  Install Section changes nothing. During the source race, a low-privilege replacement attempt gets a sharing
+  violation or Helper copies from one continuously held identity; the protected target never contains replacement
+  bytes. An already running UiPilot/private client causes no executable write error after Install Section, and
   old Service state remains rollback-capable.
 - Evidence: `installer-row04-manual-replacement.json`, `installer-row04-tauri-update.json`,
   `installer-row04-cancel.json`, `installer-row04-source-race.json`, and redacted before/after equality booleans.
 - Cleanup: close any source-race handles and revert the snapshot.
-- Status: `NOT RUN`
+- Status: `NOT RUN` — **BLOCKED: synchronized low-privilege source-handle probe missing**
 
 ## Row 5 — bounded client and Service recovery
 

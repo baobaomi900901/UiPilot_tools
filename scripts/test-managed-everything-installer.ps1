@@ -299,159 +299,6 @@ function Get-SetupArguments([string]$Flow, [string]$ScopedInstallDirectory) {
     return $arguments
 }
 
-function Get-ScopedSourceReplacementTarget($InstallScope) {
-    Assert-Condition ($null -ne $InstallScope) 'Source replacement requires a pinned install scope'
-    $InstallScope.ValidateUnchanged()
-    $target = [IO.Path]::GetFullPath((Join-Path $InstallScope.Path 'resources\everything\Everything.exe'))
-    $prefix = $InstallScope.Path.TrimEnd('\') + '\'
-    Assert-Condition ($target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) 'Source replacement target escaped the pinned install scope'
-    return $target
-}
-
-function Get-ProtectedSourceSignalPath([string]$RepositoryRoot) {
-    $lockPath = Join-Path $RepositoryRoot 'src-tauri\resources\everything\everything.lock.json'
-    $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding utf8 | ConvertFrom-Json
-    Assert-Condition ([string]$lock.version -match '^\d+\.\d+\.\d+\.\d+$') 'Reviewed Everything version is invalid'
-    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-    return Join-Path $programData ("UiPilot_tools\everything\{0}\Everything.exe" -f $lock.version)
-}
-
-function Start-SourceReplacementActor([string]$TargetPath, [string]$ReviewedHash, [string]$ProtectedSignalPath) {
-    Assert-Condition (-not [string]::IsNullOrWhiteSpace($TargetPath)) 'Source replacement target is required'
-    Assert-Condition ($ReviewedHash -match '^[0-9a-f]{64}$') 'Source replacement reviewed hash is invalid'
-    Assert-Condition (-not [string]::IsNullOrWhiteSpace($ProtectedSignalPath)) 'Source replacement protected signal is required'
-    $readyName = 'Local\UiPilotSourceRaceReady-' + [guid]::NewGuid().ToString('N')
-    $completeName = 'Local\UiPilotSourceRaceComplete-' + [guid]::NewGuid().ToString('N')
-    $baselineWriteTicks = if ([IO.File]::Exists($TargetPath)) { [IO.File]::GetLastWriteTimeUtc($TargetPath).Ticks } else { -1L }
-    $ready = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $readyName)
-    $complete = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $completeName)
-    $job = $null
-    try {
-        $job = Start-Job -ArgumentList $TargetPath, $ReviewedHash, $ProtectedSignalPath, $baselineWriteTicks, $readyName, $completeName -ScriptBlock {
-        param($TargetPath, $ReviewedHash, $ProtectedSignalPath, $BaselineWriteTicks, $ReadyName, $CompleteName)
-        Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-
-public static class UiPilotSourceRaceMove {
-  const uint MOVEFILE_REPLACE_EXISTING = 0x1, MOVEFILE_WRITE_THROUGH = 0x8;
-  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  static extern bool MoveFileEx(string existingName, string newName, uint flags);
-  public static void Replace(string source, string destination) {
-    if (!MoveFileEx(source, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-      throw new Win32Exception(Marshal.GetLastWin32Error());
-    }
-  }
-}
-'@
-        $readyEvent = [Threading.EventWaitHandle]::OpenExisting($ReadyName)
-        $completeEvent = [Threading.EventWaitHandle]::OpenExisting($CompleteName)
-        $attemptCount = 0
-        $replacementCount = 0
-        $shareViolationCount = 0
-        $beforeCompletionAttemptCount = 0
-        $beforeCompletionReplacementCount = 0
-        try {
-            $readyEvent.Set() | Out-Null
-            $deadline = [DateTime]::UtcNow.AddMinutes(3)
-            while (-not $completeEvent.WaitOne(0) -and [DateTime]::UtcNow -lt $deadline) {
-                $signalReady = $false
-                try {
-                    if ([IO.File]::Exists($ProtectedSignalPath)) {
-                        $signalHash = (Get-FileHash -LiteralPath $ProtectedSignalPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-                        $signalReady = $signalHash -ceq $ReviewedHash
-                    }
-                } catch { $signalReady = $false }
-                $sourceRefreshed = [IO.File]::Exists($TargetPath) -and
-                    ($BaselineWriteTicks -lt 0 -or [IO.File]::GetLastWriteTimeUtc($TargetPath).Ticks -ne $BaselineWriteTicks)
-                if (-not $signalReady -or -not $sourceRefreshed) {
-                    Start-Sleep -Milliseconds 10
-                    continue
-                }
-                $sourceMatches = $false
-                try {
-                    $sourceHash = (Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-                    $sourceMatches = $sourceHash -ceq $ReviewedHash
-                } catch { $sourceMatches = $false }
-                if (-not $sourceMatches) {
-                    Start-Sleep -Milliseconds 10
-                    continue
-                }
-                $attemptCount++
-                $beforeCompletionAttemptCount++
-                $candidate = Join-Path (Split-Path -Parent $TargetPath) ('.uipilot-source-race-' + [guid]::NewGuid().ToString('N'))
-                try {
-                    [IO.File]::WriteAllBytes($candidate, [Text.Encoding]::UTF8.GetBytes('uipilot-vm-source-replacement'))
-                    [UiPilotSourceRaceMove]::Replace($candidate, $TargetPath)
-                    $replacementCount++
-                    $beforeCompletionReplacementCount++
-                    break
-                } catch {
-                    $nativeError = if ($_.Exception.NativeErrorCode) {
-                        [int]$_.Exception.NativeErrorCode
-                    } elseif ($_.Exception.InnerException -and $_.Exception.InnerException.NativeErrorCode) {
-                        [int]$_.Exception.InnerException.NativeErrorCode
-                    } else { 0 }
-                    if ($nativeError -eq 32) {
-                        $shareViolationCount++
-                    } else {
-                        throw
-                    }
-                } finally {
-                    if ([IO.File]::Exists($candidate)) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
-                }
-                Start-Sleep -Milliseconds 10
-            }
-            [pscustomobject]@{
-                AttemptCount = $attemptCount
-                ReplacementCount = $replacementCount
-                ShareViolationCount = $shareViolationCount
-                BeforeSetupCompletionAttemptCount = $beforeCompletionAttemptCount
-                BeforeSetupCompletionReplacementCount = $beforeCompletionReplacementCount
-            }
-        }
-        finally {
-            $readyEvent.Dispose()
-            $completeEvent.Dispose()
-        }
-        }
-        Assert-Condition $ready.WaitOne(5000) 'Source replacement actor did not become ready'
-        return [pscustomobject]@{ Job = $job; Ready = $ready; Complete = $complete }
-    }
-    catch {
-        if ($null -ne $job) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        }
-        $ready.Dispose()
-        $complete.Dispose()
-        throw
-    }
-}
-
-function Complete-SourceReplacementSetup($Actor) {
-    Assert-Condition ($null -ne $Actor) 'Source replacement actor is missing'
-    $Actor.Complete.Set() | Out-Null
-}
-
-function Stop-SourceReplacementActor($Actor) {
-    Assert-Condition ($null -ne $Actor) 'Source replacement actor is missing'
-    try {
-        $completedJob = Wait-Job -Job $Actor.Job -Timeout 10
-        Assert-Condition ($null -ne $completedJob) 'Source replacement actor did not stop'
-        $result = @(Receive-Job -Job $Actor.Job -ErrorAction Stop)
-        Assert-Condition ($result.Count -eq 1) 'Source replacement actor returned invalid evidence'
-        return $result[0]
-    }
-    finally {
-        Stop-Job -Job $Actor.Job -ErrorAction SilentlyContinue
-        Remove-Job -Job $Actor.Job -Force -ErrorAction SilentlyContinue
-        $Actor.Ready.Dispose()
-        $Actor.Complete.Dispose()
-    }
-}
-
 function Invoke-OneVmSetup([string]$Setup, [string[]]$Arguments, [string]$Marker, [string]$FaultCheckpoint) {
     $oldMarker = $env:UIPILOT_VM_DISPOSABLE_MARKER
     $oldCheckpoint = $env:UIPILOT_VM_FAULT_CHECKPOINT
@@ -506,45 +353,6 @@ function Invoke-InstallerSelfTest {
             if ($scope -is [IDisposable]) { $scope.Dispose() }
         } catch { $caught = $true }
         Assert-Condition $caught 'Custom install scope accepted a nested junction escape'
-
-        $actorInstall = Join-Path $scopeRoot 'actor-install'
-        $actorSourceRoot = Join-Path $actorInstall 'resources\everything'
-        [IO.Directory]::CreateDirectory($actorSourceRoot) | Out-Null
-        $actorTarget = Join-Path $actorSourceRoot 'Everything.exe'
-        [IO.File]::WriteAllBytes($actorTarget, [Text.Encoding]::UTF8.GetBytes('reviewed-source'))
-        $reviewedHash = Get-LowerSha256 $actorTarget
-        $outsideDecoy = Join-Path $junctionTarget 'Everything.exe'
-        [IO.File]::WriteAllBytes($outsideDecoy, [Text.Encoding]::UTF8.GetBytes('outside-decoy'))
-        $outsideHash = Get-LowerSha256 $outsideDecoy
-        $actorScope = [UiPilot.ManagedEverythingInstaller.PinnedDirectoryScope]::Open($scopeRoot, $actorInstall)
-        $actor = $null
-        $actorResult = $null
-        $replacementObserved = $false
-        try {
-            $resolvedActorTarget = Get-ScopedSourceReplacementTarget $actorScope
-            Assert-Condition ([string]::Equals($resolvedActorTarget, $actorTarget, [StringComparison]::OrdinalIgnoreCase)) 'Source replacement actor was not restricted to the fixed Everything source'
-            $actorSignal = Join-Path $tempRoot 'protected-signal.exe'
-            $actor = Start-SourceReplacementActor $resolvedActorTarget $reviewedHash $actorSignal
-            Start-Sleep -Milliseconds 20
-            [IO.File]::SetLastWriteTimeUtc($actorTarget, [DateTime]::UtcNow.AddSeconds(2))
-            [IO.File]::WriteAllBytes($actorSignal, [Text.Encoding]::UTF8.GetBytes('reviewed-source'))
-            $deadline = [DateTime]::UtcNow.AddSeconds(5)
-            do {
-                $replacementObserved = (Get-LowerSha256 $actorTarget) -cne $reviewedHash
-                if (-not $replacementObserved) { Start-Sleep -Milliseconds 20 }
-            } while (-not $replacementObserved -and [DateTime]::UtcNow -lt $deadline)
-        }
-        finally {
-            if ($null -ne $actor) {
-                Complete-SourceReplacementSetup $actor
-                $actorResult = Stop-SourceReplacementActor $actor
-            }
-            $actorScope.Dispose()
-        }
-        Assert-Condition $replacementObserved 'Source replacement actor did not make a real replacement attempt'
-        Assert-Condition ($actorResult.AttemptCount -gt 0 -and $actorResult.ReplacementCount -gt 0) 'Source replacement actor did not report its attempted replacement'
-        Assert-Condition ($actorResult.BeforeSetupCompletionReplacementCount -gt 0) 'Source replacement actor did not coordinate the attempt before Setup completion'
-        Assert-Condition ((Get-LowerSha256 $outsideDecoy) -ceq $outsideHash) 'Source replacement actor touched a file outside the scoped install source'
 
         $validInstall = Join-Path $scopeRoot 'valid\install'
         [IO.Directory]::CreateDirectory($validInstall) | Out-Null
@@ -614,35 +422,7 @@ function Invoke-InstallerVmMode([string]$RepositoryRoot) {
         }
 
         if ($Mode -ceq 'VmSourceReplacement') {
-            $sourceTarget = Get-ScopedSourceReplacementTarget $installScope
-            $reviewedHash = Get-LowerSha256 (Join-Path $RepositoryRoot 'src-tauri\resources\everything\Everything.exe')
-            $protectedSignal = Get-ProtectedSourceSignalPath $RepositoryRoot
-            $actor = Start-SourceReplacementActor $sourceTarget $reviewedHash $protectedSignal
-            $actorResult = $null
-            try {
-                $installScope.ValidateUnchanged()
-                $exitCode = Invoke-OneVmSetup $setup $arguments $marker $null
-            }
-            finally {
-                Complete-SourceReplacementSetup $actor
-                $actorResult = Stop-SourceReplacementActor $actor
-            }
-            $protectedHashMatches = (Test-Path -LiteralPath $protectedSignal -PathType Leaf) -and
-                ((Get-LowerSha256 $protectedSignal) -ceq $reviewedHash)
-            $raceObserved = $actorResult.BeforeSetupCompletionAttemptCount -gt 0 -and
-                ($actorResult.ShareViolationCount -gt 0 -or $actorResult.ReplacementCount -gt 0)
-            $pass = $exitCode -eq $ExpectedExitCode -and $raceObserved -and $protectedHashMatches
-            Write-InstallerVmEvidence $RepositoryRoot ([ordered]@{
-                schema_version = 1; kind = 'installer-source-race'; mode = $Mode.ToLowerInvariant()
-                outcome = $(if ($pass) { 'pass' } else { 'fail' }); setup_sha256 = $setupHash
-                expected_exit_code = $ExpectedExitCode; actual_exit_code = $exitCode
-                replacement_attempted_before_setup_completion = ($actorResult.BeforeSetupCompletionAttemptCount -gt 0)
-                share_violation_observed = ($actorResult.ShareViolationCount -gt 0)
-                replacement_observed = ($actorResult.ReplacementCount -gt 0)
-                protected_target_matches_reviewed_source = $protectedHashMatches
-            })
-            Assert-Condition $pass 'VM source replacement race did not preserve the reviewed protected target'
-            return
+            throw 'VmSourceReplacement is blocked until the Instrumented Setup provides a synchronized low-privilege source-handle probe'
         }
 
         $fault = if (@('VmFaultCheckpoint', 'VmUninstallCheckpoint') -contains $Mode) { $Checkpoint } else { $null }
@@ -698,9 +478,7 @@ Assert-SourceContains $releaseGate @(
 Assert-SourceContains $vmMatrix @('# Managed Everything Windows VM Matrix', '## Row 1', '## Row 13', 'VmInstall', 'VmUpdate', 'Status: `NOT RUN`')
 $installerHarness = Get-Content -LiteralPath $PSCommandPath -Raw -Encoding utf8
 foreach ($contract in @(
-    'Get-ScopedSourceReplacementTarget', 'Start-SourceReplacementActor',
-    'Get-ProtectedSourceSignalPath', 'replacement_attempted_before_setup_completion',
-    '$installScope.ValidateUnchanged()'
+    'synchronized low-privilege source-handle probe', '$installScope.ValidateUnchanged()'
 )) {
     Assert-Condition $installerHarness.Contains($contract) "Installer VM harness contract is missing: $contract"
 }
