@@ -24,7 +24,6 @@ const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 const FALSE: Bool = 0;
 const ERROR_FILE_NOT_FOUND: Dword = 2;
 const ERROR_PATH_NOT_FOUND: Dword = 3;
-const ERROR_INSUFFICIENT_BUFFER: Dword = 122;
 const ERROR_SERVICE_DOES_NOT_EXIST: Dword = 1060;
 const WAIT_OBJECT_0: Dword = 0;
 const WAIT_ABANDONED: Dword = 0x80;
@@ -856,7 +855,7 @@ fn token_information(token: Handle, class: Dword) -> Result<Vec<u8>, String> {
     unsafe {
         GetTokenInformation(token, class, null_mut(), 0, &mut length);
     }
-    if length == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+    if length == 0 {
         return Err("token-query-size-failed".into());
     }
     let mut buffer = vec![0u8; length as usize];
@@ -2103,6 +2102,14 @@ mod tests {
     #[test]
     fn compiled_helper_image_is_as_invoker() {
         assert!(verify_current_image_as_invoker().is_ok());
+    }
+
+    #[test]
+    fn token_elevation_query_accepts_the_size_reported_by_windows() {
+        let token = current_process_token().unwrap();
+        let elevation = token_information(token.0, TOKEN_ELEVATION_CLASS).unwrap();
+
+        assert!(elevation.len() >= std::mem::size_of::<TokenElevation>());
     }
 
     #[test]
