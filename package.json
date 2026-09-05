@@ -11,6 +11,8 @@
     "dev:vite": "vite",
     "build": "tsc --noEmit && vite build",
     "build:managed-everything": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release",
+    "stage:managed-everything:production": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode ProductionBundleInput",
+    "stage:managed-everything:vm": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode VmInstrumentedBundleInput",
     "test:managed-everything": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode Source",
     "tauri": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1"
   },

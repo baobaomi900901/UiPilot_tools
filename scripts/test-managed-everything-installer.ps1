@@ -86,6 +86,40 @@ function Get-PeMachine([string]$Path) {
     finally { $stream.Dispose() }
 }
 
+function Add-ManifestReader {
+    if ('UiPilot.ManagedEverythingInstaller.ManifestReader' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace UiPilot.ManagedEverythingInstaller {
+  public static class ManifestReader {
+    [DllImport("kernel32", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr LoadLibraryEx(string file, IntPtr handle, uint flags);
+    [DllImport("kernel32", SetLastError=true)] static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32", SetLastError=true)] static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32", SetLastError=true)] static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32")] static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32")] static extern bool FreeLibrary(IntPtr module);
+    public static string Read(string file) {
+      IntPtr module = LoadLibraryEx(file, IntPtr.Zero, 0x00000002);
+      if (module == IntPtr.Zero) throw new Win32Exception();
+      try {
+        IntPtr resource = FindResource(module, (IntPtr)1, (IntPtr)24);
+        if (resource == IntPtr.Zero) throw new Win32Exception();
+        uint size = SizeofResource(module, resource);
+        IntPtr loaded = LoadResource(module, resource);
+        IntPtr bytes = LockResource(loaded);
+        byte[] data = new byte[size]; Marshal.Copy(bytes, data, 0, (int)size);
+        if (size >= 2 && data[0] == 0xff && data[1] == 0xfe) return Encoding.Unicode.GetString(data);
+        return Encoding.UTF8.GetString(data);
+      } finally { FreeLibrary(module); }
+    }
+  }
+}
+'@
+}
+
 $script:DisposableMarkerText = 'UIPILOT_DISPOSABLE_VM=I_UNDERSTAND_THIS_MACHINE_WILL_BE_MUTATED'
 
 function Test-IsElevated {
@@ -499,6 +533,7 @@ $helperRoot = Join-Path $root 'src-tauri\src\bin\uipilot-everything-installer'
 $template = Join-Path $root 'src-tauri\windows\installer.nsi'
 $hooks = Join-Path $root 'src-tauri\windows\nsis-hooks.nsh'
 $build = Join-Path $root 'scripts\build-managed-everything-installer.ps1'
+$package = Join-Path $root 'package.json'
 $tauri = Join-Path $root 'src-tauri\tauri.conf.json'
 $vmTauri = Join-Path $root 'src-tauri\tauri.vm-instrumented.conf.json'
 $runtimeGate = Join-Path $root 'scripts\test-managed-everything-runtime.ps1'
@@ -557,7 +592,8 @@ Assert-SourceContains $hooks @(
     'pre-uninstall', 'post-uninstall',
     '!insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "yes" "yes"',
     '${StrCase} $UiPilotOperationId $UiPilotOperationId "L"',
-    '${UnStrCase} $UiPilotOperationId $UiPilotOperationId "L"'
+    '${UnStrCase} $UiPilotOperationId $UiPilotOperationId "L"',
+    'File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"'
 )
 Assert-SourceContains $template @(
     'TAURI_CLI_VERSION: 2.11.4', 'UIPILOT_REGION_REINSTALL_BEGIN',
@@ -566,10 +602,20 @@ Assert-SourceContains $template @(
 Assert-SourceContains $build @(
     'x86_64-pc-windows-msvc', '--release', 'uipilot-everything-installer.exe',
     'requestedExecutionLevel', 'asInvoker', 'VmInstrumentedSetup',
-    'target\vm-instrumented', 'installer-helper-build,fault-injection'
+    'target\vm-instrumented', 'installer-helper-build,fault-injection',
+    'ProductionBundleInput', 'VmInstrumentedBundleInput'
 )
-Assert-SourceContains $tauri @('"installMode": "perMachine"', '"installerHooks"', '"template"')
-Assert-SourceContains $vmTauri @('VM Instrumented Setup', 'vm-instrumented')
+Assert-SourceContains $package @('stage:managed-everything:production', 'stage:managed-everything:vm')
+Assert-SourceContains $tauri @(
+    '"installMode": "perMachine"', '"installerHooks"', '"template"',
+    '"beforeBundleCommand": "npm run stage:managed-everything:production"'
+)
+Assert-SourceContains $vmTauri @(
+    'VM Instrumented Setup', 'vm-instrumented',
+    '"beforeBundleCommand": "npm run stage:managed-everything:vm"'
+)
+$hooksSource = Get-Content -LiteralPath $hooks -Raw -Encoding utf8
+Assert-Condition (-not $hooksSource.Contains('x86_64-pc-windows-msvc\release\uipilot-everything-installer.exe')) 'NSIS must consume the late-staged Helper from its own final release target'
 
 $allInstallerSources = @(
     Get-ChildItem -LiteralPath $helperRoot -File
@@ -641,16 +687,14 @@ Assert-Condition ($normalizedHash -ceq $expectedBaselineHash) 'Custom installer 
 $productionHelper = Join-Path $root 'src-tauri\target\release\uipilot-everything-installer.exe'
 Assert-Condition (Test-Path -LiteralPath $productionHelper -PathType Leaf) 'Production Helper is required for Source artifact isolation checks'
 Assert-Condition ((Get-PeMachine $productionHelper) -eq 0x8664) 'Production Helper must be x64'
+Add-ManifestReader
+$productionManifest = [UiPilot.ManagedEverythingInstaller.ManifestReader]::Read($productionHelper)
+Assert-Condition ($productionManifest -match 'requestedExecutionLevel') 'Production Helper manifest is missing requestedExecutionLevel'
+Assert-Condition ($productionManifest -match 'level\s*=\s*["'']asInvoker["'']') 'Production Helper must be asInvoker'
+Assert-Condition ($productionManifest -match 'uiAccess\s*=\s*["'']false["'']') 'Production Helper must disable uiAccess'
 $productionStrings = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($productionHelper))
 Assert-Condition (-not $productionStrings.Contains('fault-injection:')) 'Production Helper contains VM fault-injection code'
 $installedHelperCopies = @(Get-ChildItem (Join-Path $root 'src-tauri\target\release\resources') -Recurse -Filter 'uipilot-everything-installer.exe' -File -ErrorAction SilentlyContinue)
 Assert-Condition ($installedHelperCopies.Count -eq 0) 'Helper must not be copied into installed runtime resources'
-
-$productionBundleRoot = Join-Path $root 'src-tauri\target\release\bundle\nsis'
-Assert-Condition (Test-Path -LiteralPath $productionBundleRoot -PathType Container) 'Production bundle directory is required for Source artifact isolation checks'
-$setups = @(Get-ChildItem $productionBundleRoot -Filter '*.exe' -File)
-Assert-Condition ($setups.Count -eq 1) 'Production bundle directory must contain exactly one Setup'
-Assert-Condition (-not $setups[0].Name.Contains('VM Instrumented')) 'VM Instrumented Setup leaked into the production bundle path'
-Assert-Condition ((Get-PeMachine $setups[0].FullName) -eq 0x014c) 'NSIS Setup must be a valid x86 bootstrapper PE for the x64 payload'
 
 Write-Output 'MANAGED_EVERYTHING_INSTALLER_SOURCE_PASS'

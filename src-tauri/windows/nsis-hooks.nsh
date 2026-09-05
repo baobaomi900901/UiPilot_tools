@@ -151,11 +151,7 @@ Var UiPilotRecoveryId
   StrCpy $UiPilotRequest "$UiPilotStaging\request.json"
   StrCpy $UiPilotJournal "$UiPilotStaging\journal.json"
   SetOutPath "$UiPilotStaging"
-  !if "${PRODUCTNAME}" == "UiPilot_tools VM Instrumented Setup"
-    File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\..\x86_64-pc-windows-msvc\release\uipilot-everything-installer.exe"
-  !else
-    File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"
-  !endif
+  File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"
   FileOpen $R6 "$UiPilotJournal" w
   FileClose $R6
   System::Call 'kernel32::GetCurrentProcessId() i .UiPilotParentPid'

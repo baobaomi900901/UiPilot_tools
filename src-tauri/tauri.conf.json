@@ -8,7 +8,8 @@
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:14321",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build && npm run build:managed-everything"
+    "beforeBuildCommand": "npm run build && npm run build:managed-everything",
+    "beforeBundleCommand": "npm run stage:managed-everything:production"
   },
   "app": {
     "withGlobalTauri": false,

@@ -141,6 +141,27 @@ function Invoke-ProductionHelperBuild {
     }
 }
 
+function Invoke-ProductionNsisBuild {
+    $build = Invoke-CapturedCommand 'npm.cmd' @('run', 'tauri', '--', 'build', '--bundles', 'nsis')
+    if ($build.ExitCode -ne 0) { return $build }
+    try {
+        $helper = Join-Path $script:RepositoryRoot 'src-tauri\target\release\uipilot-everything-installer.exe'
+        Assert-Condition (Test-Path -LiteralPath $helper -PathType Leaf) 'Final production NSIS Helper input is missing'
+        Assert-Condition ((Get-PeMachine $helper) -eq 0x8664) 'Final production NSIS Helper input is not x64'
+        Add-ManifestReader
+        $manifest = [UiPilot.ManagedEverythingRelease.ManifestReader]::Read($helper)
+        Assert-Condition ($manifest -match 'requestedExecutionLevel') 'Final production NSIS Helper manifest is missing requestedExecutionLevel'
+        Assert-Condition ($manifest -match 'level\s*=\s*["'']asInvoker["'']') 'Final production NSIS Helper is not asInvoker'
+        Assert-Condition ($manifest -match 'uiAccess\s*=\s*["'']false["'']') 'Final production NSIS Helper enables uiAccess'
+        $strings = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($helper))
+        Assert-Condition (-not $strings.Contains('fault-injection:')) 'Final production NSIS Helper contains the VM fault path'
+        return [pscustomobject]@{ ExitCode = 0; Output = (([string]$build.Output) + "`r`nfinal-helper-inspection:pass") }
+    }
+    catch {
+        return [pscustomobject]@{ ExitCode = 1; Output = (([string]$build.Output) + "`r`nfinal-helper-inspection:fail") }
+    }
+}
+
 function Invoke-FrontendGate {
     $tests = Invoke-CapturedCommand 'npm.cmd' @('test')
     if ($tests.ExitCode -ne 0) { return $tests }
@@ -180,7 +201,7 @@ function New-ReleaseStages {
         },
         [pscustomobject]@{
             Name = 'Production NSIS'
-            Action = { Invoke-CapturedCommand 'npm.cmd' @('run', 'tauri', '--', 'build', '--bundles', 'nsis') }
+            Action = { Invoke-ProductionNsisBuild }
         }
     )
 }
@@ -236,12 +257,23 @@ function Write-SetupHashEvidence([string]$Directory) {
     Assert-Condition ($setups.Count -eq 1) 'Production bundle must contain exactly one Setup'
     Assert-Condition (-not $setups[0].Name.Contains('VM Instrumented')) 'VM Instrumented Setup leaked into production output'
     Assert-Condition ((Get-PeMachine $setups[0].FullName) -eq 0x014c) 'Production NSIS Setup has the wrong bootstrap architecture'
+    $helper = Join-Path $script:RepositoryRoot 'src-tauri\target\release\uipilot-everything-installer.exe'
+    Assert-Condition (Test-Path -LiteralPath $helper -PathType Leaf) 'Final production NSIS Helper input is missing'
+    Assert-Condition ((Get-PeMachine $helper) -eq 0x8664) 'Final production NSIS Helper input is not x64'
+    Add-ManifestReader
+    $manifest = [UiPilot.ManagedEverythingRelease.ManifestReader]::Read($helper)
+    Assert-Condition ($manifest -match 'level\s*=\s*["'']asInvoker["'']') 'Final production NSIS Helper is not asInvoker'
+    Assert-Condition ($manifest -match 'uiAccess\s*=\s*["'']false["'']') 'Final production NSIS Helper enables uiAccess'
+    $helperStrings = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($helper))
+    Assert-Condition (-not $helperStrings.Contains('fault-injection:')) 'Final production NSIS Helper contains the VM fault path'
     $evidence = [ordered]@{
         schema_version = 1
         kind = 'production-setup'
         setup_count = 1
         sha256 = (Get-FileHash -LiteralPath $setups[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         length = [long]$setups[0].Length
+        helper_sha256 = (Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash.ToLowerInvariant()
+        helper_length = [long](Get-Item -LiteralPath $helper).Length
         vm_instrumented = $false
     } | ConvertTo-Json
     Assert-ReleaseTextRedacted $evidence
@@ -269,6 +301,15 @@ function Invoke-SourceGate {
     Assert-Condition ([regex]::Matches($matrix, '(?m)^## Row (?:[1-9]|1[0-3])\b').Count -eq 13) 'Release matrix must contain exactly 13 rows'
     Assert-Condition $matrix.Contains('BLOCKED: Instrumented Setup termination/recovery interface missing') 'Release matrix hides the Row 8 interface blocker'
     Assert-Condition $matrix.Contains('BLOCKED: Instrumented Setup concurrency-control interface missing') 'Release matrix hides the Row 13 interface blocker'
+    $installerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'test-managed-everything-installer.ps1') -Raw -Encoding utf8
+    Assert-Condition (-not $installerSource.Contains("'src-tauri\target\release\bundle\nsis'")) 'Installer Source must not depend on a pre-existing production Setup'
+    $productionNsisAction = 'Action = { Invoke-' + 'ProductionNsisBuild }'
+    $helperHashField = 'helper_' + 'sha256 ='
+    Assert-Condition $source.Contains($productionNsisAction) 'Production NSIS stage must inspect the final Helper after Tauri builds it'
+    Assert-Condition $source.Contains($helperHashField) 'Production Setup evidence must bind the final Helper identity'
+    $pipelineIndex = $source.IndexOf('$pipeline = Invoke-ReleasePipeline', [StringComparison]::Ordinal)
+    $setupEvidenceIndex = $source.IndexOf('try { Write-SetupHashEvidence', [StringComparison]::Ordinal)
+    Assert-Condition ($pipelineIndex -ge 0 -and $setupEvidenceIndex -gt $pipelineIndex) 'Production Setup inspection must run only after the NSIS stage succeeds'
     Write-Output 'MANAGED_EVERYTHING_RELEASE_SOURCE_PASS'
 }
 

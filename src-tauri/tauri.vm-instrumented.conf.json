@@ -3,7 +3,8 @@
   "productName": "UiPilot_tools VM Instrumented Setup",
   "identifier": "com.uipilot.launcher.vm-instrumented",
   "build": {
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "npm run stage:managed-everything:vm"
   },
   "bundle": {
     "targets": ["nsis"],
