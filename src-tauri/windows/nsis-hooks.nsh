@@ -19,6 +19,7 @@ Var UiPilotParentPid
 Var UiPilotParentCreationTime
 Var UiPilotHelperExit
 Var UiPilotRecoveryId
+Var UiPilotOwnerSid
 
 !macro UIPILOT_LOCAL_FREE POINTER
   ${If} ${POINTER} != 0
@@ -59,6 +60,11 @@ Var UiPilotRecoveryId
   ${EndIf}
   System::Alloc 12
   Pop $R9
+  ${If} $R9 = 0
+    !insertmacro UIPILOT_LOCAL_FREE $R8
+    MessageBox MB_ICONSTOP "The installer could not allocate a protected transaction."
+    Abort
+  ${EndIf}
   System::Call '*$R9(i 12, p $R8, i 0)'
 !macroend
 
@@ -69,8 +75,74 @@ Var UiPilotRecoveryId
   ${EndIf}
 !macroend
 
+!macro UIPILOT_RESOLVE_TOKEN_USER_SID
+  StrCpy $UiPilotOwnerSid ""
+  StrCpy $R4 ""
+  StrCpy $R5 0
+  StrCpy $R8 0
+  System::Call 'advapi32::OpenProcessToken(p -1, i 8, *p .R5) i .R6'
+  ${If} $R6 != 0
+    StrCpy $R7 0
+    System::Call 'kernel32::SetLastError(i 0)'
+    System::Call 'advapi32::GetTokenInformation(p R5, i 1, p 0, i 0, *i .R7) i .R6'
+    System::Call 'kernel32::GetLastError() i .R9'
+    ${If} $R6 = 0
+    ${AndIf} $R9 = 122
+    ${AndIf} $R7 > 0
+      System::Alloc $R7
+      Pop $R8
+      ${If} $R8 != 0
+        System::Call 'advapi32::GetTokenInformation(p R5, i 1, p R8, i R7, *i .R9) i .R6'
+        ${If} $R6 != 0
+          System::Call '*$R8(p .R9)'
+          ${If} $R9 != 0
+            StrCpy $R6 0
+            System::Call 'advapi32::ConvertSidToStringSidW(p R9, *p .R6) i .R7'
+            ${If} $R7 != 0
+            ${AndIf} $R6 != 0
+              System::Call 'kernel32::lstrcpynW(w .R4, p R6, i ${NSIS_MAX_STRLEN}) p'
+            ${EndIf}
+            ${If} $R6 != 0
+              System::Call 'kernel32::LocalFree(p R6)'
+            ${EndIf}
+          ${EndIf}
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${If} $R8 != 0
+    System::Free $R8
+  ${EndIf}
+  ${If} $R5 != 0
+    System::Call 'kernel32::CloseHandle(p R5)'
+  ${EndIf}
+  StrCpy $UiPilotOwnerSid $R4
+  ${If} $UiPilotOwnerSid == ""
+    MessageBox MB_ICONSTOP "The installer token owner could not be resolved."
+    Abort
+  ${EndIf}
+!macroend
+
+!macro UIPILOT_SET_STAGING_FILE_OWNER PATH
+  StrCpy $R8 0
+  System::Call 'advapi32::ConvertStringSidToSidW(w "$UiPilotOwnerSid", *p .R8) i .R7'
+  ${If} $R7 = 0
+  ${OrIf} $R8 = 0
+    !insertmacro UIPILOT_LOCAL_FREE $R8
+    MessageBox MB_ICONSTOP "A protected staging file owner could not be prepared."
+    Abort
+  ${EndIf}
+  System::Call 'advapi32::SetNamedSecurityInfoW(w ${PATH}, i 1, i 1, p R8, p 0, p 0, p 0) i .R6'
+  !insertmacro UIPILOT_LOCAL_FREE $R8
+  ${If} $R6 != 0
+    MessageBox MB_ICONSTOP "A protected staging file owner could not be applied."
+    Abort
+  ${EndIf}
+!macroend
+
 !macro UIPILOT_ACQUIRE_LEASE
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
+  System::Call 'kernel32::SetLastError(i 0)'
   System::Call 'kernel32::CreateMutexW(p R9, i 0, w "${UIPILOT_MUTEX_NAME}") p .R5'
   System::Call 'kernel32::GetLastError() i .R6'
   StrCpy $UiPilotMutexHandle $R5
@@ -110,6 +182,7 @@ Var UiPilotRecoveryId
     Abort
   ${EndIf}
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
+  System::Call 'kernel32::SetLastError(i 0)'
   System::Call 'kernel32::CreateEventW(p R9, i 1, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5'
   System::Call 'kernel32::GetLastError() i .R6'
   StrCpy $UiPilotActivityHandle $R5
@@ -151,7 +224,8 @@ Var UiPilotRecoveryId
     ${StrCase} $UiPilotOperationId $UiPilotOperationId "L"
   !endif
   StrCpy $UiPilotStaging "$R4\Temp\UiPilotManagedEverything-$UiPilotOperationId"
-  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_STAGING_SDDL}"
+  !insertmacro UIPILOT_RESOLVE_TOKEN_USER_SID
+  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "O:$UiPilotOwnerSid${UIPILOT_STAGING_SDDL}"
   System::Call 'kernel32::CreateDirectoryW(w "$UiPilotStaging", p R9) i .R6'
   !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES
   ${If} $R6 = 0
@@ -163,8 +237,10 @@ Var UiPilotRecoveryId
   StrCpy $UiPilotJournal "$UiPilotStaging\journal.json"
   SetOutPath "$UiPilotStaging"
   File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"
+  !insertmacro UIPILOT_SET_STAGING_FILE_OWNER "$UiPilotHelper"
   FileOpen $R6 "$UiPilotJournal" w
   FileClose $R6
+  !insertmacro UIPILOT_SET_STAGING_FILE_OWNER "$UiPilotJournal"
   System::Call 'kernel32::GetCurrentProcessId() i .R5'
   StrCpy $UiPilotParentPid $R5
   System::Call 'kernel32::GetProcessTimes(p -1, *l .R5, *l .R6, *l .R7, *l .R8) i .R9'
@@ -203,6 +279,7 @@ Var UiPilotRecoveryId
     FileWrite $R8 ',$\"recovered_transaction_id$\":null}'
   !endif
   FileClose $R8
+  !insertmacro UIPILOT_SET_STAGING_FILE_OWNER "$UiPilotRequest"
 !macroend
 
 !macro UIPILOT_RUN_HELPER ACTION INSTALL_DIR RECOVERED_ID UNINSTALL

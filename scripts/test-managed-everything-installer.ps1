@@ -590,6 +590,11 @@ $knownFolderFunction = [regex]::Match((Get-Content -LiteralPath $helperWindows -
 Assert-Condition $knownFolderFunction.Success 'Helper known-folder function is missing'
 Assert-Condition $knownFolderFunction.Value.Contains('CoTaskMemFree') 'Helper known-folder buffer must use CoTaskMemFree'
 Assert-Condition (-not $knownFolderFunction.Value.Contains('LocalFree')) 'Helper known-folder buffer must not use LocalFree'
+$knownFolderDecision = $knownFolderFunction.Value.IndexOf('let path = if result < 0 || value.is_null()', [StringComparison]::Ordinal)
+$knownFolderGuard = $knownFolderFunction.Value.IndexOf('if !value.is_null()', [StringComparison]::Ordinal)
+$knownFolderFree = $knownFolderFunction.Value.IndexOf('CoTaskMemFree(value.cast())', [StringComparison]::Ordinal)
+$knownFolderReturn = $knownFolderFunction.Value.LastIndexOf('    path', [StringComparison]::Ordinal)
+Assert-Condition ($knownFolderDecision -ge 0 -and $knownFolderDecision -lt $knownFolderGuard -and $knownFolderGuard -lt $knownFolderFree -and $knownFolderFree -lt $knownFolderReturn) 'Helper known-folder buffer must be released on both success and failure before returning'
 Assert-SourceContains (Join-Path $helperRoot 'transaction.rs') @(
     'StageNewBinary', 'StopOldService', 'RemoveOldService', 'InstallNewService',
     'StartNewService', 'ReplaceRuntimeManifest', 'CleanupUnreferencedVersions',
@@ -604,6 +609,9 @@ Assert-SourceContains $hooks @(
     '!insertmacro UIPILOT_RUN_HELPER "pre-uninstall" "no" "yes" "yes"',
     '${StrCase} $UiPilotOperationId $UiPilotOperationId "L"',
     '${UnStrCase} $UiPilotOperationId $UiPilotOperationId "L"',
+    'OpenProcessToken', 'GetTokenInformation', 'ConvertSidToStringSidW',
+    'ConvertStringSidToSidW', 'SetNamedSecurityInfoW',
+    'O:$UiPilotOwnerSid${UIPILOT_STAGING_SDDL}',
     'File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"'
 )
 Assert-SourceContains $template @(
@@ -663,7 +671,20 @@ $baselineText = Get-Content -LiteralPath $baseline -Raw -Encoding utf8
 $customText = Get-Content -LiteralPath $template -Raw -Encoding utf8
 $pageLeaveReinstall = [regex]::Match($customText, '(?ms)^Function PageLeaveReinstall\r?\n.*?^FunctionEnd\r?\n')
 Assert-Condition $pageLeaveReinstall.Success 'Could not locate the custom reinstall leave function'
-Assert-Condition (-not $pageLeaveReinstall.Value.Contains('WiX migration retains the upstream explicit migration behavior')) 'WiX upgrade/downgrade must not invoke the old uninstaller'
+$reinstallDecision = $pageLeaveReinstall.Value.Substring(0, $pageLeaveReinstall.Value.IndexOf('reinst_uninstall:', [StringComparison]::Ordinal))
+Assert-Condition (-not $reinstallDecision.Contains('$WixMode')) 'WiX upgrade/downgrade must not select the old uninstaller before the explicit same-version uninstall branch'
+Assert-OrderedUniqueTokens $reinstallDecision @(
+    '${If} $UpdateMode = 1',
+    '${If} $R0 = 0',
+    '${If} $R1 = 1',
+    '${Else}',
+    'Goto reinst_uninstall',
+    '${ElseIf} $R0 = 1',
+    '${ElseIf} $R0 = -1'
+) 'Update, reinstall, upgrade, and downgrade decisions must preserve the approved in-place ordering'
+$explicitUninstall = $pageLeaveReinstall.Value.Substring($pageLeaveReinstall.Value.IndexOf('reinst_uninstall:', [StringComparison]::Ordinal))
+Assert-Condition ($explicitUninstall.IndexOf('Quit', [StringComparison]::Ordinal) -gt 0) 'Explicit same-version uninstall must terminate the installer'
+Assert-Condition ($explicitUninstall.IndexOf('Quit', [StringComparison]::Ordinal) -lt $explicitUninstall.IndexOf('reinst_done:', [StringComparison]::Ordinal)) 'Explicit same-version uninstall must quit before the install continuation label'
 $uninstallSection = [regex]::Match($customText, '(?ms)^Section Uninstall\r?\n.*?^SectionEnd\r?\n')
 Assert-Condition $uninstallSection.Success 'Could not locate the custom uninstall section'
 Assert-OrderedUniqueTokens $uninstallSection.Value @(

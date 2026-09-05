@@ -515,14 +515,15 @@ pub enum VersionDirectoryDeletionStep {
 pub fn version_directory_deletion_plan(
     entries: &[&str],
 ) -> Result<Vec<VersionDirectoryDeletionStep>, &'static str> {
-    if entries != ["Everything.exe"] {
-        return Err("foreign-version-directory-entry");
+    match entries {
+        [] => Ok(vec![VersionDirectoryDeletionStep::RemoveDirectory]),
+        ["Everything.exe"] => Ok(vec![
+            VersionDirectoryDeletionStep::ValidateBinary,
+            VersionDirectoryDeletionStep::DeleteBinary,
+            VersionDirectoryDeletionStep::RemoveDirectory,
+        ]),
+        _ => Err("foreign-version-directory-entry"),
     }
-    Ok(vec![
-        VersionDirectoryDeletionStep::ValidateBinary,
-        VersionDirectoryDeletionStep::DeleteBinary,
-        VersionDirectoryDeletionStep::RemoveDirectory,
-    ])
 }
 
 pub fn validated_persisted_execution<T, E>(
@@ -1742,8 +1743,11 @@ mod tests {
                 VersionDirectoryDeletionStep::RemoveDirectory,
             ])
         );
+        assert_eq!(
+            version_directory_deletion_plan(&[]),
+            Ok(vec![VersionDirectoryDeletionStep::RemoveDirectory])
+        );
         for entries in [
-            Vec::<&str>::new(),
             vec!["everything.exe"],
             vec!["Everything.exe", "foreign.txt"],
             vec!["Everything.exe", "subdirectory"],

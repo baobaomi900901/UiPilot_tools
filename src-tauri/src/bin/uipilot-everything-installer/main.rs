@@ -355,9 +355,26 @@ fn service_matches(manifest: &RuntimeManifest) -> HelperResult<bool> {
     }
 }
 
+fn validate_fresh_service_state(state: ServiceState) -> HelperResult<()> {
+    match state {
+        ServiceState::Absent => Ok(()),
+        ServiceState::Running(_) | ServiceState::Stopped(_) => {
+            fail(ExitCode::ForeignState, "foreign-service-without-manifest")
+        }
+    }
+}
+
+fn ensure_fresh_service_absent() -> HelperResult<()> {
+    let state = windows::query_service().map_err(|reason| (ExitCode::NativeFailure, reason))?;
+    validate_fresh_service_state(state)
+}
+
 fn prepare_install(request: &Request) -> HelperResult<()> {
     let root = windows::managed_root().map_err(|reason| (ExitCode::NativeFailure, reason))?;
     let root_present = managed_path_is_present(&root)?;
+    if !root_present {
+        ensure_fresh_service_absent()?;
+    }
     if root_present {
         windows::verify_managed_root(&root).map_err(|reason| (ExitCode::ForeignState, reason))?;
     }
@@ -383,6 +400,7 @@ fn prepare_install(request: &Request) -> HelperResult<()> {
                 Some(manifest)
             }
             None => {
+                ensure_fresh_service_absent()?;
                 let entries = fs::read_dir(&root)
                     .map_err(|_| (ExitCode::ForeignState, "managed-root-read-failed".into()))?
                     .map(|entry| {
@@ -488,6 +506,7 @@ fn recover_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()
         converge_transaction(&root, &durable)?;
         remove_transaction_artifacts(&root, &durable.transaction_id)?;
     } else {
+        ensure_fresh_service_absent()?;
         if request.recovered_transaction_id.is_some() {
             return fail(
                 ExitCode::ForeignState,
@@ -613,6 +632,9 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
     lease
         .ensure_parent_alive()
         .map_err(|reason| (ExitCode::AdmissionDenied, reason))?;
+    if staging.old_manifest.is_none() {
+        ensure_fresh_service_absent()?;
+    }
     if !managed_path_is_present(&program_data_root)? {
         let parent = program_data_root
             .parent()
@@ -805,8 +827,8 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
     })();
     if let Err(original) = result {
         if let Ok(outcome) = converge_transaction(&program_data_root, &durable) {
-            if remove_transaction_artifacts(&program_data_root, &durable.transaction_id).is_ok()
-                && outcome == ConvergenceOutcome::FinishedForward
+            if commit_failure_may_remove_artifacts(outcome)
+                && remove_transaction_artifacts(&program_data_root, &durable.transaction_id).is_ok()
             {
                 return Ok(());
             }
@@ -814,6 +836,10 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         return Err(original);
     }
     Ok(())
+}
+
+fn commit_failure_may_remove_artifacts(outcome: ConvergenceOutcome) -> bool {
+    outcome == ConvergenceOutcome::FinishedForward
 }
 
 fn same_version_repair_reuses_binary(
@@ -1552,6 +1578,23 @@ mod tests {
         changed.sha256 = "b".repeat(64);
         assert!(!same_version_repair_reuses_binary(Some(&old), &changed));
         assert!(!same_version_repair_reuses_binary(None, &old));
+    }
+
+    #[test]
+    fn fresh_install_accepts_only_an_absent_private_service() {
+        assert!(validate_fresh_service_state(ServiceState::Absent).is_ok());
+        assert!(validate_fresh_service_state(ServiceState::Running("foreign".into())).is_err());
+        assert!(validate_fresh_service_state(ServiceState::Stopped("foreign".into())).is_err());
+    }
+
+    #[test]
+    fn in_process_rollback_retains_artifacts_for_the_nsis_retry() {
+        assert!(!commit_failure_may_remove_artifacts(
+            ConvergenceOutcome::RolledBack
+        ));
+        assert!(commit_failure_may_remove_artifacts(
+            ConvergenceOutcome::FinishedForward
+        ));
     }
 }
 

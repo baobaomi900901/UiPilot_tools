@@ -860,14 +860,17 @@ unsafe fn wide_ptr_to_string(mut value: *const u16) -> String {
 fn known_folder(folder: &Guid) -> Result<PathBuf, String> {
     let mut value = null_mut();
     let result = unsafe { SHGetKnownFolderPath(folder, 0, null_mut(), &mut value) };
-    if result < 0 || value.is_null() {
-        return Err("known-folder-unavailable".into());
+    let path = if result < 0 || value.is_null() {
+        Err("known-folder-unavailable".into())
+    } else {
+        Ok(PathBuf::from(unsafe { wide_ptr_to_string(value) }))
+    };
+    if !value.is_null() {
+        unsafe {
+            CoTaskMemFree(value.cast());
+        }
     }
-    let path = unsafe { wide_ptr_to_string(value) };
-    unsafe {
-        CoTaskMemFree(value.cast());
-    }
-    Ok(PathBuf::from(path))
+    path
 }
 
 pub fn local_app_data() -> Result<PathBuf, String> {

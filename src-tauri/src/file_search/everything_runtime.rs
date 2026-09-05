@@ -421,7 +421,7 @@ pub(crate) trait RuntimeSystem: Send + Sync {
         resources: &VerifiedResources,
     ) -> Result<ExpectedService, RuntimeUnavailableReason>;
     fn acquire_runtime_mutex(&self) -> Result<Self::Guard, RuntimeUnavailableReason>;
-    fn private_window_pid(&self) -> Result<Option<u32>, RuntimeUnavailableReason>;
+    fn private_window_pids(&self) -> Result<Vec<u32>, RuntimeUnavailableReason>;
     fn orphan_is_managed(
         &self,
         pid: u32,
@@ -473,11 +473,18 @@ pub(crate) fn start_runtime_with<S: RuntimeSystem>(
     let expected_service = system.project_service(&resources)?;
     let guard = system.acquire_runtime_mutex()?;
     ensure_start_continues(deadline, cancelled)?;
-    if let Some(pid) = system.private_window_pid()? {
+    let private_window_pids = system.private_window_pids()?;
+    if private_window_pids.len() > 1 {
+        return Err(RuntimeUnavailableReason::ForeignProcess);
+    }
+    if let Some(pid) = private_window_pids.first().copied() {
         if !system.orphan_is_managed(pid, &resources)? {
             return Err(RuntimeUnavailableReason::ForeignProcess);
         }
         system.stop_orphan(pid, deadline)?;
+        if !system.private_window_pids()?.is_empty() {
+            return Err(RuntimeUnavailableReason::ForeignProcess);
+        }
     }
     ensure_start_continues(deadline, cancelled)?;
     let launch = system.prepare_launch(&resources)?;
@@ -743,8 +750,8 @@ impl RuntimeSystem for ProductionRuntimeSystem {
     fn acquire_runtime_mutex(&self) -> Result<Self::Guard, RuntimeUnavailableReason> {
         Err(RuntimeUnavailableReason::RuntimeAlreadyOwned)
     }
-    fn private_window_pid(&self) -> Result<Option<u32>, RuntimeUnavailableReason> {
-        Ok(None)
+    fn private_window_pids(&self) -> Result<Vec<u32>, RuntimeUnavailableReason> {
+        Ok(Vec::new())
     }
     fn orphan_is_managed(
         &self,
@@ -1124,7 +1131,7 @@ mod windows_runtime {
         FOLDERID_LocalAppData, FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+        FindWindowExW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
         SMTO_ERRORONEXIT, WM_USER,
     };
 
@@ -1239,8 +1246,8 @@ mod windows_runtime {
             })
         }
 
-        fn private_window_pid(&self) -> Result<Option<u32>, RuntimeUnavailableReason> {
-            private_window().map(|value| value.map(|(_, pid)| pid))
+        fn private_window_pids(&self) -> Result<Vec<u32>, RuntimeUnavailableReason> {
+            private_windows().map(|windows| windows.into_iter().map(|(_, pid)| pid).collect())
         }
 
         fn orphan_is_managed(
@@ -1282,7 +1289,11 @@ mod windows_runtime {
             if held_pid != pid {
                 return Err(RuntimeUnavailableReason::ForeignProcess);
             }
-            if let Some((window, actual_pid)) = private_window()? {
+            let windows = private_windows()?;
+            if windows.len() > 1 {
+                return Err(RuntimeUnavailableReason::ForeignProcess);
+            }
+            if let Some((window, actual_pid)) = windows.first().copied() {
                 if actual_pid != pid {
                     return Err(RuntimeUnavailableReason::ForeignProcess);
                 }
@@ -1673,17 +1684,21 @@ mod windows_runtime {
             .ok_or(RuntimeUnavailableReason::ProcessLaunchFailed)
     }
 
-    fn private_window() -> Result<Option<(HWND, u32)>, RuntimeUnavailableReason> {
+    fn private_windows() -> Result<Vec<(HWND, u32)>, RuntimeUnavailableReason> {
         let class = wide(OsStr::new(PRIVATE_EVERYTHING_WINDOW_CLASS));
-        let window = match unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) } {
-            Ok(window) => window,
-            Err(_) => return Ok(None),
-        };
-        let mut pid = 0u32;
-        if unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) } == 0 || pid == 0 {
-            return Err(RuntimeUnavailableReason::ForeignProcess);
+        let mut windows = Vec::new();
+        let mut after = None;
+        while let Ok(window) =
+            unsafe { FindWindowExW(None, after, PCWSTR(class.as_ptr()), PCWSTR::null()) }
+        {
+            let mut pid = 0u32;
+            if unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) } == 0 || pid == 0 {
+                return Err(RuntimeUnavailableReason::ForeignProcess);
+            }
+            windows.push((window, pid));
+            after = Some(window);
         }
-        Ok(Some((window, pid)))
+        Ok(windows)
     }
 
     fn process_image_path(handle: HANDLE) -> Result<PathBuf, ()> {
@@ -2491,8 +2506,9 @@ mod tests {
     struct PipelineSystem {
         events: Arc<Mutex<Vec<String>>>,
         failure: Option<RuntimeUnavailableReason>,
-        orphan_pid: Option<u32>,
+        orphan_pids: Mutex<Vec<u32>>,
         orphan_managed: bool,
+        orphan_stops: bool,
         service_running: bool,
         connect_failures: AtomicUsize,
         process: Arc<ProcessControl>,
@@ -2503,8 +2519,9 @@ mod tests {
             Self {
                 events: Arc::new(Mutex::new(Vec::new())),
                 failure: None,
-                orphan_pid: None,
+                orphan_pids: Mutex::new(Vec::new()),
                 orphan_managed: true,
+                orphan_stops: true,
                 service_running: true,
                 connect_failures: AtomicUsize::new(0),
                 process: Arc::new(ProcessControl::default()),
@@ -2550,9 +2567,9 @@ mod tests {
             }
         }
 
-        fn private_window_pid(&self) -> Result<Option<u32>, RuntimeUnavailableReason> {
+        fn private_window_pids(&self) -> Result<Vec<u32>, RuntimeUnavailableReason> {
             self.event("inspect-window");
-            Ok(self.orphan_pid)
+            Ok(self.orphan_pids.lock().unwrap().clone())
         }
 
         fn orphan_is_managed(
@@ -2570,6 +2587,12 @@ mod tests {
             _deadline: Instant,
         ) -> Result<(), RuntimeUnavailableReason> {
             self.event(format!("stop-orphan:{pid}"));
+            if self.orphan_stops {
+                self.orphan_pids
+                    .lock()
+                    .unwrap()
+                    .retain(|value| *value != pid);
+            }
             Ok(())
         }
 
@@ -2622,8 +2645,8 @@ mod tests {
 
     #[test]
     fn startup_pipeline_authenticates_and_stops_only_the_exact_managed_orphan() {
-        let mut system = PipelineSystem::new();
-        system.orphan_pid = Some(41);
+        let system = PipelineSystem::new();
+        *system.orphan_pids.lock().unwrap() = vec![41];
         let events = Arc::clone(&system.events);
         let mut runtime =
             start_runtime_with(&system, Instant::now() + Duration::from_secs(1), &|| false)
@@ -2638,6 +2661,7 @@ mod tests {
                 "inspect-window",
                 "authenticate-orphan:41",
                 "stop-orphan:41",
+                "inspect-window",
                 "prepare-launch",
                 "service-running",
                 "launch-process",
@@ -2760,7 +2784,7 @@ mod tests {
         }
 
         let mut foreign = PipelineSystem::new();
-        foreign.orphan_pid = Some(42);
+        *foreign.orphan_pids.lock().unwrap() = vec![42];
         foreign.orphan_managed = false;
         assert!(matches!(
             start_runtime_with(&foreign, Instant::now() + Duration::from_secs(1), &|| false,),
@@ -2772,6 +2796,46 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.starts_with("stop-orphan")));
+
+        let multiple = PipelineSystem::new();
+        *multiple.orphan_pids.lock().unwrap() = vec![42, 43];
+        assert!(matches!(
+            start_runtime_with(&multiple, Instant::now() + Duration::from_secs(1), &|| {
+                false
+            },),
+            Err(RuntimeUnavailableReason::ForeignProcess)
+        ));
+        assert!(!multiple
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("authenticate-orphan")));
+
+        let mut residual = PipelineSystem::new();
+        *residual.orphan_pids.lock().unwrap() = vec![42];
+        residual.orphan_stops = false;
+        assert!(matches!(
+            start_runtime_with(&residual, Instant::now() + Duration::from_secs(1), &|| {
+                false
+            },),
+            Err(RuntimeUnavailableReason::ForeignProcess)
+        ));
+        assert_eq!(
+            residual
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.as_str() == "inspect-window")
+                .count(),
+            2
+        );
+        assert!(!residual
+            .events
+            .lock()
+            .unwrap()
+            .contains(&"prepare-launch".into()));
 
         let mut stopped = PipelineSystem::new();
         stopped.service_running = false;

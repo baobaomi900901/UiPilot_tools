@@ -54,6 +54,42 @@ pub enum EverythingClientError {
     ClientClosed,
 }
 
+fn select_owned_window(
+    candidates: &[(usize, u32)],
+    expected_pid: u32,
+) -> Result<Option<usize>, EverythingClientError> {
+    match candidates {
+        [] => Ok(None),
+        [(window, actual_pid)] if expected_pid != 0 && *actual_pid == expected_pid => {
+            Ok(Some(*window))
+        }
+        _ => Err(EverythingClientError::IpcOwnerMismatch),
+    }
+}
+
+#[cfg(test)]
+mod owned_window_tests {
+    use super::*;
+
+    #[test]
+    fn owned_window_selection_requires_one_exact_pid() {
+        assert_eq!(select_owned_window(&[], 42), Ok(None));
+        assert_eq!(select_owned_window(&[(7, 42)], 42), Ok(Some(7)));
+        assert_eq!(
+            select_owned_window(&[(7, 41)], 42),
+            Err(EverythingClientError::IpcOwnerMismatch)
+        );
+        assert_eq!(
+            select_owned_window(&[(7, 42), (8, 43)], 42),
+            Err(EverythingClientError::IpcOwnerMismatch)
+        );
+        assert_eq!(
+            select_owned_window(&[(7, 42)], 0),
+            Err(EverythingClientError::IpcOwnerMismatch)
+        );
+    }
+}
+
 impl fmt::Display for EverythingClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -88,10 +124,13 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, FindWindowW, GetWindowThreadProcessId,
+    };
 
     use super::{
-        try_acquire_query_permit, EverythingClientError, EverythingQueryResult, EverythingQuerySpec,
+        select_owned_window, try_acquire_query_permit, EverythingClientError,
+        EverythingQueryResult, EverythingQuerySpec,
     };
     use crate::window::{self, WorkerCommand};
 
@@ -251,18 +290,22 @@ mod imp {
         }
         let started = Instant::now();
         loop {
-            if let Ok(hwnd) = unsafe { FindWindowW(class_name, PCWSTR::null()) } {
+            let mut candidates = Vec::new();
+            let mut after = None;
+            while let Ok(hwnd) = unsafe { FindWindowExW(None, after, class_name, PCWSTR::null()) } {
                 let bits = hwnd.0 as usize;
-                if bits != 0 {
-                    let mut actual_pid = 0;
-                    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual_pid)) } == 0 {
-                        return Err(EverythingClientError::IpcUnavailable);
-                    }
-                    if actual_pid != expected_pid {
-                        return Err(EverythingClientError::IpcOwnerMismatch);
-                    }
-                    return Ok(bits);
+                let mut actual_pid = 0;
+                if bits == 0
+                    || unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual_pid)) } == 0
+                    || actual_pid == 0
+                {
+                    return Err(EverythingClientError::IpcUnavailable);
                 }
+                candidates.push((bits, actual_pid));
+                after = Some(hwnd);
+            }
+            if let Some(window) = select_owned_window(&candidates, expected_pid)? {
+                return Ok(window);
             }
             if started.elapsed() >= timeout {
                 return Err(EverythingClientError::ConnectionTimedOut);
