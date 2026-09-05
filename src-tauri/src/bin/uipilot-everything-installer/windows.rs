@@ -83,10 +83,10 @@ const FOLDERID_PROGRAM_DATA: Guid = Guid::new(
     [0xA9, 0xDD, 0x07, 0x0D, 0x1D, 0x49, 0x5D, 0x97],
 );
 
-pub const STAGING_DACL_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
-pub const STAGING_FILE_DACL_SDDL: &str = "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)";
+pub const STAGING_DACL_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+pub const STAGING_FILE_DACL_SDDL: &str = "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)";
 pub const NAMED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
-pub const MANAGED_ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+pub const MANAGED_ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathPresence {
@@ -2114,11 +2114,12 @@ mod tests {
 
     #[test]
     fn security_descriptors_are_protected_and_exact() {
-        assert_eq!(STAGING_DACL_SDDL, "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)");
+        assert_eq!(STAGING_DACL_SDDL, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        assert_eq!(STAGING_FILE_DACL_SDDL, "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)");
         assert_eq!(NAMED_OBJECT_SDDL, "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)");
         assert_eq!(
             MANAGED_ROOT_SDDL,
-            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+            "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         );
     }
 
@@ -2139,21 +2140,21 @@ mod tests {
     fn managed_parent_and_staging_file_descriptors_are_compared_exactly() {
         assert!(managed_parent_descriptor_is_exact(MANAGED_ROOT_SDDL));
         assert!(!managed_parent_descriptor_is_exact(
-            "O:BAG:BAD:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+            "O:BAG:BAD:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         ));
         assert!(!managed_parent_descriptor_is_exact(
-            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GR;;;BU)"
+            "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)"
         ));
 
         assert!(staging_file_dacl_is_exact(STAGING_FILE_DACL_SDDL));
         assert!(!staging_file_dacl_is_exact(
-            "D:(A;ID;GA;;;SY)(A;ID;GA;;;BA)"
+            "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
         ));
         assert!(!staging_file_dacl_is_exact(
-            "D:AI(A;;GA;;;SY)(A;ID;GA;;;BA)"
+            "D:AI(A;;FA;;;SY)(A;ID;FA;;;BA)"
         ));
         assert!(!staging_file_dacl_is_exact(
-            "D:AI(A;ID;GA;;;SY)(A;ID;GA;;;BA)(A;ID;GR;;;BU)"
+            "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FR;;;BU)"
         ));
     }
 

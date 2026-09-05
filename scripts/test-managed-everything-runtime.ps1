@@ -30,7 +30,7 @@ Set-StrictMode -Version Latest
 $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $script:ArtifactRoot = Join-Path $script:RepositoryRoot 'artifacts\managed-everything'
 $script:DisposableMarkerText = 'UIPILOT_DISPOSABLE_VM=I_UNDERSTAND_THIS_MACHINE_WILL_BE_MUTATED'
-$script:ManagedObjectSddl = 'O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)'
+$script:ManagedObjectSddl = 'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
 $script:ExpectedManifestKeys = @(
     'architecture', 'desktop_user_sid', 'expanded_sddl', 'instance', 'pipe_name',
     'publisher', 'schema_version', 'service_binary_path', 'service_name', 'sha256', 'version'
