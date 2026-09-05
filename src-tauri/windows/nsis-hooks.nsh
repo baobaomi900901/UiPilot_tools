@@ -176,6 +176,7 @@ Var UiPilotOwnerSid
     Abort
   ${EndIf}
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
+  System::Call 'kernel32::SetLastError(i 0)'
   System::Call 'kernel32::CreateEventW(p R9, i 1, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5 ?e'
   Pop $R6
   StrCpy $UiPilotActivityHandle $R5

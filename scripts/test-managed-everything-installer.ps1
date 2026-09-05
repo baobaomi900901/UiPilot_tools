@@ -662,7 +662,7 @@ foreach ($atomicLastErrorPattern in @(
     '(?m)System::Call ''advapi32::GetTokenInformation\(p R5, i 1, p 0, i 0, \*i \.R7\) i \.R6 \?e''\r?\n\s+Pop \$R9',
     '(?m)System::Call ''kernel32::CreateMutexW\(p R9, i 0, w "\$\{UIPILOT_MUTEX_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6',
     '(?m)System::Call ''kernel32::OpenEventW\(i 1179648, i 0, w "\$\{UIPILOT_ACTIVITY_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6',
-    '(?m)System::Call ''kernel32::CreateEventW\(p R9, i 1, i 0, w "\$\{UIPILOT_ACTIVITY_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6'
+    '(?m)System::Call ''kernel32::SetLastError\(i 0\)''\r?\n\s+System::Call ''kernel32::CreateEventW\(p R9, i 1, i 0, w "\$\{UIPILOT_ACTIVITY_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6'
 )) {
     Assert-Condition ([regex]::IsMatch($hooksSource, $atomicLastErrorPattern)) 'NSIS must capture each Win32 LastError atomically before the System plug-in or NSIS instructions can overwrite it'
 }
