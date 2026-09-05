@@ -77,6 +77,15 @@ payload 编解码、文件结果协议、ResultRegistry 和路径认证边界保
 不接管、不覆盖也不删除该状态；唯一例外是“原生安装器 Helper 边界”中穷举定义、可认证为空的
 bootstrap residue。
 
+该清单只属于 elevated Helper 的安装、恢复和卸载信任边界。它与版本化 Service binary 继承 managed
+root 的 SY/BA-only DACL，标准用户 production runtime 不得 canonicalize、读取或打开这些对象。runtime
+先验证安装包内 reviewed lock 与客户端资源，再以 `FOLDERID_ProgramData`、lock 版本、固定常量和当前进程
+token 的 canonical user SID 构造只读 Service 期望投影：固定版本化 ImagePath、instance、pipe 和把当前
+SID 展开后的 SDDL。随后只通过 SCM 查询固定 Service name 的 ImagePath、完整参数和 Running 状态；任一
+字段不匹配都进入 Unavailable。SCM 或受保护 ProgramData 被管理员修改属于既有管理员信任边界，不以
+放宽 managed root ACL 作为运行时可读性的交换。第二用户投影出的 SID/SDDL 与首次安装 Service 参数不匹配，
+因此必须失败闭合。
+
 `${desktop_user_sid}` 是本文的运行时替换记号，不是 NSIS compile-time define。首装取得 canonical SID
 字符串后构造 `expanded_sddl`，先用 Windows security descriptor API 解析并核对 3 个 ACE，再传给
 Everything；清单只保存 canonical SID 与完整 `expanded_sddl`。
@@ -96,6 +105,8 @@ NSIS per-machine installer (elevated)
 UiPilot_tools.exe (interactive standard user)
   └─ EverythingRuntimeSupervisor
        ├─ resolve and verify packaged client binary
+       ├─ project expected Service identity from package lock + current SID
+       ├─ verify fixed Service configuration through SCM only
        ├─ create per-user config/database directory
        ├─ start hidden Everything -instance UiPilot
        ├─ own client with a Windows Job Object
@@ -319,25 +330,29 @@ Supervisor 启动步骤：
 
 1. 通过 Tauri Resource 目录解析 packaged `Everything.exe`，不搜索 `PATH` 或注册表。
 2. 验证资源 lock、SHA-256 和 Authenticode publisher。
-3. 取得当前 session 的 `Local\UiPilotEverythingRuntime` mutex。拿不到 mutex 时进入 Unavailable；同一
+3. 通过当前进程 token 取得 canonical user SID；以 `FOLDERID_ProgramData`、reviewed lock 版本和固定常量
+   构造预期 Service ImagePath 与展开后的 pipe SDDL。不得 canonicalize、读取或打开 SY/BA-only managed
+   root、`managed-runtime.json` 或版本化 Service binary。后续 SCM 查询必须精确匹配固定 Service name、
+   投影 ImagePath、`-svc`、instance、完整 pipe、展开 SDDL 和 Running；当前 SID 不同的第二用户因此失败闭合。
+4. 取得当前 session 的 `Local\UiPilotEverythingRuntime` mutex。拿不到 mutex 时进入 Unavailable；同一
    session 只有一个 owner 可以检查、配置和启动 private instance。
-4. 枚举 `EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)` 窗口并读取 HWND 所属 PID。若存在遗留实例，
+5. 枚举 `EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)` 窗口并读取 HWND 所属 PID。若存在遗留实例，
    只有 canonical executable、hash 和签名都匹配受管资源时才先发送 graceful quit 并有界等待，超时后
    终止精确 PID；身份不匹配时失败闭合。
-5. 在确认 private instance 已退出后，创建当前用户、当前 session 专属配置和数据库目录，并在每次启动
+6. 在确认 private instance 已退出后，创建当前用户、当前 session 专属配置和数据库目录，并在每次启动
    前从只读模板原子生成受管 INI；数据库保留，但 instance、pipe、网络入口、更新和 UI 行为不沿用
    用户修改值。session id 是目录组件前先解析为十进制 `u32`，不接受外部路径文本；同一账户的并发
    console/RDP session 不共享 DB 文件。
-6. 先创建启用 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows Job Object，再使用
+7. 先创建启用 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows Job Object，再使用
    `STARTUPINFOEX` 的 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 把该 Job 作为创建时属性传给
    `CreateProcessW(CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT)`。客户端参数固定为 private
    instance、完整 Service pipe、INI、DB 和 `-startup`。Job attribute 初始化或进程创建失败时没有可运行
    child，并进入 Unavailable；成功返回时 child 已原子属于 Job，随后才恢复主线程。不得采用
    `CreateProcessW` 返回后再 `AssignProcessToJobObject` 的两阶段顺序。
-7. `EverythingClient::connect_owned("UiPilot", expected_pid, ...)` 枚举同名 IPC 窗口，并用
+8. `EverythingClient::connect_owned("UiPilot", expected_pid, ...)` 枚举同名 IPC 窗口，并用
    `GetWindowThreadProcessId` 只接受 PID 等于 child PID 的 HWND；每次重连都重复验证，不使用启动前检查
    代替连接时身份绑定。
-8. 在 60 秒异步启动期限内验证 Service Running、owned IPC 可达、DB loaded，以及 Query2 probe 返回
+9. 在 60 秒异步启动期限内验证 owned IPC 可达、DB loaded，以及 Query2 probe 返回
    固定 request flags 和实际 date-modified sort。空索引是合法 Ready，`total` 只记录为诊断值。
 
 固定 INI 禁用托盘图标、更新提示、自更新、HTTP、ETP、FTP、全局快捷键和非 UiPilot 所需的网络入口。
@@ -386,7 +401,9 @@ Runtime 对外状态固定为：
   type 验证与并发拒绝、activity lease/父进程退出顺序、句柄固定 source 复制、真正
   卸载 manifest-last 幂等续跑、拒绝非受管路径、标准用户直接调用 Helper 失败和稳定退出码映射。
 - Runtime unit tests：异步启动、session mutex、只启动一次、owned HWND/PID、空索引 Ready、重启预算、
-  `PROC_THREAD_ATTRIBUTE_JOB_LIST` 创建时所有权、未知进程拒绝和 shutdown ordering。
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST` 创建时所有权、未知进程拒绝和 shutdown ordering；另验证 production
+  模块不引用受保护 manifest/binary 打开路径，当前 SID 投影只接受同 path/args/expanded SDDL 的 SCM 配置，
+  不同 SID 失败闭合。
 - Backend tests：生产只使用 Supervisor 提供的 owned client，runtime 未 Ready 时返回稳定 unavailable；
   client 重启后旧结果在下一次查询 admission 前仍通过现有路径认证执行；`begin_query` 立即退役旧集合，
   后端失败时保持为空，成功时发布新 ResultSet。

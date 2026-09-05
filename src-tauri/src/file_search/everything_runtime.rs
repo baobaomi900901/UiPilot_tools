@@ -20,7 +20,9 @@ const RESOURCE_SUBDIRECTORY: &str = r"resources\everything";
 const EXECUTABLE_FILE_NAME: &str = "Everything.exe";
 const LOCK_FILE_NAME: &str = "everything.lock.json";
 const TEMPLATE_FILE_NAME: &str = "Everything-UiPilot.ini";
-const MANAGED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+const MANAGED_RELATIVE_ROOT: &str = r"UiPilot_tools\everything";
+const PIPE_SDDL_TEMPLATE: &str =
+    "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;${desktop_user_sid})";
 const REVIEWED_LOCK_BYTES: &[u8] =
     include_bytes!("../../resources/everything/everything.lock.json");
 const REVIEWED_INI_BYTES: &[u8] =
@@ -40,22 +42,6 @@ pub(crate) struct ReviewedLock {
     license: String,
     license_url: String,
     license_sha256: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RuntimeManifest {
-    schema_version: u32,
-    version: String,
-    architecture: String,
-    sha256: String,
-    publisher: String,
-    instance: String,
-    service_name: String,
-    pipe_name: String,
-    desktop_user_sid: String,
-    expanded_sddl: String,
-    service_binary_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -113,62 +99,37 @@ pub(crate) fn parse_reviewed_lock(bytes: &[u8]) -> Result<ReviewedLock, RuntimeU
     Ok(lock)
 }
 
-pub(crate) fn parse_runtime_manifest(
-    bytes: &[u8],
-    lock: &ReviewedLock,
-) -> Result<RuntimeManifest, RuntimeUnavailableReason> {
-    let manifest: RuntimeManifest =
-        serde_json::from_slice(bytes).map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-    let sid_is_canonical = manifest.desktop_user_sid.starts_with("S-1-")
-        && manifest.desktop_user_sid.len() <= 184
-        && manifest.desktop_user_sid.split('-').skip(2).all(|part| {
+#[derive(Debug)]
+pub(crate) struct ExpectedService {
+    service_binary_path: PathBuf,
+    expanded_sddl: String,
+}
+
+fn canonical_sid(value: &str) -> bool {
+    value.starts_with("S-1-")
+        && value.len() <= 184
+        && value.split('-').skip(2).all(|part| {
             !part.is_empty()
                 && part.bytes().all(|byte| byte.is_ascii_digit())
                 && (part == "0" || !part.starts_with('0'))
-        });
-    let expected_sddl = format!(
-        "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;{})",
-        manifest.desktop_user_sid
-    );
-    if manifest.schema_version != 1
-        || manifest.version != lock.version
-        || manifest.architecture != lock.architecture
-        || manifest.sha256 != lock.everything_exe_sha256
-        || manifest.publisher != lock.authenticode_publisher
-        || manifest.instance != INSTANCE_NAME
-        || manifest.service_name != SERVICE_NAME
-        || manifest.pipe_name != PIPE_NAME
-        || !sid_is_canonical
-        || manifest.expanded_sddl != expected_sddl
-        || manifest
-            .service_binary_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            != Some(EXECUTABLE_FILE_NAME)
-    {
-        return Err(RuntimeUnavailableReason::InvalidManifest);
+        })
+}
+
+pub(crate) fn project_expected_service(
+    program_data: &Path,
+    lock: &ReviewedLock,
+    current_user_sid: &str,
+) -> Result<ExpectedService, RuntimeUnavailableReason> {
+    if !canonical_sid(current_user_sid) {
+        return Err(RuntimeUnavailableReason::ServiceUnavailable);
     }
-    Ok(manifest)
-}
-
-fn validate_manifest_binary_layout(
-    managed_root: &Path,
-    version: &str,
-    version_directory: &Path,
-    binary: &Path,
-    version_directory_is_reparse: bool,
-    binary_is_reparse: bool,
-) -> bool {
-    !version_directory_is_reparse
-        && !binary_is_reparse
-        && version_directory.parent() == Some(managed_root)
-        && version_directory.file_name().and_then(|name| name.to_str()) == Some(version)
-        && binary.parent() == Some(version_directory)
-        && binary.file_name().and_then(|name| name.to_str()) == Some(EXECUTABLE_FILE_NAME)
-}
-
-fn managed_descriptor_is_exact(descriptor: &str) -> bool {
-    descriptor == MANAGED_OBJECT_SDDL
+    Ok(ExpectedService {
+        service_binary_path: program_data
+            .join(MANAGED_RELATIVE_ROOT)
+            .join(&lock.version)
+            .join(EXECUTABLE_FILE_NAME),
+        expanded_sddl: PIPE_SDDL_TEMPLATE.replace("${desktop_user_sid}", current_user_sid),
+    })
 }
 
 pub(crate) fn managed_ini_bytes(bytes: &[u8]) -> Result<Vec<u8>, RuntimeUnavailableReason> {
@@ -211,7 +172,6 @@ pub(crate) enum EverythingRuntimeStatus {
 pub(crate) enum RuntimeUnavailableReason {
     RuntimeAlreadyOwned,
     InvalidResource,
-    InvalidManifest,
     ForeignProcess,
     ServiceUnavailable,
     ProcessLaunchFailed,
@@ -421,27 +381,16 @@ impl VerifiedResources {
     }
 }
 
-pub(crate) struct ValidatedManifest {
-    manifest: RuntimeManifest,
-}
-
-impl ValidatedManifest {
+impl ExpectedService {
     #[cfg(test)]
     fn for_test() -> Self {
         let resources = VerifiedResources::for_test();
-        let bytes = format!(
-            r#"{{"schema_version":1,"version":"{}","architecture":"x64","sha256":"{}","publisher":{},"instance":"{}","service_name":"{}","pipe_name":{},"desktop_user_sid":"S-1-5-21-1-2-3-1001","expanded_sddl":"D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;S-1-5-21-1-2-3-1001)","service_binary_path":"C:\\ProgramData\\UiPilot_tools\\everything\\{}\\Everything.exe"}}"#,
-            resources.lock.version,
-            resources.lock.everything_exe_sha256,
-            serde_json::to_string(&resources.lock.authenticode_publisher).unwrap(),
-            INSTANCE_NAME,
-            SERVICE_NAME,
-            serde_json::to_string(PIPE_NAME).unwrap(),
-            resources.lock.version,
-        );
-        Self {
-            manifest: parse_runtime_manifest(bytes.as_bytes(), &resources.lock).unwrap(),
-        }
+        project_expected_service(
+            Path::new(r"C:\ProgramData"),
+            &resources.lock,
+            "S-1-5-21-1-2-3-1001",
+        )
+        .unwrap()
     }
 }
 
@@ -467,10 +416,10 @@ pub(crate) trait RuntimeSystem: Send + Sync {
     type Process: OwnedRuntimeProcess + 'static;
 
     fn verify_resources(&self) -> Result<VerifiedResources, RuntimeUnavailableReason>;
-    fn verify_manifest(
+    fn project_service(
         &self,
         resources: &VerifiedResources,
-    ) -> Result<ValidatedManifest, RuntimeUnavailableReason>;
+    ) -> Result<ExpectedService, RuntimeUnavailableReason>;
     fn acquire_runtime_mutex(&self) -> Result<Self::Guard, RuntimeUnavailableReason>;
     fn private_window_pid(&self) -> Result<Option<u32>, RuntimeUnavailableReason>;
     fn orphan_is_managed(
@@ -485,7 +434,7 @@ pub(crate) trait RuntimeSystem: Send + Sync {
     ) -> Result<RuntimeLaunch, RuntimeUnavailableReason>;
     fn service_is_running(
         &self,
-        manifest: &ValidatedManifest,
+        expected: &ExpectedService,
     ) -> Result<bool, RuntimeUnavailableReason>;
     fn launch_process(
         &self,
@@ -521,7 +470,7 @@ pub(crate) fn start_runtime_with<S: RuntimeSystem>(
 ) -> Result<StartedRuntime, RuntimeUnavailableReason> {
     ensure_start_continues(deadline, cancelled)?;
     let resources = system.verify_resources()?;
-    let manifest = system.verify_manifest(&resources)?;
+    let expected_service = system.project_service(&resources)?;
     let guard = system.acquire_runtime_mutex()?;
     ensure_start_continues(deadline, cancelled)?;
     if let Some(pid) = system.private_window_pid()? {
@@ -532,7 +481,7 @@ pub(crate) fn start_runtime_with<S: RuntimeSystem>(
     }
     ensure_start_continues(deadline, cancelled)?;
     let launch = system.prepare_launch(&resources)?;
-    if !system.service_is_running(&manifest)? {
+    if !system.service_is_running(&expected_service)? {
         return Err(RuntimeUnavailableReason::ServiceUnavailable);
     }
     let mut process = system.launch_process(launch)?;
@@ -765,11 +714,11 @@ impl RuntimeSystem for ProductionRuntimeSystem {
     fn verify_resources(&self) -> Result<VerifiedResources, RuntimeUnavailableReason> {
         Err(RuntimeUnavailableReason::InvalidResource)
     }
-    fn verify_manifest(
+    fn project_service(
         &self,
         _: &VerifiedResources,
-    ) -> Result<ValidatedManifest, RuntimeUnavailableReason> {
-        Err(RuntimeUnavailableReason::InvalidManifest)
+    ) -> Result<ExpectedService, RuntimeUnavailableReason> {
+        Err(RuntimeUnavailableReason::ServiceUnavailable)
     }
     fn acquire_runtime_mutex(&self) -> Result<Self::Guard, RuntimeUnavailableReason> {
         Err(RuntimeUnavailableReason::RuntimeAlreadyOwned)
@@ -793,7 +742,7 @@ impl RuntimeSystem for ProductionRuntimeSystem {
     ) -> Result<RuntimeLaunch, RuntimeUnavailableReason> {
         Err(RuntimeUnavailableReason::InvalidResource)
     }
-    fn service_is_running(&self, _: &ValidatedManifest) -> Result<bool, RuntimeUnavailableReason> {
+    fn service_is_running(&self, _: &ExpectedService) -> Result<bool, RuntimeUnavailableReason> {
         Ok(false)
     }
     fn launch_process(&self, _: RuntimeLaunch) -> Result<Self::Process, RuntimeUnavailableReason> {
@@ -1109,7 +1058,6 @@ mod windows_runtime {
     use std::io::Read;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::ptr;
     use std::sync::{Arc, Mutex};
@@ -1118,13 +1066,10 @@ mod windows_runtime {
     use sha2::{Digest, Sha256};
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, HWND, LPARAM,
-        WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, HWND, LPARAM, WAIT_EVENT,
+        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
     };
-    use windows::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
-    };
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::Cryptography::{
         CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertStrToNameW,
         CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_FIND_SUBJECT_CERT,
@@ -1138,16 +1083,10 @@ mod windows_runtime {
         WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_IGNORE, WTD_UI_NONE,
     };
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TokenUser, DACL_SECURITY_INFORMATION,
-        GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, GetFileVersionInfoSizeW,
-        GetFileVersionInfoW, VerQueryValueW, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
-        READ_CONTROL, VS_FIXEDFILEINFO,
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
     };
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -1174,9 +1113,7 @@ mod windows_runtime {
     use crate::file_search::windows::everything_process::{self, EverythingProcess};
 
     const RUNTIME_MUTEX_NAME: &str = r"Local\UiPilotEverythingRuntime";
-    const MANAGED_RELATIVE_ROOT: &str = r"UiPilot_tools\everything";
-    const RUNTIME_MANIFEST_NAME: &str = "managed-runtime.json";
-    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    const MAX_RESOURCE_METADATA_BYTES: u64 = 64 * 1024;
     const SYNCHRONIZE_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
     const ORPHAN_STOP_WAIT: Duration = Duration::from_secs(2);
 
@@ -1234,14 +1171,14 @@ mod windows_runtime {
             let executable = canonical_regular_file(&paths.executable, &resource_root)?;
             let lock_path = canonical_regular_file(&paths.lock, &resource_root)?;
             let template_path = canonical_regular_file(&paths.template, &resource_root)?;
-            let lock_bytes = bounded_read(&lock_path, MAX_MANIFEST_BYTES)
+            let lock_bytes = bounded_read(&lock_path, MAX_RESOURCE_METADATA_BYTES)
                 .map_err(|_| RuntimeUnavailableReason::InvalidResource)?;
             if lock_bytes != REVIEWED_LOCK_BYTES {
                 return Err(RuntimeUnavailableReason::InvalidResource);
             }
             let lock = parse_reviewed_lock(&lock_bytes)?;
             let ini = managed_ini_bytes(
-                &bounded_read(&template_path, MAX_MANIFEST_BYTES)
+                &bounded_read(&template_path, MAX_RESOURCE_METADATA_BYTES)
                     .map_err(|_| RuntimeUnavailableReason::InvalidResource)?,
             )?;
             verify_binary_identity(
@@ -1258,61 +1195,15 @@ mod windows_runtime {
             })
         }
 
-        fn verify_manifest(
+        fn project_service(
             &self,
             resources: &VerifiedResources,
-        ) -> Result<ValidatedManifest, RuntimeUnavailableReason> {
+        ) -> Result<ExpectedService, RuntimeUnavailableReason> {
             let program_data = known_folder(&FOLDERID_ProgramData)
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let managed_root = fs::canonicalize(program_data.join(MANAGED_RELATIVE_ROOT))
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let manifest_path =
-                canonical_regular_file(&managed_root.join(RUNTIME_MANIFEST_NAME), &managed_root)
-                    .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let bytes = bounded_read(&manifest_path, MAX_MANIFEST_BYTES)
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let manifest = parse_runtime_manifest(&bytes, &resources.lock)?;
-            if current_user_sid().map_err(|_| RuntimeUnavailableReason::InvalidManifest)?
-                != manifest.desktop_user_sid
-            {
-                return Err(RuntimeUnavailableReason::InvalidManifest);
-            }
-            let version_path = manifest
-                .service_binary_path
-                .parent()
-                .ok_or(RuntimeUnavailableReason::InvalidManifest)?;
-            let version_metadata = fs::symlink_metadata(version_path)
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let binary_metadata = fs::symlink_metadata(&manifest.service_binary_path)
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let version_directory = fs::canonicalize(version_path)
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            let binary = fs::canonicalize(&manifest.service_binary_path)
-                .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            if !version_metadata.is_dir()
-                || !binary_metadata.is_file()
-                || !validate_manifest_binary_layout(
-                    &managed_root,
-                    &manifest.version,
-                    &version_directory,
-                    &binary,
-                    version_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
-                    binary_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
-                )
-            {
-                return Err(RuntimeUnavailableReason::InvalidManifest);
-            }
-            let _version_handle = open_protected_managed_object(version_path, true)?;
-            let _binary_handle =
-                open_protected_managed_object(&manifest.service_binary_path, false)?;
-            verify_binary_identity(
-                &binary,
-                &manifest.sha256,
-                &manifest.version,
-                &manifest.publisher,
-            )
-            .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-            Ok(ValidatedManifest { manifest })
+                .map_err(|_| RuntimeUnavailableReason::ServiceUnavailable)?;
+            let current_user_sid =
+                current_user_sid().map_err(|_| RuntimeUnavailableReason::ServiceUnavailable)?;
+            project_expected_service(&program_data, &resources.lock, &current_user_sid)
         }
 
         fn acquire_runtime_mutex(&self) -> Result<Self::Guard, RuntimeUnavailableReason> {
@@ -1429,9 +1320,9 @@ mod windows_runtime {
 
         fn service_is_running(
             &self,
-            manifest: &ValidatedManifest,
+            expected: &ExpectedService,
         ) -> Result<bool, RuntimeUnavailableReason> {
-            query_private_service(&manifest.manifest)
+            query_private_service(expected)
         }
 
         fn launch_process(
@@ -1762,95 +1653,6 @@ mod windows_runtime {
             .ok_or(RuntimeUnavailableReason::ProcessLaunchFailed)
     }
 
-    fn open_protected_managed_object(
-        path: &Path,
-        expected_directory: bool,
-    ) -> Result<OwnedHandle, RuntimeUnavailableReason> {
-        let path = wide(path.as_os_str());
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(path.as_ptr()),
-                (FILE_READ_ATTRIBUTES | READ_CONTROL).0,
-                FILE_SHARE_READ,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                None,
-            )
-        }
-        .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-        let handle = OwnedHandle(handle);
-        let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
-        unsafe {
-            GetFileInformationByHandleEx(
-                handle.0,
-                FileAttributeTagInfo,
-                ptr::from_mut(&mut attributes).cast(),
-                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-            )
-        }
-        .map_err(|_| RuntimeUnavailableReason::InvalidManifest)?;
-        let is_directory = attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-            || is_directory != expected_directory
-            || !managed_descriptor_is_exact(&security_descriptor_sddl(handle.0)?)
-        {
-            return Err(RuntimeUnavailableReason::InvalidManifest);
-        }
-        Ok(handle)
-    }
-
-    fn security_descriptor_sddl(handle: HANDLE) -> Result<String, RuntimeUnavailableReason> {
-        let information =
-            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        let status = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                information,
-                None,
-                None,
-                None,
-                None,
-                Some(&mut descriptor),
-            )
-        };
-        if status.0 != 0 || descriptor.0.is_null() {
-            return Err(RuntimeUnavailableReason::InvalidManifest);
-        }
-        let mut sddl = PWSTR::null();
-        let converted = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor,
-                SDDL_REVISION_1,
-                information,
-                &mut sddl,
-                None,
-            )
-        };
-        let result = converted
-            .map_err(|_| RuntimeUnavailableReason::InvalidManifest)
-            .and_then(|()| {
-                if sddl.is_null() {
-                    return Err(RuntimeUnavailableReason::InvalidManifest);
-                }
-                let mut length = 0usize;
-                while unsafe { *sddl.0.add(length) } != 0 {
-                    length += 1;
-                }
-                String::from_utf16(unsafe { std::slice::from_raw_parts(sddl.0, length) })
-                    .map_err(|_| RuntimeUnavailableReason::InvalidManifest)
-            });
-        unsafe {
-            if !sddl.is_null() {
-                LocalFree(Some(HLOCAL(sddl.0.cast())));
-            }
-            LocalFree(Some(HLOCAL(descriptor.0)));
-        }
-        result
-    }
-
     fn private_window() -> Result<Option<(HWND, u32)>, RuntimeUnavailableReason> {
         let class = wide(OsStr::new(PRIVATE_EVERYTHING_WINDOW_CLASS));
         let window = match unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) } {
@@ -1904,7 +1706,7 @@ mod windows_runtime {
         }
     }
 
-    fn query_private_service(manifest: &RuntimeManifest) -> Result<bool, RuntimeUnavailableReason> {
+    fn query_private_service(expected: &ExpectedService) -> Result<bool, RuntimeUnavailableReason> {
         let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
             .map_err(|_| RuntimeUnavailableReason::ServiceUnavailable)?;
         let name = wide(OsStr::new(SERVICE_NAME));
@@ -1942,7 +1744,7 @@ mod windows_runtime {
             let config = unsafe { &*storage.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
             let command = unsafe { config.lpBinaryPathName.to_string() }
                 .map_err(|_| RuntimeUnavailableReason::ServiceUnavailable)?;
-            if !service_command_matches(&command, manifest) {
+            if !service_command_matches(&command, expected) {
                 return Err(RuntimeUnavailableReason::ServiceUnavailable);
             }
             let mut status = SERVICE_STATUS_PROCESS::default();
@@ -1968,7 +1770,7 @@ mod windows_runtime {
         result
     }
 
-    pub(super) fn service_command_matches(command: &str, manifest: &RuntimeManifest) -> bool {
+    pub(super) fn service_command_matches(command: &str, expected: &ExpectedService) -> bool {
         let Some(rest) = command.strip_prefix('"') else {
             return false;
         };
@@ -1979,11 +1781,11 @@ mod windows_runtime {
         let Some(arguments) = rest.get(end + 1..) else {
             return false;
         };
-        Path::new(executable) == manifest.service_binary_path
-            && service_arguments_match(arguments.trim(), manifest)
+        Path::new(executable) == expected.service_binary_path
+            && service_arguments_match(arguments.trim(), expected)
     }
 
-    fn service_arguments_match(arguments: &str, manifest: &RuntimeManifest) -> bool {
+    fn service_arguments_match(arguments: &str, expected: &ExpectedService) -> bool {
         let Some(tokens) = split_windows_arguments(arguments) else {
             return false;
         };
@@ -2015,7 +1817,7 @@ mod windows_runtime {
         service
             && instance.as_deref() == Some(INSTANCE_NAME)
             && pipe.as_deref() == Some(PIPE_NAME)
-            && sddl.as_deref() == Some(manifest.expanded_sddl.as_str())
+            && sddl.as_deref() == Some(expected.expanded_sddl.as_str())
     }
 
     fn split_windows_arguments(value: &str) -> Option<Vec<String>> {
@@ -2057,13 +1859,11 @@ mod tests {
     use everything_ipc::protocol::{EverythingQueryResult, EverythingQuerySpec, EverythingSort};
 
     use super::{
-        build_runtime_launch, managed_descriptor_is_exact, managed_ini_bytes, parse_reviewed_lock,
-        parse_runtime_manifest, start_runtime_with, validate_manifest_binary_layout,
+        build_runtime_launch, managed_ini_bytes, parse_reviewed_lock, start_runtime_with,
         EverythingRuntimeClient, EverythingRuntimeStatus, EverythingRuntimeSupervisor,
-        OwnedRuntimeProcess, ReadyClientProvider, RuntimeBackend, RuntimeLaunch,
+        ExpectedService, OwnedRuntimeProcess, ReadyClientProvider, RuntimeBackend, RuntimeLaunch,
         RuntimeResourcePaths, RuntimeSystem, RuntimeUnavailableReason, StartedRuntime,
-        ValidatedManifest, VerifiedResources, INSTANCE_NAME, PIPE_NAME, REVIEWED_LOCK_BYTES,
-        SERVICE_NAME,
+        VerifiedResources, INSTANCE_NAME, PIPE_NAME, REVIEWED_LOCK_BYTES,
     };
 
     const WAIT_LIMIT: Duration = Duration::from_secs(2);
@@ -2398,7 +2198,6 @@ mod tests {
         for reason in [
             RuntimeUnavailableReason::RuntimeAlreadyOwned,
             RuntimeUnavailableReason::InvalidResource,
-            RuntimeUnavailableReason::InvalidManifest,
             RuntimeUnavailableReason::ForeignProcess,
             RuntimeUnavailableReason::ServiceUnavailable,
         ] {
@@ -2697,15 +2496,15 @@ mod tests {
             }
         }
 
-        fn verify_manifest(
+        fn project_service(
             &self,
             _resources: &VerifiedResources,
-        ) -> Result<ValidatedManifest, RuntimeUnavailableReason> {
-            self.event("verify-manifest");
-            if self.failure == Some(RuntimeUnavailableReason::InvalidManifest) {
-                Err(RuntimeUnavailableReason::InvalidManifest)
+        ) -> Result<ExpectedService, RuntimeUnavailableReason> {
+            self.event("project-service");
+            if self.failure == Some(RuntimeUnavailableReason::ServiceUnavailable) {
+                Err(RuntimeUnavailableReason::ServiceUnavailable)
             } else {
-                Ok(ValidatedManifest::for_test())
+                Ok(ExpectedService::for_test())
             }
         }
 
@@ -2751,7 +2550,7 @@ mod tests {
 
         fn service_is_running(
             &self,
-            _manifest: &ValidatedManifest,
+            _expected: &ExpectedService,
         ) -> Result<bool, RuntimeUnavailableReason> {
             self.event("service-running");
             Ok(self.service_running)
@@ -2801,7 +2600,7 @@ mod tests {
             events.lock().unwrap().as_slice(),
             [
                 "verify-resources",
-                "verify-manifest",
+                "project-service",
                 "acquire-mutex",
                 "inspect-window",
                 "authenticate-orphan:41",
@@ -2818,6 +2617,88 @@ mod tests {
     }
 
     #[test]
+    fn production_runtime_does_not_read_administrator_only_managed_files() {
+        let source = include_str!("everything_runtime.rs");
+        let production = source
+            .split("mod windows_runtime {")
+            .nth(1)
+            .and_then(|source| source.split("#[cfg(test)]\nmod tests {").next())
+            .expect("Windows production runtime source must be present");
+
+        assert!(!production.contains(concat!("managed-runtime", ".json")));
+        assert!(!production.contains(concat!("open_protected_", "managed_object")));
+
+        let projection = production
+            .split("fn project_service(")
+            .nth(1)
+            .and_then(|source| source.split("fn acquire_runtime_mutex(").next())
+            .expect("production Service projection must be present");
+        let service_query = production
+            .split("fn query_private_service(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(super) fn service_command_matches(")
+                    .next()
+            })
+            .expect("production SCM query must be present");
+        for forbidden in [
+            "fs::",
+            "bounded_read(",
+            "canonical_regular_file(",
+            "verify_binary_identity(",
+            "CreateFileW(",
+        ] {
+            assert!(!projection.contains(forbidden));
+            assert!(!service_query.contains(forbidden));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_desktop_sid_projection_rejects_scm_config_for_another_user() {
+        let lock = parse_reviewed_lock(REVIEWED_LOCK_BYTES).unwrap();
+        let expected = super::project_expected_service(
+            std::path::Path::new(r"C:\ProgramData"),
+            &lock,
+            "S-1-5-21-1-2-3-1001",
+        )
+        .unwrap();
+        assert_eq!(
+            expected.service_binary_path,
+            std::path::Path::new(
+                r"C:\ProgramData\UiPilot_tools\everything\1.4.1.1032\Everything.exe"
+            )
+        );
+        assert!(matches!(
+            super::project_expected_service(
+                std::path::Path::new(r"C:\ProgramData"),
+                &lock,
+                "S-1-05-21-1-2-3-1001",
+            ),
+            Err(RuntimeUnavailableReason::ServiceUnavailable)
+        ));
+        let executable = expected.service_binary_path.display();
+        let matching = format!(
+            r#""{executable}" -svc -instance "{}" -service-pipe-name "{}" -service-security-descriptor "{}""#,
+            INSTANCE_NAME, PIPE_NAME, expected.expanded_sddl,
+        );
+        let other_user = matching.replace("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002");
+
+        assert!(super::windows_runtime::service_command_matches(
+            &matching, &expected,
+        ));
+        assert!(!super::windows_runtime::service_command_matches(
+            &other_user,
+            &expected,
+        ));
+        assert!(!super::windows_runtime::service_command_matches(
+            &matching.replace("1.4.1.1032", "1.4.1.1031"),
+            &expected,
+        ));
+    }
+
+    #[test]
     fn startup_pipeline_fails_closed_before_unsafe_follow_on_work() {
         for (failure, expected_events) in [
             (
@@ -2825,12 +2706,12 @@ mod tests {
                 vec!["verify-resources"],
             ),
             (
-                RuntimeUnavailableReason::InvalidManifest,
-                vec!["verify-resources", "verify-manifest"],
+                RuntimeUnavailableReason::ServiceUnavailable,
+                vec!["verify-resources", "project-service"],
             ),
             (
                 RuntimeUnavailableReason::RuntimeAlreadyOwned,
-                vec!["verify-resources", "verify-manifest", "acquire-mutex"],
+                vec!["verify-resources", "project-service", "acquire-mutex"],
             ),
         ] {
             let mut system = PipelineSystem::new();
@@ -2894,7 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_lock_manifest_and_fixed_runtime_identity_are_strict() {
+    fn reviewed_resource_lock_is_strict() {
         let lock = parse_reviewed_lock(include_bytes!(
             "../../resources/everything/everything.lock.json"
         ))
@@ -2902,118 +2783,27 @@ mod tests {
         assert_eq!(lock.version, "1.4.1.1032");
         assert_eq!(lock.architecture, "x64");
 
-        let manifest = format!(
-            r#"{{"schema_version":1,"version":"{}","architecture":"x64","sha256":"{}","publisher":{},"instance":"{}","service_name":"{}","pipe_name":{},"desktop_user_sid":"S-1-5-21-1-2-3-1001","expanded_sddl":"D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;S-1-5-21-1-2-3-1001)","service_binary_path":"C:\\ProgramData\\UiPilot_tools\\everything\\{}\\Everything.exe"}}"#,
-            lock.version,
-            lock.everything_exe_sha256,
-            serde_json::to_string(&lock.authenticode_publisher).unwrap(),
-            INSTANCE_NAME,
-            SERVICE_NAME,
-            serde_json::to_string(PIPE_NAME).unwrap(),
-            lock.version,
-        );
-        assert!(parse_runtime_manifest(manifest.as_bytes(), &lock).is_ok());
-        assert!(parse_runtime_manifest(
-            manifest
-                .replace("\"instance\":\"UiPilot\"", "\"instance\":\"Everything\"")
-                .as_bytes(),
-            &lock,
-        )
-        .is_err());
-        assert!(parse_runtime_manifest(
-            manifest
-                .replace(
-                    "\"schema_version\":1",
-                    "\"schema_version\":1,\"extra\":true"
-                )
-                .as_bytes(),
-            &lock,
-        )
-        .is_err());
-        let noncanonical_sid = manifest.replace("S-1-5-21-1-2-3-1001", "S-1-05-21-1-2-3-1001");
-        assert!(parse_runtime_manifest(noncanonical_sid.as_bytes(), &lock).is_err());
-
         let noncanonical_lock = String::from_utf8(REVIEWED_LOCK_BYTES.to_vec())
             .unwrap()
             .replace("1.4.1.1032", "01.4.1.1032");
         assert!(parse_reviewed_lock(noncanonical_lock.as_bytes()).is_err());
     }
 
-    #[test]
-    fn manifest_binary_layout_requires_a_direct_non_reparse_version_child() {
-        let root = std::path::Path::new(r"C:\ProgramData\UiPilot_tools\everything");
-        let version = root.join("1.4.1.1032");
-        let binary = version.join("Everything.exe");
-        assert!(validate_manifest_binary_layout(
-            root,
-            "1.4.1.1032",
-            &version,
-            &binary,
-            false,
-            false,
-        ));
-        assert!(!validate_manifest_binary_layout(
-            root,
-            "1.4.1.1032",
-            root,
-            &root.join("Everything.exe"),
-            false,
-            false,
-        ));
-        assert!(!validate_manifest_binary_layout(
-            root,
-            "1.4.1.1032",
-            &root.join("1.4.1.1031"),
-            &root.join(r"1.4.1.1031\Everything.exe"),
-            false,
-            false,
-        ));
-        assert!(!validate_manifest_binary_layout(
-            root,
-            "1.4.1.1032",
-            &version,
-            &binary,
-            true,
-            false,
-        ));
-        assert!(!validate_manifest_binary_layout(
-            root,
-            "1.4.1.1032",
-            &version,
-            &binary,
-            false,
-            true,
-        ));
-    }
-
-    #[test]
-    fn managed_runtime_objects_require_the_exact_protected_descriptor() {
-        assert!(managed_descriptor_is_exact(
-            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
-        ));
-        assert!(!managed_descriptor_is_exact(
-            "O:BAG:BAD:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
-        ));
-        assert!(!managed_descriptor_is_exact(
-            "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GR;;;BU)"
-        ));
-    }
-
     #[cfg(windows)]
     #[test]
     fn service_contract_accepts_argument_order_but_rejects_duplicates() {
-        let manifest = ValidatedManifest::for_test().manifest;
-        let executable = manifest.service_binary_path.display();
+        let expected = ExpectedService::for_test();
+        let executable = expected.service_binary_path.display();
         let reordered = format!(
             r#""{executable}" -service-security-descriptor "{}" -service-pipe-name "{}" -svc -instance "{}""#,
-            manifest.expanded_sddl, PIPE_NAME, INSTANCE_NAME,
+            expected.expanded_sddl, PIPE_NAME, INSTANCE_NAME,
         );
         assert!(super::windows_runtime::service_command_matches(
-            &reordered, &manifest,
+            &reordered, &expected,
         ));
         assert!(!super::windows_runtime::service_command_matches(
             &format!("{reordered} -svc"),
-            &manifest,
+            &expected,
         ));
     }
 

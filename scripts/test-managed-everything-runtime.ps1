@@ -718,6 +718,34 @@ function Invoke-SourceGate {
         'EverythingClient::connect_owned(INSTANCE_NAME, pid, timeout)', 'runtime.client.close();',
         'runtime.process.shutdown();'
     )
+    $runtimeSource = Get-Content -LiteralPath $runtime -Raw -Encoding utf8
+    $productionRuntime = [regex]::Match(
+        $runtimeSource,
+        '(?ms)^#\[cfg\(windows\)\]\s*mod windows_runtime \{.*?(?=^#\[cfg\(test\)\]\s*mod tests \{)'
+    )
+    Assert-Condition $productionRuntime.Success 'Windows production runtime module is missing'
+    foreach ($contract in @(
+        'fn project_service(', 'project_expected_service(&program_data, &resources.lock, &current_user_sid)',
+        'query_private_service(expected)'
+    )) {
+        Assert-Condition $productionRuntime.Value.Contains($contract) "Runtime Service projection contract is missing: $contract"
+    }
+    foreach ($forbidden in @('managed-runtime.json', 'open_protected_managed_object')) {
+        Assert-Condition (-not $productionRuntime.Value.Contains($forbidden)) "Production runtime must not read administrator-only managed files: $forbidden"
+    }
+    $serviceProjection = [regex]::Match(
+        $productionRuntime.Value,
+        '(?ms)^\s*fn project_service\(.*?(?=^\s*fn acquire_runtime_mutex\()'
+    )
+    $serviceQuery = [regex]::Match(
+        $productionRuntime.Value,
+        '(?ms)^\s*fn query_private_service\(.*?(?=^\s*pub\(super\) fn service_command_matches\()'
+    )
+    Assert-Condition ($serviceProjection.Success -and $serviceQuery.Success) 'Runtime projection/SCM query source boundary is missing'
+    foreach ($forbidden in @('fs::', 'bounded_read(', 'canonical_regular_file(', 'verify_binary_identity(', 'CreateFileW(')) {
+        Assert-Condition (-not $serviceProjection.Value.Contains($forbidden)) "Runtime Service projection must not read managed files: $forbidden"
+        Assert-Condition (-not $serviceQuery.Value.Contains($forbidden)) "Runtime SCM verification must not read managed files: $forbidden"
+    }
     Assert-SourceContains $process @(
         'PROC_THREAD_ATTRIBUTE_JOB_LIST', 'CREATE_SUSPENDED', 'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE',
         'ResumeThread', 'TerminateProcess'
