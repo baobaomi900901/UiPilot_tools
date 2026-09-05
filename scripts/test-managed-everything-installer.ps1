@@ -652,6 +652,12 @@ Assert-Condition $createStagingMacro.Value.Contains('lstrcpynW(w .R4, p R7') 'NS
 Assert-Condition $createStagingMacro.Value.Contains('ole32::CoTaskMemFree(p R7)') 'NSIS known-folder buffer must use CoTaskMemFree'
 Assert-Condition (-not $createStagingMacro.Value.Contains('UIPILOT_LOCAL_FREE $R7')) 'NSIS known-folder buffer must not use LocalFree'
 Assert-Condition $createStagingMacro.Value.Contains('CreateDirectoryW(w "$UiPilotStaging", p R9)') 'NSIS protected staging directory must use the named variable value'
+$stagingFileOwnerMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_SET_STAGING_FILE_OWNER .*?^!macroend')
+Assert-Condition $stagingFileOwnerMacro.Success 'NSIS staging file owner macro is missing'
+Assert-Condition $stagingFileOwnerMacro.Value.Contains('StrCpy $R4 "${PATH}"') 'NSIS staging file owner path must be copied into a fixed System register'
+Assert-Condition $stagingFileOwnerMacro.Value.Contains('SetNamedSecurityInfoW(w R4, i 1, i 1, p R8') 'NSIS staging file owner API must consume the fixed path register'
+Assert-Condition (-not $stagingFileOwnerMacro.Value.Contains('SetNamedSecurityInfoW(w ${PATH}')) 'NSIS must not pass a macro-expanded custom variable directly to the System plug-in'
+Assert-Condition (-not $hooksSource.Contains('[DEBUG-staging-owner]')) 'Temporary staging owner instrumentation must not ship'
 $acquireLeaseMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_ACQUIRE_LEASE\r?\n.*?^!macroend')
 Assert-Condition $acquireLeaseMacro.Success 'NSIS installer lease macro is missing'
 $createMutexBlock = $acquireLeaseMacro.Value.Substring(0, $acquireLeaseMacro.Value.IndexOf('WaitForSingleObject', [StringComparison]::Ordinal))

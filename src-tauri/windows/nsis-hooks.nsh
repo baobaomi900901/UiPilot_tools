@@ -123,6 +123,7 @@ Var UiPilotOwnerSid
 !macroend
 
 !macro UIPILOT_SET_STAGING_FILE_OWNER PATH
+  StrCpy $R4 "${PATH}"
   StrCpy $R8 0
   System::Call 'advapi32::ConvertStringSidToSidW(w "$UiPilotOwnerSid", *p .R8) i .R7'
   ${If} $R7 = 0
@@ -131,7 +132,7 @@ Var UiPilotOwnerSid
     MessageBox MB_ICONSTOP "A protected staging file owner could not be prepared."
     Abort
   ${EndIf}
-  System::Call 'advapi32::SetNamedSecurityInfoW(w ${PATH}, i 1, i 1, p R8, p 0, p 0, p 0) i .R6'
+  System::Call 'advapi32::SetNamedSecurityInfoW(w R4, i 1, i 1, p R8, p 0, p 0, p 0) i .R6'
   !insertmacro UIPILOT_LOCAL_FREE $R8
   ${If} $R6 != 0
     MessageBox MB_ICONSTOP "A protected staging file owner could not be applied."
