@@ -658,6 +658,15 @@ $createMutexBlock = $acquireLeaseMacro.Value.Substring(0, $acquireLeaseMacro.Val
 Assert-Condition $createMutexBlock.Contains('${If} $UiPilotMutexHandle = 0') 'NSIS mutex creation must reject a null handle'
 Assert-Condition $createMutexBlock.Contains('${If} $R6 = 183') 'NSIS mutex creation must validate an existing named mutex'
 Assert-Condition (-not $createMutexBlock.Contains('${ElseIf} $R6 != 0')) 'NSIS mutex creation must not reject a valid new handle based on an unspecified success LastError'
+foreach ($atomicLastErrorPattern in @(
+    '(?m)System::Call ''advapi32::GetTokenInformation\(p R5, i 1, p 0, i 0, \*i \.R7\) i \.R6 \?e''\r?\n\s+Pop \$R9',
+    '(?m)System::Call ''kernel32::CreateMutexW\(p R9, i 0, w "\$\{UIPILOT_MUTEX_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6',
+    '(?m)System::Call ''kernel32::OpenEventW\(i 1179648, i 0, w "\$\{UIPILOT_ACTIVITY_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6',
+    '(?m)System::Call ''kernel32::CreateEventW\(p R9, i 1, i 0, w "\$\{UIPILOT_ACTIVITY_NAME\}"\) p \.R5 \?e''\r?\n\s+Pop \$R6'
+)) {
+    Assert-Condition ([regex]::IsMatch($hooksSource, $atomicLastErrorPattern)) 'NSIS must capture each Win32 LastError atomically before the System plug-in or NSIS instructions can overwrite it'
+}
+Assert-Condition (-not $hooksSource.Contains('kernel32::GetLastError()')) 'NSIS must not retrieve a target call LastError through a later System plug-in call'
 $systemCalls = (($hooksSource -split '\r?\n') | Where-Object { $_.Contains('System::Call') }) -join "`n"
 foreach ($invalidSystemToken in @('.UiPilot', 'p UiPilot', 'w UiPilot', '*l .UiPilot', '*w .R9')) {
     Assert-Condition (-not $systemCalls.Contains($invalidSystemToken)) "NSIS System call contains an invalid source/destination token: $invalidSystemToken"

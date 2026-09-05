@@ -83,9 +83,8 @@ Var UiPilotOwnerSid
   System::Call 'advapi32::OpenProcessToken(p -1, i 8, *p .R5) i .R6'
   ${If} $R6 != 0
     StrCpy $R7 0
-    System::Call 'kernel32::SetLastError(i 0)'
-    System::Call 'advapi32::GetTokenInformation(p R5, i 1, p 0, i 0, *i .R7) i .R6'
-    System::Call 'kernel32::GetLastError() i .R9'
+    System::Call 'advapi32::GetTokenInformation(p R5, i 1, p 0, i 0, *i .R7) i .R6 ?e'
+    Pop $R9
     ${If} $R6 = 0
     ${AndIf} $R9 = 122
     ${AndIf} $R7 > 0
@@ -142,8 +141,8 @@ Var UiPilotOwnerSid
 
 !macro UIPILOT_ACQUIRE_LEASE
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
-  System::Call 'kernel32::CreateMutexW(p R9, i 0, w "${UIPILOT_MUTEX_NAME}") p .R5'
-  System::Call 'kernel32::GetLastError() i .R6'
+  System::Call 'kernel32::CreateMutexW(p R9, i 0, w "${UIPILOT_MUTEX_NAME}") p .R5 ?e'
+  Pop $R6
   StrCpy $UiPilotMutexHandle $R5
   !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES
   ${If} $UiPilotMutexHandle = 0
@@ -164,22 +163,21 @@ Var UiPilotOwnerSid
     Abort
   ${EndIf}
 
-  System::Call 'kernel32::OpenEventW(i 1179648, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5'
+  System::Call 'kernel32::OpenEventW(i 1179648, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5 ?e'
+  Pop $R6
   ${If} $R5 != 0
     !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $R5
     System::Call 'kernel32::CloseHandle(p R5)'
     MessageBox MB_ICONSTOP "Another UiPilot installer or recovery Helper is active."
     Abort
   ${EndIf}
-  System::Call 'kernel32::GetLastError() i .R6'
   ${If} $R6 != 2
     MessageBox MB_ICONSTOP "An untrusted installer activity object already exists. Restart Windows and retry."
     Abort
   ${EndIf}
   !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
-  System::Call 'kernel32::SetLastError(i 0)'
-  System::Call 'kernel32::CreateEventW(p R9, i 1, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5'
-  System::Call 'kernel32::GetLastError() i .R6'
+  System::Call 'kernel32::CreateEventW(p R9, i 1, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5 ?e'
+  Pop $R6
   StrCpy $UiPilotActivityHandle $R5
   !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES
   ${If} $UiPilotActivityHandle = 0
