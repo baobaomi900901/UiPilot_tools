@@ -263,7 +263,7 @@ namespace UiPilot.ManagedEverything {
     [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool LogonUser(string user, string domain, string password, int type, int provider, out IntPtr token);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int infoClass, out IntPtr linkedToken, int length, out int returned);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
-    [DllImport("advapi32.dll")] static extern bool RevertToSelf();
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateNamedPipe(string name, uint openMode, uint pipeMode, uint instances, uint outSize, uint inSize, uint timeout, IntPtr security);
@@ -392,6 +392,10 @@ namespace UiPilot.ManagedEverything {
       return true;
     }
 
+    public static void EnsureRevertSucceeded(bool reverted, int errorCode) {
+      if (!reverted) throw new Win32Exception(errorCode, "RevertToSelf failed after the pipe probe");
+    }
+
     public static PipeProbeResult ProbePipe(string name, string expectedSddl, string source, uint pid, string user, string domain, string password) {
       IntPtr pipe = CreateFile(name, READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
       if (pipe == INVALID_HANDLE_VALUE) throw new Win32Exception();
@@ -420,7 +424,11 @@ namespace UiPilot.ManagedEverything {
           result.CreatedInstance = created != INVALID_HANDLE_VALUE;
           result.CreateError = result.CreatedInstance ? 0 : Marshal.GetLastWin32Error();
           if (result.CreatedInstance) CloseHandle(created);
-        } finally { RevertToSelf(); }
+        } finally {
+          bool reverted = RevertToSelf();
+          int revertError = reverted ? 0 : Marshal.GetLastWin32Error();
+          EnsureRevertSucceeded(reverted, revertError);
+        }
         return result;
       } finally {
         if (token != IntPtr.Zero) CloseHandle(token);
@@ -450,6 +458,10 @@ function Get-ReviewedEverythingHash {
     $hash = [string]$lock.everythingExeSha256
     Assert-Condition ($hash -match '^[0-9a-f]{64}$') 'Reviewed Everything hash is invalid'
     return $hash
+}
+
+function Test-HostCreationPrecedesClient([uint64]$HostCreationTime, [uint64]$ClientCreationTime) {
+    return $HostCreationTime -lt $ClientCreationTime
 }
 
 function Get-PrivateClientContext {
@@ -521,6 +533,7 @@ function Get-PrivateClientContext {
         Assert-Condition ((Split-Path -Leaf $hostLease.ImagePath) -ceq 'UiPilot_tools.exe') 'UiPilot host image name mismatch'
         Assert-Condition ($hostLease.SessionId -eq $lease.SessionId) 'UiPilot host and private client session mismatch'
         Assert-Condition ($hostLease.UserSid -ceq $lease.UserSid) 'UiPilot host and private client user mismatch'
+        Assert-Condition (Test-HostCreationPrecedesClient $hostLease.CreationTime $lease.CreationTime) 'UiPilot host creation identity does not strictly precede the private client'
         $window = [UiPilot.ManagedEverything.NativeProbe]::GetExactWindow($lease.ProcessId, 'EVERYTHING_TASKBAR_NOTIFICATION_(UiPilot)')
         if ($RequireWindow) {
             Assert-Condition ($window -ne 0) 'Private client does not own the unique private window'
@@ -724,7 +737,7 @@ function Invoke-SourceGate {
         schema_version = 1
         kind = 'runtime-source'
         outcome = 'pass'
-        read_only = $true
+        system_state_read_only = $true
         identity_contract = $true
         launch_contract = $true
         ownership_contract = $true
@@ -736,6 +749,14 @@ function Invoke-SourceGate {
 
 function Invoke-SelfTest {
     Add-RuntimeNativeProbe
+    $harnessSource = Get-Content -LiteralPath $PSCommandPath -Raw -Encoding utf8
+    $sourceGate = [regex]::Match($harnessSource, '(?ms)^function Invoke-SourceGate \{.*?^\}')
+    Assert-Condition $sourceGate.Success 'Runtime Source gate self-test could not locate its function body'
+    Assert-Condition $sourceGate.Value.Contains('system_state_read_only = $true') 'Runtime Source evidence does not distinguish artifact writes from system-state reads'
+    Assert-Condition ($sourceGate.Value -notmatch '(?m)^\s*read_only\s*=') 'Runtime Source evidence incorrectly claims the whole mode is read-only'
+    Assert-Condition (Test-HostCreationPrecedesClient 10 11) 'Host/client creation ordering rejected an older host'
+    Assert-Condition (-not (Test-HostCreationPrecedesClient 11 11)) 'Host/client creation ordering accepted equal creation identities'
+    Assert-Condition (-not (Test-HostCreationPrecedesClient 12 11)) 'Host/client creation ordering accepted a newer reused host PID'
     Assert-Condition ([UiPilot.ManagedEverything.NativeProbe]::DaclEquivalent(
         'D:P(A;;GA;;;SY)',
         'D:P(A;;GA;;;S-1-5-18)'
@@ -744,6 +765,10 @@ function Invoke-SelfTest {
         'D:P(A;;GA;;;SY)',
         'D:P(A;;GR;;;SY)'
     )) 'Pipe descriptor canonicalization accepted a different DACL'
+    [UiPilot.ManagedEverything.NativeProbe]::EnsureRevertSucceeded($true, 0)
+    $caught = $false
+    try { [UiPilot.ManagedEverything.NativeProbe]::EnsureRevertSucceeded($false, 5) } catch { $caught = $true }
+    Assert-Condition $caught 'Pipe probe cleanup accepted a failed RevertToSelf result'
     $parsed = [UiPilot.ManagedEverything.NativeProbe]::SplitCommandLine(
         '"C:\Program Files\UiPilot_tools\Everything.exe" -instance UiPilot -startup'
     )
@@ -914,22 +939,24 @@ function Invoke-RetryBudgetProbe {
                 if ($null -ne $replacement) { Close-PrivateClientContext $replacement }
             }
         }
-        $terminalStable = $hostLease.IsAlive
-        for ($sample = 0; $sample -lt 10 -and $terminalStable; $sample++) {
-            if (Test-HasExactPrivateClient $managed $hostLease $excluded) { $terminalStable = $false; break }
+        $replacementAbsentAfterBudget = $hostLease.IsAlive
+        for ($sample = 0; $sample -lt 10 -and $replacementAbsentAfterBudget; $sample++) {
+            if (Test-HasExactPrivateClient $managed $hostLease $excluded) { $replacementAbsentAfterBudget = $false; break }
             Start-Sleep -Milliseconds 200
         }
         $serviceContext = Get-ServiceProcessContext $managed $false
         $sequenceMatches = Test-RetryBudgetSequence ([bool[]]$observations)
-        $pass = $sequenceMatches -and $terminalStable -and $serviceContext.Lease.IsAlive -and $restartCount -eq 3
+        $pass = $sequenceMatches -and $replacementAbsentAfterBudget -and $serviceContext.Lease.IsAlive -and $restartCount -eq 3
         Write-ManagedEvidence $EvidenceName ([ordered]@{
             schema_version = 1; kind = 'runtime-retry-budget'; outcome = $(if ($pass) { 'pass' } else { 'fail' })
             restart_count = $restartCount; termination_count = $observations.Count
             first_three_ready = ($observations.Count -eq 4 -and $observations[0] -and $observations[1] -and $observations[2])
             fourth_replacement_absent = ($observations.Count -eq 4 -and -not $observations[3])
-            terminal_unavailable = $terminalStable; host_remains = $hostLease.IsAlive; service_remains = $serviceContext.Lease.IsAlive
+            no_replacement_after_startup_budget = $replacementAbsentAfterBudget
+            supervisor_terminal_state_observed = $false
+            host_remains = $hostLease.IsAlive; service_remains = $serviceContext.Lease.IsAlive
         })
-        Assert-Condition $pass 'Runtime retry budget did not show three replacements followed by stable unavailable'
+        Assert-Condition $pass 'Runtime retry budget did not show three replacements followed by no replacement after the startup budget'
     }
     finally {
         if ($null -ne $current) { Close-PrivateClientContext $current }

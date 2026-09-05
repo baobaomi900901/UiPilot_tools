@@ -99,10 +99,11 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
 
 ## Row 4 — both upgrade paths, cancellation, and writable source replacement
 
-- Prerequisites: old production UiPilot installed; old uninstaller, private Service, manifest, ProgramData,
-  and application hashes recorded; a standard-user-writable `$VmTestRoot` and its intended install directory
-  already exist for the source race. Every existing path component must be non-reparse and is pinned and
-  final-path revalidated immediately before Setup launch.
+- Prerequisites: old production UiPilot installed for the two upgrade paths, with old uninstaller, private
+  Service, manifest, ProgramData, and application hashes recorded. Run the source race from a separate clean
+  snapshot where the reviewed protected version target does not yet exist; a standard-user-writable
+  `$VmTestRoot` and its intended install directory already exist. Every existing path component must be
+  non-reparse and is pinned and final-path revalidated immediately before Setup launch.
 - Commands for manual replacement and Tauri `/UPDATE`, respectively:
 
   ```powershell
@@ -113,9 +114,11 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmSourceReplacement -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row04-source-race -VmTestRoot $VmTestRoot -InstallDirectory $VmInstallDirectory
   ```
 - Expected stable outcome: neither upgrade path calls the old uninstaller. Cancellation or failure before
-  Install Section changes nothing. During the source race, replacement produces a share violation or the
-  protected target receives only the held original file identity. An already running UiPilot/private client
-  causes no executable write error after Install Section, and old Service state remains rollback-capable.
+  Install Section changes nothing. `VmSourceReplacement` starts a coordinated actor only after the reviewed
+  protected copy appears; the actor attempts to replace the fixed scoped source before Setup completes. It
+  observes a share violation or a source identity replacement, while the protected target remains the reviewed
+  hash. An already running UiPilot/private client causes no executable write error after Install Section, and
+  old Service state remains rollback-capable.
 - Evidence: `installer-row04-manual-replacement.json`, `installer-row04-tauri-update.json`,
   `installer-row04-cancel.json`, `installer-row04-source-race.json`, and redacted before/after equality booleans.
 - Cleanup: close any source-race handles and revert the snapshot.
@@ -132,14 +135,18 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmRecovery -DisposableVmMarker $Marker -EvidenceName row05-service-unavailable -ClientProcessId $PrivateClientPid -RecoveryTarget Service
   ```
 - Expected stable outcome: three successive exact private-client deaths each produce one PID/creation-bound,
-  DB-loaded, fixed-Query2 Ready replacement. Terminating that third replacement produces no fourth private
-  process and a stable unavailable observation while the exact host and Service remain alive. Service death
-  independently produces a bounded stable unavailable state until SCM/repair restores it. No unowned
-  Everything process is terminated.
+  DB-loaded, fixed-Query2 Ready replacement. Terminating that third replacement produces no fourth Ready
+  private process throughout the complete 65-second startup budget while the exact host and Service remain
+  alive. Service death independently makes the exact client readiness probe unavailable. No unowned Everything
+  process is terminated.
+- Interface blocker: the current host exposes no external diagnostic/read-only surface for the Supervisor's
+  exact `Unavailable(reason)` enum. These commands prove the externally observable readiness and restart-budget
+  behavior only; they must not label the internal terminal state as observed or satisfy that final assertion.
 - Evidence: `runtime-row05-client-retry-budget.json`, `runtime-row05-service-unavailable.json`; only the
-  observed restart/termination counts and stable booleans are recorded.
+  observed restart/termination counts and stable booleans are recorded. The retry file must contain
+  `supervisor_terminal_state_observed=false` until a host observability interface exists.
 - Cleanup: revert the snapshot after each termination variant.
-- Status: `NOT RUN`
+- Status: `NOT RUN` — **BLOCKED: exact Supervisor terminal-state observability missing**
 
 ## Row 6 — true uninstall and default-instance preservation
 
