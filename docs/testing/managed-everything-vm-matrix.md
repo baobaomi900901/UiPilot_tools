@@ -182,6 +182,8 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmPipeSecurity -DisposableVmMarker $Marker -EvidenceName row07-other-batch -TokenCase OtherBatch -TokenSource CredentialBatch -Credential $OtherUser
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmPipeSecurity -DisposableVmMarker $Marker -EvidenceName row07-network-service -TokenCase NetworkService -TokenSource Process -TokenProcessId $NetworkServiceTokenPid
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmPipeSecurity -DisposableVmMarker $Marker -EvidenceName row07-filtered-admin -TokenCase FilteredAdmin -TokenSource Linked
+  # In a separately elevated shell signed in as the second administrator, run the same trusted Setup as repair.
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode VmSidPreservation -VmSetupPath $VmSetup -DisposableVmMarker $Marker -EvidenceName row07-second-admin-repair
   ```
 - Expected stable outcome: console/RDP have distinct clients, INIs, DBs, and session IDs but one Service.
   Authorized-SID Interactive/Batch/Network, LocalSystem, and elevated administrator tokens pass read/write
@@ -189,7 +191,8 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
   read/write/create-instance `AccessCheck` and actual local connect/create with AccessDenied. Running Setup
   under a second administrator does not replace the first-install SID. Remote end-to-end refusal is logged
   separately and is not treated as DACL proof.
-- Evidence: `runtime-row07-sessions.json` and the nine `runtime-row07-*.json` token files named above.
+- Evidence: `runtime-row07-sessions.json`, the nine `runtime-row07-*.json` token files named above, and
+  `installer-row07-second-admin-repair.json` with `desktop_sid_preserved=true` and no SID value.
 - Cleanup: sign out the RDP session without changing account policy and revert the snapshot.
 - Status: `NOT RUN`
 
@@ -227,19 +230,25 @@ redacted evidence. Never carry an instrumented Setup or marker into a release ma
 
 - Prerequisites: installed app plus Task 2 unit-test evidence for Job creation/attribute/CreateProcess/resume
   faults; a separate snapshot for normal exit, tray exit, logoff, rapid shutdown, crash, and forced host exit.
-- Commands after each operator-owned exit action; use `ForceHost` only for the forced termination variant:
+- Commands: for normal exit, tray exit, crash, and target-session logoff, start `Observe` while the exact client
+  is still alive, then perform the named action while the command is waiting. Run the logoff observer from a
+  different administrator session that remains signed in. Use `ForceHost` only for its named forced variant:
 
   ```powershell
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmShutdown -DisposableVmMarker $Marker -EvidenceName row09-observe -ClientProcessId $PrivateClientPid -ShutdownAction Observe
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-runtime.ps1 -Mode VmShutdown -DisposableVmMarker $Marker -EvidenceName row09-force-host -ClientProcessId $PrivateClientPid -UiPilotProcessId $UiPilotPid -ShutdownAction ForceHost
   ```
+- Interface blocker: an in-guest process cannot persist trustworthy postcondition evidence after rapid system
+  shutdown. That variant needs a VM-external observer or an Instrumented host shutdown record before it can run;
+  absence after reboot alone does not prove Job cleanup at the shutdown boundary.
 - Expected stable outcome: failures before CreateProcess leave no child; a returned child is already in the
   Job; every exit phase leaves no session client while the private Service stays running. Job/attribute list,
   CreateProcess, resume, readiness, logoff, and rapid shutdown results match Task 2's ordering contracts.
-- Evidence: `runtime-row09-observe.json`, `runtime-row09-force-host.json`, plus one redacted boolean record per
-  operator exit and Task 2 unit-test output reference.
+- Evidence: one uniquely named `runtime-row09-<exit>.json` from a pre-started surviving observer for each
+  observable exit, `runtime-row09-force-host.json`, the Task 2 unit-test output reference, and future external
+  rapid-shutdown evidence.
 - Cleanup: revert after each exit variant.
-- Status: `NOT RUN`
+- Status: `NOT RUN` — **BLOCKED: VM-external rapid-shutdown observer missing**
 
 ## Row 10 — uninstall cancellation and manifest-last interrupted continuation
 

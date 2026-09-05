@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Source', 'SelfTest', 'VmInstall', 'VmUpdate', 'VmCancelBeforeInstall', 'VmSourceReplacement', 'VmFaultCheckpoint', 'VmUninstallCheckpoint', 'VmConcurrency', 'VmExplicitUninstall')]
+    [ValidateSet('Source', 'SelfTest', 'VmInstall', 'VmUpdate', 'VmCancelBeforeInstall', 'VmSourceReplacement', 'VmSidPreservation', 'VmFaultCheckpoint', 'VmUninstallCheckpoint', 'VmConcurrency', 'VmExplicitUninstall')]
     [string]$Mode = 'Source',
     [string]$VmSetupPath,
     [string]$DisposableVmMarker,
@@ -299,6 +299,26 @@ function Get-SetupArguments([string]$Flow, [string]$ScopedInstallDirectory) {
     return $arguments
 }
 
+function Get-ManagedDesktopUserSid {
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    $managedRoot = Join-Path $programData 'UiPilot_tools\everything'
+    $rootItem = Get-Item -LiteralPath $managedRoot -Force -ErrorAction Stop
+    Assert-Condition $rootItem.PSIsContainer 'Managed runtime root is not a directory'
+    Assert-Condition (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Managed runtime root is a reparse point'
+    $manifestPath = Resolve-StrictLeaf (Join-Path $rootItem.FullName 'managed-runtime.json') 'Managed runtime manifest'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+    Assert-Condition ($manifest.schema_version -eq 1) 'Managed runtime manifest version mismatch'
+    Assert-Condition ($manifest.instance -ceq 'UiPilot') 'Managed runtime manifest instance mismatch'
+    Assert-Condition ($manifest.service_name -ceq 'Everything (UiPilot)') 'Managed runtime manifest Service mismatch'
+    $sid = [string]$manifest.desktop_user_sid
+    Assert-Condition ($sid -match '^S-1-(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*))+$') 'Managed runtime desktop SID is invalid'
+    return $sid
+}
+
+function Test-DesktopSidPreserved([string]$Before, [string]$After) {
+    return -not [string]::IsNullOrWhiteSpace($Before) -and $Before -ceq $After
+}
+
 function Invoke-OneVmSetup([string]$Setup, [string[]]$Arguments, [string]$Marker, [string]$FaultCheckpoint) {
     $oldMarker = $env:UIPILOT_VM_DISPOSABLE_MARKER
     $oldCheckpoint = $env:UIPILOT_VM_FAULT_CHECKPOINT
@@ -353,6 +373,8 @@ function Invoke-InstallerSelfTest {
             if ($scope -is [IDisposable]) { $scope.Dispose() }
         } catch { $caught = $true }
         Assert-Condition $caught 'Custom install scope accepted a nested junction escape'
+        Assert-Condition (Test-DesktopSidPreserved 'S-1-5-21-1-2-3-1001' 'S-1-5-21-1-2-3-1001') 'SID preservation self-test rejected equal canonical SIDs'
+        Assert-Condition (-not (Test-DesktopSidPreserved 'S-1-5-21-1-2-3-1001' 'S-1-5-21-1-2-3-1002')) 'SID preservation self-test accepted a changed SID'
 
         $validInstall = Join-Path $scopeRoot 'valid\install'
         [IO.Directory]::CreateDirectory($validInstall) | Out-Null
@@ -425,6 +447,24 @@ function Invoke-InstallerVmMode([string]$RepositoryRoot) {
             throw 'VmSourceReplacement is blocked until the Instrumented Setup provides a synchronized low-privilege source-handle probe'
         }
 
+        if ($Mode -ceq 'VmSidPreservation') {
+            $sidBefore = Get-ManagedDesktopUserSid
+            if ($null -ne $installScope) { $installScope.ValidateUnchanged() }
+            $exitCode = Invoke-OneVmSetup $setup $arguments $marker $null
+            $sidAfter = if ($exitCode -eq 0) { Get-ManagedDesktopUserSid } else { $null }
+            $sidPreserved = $exitCode -eq $ExpectedExitCode -and (Test-DesktopSidPreserved $sidBefore $sidAfter)
+            Write-InstallerVmEvidence $RepositoryRoot ([ordered]@{
+                schema_version = 1; kind = 'installer-sid-preservation'; mode = $Mode.ToLowerInvariant()
+                outcome = $(if ($sidPreserved) { 'pass' } else { 'fail' }); setup_sha256 = $setupHash
+                expected_exit_code = $ExpectedExitCode; actual_exit_code = $exitCode; desktop_sid_preserved = $sidPreserved
+            })
+            if (-not $sidPreserved) {
+                if ($exitCode -ne 0) { exit $exitCode }
+                exit 1
+            }
+            return
+        }
+
         $fault = if (@('VmFaultCheckpoint', 'VmUninstallCheckpoint') -contains $Mode) { $Checkpoint } else { $null }
         if ($null -ne $installScope) { $installScope.ValidateUnchanged() }
         $exitCode = Invoke-OneVmSetup $setup $arguments $marker $fault
@@ -478,7 +518,8 @@ Assert-SourceContains $releaseGate @(
 Assert-SourceContains $vmMatrix @('# Managed Everything Windows VM Matrix', '## Row 1', '## Row 13', 'VmInstall', 'VmUpdate', 'Status: `NOT RUN`')
 $installerHarness = Get-Content -LiteralPath $PSCommandPath -Raw -Encoding utf8
 foreach ($contract in @(
-    'synchronized low-privilege source-handle probe', '$installScope.ValidateUnchanged()'
+    'synchronized low-privilege source-handle probe', 'VmSidPreservation',
+    'desktop_sid_preserved', '$installScope.ValidateUnchanged()'
 )) {
     Assert-Condition $installerHarness.Contains($contract) "Installer VM harness contract is missing: $contract"
 }
