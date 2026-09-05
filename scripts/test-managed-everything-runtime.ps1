@@ -710,6 +710,7 @@ function Test-RetryBudgetSequence([bool[]]$ReplacementReady) {
 
 function Invoke-SourceGate {
     $runtime = Join-Path $script:RepositoryRoot 'src-tauri\src\file_search\everything_runtime.rs'
+    $hostSourcePath = Join-Path $script:RepositoryRoot 'src-tauri\src\lib.rs'
     $process = Join-Path $script:RepositoryRoot 'src-tauri\src\file_search\windows\everything_process.rs'
     $lifecycle = Join-Path $script:RepositoryRoot 'src-tauri\src\lifecycle.rs'
     Assert-SourceContains $runtime @(
@@ -751,6 +752,10 @@ function Invoke-SourceGate {
         'ResumeThread', 'TerminateProcess'
     )
     Assert-SourceContains $lifecycle @('prepare_application_shutdown', 'runtime.shutdown();')
+    $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw -Encoding utf8
+    $productionHostSource = ([regex]::Split($hostSource, '(?m)^#\[cfg\(test\)\]\s*$'))[0]
+    Assert-Condition $productionHostSource.Contains('_app.path().resource_dir().ok()') 'Everything resource resolution failure must become asynchronous runtime unavailability'
+    Assert-Condition (-not $productionHostSource.Contains('_app.path().resource_dir()?')) 'Everything resource resolution must not abort Tauri setup'
     $harness = Get-Content -LiteralPath $PSCommandPath -Raw -Encoding utf8
     foreach ($contract in @(
         "'VmRetryBudget'", 'OpenProcessLease', 'TerminateAndWait',

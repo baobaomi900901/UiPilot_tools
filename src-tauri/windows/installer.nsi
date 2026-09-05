@@ -317,11 +317,6 @@ FunctionEnd
 Function PageLeaveReinstall
   ${NSD_GetState} $R2 $R1
 
-  ; WiX migration retains the upstream explicit migration behavior.
-  ${If} $WixMode = 1
-    Goto reinst_uninstall
-  ${EndIf}
-
   ; In update mode, always proceeds without uninstalling
   ${If} $UpdateMode = 1
     Goto reinst_done

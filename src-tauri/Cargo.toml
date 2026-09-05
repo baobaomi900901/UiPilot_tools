@@ -23,6 +23,7 @@ installer-helper-build = []
 [[bin]]
 name = "uipilot-everything-installer"
 path = "src/bin/uipilot-everything-installer/main.rs"
+required-features = ["installer-helper-build"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }

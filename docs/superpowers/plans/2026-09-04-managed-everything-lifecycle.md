@@ -105,7 +105,7 @@
 
 **Verify:**
 
-- `cargo test --manifest-path src-tauri/Cargo.toml --bin uipilot-everything-installer`
+- `cargo test --manifest-path src-tauri/Cargo.toml --bin uipilot-everything-installer --features installer-helper-build`
 - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release`
 - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode VmInstrumentedSetup`
 - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode Source`
@@ -200,7 +200,7 @@
 **Implementation points:**
 
 - [ ] Make `test-managed-everything-runtime.ps1` read-only by default and emit redacted structured evidence. Put process termination, Service mutation, token creation/logon, pipe creation, installer invocation, failure injection, and uninstall behind explicit named modes with elevation/disposable-VM guards.
-- [ ] Make `test-managed-everything-release.ps1` the single local automated gate. In order it runs `cargo test --manifest-path src-tauri/Cargo.toml --bin uipilot-everything-installer`, the release Helper build plus PE `asInvoker`/architecture/no-fault-path inspection, installer Source gate, Everything resource-only package verification, complete IPC tests, complete Rust host tests, frontend tests/build, and production NSIS build. It must stop at the first failure, preserve individual exit codes, print the failing stage, and place generated Setup hashes and redacted outputs under the ignored artifacts root.
+- [ ] Make `test-managed-everything-release.ps1` the single local automated gate. In order it runs `cargo test --manifest-path src-tauri/Cargo.toml --bin uipilot-everything-installer --features installer-helper-build`, the release Helper build plus PE `asInvoker`/architecture/no-fault-path inspection, installer Source gate, Everything resource-only package verification, complete IPC tests, complete Rust host tests, frontend tests/build, and production NSIS build. It must stop at the first failure, preserve individual exit codes, print the failing stage, reject any generated NSIS application-binary install/delete entry for the Helper, and place generated Setup hashes and redacted outputs under the ignored artifacts root.
 - [ ] Extend the installer test script with VM-only transaction modes that invoke only Task 1's independently named VM Instrumented Setup, target each named deterministic checkpoint through that Setup, and require elevation plus a disposable-VM marker. Reuse Source-mode canonicalization and ownership assertions so tests cannot broaden cleanup scope; never invoke the Helper directly or add fault controls to the production Helper/Setup.
 - [ ] Write `docs/testing/managed-everything-vm-matrix.md` as an operator checklist mapping all 13 approved design rows to prerequisites, exact script mode/command, expected stable outcome, evidence filename, cleanup, and pass/fail/not-run status. Include both manual Setup replacement and Tauri `/UPDATE` paths.
 - [ ] Ignore `artifacts/managed-everything/` explicitly. Evidence must redact machine/user/SID/path data and must never include search text or result paths.

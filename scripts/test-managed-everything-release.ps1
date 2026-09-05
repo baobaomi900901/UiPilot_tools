@@ -155,7 +155,15 @@ function Invoke-ProductionNsisBuild {
         Assert-Condition ($manifest -match 'uiAccess\s*=\s*["'']false["'']') 'Final production NSIS Helper enables uiAccess'
         $strings = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($helper))
         Assert-Condition (-not $strings.Contains('fault-injection:')) 'Final production NSIS Helper contains the VM fault path'
-        return [pscustomobject]@{ ExitCode = 0; Output = (([string]$build.Output) + "`r`nfinal-helper-inspection:pass") }
+        $generatedNsis = Join-Path $script:RepositoryRoot 'src-tauri\target\release\nsis\x64\installer.nsi'
+        Assert-Condition (Test-Path -LiteralPath $generatedNsis -PathType Leaf) 'Generated production NSIS script is missing'
+        $generatedSource = Get-Content -LiteralPath $generatedNsis -Raw -Encoding utf8
+        Assert-Condition (-not $generatedSource.Contains('File /a "/oname=uipilot-everything-installer.exe"')) 'Helper is installed as an application binary'
+        Assert-Condition (-not $generatedSource.Contains('Delete "$INSTDIR\uipilot-everything-installer.exe"')) 'Uninstaller treats Helper as an installed application binary'
+        Assert-Condition ([regex]::Matches($generatedSource, 'nsis-hooks\.nsh').Count -eq 1) 'Generated NSIS must include the managed Everything hooks exactly once'
+        $hookSource = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'src-tauri\windows\nsis-hooks.nsh') -Raw -Encoding utf8
+        Assert-Condition ([regex]::Matches($hookSource, 'File "/oname=uipilot-everything-installer\.exe"').Count -eq 1) 'Managed Everything hooks must contain exactly one temporary Helper staging reference'
+        return [pscustomobject]@{ ExitCode = 0; Output = (([string]$build.Output) + "`r`nfinal-helper-inspection:pass`r`nhelper-install-isolation:pass") }
     }
     catch {
         return [pscustomobject]@{ ExitCode = 1; Output = (([string]$build.Output) + "`r`nfinal-helper-inspection:fail") }
@@ -173,7 +181,7 @@ function New-ReleaseStages {
     return @(
         [pscustomobject]@{
             Name = 'Helper tests'
-            Action = { Invoke-CapturedCommand 'cargo.exe' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--bin', 'uipilot-everything-installer') }
+            Action = { Invoke-CapturedCommand 'cargo.exe' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--bin', 'uipilot-everything-installer', '--features', 'installer-helper-build') }
         },
         [pscustomobject]@{
             Name = 'Production Helper build and inspection'
@@ -305,8 +313,10 @@ function Invoke-SourceGate {
     Assert-Condition (-not $installerSource.Contains("'src-tauri\target\release\bundle\nsis'")) 'Installer Source must not depend on a pre-existing production Setup'
     $productionNsisAction = 'Action = { Invoke-' + 'ProductionNsisBuild }'
     $helperHashField = 'helper_' + 'sha256 ='
+    $helperInstallIsolation = 'Helper is installed as an application binary'
     Assert-Condition $source.Contains($productionNsisAction) 'Production NSIS stage must inspect the final Helper after Tauri builds it'
     Assert-Condition $source.Contains($helperHashField) 'Production Setup evidence must bind the final Helper identity'
+    Assert-Condition $source.Contains($helperInstallIsolation) 'Production NSIS stage must reject an installed Helper application binary'
     $pipelineIndex = $source.IndexOf('$pipeline = Invoke-ReleasePipeline', [StringComparison]::Ordinal)
     $setupEvidenceIndex = $source.IndexOf('try { Write-SetupHashEvidence', [StringComparison]::Ordinal)
     Assert-Condition ($pipelineIndex -ge 0 -and $setupEvidenceIndex -gt $pipelineIndex) 'Production Setup inspection must run only after the NSIS stage succeeds'

@@ -63,6 +63,14 @@ const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
 const SDDL_REVISION_1: Dword = 1;
 const SE_KERNEL_OBJECT: Dword = 6;
 const SE_FILE_OBJECT: Dword = 1;
+const ACL_SIZE_INFORMATION_CLASS: Dword = 2;
+const SE_DACL_PROTECTED: u16 = 0x1000;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const OBJECT_INHERIT_ACE: u8 = 0x01;
+const CONTAINER_INHERIT_ACE: u8 = 0x02;
+const GENERIC_READ: Dword = 0x8000_0000;
+const GENERIC_WRITE: Dword = 0x4000_0000;
+const GENERIC_ALL: Dword = 0x1000_0000;
 const FOLDERID_LOCAL_APP_DATA: Guid = Guid::new(
     0xF1B32785,
     0x6FBA,
@@ -271,6 +279,28 @@ struct SecurityAttributes {
     length: Dword,
     security_descriptor: *mut c_void,
     inherit_handle: Bool,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct AclSizeInformation {
+    ace_count: Dword,
+    acl_bytes_in_use: Dword,
+    acl_bytes_free: Dword,
+}
+
+#[repr(C)]
+struct AceHeader {
+    ace_type: u8,
+    ace_flags: u8,
+    ace_size: u16,
+}
+
+#[repr(C)]
+struct AccessAllowedAce {
+    header: AceHeader,
+    mask: Dword,
+    sid_start: Dword,
 }
 
 #[repr(C)]
@@ -488,6 +518,24 @@ extern "system" {
         sddl: *mut *mut u16,
         length: *mut Dword,
     ) -> Bool;
+    fn GetSecurityDescriptorControl(
+        descriptor: *mut c_void,
+        control: *mut u16,
+        revision: *mut Dword,
+    ) -> Bool;
+    fn GetSecurityDescriptorDacl(
+        descriptor: *mut c_void,
+        dacl_present: *mut Bool,
+        dacl: *mut *mut c_void,
+        dacl_defaulted: *mut Bool,
+    ) -> Bool;
+    fn GetAclInformation(
+        acl: *mut c_void,
+        information: *mut c_void,
+        length: Dword,
+        information_class: Dword,
+    ) -> Bool;
+    fn GetAce(acl: *mut c_void, index: Dword, ace: *mut *mut c_void) -> Bool;
     fn GetSecurityInfo(
         handle: Handle,
         object_type: Dword,
@@ -543,6 +591,11 @@ extern "system" {
         token: Handle,
         path: *mut *mut u16,
     ) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    fn CoTaskMemFree(memory: Handle);
 }
 
 struct OwnedHandle(Handle);
@@ -812,7 +865,7 @@ fn known_folder(folder: &Guid) -> Result<PathBuf, String> {
     }
     let path = unsafe { wide_ptr_to_string(value) };
     unsafe {
-        LocalFree(value.cast());
+        CoTaskMemFree(value.cast());
     }
     Ok(PathBuf::from(path))
 }
@@ -1858,7 +1911,7 @@ pub fn query_service() -> Result<ServiceState, String> {
 pub fn invoke_service_command(
     executable: &Path,
     verb: &str,
-    sddl: Option<&str>,
+    service_security: Option<(&str, &str)>,
 ) -> Result<(), String> {
     let mut command = std::process::Command::new(executable);
     command
@@ -1866,13 +1919,15 @@ pub fn invoke_service_command(
         .arg(crate::model::INSTANCE_NAME)
         .arg(verb);
     if verb == "-install-service" {
-        let sddl = sddl.ok_or_else(|| "missing-service-sddl".to_string())?;
+        let (sddl, desktop_user_sid) =
+            service_security.ok_or_else(|| "missing-service-sddl".to_string())?;
+        validate_pipe_sddl(sddl, desktop_user_sid)?;
         command
             .arg("-install-service-pipe-name")
             .arg(crate::model::PIPE_NAME)
             .arg("-install-service-security-descriptor")
             .arg(sddl);
-    } else if sddl.is_some() {
+    } else if service_security.is_some() {
         return Err("unexpected-service-sddl".into());
     }
     let status = command
@@ -1882,6 +1937,116 @@ pub fn invoke_service_command(
         return Err("everything-service-command-failed".into());
     }
     Ok(())
+}
+
+pub fn validate_pipe_sddl(sddl: &str, desktop_user_sid: &str) -> Result<(), String> {
+    if sddl != crate::model::PIPE_SDDL_TEMPLATE.replace("${desktop_user_sid}", desktop_user_sid) {
+        return Err("pipe-sddl-template-mismatch".into());
+    }
+    validate_pipe_sddl_aces(sddl, desktop_user_sid)
+}
+
+fn validate_pipe_sddl_aces(sddl: &str, desktop_user_sid: &str) -> Result<(), String> {
+    let sddl_wide = wide(OsStr::new(sddl));
+    let mut descriptor = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == FALSE
+        || descriptor.is_null()
+    {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err("pipe-sddl-parse-failed".into());
+    }
+
+    let result = (|| {
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == FALSE
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err("pipe-sddl-control-mismatch".into());
+        }
+
+        let mut dacl_present = FALSE;
+        let mut dacl = null_mut();
+        let mut dacl_defaulted = FALSE;
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        } == FALSE
+            || dacl_present == FALSE
+            || dacl.is_null()
+            || dacl_defaulted != FALSE
+        {
+            return Err("pipe-sddl-dacl-mismatch".into());
+        }
+
+        let mut information = AclSizeInformation::default();
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut information as *mut AclSizeInformation).cast(),
+                std::mem::size_of::<AclSizeInformation>() as u32,
+                ACL_SIZE_INFORMATION_CLASS,
+            )
+        } == FALSE
+            || information.ace_count != 3
+        {
+            return Err("pipe-sddl-ace-count-mismatch".into());
+        }
+
+        let expected = [
+            ("S-1-5-18", GENERIC_ALL),
+            ("S-1-5-32-544", GENERIC_ALL),
+            (desktop_user_sid, GENERIC_READ | GENERIC_WRITE),
+        ];
+        for (index, (expected_sid_text, expected_mask)) in expected.into_iter().enumerate() {
+            let mut raw_ace = null_mut();
+            if unsafe { GetAce(dacl, index as u32, &mut raw_ace) } == FALSE || raw_ace.is_null() {
+                return Err("pipe-sddl-ace-read-failed".into());
+            }
+            let ace = unsafe { &*raw_ace.cast::<AccessAllowedAce>() };
+            if ace.header.ace_type != ACCESS_ALLOWED_ACE_TYPE
+                || ace.header.ace_flags != OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                || usize::from(ace.header.ace_size) < std::mem::size_of::<AccessAllowedAce>()
+                || ace.mask != expected_mask
+            {
+                return Err("pipe-sddl-ace-shape-mismatch".into());
+            }
+
+            let expected_sid_wide = wide(OsStr::new(expected_sid_text));
+            let mut expected_sid = null_mut();
+            if unsafe { ConvertStringSidToSidW(expected_sid_wide.as_ptr(), &mut expected_sid) }
+                == FALSE
+                || expected_sid.is_null()
+            {
+                if !expected_sid.is_null() {
+                    unsafe { LocalFree(expected_sid) };
+                }
+                return Err("pipe-sddl-expected-sid-invalid".into());
+            }
+            let actual_sid = std::ptr::addr_of!(ace.sid_start).cast_mut().cast();
+            let sid_matches = unsafe { EqualSid(actual_sid, expected_sid) } != FALSE;
+            unsafe { LocalFree(expected_sid) };
+            if !sid_matches {
+                return Err("pipe-sddl-ace-sid-mismatch".into());
+            }
+        }
+        Ok(())
+    })();
+    unsafe { LocalFree(descriptor) };
+    result
 }
 
 pub fn validate_service_command(command: &str, manifest: &RuntimeManifest) -> bool {
@@ -1988,6 +2153,19 @@ mod tests {
         assert_eq!(
             MANAGED_ROOT_SDDL,
             "O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+        );
+    }
+
+    #[test]
+    fn pipe_sddl_requires_exactly_the_three_native_aces() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let valid = crate::model::PIPE_SDDL_TEMPLATE.replace("${desktop_user_sid}", sid);
+        assert!(validate_pipe_sddl(&valid, sid).is_ok());
+        assert!(validate_pipe_sddl(&valid, "S-1-5-21-1-2-3-1002").is_err());
+        assert!(validate_pipe_sddl_aces(&format!("{valid}(A;;GR;;;BU)"), sid).is_err());
+        assert!(
+            validate_pipe_sddl_aces(&valid.replace("(A;OICI;GRGW;;;", "(A;OICI;GR;;;"), sid)
+                .is_err()
         );
     }
 

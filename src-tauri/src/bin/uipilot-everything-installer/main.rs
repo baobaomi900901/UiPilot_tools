@@ -333,8 +333,12 @@ fn invoke_validated_persisted_service_command(
     transaction::validated_persisted_execution(
         || validate_persisted_manifest(root, manifest),
         || {
-            windows::invoke_service_command(&manifest.service_binary_path, verb, sddl)
-                .map_err(|reason| (ExitCode::NativeFailure, reason))
+            windows::invoke_service_command(
+                &manifest.service_binary_path,
+                verb,
+                sddl.map(|value| (value, manifest.desktop_user_sid.as_str())),
+            )
+            .map_err(|reason| (ExitCode::NativeFailure, reason))
         },
     )
 }
@@ -657,6 +661,8 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         &request.operation_id,
     )?;
     let result = (|| {
+        let reuse_existing_binary =
+            same_version_repair_reuses_binary(durable.old_manifest.as_ref(), &durable.new_manifest);
         if managed_path_is_present(&version_dir)? {
             let disposition = candidate_directory_disposition(
                 durable
@@ -671,25 +677,33 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
                     "foreign-preexisting-version-directory",
                 );
             }
+            if !reuse_existing_binary {
+                return fail(
+                    ExitCode::ValidationFailed,
+                    "same-version-resource-identity-mismatch",
+                );
+            }
             windows::verify_managed_directory(&version_dir)
                 .map_err(|reason| (ExitCode::ForeignState, reason))?;
         } else {
             windows::create_protected_directory(&version_dir, windows::MANAGED_ROOT_SDDL)
                 .map_err(|reason| (ExitCode::ForeignState, reason))?;
         }
-        let target_temp = version_dir.join(format!(
-            "Everything.{}.tmp",
-            request.operation_id.as_str().replace('-', "")
-        ));
-        let copied_hash = windows::copy_from_held_source(&mut source, &target_temp)
-            .map_err(|reason| (ExitCode::ValidationFailed, reason))?;
-        if copied_hash != durable.new_manifest.sha256 {
-            return fail(ExitCode::ValidationFailed, "copied-target-hash-mismatch");
+        if !reuse_existing_binary {
+            let target_temp = version_dir.join(format!(
+                "Everything.{}.tmp",
+                request.operation_id.as_str().replace('-', "")
+            ));
+            let copied_hash = windows::copy_from_held_source(&mut source, &target_temp)
+                .map_err(|reason| (ExitCode::ValidationFailed, reason))?;
+            if copied_hash != durable.new_manifest.sha256 {
+                return fail(ExitCode::ValidationFailed, "copied-target-hash-mismatch");
+            }
+            windows::verify_authenticode_publisher(&target_temp, &durable.new_manifest.publisher)
+                .map_err(|reason| (ExitCode::ValidationFailed, reason))?;
+            windows::atomic_replace(&target_temp, &target)
+                .map_err(|reason| (ExitCode::NativeFailure, reason))?;
         }
-        windows::verify_authenticode_publisher(&target_temp, &durable.new_manifest.publisher)
-            .map_err(|reason| (ExitCode::ValidationFailed, reason))?;
-        windows::atomic_replace(&target_temp, &target)
-            .map_err(|reason| (ExitCode::NativeFailure, reason))?;
         windows::validate_managed_binary(&target, &durable.new_manifest)
             .map_err(|reason| (ExitCode::ValidationFailed, reason))?;
         persist_phase(
@@ -734,7 +748,10 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         windows::invoke_service_command(
             &target,
             "-install-service",
-            Some(&durable.new_manifest.expanded_sddl),
+            Some((
+                &durable.new_manifest.expanded_sddl,
+                &durable.new_manifest.desktop_user_sid,
+            )),
         )
         .map_err(|reason| (ExitCode::NativeFailure, reason))?;
         persist_phase(
@@ -797,6 +814,13 @@ fn commit_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()>
         return Err(original);
     }
     Ok(())
+}
+
+fn same_version_repair_reuses_binary(
+    old_manifest: Option<&RuntimeManifest>,
+    new_manifest: &RuntimeManifest,
+) -> bool {
+    old_manifest == Some(new_manifest)
 }
 
 fn classify_live(journal: &TransactionJournal) -> HelperResult<LiveService> {
@@ -1517,6 +1541,17 @@ mod tests {
         journal.phase = Phase::NewBinaryVerified;
         journal.new_manifest.sha256 = "b".repeat(64);
         assert!(validate_persisted_transaction_identity(root, &journal).is_err());
+    }
+
+    #[test]
+    fn same_version_repair_reuses_only_the_identical_validated_binary() {
+        let old = RuntimeManifest::fixture();
+        assert!(same_version_repair_reuses_binary(Some(&old), &old));
+
+        let mut changed = old.clone();
+        changed.sha256 = "b".repeat(64);
+        assert!(!same_version_repair_reuses_binary(Some(&old), &changed));
+        assert!(!same_version_repair_reuses_binary(None, &old));
     }
 }
 

@@ -544,7 +544,7 @@ pub fn run() {
 
             #[cfg(any(test, not(feature = "test-instrumentation")))]
             {
-                let resource_directory = _app.path().resource_dir()?;
+                let resource_directory = _app.path().resource_dir().ok();
                 let everything_runtime = Arc::new(
                     file_search::everything_runtime::EverythingRuntimeSupervisor::production(
                         resource_directory,
@@ -1767,6 +1767,8 @@ mod lib {
             let runtime = production
                 .find("EverythingRuntimeSupervisor::production(")
                 .expect("production Everything supervisor is missing");
+            assert!(production.contains("_app.path().resource_dir().ok()"));
+            assert!(!production.contains("_app.path().resource_dir()?"));
             let search = production
                 .find("EverythingSearchState::with_provider(")
                 .expect("owned-client search provider wiring is missing");

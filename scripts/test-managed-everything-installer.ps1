@@ -530,6 +530,8 @@ if ($Mode.StartsWith('Vm', [StringComparison]::Ordinal)) {
 }
 
 $helperRoot = Join-Path $root 'src-tauri\src\bin\uipilot-everything-installer'
+$helperWindows = Join-Path $helperRoot 'windows.rs'
+$cargoManifest = Join-Path $root 'src-tauri\Cargo.toml'
 $template = Join-Path $root 'src-tauri\windows\installer.nsi'
 $hooks = Join-Path $root 'src-tauri\windows\nsis-hooks.nsh'
 $build = Join-Path $root 'scripts\build-managed-everything-installer.ps1'
@@ -548,6 +550,7 @@ Assert-SourceContains $runtimeGate @(
 Assert-SourceContains $releaseGate @(
     "[ValidateSet('Local', 'Source', 'SelfTest')]",
     'Helper tests', 'Installer Source', 'Production NSIS',
+    "'--bin', 'uipilot-everything-installer', '--features', 'installer-helper-build'",
     "Action = { Invoke-CapturedCommand 'cargo.exe' @('test', '--manifest-path', 'src-tauri/Cargo.toml') }"
 )
 Assert-SourceContains $vmMatrix @('# Managed Everything Windows VM Matrix', '## Row 1', '## Row 13', 'VmInstall', 'VmUpdate', 'Status: `NOT RUN`')
@@ -571,14 +574,22 @@ Assert-SourceContains (Join-Path $helperRoot 'model.rs') @(
     'include_bytes!("../../../resources/everything/LICENSE.txt")',
     'include_bytes!("../../../resources/everything/Everything-UiPilot.ini")'
 )
-Assert-SourceContains (Join-Path $helperRoot 'windows.rs') @(
+Assert-SourceContains $helperWindows @(
     'GetShellWindow', 'GetWindowThreadProcessId', 'ProcessIdToSessionId',
     'OpenProcessToken', 'GetTokenInformation', 'ConvertSidToStringSidW',
     'CreateFileW', 'FILE_SHARE_READ', 'OPEN_EXISTING', 'FILE_FLAG_OPEN_REPARSE_POINT',
     'OpenSCManagerW', 'QueryServiceConfigW', 'QueryServiceStatusEx',
     'WaitForSingleObject', 'GetSecurityInfo', 'GetNamedSecurityInfoW',
-    'WinVerifyTrust', 'CryptQueryObject', 'CertStrToNameW', 'GetFileVersionInfoW'
+    'WinVerifyTrust', 'CryptQueryObject', 'CertStrToNameW', 'GetFileVersionInfoW',
+    'GetSecurityDescriptorControl', 'GetSecurityDescriptorDacl', 'GetAclInformation',
+    'GetAce', 'validate_pipe_sddl'
 )
+$cargoSource = Get-Content -LiteralPath $cargoManifest -Raw -Encoding utf8
+Assert-Condition ($cargoSource.Contains('required-features = ["installer-helper-build"]')) 'Helper Cargo target must require its explicit build feature so Tauri cannot install it as an application binary'
+$knownFolderFunction = [regex]::Match((Get-Content -LiteralPath $helperWindows -Raw -Encoding utf8), '(?ms)^fn known_folder\(.*?^}')
+Assert-Condition $knownFolderFunction.Success 'Helper known-folder function is missing'
+Assert-Condition $knownFolderFunction.Value.Contains('CoTaskMemFree') 'Helper known-folder buffer must use CoTaskMemFree'
+Assert-Condition (-not $knownFolderFunction.Value.Contains('LocalFree')) 'Helper known-folder buffer must not use LocalFree'
 Assert-SourceContains (Join-Path $helperRoot 'transaction.rs') @(
     'StageNewBinary', 'StopOldService', 'RemoveOldService', 'InstallNewService',
     'StartNewService', 'ReplaceRuntimeManifest', 'CleanupUnreferencedVersions',
@@ -616,6 +627,17 @@ Assert-SourceContains $vmTauri @(
 )
 $hooksSource = Get-Content -LiteralPath $hooks -Raw -Encoding utf8
 Assert-Condition (-not $hooksSource.Contains('x86_64-pc-windows-msvc\release\uipilot-everything-installer.exe')) 'NSIS must consume the late-staged Helper from its own final release target'
+$createStagingMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_CREATE_STAGING .*?^!macroend')
+Assert-Condition $createStagingMacro.Success 'NSIS staging macro is missing'
+Assert-Condition $createStagingMacro.Value.Contains('SHGetKnownFolderPath(g "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}", i 0, p 0, *p .R7)') 'NSIS known-folder API must return its allocated pointer into a fixed System register'
+Assert-Condition $createStagingMacro.Value.Contains('lstrcpynW(w .R4, p R7') 'NSIS known-folder pointer must be copied into a separate path register before release'
+Assert-Condition $createStagingMacro.Value.Contains('ole32::CoTaskMemFree(p R7)') 'NSIS known-folder buffer must use CoTaskMemFree'
+Assert-Condition (-not $createStagingMacro.Value.Contains('UIPILOT_LOCAL_FREE $R7')) 'NSIS known-folder buffer must not use LocalFree'
+Assert-Condition $createStagingMacro.Value.Contains('CreateDirectoryW(w "$UiPilotStaging", p R9)') 'NSIS protected staging directory must use the named variable value'
+$systemCalls = (($hooksSource -split '\r?\n') | Where-Object { $_.Contains('System::Call') }) -join "`n"
+foreach ($invalidSystemToken in @('.UiPilot', 'p UiPilot', 'w UiPilot', '*l .UiPilot', '*w .R9')) {
+    Assert-Condition (-not $systemCalls.Contains($invalidSystemToken)) "NSIS System call contains an invalid source/destination token: $invalidSystemToken"
+}
 
 $allInstallerSources = @(
     Get-ChildItem -LiteralPath $helperRoot -File
@@ -639,6 +661,9 @@ if ((Get-LowerSha256 $baseline) -cne $expectedBaselineHash) {
 }
 $baselineText = Get-Content -LiteralPath $baseline -Raw -Encoding utf8
 $customText = Get-Content -LiteralPath $template -Raw -Encoding utf8
+$pageLeaveReinstall = [regex]::Match($customText, '(?ms)^Function PageLeaveReinstall\r?\n.*?^FunctionEnd\r?\n')
+Assert-Condition $pageLeaveReinstall.Success 'Could not locate the custom reinstall leave function'
+Assert-Condition (-not $pageLeaveReinstall.Value.Contains('WiX migration retains the upstream explicit migration behavior')) 'WiX upgrade/downgrade must not invoke the old uninstaller'
 $uninstallSection = [regex]::Match($customText, '(?ms)^Section Uninstall\r?\n.*?^SectionEnd\r?\n')
 Assert-Condition $uninstallSection.Success 'Could not locate the custom uninstall section'
 Assert-OrderedUniqueTokens $uninstallSection.Value @(

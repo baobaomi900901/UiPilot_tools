@@ -562,9 +562,15 @@ pub(crate) struct EverythingRuntimeSupervisor {
 }
 
 impl EverythingRuntimeSupervisor {
-    pub(crate) fn production(resource_directory: PathBuf) -> Self {
+    pub(crate) fn production(resource_directory: Option<PathBuf>) -> Self {
+        let backend: Arc<dyn RuntimeBackend> = match resource_directory {
+            Some(resource_directory) => Arc::new(ProductionRuntimeBackend::new(resource_directory)),
+            None => Arc::new(UnavailableRuntimeBackend {
+                reason: RuntimeUnavailableReason::InvalidResource,
+            }),
+        };
         Self::with_backend(
-            Arc::new(ProductionRuntimeBackend::new(resource_directory)),
+            backend,
             Duration::from_secs(60),
             Duration::from_millis(100),
             [
@@ -668,6 +674,20 @@ impl EverythingRuntimeSupervisor {
         {
             let _ = worker.join();
         }
+    }
+}
+
+struct UnavailableRuntimeBackend {
+    reason: RuntimeUnavailableReason,
+}
+
+impl RuntimeBackend for UnavailableRuntimeBackend {
+    fn start(
+        &self,
+        _deadline: Instant,
+        _cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<StartedRuntime, RuntimeUnavailableReason> {
+        Err(self.reason)
     }
 }
 
@@ -2122,6 +2142,19 @@ mod tests {
             Duration::from_millis(1),
             [Duration::ZERO; 3],
         )
+    }
+
+    #[test]
+    fn missing_resource_directory_becomes_async_invalid_resource() {
+        let runtime = EverythingRuntimeSupervisor::production(None);
+        assert_eq!(runtime.snapshot().status, EverythingRuntimeStatus::Starting);
+        runtime.start_async();
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Unavailable);
+        assert_eq!(
+            runtime.snapshot().reason,
+            Some(RuntimeUnavailableReason::InvalidResource)
+        );
+        runtime.shutdown();
     }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {

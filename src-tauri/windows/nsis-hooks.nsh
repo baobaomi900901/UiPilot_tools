@@ -35,7 +35,7 @@ Var UiPilotRecoveryId
     MessageBox MB_ICONSTOP "Another installer owns an untrusted transaction object. Restart Windows and retry."
     Abort
   ${EndIf}
-  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R8, i 1, i 7, *w .R9, p 0) i .R7'
+  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R8, i 1, i 7, *p .R9, p 0) i .R7'
   !insertmacro UIPILOT_LOCAL_FREE $R8
   ${If} $R7 = 0
     MessageBox MB_ICONSTOP "The installer transaction security descriptor could not be verified."
@@ -49,31 +49,32 @@ Var UiPilotRecoveryId
   ${EndIf}
 !macroend
 
-!macro UIPILOT_SECURITY_ATTRIBUTES SDDL OUT_DESCRIPTOR OUT_ATTRIBUTES
-  StrCpy ${OUT_DESCRIPTOR} 0
-  StrCpy ${OUT_ATTRIBUTES} 0
-  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${SDDL}", i 1, *p .${OUT_DESCRIPTOR}, p 0) i .R7'
+!macro UIPILOT_SECURITY_ATTRIBUTES SDDL
+  StrCpy $R8 0
+  StrCpy $R9 0
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${SDDL}", i 1, *p .R8, p 0) i .R7'
   ${If} $R7 = 0
     MessageBox MB_ICONSTOP "The installer could not create a protected transaction."
     Abort
   ${EndIf}
   System::Alloc 12
-  Pop ${OUT_ATTRIBUTES}
-  System::Call '*${OUT_ATTRIBUTES}(i 12, p ${OUT_DESCRIPTOR}, i 0)'
+  Pop $R9
+  System::Call '*$R9(i 12, p $R8, i 0)'
 !macroend
 
-!macro UIPILOT_FREE_SECURITY_ATTRIBUTES DESCRIPTOR ATTRIBUTES
-  !insertmacro UIPILOT_LOCAL_FREE ${DESCRIPTOR}
-  ${If} ${ATTRIBUTES} != 0
-    System::Free ${ATTRIBUTES}
+!macro UIPILOT_FREE_SECURITY_ATTRIBUTES
+  !insertmacro UIPILOT_LOCAL_FREE $R8
+  ${If} $R9 != 0
+    System::Free $R9
   ${EndIf}
 !macroend
 
 !macro UIPILOT_ACQUIRE_LEASE
-  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}" $R8 $R9
-  System::Call 'kernel32::CreateMutexW(p R9, i 0, w "${UIPILOT_MUTEX_NAME}") p .UiPilotMutexHandle'
+  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
+  System::Call 'kernel32::CreateMutexW(p R9, i 0, w "${UIPILOT_MUTEX_NAME}") p .R5'
   System::Call 'kernel32::GetLastError() i .R6'
-  !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES $R8 $R9
+  StrCpy $UiPilotMutexHandle $R5
+  !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES
   ${If} $UiPilotMutexHandle = 0
     MessageBox MB_ICONSTOP "The installer transaction lock could not be created."
     Abort
@@ -81,12 +82,12 @@ Var UiPilotRecoveryId
   ${If} $R6 = 183
     !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $UiPilotMutexHandle
   ${ElseIf} $R6 != 0
-    System::Call 'kernel32::CloseHandle(p UiPilotMutexHandle)'
+    System::Call 'kernel32::CloseHandle(p $UiPilotMutexHandle)'
     StrCpy $UiPilotMutexHandle 0
     MessageBox MB_ICONSTOP "The installer transaction lock could not be verified."
     Abort
   ${EndIf}
-  System::Call 'kernel32::WaitForSingleObject(p UiPilotMutexHandle, i 0) i .R6'
+  System::Call 'kernel32::WaitForSingleObject(p $UiPilotMutexHandle, i 0) i .R6'
   ${If} $R6 = 258
     MessageBox MB_ICONSTOP "Another UiPilot installer is active. Close it or restart Windows, then retry."
     Abort
@@ -108,10 +109,11 @@ Var UiPilotRecoveryId
     MessageBox MB_ICONSTOP "An untrusted installer activity object already exists. Restart Windows and retry."
     Abort
   ${EndIf}
-  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}" $R8 $R9
-  System::Call 'kernel32::CreateEventW(p R9, i 1, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .UiPilotActivityHandle'
+  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"
+  System::Call 'kernel32::CreateEventW(p R9, i 1, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5'
   System::Call 'kernel32::GetLastError() i .R6'
-  !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES $R8 $R9
+  StrCpy $UiPilotActivityHandle $R5
+  !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES
   ${If} $UiPilotActivityHandle = 0
   ${OrIf} $R6 = 183
     MessageBox MB_ICONSTOP "The protected installer activity lease could not be created."
@@ -121,14 +123,24 @@ Var UiPilotRecoveryId
 
 !macro UIPILOT_CREATE_STAGING UNINSTALL
   ; SHGetKnownFolderPath(FOLDERID_LocalAppData) - never trust environment variables.
-  System::Call 'shell32::SHGetKnownFolderPath(g "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}", i 0, p 0, *w .R7) i .R6'
+  StrCpy $R4 ""
+  StrCpy $R7 0
+  System::Call 'shell32::SHGetKnownFolderPath(g "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}", i 0, p 0, *p .R7) i .R6'
+  ${If} $R6 = 0
+  ${AndIf} $R7 != 0
+    System::Call 'kernel32::lstrcpynW(w .R4, p R7, i ${NSIS_MAX_STRLEN}) p'
+  ${EndIf}
+  ${If} $R7 != 0
+    System::Call 'ole32::CoTaskMemFree(p R7)'
+  ${EndIf}
   ${If} $R6 != 0
+  ${OrIf} $R7 = 0
+  ${OrIf} $R4 == ""
     MessageBox MB_ICONSTOP "The elevated account temporary folder could not be resolved."
     Abort
   ${EndIf}
   System::Call 'ole32::CoCreateGuid(g .R6) i .R5'
   ${If} $R5 != 0
-    !insertmacro UIPILOT_LOCAL_FREE $R7
     MessageBox MB_ICONSTOP "A secure installer transaction identifier could not be generated."
     Abort
   ${EndIf}
@@ -138,11 +150,10 @@ Var UiPilotRecoveryId
   !else
     ${StrCase} $UiPilotOperationId $UiPilotOperationId "L"
   !endif
-  StrCpy $UiPilotStaging "$R7\Temp\UiPilotManagedEverything-$UiPilotOperationId"
-  !insertmacro UIPILOT_LOCAL_FREE $R7
-  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_STAGING_SDDL}" $R8 $R9
-  System::Call 'kernel32::CreateDirectoryW(w UiPilotStaging, p R9) i .R6'
-  !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES $R8 $R9
+  StrCpy $UiPilotStaging "$R4\Temp\UiPilotManagedEverything-$UiPilotOperationId"
+  !insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_STAGING_SDDL}"
+  System::Call 'kernel32::CreateDirectoryW(w "$UiPilotStaging", p R9) i .R6'
+  !insertmacro UIPILOT_FREE_SECURITY_ATTRIBUTES
   ${If} $R6 = 0
     MessageBox MB_ICONSTOP "The protected installer staging directory could not be created."
     Abort
@@ -154,9 +165,11 @@ Var UiPilotRecoveryId
   File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"
   FileOpen $R6 "$UiPilotJournal" w
   FileClose $R6
-  System::Call 'kernel32::GetCurrentProcessId() i .UiPilotParentPid'
-  System::Call 'kernel32::GetProcessTimes(p -1, *l .UiPilotParentCreationTime, *l .R5, *l .R6, *l .R7) i .R8'
-  ${If} $R8 = 0
+  System::Call 'kernel32::GetCurrentProcessId() i .R5'
+  StrCpy $UiPilotParentPid $R5
+  System::Call 'kernel32::GetProcessTimes(p -1, *l .R5, *l .R6, *l .R7, *l .R8) i .R9'
+  StrCpy $UiPilotParentCreationTime $R5
+  ${If} $R9 = 0
     MessageBox MB_ICONSTOP "The installer parent identity could not be captured."
     Abort
   ${EndIf}
@@ -221,12 +234,12 @@ Var UiPilotRecoveryId
   Delete "$UiPilotHelper"
   RMDir "$UiPilotStaging"
   ${If} $UiPilotActivityHandle != 0
-    System::Call 'kernel32::CloseHandle(p UiPilotActivityHandle)'
+    System::Call 'kernel32::CloseHandle(p $UiPilotActivityHandle)'
     StrCpy $UiPilotActivityHandle 0
   ${EndIf}
   ${If} $UiPilotMutexHandle != 0
-    System::Call 'kernel32::ReleaseMutex(p UiPilotMutexHandle)'
-    System::Call 'kernel32::CloseHandle(p UiPilotMutexHandle)'
+    System::Call 'kernel32::ReleaseMutex(p $UiPilotMutexHandle)'
+    System::Call 'kernel32::CloseHandle(p $UiPilotMutexHandle)'
     StrCpy $UiPilotMutexHandle 0
   ${EndIf}
 !macroend
