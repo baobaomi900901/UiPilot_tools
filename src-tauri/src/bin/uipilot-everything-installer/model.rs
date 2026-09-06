@@ -159,17 +159,19 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReviewedLock {
     pub schema_version: u32,
     pub version: String,
     pub architecture: String,
-    #[serde(rename = "everythingExeSha256")]
+    pub artifact_file_name: String,
+    pub source_url: String,
+    pub artifact_sha256: String,
     pub everything_exe_sha256: String,
-    #[serde(rename = "authenticodePublisher")]
     pub authenticode_publisher: String,
-    #[serde(flatten)]
-    pub reviewed_metadata: std::collections::BTreeMap<String, serde_json::Value>,
+    pub license: String,
+    pub license_url: String,
+    pub license_sha256: String,
 }
 
 pub fn embedded_lock() -> Result<ReviewedLock, String> {
@@ -382,6 +384,19 @@ mod tests {
         assert!(EMBEDDED_LOCK.starts_with(b"{"));
         assert!(EMBEDDED_LICENSE.starts_with(b"Everything"));
         assert!(EMBEDDED_INI.windows(18).any(|w| w == b"instance_name=UiPi"));
+    }
+
+    #[test]
+    fn embedded_reviewed_lock_matches_the_packaged_everything_binary() {
+        let lock = embedded_lock().expect("embedded reviewed lock must parse");
+
+        assert_eq!(lock.schema_version, 1);
+        assert_eq!(lock.version, "1.4.1.1032");
+        assert_eq!(lock.architecture, "x64");
+        assert_eq!(
+            lock.everything_exe_sha256,
+            "f191f756996a14a11e5445fa7103d302efd510cf2fbf920e6c0c8ed51d512e36"
+        );
     }
 
     #[test]
