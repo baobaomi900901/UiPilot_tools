@@ -648,6 +648,9 @@ Assert-Condition $hooksSource.Contains('!define UIPILOT_MUTEX_OBJECT_SDDL "O:BAG
 Assert-Condition $hooksSource.Contains('!define UIPILOT_EVENT_OBJECT_SDDL "O:BAG:BAD:P(A;;0x1f0003;;;SY)(A;;0x1f0003;;;BA)"') 'NSIS event validation must use the kernel-normalized event access mask'
 Assert-Condition $hooksSource.Contains('!insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $UiPilotMutexHandle ${UIPILOT_MUTEX_OBJECT_SDDL}') 'NSIS must validate an existing mutex against the mutex-specific descriptor'
 Assert-Condition $hooksSource.Contains('!insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $R5 ${UIPILOT_EVENT_OBJECT_SDDL}') 'NSIS must validate an existing event against the event-specific descriptor'
+$validateNamedObjectMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_VALIDATE_NAMED_OBJECT HANDLE EXPECTED_SDDL\r?\n.*?^!macroend')
+Assert-Condition $validateNamedObjectMacro.Success 'NSIS named-object validation macro must accept the expected canonical descriptor'
+Assert-Condition $validateNamedObjectMacro.Value.Contains('${If} $R7 != "${EXPECTED_SDDL}"') 'NSIS named-object validation macro must compare the actual descriptor with its expected-descriptor parameter'
 Assert-Condition (-not $hooksSource.Contains('x86_64-pc-windows-msvc\release\uipilot-everything-installer.exe')) 'NSIS must consume the late-staged Helper from its own final release target'
 $createStagingMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_CREATE_STAGING .*?^!macroend')
 Assert-Condition $createStagingMacro.Success 'NSIS staging macro is missing'
@@ -664,6 +667,13 @@ Assert-Condition (-not $stagingFileOwnerMacro.Value.Contains('SetNamedSecurityIn
 Assert-Condition (-not $hooksSource.Contains('[DEBUG-staging-owner]')) 'Temporary staging owner instrumentation must not ship'
 $acquireLeaseMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_ACQUIRE_LEASE\r?\n.*?^!macroend')
 Assert-Condition $acquireLeaseMacro.Success 'NSIS installer lease macro is missing'
+$rawNamedObjectDescriptorCalls = [regex]::Matches($acquireLeaseMacro.Value, [regex]::Escape('!insertmacro UIPILOT_SECURITY_ATTRIBUTES "${UIPILOT_NAMED_OBJECT_SDDL}"'))
+$createMutexIndex = $acquireLeaseMacro.Value.IndexOf('CreateMutexW', [StringComparison]::Ordinal)
+$openEventIndex = $acquireLeaseMacro.Value.IndexOf('OpenEventW', [StringComparison]::Ordinal)
+$createEventIndex = $acquireLeaseMacro.Value.IndexOf('CreateEventW', [StringComparison]::Ordinal)
+Assert-Condition ($rawNamedObjectDescriptorCalls.Count -eq 2) 'NSIS must use the raw GA descriptor exactly once for mutex creation and once for event creation'
+Assert-Condition ($rawNamedObjectDescriptorCalls[0].Index -lt $createMutexIndex) 'NSIS mutex creation must consume the raw GA descriptor'
+Assert-Condition ($rawNamedObjectDescriptorCalls[1].Index -gt $openEventIndex -and $rawNamedObjectDescriptorCalls[1].Index -lt $createEventIndex) 'NSIS event creation must consume the raw GA descriptor'
 $createMutexBlock = $acquireLeaseMacro.Value.Substring(0, $acquireLeaseMacro.Value.IndexOf('WaitForSingleObject', [StringComparison]::Ordinal))
 Assert-Condition $createMutexBlock.Contains('${If} $UiPilotMutexHandle = 0') 'NSIS mutex creation must reject a null handle'
 Assert-Condition $createMutexBlock.Contains('${If} $R6 = 183') 'NSIS mutex creation must validate an existing named mutex'
