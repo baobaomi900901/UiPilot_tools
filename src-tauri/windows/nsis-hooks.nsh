@@ -232,8 +232,11 @@ Var UiPilotOwnerSid
   StrCpy $UiPilotHelper "$UiPilotStaging\uipilot-everything-installer.exe"
   StrCpy $UiPilotRequest "$UiPilotStaging\request.json"
   StrCpy $UiPilotJournal "$UiPilotStaging\journal.json"
+  Push $OUTDIR
   SetOutPath "$UiPilotStaging"
   File "/oname=uipilot-everything-installer.exe" "${__FILEDIR__}\..\..\uipilot-everything-installer.exe"
+  Pop $R4
+  SetOutPath "$R4"
   !insertmacro UIPILOT_SET_STAGING_FILE_OWNER "$UiPilotHelper"
   FileOpen $R6 "$UiPilotJournal" w
   FileClose $R6

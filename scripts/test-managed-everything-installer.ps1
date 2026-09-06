@@ -655,6 +655,7 @@ Assert-Condition $validateNamedObjectMacro.Value.Contains('${If} $R7 != "${EXPEC
 Assert-Condition (-not $hooksSource.Contains('x86_64-pc-windows-msvc\release\uipilot-everything-installer.exe')) 'NSIS must consume the late-staged Helper from its own final release target'
 $createStagingMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_CREATE_STAGING .*?^!macroend')
 Assert-Condition $createStagingMacro.Success 'NSIS staging macro is missing'
+Assert-Condition ([regex]::IsMatch($createStagingMacro.Value, '(?m)^\s*Push \$OUTDIR\r?\n\s*SetOutPath "\$UiPilotStaging"\r?\n\s*File "/oname=uipilot-everything-installer\.exe"[^\r\n]*\r?\n\s*Pop \$R4\r?\n\s*SetOutPath "\$R4"')) 'NSIS staging Helper extraction must save and immediately restore the caller output directory'
 Assert-Condition $createStagingMacro.Value.Contains('SHGetKnownFolderPath(g "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}", i 0, p 0, *p .R7)') 'NSIS known-folder API must return its allocated pointer into a fixed System register'
 Assert-Condition $createStagingMacro.Value.Contains('lstrcpynW(w .R4, p R7') 'NSIS known-folder pointer must be copied into a separate path register before release'
 Assert-Condition $createStagingMacro.Value.Contains('ole32::CoTaskMemFree(p R7)') 'NSIS known-folder buffer must use CoTaskMemFree'
