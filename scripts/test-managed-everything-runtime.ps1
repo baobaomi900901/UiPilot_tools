@@ -579,9 +579,9 @@ function Get-ServiceProcessContext($Managed, [bool]$AllowTerminate) {
         Assert-ExactToken $tokens[1] '-svc' 'Private Service mode mismatch'
         Assert-ExactToken $tokens[2] '-instance' 'Private Service instance option mismatch'
         Assert-ExactToken $tokens[3] 'UiPilot' 'Private Service instance value mismatch'
-        Assert-ExactToken $tokens[4] '-service-pipe-name' 'Private Service pipe option mismatch'
+        Assert-ExactToken $tokens[4] '-svc-pipe-name' 'Private Service pipe option mismatch'
         Assert-ExactToken $tokens[5] '\\.\PIPE\UiPilotEverythingService' 'Private Service pipe value mismatch'
-        Assert-ExactToken $tokens[6] '-service-security-descriptor' 'Private Service descriptor option mismatch'
+        Assert-ExactToken $tokens[6] '-svc-security-descriptor' 'Private Service descriptor option mismatch'
         Assert-ExactToken $tokens[7] ([string]$Managed.Manifest.expanded_sddl) 'Private Service descriptor mismatch'
         $lease = [UiPilot.ManagedEverything.NativeProbe]::OpenProcessLease([uint32]$service.ProcessId, $AllowTerminate)
         Assert-ExactToken $lease.ImagePath ([string]$Managed.Binary) 'Private Service process image mismatch' $true

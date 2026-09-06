@@ -1817,12 +1817,12 @@ mod windows_runtime {
         while index < tokens.len() {
             match tokens[index].as_str() {
                 "-svc" if !service => service = true,
-                "-instance" | "-service-pipe-name" | "-service-security-descriptor"
+                "-instance" | "-svc-pipe-name" | "-svc-security-descriptor"
                     if index + 1 < tokens.len() =>
                 {
                     let slot = match tokens[index].as_str() {
                         "-instance" => &mut instance,
-                        "-service-pipe-name" => &mut pipe,
+                        "-svc-pipe-name" => &mut pipe,
                         _ => &mut sddl,
                     };
                     if slot.replace(tokens[index + 1].clone()).is_some() {
@@ -2753,7 +2753,7 @@ mod tests {
         ));
         let executable = expected.service_binary_path.display();
         let matching = format!(
-            r#""{executable}" -svc -instance "{}" -service-pipe-name "{}" -service-security-descriptor "{}""#,
+            r#""{executable}" -svc -instance "{}" -svc-pipe-name "{}" -svc-security-descriptor "{}""#,
             INSTANCE_NAME, PIPE_NAME, expected.expanded_sddl,
         );
         let other_user = matching.replace("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002");
@@ -2908,11 +2908,17 @@ mod tests {
         let expected = ExpectedService::for_test();
         let executable = expected.service_binary_path.display();
         let reordered = format!(
-            r#""{executable}" -service-security-descriptor "{}" -service-pipe-name "{}" -svc -instance "{}""#,
+            r#""{executable}" -svc-security-descriptor "{}" -svc-pipe-name "{}" -svc -instance "{}""#,
             expected.expanded_sddl, PIPE_NAME, INSTANCE_NAME,
         );
         assert!(super::windows_runtime::service_command_matches(
             &reordered, &expected,
+        ));
+        assert!(!super::windows_runtime::service_command_matches(
+            &reordered
+                .replace("-svc-security-descriptor", "-service-security-descriptor")
+                .replace("-svc-pipe-name", "-service-pipe-name"),
+            &expected,
         ));
         assert!(!super::windows_runtime::service_command_matches(
             &format!("{reordered} -svc"),

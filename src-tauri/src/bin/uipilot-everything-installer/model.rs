@@ -336,12 +336,12 @@ pub fn service_arguments_match(arguments: &str, manifest: &RuntimeManifest) -> b
     while index < tokens.len() {
         match tokens[index].as_str() {
             "-svc" if !service => service = true,
-            "-instance" | "-service-pipe-name" | "-service-security-descriptor"
+            "-instance" | "-svc-pipe-name" | "-svc-security-descriptor"
                 if index + 1 < tokens.len() =>
             {
                 let slot = match tokens[index].as_str() {
                     "-instance" => &mut instance,
-                    "-service-pipe-name" => &mut pipe,
+                    "-svc-pipe-name" => &mut pipe,
                     _ => &mut sddl,
                 };
                 if slot.replace(tokens[index + 1].clone()).is_some() {
@@ -470,6 +470,10 @@ mod tests {
     fn semantic_service_arguments_ignore_only_quoting_and_order() {
         let manifest = RuntimeManifest::fixture();
         assert!(service_arguments_match(
+            r#"-svc -instance "UiPilot" -svc-pipe-name "\\.\PIPE\UiPilotEverythingService" -svc-security-descriptor "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;S-1-5-21-1-2-3-1001)""#,
+            &manifest
+        ));
+        assert!(!service_arguments_match(
             r#"-svc -instance "UiPilot" -service-pipe-name "\\.\PIPE\UiPilotEverythingService" -service-security-descriptor "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGW;;;S-1-5-21-1-2-3-1001)""#,
             &manifest
         ));
