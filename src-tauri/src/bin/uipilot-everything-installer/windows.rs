@@ -85,8 +85,9 @@ const FOLDERID_PROGRAM_DATA: Guid = Guid::new(
 
 pub const STAGING_DACL_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 pub const STAGING_FILE_DACL_SDDL: &str = "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)";
-pub const NAMED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
 pub const MANAGED_ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const MUTEX_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)";
+const EVENT_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;0x1f0003;;;SY)(A;;0x1f0003;;;BA)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathPresence {
@@ -1014,9 +1015,23 @@ fn descriptor_sddl_for(handle: Handle, object_type: Dword) -> Result<String, Str
     result
 }
 
-fn verify_named_object_descriptor(handle: Handle) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedObjectKind {
+    Mutex,
+    ActivityEvent,
+}
+
+fn named_object_descriptor_is_exact(actual: &str, kind: NamedObjectKind) -> bool {
+    let expected = match kind {
+        NamedObjectKind::Mutex => MUTEX_OBJECT_SDDL,
+        NamedObjectKind::ActivityEvent => EVENT_OBJECT_SDDL,
+    };
+    actual == expected
+}
+
+fn verify_named_object_descriptor(handle: Handle, kind: NamedObjectKind) -> Result<(), String> {
     let actual = descriptor_sddl_for(handle, SE_KERNEL_OBJECT)?;
-    if actual != NAMED_OBJECT_SDDL {
+    if !named_object_descriptor_is_exact(&actual, kind) {
         return Err("named-object-descriptor-mismatch".into());
     }
     Ok(())
@@ -1125,14 +1140,14 @@ pub fn acquire_admission_lease(
         return Err("activity-event-missing".into());
     }
     let activity = OwnedHandle(activity);
-    verify_named_object_descriptor(activity.0)?;
+    verify_named_object_descriptor(activity.0, NamedObjectKind::ActivityEvent)?;
     let mutex_name = wide(MUTEX_NAME);
     let mutex = unsafe { OpenMutexW(SYNCHRONIZE | READ_CONTROL, FALSE, mutex_name.as_ptr()) };
     if mutex.is_null() {
         return Err("installer-mutex-missing".into());
     }
     let mutex = OwnedHandle(mutex);
-    verify_named_object_descriptor(mutex.0)?;
+    verify_named_object_descriptor(mutex.0, NamedObjectKind::Mutex)?;
     match unsafe { WaitForSingleObject(mutex.0, 0) } {
         WAIT_TIMEOUT => {}
         WAIT_OBJECT_0 | WAIT_ABANDONED => {
@@ -2116,11 +2131,33 @@ mod tests {
     fn security_descriptors_are_protected_and_exact() {
         assert_eq!(STAGING_DACL_SDDL, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
         assert_eq!(STAGING_FILE_DACL_SDDL, "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)");
-        assert_eq!(NAMED_OBJECT_SDDL, "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)");
         assert_eq!(
             MANAGED_ROOT_SDDL,
             "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         );
+    }
+
+    #[test]
+    fn named_object_descriptors_use_kernel_specific_access_masks() {
+        let mutex = "O:BAG:BAD:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)";
+        let event = "O:BAG:BAD:P(A;;0x1f0003;;;SY)(A;;0x1f0003;;;BA)";
+
+        assert!(named_object_descriptor_is_exact(
+            mutex,
+            NamedObjectKind::Mutex
+        ));
+        assert!(!named_object_descriptor_is_exact(
+            mutex,
+            NamedObjectKind::ActivityEvent
+        ));
+        assert!(named_object_descriptor_is_exact(
+            event,
+            NamedObjectKind::ActivityEvent
+        ));
+        assert!(!named_object_descriptor_is_exact(
+            event,
+            NamedObjectKind::Mutex
+        ));
     }
 
     #[test]

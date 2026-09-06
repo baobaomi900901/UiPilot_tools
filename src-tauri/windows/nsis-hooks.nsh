@@ -4,6 +4,8 @@
 !define UIPILOT_MUTEX_NAME "Global\UiPilotManagedEverythingInstaller"
 !define UIPILOT_ACTIVITY_NAME "Global\UiPilotManagedEverythingInstallerActivity"
 !define UIPILOT_NAMED_OBJECT_SDDL "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)"
+!define UIPILOT_MUTEX_OBJECT_SDDL "O:BAG:BAD:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)"
+!define UIPILOT_EVENT_OBJECT_SDDL "O:BAG:BAD:P(A;;0x1f0003;;;SY)(A;;0x1f0003;;;BA)"
 !define UIPILOT_STAGING_SDDL "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
 !define MUI_CUSTOMFUNCTION_ABORT UiPilotManagedEverythingOnAbort
 !define MUI_CUSTOMFUNCTION_UNABORT un.UiPilotManagedEverythingOnAbort
@@ -27,7 +29,7 @@ Var UiPilotOwnerSid
   ${EndIf}
 !macroend
 
-!macro UIPILOT_VALIDATE_NAMED_OBJECT HANDLE
+!macro UIPILOT_VALIDATE_NAMED_OBJECT HANDLE EXPECTED_SDDL
   StrCpy $R8 0
   StrCpy $R9 0
   System::Call 'advapi32::GetSecurityInfo(p ${HANDLE}, i 6, i 7, p 0, p 0, p 0, p 0, *p .R8) i .R7'
@@ -44,7 +46,7 @@ Var UiPilotOwnerSid
   ${EndIf}
   System::Call '*$R9(&w${NSIS_MAX_STRLEN} .R7)'
   !insertmacro UIPILOT_LOCAL_FREE $R9
-  ${If} $R7 != "${UIPILOT_NAMED_OBJECT_SDDL}"
+  ${If} $R7 != "${EXPECTED_SDDL}"
     MessageBox MB_ICONSTOP "Another installer owns an untrusted transaction object. Restart Windows and retry."
     Abort
   ${EndIf}
@@ -152,7 +154,7 @@ Var UiPilotOwnerSid
   ${EndIf}
   ; With a valid handle, LastError is meaningful only when the named mutex already existed.
   ${If} $R6 = 183
-    !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $UiPilotMutexHandle
+    !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $UiPilotMutexHandle ${UIPILOT_MUTEX_OBJECT_SDDL}
   ${EndIf}
   System::Call 'kernel32::WaitForSingleObject(p $UiPilotMutexHandle, i 0) i .R6'
   ${If} $R6 = 258
@@ -167,7 +169,7 @@ Var UiPilotOwnerSid
   System::Call 'kernel32::OpenEventW(i 1179648, i 0, w "${UIPILOT_ACTIVITY_NAME}") p .R5 ?e'
   Pop $R6
   ${If} $R5 != 0
-    !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $R5
+    !insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $R5 ${UIPILOT_EVENT_OBJECT_SDDL}
     System::Call 'kernel32::CloseHandle(p R5)'
     MessageBox MB_ICONSTOP "Another UiPilot installer or recovery Helper is active."
     Abort

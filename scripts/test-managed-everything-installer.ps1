@@ -644,6 +644,10 @@ Assert-SourceContains $vmTauri @(
     '"beforeBundleCommand": "npm run stage:managed-everything:vm"'
 )
 $hooksSource = Get-Content -LiteralPath $hooks -Raw -Encoding utf8
+Assert-Condition $hooksSource.Contains('!define UIPILOT_MUTEX_OBJECT_SDDL "O:BAG:BAD:P(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)"') 'NSIS mutex validation must use the kernel-normalized mutex access mask'
+Assert-Condition $hooksSource.Contains('!define UIPILOT_EVENT_OBJECT_SDDL "O:BAG:BAD:P(A;;0x1f0003;;;SY)(A;;0x1f0003;;;BA)"') 'NSIS event validation must use the kernel-normalized event access mask'
+Assert-Condition $hooksSource.Contains('!insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $UiPilotMutexHandle ${UIPILOT_MUTEX_OBJECT_SDDL}') 'NSIS must validate an existing mutex against the mutex-specific descriptor'
+Assert-Condition $hooksSource.Contains('!insertmacro UIPILOT_VALIDATE_NAMED_OBJECT $R5 ${UIPILOT_EVENT_OBJECT_SDDL}') 'NSIS must validate an existing event against the event-specific descriptor'
 Assert-Condition (-not $hooksSource.Contains('x86_64-pc-windows-msvc\release\uipilot-everything-installer.exe')) 'NSIS must consume the late-staged Helper from its own final release target'
 $createStagingMacro = [regex]::Match($hooksSource, '(?ms)^!macro UIPILOT_CREATE_STAGING .*?^!macroend')
 Assert-Condition $createStagingMacro.Success 'NSIS staging macro is missing'
