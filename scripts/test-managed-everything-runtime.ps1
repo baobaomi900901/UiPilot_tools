@@ -495,18 +495,16 @@ function Get-PrivateClientContext {
         Assert-Condition ($clientHash -ceq (Get-ReviewedEverythingHash)) 'Private client hash does not match the reviewed package'
 
         $tokens = Get-CommandLineTokens ([string]$record.CommandLine)
-        Assert-Condition ($tokens.Count -eq 10) 'Private client command line has an unexpected token count'
+        Assert-Condition ($tokens.Count -eq 8) 'Private client command line has an unexpected token count'
         Assert-ExactToken $tokens[0] $lease.ImagePath 'Private client command image mismatch' $true
         Assert-ExactToken $tokens[1] '-instance' 'Private client instance option mismatch'
         Assert-ExactToken $tokens[2] 'UiPilot' 'Private client instance value mismatch'
-        Assert-ExactToken $tokens[3] '-service-pipe-name' 'Private client pipe option mismatch'
-        Assert-ExactToken $tokens[4] '\\.\PIPE\UiPilotEverythingService' 'Private client pipe value mismatch'
-        Assert-ExactToken $tokens[5] '-config' 'Private client config option mismatch'
-        Assert-ExactToken $tokens[7] '-db' 'Private client database option mismatch'
-        Assert-ExactToken $tokens[9] '-startup' 'Private client startup option mismatch'
+        Assert-ExactToken $tokens[3] '-config' 'Private client config option mismatch'
+        Assert-ExactToken $tokens[5] '-db' 'Private client database option mismatch'
+        Assert-ExactToken $tokens[7] '-startup' 'Private client startup option mismatch'
 
-        $ini = [IO.Path]::GetFullPath($tokens[6])
-        $database = [IO.Path]::GetFullPath($tokens[8])
+        $ini = [IO.Path]::GetFullPath($tokens[4])
+        $database = [IO.Path]::GetFullPath($tokens[6])
         $sessionRoot = Split-Path -Parent $ini
         Assert-ExactToken (Split-Path -Parent $database) $sessionRoot 'Private client INI and DB directories differ' $true
         Assert-ExactToken (Split-Path -Leaf $ini) 'Everything-UiPilot.ini' 'Private client INI name mismatch'
@@ -516,6 +514,7 @@ function Get-PrivateClientContext {
         Assert-ExactToken (Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $sessionRoot))) 'UiPilot_tools' 'Private client application storage root mismatch'
         Resolve-StrictLeaf $ini 'Private client INI' | Out-Null
         Resolve-StrictLeaf $database 'Private client DB' | Out-Null
+        Assert-Condition ([IO.File]::ReadAllLines($ini) -ccontains 'service_pipe_name=\\.\PIPE\UiPilotEverythingService') 'Private client INI pipe value mismatch'
         $storageItem = Get-Item -LiteralPath $sessionRoot -Force -ErrorAction Stop
         Assert-Condition (($storageItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Private client storage directory is a reparse point'
 
@@ -1103,8 +1102,8 @@ function Invoke-CoexistenceProbe {
         Assert-Condition ([string]$default.Name -ceq 'Everything.exe') 'Default Everything image name mismatch'
         Assert-Condition ((Split-Path -Leaf $defaultLease.ImagePath) -ceq 'Everything.exe') 'Default Everything native image mismatch'
         $defaultTokens = Get-CommandLineTokens ([string]$default.CommandLine)
-        $looksPrivate = $defaultTokens.Count -eq 10 -and $defaultTokens[1] -ceq '-instance' -and $defaultTokens[2] -ceq 'UiPilot' -and
-            $defaultTokens[3] -ceq '-service-pipe-name' -and $defaultTokens[4] -ceq '\\.\PIPE\UiPilotEverythingService'
+        $looksPrivate = $defaultTokens.Count -eq 8 -and $defaultTokens[1] -ceq '-instance' -and $defaultTokens[2] -ceq 'UiPilot' -and
+            $defaultTokens[3] -ceq '-config' -and $defaultTokens[5] -ceq '-db' -and $defaultTokens[7] -ceq '-startup'
         $defaultUntouched = -not $looksPrivate -and $defaultLease.IsAlive -and $defaultLease.CreationTime -gt 0
         $pass = $private.Lease.IsAlive -and $defaultUntouched
         Write-ManagedEvidence $EvidenceName ([ordered]@{

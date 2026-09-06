@@ -506,8 +506,9 @@ fn recover_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()
             &durable.transaction_id,
         )
         .map_err(|reason| (ExitCode::ForeignState, reason.into()))?;
-        converge_transaction(&root, &durable)?;
+        let convergence = converge_transaction(&root, &durable)?;
         remove_transaction_artifacts(&root, &durable.transaction_id)?;
+        cleanup_recovered_fresh_root(&root, &durable, convergence)?;
     } else {
         ensure_fresh_service_absent()?;
         if request.recovered_transaction_id.is_some() {
@@ -554,6 +555,44 @@ fn recover_install(request: &Request, lease: &AdmissionLease) -> HelperResult<()
     fresh.action = Action::PrepareInstall;
     fresh.recovered_transaction_id = None;
     prepare_install(&fresh)
+}
+
+fn cleanup_recovered_fresh_root(
+    root: &Path,
+    journal: &TransactionJournal,
+    outcome: ConvergenceOutcome,
+) -> HelperResult<()> {
+    if !recovered_fresh_root_cleanup_required(outcome, journal.old_manifest.is_some()) {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(root)
+        .map_err(|_| (ExitCode::ForeignState, "recovered-root-read-failed".into()))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|_| {
+            (
+                ExitCode::ForeignState,
+                "recovered-root-entry-invalid".into(),
+            )
+        })?
+        .is_some()
+    {
+        return fail(ExitCode::ForeignState, "recovered-fresh-root-not-empty");
+    }
+    fs::remove_dir(root).map_err(|_| {
+        (
+            ExitCode::NativeFailure,
+            "recovered-fresh-root-delete-failed".into(),
+        )
+    })
+}
+
+fn recovered_fresh_root_cleanup_required(
+    outcome: ConvergenceOutcome,
+    old_manifest_present: bool,
+) -> bool {
+    outcome == ConvergenceOutcome::RolledBack && !old_manifest_present
 }
 
 fn remove_transaction_artifacts(root: &Path, id: &OperationId) -> HelperResult<()> {
@@ -1620,6 +1659,22 @@ mod tests {
         ));
         assert!(commit_failure_may_remove_artifacts(
             ConvergenceOutcome::FinishedForward
+        ));
+    }
+
+    #[test]
+    fn recovered_fresh_install_removes_only_a_rolled_back_empty_root() {
+        assert!(recovered_fresh_root_cleanup_required(
+            ConvergenceOutcome::RolledBack,
+            false
+        ));
+        assert!(!recovered_fresh_root_cleanup_required(
+            ConvergenceOutcome::RolledBack,
+            true
+        ));
+        assert!(!recovered_fresh_root_cleanup_required(
+            ConvergenceOutcome::FinishedForward,
+            false
         ));
     }
 }

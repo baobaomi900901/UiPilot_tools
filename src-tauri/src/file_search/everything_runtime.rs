@@ -144,11 +144,11 @@ pub(crate) fn build_runtime_launch(
     ini: PathBuf,
     database: PathBuf,
 ) -> Result<RuntimeLaunch, RuntimeUnavailableReason> {
+    // Everything 1.4 treats -service-pipe-name as a settings command and then exits.
+    // The reviewed INI already pins the private Service pipe for the launched client.
     let arguments = vec![
         "-instance".into(),
         INSTANCE_NAME.into(),
-        "-service-pipe-name".into(),
-        PIPE_NAME.into(),
         "-config".into(),
         ini.into_os_string(),
         "-db".into(),
@@ -2972,8 +2972,6 @@ mod tests {
             [
                 "-instance",
                 INSTANCE_NAME,
-                "-service-pipe-name",
-                PIPE_NAME,
                 "-config",
                 r"C:\Users\me\AppData\Local\UiPilot_tools\everything\7\Everything-UiPilot.ini",
                 "-db",
@@ -2981,5 +2979,6 @@ mod tests {
                 "-startup",
             ]
         );
+        assert!(!arguments.iter().any(|value| value == "-service-pipe-name"));
     }
 }

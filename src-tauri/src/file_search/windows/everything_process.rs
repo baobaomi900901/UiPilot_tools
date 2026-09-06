@@ -200,6 +200,8 @@ mod platform {
     use windows::Win32::Foundation::{
         CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
+    #[cfg(test)]
+    use windows::Win32::System::JobObjects::IsProcessInJob;
     use windows::Win32::System::JobObjects::{
         CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -227,6 +229,7 @@ mod platform {
 
     pub(crate) struct WindowsAttributeList {
         _storage: Vec<usize>,
+        _job_handles: Box<[HANDLE; 1]>,
         list: LPPROC_THREAD_ATTRIBUTE_LIST,
     }
 
@@ -275,12 +278,13 @@ mod platform {
             let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
             unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut byte_count) }
                 .map_err(|_| ProcessLaunchError::AttributeList)?;
+            let job_handles = Box::new([job.0]);
             if unsafe {
                 UpdateProcThreadAttribute(
                     list,
                     0,
                     attribute,
-                    Some(ptr::from_ref(&job.0).cast()),
+                    Some(job_handles.as_ptr().cast()),
                     size_of::<HANDLE>(),
                     None,
                     None,
@@ -293,6 +297,7 @@ mod platform {
             }
             Ok(WindowsAttributeList {
                 _storage: storage,
+                _job_handles: job_handles,
                 list,
             })
         }
@@ -442,6 +447,13 @@ mod platform {
         command: &EverythingProcessCommand,
     ) -> Result<EverythingProcess, ProcessLaunchError> {
         launch_suspended_in_job_with(WindowsProcessApi, command)
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_is_in_job(process: WindowsHandle, job: WindowsHandle) -> bool {
+        let mut assigned = windows::core::BOOL::default();
+        unsafe { IsProcessInJob(process.0, Some(job.0), &mut assigned) }.is_ok()
+            && assigned.as_bool()
     }
 }
 
@@ -624,6 +636,27 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_launch_keeps_attribute_values_valid_through_process_creation() {
+        let command = EverythingProcessCommand::new(
+            PathBuf::from(std::env::var_os("ComSpec").expect("ComSpec must be set on Windows")),
+            vec![
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from("exit 0"),
+            ],
+        )
+        .unwrap();
+
+        let mut process = super::launch(&command).expect("Windows job launch must succeed");
+        assert!(super::platform::process_is_in_job(
+            process.process,
+            process.job
+        ));
+        process.shutdown();
     }
 
     #[test]

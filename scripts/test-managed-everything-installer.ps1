@@ -540,6 +540,7 @@ if ($Mode.StartsWith('Vm', [StringComparison]::Ordinal)) {
 }
 
 $helperRoot = Join-Path $root 'src-tauri\src\bin\uipilot-everything-installer'
+$helperMain = Join-Path $helperRoot 'main.rs'
 $helperWindows = Join-Path $helperRoot 'windows.rs'
 $cargoManifest = Join-Path $root 'src-tauri\Cargo.toml'
 $template = Join-Path $root 'src-tauri\windows\installer.nsi'
@@ -597,6 +598,15 @@ Assert-SourceContains $helperWindows @(
 )
 $helperWindowsSource = Get-Content -LiteralPath $helperWindows -Raw -Encoding utf8
 Assert-Condition (-not $helperWindowsSource.Contains('CertStrToNameW')) 'Helper publisher validation must not compare re-encoded X.500 DER bytes'
+$helperMainSource = Get-Content -LiteralPath $helperMain -Raw -Encoding utf8
+$recoverInstallFunction = [regex]::Match($helperMainSource, '(?ms)^fn recover_install\(.*?^}\r?\n')
+Assert-Condition $recoverInstallFunction.Success 'Could not locate recover_install'
+Assert-OrderedUniqueTokens $recoverInstallFunction.Value @(
+    'let convergence = converge_transaction(&root, &durable)?;',
+    'remove_transaction_artifacts(&root, &durable.transaction_id)?;',
+    'cleanup_recovered_fresh_root(&root, &durable, convergence)?;',
+    'prepare_install(&fresh)'
+) 'Durable recovery must remove a rolled-back fresh-install root before preparing the replacement install'
 $cargoSource = Get-Content -LiteralPath $cargoManifest -Raw -Encoding utf8
 Assert-Condition ($cargoSource.Contains('required-features = ["installer-helper-build"]')) 'Helper Cargo target must require its explicit build feature so Tauri cannot install it as an application binary'
 $knownFolderFunction = [regex]::Match((Get-Content -LiteralPath $helperWindows -Raw -Encoding utf8), '(?ms)^fn known_folder\(.*?^}')
