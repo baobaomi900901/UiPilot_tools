@@ -84,7 +84,7 @@ const FOLDERID_PROGRAM_DATA: Guid = Guid::new(
 );
 
 pub const STAGING_DACL_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-pub const STAGING_FILE_DACL_SDDL: &str = "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)";
+pub const STAGING_FILE_DACL_SDDL: &str = "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)";
 pub const NAMED_OBJECT_SDDL: &str = "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
 pub const MANAGED_ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
@@ -2115,7 +2115,7 @@ mod tests {
     #[test]
     fn security_descriptors_are_protected_and_exact() {
         assert_eq!(STAGING_DACL_SDDL, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
-        assert_eq!(STAGING_FILE_DACL_SDDL, "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)");
+        assert_eq!(STAGING_FILE_DACL_SDDL, "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)");
         assert_eq!(NAMED_OBJECT_SDDL, "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)");
         assert_eq!(
             MANAGED_ROOT_SDDL,
@@ -2148,13 +2148,11 @@ mod tests {
 
         assert!(staging_file_dacl_is_exact(STAGING_FILE_DACL_SDDL));
         assert!(!staging_file_dacl_is_exact(
-            "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
+            "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
         ));
+        assert!(!staging_file_dacl_is_exact("D:(A;;FA;;;SY)(A;ID;FA;;;BA)"));
         assert!(!staging_file_dacl_is_exact(
-            "D:AI(A;;FA;;;SY)(A;ID;FA;;;BA)"
-        ));
-        assert!(!staging_file_dacl_is_exact(
-            "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FR;;;BU)"
+            "D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FR;;;BU)"
         ));
     }
 
