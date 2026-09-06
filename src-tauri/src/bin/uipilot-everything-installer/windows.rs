@@ -432,15 +432,13 @@ extern "system" {
         find_parameter: *const c_void,
         previous: *const CertContext,
     ) -> *const CertContext;
-    fn CertStrToNameW(
+    fn CertNameToStrW(
         encoding: Dword,
-        string: *const u16,
+        name: *const CryptIntegerBlob,
         string_type: Dword,
-        reserved: *mut c_void,
-        encoded: *mut u8,
-        encoded_size: *mut Dword,
-        error: *mut *const u16,
-    ) -> Bool;
+        output: *mut u16,
+        output_size: Dword,
+    ) -> Dword;
     fn CertFreeCertificateContext(context: *const CertContext) -> Bool;
     fn CertCloseStore(store: Handle, flags: Dword) -> Bool;
     fn CryptMsgClose(message: Handle) -> Bool;
@@ -1593,6 +1591,7 @@ fn signer_subject_matches(path: &Path, expected: &str) -> Result<(), String> {
     const CMSG_SIGNER_CERT_INFO_PARAM: Dword = 7;
     const CERT_FIND_SUBJECT_CERT: Dword = 0x000B_0000;
     const CERT_X500_NAME_STR: Dword = 3;
+    const CERT_NAME_STR_REVERSE_FLAG: Dword = 0x0200_0000;
     let path = wide(path.as_os_str());
     let mut store = null_mut();
     let mut message = null_mut();
@@ -1656,40 +1655,29 @@ fn signer_subject_matches(path: &Path, expected: &str) -> Result<(), String> {
             return Err("signer-certificate-missing".into());
         }
         let result = (|| {
-            let expected = wide(expected);
-            let mut encoded_size = 0;
-            unsafe {
-                CertStrToNameW(
-                    X509_PKCS7_ENCODING,
-                    expected.as_ptr(),
-                    CERT_X500_NAME_STR,
-                    null_mut(),
-                    null_mut(),
-                    &mut encoded_size,
-                    null_mut(),
-                );
-            }
-            if encoded_size == 0 {
-                return Err("expected-publisher-invalid".into());
-            }
-            let mut encoded = vec![0u8; encoded_size as usize];
-            if unsafe {
-                CertStrToNameW(
-                    X509_PKCS7_ENCODING,
-                    expected.as_ptr(),
-                    CERT_X500_NAME_STR,
-                    null_mut(),
-                    encoded.as_mut_ptr(),
-                    &mut encoded_size,
-                    null_mut(),
-                )
-            } == FALSE
-            {
-                return Err("expected-publisher-invalid".into());
-            }
             let subject = unsafe { &(*(*certificate).info).subject };
-            let actual = unsafe { std::slice::from_raw_parts(subject.data, subject.size as usize) };
-            (actual == &encoded[..encoded_size as usize])
+            let string_type = CERT_X500_NAME_STR | CERT_NAME_STR_REVERSE_FLAG;
+            let subject_size =
+                unsafe { CertNameToStrW(X509_PKCS7_ENCODING, subject, string_type, null_mut(), 0) };
+            if subject_size < 2 {
+                return Err("signer-subject-format-failed".into());
+            }
+            let mut subject_text = vec![0u16; subject_size as usize];
+            let written = unsafe {
+                CertNameToStrW(
+                    X509_PKCS7_ENCODING,
+                    subject,
+                    string_type,
+                    subject_text.as_mut_ptr(),
+                    subject_size,
+                )
+            };
+            if written != subject_size || subject_text.last() != Some(&0) {
+                return Err("signer-subject-format-failed".into());
+            }
+            let actual = String::from_utf16(&subject_text[..subject_text.len() - 1])
+                .map_err(|_| "signer-subject-format-failed")?;
+            (actual == expected)
                 .then_some(())
                 .ok_or_else(|| "authenticode-publisher-mismatch".into())
         })();
@@ -2308,6 +2296,33 @@ mod tests {
         drop(held);
         assert!(OpenOptions::new().write(true).open(&path).is_ok());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reviewed_publisher_matches_the_embedded_everything_signature() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(r"resources\everything\Everything.exe");
+        let lock = crate::model::embedded_lock().unwrap();
+
+        assert_eq!(
+            signer_subject_matches(&path, &lock.authenticode_publisher),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unreviewed_publisher_is_rejected_for_the_embedded_everything_signature() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(r"resources\everything\Everything.exe");
+        let lock = crate::model::embedded_lock().unwrap();
+        let unreviewed = lock
+            .authenticode_publisher
+            .replace("CN=voidtools PTY LTD", "CN=unreviewed publisher");
+
+        assert_eq!(
+            signer_subject_matches(&path, &unreviewed),
+            Err("authenticode-publisher-mismatch".into())
+        );
     }
 
     #[test]

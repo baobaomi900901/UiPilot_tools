@@ -1098,11 +1098,12 @@ mod windows_runtime {
     };
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::Cryptography::{
-        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertStrToNameW,
+        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertNameToStrW,
         CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_FIND_SUBJECT_CERT,
-        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_FORMAT_FLAG_BINARY,
-        CERT_QUERY_OBJECT_FILE, CERT_X500_NAME_STR, CMSG_SIGNER_CERT_INFO_PARAM, HCERTSTORE,
-        PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        CERT_NAME_STR_REVERSE_FLAG, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE, CERT_STRING_TYPE,
+        CERT_X500_NAME_STR, CMSG_SIGNER_CERT_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING,
+        X509_ASN_ENCODING,
     };
     use windows::Win32::Security::WinTrust::{
         WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
@@ -1581,41 +1582,23 @@ mod windows_runtime {
                 return Err(());
             }
             let comparison = (|| {
-                let expected = wide(OsStr::new(expected));
-                let mut encoded_size = 0u32;
-                let _ = unsafe {
-                    CertStrToNameW(
-                        encoding,
-                        PCWSTR(expected.as_ptr()),
-                        CERT_X500_NAME_STR,
-                        None,
-                        None,
-                        &mut encoded_size,
-                        None,
-                    )
-                };
-                if encoded_size == 0 {
+                let subject = unsafe { &(*(*certificate).pCertInfo).Subject };
+                let string_type =
+                    CERT_STRING_TYPE(CERT_X500_NAME_STR.0 | CERT_NAME_STR_REVERSE_FLAG);
+                let subject_size = unsafe { CertNameToStrW(encoding, subject, string_type, None) };
+                if subject_size < 2 {
                     return Err(());
                 }
-                let mut encoded = vec![0u8; encoded_size as usize];
-                unsafe {
-                    CertStrToNameW(
-                        encoding,
-                        PCWSTR(expected.as_ptr()),
-                        CERT_X500_NAME_STR,
-                        None,
-                        Some(encoded.as_mut_ptr()),
-                        &mut encoded_size,
-                        None,
-                    )
+                let mut subject_text = vec![0u16; subject_size as usize];
+                let written = unsafe {
+                    CertNameToStrW(encoding, subject, string_type, Some(&mut subject_text))
+                };
+                if written != subject_size || subject_text.last() != Some(&0) {
+                    return Err(());
                 }
-                .map_err(|_| ())?;
-                let subject = unsafe { &(*(*certificate).pCertInfo).Subject };
                 let actual =
-                    unsafe { std::slice::from_raw_parts(subject.pbData, subject.cbData as usize) };
-                (actual == &encoded[..encoded_size as usize])
-                    .then_some(())
-                    .ok_or(())
+                    String::from_utf16(&subject_text[..subject_text.len() - 1]).map_err(|_| ())?;
+                (actual == expected).then_some(()).ok_or(())
             })();
             let _ = unsafe { CertFreeCertificateContext(Some(certificate)) };
             comparison
@@ -1882,6 +1865,37 @@ mod windows_runtime {
 
     fn wide(value: &OsStr) -> Vec<u16> {
         value.encode_wide().chain(Some(0)).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reviewed_publisher_matches_the_embedded_everything_signature() {
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(r"resources\everything\Everything.exe");
+            let path_wide = wide(path.as_os_str());
+            let lock = parse_reviewed_lock(REVIEWED_LOCK_BYTES).unwrap();
+
+            assert_eq!(
+                signer_subject_matches(&path_wide, &lock.authenticode_publisher),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn unreviewed_publisher_is_rejected_for_the_embedded_everything_signature() {
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(r"resources\everything\Everything.exe");
+            let path_wide = wide(path.as_os_str());
+            let lock = parse_reviewed_lock(REVIEWED_LOCK_BYTES).unwrap();
+            let unreviewed = lock
+                .authenticode_publisher
+                .replace("CN=voidtools PTY LTD", "CN=unreviewed publisher");
+
+            assert_eq!(signer_subject_matches(&path_wide, &unreviewed), Err(()));
+        }
     }
 }
 

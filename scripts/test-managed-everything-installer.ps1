@@ -590,10 +590,13 @@ Assert-SourceContains $helperWindows @(
     'CreateFileW', 'FILE_SHARE_READ', 'OPEN_EXISTING', 'FILE_FLAG_OPEN_REPARSE_POINT',
     'OpenSCManagerW', 'QueryServiceConfigW', 'QueryServiceStatusEx',
     'WaitForSingleObject', 'GetSecurityInfo', 'GetNamedSecurityInfoW',
-    'WinVerifyTrust', 'CryptQueryObject', 'CertStrToNameW', 'GetFileVersionInfoW',
+    'WinVerifyTrust', 'CryptQueryObject', 'CertNameToStrW', 'CERT_NAME_STR_REVERSE_FLAG',
+    'String::from_utf16', 'GetFileVersionInfoW',
     'GetSecurityDescriptorControl', 'GetSecurityDescriptorDacl', 'GetAclInformation',
     'GetAce', 'validate_pipe_sddl'
 )
+$helperWindowsSource = Get-Content -LiteralPath $helperWindows -Raw -Encoding utf8
+Assert-Condition (-not $helperWindowsSource.Contains('CertStrToNameW')) 'Helper publisher validation must not compare re-encoded X.500 DER bytes'
 $cargoSource = Get-Content -LiteralPath $cargoManifest -Raw -Encoding utf8
 Assert-Condition ($cargoSource.Contains('required-features = ["installer-helper-build"]')) 'Helper Cargo target must require its explicit build feature so Tauri cannot install it as an application binary'
 $knownFolderFunction = [regex]::Match((Get-Content -LiteralPath $helperWindows -Raw -Encoding utf8), '(?ms)^fn known_folder\(.*?^}')
