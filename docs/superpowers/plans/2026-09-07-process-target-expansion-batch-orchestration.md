@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-07
-**Status:** Draft — awaiting user approval
+**Status:** Approved — accepted by the user on 2026-09-07; implementation not started
 
 **Goal:** Deliver the host-internal Windows process-tree and same-name planning/execution Module that freezes at most 256 exact targets before confirmation, then serially reuses Stage 1 admission and Stage 2A operations with a 30-second scheduling deadline and complete per-target reporting.
 
