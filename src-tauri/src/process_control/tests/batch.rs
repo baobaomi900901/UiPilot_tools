@@ -197,7 +197,15 @@ fn protected_owner_import_alias_catalog(source: &str) -> Vec<String> {
     let mut aliases = Vec::new();
     let mut index = 0;
     while index < lines.len() {
-        if !lines[index].trim_start().starts_with("use ") {
+        let line = lines[index].trim_start();
+        let item = if let Some(restricted) = line.strip_prefix("pub(") {
+            restricted
+                .split_once(')')
+                .map_or("", |(_, rest)| rest.trim_start())
+        } else {
+            line.strip_prefix("pub ").unwrap_or(line)
+        };
+        if !item.starts_with("use ") {
             index += 1;
             continue;
         }
@@ -434,6 +442,24 @@ use self::ProcessBatchPreview as HiddenPreview;
     assert_eq!(
         protected_owner_import_alias_catalog(private_preview_import_alias),
         expected_catalog(&["use self::ProcessBatchPreview as HiddenPreview"])
+    );
+
+    let visibility_prefixed_owner_import_aliases = r#"
+pub use self::ProcessBatchPlan as PublicPlan;
+pub(crate) use self::ProcessBatchPreview as CratePreview;
+pub(super) use self::ProcessBatchPlan as ParentPlan;
+pub(super) use self::ProcessBatchPreview as ParentPreview;
+pub(in crate::process_control) use self::ProcessBatchPlan as ScopedPlan;
+"#;
+    assert_eq!(
+        protected_owner_import_alias_catalog(visibility_prefixed_owner_import_aliases),
+        expected_catalog(&[
+            "pub use self::ProcessBatchPlan as PublicPlan",
+            "pub(crate) use self::ProcessBatchPreview as CratePreview",
+            "pub(super) use self::ProcessBatchPlan as ParentPlan",
+            "pub(super) use self::ProcessBatchPreview as ParentPreview",
+            "pub(in crate::process_control) use self::ProcessBatchPlan as ScopedPlan",
+        ])
     );
 
     let expansion_reexport = r#"
