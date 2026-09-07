@@ -1,6 +1,12 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
+};
+
+use syn::{
+    visit::{self, Visit},
+    ImplItem, TraitItem, Type, UseTree, Visibility,
 };
 
 use super::*;
@@ -129,41 +135,24 @@ fn caller_visible_type_leaks(
     sensitive_roots: &[&str],
     impl_owners: &[&str],
 ) -> Result<(), Vec<String>> {
-    let definitions = source_type_definitions(source);
-    let mut sensitive = sensitive_roots
+    let syntax = syn::parse_file(source).expect("process_control source must parse");
+    let mut surface = CallerSurface::default();
+    surface.visit_file(&syntax);
+    let sensitive = tainted_names(&surface.definitions, sensitive_roots, impl_owners);
+    let connectors = tainted_names(&surface.definitions, impl_owners, &[]);
+    let connected_traits = surface.connected_traits(&connectors);
+    let leaks = surface
+        .signatures
         .iter()
-        .map(|name| (*name).to_owned())
-        .collect::<BTreeSet<_>>();
-    loop {
-        let mut added = false;
-        for (name, definition) in &definitions {
-            if sensitive.contains(name) {
-                continue;
-            }
-            if identifiers(definition).any(|identifier| sensitive.contains(identifier)) {
-                added |= sensitive.insert(name.clone());
-            }
-        }
-        if !added {
-            break;
-        }
-    }
-
-    let visible_source = if impl_owners.is_empty() {
-        source.to_owned()
-    } else {
-        impl_owners
-            .iter()
-            .map(|owner| {
-                braced_item(source, &format!("impl {owner}"))
-                    .unwrap_or_else(|| panic!("missing impl {owner}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let leaks = caller_visible_signatures(&visible_source)
-        .into_iter()
-        .filter(|signature| identifiers(signature).any(|identifier| sensitive.contains(identifier)))
+        .filter(|signature| {
+            surface.signature_is_visible(signature)
+                && intersects(&signature.types, &sensitive)
+                && (connectors.is_empty()
+                    || intersects(&signature.types, &connectors)
+                    || intersects(&signature.owners, &connectors)
+                    || intersects(&signature.owners, &connected_traits))
+        })
+        .map(|signature| signature.label.clone())
         .collect::<Vec<_>>();
     if leaks.is_empty() {
         Ok(())
@@ -172,123 +161,412 @@ fn caller_visible_type_leaks(
     }
 }
 
-fn source_type_definitions(source: &str) -> Vec<(String, String)> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let mut definitions = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let Some((kind, name)) = type_declaration(lines[index]) else {
-            index += 1;
-            continue;
-        };
-        let mut definition = String::new();
-        let mut brace_depth = 0_isize;
-        let mut saw_brace = false;
-        loop {
-            let line = lines[index];
-            definition.push_str(line);
-            definition.push('\n');
-            for character in line.chars() {
-                match character {
-                    '{' => {
-                        saw_brace = true;
-                        brace_depth += 1;
+#[derive(Default)]
+struct TypeNames(BTreeSet<String>);
+
+impl<'ast> Visit<'ast> for TypeNames {
+    fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+        self.0.insert(segment.ident.to_string());
+        visit::visit_path_segment(self, segment);
+    }
+}
+
+enum SignatureVisibility {
+    Explicit(bool),
+    Trait { name: String, self_type: String },
+}
+
+struct CallerSignature {
+    label: String,
+    types: BTreeSet<String>,
+    owners: BTreeSet<String>,
+    visibility: SignatureVisibility,
+}
+
+#[derive(Default)]
+struct CallerSurface {
+    definitions: BTreeMap<String, BTreeSet<String>>,
+    types: BTreeMap<String, bool>,
+    traits: BTreeMap<String, bool>,
+    trait_impls: Vec<(String, String, BTreeSet<String>)>,
+    signatures: Vec<CallerSignature>,
+}
+
+impl CallerSurface {
+    fn define(&mut self, name: String, dependencies: BTreeSet<String>) {
+        self.definitions
+            .entry(name)
+            .or_default()
+            .extend(dependencies);
+    }
+
+    fn expose_type(&mut self, name: String, visible: bool) {
+        self.types.insert(name.clone(), visible);
+        self.signatures.push(CallerSignature {
+            label: format!("type {name}"),
+            types: BTreeSet::from([name]),
+            owners: BTreeSet::new(),
+            visibility: SignatureVisibility::Explicit(visible),
+        });
+    }
+
+    fn trait_is_visible(&self, name: &str) -> bool {
+        fn resolve(
+            name: &str,
+            surface: &CallerSurface,
+            visited: &mut BTreeSet<String>,
+        ) -> Option<bool> {
+            if !visited.insert(name.to_owned()) {
+                return None;
+            }
+            if let Some(visible) = surface.traits.get(name) {
+                return Some(*visible);
+            }
+            surface.definitions.get(name).and_then(|dependencies| {
+                dependencies
+                    .iter()
+                    .find_map(|dependency| resolve(dependency, surface, visited))
+            })
+        }
+        resolve(name, self, &mut BTreeSet::new()).unwrap_or(true)
+    }
+
+    fn signature_is_visible(&self, signature: &CallerSignature) -> bool {
+        match &signature.visibility {
+            SignatureVisibility::Explicit(visible) => *visible,
+            SignatureVisibility::Trait { name, self_type } => {
+                self.trait_is_visible(name) && self.type_is_visible(self_type)
+            }
+        }
+    }
+
+    fn type_is_visible(&self, name: &str) -> bool {
+        self.types.get(name).copied().unwrap_or(true)
+    }
+
+    fn connected_traits(&self, connectors: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut connected = BTreeSet::new();
+        for (trait_name, self_type, owners) in &self.trait_impls {
+            if self.trait_is_visible(trait_name)
+                && self.type_is_visible(self_type)
+                && intersects(owners, connectors)
+            {
+                collect_dependency_closure(trait_name, &self.definitions, &mut connected);
+            }
+        }
+        connected
+    }
+}
+
+impl<'ast> Visit<'ast> for CallerSurface {
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        self.define(item.ident.to_string(), names_from_fields(&item.fields));
+        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        let mut dependencies = BTreeSet::new();
+        for variant in &item.variants {
+            dependencies.extend(names_from_fields(&variant.fields));
+        }
+        self.define(item.ident.to_string(), dependencies);
+        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
+    }
+
+    fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+        let mut dependencies = TypeNames::default();
+        for field in &item.fields.named {
+            dependencies.visit_type(&field.ty);
+        }
+        self.define(item.ident.to_string(), dependencies.0);
+        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        self.define(item.ident.to_string(), names_from_type(&item.ty));
+        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        for (alias, original) in use_bindings(&item.tree) {
+            self.define(alias.clone(), BTreeSet::from([original.clone()]));
+            self.signatures.push(CallerSignature {
+                label: format!("re-export {alias}"),
+                types: BTreeSet::from([alias, original]),
+                owners: BTreeSet::new(),
+                visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
+            });
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.signatures.push(CallerSignature {
+            label: format!("function {}", item.sig.ident),
+            types: names_from_signature(&item.sig),
+            owners: BTreeSet::new(),
+            visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
+        });
+    }
+
+    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        let trait_name = item.ident.to_string();
+        let visible = caller_visible(&item.vis);
+        self.traits.insert(trait_name.clone(), visible);
+        let owners = BTreeSet::from([trait_name.clone()]);
+        for trait_item in &item.items {
+            let (label, types) = match trait_item {
+                TraitItem::Fn(method) => (
+                    format!("trait method {trait_name}::{}", method.sig.ident),
+                    names_from_signature(&method.sig),
+                ),
+                TraitItem::Const(value) => (
+                    format!("trait const {trait_name}::{}", value.ident),
+                    names_from_type(&value.ty),
+                ),
+                TraitItem::Type(value) => {
+                    let mut names = TypeNames::default();
+                    for bound in &value.bounds {
+                        names.visit_type_param_bound(bound);
                     }
-                    '}' => brace_depth -= 1,
-                    _ => {}
+                    if let Some((_, default)) = &value.default {
+                        names.visit_type(default);
+                    }
+                    (format!("trait type {trait_name}::{}", value.ident), names.0)
                 }
-            }
-            let finished = match kind {
-                "type" => line.contains(';'),
-                "struct" | "enum" => {
-                    (saw_brace && brace_depth == 0) || (!saw_brace && line.contains(';'))
-                }
-                _ => unreachable!(),
+                _ => continue,
             };
-            index += 1;
-            if finished || index == lines.len() {
-                break;
+            self.signatures.push(CallerSignature {
+                label,
+                types,
+                owners: owners.clone(),
+                visibility: SignatureVisibility::Explicit(visible),
+            });
+        }
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let owners = names_from_type(&item.self_ty);
+        let self_type = principal_type_name(&item.self_ty).unwrap_or_default();
+        let trait_name = item
+            .trait_
+            .as_ref()
+            .and_then(|(_, path, _)| path.segments.last())
+            .map(|segment| segment.ident.to_string());
+        if let Some(name) = &trait_name {
+            self.trait_impls
+                .push((name.clone(), self_type.clone(), owners.clone()));
+            let mut types = owners.clone();
+            if let Some((_, path, _)) = &item.trait_ {
+                types.extend(names_from_path(path));
             }
+            self.signatures.push(CallerSignature {
+                label: format!("trait impl {name}"),
+                types,
+                owners: owners.clone(),
+                visibility: SignatureVisibility::Trait {
+                    name: name.clone(),
+                    self_type: self_type.clone(),
+                },
+            });
         }
-        definitions.push((name, definition));
-    }
-    definitions
-}
-
-fn type_declaration(line: &str) -> Option<(&'static str, String)> {
-    let tokens = line.trim_start().split_whitespace().collect::<Vec<_>>();
-    for kind in ["struct", "enum", "type"] {
-        let Some(position) = tokens.iter().position(|token| *token == kind) else {
-            continue;
-        };
-        let raw_name = tokens.get(position + 1)?;
-        let name = raw_name
-            .chars()
-            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-            .collect::<String>();
-        if !name.is_empty() {
-            return Some((kind, name));
+        for impl_item in &item.items {
+            let (label, types, visibility) = match impl_item {
+                ImplItem::Fn(method) => (
+                    format!("impl method {}", method.sig.ident),
+                    names_from_signature(&method.sig),
+                    trait_name.as_ref().map_or_else(
+                        || SignatureVisibility::Explicit(caller_visible(&method.vis)),
+                        |name| SignatureVisibility::Trait {
+                            name: name.clone(),
+                            self_type: self_type.clone(),
+                        },
+                    ),
+                ),
+                ImplItem::Const(value) => (
+                    format!("impl const {}", value.ident),
+                    names_from_type(&value.ty),
+                    trait_name.as_ref().map_or_else(
+                        || SignatureVisibility::Explicit(caller_visible(&value.vis)),
+                        |name| SignatureVisibility::Trait {
+                            name: name.clone(),
+                            self_type: self_type.clone(),
+                        },
+                    ),
+                ),
+                ImplItem::Type(value) => (
+                    format!("impl type {}", value.ident),
+                    names_from_type(&value.ty),
+                    trait_name.as_ref().map_or_else(
+                        || SignatureVisibility::Explicit(caller_visible(&value.vis)),
+                        |name| SignatureVisibility::Trait {
+                            name: name.clone(),
+                            self_type: self_type.clone(),
+                        },
+                    ),
+                ),
+                _ => continue,
+            };
+            self.signatures.push(CallerSignature {
+                label,
+                types,
+                owners: owners.clone(),
+                visibility,
+            });
         }
     }
-    None
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        self.signatures.push(CallerSignature {
+            label: format!("const {}", item.ident),
+            types: names_from_type(&item.ty),
+            owners: BTreeSet::new(),
+            visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
+        });
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.signatures.push(CallerSignature {
+            label: format!("static {}", item.ident),
+            types: names_from_type(&item.ty),
+            owners: BTreeSet::new(),
+            visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
+        });
+    }
 }
 
-fn identifiers(source: &str) -> impl Iterator<Item = &str> {
-    source
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .filter(|token| !token.is_empty())
+fn names_from_fields(fields: &syn::Fields) -> BTreeSet<String> {
+    let mut names = TypeNames::default();
+    for field in fields {
+        names.visit_type(&field.ty);
+    }
+    names.0
 }
 
-fn braced_item(source: &str, marker: &str) -> Option<String> {
-    let start = source.find(marker)?;
-    let item = &source[start..];
-    let opening = item.find('{')?;
-    let mut depth = 0_isize;
-    for (offset, character) in item[opening..].char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(item[..opening + offset + 1].to_owned());
+fn names_from_type(value: &Type) -> BTreeSet<String> {
+    let mut names = TypeNames::default();
+    names.visit_type(value);
+    names.0
+}
+
+fn principal_type_name(value: &Type) -> Option<String> {
+    match value {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        Type::Group(group) => principal_type_name(&group.elem),
+        Type::Paren(paren) => principal_type_name(&paren.elem),
+        Type::Reference(reference) => principal_type_name(&reference.elem),
+        _ => None,
+    }
+}
+
+fn names_from_signature(signature: &syn::Signature) -> BTreeSet<String> {
+    let mut names = TypeNames::default();
+    names.visit_signature(signature);
+    names.0
+}
+
+fn names_from_path(path: &syn::Path) -> BTreeSet<String> {
+    let mut names = TypeNames::default();
+    names.visit_path(path);
+    names.0
+}
+
+fn use_bindings(tree: &UseTree) -> Vec<(String, String)> {
+    fn walk(tree: &UseTree, prefix: &mut Vec<String>, bindings: &mut Vec<(String, String)>) {
+        match tree {
+            UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                walk(&path.tree, prefix, bindings);
+                prefix.pop();
+            }
+            UseTree::Name(name) => {
+                let name = name.ident.to_string();
+                let original = if name == "self" {
+                    prefix.last().cloned().unwrap_or(name)
+                } else {
+                    name
+                };
+                bindings.push((original.clone(), original));
+            }
+            UseTree::Rename(rename) => {
+                let original = if rename.ident == "self" {
+                    prefix
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| rename.ident.to_string())
+                } else {
+                    rename.ident.to_string()
+                };
+                bindings.push((rename.rename.to_string(), original));
+            }
+            UseTree::Group(group) => {
+                for tree in &group.items {
+                    walk(tree, prefix, bindings);
                 }
             }
-            _ => {}
+            UseTree::Glob(_) => {}
         }
     }
-    None
+    let mut bindings = Vec::new();
+    walk(tree, &mut Vec::new(), &mut bindings);
+    bindings
 }
 
-fn caller_visible_signatures(source: &str) -> Vec<String> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let mut signatures = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        if !lines[index].trim_start().starts_with("pub(crate)") {
-            index += 1;
-            continue;
+fn tainted_names(
+    definitions: &BTreeMap<String, BTreeSet<String>>,
+    roots: &[&str],
+    barriers: &[&str],
+) -> BTreeSet<String> {
+    let mut tainted = roots
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    let barriers = barriers.iter().copied().collect::<BTreeSet<_>>();
+    loop {
+        let additions = definitions
+            .iter()
+            .filter(|(name, dependencies)| {
+                !barriers.contains(name.as_str())
+                    && !tainted.contains(*name)
+                    && intersects(dependencies, &tainted)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            return tainted;
         }
-
-        let mut signature = String::new();
-        loop {
-            let line = lines[index];
-            signature.push_str(line.trim());
-            signature.push(' ');
-            index += 1;
-            let trimmed = line.trim_end();
-            let is_function = signature.contains(" fn ") || signature.starts_with("pub(crate) fn ");
-            let finished = if is_function {
-                trimmed.contains('{') || trimmed.ends_with(';')
-            } else {
-                trimmed.contains('{') || trimmed.ends_with(';') || trimmed.ends_with(',')
-            };
-            if finished || index == lines.len() {
-                break;
-            }
-        }
-        signatures.push(signature.trim().to_owned());
+        tainted.extend(additions);
     }
-    signatures
+}
+
+fn collect_dependency_closure(
+    name: &str,
+    definitions: &BTreeMap<String, BTreeSet<String>>,
+    closure: &mut BTreeSet<String>,
+) {
+    if !closure.insert(name.to_owned()) {
+        return;
+    }
+    if let Some(dependencies) = definitions.get(name) {
+        for dependency in dependencies {
+            collect_dependency_closure(dependency, definitions, closure);
+        }
+    }
+}
+
+fn caller_visible(visibility: &Visibility) -> bool {
+    match visibility {
+        Visibility::Public(_) => true,
+        Visibility::Restricted(restricted) => restricted.path.is_ident("crate"),
+        Visibility::Inherited => false,
+    }
+}
+
+fn intersects(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    left.iter().any(|name| right.contains(name))
 }
 
 #[test]
@@ -308,6 +586,56 @@ impl ProcessBatchPlan {
     )
     .is_err());
 
+    let second_inherent_impl = r#"
+impl ProcessBatchPlan {
+    pub(crate) fn scope_name(&self) -> &str {
+        unreachable!()
+    }
+}
+impl ProcessBatchPlan {
+    pub(crate) fn exact_identity(&self) -> &ProcessTarget {
+        unreachable!()
+    }
+}
+"#;
+    assert!(caller_visible_type_leaks(
+        second_inherent_impl,
+        &["ProcessTarget"],
+        &["ProcessBatchPlan"]
+    )
+    .is_err());
+
+    let free_function_seam = r#"
+pub(crate) fn inspect_plan(
+    plan: &ProcessBatchPlan,
+) -> &ProcessTarget {
+    unreachable!()
+}
+"#;
+    assert!(caller_visible_type_leaks(
+        free_function_seam,
+        &["ProcessTarget"],
+        &["ProcessBatchPlan", "ProcessBatchPreview"]
+    )
+    .is_err());
+
+    let trait_seam = r#"
+pub(crate) trait PlanInspection {
+    fn exact_identity(&self) -> &ProcessTarget;
+}
+impl PlanInspection for ProcessBatchPlan {
+    fn exact_identity(&self) -> &ProcessTarget {
+        unreachable!()
+    }
+}
+"#;
+    assert!(caller_visible_type_leaks(
+        trait_seam,
+        &["ProcessTarget"],
+        &["ProcessBatchPlan", "ProcessBatchPreview"]
+    )
+    .is_err());
+
     let renamed_expansion_wrapper = r#"
 struct CatalogEnvelope {
     snapshot: ExpansionSnapshot,
@@ -317,6 +645,24 @@ pub(crate) type CallerCatalog = InternalCatalog;
 "#;
     assert!(caller_visible_type_leaks(
         renamed_expansion_wrapper,
+        &[
+            "ExpansionSnapshot",
+            "ExpansionEntry",
+            "ExpansionOmissionReason",
+        ],
+        &[],
+    )
+    .is_err());
+
+    let import_renamed_expansion_wrapper = r#"
+use crate::process_control::core::ExpansionSnapshot as HiddenCatalog;
+struct CatalogEnvelope {
+    snapshot: HiddenCatalog,
+}
+pub(crate) type CallerCatalog = CatalogEnvelope;
+"#;
+    assert!(caller_visible_type_leaks(
+        import_renamed_expansion_wrapper,
         &[
             "ExpansionSnapshot",
             "ExpansionEntry",
