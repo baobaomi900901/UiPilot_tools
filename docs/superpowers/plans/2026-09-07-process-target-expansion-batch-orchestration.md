@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-07
-**Status:** Approved — accepted by the user on 2026-09-07; implementation not started
+**Status:** Implementation in progress — Task 1 implemented and independently reviewed through 02ec01a (no findings); Tasks 2-6 not started.
 
 **Goal:** Deliver the host-internal Windows process-tree and same-name planning/execution Module that freezes at most 256 exact targets before confirmation, then serially reuses Stage 1 admission and Stage 2A operations with a 30-second scheduling deadline and complete per-target reporting.
 
@@ -114,12 +114,12 @@ The approved design is canonical for field visibility, root error priority, ance
 
 **Dependencies:** Approved design sections 4. Core Invariants, 5.3 Internal Expansion Snapshot, 6. Crate-Private Interface, 7.1 Root Preflight, 7.2 Root Correlation And Error Priority, 7.3 Candidate Normalization, 14. Top-Level Error Contract, 15.1 Planning, and 18. Logging And Data Handling.
 
-- [ ] Declare batch and its child test module without changing visibility or moving/reworking existing Stage 1/2A tests.
-- [ ] Define ProcessBatchScope, ProcessBatchOperation, ProcessBatchOmissions, ProcessBatchSelectionCompleteness, ProcessBatchPreview, ProcessBatchPlan, and ProcessBatchError with the exact variants/accessors above and stable Display codes from design section 14; all constructors remain private to batch.rs.
-- [ ] Add ExpansionSnapshot, ExpansionEntry, and ExpansionOmissionReason behind the core-to-batch internal seam. Capture raw PID/name/parent hints only for private scope attribution, attach a reliable ProcessRecord only after the existing full observation flow, and preserve the ordinary ProcessSnapshot records, ordering, omissions, errors, and HANDLE behavior exactly.
-- [ ] Implement candidate normalization for zero/duplicate PID, invalid names, per-candidate observation failure, full-enumeration failure, checked omission counts, and exact temporary-HANDLE cleanup.
-- [ ] Implement prepare_batch_planning: validate root and operation, retain one temporary Stage 1 admission while taking one expansion snapshot, correlate the exact root with the approved priority, then close the admission and return a handle-free PreparedBatchPlanning.
-- [ ] Add source/trait checks that the plan and preview cannot clone/serialize exact targets, raw hints never leave the Module, and no logging or platform side-effect primitive is introduced.
+- [x] Declare batch and its child test module without changing visibility or moving/reworking existing Stage 1/2A tests.
+- [x] Define ProcessBatchScope, ProcessBatchOperation, ProcessBatchOmissions, ProcessBatchSelectionCompleteness, ProcessBatchPreview, ProcessBatchPlan, and ProcessBatchError with the exact variants/accessors above and stable Display codes from design section 14; all constructors remain private to batch.rs.
+- [x] Add ExpansionSnapshot, ExpansionEntry, and ExpansionOmissionReason behind the core-to-batch internal seam. Capture raw PID/name/parent hints only for private scope attribution, attach a reliable ProcessRecord only after the existing full observation flow, and preserve the ordinary ProcessSnapshot records, ordering, omissions, errors, and HANDLE behavior exactly.
+- [x] Implement candidate normalization for zero/duplicate PID, invalid names, per-candidate observation failure, full-enumeration failure, checked omission counts, and exact temporary-HANDLE cleanup.
+- [x] Implement prepare_batch_planning: validate root and operation, retain one temporary Stage 1 admission while taking one expansion snapshot, correlate the exact root with the approved priority, then close the admission and return a handle-free PreparedBatchPlanning.
+- [x] Add source/trait checks that the plan and preview cannot clone/serialize exact targets, raw hints never leave the Module, and no logging or platform side-effect primitive is introduced.
 
 **Distinct test coverage:** Root invalid/expired/exited/changed/inspection/protected priority; catalog creation and traversal failure; same-PID replacement versus absent root re-poll; root admission remains open through snapshot and closes before prepared context return; duplicate PID makes all duplicates unreliable without changing ordinary ProcessSnapshot behavior; invalid/failed candidates retain private omission reasons; normal, error, and catch_unwind paths close root/snapshot/candidate handles once; all error Display text is the stable code and excludes scripted sensitive values.
 
@@ -234,7 +234,7 @@ Expected: format, every focused suite, serialized Windows batch tests, complete 
 
 ## Final Acceptance Checklist
 
-- [ ] Task 1 covers design sections 4, 5.3, 7.1-7.3, 14, 15.1, and the planning portion of 18.
+- [x] Task 1 covers design sections 4, 5.3, 7.1-7.3, 14, 15.1, and the planning portion of 18.
 - [ ] Task 2 covers design sections 6.1-6.2, 8, 10, 11, and tree-related known limits.
 - [ ] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
 - [ ] Task 4 covers design sections 12-17 and the execution portion of 18.
