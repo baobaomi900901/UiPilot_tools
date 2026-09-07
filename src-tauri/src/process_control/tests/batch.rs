@@ -40,6 +40,21 @@ mod plan_is_not_serialize {
     }
 }
 
+mod plan_is_not_deserialize_owned {
+    use super::ProcessBatchPlan;
+
+    trait AmbiguousIfImpl<A> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+    struct Implemented;
+    impl<T: ?Sized + serde::de::DeserializeOwned> AmbiguousIfImpl<Implemented> for T {}
+
+    pub(super) fn assert_contract() {
+        let _ = <ProcessBatchPlan as AmbiguousIfImpl<_>>::marker;
+    }
+}
+
 mod preview_is_not_clone {
     use super::ProcessBatchPreview;
 
@@ -70,6 +85,21 @@ mod preview_is_not_serialize {
     }
 }
 
+mod preview_is_not_deserialize_owned {
+    use super::ProcessBatchPreview;
+
+    trait AmbiguousIfImpl<A> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+    struct Implemented;
+    impl<T: ?Sized + serde::de::DeserializeOwned> AmbiguousIfImpl<Implemented> for T {}
+
+    pub(super) fn assert_contract() {
+        let _ = <ProcessBatchPreview as AmbiguousIfImpl<_>>::marker;
+    }
+}
+
 fn planning_script(creation_time: u64, name: &str, path: &str) -> FakeProcessScript {
     FakeProcessScript {
         open: vec![Ok(()), Ok(())].into(),
@@ -94,12 +124,236 @@ fn absent_root_script(
     }
 }
 
+fn caller_visible_type_leaks(
+    source: &str,
+    sensitive_roots: &[&str],
+    impl_owners: &[&str],
+) -> Result<(), Vec<String>> {
+    let definitions = source_type_definitions(source);
+    let mut sensitive = sensitive_roots
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let mut added = false;
+        for (name, definition) in &definitions {
+            if sensitive.contains(name) {
+                continue;
+            }
+            if identifiers(definition).any(|identifier| sensitive.contains(identifier)) {
+                added |= sensitive.insert(name.clone());
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    let visible_source = if impl_owners.is_empty() {
+        source.to_owned()
+    } else {
+        impl_owners
+            .iter()
+            .map(|owner| {
+                braced_item(source, &format!("impl {owner}"))
+                    .unwrap_or_else(|| panic!("missing impl {owner}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let leaks = caller_visible_signatures(&visible_source)
+        .into_iter()
+        .filter(|signature| identifiers(signature).any(|identifier| sensitive.contains(identifier)))
+        .collect::<Vec<_>>();
+    if leaks.is_empty() {
+        Ok(())
+    } else {
+        Err(leaks)
+    }
+}
+
+fn source_type_definitions(source: &str) -> Vec<(String, String)> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut definitions = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let Some((kind, name)) = type_declaration(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        let mut definition = String::new();
+        let mut brace_depth = 0_isize;
+        let mut saw_brace = false;
+        loop {
+            let line = lines[index];
+            definition.push_str(line);
+            definition.push('\n');
+            for character in line.chars() {
+                match character {
+                    '{' => {
+                        saw_brace = true;
+                        brace_depth += 1;
+                    }
+                    '}' => brace_depth -= 1,
+                    _ => {}
+                }
+            }
+            let finished = match kind {
+                "type" => line.contains(';'),
+                "struct" | "enum" => {
+                    (saw_brace && brace_depth == 0) || (!saw_brace && line.contains(';'))
+                }
+                _ => unreachable!(),
+            };
+            index += 1;
+            if finished || index == lines.len() {
+                break;
+            }
+        }
+        definitions.push((name, definition));
+    }
+    definitions
+}
+
+fn type_declaration(line: &str) -> Option<(&'static str, String)> {
+    let tokens = line.trim_start().split_whitespace().collect::<Vec<_>>();
+    for kind in ["struct", "enum", "type"] {
+        let Some(position) = tokens.iter().position(|token| *token == kind) else {
+            continue;
+        };
+        let raw_name = tokens.get(position + 1)?;
+        let name = raw_name
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect::<String>();
+        if !name.is_empty() {
+            return Some((kind, name));
+        }
+    }
+    None
+}
+
+fn identifiers(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+}
+
+fn braced_item(source: &str, marker: &str) -> Option<String> {
+    let start = source.find(marker)?;
+    let item = &source[start..];
+    let opening = item.find('{')?;
+    let mut depth = 0_isize;
+    for (offset, character) in item[opening..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(item[..opening + offset + 1].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn caller_visible_signatures(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut signatures = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].trim_start().starts_with("pub(crate)") {
+            index += 1;
+            continue;
+        }
+
+        let mut signature = String::new();
+        loop {
+            let line = lines[index];
+            signature.push_str(line.trim());
+            signature.push(' ');
+            index += 1;
+            let trimmed = line.trim_end();
+            let is_function = signature.contains(" fn ") || signature.starts_with("pub(crate) fn ");
+            let finished = if is_function {
+                trimmed.contains('{') || trimmed.ends_with(';')
+            } else {
+                trimmed.contains('{') || trimmed.ends_with(';') || trimmed.ends_with(',')
+            };
+            if finished || index == lines.len() {
+                break;
+            }
+        }
+        signatures.push(signature.trim().to_owned());
+    }
+    signatures
+}
+
+#[test]
+fn batch_catalog_api_leak_guard_rejects_aliases_wrappers_and_alternate_accessors() {
+    let renamed_target_accessor = r#"
+type ConfirmedIdentity = ProcessTarget;
+impl ProcessBatchPlan {
+    pub(crate) fn confirmed_identity(&self) -> &ConfirmedIdentity {
+        unreachable!()
+    }
+}
+"#;
+    assert!(caller_visible_type_leaks(
+        renamed_target_accessor,
+        &["ProcessTarget"],
+        &["ProcessBatchPlan"]
+    )
+    .is_err());
+
+    let renamed_expansion_wrapper = r#"
+struct CatalogEnvelope {
+    snapshot: ExpansionSnapshot,
+}
+type InternalCatalog = CatalogEnvelope;
+pub(crate) type CallerCatalog = InternalCatalog;
+"#;
+    assert!(caller_visible_type_leaks(
+        renamed_expansion_wrapper,
+        &[
+            "ExpansionSnapshot",
+            "ExpansionEntry",
+            "ExpansionOmissionReason",
+        ],
+        &[],
+    )
+    .is_err());
+
+    let internal_only = r#"
+struct CatalogEnvelope {
+    snapshot: ExpansionSnapshot,
+}
+pub(super) fn prepare_catalog() -> CatalogEnvelope {
+    unreachable!()
+}
+"#;
+    assert!(caller_visible_type_leaks(
+        internal_only,
+        &[
+            "ExpansionSnapshot",
+            "ExpansionEntry",
+            "ExpansionOmissionReason",
+        ],
+        &[],
+    )
+    .is_ok());
+}
+
 #[test]
 fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
     plan_is_not_clone::assert_contract();
     plan_is_not_serialize::assert_contract();
+    plan_is_not_deserialize_owned::assert_contract();
     preview_is_not_clone::assert_contract();
     preview_is_not_serialize::assert_contract();
+    preview_is_not_deserialize_owned::assert_contract();
 
     let errors = [
         ProcessBatchError::InvalidTarget,
@@ -133,7 +387,9 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
         .all(|error| !error.to_string().contains("sensitive-fixture.exe")));
 
     let batch_source = include_str!("../batch.rs");
+    let core_source = include_str!("../core.rs");
     let module_source = include_str!("../mod.rs");
+    let process_control_source = format!("{core_source}\n{batch_source}\n{module_source}");
     let plan_fields = batch_source
         .split("pub(crate) struct ProcessBatchPlan")
         .nth(1)
@@ -141,13 +397,6 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
         .split("impl ProcessBatchPlan")
         .next()
         .expect("ProcessBatchPlan accessors must follow the fields");
-    let plan_accessors = batch_source
-        .split("impl ProcessBatchPlan")
-        .nth(1)
-        .expect("ProcessBatchPlan accessors must be declared")
-        .split("pub(crate) struct ProcessBatchPreview")
-        .next()
-        .expect("ProcessBatchPreview must follow plan accessors");
     let preview_fields = batch_source
         .split("pub(crate) struct ProcessBatchPreview")
         .nth(1)
@@ -157,7 +406,12 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
         .expect("ProcessBatchPreview accessors must follow the fields");
 
     assert!(plan_fields.contains("targets: Vec<ProcessTarget>"));
-    assert!(!plan_accessors.contains("targets("));
+    caller_visible_type_leaks(
+        &process_control_source,
+        &["ProcessTarget"],
+        &["ProcessBatchPlan", "ProcessBatchPreview"],
+    )
+    .expect("plan and preview signatures must not expose exact targets");
     for forbidden in ["Clone", "Serialize", "Deserialize"] {
         assert!(
             !plan_fields.contains(forbidden),
@@ -199,9 +453,16 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "found forbidden {forbidden}"
         );
     }
-    assert!(!module_source.contains("ExpansionSnapshot"));
-    assert!(!module_source.contains("ExpansionEntry"));
-    assert!(!module_source.contains("ExpansionOmissionReason"));
+    caller_visible_type_leaks(
+        &process_control_source,
+        &[
+            "ExpansionSnapshot",
+            "ExpansionEntry",
+            "ExpansionOmissionReason",
+        ],
+        &[],
+    )
+    .expect("caller-visible process_control signatures must not expose expansion data");
 
     let _ = ProcessBatchScope::Tree;
     let _ = ProcessBatchScope::SameName;
