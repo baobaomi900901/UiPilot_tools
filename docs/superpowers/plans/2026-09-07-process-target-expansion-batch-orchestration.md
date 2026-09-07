@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-07
-**Status:** Implementation in progress — Task 1 implemented and independently reviewed through 02ec01a (no findings); Tasks 2-6 not started.
+**Status:** Implementation in progress — Tasks 1-2 implemented and independently reviewed through e30fbf2 (no findings); Tasks 3-6 not started.
 
 **Goal:** Deliver the host-internal Windows process-tree and same-name planning/execution Module that freezes at most 256 exact targets before confirmation, then serially reuses Stage 1 admission and Stage 2A operations with a 30-second scheduling deadline and complete per-target reporting.
 
@@ -131,11 +131,11 @@ The approved design is canonical for field visibility, root error priority, ance
 
 **Dependencies:** Task 1; approved design sections 6.1 ProcessBatchPlan, 6.2 Read-Only Preview, 8. Tree Expansion, 10. Cardinality And Completeness, 11. Confirmation Handoff, and 24. Known Limits.
 
-- [ ] Implement the private tree-plan builder over PreparedBatchPlanning; include the root and only descendants whose entire root path has unique reliable endpoints, matching observedParentPid, nondecreasing creationTime, and no cycle.
-- [ ] Attribute a direct unreliable child to its observed Stage 1 omission and every blocked descendant/invalid edge/cycle to ancestryUnverified exactly once; never reconnect a reliable descendant across an unreliable ancestor.
-- [ ] Compute immutable depth, then sort by depth descending, PID ascending, and creationTime ascending. Store exact targets privately while preview exposes only ordinal/display fields.
-- [ ] Apply the shared checked 256-target limit after reliable selection; 257 returns TargetSetTooLarge without a partial plan.
-- [ ] Derive CompleteSelection versus IncompleteSelection from the four omission counters and prove planning performs no operation call.
+- [x] Implement the private tree-plan builder over PreparedBatchPlanning; include the root and only descendants whose entire root path has unique reliable endpoints, matching observedParentPid, nondecreasing creationTime, and no cycle.
+- [x] Attribute a direct unreliable child to its observed Stage 1 omission and every blocked descendant/invalid edge/cycle to ancestryUnverified exactly once; never reconnect a reliable descendant across an unreliable ancestor.
+- [x] Compute immutable depth, then sort by depth descending, PID ascending, and creationTime ascending. Store exact targets privately while preview exposes only ordinal/display fields.
+- [x] Apply the shared checked 256-target limit after reliable selection; 257 returns TargetSetTooLarge without a partial plan.
+- [x] Derive CompleteSelection versus IncompleteSelection from the four omission counters and prove planning performs no operation call.
 
 **Distinct test coverage:** Root-only tree; root/child/grandchild order; stable sibling order; parent PID reuse with creation-time inversion; self-loop, reachable cycle, duplicate/missing parent, direct unreliable child, reliable descendant behind an unreliable parent, one omission per candidate, 256 accepted/257 rejected, exact frozen preview, and candidate/relationship changes after planning leaving the plan unchanged.
 
@@ -235,7 +235,7 @@ Expected: format, every focused suite, serialized Windows batch tests, complete 
 ## Final Acceptance Checklist
 
 - [x] Task 1 covers design sections 4, 5.3, 7.1-7.3, 14, 15.1, and the planning portion of 18.
-- [ ] Task 2 covers design sections 6.1-6.2, 8, 10, 11, and tree-related known limits.
+- [x] Task 2 covers design sections 6.1-6.2, 8, 10, 11, and tree-related known limits.
 - [ ] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
 - [ ] Task 4 covers design sections 12-17 and the execution portion of 18.
 - [ ] Task 5 covers the real Windows requirements in sections 19, 21, and 24 without production fallback changes.
