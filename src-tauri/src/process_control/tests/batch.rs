@@ -138,7 +138,9 @@ fn declaration_catalog(source: &str, visibility: CatalogVisibility) -> Vec<Strin
         let line = lines[index].trim_start();
         let visible = match visibility {
             CatalogVisibility::Caller => {
-                line.starts_with("pub(crate) ") || line.starts_with("pub ")
+                line.starts_with("pub(crate) ")
+                    || line.starts_with("pub(in crate) ")
+                    || line.starts_with("pub ")
             }
             CatalogVisibility::Internal => line.starts_with("pub(super) "),
         };
@@ -185,6 +187,36 @@ fn type_alias_catalog(source: &str) -> Vec<String> {
             }
         }
         aliases.push(normalize_declaration(&declaration));
+    }
+    aliases.sort();
+    aliases
+}
+
+fn protected_owner_import_alias_catalog(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut aliases = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].trim_start().starts_with("use ") {
+            index += 1;
+            continue;
+        }
+        let mut declaration = String::new();
+        loop {
+            let line = lines[index].trim();
+            declaration.push_str(line);
+            declaration.push(' ');
+            index += 1;
+            if line.ends_with(';') || index == lines.len() {
+                break;
+            }
+        }
+        let tokens = identifier_tokens(&declaration).collect::<Vec<_>>();
+        if tokens.windows(3).any(|window| {
+            matches!(window[0], "ProcessBatchPlan" | "ProcessBatchPreview") && window[1] == "as"
+        }) {
+            aliases.push(normalize_declaration(&declaration));
+        }
     }
     aliases.sort();
     aliases
@@ -322,6 +354,33 @@ pub(crate) fn inspect_plan(
     assert!(!declaration_catalog(free_function_seam, CatalogVisibility::Caller).is_empty());
     assert!(returns_exact_target(free_function_seam));
 
+    let crate_visible_free_function_seam = r#"
+pub(in crate) fn exact_identity(
+    plan: &ProcessBatchPlan,
+) -> &ProcessTarget {
+    unreachable!()
+}
+"#;
+    assert_eq!(
+        declaration_catalog(crate_visible_free_function_seam, CatalogVisibility::Caller),
+        expected_catalog(&[
+            "pub(in crate) fn exact_identity(plan: &ProcessBatchPlan) -> &ProcessTarget"
+        ])
+    );
+    assert!(returns_exact_target(crate_visible_free_function_seam));
+
+    let module_visible_free_function_seam = r#"
+pub(in crate::process_control) fn exact_identity(
+    plan: &ProcessBatchPlan,
+) -> &ProcessTarget {
+    unreachable!()
+}
+"#;
+    assert!(
+        declaration_catalog(module_visible_free_function_seam, CatalogVisibility::Caller)
+            .is_empty()
+    );
+
     let permitted_planning_input = r#"
 pub(crate) fn plan_batch(root: &ProcessTarget) -> ProcessBatchPlan {
     unreachable!()
@@ -356,6 +415,25 @@ impl PublicTrait for HiddenPlan {}
     assert_ne!(
         type_alias_catalog(private_self_alias_trait_impl),
         Vec::<String>::new()
+    );
+
+    let private_owner_import_alias = r#"
+use self::ProcessBatchPlan as HiddenPlan;
+impl Deref for HiddenPlan {
+    type Target = ProcessTarget;
+}
+"#;
+    assert_eq!(
+        protected_owner_import_alias_catalog(private_owner_import_alias),
+        expected_catalog(&["use self::ProcessBatchPlan as HiddenPlan"])
+    );
+
+    let private_preview_import_alias = r#"
+use self::ProcessBatchPreview as HiddenPreview;
+"#;
+    assert_eq!(
+        protected_owner_import_alias_catalog(private_preview_import_alias),
+        expected_catalog(&["use self::ProcessBatchPreview as HiddenPreview"])
     );
 
     let expansion_reexport = r#"
@@ -454,6 +532,10 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
     let core_source = include_str!("../core.rs");
     let module_source = include_str!("../mod.rs");
     assert_eq!(type_alias_catalog(batch_source), Vec::<String>::new());
+    assert_eq!(
+        protected_owner_import_alias_catalog(batch_source),
+        Vec::<String>::new()
+    );
     let plan_fields = batch_source
         .split("pub(crate) struct ProcessBatchPlan")
         .nth(1)
