@@ -5,8 +5,8 @@ use std::{
 
 use super::*;
 use crate::process_control::batch::{
-    ProcessBatchError, ProcessBatchOperation, ProcessBatchPlan, ProcessBatchPreview,
-    ProcessBatchScope, ProcessBatchSelectionCompleteness,
+    build_tree_plan, ProcessBatchError, ProcessBatchOperation, ProcessBatchPlan,
+    ProcessBatchPreview, ProcessBatchScope, ProcessBatchSelectionCompleteness,
 };
 use crate::process_control::core::ExpansionOmissionReason;
 
@@ -734,6 +734,7 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(super) fn snapshot(&self) -> &ExpansionSnapshot",
             "pub(super) fn operation(&self) -> ProcessBatchOperation",
             "pub(super) fn prepare_batch_planning(&self, root: &ProcessTarget, operation: ProcessBatchOperation) -> Result<PreparedBatchPlanning, ProcessBatchError>",
+            "pub(super) fn build_tree_plan(prepared: PreparedBatchPlanning) -> Result<ProcessBatchPlan, ProcessBatchError>",
         ])
     );
     for forbidden in ["Clone", "Serialize", "Deserialize"] {
@@ -1234,4 +1235,487 @@ fn batch_catalog_normal_error_and_unwind_paths_close_every_temporary_handle_once
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(dropped.len(), 3);
+}
+
+fn prepared_tree(
+    root_pid: u32,
+    root_creation_time: u64,
+    candidates: Vec<ProcessCandidate>,
+    processes: Vec<(u32, FakeProcessScript)>,
+) -> (FakeProcessAdapter, ProcessBatchPlan) {
+    let mut adapter = FakeProcessAdapter::default().with_enumeration(
+        std::iter::once(Ok(candidate(root_pid, "root.exe", None)))
+            .chain(candidates.into_iter().map(Ok))
+            .collect(),
+    );
+    adapter = adapter.with_process(
+        root_pid,
+        planning_script(root_creation_time, "root.exe", r"C:\Fixtures\root.exe"),
+    );
+    for (pid, script) in processes {
+        adapter = adapter.with_process(pid, script);
+    }
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(
+            &target(root_pid, root_creation_time),
+            ProcessBatchOperation::Terminate,
+        )
+        .unwrap();
+    let plan = build_tree_plan(prepared).unwrap();
+    (adapter, plan)
+}
+
+fn preview_rows(
+    plan: &ProcessBatchPlan,
+) -> Vec<(usize, u32, String, Option<PathBuf>, Option<usize>)> {
+    plan.previews()
+        .iter()
+        .map(|preview| {
+            (
+                preview.ordinal(),
+                preview.pid(),
+                preview.name().to_owned(),
+                preview.executable_path().map(PathBuf::from),
+                preview.depth(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn batch_tree_root_only_freezes_exact_preview_without_operation_calls() {
+    let (adapter, plan) = prepared_tree(600, 60_000, vec![], vec![]);
+
+    assert_eq!(plan.scope(), ProcessBatchScope::Tree);
+    assert_eq!(plan.operation(), ProcessBatchOperation::Terminate);
+    assert_eq!(
+        preview_rows(&plan),
+        vec![(
+            0,
+            600,
+            "root.exe".into(),
+            Some(PathBuf::from(r"C:\Fixtures\root.exe")),
+            Some(0),
+        )]
+    );
+    assert_eq!(
+        plan.selection_completeness(),
+        ProcessBatchSelectionCompleteness::CompleteSelection
+    );
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+    assert_eq!(adapter.post_close_calls(), 0);
+    assert_eq!(adapter.terminate_calls(), 0);
+}
+
+#[test]
+fn batch_tree_orders_deepest_first_then_pid_and_freezes_snapshot_values() {
+    let candidates = vec![
+        candidate(603, "sibling.exe", Some(600)),
+        candidate(602, "child.exe", Some(600)),
+        candidate(604, "grandchild.exe", Some(602)),
+    ];
+    let processes = vec![
+        (
+            603,
+            successful_script(60_300, "sibling.exe", r"C:\Old\sibling.exe"),
+        ),
+        (
+            602,
+            successful_script(60_200, "child.exe", r"C:\Old\child.exe"),
+        ),
+        (
+            604,
+            successful_script(60_400, "grandchild.exe", r"C:\Old\grandchild.exe"),
+        ),
+    ];
+    let (adapter, plan) = prepared_tree(600, 60_000, candidates, processes);
+
+    adapter.replace_process(
+        602,
+        successful_script(99_999, "changed.exe", r"C:\New\changed.exe"),
+    );
+    assert_eq!(
+        preview_rows(&plan),
+        vec![
+            (
+                0,
+                604,
+                "grandchild.exe".into(),
+                Some(PathBuf::from(r"C:\Old\grandchild.exe")),
+                Some(2)
+            ),
+            (
+                1,
+                602,
+                "child.exe".into(),
+                Some(PathBuf::from(r"C:\Old\child.exe")),
+                Some(1)
+            ),
+            (
+                2,
+                603,
+                "sibling.exe".into(),
+                Some(PathBuf::from(r"C:\Old\sibling.exe")),
+                Some(1)
+            ),
+            (
+                3,
+                600,
+                "root.exe".into(),
+                Some(PathBuf::from(r"C:\Fixtures\root.exe")),
+                Some(0)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn batch_tree_attributes_direct_failure_and_blocks_descendants_once() {
+    let denied = FakeProcessScript {
+        open: vec![Err(ObservationFailure::AccessDenied)].into(),
+        ..FakeProcessScript::default()
+    };
+    let (adapter, plan) = prepared_tree(
+        610,
+        61_000,
+        vec![
+            candidate(611, "denied.exe", Some(610)),
+            candidate(612, "behind.exe", Some(611)),
+        ],
+        vec![
+            (611, denied),
+            (
+                612,
+                successful_script(61_200, "behind.exe", r"C:\Fixtures\behind.exe"),
+            ),
+        ],
+    );
+
+    assert_eq!(plan.previews().len(), 1);
+    assert_eq!(plan.omissions().inspection_denied(), 1);
+    assert_eq!(plan.omissions().ancestry_unverified(), 1);
+    assert_eq!(plan.omissions().total(), 2);
+    assert_eq!(
+        plan.selection_completeness(),
+        ProcessBatchSelectionCompleteness::IncompleteSelection
+    );
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_tree_preserves_each_direct_stage_one_omission_category() {
+    let (adapter, plan) = prepared_tree(
+        615,
+        61_500,
+        vec![
+            candidate(616, "exited.exe", Some(615)),
+            candidate(617, "denied.exe", Some(615)),
+            candidate(0, "zero.exe", Some(615)),
+        ],
+        vec![
+            (
+                616,
+                FakeProcessScript {
+                    open: vec![Ok(())].into(),
+                    creation_times: vec![Ok(61_600)].into(),
+                    liveness: vec![Ok(Liveness::Exited)].into(),
+                    ..FakeProcessScript::default()
+                },
+            ),
+            (
+                617,
+                FakeProcessScript {
+                    open: vec![Err(ObservationFailure::AccessDenied)].into(),
+                    ..FakeProcessScript::default()
+                },
+            ),
+        ],
+    );
+
+    assert_eq!(plan.omissions().exited_or_changed(), 1);
+    assert_eq!(plan.omissions().inspection_denied(), 1);
+    assert_eq!(plan.omissions().identity_unavailable(), 1);
+    assert_eq!(plan.omissions().ancestry_unverified(), 0);
+    assert_eq!(plan.omissions().total(), 3);
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_tree_rejects_time_inversion_missing_parent_self_loop_and_reachable_cycle() {
+    let (adapter, plan) = prepared_tree(
+        620,
+        62_000,
+        vec![
+            candidate(621, "older.exe", Some(620)),
+            candidate(622, "behind-older.exe", Some(621)),
+            candidate(623, "missing.exe", Some(9_123)),
+            candidate(624, "self.exe", Some(624)),
+            candidate(625, "cycle-a.exe", Some(626)),
+            candidate(626, "cycle-b.exe", Some(625)),
+            candidate(627, "other-root.exe", Some(0)),
+            candidate(630, "unreliable-outside.exe", None),
+            candidate(631, "behind-unreliable-outside.exe", Some(630)),
+        ],
+        vec![
+            (
+                621,
+                successful_script(61_999, "older.exe", r"C:\Fixtures\older.exe"),
+            ),
+            (
+                622,
+                successful_script(62_200, "behind-older.exe", r"C:\Fixtures\behind-older.exe"),
+            ),
+            (
+                623,
+                successful_script(62_300, "missing.exe", r"C:\Fixtures\missing.exe"),
+            ),
+            (
+                624,
+                successful_script(62_400, "self.exe", r"C:\Fixtures\self.exe"),
+            ),
+            (
+                625,
+                successful_script(62_500, "cycle-a.exe", r"C:\Fixtures\cycle-a.exe"),
+            ),
+            (
+                626,
+                successful_script(62_600, "cycle-b.exe", r"C:\Fixtures\cycle-b.exe"),
+            ),
+            (
+                627,
+                successful_script(62_700, "other-root.exe", r"C:\Fixtures\other-root.exe"),
+            ),
+            (
+                630,
+                FakeProcessScript {
+                    open: vec![Err(ObservationFailure::AccessDenied)].into(),
+                    ..FakeProcessScript::default()
+                },
+            ),
+            (
+                631,
+                successful_script(
+                    62_710,
+                    "behind-unreliable-outside.exe",
+                    r"C:\Fixtures\behind-unreliable-outside.exe",
+                ),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        plan.previews()
+            .iter()
+            .map(ProcessBatchPreview::pid)
+            .collect::<Vec<_>>(),
+        vec![620]
+    );
+    assert_eq!(plan.omissions().ancestry_unverified(), 8);
+    assert_eq!(plan.omissions().total(), 8);
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_tree_root_incoming_edge_blocks_reachable_cycle_without_omitting_root() {
+    let root_pid = 628;
+    let child_pid = 629;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", Some(child_pid))),
+            Ok(candidate(child_pid, "child.exe", Some(root_pid))),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(62_800, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            child_pid,
+            successful_script(62_900, "child.exe", r"C:\Fixtures\child.exe"),
+        );
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(&target(root_pid, 62_800), ProcessBatchOperation::Terminate)
+        .unwrap();
+    let plan = build_tree_plan(prepared).unwrap();
+
+    assert_eq!(
+        plan.previews()
+            .iter()
+            .map(ProcessBatchPreview::pid)
+            .collect::<Vec<_>>(),
+        vec![root_pid]
+    );
+    assert_eq!(plan.omissions().ancestry_unverified(), 1);
+    assert_eq!(plan.omissions().total(), 1);
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_tree_root_parent_and_its_other_children_are_provably_outside_scope() {
+    let root_pid = 635;
+    let parent_pid = 636;
+    let sibling_pid = 637;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", Some(parent_pid))),
+            Ok(candidate(parent_pid, "parent.exe", None)),
+            Ok(candidate(sibling_pid, "sibling.exe", Some(parent_pid))),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(63_500, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            parent_pid,
+            successful_script(63_400, "parent.exe", r"C:\Fixtures\parent.exe"),
+        )
+        .with_process(
+            sibling_pid,
+            successful_script(63_600, "sibling.exe", r"C:\Fixtures\sibling.exe"),
+        );
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(&target(root_pid, 63_500), ProcessBatchOperation::Terminate)
+        .unwrap();
+    let plan = build_tree_plan(prepared).unwrap();
+
+    assert_eq!(
+        plan.previews()
+            .iter()
+            .map(ProcessBatchPreview::pid)
+            .collect::<Vec<_>>(),
+        vec![root_pid]
+    );
+    assert_eq!(plan.omissions().total(), 0);
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_tree_uses_only_prepared_relationships_and_never_reenumerates() {
+    let root_pid = 633;
+    let child_pid = 634;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(child_pid, "child.exe", Some(root_pid))),
+        ])
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "renamed-root.exe", None)),
+            Ok(candidate(child_pid, "renamed-child.exe", None)),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(63_300, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            child_pid,
+            successful_script(63_400, "child.exe", r"C:\Fixtures\child.exe"),
+        );
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(&target(root_pid, 63_300), ProcessBatchOperation::Terminate)
+        .unwrap();
+    let calls_after_preparation = adapter.calls();
+    let plan = build_tree_plan(prepared).unwrap();
+
+    assert_eq!(adapter.calls(), calls_after_preparation);
+    assert_eq!(
+        adapter
+            .calls()
+            .iter()
+            .filter(|call| **call == FakeCall::Enumerate)
+            .count(),
+        1
+    );
+    assert_eq!(
+        preview_rows(&plan),
+        vec![
+            (
+                0,
+                child_pid,
+                "child.exe".into(),
+                Some(PathBuf::from(r"C:\Fixtures\child.exe")),
+                Some(1),
+            ),
+            (
+                1,
+                root_pid,
+                "root.exe".into(),
+                Some(PathBuf::from(r"C:\Fixtures\root.exe")),
+                Some(0),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn batch_tree_duplicate_pid_branch_is_ancestry_unverified_per_candidate() {
+    let duplicate_pid = 631;
+    let (adapter, plan) = prepared_tree(
+        630,
+        63_000,
+        vec![
+            candidate(duplicate_pid, "first.exe", Some(630)),
+            candidate(duplicate_pid, "second.exe", Some(630)),
+            candidate(632, "behind.exe", Some(duplicate_pid)),
+        ],
+        vec![
+            (
+                duplicate_pid,
+                successful_script(63_100, "first.exe", r"C:\Fixtures\first.exe"),
+            ),
+            (
+                632,
+                successful_script(63_200, "behind.exe", r"C:\Fixtures\behind.exe"),
+            ),
+        ],
+    );
+
+    assert_eq!(plan.previews().len(), 1);
+    assert_eq!(plan.omissions().exited_or_changed(), 0);
+    assert_eq!(plan.omissions().ancestry_unverified(), 3);
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_tree_accepts_256_targets_and_rejects_257_without_operation_calls() {
+    for (descendants, expected_error) in [
+        (255_u32, None),
+        (256, Some(ProcessBatchError::TargetSetTooLarge)),
+    ] {
+        let root_pid = 700;
+        let mut candidates = Vec::new();
+        let mut processes = Vec::new();
+        for offset in 1..=descendants {
+            let pid = root_pid + offset;
+            candidates.push(candidate(pid, "child.exe", Some(root_pid)));
+            processes.push((
+                pid,
+                successful_script(
+                    70_000 + offset as u64,
+                    "child.exe",
+                    r"C:\Fixtures\child.exe",
+                ),
+            ));
+        }
+        let mut adapter = FakeProcessAdapter::default().with_enumeration(
+            std::iter::once(Ok(candidate(root_pid, "root.exe", None)))
+                .chain(candidates.into_iter().map(Ok))
+                .collect(),
+        );
+        adapter = adapter.with_process(
+            root_pid,
+            planning_script(70_000, "root.exe", r"C:\Fixtures\root.exe"),
+        );
+        for (pid, script) in processes {
+            adapter = adapter.with_process(pid, script);
+        }
+        let prepared = authority(adapter.clone())
+            .prepare_batch_planning(&target(root_pid, 70_000), ProcessBatchOperation::Terminate)
+            .unwrap();
+        let result = build_tree_plan(prepared);
+        assert_eq!(result.as_ref().err().copied(), expected_error);
+        if expected_error.is_none() {
+            assert_eq!(result.unwrap().previews().len(), 256);
+        }
+        assert_eq!(adapter.requested_operation_access(), vec![]);
+        assert_eq!(adapter.terminate_calls(), 0);
+    }
 }

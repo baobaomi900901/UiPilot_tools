@@ -1,11 +1,15 @@
-use std::{error::Error, fmt, path::Path};
-
-use super::core::{
-    CoreAuthority, ExpansionSnapshot, HostInstanceId, Liveness, ProcessError, ProcessIntent,
-    ProcessPlatformAdapter, ProcessRecord, ProcessTarget,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    path::Path,
 };
 
-#[allow(dead_code)]
+use super::core::{
+    CoreAuthority, ExpansionEntry, ExpansionOmissionReason, ExpansionSnapshot, HostInstanceId,
+    Liveness, ProcessError, ProcessIntent, ProcessPlatformAdapter, ProcessRecord, ProcessTarget,
+};
+
 const BATCH_TARGET_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +246,167 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
             snapshot,
             operation,
         })
+    }
+}
+
+pub(super) fn build_tree_plan(
+    prepared: PreparedBatchPlanning,
+) -> Result<ProcessBatchPlan, ProcessBatchError> {
+    let root_pid = prepared.root.pid();
+    let mut by_pid = BTreeMap::<u32, Vec<&ExpansionEntry>>::new();
+    for entry in prepared.snapshot.entries() {
+        by_pid.entry(entry.pid_hint()).or_default().push(entry);
+    }
+
+    let mut omissions = ProcessBatchOmissions::new();
+    let mut selected = vec![(prepared.root.clone(), 0_usize)];
+    for entry in prepared
+        .snapshot
+        .entries()
+        .iter()
+        .filter(|entry| entry.pid_hint() != root_pid)
+    {
+        match resolve_tree_candidate(entry, prepared.root(), &by_pid) {
+            TreeCandidateResolution::Selected(depth) => {
+                let record = entry
+                    .record()
+                    .expect("selected tree candidates have reliable records");
+                selected.push((record.clone(), depth));
+            }
+            TreeCandidateResolution::Omitted(reason) => omissions.increment(reason)?,
+            TreeCandidateResolution::OutsideScope => {}
+        }
+    }
+
+    if selected.len() > BATCH_TARGET_LIMIT {
+        return Err(ProcessBatchError::TargetSetTooLarge);
+    }
+    selected.sort_by(|(left_record, left_depth), (right_record, right_depth)| {
+        right_depth
+            .cmp(left_depth)
+            .then_with(|| left_record.pid().cmp(&right_record.pid()))
+            .then_with(|| {
+                left_record
+                    .target()
+                    .creation_time()
+                    .cmp(&right_record.target().creation_time())
+            })
+    });
+
+    let targets = selected
+        .iter()
+        .map(|(record, _)| record.target().clone())
+        .collect();
+    let previews = selected
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (record, depth))| ProcessBatchPreview {
+            ordinal,
+            pid: record.pid(),
+            name: record.name().to_owned(),
+            executable_path: record.executable_path().map(Path::to_path_buf),
+            depth: Some(depth),
+        })
+        .collect();
+    Ok(ProcessBatchPlan {
+        authority_id: prepared.authority_id,
+        scope: ProcessBatchScope::Tree,
+        operation: prepared.operation,
+        targets,
+        previews,
+        omissions,
+    })
+}
+
+enum TreeCandidateResolution {
+    Selected(usize),
+    Omitted(BatchOmissionReason),
+    OutsideScope,
+}
+
+fn resolve_tree_candidate(
+    candidate: &ExpansionEntry,
+    root: &ProcessRecord,
+    by_pid: &BTreeMap<u32, Vec<&ExpansionEntry>>,
+) -> TreeCandidateResolution {
+    if by_pid
+        .get(&candidate.pid_hint())
+        .is_some_and(|entries| entries.len() != 1)
+    {
+        return TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified);
+    }
+
+    let mut current = candidate;
+    let mut visited = BTreeSet::new();
+    let mut depth = 0_usize;
+    let candidate_unreliable = candidate.record().is_none();
+    let mut ancestry_invalid = false;
+    let mut root_parent_encountered = false;
+
+    loop {
+        if !visited.insert(current.pid_hint()) {
+            return TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified);
+        }
+        if root.observed_parent_pid() == Some(current.pid_hint()) {
+            root_parent_encountered = true;
+        }
+        let Some(parent_pid) = current
+            .observed_parent_pid_hint()
+            .filter(|parent_pid| *parent_pid != 0)
+        else {
+            return if ancestry_invalid || candidate_unreliable {
+                TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified)
+            } else {
+                TreeCandidateResolution::OutsideScope
+            };
+        };
+        depth = match depth.checked_add(1) {
+            Some(depth) => depth,
+            None => {
+                return TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified)
+            }
+        };
+
+        if parent_pid == root.pid() {
+            ancestry_invalid |= root_parent_encountered;
+            if let Some(child) = current.record() {
+                ancestry_invalid |= root.target().creation_time() > child.target().creation_time();
+            } else if !std::ptr::eq(current, candidate) {
+                ancestry_invalid = true;
+            }
+            if ancestry_invalid {
+                return TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified);
+            }
+            return match candidate.omission_reason() {
+                Some(reason) => TreeCandidateResolution::Omitted(map_expansion_omission(reason)),
+                None => TreeCandidateResolution::Selected(depth),
+            };
+        }
+
+        let Some(parents) = by_pid.get(&parent_pid) else {
+            return TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified);
+        };
+        if parents.len() != 1 {
+            return TreeCandidateResolution::Omitted(BatchOmissionReason::AncestryUnverified);
+        }
+        let parent = parents[0];
+        match (parent.record(), current.record()) {
+            (Some(parent_record), Some(child_record)) => {
+                ancestry_invalid |=
+                    parent_record.target().creation_time() > child_record.target().creation_time();
+            }
+            (None, _) => ancestry_invalid = true,
+            _ => {}
+        }
+        current = parent;
+    }
+}
+
+fn map_expansion_omission(reason: ExpansionOmissionReason) -> BatchOmissionReason {
+    match reason {
+        ExpansionOmissionReason::ExitedOrChanged => BatchOmissionReason::ExitedOrChanged,
+        ExpansionOmissionReason::InspectionDenied => BatchOmissionReason::InspectionDenied,
+        ExpansionOmissionReason::IdentityUnavailable => BatchOmissionReason::IdentityUnavailable,
     }
 }
 
