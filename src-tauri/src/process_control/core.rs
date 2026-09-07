@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     ffi::OsStr,
     fmt,
@@ -184,6 +184,73 @@ impl ProcessOmissions {
 pub(crate) struct ProcessSnapshot {
     processes: Vec<ProcessRecord>,
     omissions: ProcessOmissions,
+}
+
+pub(super) struct ExpansionSnapshot {
+    entries: Vec<ExpansionEntry>,
+}
+
+impl ExpansionSnapshot {
+    pub(super) fn entries(&self) -> &[ExpansionEntry] {
+        &self.entries
+    }
+}
+
+pub(super) struct ExpansionEntry {
+    pid_hint: u32,
+    name_hint: String,
+    observed_parent_pid_hint: Option<u32>,
+    record: Option<ProcessRecord>,
+    omission_reason: Option<ExpansionOmissionReason>,
+}
+
+impl ExpansionEntry {
+    fn reliable(candidate: ProcessCandidate, record: ProcessRecord) -> Self {
+        Self {
+            pid_hint: candidate.pid,
+            name_hint: candidate.name,
+            observed_parent_pid_hint: candidate.observed_parent_pid,
+            record: Some(record),
+            omission_reason: None,
+        }
+    }
+
+    fn omitted(candidate: ProcessCandidate, omission_reason: ExpansionOmissionReason) -> Self {
+        Self {
+            pid_hint: candidate.pid,
+            name_hint: candidate.name,
+            observed_parent_pid_hint: candidate.observed_parent_pid,
+            record: None,
+            omission_reason: Some(omission_reason),
+        }
+    }
+
+    pub(super) fn pid_hint(&self) -> u32 {
+        self.pid_hint
+    }
+
+    pub(super) fn name_hint(&self) -> &str {
+        &self.name_hint
+    }
+
+    pub(super) fn observed_parent_pid_hint(&self) -> Option<u32> {
+        self.observed_parent_pid_hint
+    }
+
+    pub(super) fn record(&self) -> Option<&ProcessRecord> {
+        self.record.as_ref()
+    }
+
+    pub(super) fn omission_reason(&self) -> Option<ExpansionOmissionReason> {
+        self.omission_reason
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExpansionOmissionReason {
+    ExitedOrChanged,
+    InspectionDenied,
+    IdentityUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,6 +499,47 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
         })
     }
 
+    pub(super) fn expansion_snapshot(&self) -> Result<ExpansionSnapshot, ProcessError> {
+        let enumerated = self
+            .adapter
+            .enumerate_candidates()
+            .map_err(|_| ProcessError::CatalogUnavailable)?;
+        let candidates = enumerated
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ProcessError::CatalogUnavailable)?;
+        let mut pid_counts = BTreeMap::new();
+        for candidate in &candidates {
+            if candidate.pid != 0 {
+                let count = pid_counts.entry(candidate.pid).or_insert(0_u64);
+                *count = count
+                    .checked_add(1)
+                    .ok_or(ProcessError::CatalogUnavailable)?;
+            }
+        }
+
+        let mut entries = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let omission_reason = if candidate.pid == 0 || !valid_name(&candidate.name) {
+                Some(ExpansionOmissionReason::IdentityUnavailable)
+            } else if pid_counts.get(&candidate.pid).copied().unwrap_or_default() > 1 {
+                Some(ExpansionOmissionReason::ExitedOrChanged)
+            } else {
+                None
+            };
+
+            if let Some(omission_reason) = omission_reason {
+                entries.push(ExpansionEntry::omitted(candidate, omission_reason));
+                continue;
+            }
+            match self.snapshot_candidate(candidate.clone()) {
+                Ok(record) => entries.push(ExpansionEntry::reliable(candidate, record)),
+                Err(kind) => entries.push(ExpansionEntry::omitted(candidate, kind.into())),
+            }
+        }
+        Ok(ExpansionSnapshot { entries })
+    }
+
     pub(super) fn admit(
         &self,
         target: &ProcessTarget,
@@ -481,6 +589,17 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
             intent,
             handle,
         })
+    }
+
+    pub(super) fn admission_liveness(
+        &self,
+        admission: &CoreAdmission<A::Handle>,
+    ) -> Result<Liveness, ObservationFailure> {
+        self.adapter.liveness(&admission.handle)
+    }
+
+    pub(super) fn host_instance_id(&self) -> HostInstanceId {
+        self.host_instance_id
     }
 
     fn snapshot_candidate(
@@ -586,6 +705,16 @@ impl From<ObservationFailure> for OmissionKind {
             ObservationFailure::ExitedOrChanged => Self::ExitedOrChanged,
             ObservationFailure::AccessDenied => Self::InspectionDenied,
             ObservationFailure::IdentityUnavailable => Self::IdentityUnavailable,
+        }
+    }
+}
+
+impl From<OmissionKind> for ExpansionOmissionReason {
+    fn from(kind: OmissionKind) -> Self {
+        match kind {
+            OmissionKind::ExitedOrChanged => Self::ExitedOrChanged,
+            OmissionKind::InspectionDenied => Self::InspectionDenied,
+            OmissionKind::IdentityUnavailable => Self::IdentityUnavailable,
         }
     }
 }

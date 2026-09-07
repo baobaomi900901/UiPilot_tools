@@ -18,6 +18,8 @@ use super::operation::{
 };
 use super::ProcessOperationError;
 
+mod batch;
+
 const HOST: [u8; 16] = [0x41; 16];
 const SELF_PID: u32 = 9_999;
 const SELF_CREATION_TIME: u64 = 99_990;
@@ -40,7 +42,6 @@ enum FakeCall {
     WaitForExit(u32, Duration),
 }
 
-#[derive(Clone)]
 enum FakeMutation {
     CreationTimes {
         pid: u32,
@@ -54,6 +55,11 @@ enum FakeMutation {
         pid: u32,
         values: Vec<Result<Option<String>, ObservationFailure>>,
     },
+    ReplaceProcess {
+        pid: u32,
+        script: FakeProcessScript,
+    },
+    ResumeUnwind(&'static str),
 }
 
 struct MutationHook {
@@ -135,6 +141,9 @@ struct FakeState {
     next_object_id: u64,
     dropped: BTreeSet<u64>,
     active_handles: BTreeSet<u64>,
+    catalog_opened: usize,
+    catalog_dropped: usize,
+    catalog_active: bool,
     handle_events: Vec<FakeHandleEvent>,
     events: Vec<FakeEvent>,
 }
@@ -160,6 +169,9 @@ impl Default for FakeState {
             next_object_id: 1,
             dropped: BTreeSet::new(),
             active_handles: BTreeSet::new(),
+            catalog_opened: 0,
+            catalog_dropped: 0,
+            catalog_active: false,
             handle_events: Vec::new(),
             events: Vec::new(),
         }
@@ -177,6 +189,19 @@ struct FakeHandle {
     kind: FakeHandleKind,
     object: Rc<RefCell<FakeProcessObject>>,
     state: Rc<RefCell<FakeState>>,
+}
+
+struct FakeCatalogHandle {
+    state: Rc<RefCell<FakeState>>,
+}
+
+impl Drop for FakeCatalogHandle {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        assert!(state.catalog_active, "fake catalog handle was not active");
+        state.catalog_active = false;
+        state.catalog_dropped += 1;
+    }
 }
 
 impl Drop for FakeHandle {
@@ -294,6 +319,18 @@ impl FakeProcessAdapter {
         self.state.borrow().dropped.len()
     }
 
+    fn catalog_opened(&self) -> usize {
+        self.state.borrow().catalog_opened
+    }
+
+    fn catalog_dropped(&self) -> usize {
+        self.state.borrow().catalog_dropped
+    }
+
+    fn catalog_active(&self) -> bool {
+        self.state.borrow().catalog_active
+    }
+
     fn handle_events(&self) -> Vec<FakeHandleEvent> {
         self.state.borrow().handle_events.clone()
     }
@@ -371,6 +408,23 @@ impl FakeProcessAdapter {
                     .script
                     .reenumerated_names = values.into();
             }
+            FakeMutation::ReplaceProcess { pid, script } => {
+                self.replace_process(pid, script);
+            }
+            FakeMutation::ResumeUnwind(message) => {
+                std::panic::resume_unwind(Box::new(message));
+            }
+        }
+    }
+
+    fn begin_catalog(&self) -> FakeCatalogHandle {
+        let mut state = self.state.borrow_mut();
+        assert!(!state.catalog_active, "fake catalog handle already active");
+        state.catalog_active = true;
+        state.catalog_opened += 1;
+        drop(state);
+        FakeCatalogHandle {
+            state: Rc::clone(&self.state),
         }
     }
 
@@ -446,6 +500,7 @@ impl ProcessPlatformAdapter for FakeProcessAdapter {
     fn enumerate_candidates(
         &self,
     ) -> Result<Vec<Result<ProcessCandidate, EnumerationFailure>>, EnumerationFailure> {
+        let _catalog = self.begin_catalog();
         let result = self
             .state
             .borrow_mut()

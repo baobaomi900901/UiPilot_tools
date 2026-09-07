@@ -1,3 +1,4 @@
+mod batch;
 mod core;
 mod operation;
 
@@ -13,6 +14,13 @@ pub(crate) type ProcessIntent = core::ProcessIntent;
 pub(crate) type ProcessOperationError = operation::ProcessOperationError;
 pub(crate) type ProcessSnapshot = core::ProcessSnapshot;
 pub(crate) type ProcessTarget = core::ProcessTarget;
+pub(crate) type ProcessBatchError = batch::ProcessBatchError;
+pub(crate) type ProcessBatchOmissions = batch::ProcessBatchOmissions;
+pub(crate) type ProcessBatchOperation = batch::ProcessBatchOperation;
+pub(crate) type ProcessBatchPlan = batch::ProcessBatchPlan;
+pub(crate) type ProcessBatchPreview = batch::ProcessBatchPreview;
+pub(crate) type ProcessBatchScope = batch::ProcessBatchScope;
+pub(crate) type ProcessBatchSelectionCompleteness = batch::ProcessBatchSelectionCompleteness;
 
 #[cfg(windows)]
 pub(crate) struct ProcessAuthority {
