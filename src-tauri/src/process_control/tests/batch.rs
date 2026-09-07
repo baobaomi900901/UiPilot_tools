@@ -1,12 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
-};
-
-use syn::{
-    visit::{self, Visit},
-    ImplItem, TraitItem, Type, UseTree, Visibility,
 };
 
 use super::*;
@@ -130,467 +124,150 @@ fn absent_root_script(
     }
 }
 
-fn caller_visible_type_leaks(
-    source: &str,
-    sensitive_roots: &[&str],
-    impl_owners: &[&str],
-) -> Result<(), Vec<String>> {
-    let syntax = syn::parse_file(source).expect("process_control source must parse");
-    let mut surface = CallerSurface::default();
-    surface.visit_file(&syntax);
-    let sensitive = tainted_names(&surface.definitions, sensitive_roots, impl_owners);
-    let connectors = tainted_names(&surface.definitions, impl_owners, &[]);
-    let connected_traits = surface.connected_traits(&connectors);
-    let leaks = surface
-        .signatures
-        .iter()
-        .filter(|signature| {
-            surface.signature_is_visible(signature)
-                && intersects(&signature.types, &sensitive)
-                && (connectors.is_empty()
-                    || intersects(&signature.types, &connectors)
-                    || intersects(&signature.owners, &connectors)
-                    || intersects(&signature.owners, &connected_traits))
-        })
-        .map(|signature| signature.label.clone())
-        .collect::<Vec<_>>();
-    if leaks.is_empty() {
-        Ok(())
-    } else {
-        Err(leaks)
-    }
+#[derive(Clone, Copy)]
+enum CatalogVisibility {
+    Caller,
+    Internal,
 }
 
-#[derive(Default)]
-struct TypeNames(BTreeSet<String>);
-
-impl<'ast> Visit<'ast> for TypeNames {
-    fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
-        self.0.insert(segment.ident.to_string());
-        visit::visit_path_segment(self, segment);
-    }
-}
-
-enum SignatureVisibility {
-    Explicit(bool),
-    Trait { name: String, self_type: String },
-}
-
-struct CallerSignature {
-    label: String,
-    types: BTreeSet<String>,
-    owners: BTreeSet<String>,
-    visibility: SignatureVisibility,
-}
-
-#[derive(Default)]
-struct CallerSurface {
-    definitions: BTreeMap<String, BTreeSet<String>>,
-    types: BTreeMap<String, bool>,
-    traits: BTreeMap<String, bool>,
-    trait_impls: Vec<(String, String, BTreeSet<String>)>,
-    signatures: Vec<CallerSignature>,
-}
-
-impl CallerSurface {
-    fn define(&mut self, name: String, dependencies: BTreeSet<String>) {
-        self.definitions
-            .entry(name)
-            .or_default()
-            .extend(dependencies);
-    }
-
-    fn expose_type(&mut self, name: String, visible: bool) {
-        self.types.insert(name.clone(), visible);
-        self.signatures.push(CallerSignature {
-            label: format!("type {name}"),
-            types: BTreeSet::from([name]),
-            owners: BTreeSet::new(),
-            visibility: SignatureVisibility::Explicit(visible),
-        });
-    }
-
-    fn trait_is_visible(&self, name: &str) -> bool {
-        fn resolve(
-            name: &str,
-            surface: &CallerSurface,
-            visited: &mut BTreeSet<String>,
-        ) -> Option<bool> {
-            if !visited.insert(name.to_owned()) {
-                return None;
+fn declaration_catalog(source: &str, visibility: CatalogVisibility) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut declarations = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_start();
+        let visible = match visibility {
+            CatalogVisibility::Caller => {
+                line.starts_with("pub(crate) ") || line.starts_with("pub ")
             }
-            if let Some(visible) = surface.traits.get(name) {
-                return Some(*visible);
-            }
-            surface.definitions.get(name).and_then(|dependencies| {
-                dependencies
-                    .iter()
-                    .find_map(|dependency| resolve(dependency, surface, visited))
-            })
+            CatalogVisibility::Internal => line.starts_with("pub(super) "),
+        };
+        if !visible {
+            index += 1;
+            continue;
         }
-        resolve(name, self, &mut BTreeSet::new()).unwrap_or(true)
-    }
-
-    fn signature_is_visible(&self, signature: &CallerSignature) -> bool {
-        match &signature.visibility {
-            SignatureVisibility::Explicit(visible) => *visible,
-            SignatureVisibility::Trait { name, self_type } => {
-                self.trait_is_visible(name) && self.type_is_visible(self_type)
+        let mut declaration = String::new();
+        loop {
+            let line = lines[index].trim();
+            declaration.push_str(line);
+            declaration.push(' ');
+            index += 1;
+            if line.contains('{') || line.ends_with(';') || index == lines.len() {
+                break;
             }
         }
+        declarations.push(normalize_declaration(&declaration));
     }
+    declarations.sort();
+    declarations
+}
 
-    fn type_is_visible(&self, name: &str) -> bool {
-        self.types.get(name).copied().unwrap_or(true)
-    }
-
-    fn connected_traits(&self, connectors: &BTreeSet<String>) -> BTreeSet<String> {
-        let mut connected = BTreeSet::new();
-        for (trait_name, self_type, owners) in &self.trait_impls {
-            if self.trait_is_visible(trait_name)
-                && self.type_is_visible(self_type)
-                && intersects(owners, connectors)
-            {
-                collect_dependency_closure(trait_name, &self.definitions, &mut connected);
+fn relevant_impl_catalog(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut implementations = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_start();
+        if !line.starts_with("impl ") && !line.starts_with("unsafe impl ") {
+            index += 1;
+            continue;
+        }
+        let mut header = String::new();
+        loop {
+            let line = lines[index].trim();
+            header.push_str(line);
+            header.push(' ');
+            index += 1;
+            if line.contains('{') || index == lines.len() {
+                break;
             }
         }
-        connected
-    }
-}
-
-impl<'ast> Visit<'ast> for CallerSurface {
-    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-        self.define(item.ident.to_string(), names_from_fields(&item.fields));
-        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
-    }
-
-    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
-        let mut dependencies = BTreeSet::new();
-        for variant in &item.variants {
-            dependencies.extend(names_from_fields(&variant.fields));
-        }
-        self.define(item.ident.to_string(), dependencies);
-        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
-    }
-
-    fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
-        let mut dependencies = TypeNames::default();
-        for field in &item.fields.named {
-            dependencies.visit_type(&field.ty);
-        }
-        self.define(item.ident.to_string(), dependencies.0);
-        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
-    }
-
-    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        self.define(item.ident.to_string(), names_from_type(&item.ty));
-        self.expose_type(item.ident.to_string(), caller_visible(&item.vis));
-    }
-
-    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        for (alias, original) in use_bindings(&item.tree) {
-            self.define(alias.clone(), BTreeSet::from([original.clone()]));
-            self.signatures.push(CallerSignature {
-                label: format!("re-export {alias}"),
-                types: BTreeSet::from([alias, original]),
-                owners: BTreeSet::new(),
-                visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
-            });
-        }
-    }
-
-    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        self.signatures.push(CallerSignature {
-            label: format!("function {}", item.sig.ident),
-            types: names_from_signature(&item.sig),
-            owners: BTreeSet::new(),
-            visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
-        });
-    }
-
-    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-        let trait_name = item.ident.to_string();
-        let visible = caller_visible(&item.vis);
-        self.traits.insert(trait_name.clone(), visible);
-        let owners = BTreeSet::from([trait_name.clone()]);
-        for trait_item in &item.items {
-            let (label, types) = match trait_item {
-                TraitItem::Fn(method) => (
-                    format!("trait method {trait_name}::{}", method.sig.ident),
-                    names_from_signature(&method.sig),
-                ),
-                TraitItem::Const(value) => (
-                    format!("trait const {trait_name}::{}", value.ident),
-                    names_from_type(&value.ty),
-                ),
-                TraitItem::Type(value) => {
-                    let mut names = TypeNames::default();
-                    for bound in &value.bounds {
-                        names.visit_type_param_bound(bound);
-                    }
-                    if let Some((_, default)) = &value.default {
-                        names.visit_type(default);
-                    }
-                    (format!("trait type {trait_name}::{}", value.ident), names.0)
-                }
-                _ => continue,
-            };
-            self.signatures.push(CallerSignature {
-                label,
-                types,
-                owners: owners.clone(),
-                visibility: SignatureVisibility::Explicit(visible),
-            });
-        }
-    }
-
-    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        let owners = names_from_type(&item.self_ty);
-        let self_type = principal_type_name(&item.self_ty).unwrap_or_default();
-        let trait_name = item
-            .trait_
-            .as_ref()
-            .and_then(|(_, path, _)| path.segments.last())
-            .map(|segment| segment.ident.to_string());
-        if let Some(name) = &trait_name {
-            self.trait_impls
-                .push((name.clone(), self_type.clone(), owners.clone()));
-            let mut types = owners.clone();
-            if let Some((_, path, _)) = &item.trait_ {
-                types.extend(names_from_path(path));
-            }
-            self.signatures.push(CallerSignature {
-                label: format!("trait impl {name}"),
-                types,
-                owners: owners.clone(),
-                visibility: SignatureVisibility::Trait {
-                    name: name.clone(),
-                    self_type: self_type.clone(),
-                },
-            });
-        }
-        for impl_item in &item.items {
-            let (label, types, visibility) = match impl_item {
-                ImplItem::Fn(method) => (
-                    format!("impl method {}", method.sig.ident),
-                    names_from_signature(&method.sig),
-                    trait_name.as_ref().map_or_else(
-                        || SignatureVisibility::Explicit(caller_visible(&method.vis)),
-                        |name| SignatureVisibility::Trait {
-                            name: name.clone(),
-                            self_type: self_type.clone(),
-                        },
-                    ),
-                ),
-                ImplItem::Const(value) => (
-                    format!("impl const {}", value.ident),
-                    names_from_type(&value.ty),
-                    trait_name.as_ref().map_or_else(
-                        || SignatureVisibility::Explicit(caller_visible(&value.vis)),
-                        |name| SignatureVisibility::Trait {
-                            name: name.clone(),
-                            self_type: self_type.clone(),
-                        },
-                    ),
-                ),
-                ImplItem::Type(value) => (
-                    format!("impl type {}", value.ident),
-                    names_from_type(&value.ty),
-                    trait_name.as_ref().map_or_else(
-                        || SignatureVisibility::Explicit(caller_visible(&value.vis)),
-                        |name| SignatureVisibility::Trait {
-                            name: name.clone(),
-                            self_type: self_type.clone(),
-                        },
-                    ),
-                ),
-                _ => continue,
-            };
-            self.signatures.push(CallerSignature {
-                label,
-                types,
-                owners: owners.clone(),
-                visibility,
-            });
-        }
-    }
-
-    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-        self.signatures.push(CallerSignature {
-            label: format!("const {}", item.ident),
-            types: names_from_type(&item.ty),
-            owners: BTreeSet::new(),
-            visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
-        });
-    }
-
-    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-        self.signatures.push(CallerSignature {
-            label: format!("static {}", item.ident),
-            types: names_from_type(&item.ty),
-            owners: BTreeSet::new(),
-            visibility: SignatureVisibility::Explicit(caller_visible(&item.vis)),
-        });
-    }
-}
-
-fn names_from_fields(fields: &syn::Fields) -> BTreeSet<String> {
-    let mut names = TypeNames::default();
-    for field in fields {
-        names.visit_type(&field.ty);
-    }
-    names.0
-}
-
-fn names_from_type(value: &Type) -> BTreeSet<String> {
-    let mut names = TypeNames::default();
-    names.visit_type(value);
-    names.0
-}
-
-fn principal_type_name(value: &Type) -> Option<String> {
-    match value {
-        Type::Path(path) => path
-            .path
-            .segments
-            .last()
-            .map(|segment| segment.ident.to_string()),
-        Type::Group(group) => principal_type_name(&group.elem),
-        Type::Paren(paren) => principal_type_name(&paren.elem),
-        Type::Reference(reference) => principal_type_name(&reference.elem),
-        _ => None,
-    }
-}
-
-fn names_from_signature(signature: &syn::Signature) -> BTreeSet<String> {
-    let mut names = TypeNames::default();
-    names.visit_signature(signature);
-    names.0
-}
-
-fn names_from_path(path: &syn::Path) -> BTreeSet<String> {
-    let mut names = TypeNames::default();
-    names.visit_path(path);
-    names.0
-}
-
-fn use_bindings(tree: &UseTree) -> Vec<(String, String)> {
-    fn walk(tree: &UseTree, prefix: &mut Vec<String>, bindings: &mut Vec<(String, String)>) {
-        match tree {
-            UseTree::Path(path) => {
-                prefix.push(path.ident.to_string());
-                walk(&path.tree, prefix, bindings);
-                prefix.pop();
-            }
-            UseTree::Name(name) => {
-                let name = name.ident.to_string();
-                let original = if name == "self" {
-                    prefix.last().cloned().unwrap_or(name)
-                } else {
-                    name
-                };
-                bindings.push((original.clone(), original));
-            }
-            UseTree::Rename(rename) => {
-                let original = if rename.ident == "self" {
-                    prefix
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| rename.ident.to_string())
-                } else {
-                    rename.ident.to_string()
-                };
-                bindings.push((rename.rename.to_string(), original));
-            }
-            UseTree::Group(group) => {
-                for tree in &group.items {
-                    walk(tree, prefix, bindings);
-                }
-            }
-            UseTree::Glob(_) => {}
-        }
-    }
-    let mut bindings = Vec::new();
-    walk(tree, &mut Vec::new(), &mut bindings);
-    bindings
-}
-
-fn tainted_names(
-    definitions: &BTreeMap<String, BTreeSet<String>>,
-    roots: &[&str],
-    barriers: &[&str],
-) -> BTreeSet<String> {
-    let mut tainted = roots
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect::<BTreeSet<_>>();
-    let barriers = barriers.iter().copied().collect::<BTreeSet<_>>();
-    loop {
-        let additions = definitions
+        let header = normalize_declaration(&header);
+        if ["ProcessBatchPlan", "ProcessBatchPreview"]
             .iter()
-            .filter(|(name, dependencies)| {
-                !barriers.contains(name.as_str())
-                    && !tainted.contains(*name)
-                    && intersects(dependencies, &tainted)
-            })
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        if additions.is_empty() {
-            return tainted;
-        }
-        tainted.extend(additions);
-    }
-}
-
-fn collect_dependency_closure(
-    name: &str,
-    definitions: &BTreeMap<String, BTreeSet<String>>,
-    closure: &mut BTreeSet<String>,
-) {
-    if !closure.insert(name.to_owned()) {
-        return;
-    }
-    if let Some(dependencies) = definitions.get(name) {
-        for dependency in dependencies {
-            collect_dependency_closure(dependency, definitions, closure);
+            .any(|name| identifier_tokens(&header).any(|token| token == *name))
+        {
+            implementations.push(header);
         }
     }
+    implementations.sort();
+    implementations
 }
 
-fn caller_visible(visibility: &Visibility) -> bool {
-    match visibility {
-        Visibility::Public(_) => true,
-        Visibility::Restricted(restricted) => restricted.path.is_ident("crate"),
-        Visibility::Inherited => false,
+fn normalize_declaration(source: &str) -> String {
+    let source = source.split('{').next().unwrap_or(source);
+    let mut normalized = source
+        .trim()
+        .trim_end_matches([';', ','])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (from, to) in [("( ", "("), (", )", ")"), (" )", ")")] {
+        normalized = normalized.replace(from, to);
     }
+    normalized
 }
 
-fn intersects(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
-    left.iter().any(|name| right.contains(name))
+fn normalized_item(source: &str, marker: &str) -> String {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker}"));
+    let item = &source[start..];
+    let opening = item.find('{').expect("item must have a body");
+    let mut depth = 0_isize;
+    for (offset, character) in item[opening..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return item[..opening + offset + 1]
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated {marker}");
+}
+
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let source = &source[start..];
+    let end = source.find(end).unwrap_or_else(|| panic!("missing {end}"));
+    &source[..end]
+}
+
+fn expected_catalog(entries: &[&str]) -> Vec<String> {
+    let mut entries = entries
+        .iter()
+        .map(|entry| normalize_declaration(entry))
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+fn returns_exact_target(signature: &str) -> bool {
+    normalize_declaration(signature)
+        .split_once("->")
+        .is_some_and(|(_, output)| identifier_tokens(output).any(|token| token == "ProcessTarget"))
+}
+
+fn identifier_tokens(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
 }
 
 #[test]
 fn batch_catalog_api_leak_guard_rejects_aliases_wrappers_and_alternate_accessors() {
-    let renamed_target_accessor = r#"
-type ConfirmedIdentity = ProcessTarget;
-impl ProcessBatchPlan {
-    pub(crate) fn confirmed_identity(&self) -> &ConfirmedIdentity {
-        unreachable!()
-    }
-}
-"#;
-    assert!(caller_visible_type_leaks(
-        renamed_target_accessor,
-        &["ProcessTarget"],
-        &["ProcessBatchPlan"]
-    )
-    .is_err());
-
+    let approved_impl = "impl ProcessBatchPlan {}";
     let second_inherent_impl = r#"
 impl ProcessBatchPlan {
-    pub(crate) fn scope_name(&self) -> &str {
-        unreachable!()
-    }
 }
 impl ProcessBatchPlan {
     pub(crate) fn exact_identity(&self) -> &ProcessTarget {
@@ -598,12 +275,14 @@ impl ProcessBatchPlan {
     }
 }
 "#;
-    assert!(caller_visible_type_leaks(
-        second_inherent_impl,
-        &["ProcessTarget"],
-        &["ProcessBatchPlan"]
-    )
-    .is_err());
+    assert_eq!(
+        relevant_impl_catalog(approved_impl),
+        expected_catalog(&["impl ProcessBatchPlan"])
+    );
+    assert_ne!(
+        relevant_impl_catalog(second_inherent_impl),
+        relevant_impl_catalog(approved_impl)
+    );
 
     let free_function_seam = r#"
 pub(crate) fn inspect_plan(
@@ -612,12 +291,19 @@ pub(crate) fn inspect_plan(
     unreachable!()
 }
 "#;
-    assert!(caller_visible_type_leaks(
-        free_function_seam,
-        &["ProcessTarget"],
-        &["ProcessBatchPlan", "ProcessBatchPreview"]
-    )
-    .is_err());
+    assert!(!declaration_catalog(free_function_seam, CatalogVisibility::Caller).is_empty());
+    assert!(returns_exact_target(free_function_seam));
+
+    let permitted_planning_input = r#"
+pub(crate) fn plan_batch(root: &ProcessTarget) -> ProcessBatchPlan {
+    unreachable!()
+}
+"#;
+    assert!(!returns_exact_target(permitted_planning_input));
+    assert_eq!(
+        declaration_catalog(permitted_planning_input, CatalogVisibility::Caller),
+        expected_catalog(&["pub(crate) fn plan_batch(root: &ProcessTarget) -> ProcessBatchPlan"])
+    );
 
     let trait_seam = r#"
 pub(crate) trait PlanInspection {
@@ -629,48 +315,21 @@ impl PlanInspection for ProcessBatchPlan {
     }
 }
 "#;
-    assert!(caller_visible_type_leaks(
-        trait_seam,
-        &["ProcessTarget"],
-        &["ProcessBatchPlan", "ProcessBatchPreview"]
-    )
-    .is_err());
+    assert!(!declaration_catalog(trait_seam, CatalogVisibility::Caller).is_empty());
+    assert_ne!(
+        relevant_impl_catalog(trait_seam),
+        relevant_impl_catalog(approved_impl)
+    );
 
-    let renamed_expansion_wrapper = r#"
-struct CatalogEnvelope {
-    snapshot: ExpansionSnapshot,
-}
-type InternalCatalog = CatalogEnvelope;
-pub(crate) type CallerCatalog = InternalCatalog;
+    let expansion_reexport = r#"
+pub(crate) use crate::process_control::core::ExpansionSnapshot as HiddenCatalog;
 "#;
-    assert!(caller_visible_type_leaks(
-        renamed_expansion_wrapper,
-        &[
-            "ExpansionSnapshot",
-            "ExpansionEntry",
-            "ExpansionOmissionReason",
-        ],
-        &[],
-    )
-    .is_err());
-
-    let import_renamed_expansion_wrapper = r#"
-use crate::process_control::core::ExpansionSnapshot as HiddenCatalog;
-struct CatalogEnvelope {
-    snapshot: HiddenCatalog,
-}
-pub(crate) type CallerCatalog = CatalogEnvelope;
-"#;
-    assert!(caller_visible_type_leaks(
-        import_renamed_expansion_wrapper,
-        &[
-            "ExpansionSnapshot",
-            "ExpansionEntry",
-            "ExpansionOmissionReason",
-        ],
-        &[],
-    )
-    .is_err());
+    assert_eq!(
+        declaration_catalog(expansion_reexport, CatalogVisibility::Caller),
+        expected_catalog(&[
+            "pub(crate) use crate::process_control::core::ExpansionSnapshot as HiddenCatalog"
+        ])
+    );
 
     let internal_only = r#"
 struct CatalogEnvelope {
@@ -680,16 +339,38 @@ pub(super) fn prepare_catalog() -> CatalogEnvelope {
     unreachable!()
 }
 "#;
-    assert!(caller_visible_type_leaks(
-        internal_only,
-        &[
-            "ExpansionSnapshot",
-            "ExpansionEntry",
-            "ExpansionOmissionReason",
-        ],
-        &[],
-    )
-    .is_ok());
+    assert!(declaration_catalog(internal_only, CatalogVisibility::Caller).is_empty());
+    assert_eq!(
+        declaration_catalog(internal_only, CatalogVisibility::Internal),
+        expected_catalog(&["pub(super) fn prepare_catalog() -> CatalogEnvelope"])
+    );
+
+    let approved_preview = r#"
+pub(crate) struct ProcessBatchPreview {
+    ordinal: usize,
+    pid: u32,
+    name: String,
+    executable_path: Option<PathBuf>,
+    depth: Option<usize>,
+}
+"#;
+    let alias_backed_preview_field = r#"
+pub(crate) struct ProcessBatchPreview {
+    ordinal: usize,
+    pid: u32,
+    name: String,
+    executable_path: Option<PathBuf>,
+    depth: Option<usize>,
+    hidden_identity: HiddenIdentity,
+}
+"#;
+    assert_ne!(
+        normalized_item(
+            alias_backed_preview_field,
+            "pub(crate) struct ProcessBatchPreview"
+        ),
+        normalized_item(approved_preview, "pub(crate) struct ProcessBatchPreview")
+    );
 }
 
 #[test]
@@ -735,7 +416,6 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
     let batch_source = include_str!("../batch.rs");
     let core_source = include_str!("../core.rs");
     let module_source = include_str!("../mod.rs");
-    let process_control_source = format!("{core_source}\n{batch_source}\n{module_source}");
     let plan_fields = batch_source
         .split("pub(crate) struct ProcessBatchPlan")
         .nth(1)
@@ -752,12 +432,164 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
         .expect("ProcessBatchPreview accessors must follow the fields");
 
     assert!(plan_fields.contains("targets: Vec<ProcessTarget>"));
-    caller_visible_type_leaks(
-        &process_control_source,
-        &["ProcessTarget"],
-        &["ProcessBatchPlan", "ProcessBatchPreview"],
-    )
-    .expect("plan and preview signatures must not expose exact targets");
+    assert_eq!(
+        declaration_catalog(batch_source, CatalogVisibility::Caller),
+        expected_catalog(&[
+            "pub(crate) enum ProcessBatchError",
+            "pub(crate) enum ProcessBatchOperation",
+            "pub(crate) enum ProcessBatchScope",
+            "pub(crate) enum ProcessBatchSelectionCompleteness",
+            "pub(crate) struct ProcessBatchOmissions",
+            "pub(crate) struct ProcessBatchPlan",
+            "pub(crate) struct ProcessBatchPreview",
+            "pub(crate) fn ancestry_unverified(&self) -> u64",
+            "pub(crate) fn depth(&self) -> Option<usize>",
+            "pub(crate) fn executable_path(&self) -> Option<&Path>",
+            "pub(crate) fn exited_or_changed(&self) -> u64",
+            "pub(crate) fn identity_unavailable(&self) -> u64",
+            "pub(crate) fn inspection_denied(&self) -> u64",
+            "pub(crate) fn name(&self) -> &str",
+            "pub(crate) fn omissions(&self) -> &ProcessBatchOmissions",
+            "pub(crate) fn operation(&self) -> ProcessBatchOperation",
+            "pub(crate) fn ordinal(&self) -> usize",
+            "pub(crate) fn pid(&self) -> u32",
+            "pub(crate) fn previews(&self) -> &[ProcessBatchPreview]",
+            "pub(crate) fn scope(&self) -> ProcessBatchScope",
+            "pub(crate) fn selection_completeness(&self) -> ProcessBatchSelectionCompleteness",
+            "pub(crate) fn total(&self) -> u64",
+        ])
+    );
+    assert_eq!(
+        relevant_impl_catalog(batch_source),
+        expected_catalog(&["impl ProcessBatchPlan", "impl ProcessBatchPreview"])
+    );
+    assert!(declaration_catalog(batch_source, CatalogVisibility::Caller)
+        .iter()
+        .all(|signature| !returns_exact_target(signature)));
+    assert_eq!(
+        declaration_catalog(module_source, CatalogVisibility::Caller),
+        expected_catalog(&[
+            "pub(crate) type HostInstanceId = core::HostInstanceId",
+            "pub(crate) type ProcessAuthorityInitError = core::ProcessAuthorityInitError",
+            "pub(crate) type ProcessError = core::ProcessError",
+            "pub(crate) type ProcessOmissions = core::ProcessOmissions",
+            "pub(crate) type ProcessRecord = core::ProcessRecord",
+            "pub(crate) type ProcessIntent = core::ProcessIntent",
+            "pub(crate) type ProcessOperationError = operation::ProcessOperationError",
+            "pub(crate) type ProcessSnapshot = core::ProcessSnapshot",
+            "pub(crate) type ProcessTarget = core::ProcessTarget",
+            "pub(crate) type ProcessBatchError = batch::ProcessBatchError",
+            "pub(crate) type ProcessBatchOmissions = batch::ProcessBatchOmissions",
+            "pub(crate) type ProcessBatchOperation = batch::ProcessBatchOperation",
+            "pub(crate) type ProcessBatchPlan = batch::ProcessBatchPlan",
+            "pub(crate) type ProcessBatchPreview = batch::ProcessBatchPreview",
+            "pub(crate) type ProcessBatchScope = batch::ProcessBatchScope",
+            "pub(crate) type ProcessBatchSelectionCompleteness = batch::ProcessBatchSelectionCompleteness",
+            "pub(crate) struct ProcessAuthority",
+            "pub(crate) struct ProcessAuthority",
+            "pub(crate) struct ProcessAdmission",
+            "pub(crate) enum ProcessAdmission",
+            "pub(crate) fn new() -> Result<Self, ProcessAuthorityInitError>",
+            "pub(crate) fn new() -> Result<Self, ProcessAuthorityInitError>",
+            "pub(crate) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError>",
+            "pub(crate) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError>",
+            "pub(crate) fn admit(&self, target: &ProcessTarget, intent: ProcessIntent) -> Result<ProcessAdmission, ProcessError>",
+            "pub(crate) fn admit(&self, _target: &ProcessTarget, _intent: ProcessIntent) -> Result<ProcessAdmission, ProcessError>",
+            "pub(crate) fn terminate(&self, admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
+            "pub(crate) fn terminate(&self, _admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
+            "pub(crate) fn force_terminate(&self, admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
+            "pub(crate) fn force_terminate(&self, _admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
+        ])
+    );
+    for (marker, expected) in [
+        (
+            "pub(crate) struct ProcessBatchOmissions",
+            "pub(crate) struct ProcessBatchOmissions { exited_or_changed: u64, inspection_denied: u64, identity_unavailable: u64, ancestry_unverified: u64, }",
+        ),
+        (
+            "pub(crate) struct ProcessBatchPlan",
+            "pub(crate) struct ProcessBatchPlan { authority_id: HostInstanceId, scope: ProcessBatchScope, operation: ProcessBatchOperation, targets: Vec<ProcessTarget>, previews: Vec<ProcessBatchPreview>, omissions: ProcessBatchOmissions, }",
+        ),
+        (
+            "pub(crate) struct ProcessBatchPreview",
+            "pub(crate) struct ProcessBatchPreview { ordinal: usize, pid: u32, name: String, executable_path: Option<std::path::PathBuf>, depth: Option<usize>, }",
+        ),
+        (
+            "pub(crate) enum ProcessBatchScope",
+            "pub(crate) enum ProcessBatchScope { Tree, SameName, }",
+        ),
+        (
+            "pub(crate) enum ProcessBatchOperation",
+            "pub(crate) enum ProcessBatchOperation { Terminate, ForceTerminate, }",
+        ),
+        (
+            "pub(crate) enum ProcessBatchSelectionCompleteness",
+            "pub(crate) enum ProcessBatchSelectionCompleteness { CompleteSelection, IncompleteSelection, }",
+        ),
+        (
+            "pub(crate) enum ProcessBatchError",
+            "pub(crate) enum ProcessBatchError { InvalidTarget, ExpiredTarget, TargetExited, TargetChanged, InspectionDenied, ProtectedTarget, CatalogUnavailable, TargetSetTooLarge, ExpiredPlan, PlatformUnsupported, }",
+        ),
+    ] {
+        assert_eq!(
+            normalized_item(batch_source, marker),
+            expected.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+    let expansion_source = source_between(
+        core_source,
+        "pub(super) struct ExpansionSnapshot",
+        "pub(crate) enum ProcessIntent",
+    );
+    assert_eq!(
+        declaration_catalog(expansion_source, CatalogVisibility::Internal),
+        expected_catalog(&[
+            "pub(super) struct ExpansionSnapshot",
+            "pub(super) fn entries(&self) -> &[ExpansionEntry]",
+            "pub(super) struct ExpansionEntry",
+            "pub(super) fn pid_hint(&self) -> u32",
+            "pub(super) fn name_hint(&self) -> &str",
+            "pub(super) fn observed_parent_pid_hint(&self) -> Option<u32>",
+            "pub(super) fn record(&self) -> Option<&ProcessRecord>",
+            "pub(super) fn omission_reason(&self) -> Option<ExpansionOmissionReason>",
+            "pub(super) enum ExpansionOmissionReason",
+        ])
+    );
+    for (marker, expected) in [
+        (
+            "pub(super) struct ExpansionSnapshot",
+            "pub(super) struct ExpansionSnapshot { entries: Vec<ExpansionEntry>, }",
+        ),
+        (
+            "pub(super) struct ExpansionEntry",
+            "pub(super) struct ExpansionEntry { pid_hint: u32, name_hint: String, observed_parent_pid_hint: Option<u32>, record: Option<ProcessRecord>, omission_reason: Option<ExpansionOmissionReason>, }",
+        ),
+        (
+            "pub(super) enum ExpansionOmissionReason",
+            "pub(super) enum ExpansionOmissionReason { ExitedOrChanged, InspectionDenied, IdentityUnavailable, }",
+        ),
+    ] {
+        assert_eq!(
+            normalized_item(core_source, marker),
+            expected.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+    let prepared_source = source_between(
+        batch_source,
+        "pub(super) struct PreparedBatchPlanning",
+        "impl From<ProcessError>",
+    );
+    assert_eq!(
+        declaration_catalog(prepared_source, CatalogVisibility::Internal),
+        expected_catalog(&[
+            "pub(super) struct PreparedBatchPlanning",
+            "pub(super) fn authority_id(&self) -> HostInstanceId",
+            "pub(super) fn root(&self) -> &ProcessRecord",
+            "pub(super) fn snapshot(&self) -> &ExpansionSnapshot",
+            "pub(super) fn operation(&self) -> ProcessBatchOperation",
+            "pub(super) fn prepare_batch_planning(&self, root: &ProcessTarget, operation: ProcessBatchOperation) -> Result<PreparedBatchPlanning, ProcessBatchError>",
+        ])
+    );
     for forbidden in ["Clone", "Serialize", "Deserialize"] {
         assert!(
             !plan_fields.contains(forbidden),
@@ -799,17 +631,6 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "found forbidden {forbidden}"
         );
     }
-    caller_visible_type_leaks(
-        &process_control_source,
-        &[
-            "ExpansionSnapshot",
-            "ExpansionEntry",
-            "ExpansionOmissionReason",
-        ],
-        &[],
-    )
-    .expect("caller-visible process_control signatures must not expose expansion data");
-
     let _ = ProcessBatchScope::Tree;
     let _ = ProcessBatchScope::SameName;
     let _ = ProcessBatchOperation::Terminate;

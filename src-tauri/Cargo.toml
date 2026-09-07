@@ -84,7 +84,6 @@ webview2-com = "=0.38.2"
 
 [dev-dependencies]
 rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
-syn = { version = "=2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 
 [profile.dev]
