@@ -162,6 +162,34 @@ fn declaration_catalog(source: &str, visibility: CatalogVisibility) -> Vec<Strin
     declarations
 }
 
+fn type_alias_catalog(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut aliases = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_start();
+        let mut tokens = identifier_tokens(line.split('=').next().unwrap_or(line));
+        let first = tokens.next();
+        if first != Some("type") && !(first == Some("pub") && tokens.any(|token| token == "type")) {
+            index += 1;
+            continue;
+        }
+        let mut declaration = String::new();
+        loop {
+            let line = lines[index].trim();
+            declaration.push_str(line);
+            declaration.push(' ');
+            index += 1;
+            if line.ends_with(';') || index == lines.len() {
+                break;
+            }
+        }
+        aliases.push(normalize_declaration(&declaration));
+    }
+    aliases.sort();
+    aliases
+}
+
 fn relevant_impl_catalog(source: &str) -> Vec<String> {
     let lines = source.lines().collect::<Vec<_>>();
     let mut implementations = Vec::new();
@@ -321,6 +349,15 @@ impl PlanInspection for ProcessBatchPlan {
         relevant_impl_catalog(approved_impl)
     );
 
+    let private_self_alias_trait_impl = r#"
+type HiddenPlan = ProcessBatchPlan;
+impl PublicTrait for HiddenPlan {}
+"#;
+    assert_ne!(
+        type_alias_catalog(private_self_alias_trait_impl),
+        Vec::<String>::new()
+    );
+
     let expansion_reexport = r#"
 pub(crate) use crate::process_control::core::ExpansionSnapshot as HiddenCatalog;
 "#;
@@ -416,6 +453,7 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
     let batch_source = include_str!("../batch.rs");
     let core_source = include_str!("../core.rs");
     let module_source = include_str!("../mod.rs");
+    assert_eq!(type_alias_catalog(batch_source), Vec::<String>::new());
     let plan_fields = batch_source
         .split("pub(crate) struct ProcessBatchPlan")
         .nth(1)
