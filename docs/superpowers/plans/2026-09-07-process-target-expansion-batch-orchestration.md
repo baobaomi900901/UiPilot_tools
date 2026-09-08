@@ -199,12 +199,12 @@ The approved design is canonical for field visibility, root error priority, ance
 
 **Dependencies:** Tasks 1-5; approved design sections 18. Logging And Data Handling, 20. Deterministic Verification, 21. Real Windows Verification, 22. Regression And Evidence, 23. Exit Gate, and 24. Known Limits.
 
-- [ ] Run every focused Stage 2B suite, serialized Windows batch suite, complete process_control suite, and default full tests; record exact commands, exit codes, counts, durations, and fixture cleanup.
-- [ ] Run format, all-features tests, and both Clippy gates. Compare all failures with the accepted Stage 2A verification record, retain factual red gates, and prove Stage 2B adds zero process_control diagnostics.
-- [ ] Record Windows 11 x64 standard-user environment, Rust/Cargo versions, 256/257 Fake evidence, 30-second Fake evidence, tree/name real scenarios, newcomer survival, partial result behavior, and zero fixture/HANDLE residue.
-- [ ] Record the parent-PID limitation, IncompleteSelection semantics, approximately 35 seconds of protocol-controlled wait budget, inherited HWND/PID race, asynchronous force-completion boundary, and no auto-force/retry/elevation.
-- [ ] Prove Cargo files, operation.rs, windows.rs, Tauri wiring, frontend, public plugin contracts, persistence, Restart, elevation, macOS, and unrelated sources remain unchanged from the approved scope.
-- [ ] Keep the verification status AWAITING USER ACCEPTANCE. Do not mark Stage 2B accepted or start the Restart design without explicit user acceptance of the evidence.
+- [x] Run every focused Stage 2B suite, serialized Windows batch suite, complete process_control suite, and default full tests; record exact commands, exit codes, counts, durations, and fixture cleanup.
+- [x] Run format, all-features tests, and both Clippy gates. Compare all failures with the accepted Stage 2A verification record, retain factual red gates, and prove Stage 2B adds zero process_control diagnostics.
+- [x] Record Windows 11 x64 standard-user environment, Rust/Cargo versions, 256/257 Fake evidence, 30-second Fake evidence, tree/name real scenarios, newcomer survival, partial result behavior, and zero fixture/HANDLE residue.
+- [x] Record the parent-PID limitation, IncompleteSelection semantics, approximately 35 seconds of protocol-controlled wait budget, inherited HWND/PID race, asynchronous force-completion boundary, and no auto-force/retry/elevation.
+- [x] Prove Cargo files, operation.rs, windows.rs, Tauri wiring, frontend, public plugin contracts, persistence, Restart, elevation, macOS, and unrelated sources remain unchanged from the approved scope.
+- [x] Keep the verification status AWAITING USER ACCEPTANCE. Do not mark Stage 2B accepted or start the Restart design without explicit user acceptance of the evidence.
 
 **Distinct test coverage:** This task owns aggregate regression, baseline comparison, standard-user evidence, changed-scope proof, exact environment/toolchain record, known-limit disclosure, and the user-acceptance stop gate; it adds no product behavior.
 
@@ -239,5 +239,5 @@ Expected: format, every focused suite, serialized Windows batch tests, complete 
 - [x] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
 - [x] Task 4 covers design sections 12-17 and the execution portion of 18.
 - [x] Task 5 covers the real Windows requirements in sections 19, 21, and 24 without production fallback changes.
-- [ ] Task 6 records every requirement in sections 20-24 and confirms the final changed scope.
+- [x] Task 6 records every requirement in sections 20-24 and confirms the final changed scope.
 - [ ] The user reviews the verification record and explicitly accepts Stage 2B before any Restart, elevation, host product-entry, or Stage 3 design/plan/code begins.
