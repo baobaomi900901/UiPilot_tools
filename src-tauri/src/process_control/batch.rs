@@ -3,14 +3,17 @@ use std::{
     error::Error,
     fmt,
     path::Path,
+    time::Duration,
 };
 
 use super::core::{
     CoreAuthority, ExpansionEntry, ExpansionOmissionReason, ExpansionSnapshot, HostInstanceId,
     Liveness, ProcessError, ProcessIntent, ProcessPlatformAdapter, ProcessRecord, ProcessTarget,
 };
+use super::operation::{MonotonicClock, ProcessOperationAdapter, ProcessOperationError};
 
 const BATCH_TARGET_LIMIT: usize = 256;
+const BATCH_SCHEDULING_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessBatchScope {
@@ -140,6 +143,129 @@ impl ProcessBatchPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessBatchTargetError {
+    TargetChanged,
+    InspectionDenied,
+    ProtectedTarget,
+    OperationAccessDenied,
+    GracefulCloseUnavailable,
+    GracefulCloseTimedOut,
+    OperationUnavailable,
+    TerminationPending,
+    CompletionUnknown,
+}
+
+impl fmt::Display for ProcessBatchTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TargetChanged => "TargetChanged",
+            Self::InspectionDenied => "InspectionDenied",
+            Self::ProtectedTarget => "ProtectedTarget",
+            Self::OperationAccessDenied => "OperationAccessDenied",
+            Self::GracefulCloseUnavailable => "GracefulCloseUnavailable",
+            Self::GracefulCloseTimedOut => "GracefulCloseTimedOut",
+            Self::OperationUnavailable => "OperationUnavailable",
+            Self::TerminationPending => "TerminationPending",
+            Self::CompletionUnknown => "CompletionUnknown",
+        })
+    }
+}
+
+impl Error for ProcessBatchTargetError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessBatchTargetOutcome {
+    ObservedExited,
+    AlreadyExited,
+    Failed(ProcessBatchTargetError),
+    NotAttemptedBatchDeadline,
+}
+
+pub(crate) struct ProcessBatchTargetResult {
+    preview: ProcessBatchPreview,
+    outcome: ProcessBatchTargetOutcome,
+}
+
+impl ProcessBatchTargetResult {
+    pub(crate) fn preview(&self) -> &ProcessBatchPreview {
+        &self.preview
+    }
+
+    pub(crate) fn outcome(&self) -> ProcessBatchTargetOutcome {
+        self.outcome
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessBatchCompletion {
+    Complete,
+    Partial,
+}
+
+pub(crate) struct ProcessBatchReport {
+    scope: ProcessBatchScope,
+    operation: ProcessBatchOperation,
+    results: Vec<ProcessBatchTargetResult>,
+    omissions: ProcessBatchOmissions,
+    observed_exited: u64,
+    already_exited: u64,
+    failed: u64,
+    not_attempted: u64,
+}
+
+impl ProcessBatchReport {
+    pub(crate) fn scope(&self) -> ProcessBatchScope {
+        self.scope
+    }
+
+    pub(crate) fn operation(&self) -> ProcessBatchOperation {
+        self.operation
+    }
+
+    pub(crate) fn results(&self) -> &[ProcessBatchTargetResult] {
+        &self.results
+    }
+
+    pub(crate) fn omissions(&self) -> &ProcessBatchOmissions {
+        &self.omissions
+    }
+
+    pub(crate) fn observed_exited(&self) -> u64 {
+        self.observed_exited
+    }
+
+    pub(crate) fn already_exited(&self) -> u64 {
+        self.already_exited
+    }
+
+    pub(crate) fn failed(&self) -> u64 {
+        self.failed
+    }
+
+    pub(crate) fn not_attempted(&self) -> u64 {
+        self.not_attempted
+    }
+
+    pub(crate) fn completion(&self) -> ProcessBatchCompletion {
+        if self.failed == 0
+            && self.not_attempted == 0
+            && self.omissions.total() == 0
+            && self.results.iter().all(|result| {
+                matches!(
+                    result.outcome,
+                    ProcessBatchTargetOutcome::ObservedExited
+                        | ProcessBatchTargetOutcome::AlreadyExited
+                )
+            })
+        {
+            ProcessBatchCompletion::Complete
+        } else {
+            ProcessBatchCompletion::Partial
+        }
+    }
+}
+
 pub(crate) struct ProcessBatchPreview {
     ordinal: usize,
     pid: u32,
@@ -259,6 +385,164 @@ impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
             snapshot,
             operation,
         })
+    }
+}
+
+impl<A: ProcessOperationAdapter> CoreAuthority<A> {
+    pub(super) fn execute_batch_with_clock<C: MonotonicClock>(
+        &self,
+        plan: ProcessBatchPlan,
+        clock: &C,
+    ) -> Result<ProcessBatchReport, ProcessBatchError> {
+        if plan.authority_id != self.host_instance_id() {
+            return Err(ProcessBatchError::ExpiredPlan);
+        }
+
+        let deadline = clock
+            .now()
+            .checked_add(BATCH_SCHEDULING_DEADLINE)
+            .expect("thirty-second monotonic deadline is representable");
+        let mut results = Vec::with_capacity(plan.targets.len());
+        let mut entries = plan.targets.into_iter().zip(plan.previews);
+
+        while let Some((target, preview)) = entries.next() {
+            if clock.now() >= deadline {
+                results.push(ProcessBatchTargetResult {
+                    preview,
+                    outcome: ProcessBatchTargetOutcome::NotAttemptedBatchDeadline,
+                });
+                results.extend(entries.map(|(_, preview)| ProcessBatchTargetResult {
+                    preview,
+                    outcome: ProcessBatchTargetOutcome::NotAttemptedBatchDeadline,
+                }));
+                break;
+            }
+
+            let admission = match self.admit(&target, plan.operation.intent()) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    results.push(ProcessBatchTargetResult {
+                        preview,
+                        outcome: map_admission_outcome(error),
+                    });
+                    continue;
+                }
+            };
+
+            if clock.now() >= deadline {
+                drop(admission);
+                results.push(ProcessBatchTargetResult {
+                    preview,
+                    outcome: ProcessBatchTargetOutcome::NotAttemptedBatchDeadline,
+                });
+                results.extend(entries.map(|(_, preview)| ProcessBatchTargetResult {
+                    preview,
+                    outcome: ProcessBatchTargetOutcome::NotAttemptedBatchDeadline,
+                }));
+                break;
+            }
+
+            let outcome = match plan.operation {
+                ProcessBatchOperation::Terminate => self.terminate_with_clock(admission, clock),
+                ProcessBatchOperation::ForceTerminate => {
+                    self.force_terminate_with_clock(admission, clock)
+                }
+            }
+            .map_or_else(map_operation_outcome, |()| {
+                ProcessBatchTargetOutcome::ObservedExited
+            });
+            results.push(ProcessBatchTargetResult { preview, outcome });
+        }
+
+        Ok(assemble_report(
+            plan.scope,
+            plan.operation,
+            results,
+            plan.omissions,
+        ))
+    }
+}
+
+pub(super) fn map_admission_outcome(error: ProcessError) -> ProcessBatchTargetOutcome {
+    match error {
+        ProcessError::TargetExited => ProcessBatchTargetOutcome::AlreadyExited,
+        ProcessError::TargetChanged => failed(ProcessBatchTargetError::TargetChanged),
+        ProcessError::InspectionDenied => failed(ProcessBatchTargetError::InspectionDenied),
+        ProcessError::ProtectedTarget => failed(ProcessBatchTargetError::ProtectedTarget),
+        ProcessError::InvalidTarget
+        | ProcessError::ExpiredTarget
+        | ProcessError::CatalogUnavailable
+        | ProcessError::PlatformUnsupported => {
+            failed(ProcessBatchTargetError::OperationUnavailable)
+        }
+    }
+}
+
+pub(super) fn map_operation_outcome(error: ProcessOperationError) -> ProcessBatchTargetOutcome {
+    match error {
+        ProcessOperationError::TargetExited => ProcessBatchTargetOutcome::AlreadyExited,
+        ProcessOperationError::TargetChanged => failed(ProcessBatchTargetError::TargetChanged),
+        ProcessOperationError::InspectionDenied => {
+            failed(ProcessBatchTargetError::InspectionDenied)
+        }
+        ProcessOperationError::ProtectedTarget => failed(ProcessBatchTargetError::ProtectedTarget),
+        ProcessOperationError::OperationAccessDenied => {
+            failed(ProcessBatchTargetError::OperationAccessDenied)
+        }
+        ProcessOperationError::GracefulCloseUnavailable => {
+            failed(ProcessBatchTargetError::GracefulCloseUnavailable)
+        }
+        ProcessOperationError::GracefulCloseTimedOut => {
+            failed(ProcessBatchTargetError::GracefulCloseTimedOut)
+        }
+        ProcessOperationError::TerminationPending => {
+            failed(ProcessBatchTargetError::TerminationPending)
+        }
+        ProcessOperationError::CompletionUnknown => {
+            failed(ProcessBatchTargetError::CompletionUnknown)
+        }
+        ProcessOperationError::IntentMismatch
+        | ProcessOperationError::OperationUnavailable
+        | ProcessOperationError::PlatformUnsupported => {
+            failed(ProcessBatchTargetError::OperationUnavailable)
+        }
+    }
+}
+
+fn failed(error: ProcessBatchTargetError) -> ProcessBatchTargetOutcome {
+    ProcessBatchTargetOutcome::Failed(error)
+}
+
+fn assemble_report(
+    scope: ProcessBatchScope,
+    operation: ProcessBatchOperation,
+    results: Vec<ProcessBatchTargetResult>,
+    omissions: ProcessBatchOmissions,
+) -> ProcessBatchReport {
+    let mut observed_exited = 0_u64;
+    let mut already_exited = 0_u64;
+    let mut failed = 0_u64;
+    let mut not_attempted = 0_u64;
+    for result in &results {
+        let count = match result.outcome {
+            ProcessBatchTargetOutcome::ObservedExited => &mut observed_exited,
+            ProcessBatchTargetOutcome::AlreadyExited => &mut already_exited,
+            ProcessBatchTargetOutcome::Failed(_) => &mut failed,
+            ProcessBatchTargetOutcome::NotAttemptedBatchDeadline => &mut not_attempted,
+        };
+        *count = count
+            .checked_add(1)
+            .expect("batch reports contain at most BATCH_TARGET_LIMIT results");
+    }
+    ProcessBatchReport {
+        scope,
+        operation,
+        results,
+        omissions,
+        observed_exited,
+        already_exited,
+        failed,
+        not_attempted,
     }
 }
 

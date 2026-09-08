@@ -1,12 +1,15 @@
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use super::*;
 use crate::process_control::batch::{
-    build_same_name_plan, build_tree_plan, ProcessBatchError, ProcessBatchOperation,
-    ProcessBatchPlan, ProcessBatchPreview, ProcessBatchScope, ProcessBatchSelectionCompleteness,
+    build_same_name_plan, build_tree_plan, ProcessBatchCompletion, ProcessBatchError,
+    ProcessBatchOperation, ProcessBatchPlan, ProcessBatchPreview, ProcessBatchScope,
+    ProcessBatchSelectionCompleteness, ProcessBatchTargetError, ProcessBatchTargetOutcome,
+    ProcessBatchTargetResult,
 };
 use crate::process_control::core::ExpansionOmissionReason;
 
@@ -569,9 +572,14 @@ fn relevant_impl_catalog(source: &str) -> Vec<String> {
             }
         }
         let header = normalize_declaration(&header);
-        if ["ProcessBatchPlan", "ProcessBatchPreview"]
-            .iter()
-            .any(|name| identifier_tokens(&header).any(|token| token == *name))
+        if [
+            "ProcessBatchPlan",
+            "ProcessBatchPreview",
+            "ProcessBatchReport",
+            "ProcessBatchTargetResult",
+        ]
+        .iter()
+        .any(|name| identifier_tokens(&header).any(|token| token == *name))
         {
             implementations.push(header);
         }
@@ -899,25 +907,41 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
     assert_eq!(
         declaration_catalog(batch_source, CatalogVisibility::Caller),
         expected_catalog(&[
+            "pub(crate) enum ProcessBatchCompletion",
             "pub(crate) enum ProcessBatchError",
             "pub(crate) enum ProcessBatchOperation",
             "pub(crate) enum ProcessBatchScope",
             "pub(crate) enum ProcessBatchSelectionCompleteness",
+            "pub(crate) enum ProcessBatchTargetError",
+            "pub(crate) enum ProcessBatchTargetOutcome",
             "pub(crate) struct ProcessBatchOmissions",
             "pub(crate) struct ProcessBatchPlan",
             "pub(crate) struct ProcessBatchPreview",
+            "pub(crate) struct ProcessBatchReport",
+            "pub(crate) struct ProcessBatchTargetResult",
+            "pub(crate) fn already_exited(&self) -> u64",
             "pub(crate) fn ancestry_unverified(&self) -> u64",
+            "pub(crate) fn completion(&self) -> ProcessBatchCompletion",
             "pub(crate) fn depth(&self) -> Option<usize>",
             "pub(crate) fn executable_path(&self) -> Option<&Path>",
             "pub(crate) fn exited_or_changed(&self) -> u64",
+            "pub(crate) fn failed(&self) -> u64",
             "pub(crate) fn identity_unavailable(&self) -> u64",
             "pub(crate) fn inspection_denied(&self) -> u64",
             "pub(crate) fn name(&self) -> &str",
+            "pub(crate) fn not_attempted(&self) -> u64",
+            "pub(crate) fn observed_exited(&self) -> u64",
+            "pub(crate) fn omissions(&self) -> &ProcessBatchOmissions",
             "pub(crate) fn omissions(&self) -> &ProcessBatchOmissions",
             "pub(crate) fn operation(&self) -> ProcessBatchOperation",
+            "pub(crate) fn operation(&self) -> ProcessBatchOperation",
             "pub(crate) fn ordinal(&self) -> usize",
+            "pub(crate) fn outcome(&self) -> ProcessBatchTargetOutcome",
             "pub(crate) fn pid(&self) -> u32",
+            "pub(crate) fn preview(&self) -> &ProcessBatchPreview",
             "pub(crate) fn previews(&self) -> &[ProcessBatchPreview]",
+            "pub(crate) fn results(&self) -> &[ProcessBatchTargetResult]",
+            "pub(crate) fn scope(&self) -> ProcessBatchScope",
             "pub(crate) fn scope(&self) -> ProcessBatchScope",
             "pub(crate) fn selection_completeness(&self) -> ProcessBatchSelectionCompleteness",
             "pub(crate) fn total(&self) -> u64",
@@ -925,7 +949,12 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
     );
     assert_eq!(
         relevant_impl_catalog(batch_source),
-        expected_catalog(&["impl ProcessBatchPlan", "impl ProcessBatchPreview"])
+        expected_catalog(&[
+            "impl ProcessBatchPlan",
+            "impl ProcessBatchPreview",
+            "impl ProcessBatchReport",
+            "impl ProcessBatchTargetResult",
+        ])
     );
     assert!(declaration_catalog(batch_source, CatalogVisibility::Caller)
         .iter()
@@ -949,6 +978,11 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(crate) type ProcessBatchPreview = batch::ProcessBatchPreview",
             "pub(crate) type ProcessBatchScope = batch::ProcessBatchScope",
             "pub(crate) type ProcessBatchSelectionCompleteness = batch::ProcessBatchSelectionCompleteness",
+            "pub(crate) type ProcessBatchTargetError = batch::ProcessBatchTargetError",
+            "pub(crate) type ProcessBatchTargetOutcome = batch::ProcessBatchTargetOutcome",
+            "pub(crate) type ProcessBatchTargetResult = batch::ProcessBatchTargetResult",
+            "pub(crate) type ProcessBatchReport = batch::ProcessBatchReport",
+            "pub(crate) type ProcessBatchCompletion = batch::ProcessBatchCompletion",
             "pub(crate) struct ProcessAuthority",
             "pub(crate) struct ProcessAuthority",
             "pub(crate) struct ProcessAdmission",
@@ -959,6 +993,8 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(crate) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError>",
             "pub(crate) fn plan_batch(&self, root: &ProcessTarget, scope: ProcessBatchScope, operation: ProcessBatchOperation) -> Result<ProcessBatchPlan, ProcessBatchError>",
             "pub(crate) fn plan_batch(&self, _root: &ProcessTarget, _scope: ProcessBatchScope, _operation: ProcessBatchOperation) -> Result<ProcessBatchPlan, ProcessBatchError>",
+            "pub(crate) fn execute_batch(&self, plan: ProcessBatchPlan) -> Result<ProcessBatchReport, ProcessBatchError>",
+            "pub(crate) fn execute_batch(&self, _plan: ProcessBatchPlan) -> Result<ProcessBatchReport, ProcessBatchError>",
             "pub(crate) fn admit(&self, target: &ProcessTarget, intent: ProcessIntent) -> Result<ProcessAdmission, ProcessError>",
             "pub(crate) fn admit(&self, _target: &ProcessTarget, _intent: ProcessIntent) -> Result<ProcessAdmission, ProcessError>",
             "pub(crate) fn terminate(&self, admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
@@ -1057,6 +1093,9 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(super) fn prepare_batch_planning(&self, root: &ProcessTarget, operation: ProcessBatchOperation) -> Result<PreparedBatchPlanning, ProcessBatchError>",
             "pub(super) fn build_same_name_plan<A: ProcessPlatformAdapter>(authority: &CoreAuthority<A>, prepared: PreparedBatchPlanning) -> Result<ProcessBatchPlan, ProcessBatchError>",
             "pub(super) fn build_tree_plan(prepared: PreparedBatchPlanning) -> Result<ProcessBatchPlan, ProcessBatchError>",
+            "pub(super) fn execute_batch_with_clock<C: MonotonicClock>(&self, plan: ProcessBatchPlan, clock: &C) -> Result<ProcessBatchReport, ProcessBatchError>",
+            "pub(super) fn map_admission_outcome(error: ProcessError) -> ProcessBatchTargetOutcome",
+            "pub(super) fn map_operation_outcome(error: ProcessOperationError) -> ProcessBatchTargetOutcome",
         ])
     );
 
@@ -2063,4 +2102,631 @@ fn batch_tree_accepts_256_targets_and_rejects_257_without_operation_calls() {
         assert_eq!(adapter.requested_operation_access(), vec![]);
         assert_eq!(adapter.terminate_calls(), 0);
     }
+}
+
+fn batch_execution_force_script(
+    creation_time: u64,
+    admission_liveness: Liveness,
+    operation_open: Result<(), OperationFailure>,
+    termination: Result<(), OperationFailure>,
+    wait: Result<ExitWait, OperationFailure>,
+) -> FakeProcessScript {
+    FakeProcessScript {
+        open: vec![Ok(()), Ok(()), Ok(())].into(),
+        operation_open: vec![operation_open].into(),
+        creation_times: vec![
+            Ok(creation_time),
+            Ok(creation_time),
+            Ok(creation_time),
+            Ok(creation_time),
+        ]
+        .into(),
+        liveness: vec![
+            Ok(Liveness::Alive),
+            Ok(Liveness::Alive),
+            Ok(admission_liveness),
+            Ok(Liveness::Alive),
+        ]
+        .into(),
+        observations: vec![Ok(path_observation("root.exe", r"C:\Fixtures\root.exe"))].into(),
+        protections: vec![Ok(ProcessProtection::new(false, false)); 3].into(),
+        terminations: vec![termination].into(),
+        waits: vec![Ok(ExitWait::TimedOut), wait, Ok(ExitWait::Exited)].into(),
+        ..FakeProcessScript::default()
+    }
+}
+
+#[test]
+fn batch_execution_reports_success_with_exact_read_only_summary() {
+    let pid = 900;
+    let creation_time = 90_000;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            batch_execution_force_script(
+                creation_time,
+                Liveness::Alive,
+                Ok(()),
+                Ok(()),
+                Ok(ExitWait::Exited),
+            ),
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+
+    let report = authority
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(report.scope(), ProcessBatchScope::Tree);
+    assert_eq!(report.operation(), ProcessBatchOperation::ForceTerminate);
+    assert_eq!(report.results().len(), 1);
+    assert_eq!(report.results()[0].preview().pid(), pid);
+    assert_eq!(
+        report.results()[0].outcome(),
+        ProcessBatchTargetOutcome::ObservedExited
+    );
+    assert_eq!(report.observed_exited(), 1);
+    assert_eq!(report.already_exited(), 0);
+    assert_eq!(report.failed(), 0);
+    assert_eq!(report.not_attempted(), 0);
+    assert_eq!(report.completion(), ProcessBatchCompletion::Complete);
+    assert_eq!(adapter.terminate_calls(), 1);
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+#[test]
+fn batch_execution_expired_plan_is_immutable_preflight() {
+    let pid = 901;
+    let creation_time = 90_100;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            planning_script(creation_time, "root.exe", r"C:\Fixtures\root.exe"),
+        );
+    let plan = authority(adapter.clone())
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::Terminate,
+        )
+        .unwrap();
+    let calls_before = adapter.calls();
+    let other_host = HostInstanceId::new([0x42; 16]).unwrap();
+    let other_self = ProcessTarget::new(other_host, SELF_PID + 1, SELF_CREATION_TIME + 1).unwrap();
+    let other = CoreAuthority::new(other_host, other_self, adapter.clone());
+
+    assert!(matches!(
+        other.execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now())),
+        Err(ProcessBatchError::ExpiredPlan)
+    ));
+    assert_eq!(adapter.calls(), calls_before);
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+#[test]
+fn batch_execution_deadline_before_admission_marks_every_target_once() {
+    let pid = 902;
+    let creation_time = 90_200;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            planning_script(creation_time, "root.exe", r"C:\Fixtures\root.exe"),
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::Terminate,
+        )
+        .unwrap();
+    let base = Instant::now();
+    let clock =
+        FakeMonotonicClock::with_readings(base, vec![Duration::ZERO, Duration::from_secs(30)]);
+
+    let report = authority.execute_batch_with_clock(plan, &clock).unwrap();
+
+    assert_eq!(
+        report.results()[0].outcome(),
+        ProcessBatchTargetOutcome::NotAttemptedBatchDeadline
+    );
+    assert_eq!(report.not_attempted(), 1);
+    assert_eq!(report.completion(), ProcessBatchCompletion::Partial);
+    assert_eq!(adapter.requested_operation_access(), vec![]);
+}
+
+#[test]
+fn batch_execution_target_errors_are_stable_and_redacted() {
+    let errors = [
+        ProcessBatchTargetError::TargetChanged,
+        ProcessBatchTargetError::InspectionDenied,
+        ProcessBatchTargetError::ProtectedTarget,
+        ProcessBatchTargetError::OperationAccessDenied,
+        ProcessBatchTargetError::GracefulCloseUnavailable,
+        ProcessBatchTargetError::GracefulCloseTimedOut,
+        ProcessBatchTargetError::OperationUnavailable,
+        ProcessBatchTargetError::TerminationPending,
+        ProcessBatchTargetError::CompletionUnknown,
+    ];
+    for error in errors {
+        assert_eq!(error.to_string(), format!("{error:?}"));
+        assert!(!error.to_string().contains("secret"));
+    }
+}
+
+#[test]
+fn batch_execution_deadline_after_successful_admission_closes_it_and_stops() {
+    let pid = 903;
+    let creation_time = 90_300;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            batch_execution_force_script(
+                creation_time,
+                Liveness::Alive,
+                Ok(()),
+                Ok(()),
+                Ok(ExitWait::Exited),
+            ),
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    let opened_before = adapter.opened();
+    let base = Instant::now();
+    let clock = FakeMonotonicClock::with_readings(
+        base,
+        vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(30)],
+    );
+
+    let report = authority.execute_batch_with_clock(plan, &clock).unwrap();
+
+    assert_eq!(
+        report.results()[0].outcome(),
+        ProcessBatchTargetOutcome::NotAttemptedBatchDeadline
+    );
+    assert_eq!(adapter.opened(), opened_before + 1);
+    assert_eq!(adapter.opened(), adapter.dropped());
+    assert!(adapter.requested_operation_access().is_empty());
+}
+
+#[test]
+fn batch_execution_failed_admission_is_kept_when_next_deadline_check_expires() {
+    let root_pid = 904;
+    let child_pid = 905;
+    let (adapter, plan) = prepared_tree(
+        root_pid,
+        90_400,
+        vec![candidate(child_pid, "child.exe", Some(root_pid))],
+        vec![(
+            child_pid,
+            successful_script(90_500, "child.exe", r"C:\Fixtures\child.exe"),
+        )],
+    );
+    adapter.replace_process(
+        child_pid,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            creation_times: vec![Ok(99_999)].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    let base = Instant::now();
+    let clock = FakeMonotonicClock::with_readings(
+        base,
+        vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(30)],
+    );
+
+    let report = authority(adapter.clone())
+        .execute_batch_with_clock(plan, &clock)
+        .unwrap();
+
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(ProcessBatchTargetResult::outcome)
+            .collect::<Vec<_>>(),
+        vec![
+            ProcessBatchTargetOutcome::Failed(ProcessBatchTargetError::TargetChanged),
+            ProcessBatchTargetOutcome::NotAttemptedBatchDeadline,
+        ]
+    );
+    assert_eq!(report.failed(), 1);
+    assert_eq!(report.not_attempted(), 1);
+}
+
+#[test]
+fn batch_execution_continues_to_root_and_stage_two_keeps_full_five_seconds() {
+    let root_pid = 906;
+    let child_pid = 907;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(child_pid, "child.exe", Some(root_pid))),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(90_600, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            child_pid,
+            successful_script(90_700, "child.exe", r"C:\Fixtures\child.exe"),
+        );
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(
+            &target(root_pid, 90_600),
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    let plan = build_tree_plan(prepared).unwrap();
+    adapter.replace_process(
+        child_pid,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            creation_times: vec![Ok(90_700)].into(),
+            liveness: vec![Ok(Liveness::Exited)].into(),
+            protections: vec![Ok(ProcessProtection::new(false, false))].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    adapter.replace_process(
+        root_pid,
+        batch_execution_force_script(
+            90_600,
+            Liveness::Alive,
+            Ok(()),
+            Ok(()),
+            Ok(ExitWait::Exited),
+        ),
+    );
+
+    let report = authority(adapter.clone())
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(ProcessBatchTargetResult::outcome)
+            .collect::<Vec<_>>(),
+        vec![
+            ProcessBatchTargetOutcome::AlreadyExited,
+            ProcessBatchTargetOutcome::ObservedExited
+        ]
+    );
+    assert!(adapter
+        .calls()
+        .contains(&FakeCall::WaitForExit(root_pid, Duration::from_secs(5))));
+    assert_eq!(report.completion(), ProcessBatchCompletion::Complete);
+}
+
+#[test]
+fn batch_execution_normalizes_every_stage_error_without_top_level_escape() {
+    let admission_cases = [
+        (
+            ProcessError::InvalidTarget,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+        (
+            ProcessError::ExpiredTarget,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+        (
+            ProcessError::TargetChanged,
+            ProcessBatchTargetError::TargetChanged,
+        ),
+        (
+            ProcessError::InspectionDenied,
+            ProcessBatchTargetError::InspectionDenied,
+        ),
+        (
+            ProcessError::ProtectedTarget,
+            ProcessBatchTargetError::ProtectedTarget,
+        ),
+        (
+            ProcessError::CatalogUnavailable,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+        (
+            ProcessError::PlatformUnsupported,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+    ];
+    for (source, expected) in admission_cases {
+        assert_eq!(
+            crate::process_control::batch::map_admission_outcome(source),
+            ProcessBatchTargetOutcome::Failed(expected)
+        );
+    }
+    assert_eq!(
+        crate::process_control::batch::map_admission_outcome(ProcessError::TargetExited),
+        ProcessBatchTargetOutcome::AlreadyExited
+    );
+
+    let operation_cases = [
+        (
+            ProcessOperationError::IntentMismatch,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+        (
+            ProcessOperationError::TargetChanged,
+            ProcessBatchTargetError::TargetChanged,
+        ),
+        (
+            ProcessOperationError::InspectionDenied,
+            ProcessBatchTargetError::InspectionDenied,
+        ),
+        (
+            ProcessOperationError::ProtectedTarget,
+            ProcessBatchTargetError::ProtectedTarget,
+        ),
+        (
+            ProcessOperationError::OperationAccessDenied,
+            ProcessBatchTargetError::OperationAccessDenied,
+        ),
+        (
+            ProcessOperationError::GracefulCloseUnavailable,
+            ProcessBatchTargetError::GracefulCloseUnavailable,
+        ),
+        (
+            ProcessOperationError::GracefulCloseTimedOut,
+            ProcessBatchTargetError::GracefulCloseTimedOut,
+        ),
+        (
+            ProcessOperationError::OperationUnavailable,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+        (
+            ProcessOperationError::TerminationPending,
+            ProcessBatchTargetError::TerminationPending,
+        ),
+        (
+            ProcessOperationError::CompletionUnknown,
+            ProcessBatchTargetError::CompletionUnknown,
+        ),
+        (
+            ProcessOperationError::PlatformUnsupported,
+            ProcessBatchTargetError::OperationUnavailable,
+        ),
+    ];
+    for (source, expected) in operation_cases {
+        assert_eq!(
+            crate::process_control::batch::map_operation_outcome(source),
+            ProcessBatchTargetOutcome::Failed(expected)
+        );
+    }
+    assert_eq!(
+        crate::process_control::batch::map_operation_outcome(ProcessOperationError::TargetExited),
+        ProcessBatchTargetOutcome::AlreadyExited
+    );
+}
+
+#[test]
+fn batch_execution_stage_two_target_exited_is_already_exited_without_retry() {
+    let pid = 908;
+    let creation_time = 90_800;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            FakeProcessScript {
+                open: vec![Ok(()), Ok(()), Ok(())].into(),
+                operation_open: vec![Ok(())].into(),
+                creation_times: vec![Ok(creation_time); 4].into(),
+                liveness: vec![
+                    Ok(Liveness::Alive),
+                    Ok(Liveness::Alive),
+                    Ok(Liveness::Alive),
+                    Ok(Liveness::Exited),
+                ]
+                .into(),
+                observations: vec![Ok(path_observation("root.exe", r"C:\Fixtures\root.exe"))]
+                    .into(),
+                protections: vec![Ok(ProcessProtection::new(false, false)); 2].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+
+    let report = authority
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(
+        report.results()[0].outcome(),
+        ProcessBatchTargetOutcome::AlreadyExited
+    );
+    assert_eq!(adapter.requested_operation_access().len(), 1);
+    assert_eq!(adapter.terminate_calls(), 0);
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+#[test]
+fn batch_execution_unwind_drops_current_handles_exactly_once() {
+    let pid = 909;
+    let creation_time = 90_900;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            batch_execution_force_script(
+                creation_time,
+                Liveness::Alive,
+                Ok(()),
+                Ok(()),
+                Ok(ExitWait::Exited),
+            ),
+        )
+        .mutate_after(
+            FakeCall::TerminateProcess(pid),
+            1,
+            FakeMutation::ResumeUnwind("batch execution unwind fixture"),
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        let _ = authority.execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()));
+    }));
+
+    assert!(unwind.is_err());
+    assert_eq!(adapter.opened(), adapter.dropped());
+    let dropped = adapter
+        .handle_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            FakeHandleEvent::Dropped { handle_id, .. } => Some(handle_id),
+            FakeHandleEvent::Opened { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(dropped.len(), adapter.dropped());
+}
+
+#[test]
+fn batch_execution_omissions_make_an_otherwise_successful_report_partial() {
+    let root_pid = 910;
+    let omitted_pid = 911;
+    let creation_time = 91_000;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(omitted_pid, "denied.exe", Some(root_pid))),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(creation_time, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            omitted_pid,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::AccessDenied)].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(
+            &target(root_pid, creation_time),
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    let plan = build_tree_plan(prepared).unwrap();
+    adapter.replace_process(
+        root_pid,
+        batch_execution_force_script(
+            creation_time,
+            Liveness::Alive,
+            Ok(()),
+            Ok(()),
+            Ok(ExitWait::Exited),
+        ),
+    );
+
+    let report = authority(adapter)
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(report.observed_exited(), 1);
+    assert_eq!(report.omissions().inspection_denied(), 1);
+    assert_eq!(report.completion(), ProcessBatchCompletion::Partial);
+}
+
+#[test]
+fn batch_execution_overlapping_plans_execute_with_independent_admissions() {
+    let pid = 912;
+    let creation_time = 91_200;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_enumeration(vec![Ok(candidate(pid, "root.exe", None))])
+        .with_process(
+            pid,
+            FakeProcessScript {
+                open: vec![Ok(()); 4].into(),
+                creation_times: vec![Ok(creation_time); 4].into(),
+                liveness: vec![Ok(Liveness::Alive); 4].into(),
+                observations: vec![
+                    Ok(path_observation("root.exe", r"C:\Fixtures\root.exe")),
+                    Ok(path_observation("root.exe", r"C:\Fixtures\root.exe")),
+                ]
+                .into(),
+                protections: vec![Ok(ProcessProtection::new(false, false)); 2].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+    let authority = authority(adapter.clone());
+    let first = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    let second = authority
+        .plan_batch(
+            &target(pid, creation_time),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    adapter.replace_process(
+        pid,
+        FakeProcessScript {
+            open: vec![Ok(()); 2].into(),
+            operation_open: vec![Ok(()); 2].into(),
+            creation_times: vec![Ok(creation_time); 4].into(),
+            liveness: vec![Ok(Liveness::Alive); 4].into(),
+            protections: vec![Ok(ProcessProtection::new(false, false)); 4].into(),
+            terminations: vec![Ok(()); 2].into(),
+            waits: vec![
+                Ok(ExitWait::TimedOut),
+                Ok(ExitWait::Exited),
+                Ok(ExitWait::Exited),
+                Ok(ExitWait::TimedOut),
+                Ok(ExitWait::Exited),
+                Ok(ExitWait::Exited),
+            ]
+            .into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    let clock = FakeMonotonicClock::at(Instant::now());
+
+    let first_report = authority.execute_batch_with_clock(first, &clock).unwrap();
+    let second_report = authority.execute_batch_with_clock(second, &clock).unwrap();
+
+    assert_eq!(first_report.completion(), ProcessBatchCompletion::Complete);
+    assert_eq!(second_report.completion(), ProcessBatchCompletion::Complete);
+    assert_eq!(adapter.requested_operation_access().len(), 2);
+    assert_eq!(adapter.terminate_calls(), 2);
+    assert_eq!(adapter.opened(), adapter.dropped());
 }

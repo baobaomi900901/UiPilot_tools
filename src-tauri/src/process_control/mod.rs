@@ -21,6 +21,11 @@ pub(crate) type ProcessBatchPlan = batch::ProcessBatchPlan;
 pub(crate) type ProcessBatchPreview = batch::ProcessBatchPreview;
 pub(crate) type ProcessBatchScope = batch::ProcessBatchScope;
 pub(crate) type ProcessBatchSelectionCompleteness = batch::ProcessBatchSelectionCompleteness;
+pub(crate) type ProcessBatchTargetError = batch::ProcessBatchTargetError;
+pub(crate) type ProcessBatchTargetOutcome = batch::ProcessBatchTargetOutcome;
+pub(crate) type ProcessBatchTargetResult = batch::ProcessBatchTargetResult;
+pub(crate) type ProcessBatchReport = batch::ProcessBatchReport;
+pub(crate) type ProcessBatchCompletion = batch::ProcessBatchCompletion;
 
 #[cfg(windows)]
 pub(crate) struct ProcessAuthority {
@@ -46,6 +51,14 @@ impl ProcessAuthority {
         operation: ProcessBatchOperation,
     ) -> Result<ProcessBatchPlan, ProcessBatchError> {
         self.inner.plan_batch(root, scope, operation)
+    }
+
+    pub(crate) fn execute_batch(
+        &self,
+        plan: ProcessBatchPlan,
+    ) -> Result<ProcessBatchReport, ProcessBatchError> {
+        self.inner
+            .execute_batch_with_clock(plan, &operation::SystemMonotonicClock)
     }
 
     pub(crate) fn admit(
@@ -99,6 +112,13 @@ impl ProcessAuthority {
         _scope: ProcessBatchScope,
         _operation: ProcessBatchOperation,
     ) -> Result<ProcessBatchPlan, ProcessBatchError> {
+        Err(ProcessBatchError::PlatformUnsupported)
+    }
+
+    pub(crate) fn execute_batch(
+        &self,
+        _plan: ProcessBatchPlan,
+    ) -> Result<ProcessBatchReport, ProcessBatchError> {
         Err(ProcessBatchError::PlatformUnsupported)
     }
 
