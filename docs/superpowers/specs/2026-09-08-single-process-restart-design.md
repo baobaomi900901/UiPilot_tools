@@ -1,7 +1,7 @@
 # Stage 2C Single-Process Restart Design
 
 **Date:** 2026-09-08
-**Status:** DRAFT - independently reviewed; awaiting user design approval
+**Status:** APPROVED - accepted by the user on 2026-09-08
 **Prerequisite:** Stage 2B accepted by the user on 2026-09-08.
 
 ## 1. Goal And User Decision
@@ -11,8 +11,8 @@ outcomes. The user approved rejecting restart when original arguments or working
 directory cannot be established reliably. Rejection must occur before stopping
 the old process. Reopening an executable alone is not a successful substitute.
 
-This is a design proposal, not implementation authorization. The separate
-implementation plan follows only after this document is accepted.
+The user accepted this design on 2026-09-08. A separate implementation plan must
+be approved before implementation starts.
 
 ## 2. Current Boundary And Alternatives
 
@@ -37,8 +37,8 @@ Alternatives considered:
 Consequently, this first version supports processes launched through the new
 internal managed path. Pre-existing processes, existing ShellExecute-launched
 applications, and their descendants without their own receipts return
-LaunchContextUnavailable before any stop. This coverage restriction requires
-approval together with this design.
+LaunchContextUnavailable before any stop. The user accepted this coverage
+restriction together with the design.
 
 ## 3. Scope
 
@@ -216,8 +216,9 @@ owns task decomposition, file boundaries, commands, and evidence collection.
 
 Exit requires the approved design and separate plan, working managed receipt and
 restart chain, owned-Windows evidence, no new module diagnostics, one independent
-correctness/scope review, and explicit user acceptance. No implementation plan,
-product code, elevation design, or host-entry work is authorized by this draft.
+correctness/scope review, and explicit user acceptance. Design approval authorizes
+the separate implementation plan only. Product code requires plan approval;
+elevation and host-entry work retain their later stage gates.
 
 ## 9. Official References
 
@@ -229,9 +230,8 @@ product code, elevation design, or host-entry work is authorized by this draft.
 
 ## 10. Approval
 
-The user approved strict missing-context rejection. Managed-launch coverage,
-receipt lifetime/concurrency, and the stop/launch result contract above are proposed
-design decisions awaiting user approval after the independent review.
+The user approved strict missing-context rejection, managed-launch coverage,
+receipt lifetime/concurrency, and the stop/launch result contract on 2026-09-08.
 
 Independent review on 2026-09-08 found a pathname-to-file identity gap. The targeted
 revision added full path-component protection and an explicit Windows feasibility
