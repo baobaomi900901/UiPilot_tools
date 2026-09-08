@@ -681,7 +681,7 @@ fn assemble_plan(
     }
     let targets = selected
         .iter()
-        .map(|(record, _)| record.target().clone())
+        .map(|(record, _)| *record.target())
         .collect();
     let previews = selected
         .into_iter()

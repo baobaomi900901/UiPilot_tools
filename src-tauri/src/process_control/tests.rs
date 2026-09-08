@@ -57,7 +57,7 @@ enum FakeMutation {
     },
     ReplaceProcess {
         pid: u32,
-        script: FakeProcessScript,
+        script: Box<FakeProcessScript>,
     },
     ResumeUnwind(&'static str),
 }
@@ -409,7 +409,7 @@ impl FakeProcessAdapter {
                     .reenumerated_names = values.into();
             }
             FakeMutation::ReplaceProcess { pid, script } => {
-                self.replace_process(pid, script);
+                self.replace_process(pid, *script);
             }
             FakeMutation::ResumeUnwind(message) => {
                 std::panic::resume_unwind(Box::new(message));

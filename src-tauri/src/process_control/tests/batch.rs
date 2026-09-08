@@ -21,7 +21,7 @@ mod plan_is_not_clone {
     }
     impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
     struct Implemented;
-    impl<T: ?Sized + Clone> AmbiguousIfImpl<Implemented> for T {}
+    impl<T: Clone> AmbiguousIfImpl<Implemented> for T {}
 
     pub(super) fn assert_contract() {
         let _ = <ProcessBatchPlan as AmbiguousIfImpl<_>>::marker;
@@ -369,7 +369,7 @@ mod plan_is_not_deserialize_owned {
     }
     impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
     struct Implemented;
-    impl<T: ?Sized + serde::de::DeserializeOwned> AmbiguousIfImpl<Implemented> for T {}
+    impl<T: serde::de::DeserializeOwned> AmbiguousIfImpl<Implemented> for T {}
 
     pub(super) fn assert_contract() {
         let _ = <ProcessBatchPlan as AmbiguousIfImpl<_>>::marker;
@@ -384,7 +384,7 @@ mod preview_is_not_clone {
     }
     impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
     struct Implemented;
-    impl<T: ?Sized + Clone> AmbiguousIfImpl<Implemented> for T {}
+    impl<T: Clone> AmbiguousIfImpl<Implemented> for T {}
 
     pub(super) fn assert_contract() {
         let _ = <ProcessBatchPreview as AmbiguousIfImpl<_>>::marker;
@@ -414,7 +414,7 @@ mod preview_is_not_deserialize_owned {
     }
     impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
     struct Implemented;
-    impl<T: ?Sized + serde::de::DeserializeOwned> AmbiguousIfImpl<Implemented> for T {}
+    impl<T: serde::de::DeserializeOwned> AmbiguousIfImpl<Implemented> for T {}
 
     pub(super) fn assert_contract() {
         let _ = <ProcessBatchPreview as AmbiguousIfImpl<_>>::marker;
@@ -1379,11 +1379,11 @@ fn batch_catalog_same_pid_replacement_wins_over_absent_root_repoll() {
             1,
             FakeMutation::ReplaceProcess {
                 pid,
-                script: successful_script(
+                script: Box::new(successful_script(
                     51_001,
                     "replacement.exe",
                     r"C:\Fixtures\replacement.exe",
-                ),
+                )),
             },
         );
 
@@ -1649,9 +1649,9 @@ fn prepared_tree(
     (adapter, plan)
 }
 
-fn preview_rows(
-    plan: &ProcessBatchPlan,
-) -> Vec<(usize, u32, String, Option<PathBuf>, Option<usize>)> {
+type PreviewRow = (usize, u32, String, Option<PathBuf>, Option<usize>);
+
+fn preview_rows(plan: &ProcessBatchPlan) -> Vec<PreviewRow> {
     plan.previews()
         .iter()
         .map(|preview| {
@@ -3190,8 +3190,7 @@ mod windows_batch {
                 .copied_exe
                 .clone()
                 .unwrap_or_else(|| std::env::current_exe().unwrap());
-            let node = self.spawn_exe(&exe, mode, None, true);
-            node
+            self.spawn_exe(&exe, mode, None, true)
         }
 
         fn spawn_alternate_path(&mut self, mode: &str) -> usize {
@@ -3205,18 +3204,19 @@ mod windows_batch {
             self.spawn_exe(&alternate, mode, None, true)
         }
 
-        fn spawn_select_window(&mut self) -> usize {
+        fn spawn_pending_select_window(&self) -> PendingChild {
             let exe = self.copied_exe.clone().unwrap();
-            self.spawn_exe(&exe, "select-window", None, false)
+            self.spawn_pending(&exe, "select-window", None)
         }
 
-        fn select_window_mode(&self, node: usize, mode: &str) {
-            fs::write(
-                self.dir.join(format!("{}.mode", self.nodes[node].pid)),
-                mode,
-            )
-            .unwrap();
-            self.wait_ready(node);
+        fn select_window_mode(&self, pid: u32, mode: &str) {
+            fs::write(self.dir.join(format!("{pid}.mode")), mode).unwrap();
+        }
+
+        fn retain_pending(&mut self, child: PendingChild) -> usize {
+            let pid = child.id();
+            let record = wait_record(&self.authority, pid, Duration::from_secs(5));
+            self.retain_record(record, Some(child.transfer()))
         }
 
         fn spawn_tree(&mut self, kind: &str) -> [usize; 3] {
@@ -3241,6 +3241,22 @@ mod windows_batch {
             kind: Option<&str>,
             wait_ready: bool,
         ) -> usize {
+            let child = self.spawn_pending(exe, mode, kind);
+            let pid = child.id();
+            let record = wait_record(&self.authority, pid, Duration::from_secs(5));
+            let node = self.retain_record(record, Some(child.transfer()));
+            if wait_ready {
+                self.wait_ready(node);
+            }
+            node
+        }
+
+        fn spawn_pending(
+            &self,
+            exe: &std::path::Path,
+            mode: &str,
+            kind: Option<&str>,
+        ) -> PendingChild {
             let mut command = Command::new(exe);
             command
                 .args(["--ignored", "--exact", FIXTURE_TEST, "--test-threads=1"])
@@ -3253,14 +3269,7 @@ mod windows_batch {
             if let Some(kind) = kind {
                 command.env(TREE_KIND, kind);
             }
-            let child = PendingChild::new(command.spawn().unwrap());
-            let pid = child.id();
-            let record = wait_record(&self.authority, pid, Duration::from_secs(5));
-            let node = self.retain_record(record, Some(child.transfer()));
-            if wait_ready {
-                self.wait_ready(node);
-            }
-            node
+            PendingChild::new(command.spawn().unwrap())
         }
 
         fn retain_pid(&mut self, pid: u32, child: Option<Child>) -> usize {
@@ -3295,13 +3304,12 @@ mod windows_batch {
         }
 
         fn target(&self, node: usize) -> ProcessTarget {
-            wait_record(
+            *wait_record(
                 &self.authority,
                 self.nodes[node].pid,
                 Duration::from_secs(5),
             )
             .target()
-            .clone()
         }
 
         fn read_pid(&self, name: &str) -> u32 {
@@ -3617,15 +3625,24 @@ mod windows_batch {
     #[test]
     fn windows_batch_graceful_timeout_keeps_later_target_running() {
         let mut fixture = FixtureController::new(true);
-        let first = fixture.spawn_select_window();
-        let second = fixture.spawn_select_window();
-        let (ignored, closed) = if fixture.nodes[first].pid < fixture.nodes[second].pid {
+        let first = fixture.spawn_pending_select_window();
+        let second = fixture.spawn_pending_select_window();
+        let (ignored_pid, closed_pid) = if first.id() < second.id() {
+            (first.id(), second.id())
+        } else {
+            (second.id(), first.id())
+        };
+        fixture.select_window_mode(ignored_pid, "ignore-close-window");
+        fixture.select_window_mode(closed_pid, "graceful-window");
+        let first = fixture.retain_pending(first);
+        let second = fixture.retain_pending(second);
+        let (ignored, closed) = if fixture.nodes[first].pid == ignored_pid {
             (first, second)
         } else {
             (second, first)
         };
-        fixture.select_window_mode(ignored, "ignore-close-window");
-        fixture.select_window_mode(closed, "graceful-window");
+        fixture.wait_ready(ignored);
+        fixture.wait_ready(closed);
         fixture.assert_all_name_matches_owned(ignored);
         let plan = fixture
             .authority
@@ -3667,6 +3684,22 @@ mod windows_batch {
         assert!(fixture.alive(ignored));
         fixture.wait_dead(closed);
         fixture.cleanup_asserted();
+    }
+
+    #[test]
+    fn windows_batch_select_modes_precede_snapshot_retention_in_source() {
+        let source = include_str!("batch.rs");
+        let test = source
+            .split("fn windows_batch_graceful_timeout_keeps_later_target_running()")
+            .nth(1)
+            .unwrap()
+            .split("fn windows_batch_select_modes_precede_snapshot_retention_in_source()")
+            .next()
+            .unwrap();
+        let second_spawn = test.rfind("spawn_pending_select_window").unwrap();
+        let last_mode = test.rfind("select_window_mode").unwrap();
+        let first_retention = test.find("retain_pending").unwrap();
+        assert!(second_spawn < last_mode && last_mode < first_retention);
     }
 
     #[test]
