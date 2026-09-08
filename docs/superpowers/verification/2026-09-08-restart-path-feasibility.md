@@ -1,17 +1,19 @@
 # Stage 2C Task 1: Restart Path Feasibility
 
-Status: **BLOCKED — path-to-child handshake property not demonstrated**
+Status: **SUPPORTED — focused feasibility and affected regression pass; targeted review pending**
 
 Date: 2026-09-08
 Branch: `codex/plugin-platform-roadmap`
 Implementation-start base: `3e027b3`
-Latest experimental revision: `7b38499`
+Controlled-helper implementation base: `93ff3b9`
 Environment: Windows standard user; owned files, directories, handles, and process only.
 
 ## Experiment
 
-The fixture copied the current Rust test executable to a test-owned path containing
-spaces and Unicode, and created separate owned working and control directories. It
+The final fixture compiles a minimal std-only Rust helper into a test-owned path
+containing spaces and Unicode, and creates separate owned working and control
+directories. The compiler child is guarded and bounded; its source and output
+remain inside the owned temporary tree. The fixture
 resolved the executable and working directory from their DOS paths to
 `\\?\Volume{GUID}\...` paths using `GetVolumePathNameW` and
 `GetVolumeNameForVolumeMountPointW`.
@@ -37,7 +39,7 @@ single RAII owner for both returned handles. Its process handle was independentl
 capable of bounded termination/wait cleanup. `WAIT_FAILED` was classified
 separately from timeout and signaled completion.
 
-## Demonstrated Before The Blocker
+## Demonstrated Properties
 
 - Local fixed-volume resolution produced the required volume-GUID form and a
   non-empty filesystem name.
@@ -60,8 +62,25 @@ separately from timeout and signaled completion.
   leases, the same rename succeeded and was reversed.
 - `CreateProcessW` returned success while every executable and working-directory
   lease remained held.
+- The minimal helper wrote its handshake directly from `main`, demonstrating the
+  exact five argument values (`plain`, a space-containing value, a quoted value,
+  Unicode, and the owned control argument), the explicit Unicode environment
+  marker, and agreement between the CONTROL environment value and control arg.
+- The helper's effective current directory was opened and its final volume-GUID
+  path matched the leased CWD identity. Display spelling differences are not
+  accepted without this handle-based identity match.
+- `QueryFullProcessImageNameW` on the returned process handle matched the owned
+  helper executable. The controller observed child completion through that same
+  independently retained process handle.
+- Successful path leases were released immediately after `CreateProcessW`
+  returned. The final executable and executable-parent renames then succeeded
+  and were reversed.
+- Waiting on a null handle produced `WAIT_FAILED`, distinct from timeout and
+  signaled completion.
+- Explicit cleanup removed the complete owned temporary tree and asserted zero
+  residue.
 
-## Blocker Evidence
+## Historical Libtest-Fixture Evidence
 
 Compile-only command:
 
@@ -109,37 +128,54 @@ path policy, creation inputs, or five-second handshake budget:
    identifies the intended executable; this does not prove that its primary
    thread or test entry executed or received the intended child context.
 
-Because the required owned child did not publish its actual arguments, effective
-working directory, and explicit environment marker, this experiment does **not**
-prove that the intended image and CWD were successfully reached. Execution also
-did not reach the normal post-child assertions that the exact executable and
-ancestor mutations succeed after releasing the successful launch leases. Those
-facts are therefore not claimed.
+Those runs establish only that the copied libtest fixture did not publish its
+handshake. The final controlled contrast does not prove why libtest stalled; it
+removes libtest parsing from the feasibility proof.
 
-The corrected experiment releases successful-launch lease vectors immediately
-after `CreateProcessW` return. The explicit environment block was supplied to
-creation and included the marker and control path, but child receipt of it was
-not demonstrated. The remaining failure is plausibly in fixture/test-harness
-startup rather than pathname resolution; this result remains BLOCKED/INCONCLUSIVE,
-not evidence that the approved path policy is fundamentally impossible.
+## Controlled Minimal-Helper Evidence
 
-The affected process-control regression, formatting and Clippy gates have not been
-run at this experimental revision, and no success is claimed for them.
+The first two helper-focused invocations stopped before `CreateProcessW`: guarded
+`rustc` returned exit 1, then inherited stderr identified the concrete setup error
+`invalid character ' ' in crate name: startup helper`. Adding only
+`--crate-name uipilot_restart_feasibility_helper` corrected that compiler
+invocation. These were compiler setup failures, not path-feasibility attempts.
+
+After that correction, the controlled helper reached its handshake and all path,
+argument, environment, CWD-identity, release, wait-classification, child-completion,
+and zero-residue assertions. One intermediate focused run reached all substantive
+proofs but failed the final WAIT_FAILED fixture because `HANDLE(-1)` is a valid
+current-process pseudo-handle and returned `WAIT_TIMEOUT`. Replacing it with the
+documented invalid null handle corrected only that test datum.
+
+Final focused command: PASS, exit 0, 1 passed, 0 failed, 0 ignored, 1130 filtered
+out, test 0.39 s (compile 28.41 s). Reported filesystem was NTFS and effective
+volume root was `\\?\Volume{86bc9793-23b4-468b-b1a6-19b8d91ad2d2}\`.
+
+Affected serialized command:
+
+```text
+cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control -- --nocapture --test-threads=1
+```
+
+Result: PASS, exit 0, 153 passed, 0 failed, 2 ignored, 976 filtered out,
+22.96 s. This is the prior 152-pass baseline plus the new feasibility test.
+
+`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: PASS after applying
+rustfmt to the new test module.
+
+Default Clippy command failed with the accepted inherited aggregate only:
+12 library errors and 13 library-test errors. No diagnostic referenced
+`process_control/tests/restart/windows.rs`; therefore the new module contributes
+zero Clippy diagnostics. No inherited warning was suppressed or changed.
+
 No production restart module or Task 2 work was started.
 
 ## Independent Correctness And Scope Review
 
-Independent targeted review on 2026-09-08 confirmed the corrected release probes
-and accepted this record only as BLOCKED/INCONCLUSIVE evidence. It requested the
-image-query wording and revision corrections above. Task 1 is not accepted and
-Task 2 must not begin.
+An earlier targeted review accepted only the historical BLOCKED/INCONCLUSIVE
+record and requested the corrected owned-component release probes. The final
+controlled-helper PASS and scope are awaiting a new targeted read-only review;
+this record does not self-approve Task 1 or authorize Task 2.
 
-The authorized timing change did not resolve the timeout. The corrected release
-regressions now target actually leased owned components. The child-context
-handshake remains the unresolved gate. A separately authorized next diagnostic
-can use a minimal owned helper with an entry-point handshake before libtest
-parsing; this has not been run and is not a proven root cause.
-
-A controller read-only post-run scan found zero `UiPilot restart feasibility *`
-directories under the current temporary directory. This establishes directory
-residue absence at that scan, not the still-unproven per-path cleanup assertions.
+Earlier controller scanning found no historical fixture residue. The final passing
+test additionally performs and asserts removal of its own complete temporary tree.

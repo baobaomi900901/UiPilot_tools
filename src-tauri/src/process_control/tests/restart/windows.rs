@@ -2,8 +2,9 @@ use std::{
     ffi::{c_void, OsStr, OsString},
     fs,
     os::windows::{ffi::OsStrExt, fs::symlink_dir},
-    path::{Path, PathBuf},
     panic::{catch_unwind, AssertUnwindSafe},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -12,13 +13,13 @@ use windows::{
     core::{PCWSTR, PWSTR},
     Win32::{
         Foundation::{
-            CloseHandle, HANDLE, GENERIC_READ, GENERIC_WRITE, WAIT_FAILED,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
         },
         Storage::FileSystem::{
-            CreateFileW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, DELETE,
-            GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
-            FileAttributeTagInfo, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
+            GetFinalPathNameByHandleW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+            GetVolumePathNameW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
             FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
             VOLUME_NAME_GUID,
@@ -31,8 +32,6 @@ use windows::{
     },
 };
 
-const CHILD_TEST: &str =
-    "process_control::tests::restart::windows::restart_path_feasibility_child";
 const MARKER: &str = "UIPILOT_RESTART_FEASIBILITY_MARKER";
 const CONTROL: &str = "UIPILOT_RESTART_FEASIBILITY_CONTROL";
 const MARKER_VALUE: &str = "explicit value 雪 with spaces";
@@ -85,12 +84,89 @@ impl Drop for OwnedCreatedProcess {
     }
 }
 
-struct OwnedTree(PathBuf);
+struct OwnedTree(Option<PathBuf>);
+
+impl OwnedTree {
+    fn cleanup_asserted(&mut self) {
+        let path = self.0.take().unwrap();
+        fs::remove_dir_all(&path).unwrap();
+        assert!(
+            !path.exists(),
+            "owned temporary tree remained after cleanup"
+        );
+    }
+}
 
 impl Drop for OwnedTree {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if let Some(path) = self.0.as_ref() {
+            let _ = fs::remove_dir_all(path);
+        }
     }
+}
+
+struct GuardedCompiler(Option<Child>);
+
+impl GuardedCompiler {
+    fn finish(mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.0.as_mut().unwrap().try_wait().unwrap() {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "owned helper compilation failed: {status}"
+                    );
+                    self.0.take();
+                    return;
+                }
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => panic!("owned helper compilation timed out"),
+            }
+        }
+    }
+}
+
+impl Drop for GuardedCompiler {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+const HELPER_SOURCE: &str = r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let control = PathBuf::from(env::var_os("UIPILOT_RESTART_FEASIBILITY_CONTROL").unwrap());
+    let control_arg = args.last().and_then(|arg| arg.strip_prefix("control=")).unwrap();
+    assert_eq!(PathBuf::from(control_arg), control);
+    let marker = env::var("UIPILOT_RESTART_FEASIBILITY_MARKER").unwrap();
+    let cwd = env::current_dir().unwrap();
+    let mut report = format!("marker={marker}\ncwd={}\nargc={}\n", cwd.display(), args.len());
+    for (index, arg) in args.iter().enumerate() {
+        report.push_str(&format!("arg{index}={arg}\n"));
+    }
+    fs::write(control.join("child-report.txt"), report).unwrap();
+}
+"#;
+
+fn compile_owned_helper(source: &Path, executable: &Path) {
+    fs::write(source, HELPER_SOURCE).unwrap();
+    let child = Command::new("rustc")
+        .arg(source)
+        .args(["--crate-name", "uipilot_restart_feasibility_helper"])
+        .arg("-o")
+        .arg(executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    GuardedCompiler(Some(child)).finish();
 }
 
 #[derive(Clone)]
@@ -110,7 +186,10 @@ fn wide_str(value: &str) -> Vec<u16> {
 }
 
 fn string_from_nul(buffer: &[u16]) -> String {
-    let end = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
     String::from_utf16(&buffer[..end]).unwrap()
 }
 
@@ -120,7 +199,10 @@ fn resolve_volume(path: &Path) -> VolumePath {
         display.get(2..).is_some_and(|tail| !tail.contains(':')),
         "alternate data streams are unsupported"
     );
-    assert!(!display.starts_with("\\\\"), "network paths are unsupported");
+    assert!(
+        !display.starts_with("\\\\"),
+        "network paths are unsupported"
+    );
     let display_wide = wide_str(&display);
     let mut mount = vec![0u16; 32_768];
     unsafe { GetVolumePathNameW(PCWSTR(display_wide.as_ptr()), &mut mount) }.unwrap();
@@ -129,8 +211,17 @@ fn resolve_volume(path: &Path) -> VolumePath {
     let mut guid = vec![0u16; 128];
     unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount_wide.as_ptr()), &mut guid) }.unwrap();
     let mut filesystem = vec![0u16; 64];
-    unsafe { GetVolumeInformationW(PCWSTR(mount_wide.as_ptr()), None, None, None, None, Some(&mut filesystem)) }
-        .unwrap();
+    unsafe {
+        GetVolumeInformationW(
+            PCWSTR(mount_wide.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut filesystem),
+        )
+    }
+    .unwrap();
     let guid_root = string_from_nul(&guid);
     assert!(guid_root.starts_with("\\\\?\\Volume{"));
     let relative = display[mount.len()..].trim_matches('\\').to_owned();
@@ -144,7 +235,11 @@ fn resolve_volume(path: &Path) -> VolumePath {
     }
 }
 
-fn open_component(path: &str, directory: bool, final_file: bool) -> Result<OwnedHandle, windows::core::Error> {
+fn open_component(
+    path: &str,
+    directory: bool,
+    final_file: bool,
+) -> Result<OwnedHandle, windows::core::Error> {
     let path = wide_str(path);
     let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
     let access = if directory {
@@ -169,7 +264,10 @@ fn open_component(path: &str, directory: bool, final_file: bool) -> Result<Owned
     .map(OwnedHandle)
 }
 
-fn is_directory_and_not_reparse(handle: HANDLE, expected_directory: bool) -> Result<(), &'static str> {
+fn is_directory_and_not_reparse(
+    handle: HANDLE,
+    expected_directory: bool,
+) -> Result<(), &'static str> {
     let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
     unsafe {
         GetFileInformationByHandleEx(
@@ -192,7 +290,8 @@ fn is_directory_and_not_reparse(handle: HANDLE, expected_directory: bool) -> Res
 
 fn final_guid_path(handle: HANDLE) -> Result<String, &'static str> {
     let mut buffer = vec![0u16; 32_768];
-    let written = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, VOLUME_NAME_GUID) } as usize;
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, VOLUME_NAME_GUID) } as usize;
     if written == 0 || written >= buffer.len() {
         return Err("final path query failed");
     }
@@ -234,7 +333,11 @@ fn lease_path(
 fn assert_incompatible_open_rejected(path: &Path, directory: bool) {
     let path = wide(path.as_os_str());
     let flags = FILE_FLAG_OPEN_REPARSE_POINT
-        | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { Default::default() };
+        | if directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            Default::default()
+        };
     for access in [GENERIC_WRITE.0, DELETE.0] {
         let opened = unsafe {
             CreateFileW(
@@ -247,7 +350,10 @@ fn assert_incompatible_open_rejected(path: &Path, directory: bool) {
                 None,
             )
         };
-        assert!(opened.is_err(), "incompatible write/delete open unexpectedly succeeded");
+        assert!(
+            opened.is_err(),
+            "incompatible write/delete open unexpectedly succeeded"
+        );
     }
 }
 
@@ -291,7 +397,11 @@ fn environment_block(control: &Path) -> Vec<u16> {
     entries.retain(|(key, _)| key != MARKER && key != CONTROL);
     entries.push((OsString::from(MARKER), OsString::from(MARKER_VALUE)));
     entries.push((OsString::from(CONTROL), control.as_os_str().to_owned()));
-    entries.sort_by(|a, b| a.0.to_string_lossy().to_uppercase().cmp(&b.0.to_string_lossy().to_uppercase()));
+    entries.sort_by(|a, b| {
+        a.0.to_string_lossy()
+            .to_uppercase()
+            .cmp(&b.0.to_string_lossy().to_uppercase())
+    });
     let mut block = Vec::new();
     for (key, value) in entries {
         block.extend(key.encode_wide());
@@ -307,15 +417,20 @@ fn spawn_leased(executable: &VolumePath, cwd: &VolumePath, control: &Path) -> Ow
     let payloads = ["plain", "space value", "quote\"value", "Unicode-雪"];
     let control_arg = format!("control={}", control.display());
     let args = vec![
-        "--ignored", "--exact", CHILD_TEST, "--test-threads=1",
-        "--skip", payloads[0], "--skip", payloads[1], "--skip", payloads[2], "--skip", payloads[3],
-        "--skip", control_arg.as_str(),
+        payloads[0],
+        payloads[1],
+        payloads[2],
+        payloads[3],
+        control_arg.as_str(),
     ];
     let application = wide_str(&executable.full);
     let cwd_wide = wide_str(&cwd.full);
     let mut command = command_line(&executable.full, &args);
     let environment = environment_block(control);
-    let startup = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
     let mut info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -343,7 +458,10 @@ fn wait_for(path: &Path, process: HANDLE) {
             unsafe { GetExitCodeProcess(process, &mut exit_code) }.unwrap();
             panic!("child exited before handshake with code {exit_code:#x}");
         }
-        assert!(Instant::now() < deadline, "bounded child handshake timed out");
+        assert!(
+            Instant::now() < deadline,
+            "bounded child handshake timed out"
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -363,11 +481,28 @@ fn process_image(process: HANDLE) -> String {
     String::from_utf16(&buffer[..size as usize]).unwrap()
 }
 
+fn assert_cwd_identity(observed: &str, expected: &VolumePath) {
+    let handle = open_component(observed, true, false).unwrap();
+    is_directory_and_not_reparse(handle.0, true).unwrap();
+    assert!(
+        final_guid_path(handle.0)
+            .unwrap()
+            .eq_ignore_ascii_case(&expected.full),
+        "child effective CWD resolved to a different directory"
+    );
+}
+
 #[test]
 fn restart_path_feasibility() {
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("UiPilot restart feasibility 雪 {} {nonce}", std::process::id()));
-    let _tree = OwnedTree(root.clone());
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "UiPilot restart feasibility 雪 {} {nonce}",
+        std::process::id()
+    ));
+    let mut tree = OwnedTree(Some(root.clone()));
     let bin_parent = root.join("bin parent");
     let cwd = root.join("working directory 雪");
     let control = root.join("control handshake");
@@ -375,7 +510,7 @@ fn restart_path_feasibility() {
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(&control).unwrap();
     let executable = bin_parent.join("owned child 雪.exe");
-    fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    compile_owned_helper(&root.join("startup helper.rs"), &executable);
 
     let exe_volume = resolve_volume(&executable);
     let cwd_volume = resolve_volume(&cwd);
@@ -442,11 +577,22 @@ fn restart_path_feasibility() {
     let report_path = control.join("child-report.txt");
     wait_for(&report_path, child.process.0);
     let report = fs::read_to_string(&report_path).unwrap();
-    assert!(report.contains(&format!("marker={MARKER_VALUE}")));
-    assert!(report.contains("space value"));
-    assert!(report.contains("quote\\\"value") || report.contains("quote\"value"));
-    assert!(report.contains("Unicode-雪"));
-    assert!(report.contains(&format!("cwd={}", cwd_volume.full)));
+    let lines = report.lines().collect::<Vec<_>>();
+    let control_arg = format!("control={}", control.display());
+    assert_eq!(lines[0], format!("marker={MARKER_VALUE}"));
+    assert_eq!(lines[2], "argc=5");
+    assert_eq!(
+        &lines[3..],
+        [
+            "arg0=plain",
+            "arg1=space value",
+            "arg2=quote\"value",
+            "arg3=Unicode-雪",
+            format!("arg4={control_arg}").as_str(),
+        ]
+    );
+    let observed_cwd = lines[1].strip_prefix("cwd=").unwrap();
+    assert_cwd_identity(observed_cwd, &cwd_volume);
     child.wait().unwrap();
 
     let moved_executable = bin_parent.join("owned child moved.exe");
@@ -456,30 +602,13 @@ fn restart_path_feasibility() {
     fs::rename(&bin_parent, &moved_parent).unwrap();
     fs::rename(&moved_parent, &bin_parent).unwrap();
 
-    assert_eq!(unsafe { WaitForSingleObject(HANDLE(-1isize as *mut c_void), 0) }, WAIT_FAILED);
+    assert_eq!(
+        unsafe { WaitForSingleObject(HANDLE(std::ptr::null_mut()), 0) },
+        WAIT_FAILED
+    );
     println!(
         "supported volume-guid path={} filesystem={} component leases=FILE_SHARE_READ create=CreateProcessW",
         exe_volume.guid_root, exe_volume.filesystem
     );
-}
-
-#[test]
-#[ignore = "spawned explicitly by restart path feasibility controller"]
-fn restart_path_feasibility_child() {
-    assert_eq!(std::env::var(MARKER).as_deref(), Ok(MARKER_VALUE));
-    let owned_args = std::env::args().collect::<Vec<_>>();
-    let control = PathBuf::from(
-        owned_args
-            .iter()
-            .find_map(|arg| arg.strip_prefix("control="))
-            .expect("control argument missing"),
-    );
-    assert_eq!(std::env::var_os(CONTROL).as_deref(), Some(control.as_os_str()));
-    let args = owned_args.join("|");
-    let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
-    fs::write(
-        control.join("child-report.txt"),
-        format!("marker={MARKER_VALUE}\ncwd={cwd}\nargs={args}\n"),
-    )
-    .unwrap();
+    tree.cleanup_asserted();
 }
