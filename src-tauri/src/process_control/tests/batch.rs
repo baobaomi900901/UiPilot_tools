@@ -3570,7 +3570,27 @@ mod windows_batch {
         fixture.assert_plan_owned(&plan, &[first, second]);
         fixture.assert_all_name_matches_owned(first);
         let report = fixture.authority.execute_batch(plan).unwrap();
+        let mut expected_pids = vec![fixture.nodes[first].pid, fixture.nodes[second].pid];
+        expected_pids.sort_unstable();
         assert_eq!(report.results().len(), 2);
+        assert_eq!(
+            report
+                .results()
+                .iter()
+                .map(|result| result.preview().pid())
+                .collect::<Vec<_>>(),
+            expected_pids
+        );
+        assert!(report
+            .results()
+            .iter()
+            .all(|result| { result.outcome() == ProcessBatchTargetOutcome::ObservedExited }));
+        assert_eq!(report.observed_exited(), 2);
+        assert_eq!(report.already_exited(), 0);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.not_attempted(), 0);
+        assert_eq!(report.omissions().total(), 0);
+        assert_eq!(report.completion(), ProcessBatchCompletion::Complete);
         assert!(!report
             .results()
             .iter()
@@ -3639,6 +3659,11 @@ mod windows_batch {
             report.results()[1].outcome(),
             ProcessBatchTargetOutcome::ObservedExited
         );
+        assert_eq!(report.observed_exited(), 1);
+        assert_eq!(report.already_exited(), 0);
+        assert_eq!(report.failed(), 1);
+        assert_eq!(report.not_attempted(), 0);
+        assert_eq!(report.completion(), ProcessBatchCompletion::Partial);
         assert!(fixture.alive(ignored));
         fixture.wait_dead(closed);
         fixture.cleanup_asserted();
