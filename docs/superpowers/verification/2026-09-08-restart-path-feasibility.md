@@ -50,9 +50,13 @@ separately from timeout and signaled completion.
   than an invalid directory-open shape.
 - While leased, final-executable rename, executable-ancestor rename, and working-
   directory rename were denied.
-- Partial acquisition failure and intentional unwind were exercised, but the
-  subsequent rename targeted a different probe directory, not an acquired lease
-  component. This does not prove lease release; that verification remains open.
+- An injected failure immediately before opening the final executable occurred
+  after the owned executable parent had been leased. While held, that exact owned
+  directory rejected write/delete opens and rename; after partial leases dropped,
+  the same rename succeeded and was reversed.
+- Intentional unwind held the exact owned working-directory path leases. That CWD
+  rejected write/delete opens and rename while held; after unwind released the
+  leases, the same rename succeeded and was reversed.
 - `CreateProcessW` returned success while every executable and working-directory
   lease remained held.
 
@@ -85,10 +89,24 @@ The same bounded handshake failure occurred on three runs of that exact command:
    1 ignored, 1130 filtered out, 6.65 s.
 
 On all runs `CreateProcessW` returned a process and thread handle. The RAII cleanup
-path then requested termination, waited boundedly, and closed both returned
-handles. The temporary-tree guard made a best-effort recursive removal during
+path then requested termination, attempted a bounded wait, and closed both returned
+handles; the ignored wait result does not establish successful termination. The
+temporary-tree guard made a best-effort recursive removal during
 unwind; because the test stopped at the handshake assertion and cleanup was not
 separately inspected afterward, complete tree removal is not claimed.
+
+User-authorized narrow continuation added two more runs without changing the
+path policy, creation inputs, or five-second handshake budget:
+
+1. Successful executable/CWD leases were released immediately after
+   `CreateProcessW` returned and before the handshake wait. The same timeout
+   occurred: exit 1, 1 failed, 1 ignored, 1130 filtered out, 6.26 s. Extended
+   successful-lease lifetime was therefore not the observed cause.
+2. A read-only `QueryFullProcessImageNameW` check on the returned process handle
+   matched the owned copied executable, then the same timeout occurred: exit 1,
+   1 failed, 1 ignored, 1130 filtered out, 6.22 s. Windows started the intended
+   image, but this does not prove that its test entry ran or received the intended
+   child context.
 
 Because the required owned child did not publish its actual arguments, effective
 working directory, and explicit environment marker, this experiment does **not**
@@ -97,12 +115,12 @@ did not reach the normal post-child assertions that the exact executable and
 ancestor mutations succeed after releasing the successful launch leases. Those
 facts are therefore not claimed.
 
-The successful-launch lease vectors remained alive through the handshake wait,
-although the design requires them only through `CreateProcessW` return. The
-explicit environment block was supplied to creation and included the marker and
-control path, but child receipt of it was not demonstrated. These are possible
-fixture/harness factors; this result is BLOCKED/INCONCLUSIVE, not evidence that
-the approved path policy is fundamentally impossible.
+The corrected experiment releases successful-launch lease vectors immediately
+after `CreateProcessW` return. The explicit environment block was supplied to
+creation and included the marker and control path, but child receipt of it was
+not demonstrated. The remaining failure is plausibly in fixture/test-harness
+startup rather than pathname resolution; this result remains BLOCKED/INCONCLUSIVE,
+not evidence that the approved path policy is fundamentally impossible.
 
 The affected process-control regression, formatting and Clippy gates have not been
 run at this experimental revision, and no success is claimed for them.
@@ -110,17 +128,14 @@ No production restart module or Task 2 work was started.
 
 ## Independent Correctness And Scope Review
 
-Independent review on 2026-09-08 confirmed the four-file scope and the
-BLOCKED/INCONCLUSIVE gate, and identified the unsupported lease-release claim
-corrected above. The earlier text under this heading was author assessment, not
-an independent approval. Task 1 is not accepted and Task 2 must not begin.
+An earlier controller review identified the unsupported lease-release claim that
+is corrected above. A targeted read-only review of the resumed timing, image, and
+owned-component evidence is pending; this section does not claim independent
+approval. Task 1 is not accepted and Task 2 must not begin.
 
-The narrow next diagnostic is to release successful-launch leases after
-CreateProcessW returns and before waiting for the child handshake, matching the
-approved design rather than holding them until child exit. This is a hypothesis,
-not a demonstrated root cause; no further experiment was run after the repeated
-blocker stop. A subsequent release regression must target actually leased
-components, not an unrelated probe directory.
+The authorized timing hypothesis was tested and rejected. The corrected release
+regressions now target actually leased owned components. The child-context
+handshake remains the unresolved gate; no Task 2 work is authorized.
 
 A controller read-only post-run scan found zero `UiPilot restart feasibility *`
 directories under the current temporary directory. This establishes directory

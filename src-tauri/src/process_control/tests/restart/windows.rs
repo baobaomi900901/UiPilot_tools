@@ -24,8 +24,9 @@ use windows::{
             VOLUME_NAME_GUID,
         },
         System::Threading::{
-            CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
-            CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+            CreateProcessW, GetExitCodeProcess, QueryFullProcessImageNameW, TerminateProcess,
+            WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+            PROCESS_NAME_WIN32, STARTUPINFOW,
         },
     },
 };
@@ -198,12 +199,20 @@ fn final_guid_path(handle: HANDLE) -> Result<String, &'static str> {
     String::from_utf16(&buffer[..written]).map_err(|_| "final path was not UTF-16")
 }
 
-fn lease_path(path: &VolumePath, final_directory: bool, fail_at: Option<usize>) -> Result<Vec<OwnedHandle>, &'static str> {
+fn lease_path(
+    path: &VolumePath,
+    final_directory: bool,
+    fail_at: Option<usize>,
+    failure_probe: Option<&dyn Fn()>,
+) -> Result<Vec<OwnedHandle>, &'static str> {
     let components = path.relative.split('\\').collect::<Vec<_>>();
     let mut leases = Vec::with_capacity(components.len());
     let mut current = path.guid_root.trim_end_matches('\\').to_owned();
     for (index, component) in components.iter().enumerate() {
         if fail_at == Some(index) {
+            if let Some(probe) = failure_probe {
+                probe();
+            }
             return Err("injected partial acquisition failure");
         }
         current.push('\\');
@@ -339,6 +348,21 @@ fn wait_for(path: &Path, process: HANDLE) {
     }
 }
 
+fn process_image(process: HANDLE) -> String {
+    let mut buffer = vec![0u16; 32_768];
+    let mut size = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    }
+    .unwrap();
+    String::from_utf16(&buffer[..size as usize]).unwrap()
+}
+
 #[test]
 fn restart_path_feasibility() {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -366,28 +390,40 @@ fn restart_path_feasibility() {
     symlink_dir(&cwd, &link).expect("owned reparse fixture must be creatable for this gate");
     let link_volume = resolve_volume(&link);
     assert!(matches!(
-        lease_path(&link_volume, true, None),
+        lease_path(&link_volume, true, None, None),
         Err("reparse component rejected")
     ));
     fs::remove_dir(&link).unwrap();
 
     // Partial failure and unwind release every acquired lease and restore cleanup ability.
-    assert!(lease_path(&exe_volume, false, Some(2)).is_err());
-    let probe = root.join("partial-release-probe");
-    fs::create_dir(&probe).unwrap();
-    let renamed_probe = root.join("partial-release-probe-renamed");
-    fs::rename(&probe, &renamed_probe).unwrap();
-    fs::rename(&renamed_probe, &probe).unwrap();
+    let moved_bin_parent = root.join("bin parent partial-failure moved");
+    let fail_before_final_executable = exe_volume.relative.split('\\').count() - 1;
+    let probe_partial = || {
+        assert_incompatible_open_rejected(&bin_parent, true);
+        assert!(fs::rename(&bin_parent, &moved_bin_parent).is_err());
+    };
+    assert!(lease_path(
+        &exe_volume,
+        false,
+        Some(fail_before_final_executable),
+        Some(&probe_partial),
+    )
+    .is_err());
+    fs::rename(&bin_parent, &moved_bin_parent).unwrap();
+    fs::rename(&moved_bin_parent, &bin_parent).unwrap();
+    let moved_cwd = root.join("working directory unwind moved");
     let unwind = catch_unwind(AssertUnwindSafe(|| {
-        let _leases = lease_path(&cwd_volume, true, None).unwrap();
+        let _leases = lease_path(&cwd_volume, true, None, None).unwrap();
+        assert_incompatible_open_rejected(&cwd, true);
+        assert!(fs::rename(&cwd, &moved_cwd).is_err());
         panic!("intentional lease unwind");
     }));
     assert!(unwind.is_err());
-    fs::rename(&probe, &renamed_probe).unwrap();
-    fs::rename(&renamed_probe, &probe).unwrap();
+    fs::rename(&cwd, &moved_cwd).unwrap();
+    fs::rename(&moved_cwd, &cwd).unwrap();
 
-    let exe_leases = lease_path(&exe_volume, false, None).unwrap();
-    let cwd_leases = lease_path(&cwd_volume, true, None).unwrap();
+    let exe_leases = lease_path(&exe_volume, false, None, None).unwrap();
+    let cwd_leases = lease_path(&cwd_volume, true, None, None).unwrap();
     assert_incompatible_open_rejected(&executable, false);
     assert_incompatible_open_rejected(&bin_parent, true);
     assert_incompatible_open_rejected(&cwd, true);
@@ -396,6 +432,13 @@ fn restart_path_feasibility() {
     assert!(fs::rename(&cwd, root.join("working directory replaced")).is_err());
 
     let mut child = spawn_leased(&exe_volume, &cwd_volume, &control);
+    let observed_image = process_image(child.process.0);
+    assert!(
+        observed_image.eq_ignore_ascii_case(executable.to_string_lossy().as_ref()),
+        "created process image differed from owned executable"
+    );
+    drop(cwd_leases);
+    drop(exe_leases);
     let report_path = control.join("child-report.txt");
     wait_for(&report_path, child.process.0);
     let report = fs::read_to_string(&report_path).unwrap();
@@ -406,8 +449,6 @@ fn restart_path_feasibility() {
     assert!(report.contains(&format!("cwd={}", cwd_volume.full)));
     child.wait().unwrap();
 
-    drop(cwd_leases);
-    drop(exe_leases);
     let moved_executable = bin_parent.join("owned child moved.exe");
     fs::rename(&executable, &moved_executable).unwrap();
     fs::rename(&moved_executable, &executable).unwrap();
