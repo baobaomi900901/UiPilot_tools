@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-07
-**Status:** Implementation in progress — Tasks 1-4 implemented and independently reviewed through 784a8e3; no blocking findings. Task 3 retains a non-blocking name-validation drift risk and non-Windows runtime verification limit. Tasks 5-6 not started.
+**Status:** Implementation in progress — Tasks 1-5 implemented and independently reviewed through cca5acc; no blocking findings. Task 3 retains a non-blocking name-validation drift risk and non-Windows runtime verification limit. Task 5 passed standard-user Windows fixtures; real PPL is N/A without a safe owned fixture. Task 6 not started.
 
 **Goal:** Deliver the host-internal Windows process-tree and same-name planning/execution Module that freezes at most 256 exact targets before confirmation, then serially reuses Stage 1 admission and Stage 2A operations with a 30-second scheduling deadline and complete per-target reporting.
 
@@ -181,13 +181,13 @@ The approved design is canonical for field visibility, root error priority, ance
 
 **Dependencies:** Tasks 1-4; approved design sections 19. Windows Adapter, 21. Real Windows Verification, and 24. Known Limits. Production operation.rs and windows.rs remain unchanged.
 
-- [ ] Add an ignored batch fixture entry with bounded sleep, graceful-window, ignore-close-window, tree-parent, tree-child, and handshake modes. Coordinate readiness and child PID publication through a unique test-owned temporary control directory with bounded polling; product code may not create or inspect these files.
-- [ ] Build a controller that receives every node PID, correlates it to an exact snapshot creationTime, opens/retains a bounded cleanup HANDLE for every node, and tears down all nodes on normal, failure, panic, and Drop paths.
-- [ ] For same-name cases, copy the current test executable to a unique temporary executable name, spawn only retained children from it, and abort before batch execution if any reliable matching process is not one of the test-owned exact targets.
-- [ ] Add controlled root/child/grandchild tests for graceful and force tree execution; assert report order and exact final states without targeting any existing user/system process.
-- [ ] Add graceful and force same-name tests, then create a new owned matching fixture after planning and prove that it remains alive and absent from the report until explicit fixture cleanup.
-- [ ] Add a partial graceful-close case where one fixture ignores WM_CLOSE while later targets still run and the report retains timeout plus completed outcomes.
-- [ ] Extend source guards to prove batch.rs uses existing Stage 1/2A methods and contains no process side-effect primitive, Shell fallback, wider access right, persistence, Tauri, public plugin, Restart, or elevation path.
+- [x] Add an ignored batch fixture entry with bounded sleep, graceful-window, ignore-close-window, tree-parent, tree-child, and handshake modes. Coordinate readiness and child PID publication through a unique test-owned temporary control directory with bounded polling; product code may not create or inspect these files.
+- [x] Build a controller that receives every node PID, correlates it to an exact snapshot creationTime, opens/retains a bounded cleanup HANDLE for every node, and tears down all nodes on normal, failure, panic, and Drop paths.
+- [x] For same-name cases, copy the current test executable to a unique temporary executable name, spawn only retained children from it, and abort before batch execution if any reliable matching process is not one of the test-owned exact targets.
+- [x] Add controlled root/child/grandchild tests for graceful and force tree execution; assert report order and exact final states without targeting any existing user/system process.
+- [x] Add graceful and force same-name tests, then create a new owned matching fixture after planning and prove that it remains alive and absent from the report until explicit fixture cleanup.
+- [x] Add a partial graceful-close case where one fixture ignores WM_CLOSE while later targets still run and the report retains timeout plus completed outcomes.
+- [x] Extend source guards to prove batch.rs uses existing Stage 1/2A methods and contains no process side-effect primitive, Shell fallback, wider access right, persistence, Tauri, public plugin, Restart, or elevation path.
 
 **Distinct test coverage:** Unique-name ownership preflight; exact handshake identities; deepest-first tree report; same-name path independence; post-plan newcomer survival; partial failure continuation; standard-user redacted errors; bounded timing; every fixture process/HANDLE and temporary copied executable cleaned with zero residue. Real PPL remains N/A when no safe fixture exists.
 
@@ -238,6 +238,6 @@ Expected: format, every focused suite, serialized Windows batch tests, complete 
 - [x] Task 2 covers design sections 6.1-6.2, 8, 10, 11, and tree-related known limits.
 - [x] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
 - [x] Task 4 covers design sections 12-17 and the execution portion of 18.
-- [ ] Task 5 covers the real Windows requirements in sections 19, 21, and 24 without production fallback changes.
+- [x] Task 5 covers the real Windows requirements in sections 19, 21, and 24 without production fallback changes.
 - [ ] Task 6 records every requirement in sections 20-24 and confirms the final changed scope.
 - [ ] The user reviews the verification record and explicitly accepts Stage 2B before any Restart, elevation, host product-entry, or Stage 3 design/plan/code begins.
