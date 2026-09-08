@@ -50,9 +50,9 @@ separately from timeout and signaled completion.
   than an invalid directory-open shape.
 - While leased, final-executable rename, executable-ancestor rename, and working-
   directory rename were denied.
-- Injected partial acquisition failure dropped earlier leases. Intentional unwind
-  dropped a complete lease set. A same owned-directory rename succeeded after
-  each of those releases, demonstrating cleanup rather than unrelated ACL denial.
+- Partial acquisition failure and intentional unwind were exercised, but the
+  subsequent rename targeted a different probe directory, not an acquired lease
+  component. This does not prove lease release; that verification remains open.
 - `CreateProcessW` returned success while every executable and working-directory
   lease remained held.
 
@@ -104,15 +104,24 @@ control path, but child receipt of it was not demonstrated. These are possible
 fixture/harness factors; this result is BLOCKED/INCONCLUSIVE, not evidence that
 the approved path policy is fundamentally impossible.
 
-No affected process-control regression, formatting, or Clippy success is claimed:
-the approved plan makes those conditional on a passing focused feasibility test.
+The affected process-control regression, formatting and Clippy gates have not been
+run at this experimental revision, and no success is claimed for them.
 No production restart module or Task 2 work was started.
 
 ## Independent Correctness And Scope Review
 
-Concise review: the experiment is confined to the four Task 1 files and owned
-temporary resources. It does not weaken the path policy, treat failure as N/A,
-touch product restart/operation/batch code, use PID lookup for cleanup, or proceed
-past the hard gate. The recorded partial successes are insufficient to establish
-the full CreateProcessW path guarantee; **Stage 2C is blocked pending a revised,
-approved way to obtain the required child evidence.**
+Independent review on 2026-09-08 confirmed the four-file scope and the
+BLOCKED/INCONCLUSIVE gate, and identified the unsupported lease-release claim
+corrected above. The earlier text under this heading was author assessment, not
+an independent approval. Task 1 is not accepted and Task 2 must not begin.
+
+The narrow next diagnostic is to release successful-launch leases after
+CreateProcessW returns and before waiting for the child handshake, matching the
+approved design rather than holding them until child exit. This is a hypothesis,
+not a demonstrated root cause; no further experiment was run after the repeated
+blocker stop. A subsequent release regression must target actually leased
+components, not an unrelated probe directory.
+
+A controller read-only post-run scan found zero `UiPilot restart feasibility *`
+directories under the current temporary directory. This establishes directory
+residue absence at that scan, not the still-unproven per-path cleanup assertions.
