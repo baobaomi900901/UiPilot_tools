@@ -1,7 +1,7 @@
 # Stage 2B Process Target Expansion And Batch Orchestration Verification Record
 
 **Date:** 2026-09-08  
-**Status:** AWAITING USER ACCEPTANCE  
+**Status:** ACCEPTED BY USER ON 2026-09-08
 **Verification outcome:** `DONE_WITH_CONCERNS` - all Stage 2B focused, serialized
 Windows, complete `process_control`, default full-test, format, dependency,
 cleanup, and scope gates pass at the final source revision. The all-features test
@@ -9,9 +9,9 @@ and both required Clippy commands remain factually red only for the accepted
 Stage 1/2A repository baseline. Final Clippy output has zero `process_control`
 diagnostics.
 
-This record adds no product behavior. Stage 2B is not accepted until the user
-reviews this evidence and explicitly accepts it. No Restart, elevation, host
-product-entry, or Stage 3 design or implementation may begin before that gate.
+This record adds no product behavior. The user explicitly accepted Stage 2B on
+2026-09-08. The next step is the separate Restart design; its design and
+implementation-plan approval gates remain in force.
 
 ## Revision Under Verification
 
@@ -204,9 +204,9 @@ module expansion.
 The implementation, plan, deterministic/Windows evidence, cleanup, scope, and
 zero-new-diagnostic requirements are satisfied. The concise independent final
 targeted review approved the correction and record with no remaining Critical or
-Important finding. User review and explicit acceptance remain the only open exit
-item; the documented mirrored-validation Minor remains nonblocking.
+Important finding. The user explicitly accepted the record on 2026-09-08;
+the documented mirrored-validation Minor remains nonblocking.
 
-**Stop:** Stage 2B remains **AWAITING USER ACCEPTANCE**. This record does not
-accept Stage 2B and does not authorize Restart, elevation, host product-entry,
-Stage 3, or any further design or implementation.
+**Stage gate:** Stage 2B is **ACCEPTED**. The next Restart substage requires its
+own approved design and implementation plan before development. Elevation,
+host product-entry, and Stage 3 retain their ordered stage gates.
