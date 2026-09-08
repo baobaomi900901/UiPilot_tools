@@ -3216,7 +3216,7 @@ mod windows_batch {
         fn retain_pending(&mut self, child: PendingChild) -> usize {
             let pid = child.id();
             let record = wait_record(&self.authority, pid, Duration::from_secs(5));
-            self.retain_record(record, Some(child.transfer()))
+            self.retain_record(record, Some(child))
         }
 
         fn spawn_tree(&mut self, kind: &str) -> [usize; 3] {
@@ -3244,7 +3244,7 @@ mod windows_batch {
             let child = self.spawn_pending(exe, mode, kind);
             let pid = child.id();
             let record = wait_record(&self.authority, pid, Duration::from_secs(5));
-            let node = self.retain_record(record, Some(child.transfer()));
+            let node = self.retain_record(record, Some(child));
             if wait_ready {
                 self.wait_ready(node);
             }
@@ -3272,7 +3272,7 @@ mod windows_batch {
             PendingChild::new(command.spawn().unwrap())
         }
 
-        fn retain_pid(&mut self, pid: u32, child: Option<Child>) -> usize {
+        fn retain_pid(&mut self, pid: u32, child: Option<PendingChild>) -> usize {
             let record = wait_record(&self.authority, pid, Duration::from_secs(5));
             self.retain_record(record, child)
         }
@@ -3280,7 +3280,7 @@ mod windows_batch {
         fn retain_record(
             &mut self,
             record: crate::process_control::ProcessRecord,
-            child: Option<Child>,
+            child: Option<PendingChild>,
         ) -> usize {
             let pid = record.pid();
             let handle = unsafe {
@@ -3293,12 +3293,23 @@ mod windows_batch {
             .unwrap();
             let handle = CleanupHandle(handle);
             let creation_time = creation_time(handle.0).unwrap();
+            self.register_owned_node(record, child, handle, creation_time)
+        }
+
+        fn register_owned_node(
+            &mut self,
+            record: crate::process_control::ProcessRecord,
+            child: Option<PendingChild>,
+            handle: CleanupHandle,
+            creation_time: u64,
+        ) -> usize {
+            let pid = record.pid();
             assert_eq!(creation_time, record.target().creation_time());
             self.nodes.push(OwnedNode {
                 pid,
                 creation_time,
                 handle,
-                child,
+                child: child.map(PendingChild::transfer),
             });
             self.nodes.len() - 1
         }
@@ -3325,7 +3336,11 @@ mod windows_batch {
         }
 
         fn wait_ready(&self, node: usize) {
-            let path = self.dir.join(format!("{}.ready", self.nodes[node].pid));
+            self.wait_ready_pid(self.nodes[node].pid);
+        }
+
+        fn wait_ready_pid(&self, pid: u32) {
+            let path = self.dir.join(format!("{pid}.ready"));
             let deadline = Instant::now() + Duration::from_secs(5);
             while !path.exists() {
                 assert!(Instant::now() < deadline, "fixture readiness timed out");
@@ -3700,6 +3715,42 @@ mod windows_batch {
         let last_mode = test.rfind("select_window_mode").unwrap();
         let first_retention = test.find("retain_pending").unwrap();
         assert!(second_spawn < last_mode && last_mode < first_retention);
+    }
+
+    #[test]
+    fn windows_batch_pre_registration_failure_keeps_child_guarded() {
+        let mut fixture = FixtureController::new(true);
+        let child = fixture.spawn_pending(fixture.copied_exe.as_ref().unwrap(), "sleep", None);
+        let pid = child.id();
+        fixture.wait_ready_pid(pid);
+        let record = wait_record(&fixture.authority, pid, Duration::from_secs(5));
+        let verify =
+            CleanupHandle(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.unwrap());
+        let cleanup = CleanupHandle(
+            unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                    false,
+                    pid,
+                )
+            }
+            .unwrap(),
+        );
+        let wrong_creation_time = creation_time(cleanup.0).unwrap().wrapping_add(1);
+        let started = Instant::now();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            fixture.register_owned_node(record, Some(child), cleanup, wrong_creation_time);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            unsafe { WaitForSingleObject(verify.0, WAIT_MS) },
+            WAIT_OBJECT_0
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(fixture.nodes.is_empty());
+        fixture.cleanup_asserted();
     }
 
     #[test]
