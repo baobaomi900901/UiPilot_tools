@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-07
-**Status:** Implementation in progress — Tasks 1-3 implemented and independently reviewed through 4b2d236; no blocking findings. Task 3 retains a non-blocking name-validation drift risk and non-Windows runtime verification limit. Tasks 4-6 not started.
+**Status:** Implementation in progress — Tasks 1-4 implemented and independently reviewed through 784a8e3; no blocking findings. Task 3 retains a non-blocking name-validation drift risk and non-Windows runtime verification limit. Tasks 5-6 not started.
 
 **Goal:** Deliver the host-internal Windows process-tree and same-name planning/execution Module that freezes at most 256 exact targets before confirmation, then serially reuses Stage 1 admission and Stage 2A operations with a 30-second scheduling deadline and complete per-target reporting.
 
@@ -163,13 +163,13 @@ The approved design is canonical for field visibility, root error priority, ance
 
 **Dependencies:** Tasks 1-3; approved design sections 12. Execution Flow, 13. Target Outcomes And Report, 14. Top-Level Error Contract, 15.2 Execution, 16. Concurrency And Retry Policy, and 17. Elevation Handoff.
 
-- [ ] Define ProcessBatchTargetError, ProcessBatchTargetOutcome, ProcessBatchReport, and ProcessBatchCompletion once, with stable redacted Display and checked summary counts. Complete requires no failures, no unattempted targets, no omissions, and only ObservedExited/AlreadyExited outcomes.
-- [ ] Implement execute_batch_with_clock: consume and Authority-check the plan before the loop, start one 30-second deadline, process the frozen order serially, and return a complete ordered report after preflight.
-- [ ] Before every admission and after every successful admission, check the scheduling deadline. After the second check expires, close the current admission and mark it plus all remaining entries NotAttemptedBatchDeadline.
-- [ ] For each started target, call CoreAuthority::admit with the bound intent and immediately call terminate_with_clock or force_terminate_with_clock with the same clock. Never duplicate Stage 2A logic or shorten its five-second deadline.
-- [ ] Normalize Stage 1/Stage 2A TargetExited to AlreadyExited, Ok to ObservedExited, and every specified failure to ProcessBatchTargetError; map structurally unreachable post-preflight contract variants to OperationUnavailable without retry or top-level escape.
-- [ ] Continue after every target outcome while the batch deadline permits. Preserve timeout/pending/unknown after-side-effect classifications and prohibit rollback, retry, force fallback, elevation, or cross-target admission reuse.
-- [ ] Add ProcessAuthority::execute_batch for Windows using SystemMonotonicClock and the non-Windows preflight PlatformUnsupported path.
+- [x] Define ProcessBatchTargetError, ProcessBatchTargetOutcome, ProcessBatchReport, and ProcessBatchCompletion once, with stable redacted Display and checked summary counts. Complete requires no failures, no unattempted targets, no omissions, and only ObservedExited/AlreadyExited outcomes.
+- [x] Implement execute_batch_with_clock: consume and Authority-check the plan before the loop, start one 30-second deadline, process the frozen order serially, and return a complete ordered report after preflight.
+- [x] Before every admission and after every successful admission, check the scheduling deadline. After the second check expires, close the current admission and mark it plus all remaining entries NotAttemptedBatchDeadline.
+- [x] For each started target, call CoreAuthority::admit with the bound intent and immediately call terminate_with_clock or force_terminate_with_clock with the same clock. Never duplicate Stage 2A logic or shorten its five-second deadline.
+- [x] Normalize Stage 1/Stage 2A TargetExited to AlreadyExited, Ok to ObservedExited, and every specified failure to ProcessBatchTargetError; map structurally unreachable post-preflight contract variants to OperationUnavailable without retry or top-level escape.
+- [x] Continue after every target outcome while the batch deadline permits. Preserve timeout/pending/unknown after-side-effect classifications and prohibit rollback, retry, force fallback, elevation, or cross-target admission reuse.
+- [x] Add ProcessAuthority::execute_batch for Windows using SystemMonotonicClock and the non-Windows preflight PlatformUnsupported path.
 
 **Distinct test coverage:** ExpiredPlan causes zero admissions/effects; exact tree/name order; independent admission per target; success/failure/AlreadyExited sequences continue; root still runs after child failure; pre-admission deadline, successful-admission deadline, failed admission crossing deadline, and one in-flight Stage 2A retaining five seconds; all remaining entries marked once; every target-error mapping; Complete/Partial matrix including omissions; no top-level Err after loop entry; no retries/fallback/elevation; overlapping plans; normal/error/deadline/catch_unwind exact HANDLE drops.
 
@@ -237,7 +237,7 @@ Expected: format, every focused suite, serialized Windows batch tests, complete 
 - [x] Task 1 covers design sections 4, 5.3, 7.1-7.3, 14, 15.1, and the planning portion of 18.
 - [x] Task 2 covers design sections 6.1-6.2, 8, 10, 11, and tree-related known limits.
 - [x] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
-- [ ] Task 4 covers design sections 12-17 and the execution portion of 18.
+- [x] Task 4 covers design sections 12-17 and the execution portion of 18.
 - [ ] Task 5 covers the real Windows requirements in sections 19, 21, and 24 without production fallback changes.
 - [ ] Task 6 records every requirement in sections 20-24 and confirms the final changed scope.
 - [ ] The user reviews the verification record and explicitly accepts Stage 2B before any Restart, elevation, host product-entry, or Stage 3 design/plan/code begins.
