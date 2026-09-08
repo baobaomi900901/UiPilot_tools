@@ -19,6 +19,7 @@ use super::operation::{
 use super::ProcessOperationError;
 
 mod batch;
+mod restart;
 
 const HOST: [u8; 16] = [0x41; 16];
 const SELF_PID: u32 = 9_999;
