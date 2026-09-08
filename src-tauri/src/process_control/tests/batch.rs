@@ -3059,3 +3059,782 @@ fn batch_execution_graceful_failure_continues_without_force_fallback() {
     assert_eq!(adapter.terminate_calls(), 0);
     assert_eq!(adapter.opened(), adapter.dropped());
 }
+
+#[cfg(windows)]
+mod windows_batch {
+    use super::*;
+    use std::{
+        fs,
+        process::{Child, Command, Stdio},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        thread,
+    };
+    use windows::{
+        core::w,
+        Win32::{
+            Foundation::{
+                CloseHandle, FILETIME, HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0,
+                WAIT_TIMEOUT, WPARAM,
+            },
+            System::Threading::{
+                GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+            },
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+                PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, CW_USEDEFAULT, MSG,
+                SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WNDCLASSW, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+            },
+        },
+    };
+
+    use crate::process_control::{ProcessAuthority, ProcessTarget};
+
+    const FIXTURE_TEST: &str =
+        "process_control::tests::batch::windows_batch::windows_batch_fixture";
+    const MARKER: &str = "UIPILOT_BATCH_FIXTURE";
+    const MODE: &str = "UIPILOT_BATCH_FIXTURE_MODE";
+    const CONTROL: &str = "UIPILOT_BATCH_FIXTURE_CONTROL";
+    const TREE_KIND: &str = "UIPILOT_BATCH_FIXTURE_TREE_KIND";
+    const WAIT_MS: u32 = 5_000;
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+    static IGNORE_CLOSE: AtomicBool = AtomicBool::new(false);
+
+    struct CleanupHandle(HANDLE);
+
+    impl Drop for CleanupHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct OwnedNode {
+        pid: u32,
+        creation_time: u64,
+        handle: CleanupHandle,
+        child: Option<Child>,
+    }
+
+    struct PendingChild(Option<Child>);
+
+    impl PendingChild {
+        fn new(child: Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn id(&self) -> u32 {
+            self.0.as_ref().unwrap().id()
+        }
+
+        fn transfer(mut self) -> Child {
+            self.0.take().unwrap()
+        }
+
+        fn disarm(mut self) {
+            let _ = self.0.take();
+        }
+    }
+
+    impl Drop for PendingChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(None) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    struct FixtureController {
+        authority: ProcessAuthority,
+        dir: PathBuf,
+        copied_exe: Option<PathBuf>,
+        nodes: Vec<OwnedNode>,
+    }
+
+    impl FixtureController {
+        fn new(copy_exe: bool) -> Self {
+            let nonce = UNIQUE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "uipilot-batch-{}-{}-{nonce}",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            fs::create_dir(&dir).unwrap();
+            let copied_exe = copy_exe.then(|| {
+                let path = dir.join(format!("uib{:x}{:x}.exe", std::process::id(), nonce));
+                fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+                path
+            });
+            Self {
+                authority: ProcessAuthority::new().unwrap(),
+                dir,
+                copied_exe,
+                nodes: Vec::new(),
+            }
+        }
+
+        fn spawn(&mut self, mode: &str) -> usize {
+            let exe = self
+                .copied_exe
+                .clone()
+                .unwrap_or_else(|| std::env::current_exe().unwrap());
+            let node = self.spawn_exe(&exe, mode, None, true);
+            node
+        }
+
+        fn spawn_alternate_path(&mut self, mode: &str) -> usize {
+            let primary = self.copied_exe.as_ref().unwrap();
+            let alternate_dir = self.dir.join("alternate");
+            fs::create_dir(&alternate_dir).unwrap();
+            let alternate = alternate_dir.join(primary.file_name().unwrap());
+            if !alternate.exists() {
+                fs::copy(std::env::current_exe().unwrap(), &alternate).unwrap();
+            }
+            self.spawn_exe(&alternate, mode, None, true)
+        }
+
+        fn spawn_select_window(&mut self) -> usize {
+            let exe = self.copied_exe.clone().unwrap();
+            self.spawn_exe(&exe, "select-window", None, false)
+        }
+
+        fn select_window_mode(&self, node: usize, mode: &str) {
+            fs::write(
+                self.dir.join(format!("{}.mode", self.nodes[node].pid)),
+                mode,
+            )
+            .unwrap();
+            self.wait_ready(node);
+        }
+
+        fn spawn_tree(&mut self, kind: &str) -> [usize; 3] {
+            let exe = std::env::current_exe().unwrap();
+            let root = self.spawn_exe(&exe, "tree-parent", Some(kind), false);
+            let child_pid = self.read_pid("child.pid");
+            let child = self.retain_pid(child_pid, None);
+            fs::write(self.dir.join("child.ack"), b"retained").unwrap();
+            let grandchild_pid = self.read_pid("grandchild.pid");
+            let grandchild = self.retain_pid(grandchild_pid, None);
+            fs::write(self.dir.join("grandchild.ack"), b"retained").unwrap();
+            for node in [root, child, grandchild] {
+                self.wait_ready(node);
+            }
+            [root, child, grandchild]
+        }
+
+        fn spawn_exe(
+            &mut self,
+            exe: &std::path::Path,
+            mode: &str,
+            kind: Option<&str>,
+            wait_ready: bool,
+        ) -> usize {
+            let mut command = Command::new(exe);
+            command
+                .args(["--ignored", "--exact", FIXTURE_TEST, "--test-threads=1"])
+                .env(MARKER, "1")
+                .env(MODE, mode)
+                .env(CONTROL, &self.dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(kind) = kind {
+                command.env(TREE_KIND, kind);
+            }
+            let child = PendingChild::new(command.spawn().unwrap());
+            let pid = child.id();
+            let record = wait_record(&self.authority, pid, Duration::from_secs(5));
+            let node = self.retain_record(record, Some(child.transfer()));
+            if wait_ready {
+                self.wait_ready(node);
+            }
+            node
+        }
+
+        fn retain_pid(&mut self, pid: u32, child: Option<Child>) -> usize {
+            let record = wait_record(&self.authority, pid, Duration::from_secs(5));
+            self.retain_record(record, child)
+        }
+
+        fn retain_record(
+            &mut self,
+            record: crate::process_control::ProcessRecord,
+            child: Option<Child>,
+        ) -> usize {
+            let pid = record.pid();
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                    false,
+                    pid,
+                )
+            }
+            .unwrap();
+            let handle = CleanupHandle(handle);
+            let creation_time = creation_time(handle.0).unwrap();
+            assert_eq!(creation_time, record.target().creation_time());
+            self.nodes.push(OwnedNode {
+                pid,
+                creation_time,
+                handle,
+                child,
+            });
+            self.nodes.len() - 1
+        }
+
+        fn target(&self, node: usize) -> ProcessTarget {
+            wait_record(
+                &self.authority,
+                self.nodes[node].pid,
+                Duration::from_secs(5),
+            )
+            .target()
+            .clone()
+        }
+
+        fn read_pid(&self, name: &str) -> u32 {
+            let path = self.dir.join(name);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(value) = fs::read_to_string(&path) {
+                    return value.trim().parse().unwrap();
+                }
+                assert!(Instant::now() < deadline, "fixture handshake timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_ready(&self, node: usize) {
+            let path = self.dir.join(format!("{}.ready", self.nodes[node].pid));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "fixture readiness timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn assert_all_name_matches_owned(&self, root: usize) {
+            let snapshot = self.authority.snapshot().unwrap();
+            let root_name = snapshot
+                .processes()
+                .iter()
+                .find(|record| record.pid() == self.nodes[root].pid)
+                .unwrap()
+                .name()
+                .to_owned();
+            let matching: Vec<_> = snapshot
+                .processes()
+                .iter()
+                .filter(|record| record.name().eq_ignore_ascii_case(&root_name))
+                .collect();
+            assert!(!matching.is_empty());
+            assert!(
+                matching.iter().all(|record| self.nodes.iter().any(|node| {
+                    node.pid == record.pid()
+                        && node.creation_time == record.target().creation_time()
+                })),
+                "unowned reliable same-name process; aborting before effects"
+            );
+        }
+
+        fn assert_plan_owned(&self, plan: &ProcessBatchPlan, expected: &[usize]) {
+            let mut expected_pids = expected
+                .iter()
+                .map(|&node| self.nodes[node].pid)
+                .collect::<Vec<_>>();
+            expected_pids.sort_unstable();
+            let mut planned_pids = plan.previews().iter().map(|p| p.pid()).collect::<Vec<_>>();
+            planned_pids.sort_unstable();
+            assert_eq!(planned_pids, expected_pids);
+            let snapshot = self.authority.snapshot().unwrap();
+            for &node in expected {
+                let record = snapshot
+                    .processes()
+                    .iter()
+                    .find(|record| record.pid() == self.nodes[node].pid)
+                    .expect("owned planned fixture disappeared before execution");
+                assert_eq!(
+                    record.target().creation_time(),
+                    self.nodes[node].creation_time
+                );
+                assert_eq!(
+                    creation_time(self.nodes[node].handle.0).unwrap(),
+                    self.nodes[node].creation_time
+                );
+            }
+        }
+
+        fn alive(&mut self, node: usize) -> bool {
+            match self.nodes[node].child.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => match unsafe { WaitForSingleObject(self.nodes[node].handle.0, 0) } {
+                    WAIT_TIMEOUT => true,
+                    WAIT_OBJECT_0 => false,
+                    WAIT_FAILED => panic!("fixture wait failed"),
+                    result => panic!("unexpected fixture wait result {result:?}"),
+                },
+            }
+        }
+
+        fn wait_dead(&mut self, node: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.alive(node) {
+                assert!(Instant::now() < deadline, "owned fixture did not exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn cleanup_asserted(&mut self) {
+            self.cleanup(false);
+            assert!(self.nodes.is_empty());
+            assert!(!self.dir.exists(), "fixture temporary directory remains");
+        }
+
+        fn cleanup(&mut self, best_effort: bool) {
+            let mut clean = true;
+            for node in self.nodes.iter_mut().rev() {
+                let initial = unsafe { WaitForSingleObject(node.handle.0, 0) };
+                if initial == WAIT_TIMEOUT {
+                    if unsafe { TerminateProcess(node.handle.0, 0x55) }.is_err() {
+                        clean = false;
+                    }
+                    if unsafe { WaitForSingleObject(node.handle.0, WAIT_MS) } != WAIT_OBJECT_0 {
+                        clean = false;
+                    }
+                } else if initial != WAIT_OBJECT_0 {
+                    clean = false;
+                }
+                if let Some(child) = node.child.as_mut() {
+                    let _ = child.try_wait();
+                }
+            }
+            self.nodes.clear();
+            if let Some(exe) = self.copied_exe.take() {
+                if exe.exists() && fs::remove_file(exe).is_err() {
+                    clean = false;
+                }
+            }
+            if self.dir.exists() && fs::remove_dir_all(&self.dir).is_err() {
+                clean = false;
+            }
+            if !best_effort {
+                assert!(clean, "fixture cleanup did not reach zero residue");
+            }
+        }
+    }
+
+    impl Drop for FixtureController {
+        fn drop(&mut self) {
+            self.cleanup(true);
+        }
+    }
+
+    fn creation_time(handle: HANDLE) -> windows::core::Result<u64> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user)? };
+        Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+    }
+
+    fn wait_record(
+        authority: &ProcessAuthority,
+        pid: u32,
+        timeout: Duration,
+    ) -> crate::process_control::ProcessRecord {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(record) = authority
+                .snapshot()
+                .unwrap()
+                .processes()
+                .iter()
+                .find(|record| record.pid() == pid)
+            {
+                return record.clone();
+            }
+            assert!(Instant::now() < deadline, "fixture did not enter snapshot");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn windows_batch_tree_graceful_is_deepest_first() {
+        let mut fixture = FixtureController::new(false);
+        let [root, child, grandchild] = fixture.spawn_tree("graceful-window");
+        let plan = fixture
+            .authority
+            .plan_batch(
+                &fixture.target(root),
+                ProcessBatchScope::Tree,
+                ProcessBatchOperation::Terminate,
+            )
+            .unwrap();
+        fixture.assert_plan_owned(&plan, &[root, child, grandchild]);
+        let report = fixture.authority.execute_batch(plan).unwrap();
+        assert_eq!(
+            report
+                .results()
+                .iter()
+                .map(|r| r.preview().pid())
+                .collect::<Vec<_>>(),
+            vec![
+                fixture.nodes[grandchild].pid,
+                fixture.nodes[child].pid,
+                fixture.nodes[root].pid
+            ]
+        );
+        assert!(report
+            .results()
+            .iter()
+            .all(|r| r.outcome() == ProcessBatchTargetOutcome::ObservedExited));
+        for node in [root, child, grandchild] {
+            fixture.wait_dead(node);
+        }
+        fixture.cleanup_asserted();
+    }
+
+    #[test]
+    fn windows_batch_tree_force_is_deepest_first() {
+        let mut fixture = FixtureController::new(false);
+        let [root, child, grandchild] = fixture.spawn_tree("sleep");
+        let plan = fixture
+            .authority
+            .plan_batch(
+                &fixture.target(root),
+                ProcessBatchScope::Tree,
+                ProcessBatchOperation::ForceTerminate,
+            )
+            .unwrap();
+        fixture.assert_plan_owned(&plan, &[root, child, grandchild]);
+        let report = fixture.authority.execute_batch(plan).unwrap();
+        assert_eq!(
+            report
+                .results()
+                .iter()
+                .map(|r| r.preview().pid())
+                .collect::<Vec<_>>(),
+            vec![
+                fixture.nodes[grandchild].pid,
+                fixture.nodes[child].pid,
+                fixture.nodes[root].pid
+            ]
+        );
+        assert!(report
+            .results()
+            .iter()
+            .all(|r| r.outcome() == ProcessBatchTargetOutcome::ObservedExited));
+        for node in [root, child, grandchild] {
+            fixture.wait_dead(node);
+        }
+        fixture.cleanup_asserted();
+    }
+
+    fn same_name_newcomer(operation: ProcessBatchOperation, modes: [&str; 2]) {
+        let mut fixture = FixtureController::new(true);
+        let first = fixture.spawn(modes[0]);
+        let second = fixture.spawn_alternate_path(modes[1]);
+        fixture.assert_all_name_matches_owned(first);
+        let plan = fixture
+            .authority
+            .plan_batch(
+                &fixture.target(first),
+                ProcessBatchScope::SameName,
+                operation,
+            )
+            .unwrap();
+        let planned_paths = plan
+            .previews()
+            .iter()
+            .map(|preview| preview.executable_path().unwrap().to_path_buf())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            planned_paths.len(),
+            2,
+            "same-name fixtures must use distinct paths"
+        );
+        let newcomer = fixture.spawn("sleep");
+        fixture.assert_plan_owned(&plan, &[first, second]);
+        fixture.assert_all_name_matches_owned(first);
+        let report = fixture.authority.execute_batch(plan).unwrap();
+        assert_eq!(report.results().len(), 2);
+        assert!(!report
+            .results()
+            .iter()
+            .any(|r| r.preview().pid() == fixture.nodes[newcomer].pid));
+        assert!(fixture.alive(newcomer));
+        fixture.wait_dead(first);
+        fixture.wait_dead(second);
+        fixture.cleanup_asserted();
+    }
+
+    #[test]
+    fn windows_batch_same_name_graceful_freezes_before_newcomer() {
+        same_name_newcomer(
+            ProcessBatchOperation::Terminate,
+            ["graceful-window", "graceful-window"],
+        );
+    }
+
+    #[test]
+    fn windows_batch_same_name_force_freezes_before_newcomer() {
+        same_name_newcomer(ProcessBatchOperation::ForceTerminate, ["sleep", "sleep"]);
+    }
+
+    #[test]
+    fn windows_batch_graceful_timeout_keeps_later_target_running() {
+        let mut fixture = FixtureController::new(true);
+        let first = fixture.spawn_select_window();
+        let second = fixture.spawn_select_window();
+        let (ignored, closed) = if fixture.nodes[first].pid < fixture.nodes[second].pid {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        fixture.select_window_mode(ignored, "ignore-close-window");
+        fixture.select_window_mode(closed, "graceful-window");
+        fixture.assert_all_name_matches_owned(ignored);
+        let plan = fixture
+            .authority
+            .plan_batch(
+                &fixture.target(ignored),
+                ProcessBatchScope::SameName,
+                ProcessBatchOperation::Terminate,
+            )
+            .unwrap();
+        fixture.assert_plan_owned(&plan, &[ignored, closed]);
+        fixture.assert_all_name_matches_owned(ignored);
+        let report = fixture.authority.execute_batch(plan).unwrap();
+        assert_eq!(
+            report.results()[0].outcome(),
+            ProcessBatchTargetOutcome::Failed(ProcessBatchTargetError::GracefulCloseTimedOut)
+        );
+        let redacted = ProcessBatchTargetError::GracefulCloseTimedOut.to_string();
+        assert_eq!(redacted, "GracefulCloseTimedOut");
+        assert!(!redacted.contains(&fixture.nodes[ignored].pid.to_string()));
+        assert!(!redacted.contains(
+            fixture
+                .copied_exe
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        ));
+        assert_eq!(
+            report.results()[1].outcome(),
+            ProcessBatchTargetOutcome::ObservedExited
+        );
+        assert!(fixture.alive(ignored));
+        fixture.wait_dead(closed);
+        fixture.cleanup_asserted();
+    }
+
+    #[test]
+    fn windows_batch_source_uses_only_existing_stage_methods_and_forbids_expansion() {
+        let source = include_str!("../batch.rs");
+        for required in [
+            ".admit(",
+            "terminate_with_clock",
+            "force_terminate_with_clock",
+        ] {
+            assert!(source.contains(required), "missing required {required}");
+        }
+        for forbidden in [
+            "TerminateProcess",
+            "PostMessageW",
+            "ShellExecute",
+            "std::process::Command",
+            "taskkill",
+            "PowerShell",
+            "powershell",
+            "PROCESS_ALL_ACCESS",
+            "PROCESS_CREATE_THREAD",
+            "Restart",
+            "elevat",
+            "tauri",
+            "persist",
+            "plugin",
+        ] {
+            assert!(!source.contains(forbidden), "found forbidden {forbidden}");
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned explicitly by Windows batch fixture controllers"]
+    fn windows_batch_fixture() {
+        assert_eq!(std::env::var(MARKER).as_deref(), Ok("1"));
+        thread::spawn(|| {
+            thread::sleep(Duration::from_secs(20));
+            std::process::exit(0x56);
+        });
+        match std::env::var(MODE).as_deref() {
+            Ok("sleep") => {
+                publish_ready();
+                thread::sleep(Duration::from_secs(20));
+            }
+            Ok("graceful-window") => run_window(false),
+            Ok("ignore-close-window") => run_window(true),
+            Ok("select-window") => {
+                let path = PathBuf::from(std::env::var_os(CONTROL).unwrap())
+                    .join(format!("{}.mode", std::process::id()));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let selected = loop {
+                    if let Ok(value) = fs::read_to_string(&path) {
+                        break value;
+                    }
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                };
+                run_window(selected.trim() == "ignore-close-window");
+            }
+            Ok("tree-parent") => run_tree_parent(),
+            Ok("tree-child") => run_tree_child(),
+            mode => panic!("unsupported batch fixture mode {mode:?}"),
+        }
+    }
+
+    fn spawn_descendant(mode: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", FIXTURE_TEST, "--test-threads=1"])
+            .env(MARKER, "1")
+            .env(MODE, mode)
+            .env(CONTROL, std::env::var_os(CONTROL).unwrap())
+            .env(TREE_KIND, std::env::var_os(TREE_KIND).unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn run_tree_parent() {
+        let child = PendingChild::new(spawn_descendant("tree-child"));
+        let control = PathBuf::from(std::env::var_os(CONTROL).unwrap());
+        fs::write(control.join("child.pid"), child.id().to_string()).unwrap();
+        if !wait_for_ack(&control.join("child.ack")) {
+            return;
+        }
+        child.disarm();
+        run_fixture_kind();
+    }
+
+    fn run_tree_child() {
+        let grandchild =
+            PendingChild::new(spawn_descendant(std::env::var(TREE_KIND).unwrap().as_str()));
+        let control = PathBuf::from(std::env::var_os(CONTROL).unwrap());
+        fs::write(control.join("grandchild.pid"), grandchild.id().to_string()).unwrap();
+        if !wait_for_ack(&control.join("grandchild.ack")) {
+            return;
+        }
+        grandchild.disarm();
+        run_fixture_kind();
+    }
+
+    fn wait_for_ack(path: &std::path::Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    fn run_fixture_kind() {
+        match std::env::var(TREE_KIND).as_deref() {
+            Ok("sleep") => {
+                publish_ready();
+                thread::sleep(Duration::from_secs(20));
+            }
+            Ok("graceful-window") => run_window(false),
+            mode => panic!("unsupported tree fixture kind {mode:?}"),
+        }
+    }
+
+    fn run_window(ignore: bool) {
+        IGNORE_CLOSE.store(ignore, Ordering::Relaxed);
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            lpszClassName: w!("UiPilotBatchFixtureWindow"),
+            ..Default::default()
+        };
+        assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+        let window = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("UiPilotBatchFixtureWindow"),
+                w!("UiPilot batch fixture"),
+                WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                240,
+                120,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+        }
+        publish_ready();
+        let mut message = MSG::default();
+        loop {
+            let result = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+            assert_ne!(result, -1);
+            if result == 0 {
+                break;
+            }
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    fn publish_ready() {
+        let path = PathBuf::from(std::env::var_os(CONTROL).unwrap())
+            .join(format!("{}.ready", std::process::id()));
+        fs::write(path, b"ready").unwrap();
+    }
+
+    unsafe extern "system" fn window_proc(
+        window: HWND,
+        message: u32,
+        w: WPARAM,
+        l: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_CLOSE if IGNORE_CLOSE.load(Ordering::Relaxed) => LRESULT(0),
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(window, message, w, l) },
+        }
+    }
+}
