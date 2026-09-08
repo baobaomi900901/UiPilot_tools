@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** DRAFT - independently reviewed; awaiting user plan approval
+**Status:** APPROVED - accepted by the user on 2026-09-08; implementation not started
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -160,7 +160,7 @@ Expected: scoped/default tests and format pass; no new module diagnostics; inher
 ## Approval And Next Step
 
 - [x] Independent plan review confirms design coverage and bounded task scope (2026-09-08; no material findings).
-- [ ] User approves this implementation plan before Task 1 experiments or code begin.
+- [x] User approves this implementation plan before Task 1 experiments or code begin (2026-09-08).
 - [ ] User accepts final Stage 2C evidence before any later substage begins.
 
 The next authorized action after plan approval is Task 1 only. Failure of the
