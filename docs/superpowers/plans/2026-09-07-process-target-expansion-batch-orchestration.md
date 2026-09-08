@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Checkboxes are the execution record.
 
 **Date:** 2026-09-07
-**Status:** Implementation in progress — Tasks 1-2 implemented and independently reviewed through e30fbf2 (no findings); Tasks 3-6 not started.
+**Status:** Implementation in progress — Tasks 1-3 implemented and independently reviewed through 4b2d236; no blocking findings. Task 3 retains a non-blocking name-validation drift risk and non-Windows runtime verification limit. Tasks 4-6 not started.
 
 **Goal:** Deliver the host-internal Windows process-tree and same-name planning/execution Module that freezes at most 256 exact targets before confirmation, then serially reuses Stage 1 admission and Stage 2A operations with a 30-second scheduling deadline and complete per-target reporting.
 
@@ -147,11 +147,11 @@ The approved design is canonical for field visibility, root error priority, ance
 
 **Dependencies:** Tasks 1-2; approved design sections 6. Crate-Private Interface, 9. Same-Name Expansion, 10. Cardinality And Completeness, 11. Confirmation Handoff, and 19. Windows Adapter.
 
-- [ ] Implement the same-name builder using only the verified fresh root record and ProcessPlatformAdapter::process_names_equivalent; include every reliable platform-equivalent name regardless of path and always include the root.
-- [ ] Count equivalent-name observation failures by their actual reason, count invalid/uncomparable names as identityUnavailable, and exclude known nonmatching names from scoped omissions.
-- [ ] Sort reliable matches by PID then creationTime and reuse the same checked limit, immutable plan representation, preview rules, and completeness derivation as tree planning.
-- [ ] Implement CoreAuthority::plan_batch as the Tree/SameName dispatcher and add the Windows facade plus non-Windows PlatformUnsupported behavior. The facade returns the opaque plan, not a target vector.
-- [ ] Lock the confirmation handoff contract in source tests: no re-expansion/execution method accepts a name, parent PID, mutable target list, or caller-defined order.
+- [x] Implement the same-name builder using only the verified fresh root record and ProcessPlatformAdapter::process_names_equivalent; include every reliable platform-equivalent name regardless of path and always include the root.
+- [x] Count equivalent-name observation failures by their actual reason, count invalid/uncomparable names as identityUnavailable, and exclude known nonmatching names from scoped omissions.
+- [x] Sort reliable matches by PID then creationTime and reuse the same checked limit, immutable plan representation, preview rules, and completeness derivation as tree planning.
+- [x] Implement CoreAuthority::plan_batch as the Tree/SameName dispatcher and add the Windows facade plus non-Windows PlatformUnsupported behavior. The facade returns the opaque plan, not a target vector.
+- [x] Lock the confirmation handoff contract in source tests: no re-expansion/execution method accepts a name, parent PID, mutable target list, or caller-defined order.
 
 **Distinct test coverage:** Case/non-ASCII Adapter-equivalent names, unequal names, same name at different paths, root inclusion, equivalent omitted candidates, invalid name, deterministic order, same-name 256/257 boundary, platform comparison failure, post-plan new same-name process exclusion, non-Windows contract, and facade/source proof that preview exposes no ProcessTarget or mutation seam.
 
@@ -236,7 +236,7 @@ Expected: format, every focused suite, serialized Windows batch tests, complete 
 
 - [x] Task 1 covers design sections 4, 5.3, 7.1-7.3, 14, 15.1, and the planning portion of 18.
 - [x] Task 2 covers design sections 6.1-6.2, 8, 10, 11, and tree-related known limits.
-- [ ] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
+- [x] Task 3 covers design sections 6, 9-11, and the planning facade/platform contract.
 - [ ] Task 4 covers design sections 12-17 and the execution portion of 18.
 - [ ] Task 5 covers the real Windows requirements in sections 19, 21, and 24 without production fallback changes.
 - [ ] Task 6 records every requirement in sections 20-24 and confirms the final changed scope.
