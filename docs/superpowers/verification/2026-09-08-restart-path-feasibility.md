@@ -5,6 +5,7 @@ Status: **BLOCKED — path-to-child handshake property not demonstrated**
 Date: 2026-09-08
 Branch: `codex/plugin-platform-roadmap`
 Implementation-start base: `3e027b3`
+Latest experimental revision: `7b38499`
 Environment: Windows standard user; owned files, directories, handles, and process only.
 
 ## Experiment
@@ -100,13 +101,13 @@ path policy, creation inputs, or five-second handshake budget:
 
 1. Successful executable/CWD leases were released immediately after
    `CreateProcessW` returned and before the handshake wait. The same timeout
-   occurred: exit 1, 1 failed, 1 ignored, 1130 filtered out, 6.26 s. Extended
-   successful-lease lifetime was therefore not the observed cause.
+   occurred: exit 1, 1 failed, 1 ignored, 1130 filtered out, 6.26 s. Changing
+   successful-lease lifetime alone did not resolve the failure.
 2. A read-only `QueryFullProcessImageNameW` check on the returned process handle
    matched the owned copied executable, then the same timeout occurred: exit 1,
-   1 failed, 1 ignored, 1130 filtered out, 6.22 s. Windows started the intended
-   image, but this does not prove that its test entry ran or received the intended
-   child context.
+   1 failed, 1 ignored, 1130 filtered out, 6.22 s. The returned process object
+   identifies the intended executable; this does not prove that its primary
+   thread or test entry executed or received the intended child context.
 
 Because the required owned child did not publish its actual arguments, effective
 working directory, and explicit environment marker, this experiment does **not**
@@ -128,14 +129,16 @@ No production restart module or Task 2 work was started.
 
 ## Independent Correctness And Scope Review
 
-An earlier controller review identified the unsupported lease-release claim that
-is corrected above. A targeted read-only review of the resumed timing, image, and
-owned-component evidence is pending; this section does not claim independent
-approval. Task 1 is not accepted and Task 2 must not begin.
+Independent targeted review on 2026-09-08 confirmed the corrected release probes
+and accepted this record only as BLOCKED/INCONCLUSIVE evidence. It requested the
+image-query wording and revision corrections above. Task 1 is not accepted and
+Task 2 must not begin.
 
-The authorized timing hypothesis was tested and rejected. The corrected release
+The authorized timing change did not resolve the timeout. The corrected release
 regressions now target actually leased owned components. The child-context
-handshake remains the unresolved gate; no Task 2 work is authorized.
+handshake remains the unresolved gate. A separately authorized next diagnostic
+can use a minimal owned helper with an entry-point handshake before libtest
+parsing; this has not been run and is not a proven root cause.
 
 A controller read-only post-run scan found zero `UiPilot restart feasibility *`
 directories under the current temporary directory. This establishes directory

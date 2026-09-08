@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Task 1 is BLOCKED/INCONCLUSIVE at 6cf8801: child handshake not demonstrated; independent review confirms the gate remains closed. Tasks 2-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Task 1 remains BLOCKED/INCONCLUSIVE at 7b38499: earlier lease release did not resolve the handshake; actual leased-component release checks passed. Independent review confirms the child-context gate remains closed. Tasks 2-6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
