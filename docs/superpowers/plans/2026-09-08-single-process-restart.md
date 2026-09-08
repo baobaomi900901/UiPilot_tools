@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Task 1 remains BLOCKED/INCONCLUSIVE at 7b38499: earlier lease release did not resolve the handshake; actual leased-component release checks passed. Independent review confirms the child-context gate remains closed. Tasks 2-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Task 1 feasibility passed at 0cea2d0 using a minimal owned helper and passed independent review. Historical libtest handshake failures remain documented. Tasks 2-6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -66,11 +66,11 @@ All constructors/state transitions that mint or modify receipt authority are pri
 **Files:** Create `tests/restart.rs`, `tests/restart/windows.rs` under process_control; modify `tests.rs` to declare the module; create the path-feasibility verification record above.
 **Dependencies:** Design section 5 path-policy and feasibility gate, sections 7-8. No production restart module exists yet.
 
-- [ ] Build an owned local executable/directory fixture and an ignored child entry that publishes its arguments, effective directory and selected environment markers via a bounded test-owned handshake.
-- [ ] Demonstrate CreateProcessW using the proposed volume-qualified paths while all executable/directory components and the final file are leased. Use explicit command line/environment and no inherited handles; keep an independent guarded cleanup process handle until the fixture exits.
-- [ ] Attempt file and ancestor-directory replacement/rename and incompatible opens while leased; prove expected rejection without changing non-owned paths. Demonstrate fail-closed rejection of reparse/unsupported paths and sharing denial before any creation or target stop.
-- [ ] Record the effective path form, flags, share/access combinations, filesystem, standard-user result and cleanup. Unsupported setup is a blocked gate, not a passing N/A. Prove leases are released on failure/unwind and the temporary tree can be removed afterward.
-- [ ] Stop here if the property is not demonstrated. No production managed-launch, stop or restart implementation can proceed on an assumed path guarantee.
+- [x] Build an owned local executable/directory fixture and a bounded child handshake for arguments, effective directory and environment markers. The original ignored libtest entry was replaced by the user-authorized minimal owned helper after documented handshake failures.
+- [x] Demonstrate CreateProcessW using the proposed volume-qualified paths while all executable/directory components and the final file are leased. Use explicit command line/environment and no inherited handles; keep an independent guarded cleanup process handle until the fixture exits.
+- [x] Attempt file and ancestor-directory replacement/rename and incompatible opens while leased; prove expected rejection without changing non-owned paths. Demonstrate fail-closed rejection of reparse/unsupported paths and sharing denial before any creation or target stop.
+- [x] Record the effective path form, flags, share/access combinations, filesystem, standard-user result and cleanup. Unsupported setup is a blocked gate, not a passing N/A. Prove leases are released on failure/unwind and the temporary tree can be removed afterward.
+- [x] Stop here if the property is not demonstrated. No production managed-launch, stop or restart implementation can proceed on an assumed path guarantee.
 
 **Distinct test coverage:** Actual path-to-image/directory behavior; ancestor rename/replacement; reparse rejection; incompatible sharing; Unicode/space paths; lease/returned-handle cleanup. Do not change existing applications or user files.
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control::tests::restart::windows::restart_path_feasibility -- --nocapture --test-threads=1`

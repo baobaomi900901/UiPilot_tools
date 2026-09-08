@@ -1,11 +1,12 @@
 # Stage 2C Task 1: Restart Path Feasibility
 
-Status: **SUPPORTED — focused feasibility and affected regression pass; targeted review pending**
+Status: **PASS — feasibility and affected regression passed; independent review complete**
 
 Date: 2026-09-08
 Branch: `codex/plugin-platform-roadmap`
 Implementation-start base: `3e027b3`
 Controlled-helper implementation base: `93ff3b9`
+Final experiment revision: `0cea2d097e2135beca7a81f3b88377b88d76609c`
 Environment: Windows standard user; owned files, directories, handles, and process only.
 
 ## Experiment
@@ -173,9 +174,12 @@ No production restart module or Task 2 work was started.
 ## Independent Correctness And Scope Review
 
 An earlier targeted review accepted only the historical BLOCKED/INCONCLUSIVE
-record and requested the corrected owned-component release probes. The final
-controlled-helper PASS and scope are awaiting a new targeted read-only review;
-this record does not self-approve Task 1 or authorize Task 2.
+record and requested the corrected owned-component release probes. Independent
+targeted review on 2026-09-08 approved the final controlled-helper proof for Task 1
+acceptance, with no material findings. The demonstrated boundary is the reported
+standard-user NTFS fixed volume and owned resources; it is not a guarantee of
+application readiness for arbitrary executables. No Task 2 or production restart
+implementation has begun, and this does not constitute Stage 2C acceptance.
 
 Earlier controller scanning found no historical fixture residue. The final passing
 test additionally performs and asserts removal of its own complete temporary tree.
