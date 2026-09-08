@@ -229,6 +229,19 @@ impl PreparedBatchPlanning {
 }
 
 impl<A: ProcessPlatformAdapter> CoreAuthority<A> {
+    pub(super) fn plan_batch(
+        &self,
+        root: &ProcessTarget,
+        scope: ProcessBatchScope,
+        operation: ProcessBatchOperation,
+    ) -> Result<ProcessBatchPlan, ProcessBatchError> {
+        let prepared = self.prepare_batch_planning(root, operation)?;
+        match scope {
+            ProcessBatchScope::Tree => build_tree_plan(prepared),
+            ProcessBatchScope::SameName => build_same_name_plan(self, prepared),
+        }
+    }
+
     pub(super) fn prepare_batch_planning(
         &self,
         root: &ProcessTarget,
@@ -293,6 +306,95 @@ pub(super) fn build_tree_plan(
             })
     });
 
+    assemble_plan(
+        prepared.authority_id,
+        ProcessBatchScope::Tree,
+        prepared.operation,
+        selected
+            .into_iter()
+            .map(|(record, depth)| (record, Some(depth)))
+            .collect(),
+        omissions,
+    )
+}
+
+pub(super) fn build_same_name_plan<A: ProcessPlatformAdapter>(
+    authority: &CoreAuthority<A>,
+    prepared: PreparedBatchPlanning,
+) -> Result<ProcessBatchPlan, ProcessBatchError> {
+    let root_target = prepared.root.target();
+    let root_name = prepared.root.name();
+    let mut omissions = ProcessBatchOmissions::new();
+    let mut selected = vec![prepared.root.clone()];
+
+    for entry in prepared.snapshot.entries() {
+        if entry.record().is_some_and(|record| {
+            record.pid() == root_target.pid()
+                && record.target().creation_time() == root_target.creation_time()
+        }) {
+            continue;
+        }
+
+        if entry.omission_reason() == Some(ExpansionOmissionReason::IdentityUnavailable)
+            && !same_name_hint_is_comparable(entry.name_hint())
+        {
+            omissions.increment(BatchOmissionReason::IdentityUnavailable)?;
+            continue;
+        }
+
+        let candidate_name = entry
+            .record()
+            .map_or(entry.name_hint(), ProcessRecord::name);
+        match authority.adapter().process_names_equivalent(
+            std::ffi::OsStr::new(candidate_name),
+            std::ffi::OsStr::new(root_name),
+        ) {
+            Ok(false) => {}
+            Ok(true) => match entry.record() {
+                Some(record) => selected.push(record.clone()),
+                None => omissions.increment(map_expansion_omission(
+                    entry
+                        .omission_reason()
+                        .expect("unreliable expansion entries have omission reasons"),
+                ))?,
+            },
+            Err(_) => omissions.increment(BatchOmissionReason::IdentityUnavailable)?,
+        }
+    }
+
+    if selected.len() > BATCH_TARGET_LIMIT {
+        return Err(ProcessBatchError::TargetSetTooLarge);
+    }
+    selected.sort_by(|left, right| {
+        left.pid().cmp(&right.pid()).then_with(|| {
+            left.target()
+                .creation_time()
+                .cmp(&right.target().creation_time())
+        })
+    });
+    assemble_plan(
+        prepared.authority_id,
+        ProcessBatchScope::SameName,
+        prepared.operation,
+        selected.into_iter().map(|record| (record, None)).collect(),
+        omissions,
+    )
+}
+
+fn same_name_hint_is_comparable(name: &str) -> bool {
+    !name.is_empty() && name == name.trim() && !name.contains(['\0', '\\', '/'])
+}
+
+fn assemble_plan(
+    authority_id: HostInstanceId,
+    scope: ProcessBatchScope,
+    operation: ProcessBatchOperation,
+    selected: Vec<(ProcessRecord, Option<usize>)>,
+    omissions: ProcessBatchOmissions,
+) -> Result<ProcessBatchPlan, ProcessBatchError> {
+    if selected.len() > BATCH_TARGET_LIMIT {
+        return Err(ProcessBatchError::TargetSetTooLarge);
+    }
     let targets = selected
         .iter()
         .map(|(record, _)| record.target().clone())
@@ -305,13 +407,13 @@ pub(super) fn build_tree_plan(
             pid: record.pid(),
             name: record.name().to_owned(),
             executable_path: record.executable_path().map(Path::to_path_buf),
-            depth: Some(depth),
+            depth,
         })
         .collect();
     Ok(ProcessBatchPlan {
-        authority_id: prepared.authority_id,
-        scope: ProcessBatchScope::Tree,
-        operation: prepared.operation,
+        authority_id,
+        scope,
+        operation,
         targets,
         previews,
         omissions,

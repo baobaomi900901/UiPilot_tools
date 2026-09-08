@@ -39,6 +39,15 @@ impl ProcessAuthority {
         self.inner.snapshot()
     }
 
+    pub(crate) fn plan_batch(
+        &self,
+        root: &ProcessTarget,
+        scope: ProcessBatchScope,
+        operation: ProcessBatchOperation,
+    ) -> Result<ProcessBatchPlan, ProcessBatchError> {
+        self.inner.plan_batch(root, scope, operation)
+    }
+
     pub(crate) fn admit(
         &self,
         target: &ProcessTarget,
@@ -82,6 +91,15 @@ impl ProcessAuthority {
 
     pub(crate) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError> {
         Err(ProcessError::PlatformUnsupported)
+    }
+
+    pub(crate) fn plan_batch(
+        &self,
+        _root: &ProcessTarget,
+        _scope: ProcessBatchScope,
+        _operation: ProcessBatchOperation,
+    ) -> Result<ProcessBatchPlan, ProcessBatchError> {
+        Err(ProcessBatchError::PlatformUnsupported)
     }
 
     pub(crate) fn admit(

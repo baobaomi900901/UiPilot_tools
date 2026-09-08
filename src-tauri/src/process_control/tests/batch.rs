@@ -5,8 +5,8 @@ use std::{
 
 use super::*;
 use crate::process_control::batch::{
-    build_tree_plan, ProcessBatchError, ProcessBatchOperation, ProcessBatchPlan,
-    ProcessBatchPreview, ProcessBatchScope, ProcessBatchSelectionCompleteness,
+    build_same_name_plan, build_tree_plan, ProcessBatchError, ProcessBatchOperation,
+    ProcessBatchPlan, ProcessBatchPreview, ProcessBatchScope, ProcessBatchSelectionCompleteness,
 };
 use crate::process_control::core::ExpansionOmissionReason;
 
@@ -22,6 +22,324 @@ mod plan_is_not_clone {
 
     pub(super) fn assert_contract() {
         let _ = <ProcessBatchPlan as AmbiguousIfImpl<_>>::marker;
+    }
+}
+
+fn prepared_same_name(
+    root_pid: u32,
+    root_creation_time: u64,
+    candidates: Vec<ProcessCandidate>,
+    processes: Vec<(u32, FakeProcessScript)>,
+    comparisons: Vec<Result<bool, ObservationFailure>>,
+) -> (FakeProcessAdapter, ProcessBatchPlan) {
+    let mut adapter = FakeProcessAdapter::default()
+        .with_enumeration(
+            std::iter::once(Ok(candidate(root_pid, "root.exe", None)))
+                .chain(candidates.into_iter().map(Ok))
+                .collect(),
+        )
+        .with_process_name_equivalences(comparisons)
+        .with_process(
+            root_pid,
+            planning_script(root_creation_time, "root.exe", r"C:\Fixtures\root.exe"),
+        );
+    for (pid, script) in processes {
+        adapter = adapter.with_process(pid, script);
+    }
+    let prepared = authority(adapter.clone())
+        .prepare_batch_planning(
+            &target(root_pid, root_creation_time),
+            ProcessBatchOperation::Terminate,
+        )
+        .unwrap();
+    let plan = build_same_name_plan(&authority(adapter.clone()), prepared).unwrap();
+    (adapter, plan)
+}
+
+#[test]
+fn batch_same_name_uses_frozen_root_and_adapter_equivalence_ignoring_path() {
+    let root_pid = 800;
+    let equivalent_pid = 801;
+    let unequal_pid = 802;
+    let comparisons = vec![
+        Ok(true),
+        Ok(true), // root snapshot validation
+        Ok(true),
+        Ok(true), // equivalent snapshot validation
+        Ok(true),
+        Ok(true),  // unequal snapshot validation
+        Ok(true),  // adapter-equivalent Unicode/case name
+        Ok(false), // known nonmatch
+    ];
+    let (adapter, plan) = prepared_same_name(
+        root_pid,
+        80_000,
+        vec![
+            candidate(equivalent_pid, "RöÖT.EXE", None),
+            candidate(unequal_pid, "other.exe", None),
+        ],
+        vec![
+            (
+                equivalent_pid,
+                successful_script(80_100, "RöÖT.EXE", r"D:\Elsewhere\RöÖT.EXE"),
+            ),
+            (
+                unequal_pid,
+                successful_script(80_200, "other.exe", r"C:\Fixtures\other.exe"),
+            ),
+        ],
+        comparisons,
+    );
+
+    assert_eq!(plan.scope(), ProcessBatchScope::SameName);
+    assert_eq!(
+        preview_rows(&plan),
+        vec![
+            (
+                0,
+                root_pid,
+                "root.exe".into(),
+                Some(PathBuf::from(r"C:\Fixtures\root.exe")),
+                None
+            ),
+            (
+                1,
+                equivalent_pid,
+                "RöÖT.EXE".into(),
+                Some(PathBuf::from(r"D:\Elsewhere\RöÖT.EXE")),
+                None
+            ),
+        ]
+    );
+    assert_eq!(plan.omissions().total(), 0);
+    assert_eq!(adapter.terminate_calls(), 0);
+}
+
+#[test]
+fn batch_same_name_counts_only_equivalent_omissions_and_comparison_failures() {
+    let root_pid = 810;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(811, "root.exe", None)),
+            Ok(candidate(812, "root.exe", None)),
+            Ok(candidate(813, "root.exe", None)),
+            Ok(candidate(0, "root.exe", None)),
+            Ok(candidate(814, "", None)),
+            Ok(candidate(815, "other.exe", None)),
+            Ok(candidate(816, "other-identity.exe", None)),
+            Ok(candidate(817, "root.exe", None)),
+            Ok(candidate(818, "root.exe", None)),
+        ])
+        .with_process_name_equivalences(vec![
+            Ok(true),
+            Ok(true),                              // root snapshot validation
+            Ok(true),                              // exited hint is equivalent
+            Ok(true),                              // denied hint is equivalent
+            Err(ObservationFailure::AccessDenied), // comparison itself failed
+            Ok(true),                              // zero-pid hint is equivalent
+            Ok(false),                             // known nonmatch
+            Ok(false),                             // valid identity-unavailable nonmatch
+            Err(ObservationFailure::ExitedOrChanged),
+            Err(ObservationFailure::IdentityUnavailable),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(81_000, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            811,
+            FakeProcessScript {
+                open: vec![Ok(())].into(),
+                creation_times: vec![Ok(81_100)].into(),
+                liveness: vec![Ok(Liveness::Exited)].into(),
+                ..FakeProcessScript::default()
+            },
+        )
+        .with_process(
+            812,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::AccessDenied)].into(),
+                ..FakeProcessScript::default()
+            },
+        )
+        .with_process(
+            813,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::IdentityUnavailable)].into(),
+                ..FakeProcessScript::default()
+            },
+        )
+        .with_process(
+            815,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::AccessDenied)].into(),
+                ..FakeProcessScript::default()
+            },
+        )
+        .with_process(
+            816,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::IdentityUnavailable)].into(),
+                ..FakeProcessScript::default()
+            },
+        )
+        .with_process(
+            817,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::IdentityUnavailable)].into(),
+                ..FakeProcessScript::default()
+            },
+        )
+        .with_process(
+            818,
+            FakeProcessScript {
+                open: vec![Err(ObservationFailure::IdentityUnavailable)].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(root_pid, 81_000),
+            ProcessBatchScope::SameName,
+            ProcessBatchOperation::Terminate,
+        )
+        .unwrap();
+
+    assert_eq!(plan.previews().len(), 1);
+    assert_eq!(plan.omissions().exited_or_changed(), 1);
+    assert_eq!(plan.omissions().inspection_denied(), 1);
+    assert_eq!(plan.omissions().identity_unavailable(), 5);
+    assert_eq!(plan.omissions().ancestry_unverified(), 0);
+    assert_eq!(plan.omissions().total(), 7);
+}
+
+#[test]
+fn batch_same_name_dispatches_once_freezes_order_and_excludes_future_candidates() {
+    let root_pid = 820;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(822, "root.exe", None)),
+            Ok(candidate(821, "root.exe", None)),
+        ])
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(823, "root.exe", None)),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(82_000, "root.exe", r"C:\root.exe"),
+        )
+        .with_process(821, successful_script(82_200, "root.exe", r"C:\A\root.exe"))
+        .with_process(822, successful_script(82_100, "root.exe", r"C:\B\root.exe"))
+        .with_process(
+            823,
+            successful_script(82_300, "root.exe", r"C:\Future\root.exe"),
+        );
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(root_pid, 82_000),
+            ProcessBatchScope::SameName,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan.previews()
+            .iter()
+            .map(ProcessBatchPreview::pid)
+            .collect::<Vec<_>>(),
+        vec![820, 821, 822]
+    );
+    assert_eq!(plan.operation(), ProcessBatchOperation::ForceTerminate);
+    assert_eq!(
+        adapter
+            .calls()
+            .iter()
+            .filter(|call| **call == FakeCall::Enumerate)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn batch_planning_facade_dispatches_tree_with_one_preparation() {
+    let root_pid = 830;
+    let child_pid = 831;
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root_pid, "root.exe", None)),
+            Ok(candidate(child_pid, "child.exe", Some(root_pid))),
+        ])
+        .with_process(
+            root_pid,
+            planning_script(83_000, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            child_pid,
+            successful_script(83_100, "child.exe", r"C:\Fixtures\child.exe"),
+        );
+    let plan = authority(adapter.clone())
+        .plan_batch(
+            &target(root_pid, 83_000),
+            ProcessBatchScope::Tree,
+            ProcessBatchOperation::Terminate,
+        )
+        .unwrap();
+
+    assert_eq!(plan.scope(), ProcessBatchScope::Tree);
+    assert_eq!(
+        plan.previews()
+            .iter()
+            .map(ProcessBatchPreview::pid)
+            .collect::<Vec<_>>(),
+        vec![child_pid, root_pid]
+    );
+    assert_eq!(
+        adapter
+            .calls()
+            .iter()
+            .filter(|call| **call == FakeCall::Enumerate)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn batch_same_name_accepts_256_targets_and_rejects_257() {
+    for (additional, expected_error) in [
+        (255_u32, None),
+        (256, Some(ProcessBatchError::TargetSetTooLarge)),
+    ] {
+        let root_pid = 900;
+        let mut enumeration = vec![Ok(candidate(root_pid, "root.exe", None))];
+        let mut adapter = FakeProcessAdapter::default().with_process(
+            root_pid,
+            planning_script(90_000, "root.exe", r"C:\root.exe"),
+        );
+        for offset in 1..=additional {
+            let pid = root_pid + offset;
+            enumeration.push(Ok(candidate(pid, "root.exe", None)));
+            adapter = adapter.with_process(
+                pid,
+                successful_script(90_000 + offset as u64, "root.exe", r"C:\Same\root.exe"),
+            );
+        }
+        adapter = adapter.with_enumeration(enumeration);
+        let authority = authority(adapter.clone());
+        let result = authority.plan_batch(
+            &target(root_pid, 90_000),
+            ProcessBatchScope::SameName,
+            ProcessBatchOperation::Terminate,
+        );
+        assert_eq!(result.as_ref().err().copied(), expected_error);
+        if expected_error.is_none() {
+            assert_eq!(result.unwrap().previews().len(), 256);
+        }
+        assert_eq!(adapter.terminate_calls(), 0);
     }
 }
 
@@ -639,6 +957,8 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(crate) fn new() -> Result<Self, ProcessAuthorityInitError>",
             "pub(crate) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError>",
             "pub(crate) fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError>",
+            "pub(crate) fn plan_batch(&self, root: &ProcessTarget, scope: ProcessBatchScope, operation: ProcessBatchOperation) -> Result<ProcessBatchPlan, ProcessBatchError>",
+            "pub(crate) fn plan_batch(&self, _root: &ProcessTarget, _scope: ProcessBatchScope, _operation: ProcessBatchOperation) -> Result<ProcessBatchPlan, ProcessBatchError>",
             "pub(crate) fn admit(&self, target: &ProcessTarget, intent: ProcessIntent) -> Result<ProcessAdmission, ProcessError>",
             "pub(crate) fn admit(&self, _target: &ProcessTarget, _intent: ProcessIntent) -> Result<ProcessAdmission, ProcessError>",
             "pub(crate) fn terminate(&self, admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
@@ -733,10 +1053,35 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(super) fn root(&self) -> &ProcessRecord",
             "pub(super) fn snapshot(&self) -> &ExpansionSnapshot",
             "pub(super) fn operation(&self) -> ProcessBatchOperation",
+            "pub(super) fn plan_batch(&self, root: &ProcessTarget, scope: ProcessBatchScope, operation: ProcessBatchOperation) -> Result<ProcessBatchPlan, ProcessBatchError>",
             "pub(super) fn prepare_batch_planning(&self, root: &ProcessTarget, operation: ProcessBatchOperation) -> Result<PreparedBatchPlanning, ProcessBatchError>",
+            "pub(super) fn build_same_name_plan<A: ProcessPlatformAdapter>(authority: &CoreAuthority<A>, prepared: PreparedBatchPlanning) -> Result<ProcessBatchPlan, ProcessBatchError>",
             "pub(super) fn build_tree_plan(prepared: PreparedBatchPlanning) -> Result<ProcessBatchPlan, ProcessBatchError>",
         ])
     );
+
+    let planning_facade = declaration_catalog(module_source, CatalogVisibility::Caller)
+        .into_iter()
+        .filter(|signature| signature.contains("fn plan_batch"))
+        .collect::<Vec<_>>();
+    assert_eq!(planning_facade.len(), 2);
+    assert!(planning_facade.iter().all(|signature| {
+        signature.contains("root: &ProcessTarget")
+            && signature.contains("scope: ProcessBatchScope")
+            && signature.contains("operation: ProcessBatchOperation")
+            && signature.contains("Result<ProcessBatchPlan, ProcessBatchError>")
+            && !signature.contains("name:")
+            && !signature.contains("parent")
+            && !signature.contains("Vec<ProcessTarget>")
+    }));
+    let non_windows_facade = source_between(
+        module_source,
+        "#[cfg(not(windows))]\npub(crate) struct ProcessAuthority",
+        "#[cfg(not(windows))]\npub(crate) enum ProcessAdmission",
+    );
+    assert!(non_windows_facade.contains("Err(ProcessBatchError::PlatformUnsupported)"));
+    assert!(!batch_source.contains("execute_batch("));
+    assert!(!batch_source.contains("reenumerate_name("));
     for forbidden in ["Clone", "Serialize", "Deserialize"] {
         assert!(
             !plan_fields.contains(forbidden),
