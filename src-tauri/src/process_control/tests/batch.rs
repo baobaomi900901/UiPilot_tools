@@ -2730,3 +2730,332 @@ fn batch_execution_overlapping_plans_execute_with_independent_admissions() {
     assert_eq!(adapter.terminate_calls(), 2);
     assert_eq!(adapter.opened(), adapter.dropped());
 }
+
+#[test]
+fn batch_execution_failed_tree_child_preserves_order_and_continues_without_fallback() {
+    let root = (920, 92_000);
+    let child = (921, 92_100);
+    let grandchild = (922, 92_200);
+    let adapter = FakeProcessAdapter::default()
+        .with_enumeration(vec![
+            Ok(candidate(root.0, "root.exe", None)),
+            Ok(candidate(child.0, "child.exe", Some(root.0))),
+            Ok(candidate(grandchild.0, "grandchild.exe", Some(child.0))),
+        ])
+        .with_process(
+            root.0,
+            planning_script(root.1, "root.exe", r"C:\Fixtures\root.exe"),
+        )
+        .with_process(
+            child.0,
+            successful_script(child.1, "child.exe", r"C:\Fixtures\child.exe"),
+        )
+        .with_process(
+            grandchild.0,
+            successful_script(
+                grandchild.1,
+                "grandchild.exe",
+                r"C:\Fixtures\grandchild.exe",
+            ),
+        );
+    let authority = authority(adapter.clone());
+    let prepared = authority
+        .prepare_batch_planning(
+            &target(root.0, root.1),
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    let plan = build_tree_plan(prepared).unwrap();
+    adapter.replace_process(
+        grandchild.0,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            operation_open: vec![Err(OperationFailure::AccessDenied)].into(),
+            creation_times: vec![Ok(grandchild.1)].into(),
+            liveness: vec![Ok(Liveness::Alive)].into(),
+            protections: vec![Ok(ProcessProtection::new(false, false))].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    adapter.replace_process(
+        child.0,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            operation_open: vec![Ok(())].into(),
+            creation_times: vec![Ok(child.1), Ok(child.1)].into(),
+            liveness: vec![Ok(Liveness::Alive), Ok(Liveness::Alive)].into(),
+            protections: vec![Ok(ProcessProtection::new(false, false)); 2].into(),
+            terminations: vec![Ok(())].into(),
+            waits: vec![
+                Ok(ExitWait::TimedOut),
+                Ok(ExitWait::Exited),
+                Ok(ExitWait::Exited),
+            ]
+            .into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    adapter.replace_process(
+        root.0,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            creation_times: vec![Ok(root.1)].into(),
+            liveness: vec![Ok(Liveness::Exited)].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+
+    let report = authority
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(|result| (result.preview().pid(), result.outcome()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                grandchild.0,
+                ProcessBatchTargetOutcome::Failed(ProcessBatchTargetError::OperationAccessDenied)
+            ),
+            (child.0, ProcessBatchTargetOutcome::ObservedExited),
+            (root.0, ProcessBatchTargetOutcome::AlreadyExited),
+        ]
+    );
+    assert_eq!(
+        (
+            report.observed_exited(),
+            report.already_exited(),
+            report.failed()
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(report.completion(), ProcessBatchCompletion::Partial);
+    assert_eq!(
+        adapter
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                FakeCall::OpenObservation(pid)
+                    if [grandchild.0, child.0, root.0].contains(&pid) =>
+                {
+                    Some(pid)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>(),
+        vec![grandchild.0, child.0, root.0]
+    );
+    assert_eq!(adapter.requested_operation_access().len(), 2);
+    assert_eq!(adapter.terminate_calls(), 1);
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+#[test]
+fn batch_execution_same_name_uses_pid_order_and_independent_admissions() {
+    let pids = [(930, 93_000), (928, 92_800), (929, 92_900)];
+    let mut adapter = FakeProcessAdapter::default().with_enumeration(
+        pids.iter()
+            .map(|(pid, _)| Ok(candidate(*pid, "same.exe", None)))
+            .collect(),
+    );
+    for (pid, creation) in pids {
+        adapter = adapter.with_process(
+            pid,
+            if pid == 930 {
+                planning_script(creation, "same.exe", r"C:\Fixtures\same.exe")
+            } else {
+                successful_script(creation, "same.exe", r"C:\Fixtures\same.exe")
+            },
+        );
+    }
+    let authority = authority(adapter.clone());
+    let plan = authority
+        .plan_batch(
+            &target(930, 93_000),
+            ProcessBatchScope::SameName,
+            ProcessBatchOperation::ForceTerminate,
+        )
+        .unwrap();
+    for (pid, creation) in pids {
+        adapter.replace_process(
+            pid,
+            FakeProcessScript {
+                open: vec![Ok(())].into(),
+                creation_times: vec![Ok(creation)].into(),
+                liveness: vec![Ok(Liveness::Exited)].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+    }
+
+    let report = authority
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(|r| r.preview().pid())
+            .collect::<Vec<_>>(),
+        vec![928, 929, 930]
+    );
+    assert!(report
+        .results()
+        .iter()
+        .all(|r| r.outcome() == ProcessBatchTargetOutcome::AlreadyExited));
+    assert_eq!(report.already_exited(), 3);
+    assert!(adapter.requested_operation_access().is_empty());
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
+
+fn three_target_execution_plan() -> (FakeProcessAdapter, ProcessBatchPlan) {
+    prepared_tree(
+        940,
+        94_000,
+        vec![
+            candidate(941, "first.exe", Some(940)),
+            candidate(942, "second.exe", Some(940)),
+        ],
+        vec![
+            (
+                941,
+                successful_script(94_100, "first.exe", r"C:\Fixtures\first.exe"),
+            ),
+            (
+                942,
+                successful_script(94_200, "second.exe", r"C:\Fixtures\second.exe"),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn batch_execution_pre_admission_deadline_preserves_current_and_all_remaining() {
+    let (adapter, plan) = three_target_execution_plan();
+    let calls_before = adapter.calls().len();
+    let base = Instant::now();
+    let clock =
+        FakeMonotonicClock::with_readings(base, vec![Duration::ZERO, Duration::from_secs(30)]);
+
+    let report = authority(adapter.clone())
+        .execute_batch_with_clock(plan, &clock)
+        .unwrap();
+
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(|result| (result.preview().pid(), result.outcome()))
+            .collect::<Vec<_>>(),
+        vec![
+            (941, ProcessBatchTargetOutcome::NotAttemptedBatchDeadline),
+            (942, ProcessBatchTargetOutcome::NotAttemptedBatchDeadline),
+            (940, ProcessBatchTargetOutcome::NotAttemptedBatchDeadline),
+        ]
+    );
+    assert_eq!(report.not_attempted(), 3);
+    assert_eq!(adapter.calls().len(), calls_before);
+}
+
+#[test]
+fn batch_execution_post_admission_deadline_closes_current_and_preserves_tail() {
+    let (adapter, plan) = three_target_execution_plan();
+    adapter.replace_process(
+        941,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            creation_times: vec![Ok(94_100)].into(),
+            liveness: vec![Ok(Liveness::Alive)].into(),
+            protections: vec![Ok(ProcessProtection::new(false, false))].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    let calls_before = adapter.calls().len();
+    let opened_before = adapter.opened();
+    let base = Instant::now();
+    let clock = FakeMonotonicClock::with_readings(
+        base,
+        vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(30)],
+    );
+
+    let report = authority(adapter.clone())
+        .execute_batch_with_clock(plan, &clock)
+        .unwrap();
+
+    assert_eq!(report.results().len(), 3);
+    assert!(report
+        .results()
+        .iter()
+        .all(|result| result.outcome() == ProcessBatchTargetOutcome::NotAttemptedBatchDeadline));
+    assert_eq!(adapter.opened(), opened_before + 1);
+    assert_eq!(adapter.opened(), adapter.dropped());
+    assert_eq!(
+        adapter.calls()[calls_before..]
+            .iter()
+            .filter(|call| matches!(call, FakeCall::OpenObservation(_)))
+            .count(),
+        1
+    );
+    assert!(adapter.requested_operation_access().is_empty());
+}
+
+#[test]
+fn batch_execution_graceful_failure_continues_without_force_fallback() {
+    let (adapter, plan) = three_target_execution_plan();
+    adapter.replace_process(
+        941,
+        FakeProcessScript {
+            open: vec![Ok(())].into(),
+            operation_open: vec![Err(OperationFailure::Unavailable)].into(),
+            creation_times: vec![Ok(94_100)].into(),
+            liveness: vec![Ok(Liveness::Alive)].into(),
+            protections: vec![Ok(ProcessProtection::new(false, false))].into(),
+            ..FakeProcessScript::default()
+        },
+    );
+    for (pid, creation) in [(942, 94_200), (940, 94_000)] {
+        adapter.replace_process(
+            pid,
+            FakeProcessScript {
+                open: vec![Ok(())].into(),
+                creation_times: vec![Ok(creation)].into(),
+                liveness: vec![Ok(Liveness::Exited)].into(),
+                ..FakeProcessScript::default()
+            },
+        );
+    }
+
+    let report = authority(adapter.clone())
+        .execute_batch_with_clock(plan, &FakeMonotonicClock::at(Instant::now()))
+        .unwrap();
+
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(ProcessBatchTargetResult::outcome)
+            .collect::<Vec<_>>(),
+        vec![
+            ProcessBatchTargetOutcome::Failed(ProcessBatchTargetError::OperationUnavailable),
+            ProcessBatchTargetOutcome::AlreadyExited,
+            ProcessBatchTargetOutcome::AlreadyExited,
+        ]
+    );
+    assert_eq!(
+        adapter.requested_operation_access(),
+        vec![OperationAccess::GRACEFUL]
+    );
+    assert_eq!(adapter.terminate_calls(), 0);
+    assert_eq!(adapter.opened(), adapter.dropped());
+}
