@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Task 1 feasibility passed at 0cea2d0 using a minimal owned helper and passed independent review. Historical libtest handshake failures remain documented. Tasks 2-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-2 completed and independently reviewed through a694734; Task 2 supports fixed NTFS volumes, including executable/CWD on different volumes. Historical libtest handshake failures remain documented. Tasks 3-6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -80,10 +80,10 @@ All constructors/state transitions that mint or modify receipt authority are pri
 **Files:** Create `restart.rs`, `restart/windows.rs`; modify `mod.rs`, `tests/restart.rs`, `tests/restart/windows.rs` under process_control.
 **Dependencies:** Task 1 PASS; design sections 5 and 7.
 
-- [ ] Introduce the private ProcessRestartAdapter boundary and RAII lease/created-process resource types, implementing only launch-side platform primitives at this step.
-- [ ] Implement the verified fixed-volume/no-reparse component-walk, final identity checks and denied write/delete sharing policy. Keep leases through the creation call and make every intermediate failure release the full acquired set.
-- [ ] Implement explicit CreateProcessW invocation, mutable command-line buffer, Unicode environment, noninheritance, returned process/thread guards and identity observation through the returned handle. Never reopen a returned process by bare PID to establish receipt identity.
-- [ ] Replace feasibility-only mechanics with calls to these production primitives, retaining the Task 1 experiments as regressions. Do not keep a second implementation of the path policy in tests.
+- [x] Introduce the private ProcessRestartAdapter boundary and RAII lease/created-process resource types, implementing only launch-side platform primitives at this step.
+- [x] Implement the verified fixed-volume/no-reparse component-walk, final identity checks and denied write/delete sharing policy. Keep leases through the creation call and make every intermediate failure release the full acquired set.
+- [x] Implement explicit CreateProcessW invocation, mutable command-line buffer, Unicode environment, noninheritance, returned process/thread guards and identity observation through the returned handle. Never reopen a returned process by bare PID to establish receipt identity.
+- [x] Replace feasibility-only mechanics with calls to these production primitives, retaining the Task 1 experiments as regressions. Do not keep a second implementation of the path policy in tests.
 
 **Distinct test coverage:** Partial component acquisition failure, mismatch after acquisition, unsupported volume/path, native creation failure, process/thread identity-observation failure, and exact cleanup. Re-run Task 1 real proof against the production implementation before Task 3.
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control::tests::restart -- --nocapture --test-threads=1`
