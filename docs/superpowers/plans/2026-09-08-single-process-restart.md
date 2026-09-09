@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-3 complete; the user accepted the disclosed Task 3 RED-evidence deviation by continuation on 2026-09-09. Task 4 is starting; Tasks 5-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-4 complete through 4f2580c; independent Task 4 review passed with a non-blocking stop-admission branch coverage note. The Task 3 RED-evidence deviation was accepted by continuation on 2026-09-09. Tasks 5-6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -116,14 +116,22 @@ whole-facade expected-catalog synchronization, preserving existing behavior.
 **Files:** Modify `restart.rs`, `mod.rs`, `tests/restart.rs` under process_control.
 **Dependencies:** Task 3; design sections 5-7.
 
-- [ ] Implement execute_restart_with_clock consuming the frozen plan and acquiring its attempt state before effects. Revalidate provenance, exact target and full path lease; all preflight failure paths release the attempt and temporary resources.
-- [ ] Acquire Restart-policy admission, then fresh matching Terminate/ForceTerminate admission for the same target. Release the policy handle and call the accepted Stage 2A method with the supplied clock and its full five-second budget. Do not change Stage 2A IntentMismatch behavior.
-- [ ] Return the exact stop failure report without launching for every non-Ok stop result, including TargetExited and uncertain completion. After observed exit, mark the receipt Consumed before a single possible creation call.
-- [ ] Return distinct created, launch-failed and identity-unknown phase outcomes; identified creation returns a new receipt bound to the new exact target. Never retry/rollback or revive the old receipt after possible launch.
-- [ ] Wire Windows execute_restart using SystemMonotonicClock and non-Windows preflight rejection. Preserve stable redacted error/result presentation.
+- [x] Implement execute_restart_with_clock consuming the frozen plan and acquiring its attempt state before effects. Revalidate provenance, exact target and full path lease; all preflight failure paths release the attempt and temporary resources.
+- [x] Acquire Restart-policy admission, then fresh matching Terminate/ForceTerminate admission for the same target. Release the policy handle and call the accepted Stage 2A method with the supplied clock and its full five-second budget. Do not change Stage 2A IntentMismatch behavior.
+- [x] Return the exact stop failure report without launching for every non-Ok stop result, including TargetExited and uncertain completion. After observed exit, mark the receipt Consumed before a single possible creation call.
+- [x] Return distinct created, launch-failed and identity-unknown phase outcomes; identified creation returns a new receipt bound to the new exact target. Never retry/rollback or revive the old receipt after possible launch.
+- [x] Wire Windows execute_restart using SystemMonotonicClock and non-Windows preflight rejection. Preserve stable redacted error/result presentation.
 
 **Distinct test coverage:** Graceful/Force routing; old target changes after planning; every stop error prevents launch; stop success followed by native launch failure/identity failure; replacement receipt identity; simultaneous attempts return RestartInProgress with zero secondary calls; unexecuted plan cancellation; failure before consumption allows explicit replanning; failure/unwind after consumption forbids another launch; exact handle/lease/attempt cleanup on each phase boundary.
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control::tests::restart::restart_execution -- --nocapture`
+
+**Execution record (2026-09-09):** At `4f2580c`, focused tests passed 9/0 and
+serialized process_control passed 178/0/2 ignored; format passed and strict Clippy
+retained only the inherited baseline. Independent spec/quality review passed with
+one Minor: the separate fresh stop-admission failure branch is statically correct
+but lacks a focused executor assertion; representative Stage 2A operation failure
+is covered and its generic propagation was reviewed. Carry this evidence note
+into final verification. No Task 5 fixture or native-operation change occurred.
 
 ### Task 5: Owned Windows Restart Integration
 
