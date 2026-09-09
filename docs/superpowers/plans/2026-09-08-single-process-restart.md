@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-4 complete through 4f2580c; independent Task 4 review passed with a non-blocking stop-admission branch coverage note. The Task 3 RED-evidence deviation was accepted by continuation on 2026-09-09. Tasks 5-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-5 complete through 08737de; independent Task 5 review and targeted handshake cleanup recheck passed. Task 4 retains a non-blocking stop-admission coverage note; the Task 3 RED-evidence deviation was accepted on 2026-09-09. Task 6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -138,14 +138,22 @@ into final verification. No Task 5 fixture or native-operation change occurred.
 **Files:** Modify only `tests/restart/windows.rs` under process_control.
 **Dependencies:** Tasks 1-4; design sections 5, 7-8.
 
-- [ ] Extend the owned fixture entry for graceful close, ignore-close and force-stop scenarios; retain independent cleanup guards for both old and created instances before fallible handoff/registration.
-- [ ] Launch through launch_managed, capture the receipt, plan/execute both modes, and prove old exact-process exit plus new exact identity and preserved command line, effective working directory and environment markers.
-- [ ] Prove ignored graceful close launches nothing; changed executable/path/context rejects before stop; deliberate launch failure after a successful stop reports the irreversible partial outcome without retry.
-- [ ] Validate unknown-identity handling with a controlled failure seam and prove returned native handles close while the test's separate cleanup authority remains effective. Do not manufacture receipts for arbitrary existing processes.
-- [ ] Test subsequent restart with the replacement receipt and rejection of consumed old plans; verify no fixture process, cleanup HANDLE, temporary copied executable or control directory remains after normal and failure/unwind paths.
+- [x] Extend the owned fixture entry for graceful close, ignore-close and force-stop scenarios; retain independent cleanup guards for both old and created instances before fallible handoff/registration.
+- [x] Launch through launch_managed, capture the receipt, plan/execute both modes, and prove old exact-process exit plus new exact identity and preserved command line, effective working directory and environment markers.
+- [x] Prove ignored graceful close launches nothing; changed executable/path/context rejects before stop; deliberate launch failure after a successful stop reports the irreversible partial outcome without retry.
+- [x] Validate unknown-identity handling with a controlled failure seam and prove returned native handles close while the test's separate cleanup authority remains effective. Do not manufacture receipts for arbitrary existing processes.
+- [x] Test subsequent restart with the replacement receipt and rejection of consumed old plans; verify no fixture process, cleanup HANDLE, temporary copied executable or control directory remains after normal and failure/unwind paths.
 
 **Distinct test coverage:** Real argument quoting/Unicode/empty arguments; effective CWD/environment roundtrip; new PID/creationTime; both stop modes; timeout/no relaunch; changed-path preflight; post-stop failure; receipt replacement; parallel default-suite fixture setup without budget races. PPL/admin-only behavior remains unsupported, not a reason to act on system processes.
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control::tests::restart::windows::restart_windows -- --nocapture --test-threads=1`
+
+**Execution record (2026-09-09):** At `34a24d6`, real restart tests passed 4/0,
+process_control 182/0/2 ignored, and default parallel library tests 1156/0/4 ignored
+plus one passing integration test. Commit `08737de` clears third-generation
+handshake files before control-directory reuse; its exact real roundtrip test
+passed 1/0. Independent review and targeted recheck passed. Native context/stop
+behavior and explicitly injected creation/identity failures are distinguished;
+only the Windows restart test file changed.
 
 ### Task 6: Aggregate Evidence And Acceptance Gate
 
