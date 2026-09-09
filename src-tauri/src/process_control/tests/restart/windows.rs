@@ -889,6 +889,7 @@ fn restart_windows_owned_graceful_force_and_replacement_receipt_roundtrip() {
         );
     }
     assert_report(&control, third.pid(), &effective_cwd);
+    clear_generation_handshake(&control, third.pid());
     authority.adapter().cleanup_all();
     drop(authority);
 
