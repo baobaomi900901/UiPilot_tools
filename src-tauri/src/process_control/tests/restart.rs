@@ -25,7 +25,8 @@ use super::super::{
     restart::{
         AttemptGuard, CreatedProcessIdentity, LeasedPathMetadata, ManagedLaunchError,
         ManagedLaunchInput, ManagedLaunchOutcome, NativeLaunchInput, ProcessRestartAdapter,
-        ProcessRestartError, ProcessRestartMode, RestartAdapterError, RestartPathInput,
+        ProcessRestartCompletion, ProcessRestartError, ProcessRestartMode, RestartAdapterError,
+        RestartPathInput,
     },
 };
 
@@ -34,6 +35,8 @@ struct DropResource {
     drops: Rc<Cell<usize>>,
     metadata: Option<LeasedPathMetadata>,
 }
+
+type FakeCallback = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
 impl Drop for DropResource {
     fn drop(&mut self) {
@@ -45,8 +48,13 @@ struct FakeRestartAdapter {
     process: FakeProcessAdapter,
     lease_drops: Rc<Cell<usize>>,
     process_drops: Rc<Cell<usize>>,
-    failure: Option<RestartAdapterError>,
-    identity_failure: bool,
+    failure: Rc<Cell<Option<RestartAdapterError>>>,
+    create_failure: Rc<Cell<Option<RestartAdapterError>>>,
+    identity_failure: Rc<Cell<bool>>,
+    lease_acquisitions: Rc<Cell<usize>>,
+    create_calls: Rc<Cell<usize>>,
+    on_acquire: FakeCallback,
+    on_create: FakeCallback,
     created_inputs: Rc<RefCell<Vec<NativeLaunchInput>>>,
     metadata: LeasedPathMetadata,
 }
@@ -140,7 +148,12 @@ impl ProcessRestartAdapter for FakeRestartAdapter {
         &self,
         _input: &RestartPathInput,
     ) -> Result<Self::PathLeases, RestartAdapterError> {
-        self.failure.map_or_else(
+        self.lease_acquisitions
+            .set(self.lease_acquisitions.get() + 1);
+        if let Some(callback) = self.on_acquire.borrow_mut().take() {
+            callback();
+        }
+        self.failure.get().map_or_else(
             || {
                 Ok(DropResource {
                     drops: self.lease_drops.clone(),
@@ -154,7 +167,7 @@ impl ProcessRestartAdapter for FakeRestartAdapter {
         &self,
         _leases: &Self::PathLeases,
     ) -> Result<(), RestartAdapterError> {
-        self.failure.map_or(Ok(()), Err)
+        self.failure.get().map_or(Ok(()), Err)
     }
     fn path_lease_metadata<'a>(&self, leases: &'a Self::PathLeases) -> &'a LeasedPathMetadata {
         leases.metadata.as_ref().unwrap()
@@ -164,25 +177,33 @@ impl ProcessRestartAdapter for FakeRestartAdapter {
         _leases: &Self::PathLeases,
         _input: &NativeLaunchInput,
     ) -> Result<Self::CreatedProcess, RestartAdapterError> {
+        self.create_calls.set(self.create_calls.get() + 1);
+        if let Some(callback) = self.on_create.borrow_mut().take() {
+            callback();
+        }
         self.created_inputs.borrow_mut().push(_input.clone());
-        self.failure.map_or_else(
-            || {
-                Ok(DropResource {
-                    drops: self.process_drops.clone(),
-                    metadata: None,
-                })
-            },
-            Err,
-        )
+        self.create_failure
+            .get()
+            .or(self.failure.get())
+            .map_or_else(
+                || {
+                    Ok(DropResource {
+                        drops: self.process_drops.clone(),
+                        metadata: None,
+                    })
+                },
+                Err,
+            )
     }
     fn created_process_identity(
         &self,
         _process: &Self::CreatedProcess,
     ) -> Result<CreatedProcessIdentity, RestartAdapterError> {
-        if self.identity_failure {
+        if self.identity_failure.get() {
             Err(RestartAdapterError::IdentityUnavailable)
         } else {
             self.failure
+                .get()
                 .map_or_else(|| CreatedProcessIdentity::new(42, 99), Err)
         }
     }
@@ -199,12 +220,17 @@ fn paths() -> RestartPathInput {
 fn restart_adapter_resources_release_exactly_once_after_identity_failure() {
     let lease_drops = Rc::new(Cell::new(0));
     let process_drops = Rc::new(Cell::new(0));
-    let mut adapter = FakeRestartAdapter {
+    let adapter = FakeRestartAdapter {
         process: FakeProcessAdapter::default(),
         lease_drops: lease_drops.clone(),
         process_drops: process_drops.clone(),
-        failure: None,
-        identity_failure: false,
+        failure: Rc::new(Cell::new(None)),
+        create_failure: Rc::new(Cell::new(None)),
+        identity_failure: Rc::new(Cell::new(false)),
+        lease_acquisitions: Rc::new(Cell::new(0)),
+        create_calls: Rc::new(Cell::new(0)),
+        on_acquire: Rc::new(RefCell::new(None)),
+        on_create: Rc::new(RefCell::new(None)),
         created_inputs: Rc::new(RefCell::new(Vec::new())),
         metadata: LeasedPathMetadata::new(
             PathBuf::from(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\owned\child.exe"),
@@ -218,7 +244,9 @@ fn restart_adapter_resources_release_exactly_once_after_identity_failure() {
     let process = adapter
         .create_process(&leases, &NativeLaunchInput::new(vec![0], vec![0, 0]))
         .unwrap();
-    adapter.failure = Some(RestartAdapterError::IdentityUnavailable);
+    adapter
+        .failure
+        .set(Some(RestartAdapterError::IdentityUnavailable));
     assert_eq!(
         adapter.created_process_identity(&process),
         Err(RestartAdapterError::IdentityUnavailable)
@@ -244,12 +272,17 @@ fn restart_adapter_error_display_is_stable_and_redacted() {
 #[test]
 fn restart_adapter_metadata_and_revalidation_mismatch_use_the_opaque_lease() {
     let drops = Rc::new(Cell::new(0));
-    let mut adapter = FakeRestartAdapter {
+    let adapter = FakeRestartAdapter {
         process: FakeProcessAdapter::default(),
         lease_drops: drops.clone(),
         process_drops: Rc::new(Cell::new(0)),
-        failure: None,
-        identity_failure: false,
+        failure: Rc::new(Cell::new(None)),
+        create_failure: Rc::new(Cell::new(None)),
+        identity_failure: Rc::new(Cell::new(false)),
+        lease_acquisitions: Rc::new(Cell::new(0)),
+        create_calls: Rc::new(Cell::new(0)),
+        on_acquire: Rc::new(RefCell::new(None)),
+        on_create: Rc::new(RefCell::new(None)),
         created_inputs: Rc::new(RefCell::new(Vec::new())),
         metadata: LeasedPathMetadata::new(
             PathBuf::from(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\owned\child.exe"),
@@ -265,7 +298,7 @@ fn restart_adapter_metadata_and_revalidation_mismatch_use_the_opaque_lease() {
             .executable_file_identity(),
         (17, 23)
     );
-    adapter.failure = Some(RestartAdapterError::PathChanged);
+    adapter.failure.set(Some(RestartAdapterError::PathChanged));
     assert_eq!(
         adapter.revalidate_path_leases(&leases),
         Err(RestartAdapterError::PathChanged)
@@ -289,8 +322,13 @@ fn managed_adapter(identity_failure: bool) -> FakeRestartAdapter {
         process,
         lease_drops: Rc::new(Cell::new(0)),
         process_drops: Rc::new(Cell::new(0)),
-        failure: None,
-        identity_failure,
+        failure: Rc::new(Cell::new(None)),
+        create_failure: Rc::new(Cell::new(None)),
+        identity_failure: Rc::new(Cell::new(identity_failure)),
+        lease_acquisitions: Rc::new(Cell::new(0)),
+        create_calls: Rc::new(Cell::new(0)),
+        on_acquire: Rc::new(RefCell::new(None)),
+        on_create: Rc::new(RefCell::new(None)),
         created_inputs: Rc::new(RefCell::new(Vec::new())),
         metadata: LeasedPathMetadata::new(
             PathBuf::from(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\owned\child.exe"),
@@ -596,4 +634,387 @@ fn restart_receipt_contract_is_opaque_nonclone_and_debug_redacted() {
         _ => unreachable!(),
     };
     assert_eq!(format!("{receipt:?}"), "ProcessLaunchReceipt { .. }");
+}
+
+#[test]
+fn restart_execution_graceful_stops_then_creates_one_replacement() {
+    let mut adapter = managed_adapter(false);
+    adapter.process = adapter
+        .process
+        .clone()
+        .with_window_enumeration(Ok(vec![WindowCandidate::new(1, 42, true, false)]))
+        .with_window_facts(1, vec![Ok(WindowFacts::new(42, true, false))])
+        .with_post_close_outcomes(1, vec![Ok(())]);
+    adapter
+        .process
+        .state
+        .borrow_mut()
+        .processes
+        .get(&42)
+        .unwrap()
+        .borrow_mut()
+        .script
+        .operation_open = vec![Ok(())].into();
+    adapter
+        .process
+        .state
+        .borrow_mut()
+        .processes
+        .get(&42)
+        .unwrap()
+        .borrow_mut()
+        .script
+        .waits = vec![Ok(ExitWait::Exited)].into();
+    let process = adapter.process.clone();
+    let created = Rc::clone(&adapter.created_inputs);
+    let authority = managed_authority(adapter);
+    let receipt = match authority
+        .launch_managed(managed_input(Some("child.exe".encode_utf16().collect())))
+        .unwrap()
+    {
+        ManagedLaunchOutcome::Created(receipt) => receipt,
+        _ => unreachable!(),
+    };
+    let plan = authority
+        .plan_restart(
+            receipt.target(),
+            Some(&receipt),
+            ProcessRestartMode::Graceful,
+        )
+        .unwrap();
+
+    let report = authority
+        .execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        )
+        .unwrap();
+
+    if !matches!(
+        report.completion(),
+        ProcessRestartCompletion::OldProcessExitedNewProcessCreated(_)
+    ) {
+        panic!("unexpected winning completion: {:?}", report.completion());
+    }
+    assert_eq!(
+        process.requested_operation_access(),
+        vec![OperationAccess::GRACEFUL]
+    );
+    assert_eq!(process.terminate_calls(), 0);
+    assert_eq!(created.borrow().len(), 2);
+}
+
+fn configure_force_success(adapter: &FakeRestartAdapter) {
+    let state = adapter.process.state.borrow_mut();
+    let mut process = state.processes.get(&42).unwrap().borrow_mut();
+    process.script.operation_open = vec![Ok(())].into();
+    process.script.terminations = vec![Ok(())].into();
+    process.script.waits = vec![Ok(ExitWait::TimedOut), Ok(ExitWait::Exited)].into();
+}
+
+fn launched_receipt(
+    authority: &super::CoreAuthority<FakeRestartAdapter>,
+) -> super::super::restart::ProcessLaunchReceipt {
+    match authority
+        .launch_managed(managed_input(Some("child.exe".encode_utf16().collect())))
+        .unwrap()
+    {
+        ManagedLaunchOutcome::Created(receipt) => receipt,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn restart_execution_force_routes_once_and_replacement_receipt_matches_new_identity() {
+    let adapter = managed_adapter(false);
+    configure_force_success(&adapter);
+    let process = adapter.process.clone();
+    let authority = managed_authority(adapter);
+    let receipt = launched_receipt(&authority);
+    let plan = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+
+    let report = authority
+        .execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        )
+        .unwrap();
+
+    let replacement = match report.completion() {
+        ProcessRestartCompletion::OldProcessExitedNewProcessCreated(receipt) => receipt,
+        completion => panic!("unexpected completion: {completion:?}"),
+    };
+    assert_eq!(
+        (
+            replacement.target().pid(),
+            replacement.target().creation_time()
+        ),
+        (42, 99)
+    );
+    assert_eq!(
+        process.requested_operation_access(),
+        vec![OperationAccess::FORCE]
+    );
+    assert_eq!(process.terminate_calls(), 1);
+}
+
+#[test]
+fn restart_execution_changed_frozen_executable_rejects_before_stop_and_releases_attempt() {
+    let adapter = managed_adapter(false);
+    let process = adapter.process.clone();
+    let authority = managed_authority(adapter);
+    let receipt = launched_receipt(&authority);
+    let plan = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+    // Planning freezes (7, 11); execution observes a different executable file.
+    // Use the adapter's deterministic revalidation seam.
+    authority
+        .adapter()
+        .failure
+        .set(Some(RestartAdapterError::PathChanged));
+
+    assert!(matches!(
+        authority.execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now())
+        ),
+        Err(ProcessRestartError::PathChanged)
+    ));
+    assert_eq!(process.terminate_calls(), 0);
+    assert!(authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .is_ok());
+}
+
+#[test]
+fn restart_execution_stop_failure_never_launches_and_receipt_can_be_replanned() {
+    let adapter = managed_adapter(false);
+    adapter
+        .process
+        .state
+        .borrow_mut()
+        .processes
+        .get(&42)
+        .unwrap()
+        .borrow_mut()
+        .script
+        .operation_open = vec![Err(OperationFailure::ExitedOrChanged)].into();
+    let creates = Rc::clone(&adapter.create_calls);
+    let authority = managed_authority(adapter);
+    let receipt = launched_receipt(&authority);
+    let plan = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+
+    let report = authority
+        .execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        report.completion(),
+        ProcessRestartCompletion::StopFailedLaunchNotAttempted(
+            super::super::restart::ProcessRestartStopError::Operation(
+                super::super::operation::ProcessOperationError::TargetExited
+            )
+        )
+    ));
+    assert_eq!(creates.get(), 1);
+    assert!(authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .is_ok());
+}
+
+#[test]
+fn restart_execution_creation_failure_is_irreversible_and_consumes_old_receipt() {
+    let adapter = managed_adapter(false);
+    configure_force_success(&adapter);
+    let authority = managed_authority(adapter);
+    let receipt = launched_receipt(&authority);
+    // Initial creation must succeed; fail only the restart creation.
+    authority
+        .adapter()
+        .create_failure
+        .set(Some(RestartAdapterError::CreationFailed));
+    let plan = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+
+    let report = authority
+        .execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        report.completion(),
+        ProcessRestartCompletion::OldProcessExitedLaunchFailed
+    ));
+    assert_eq!(
+        authority
+            .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+            .unwrap_err(),
+        ProcessRestartError::ReceiptConsumed
+    );
+}
+
+#[test]
+fn restart_execution_foreign_plan_rejects_without_claim_or_adapter_calls() {
+    let owner_adapter = managed_adapter(false);
+    configure_force_success(&owner_adapter);
+    let owner = managed_authority(owner_adapter);
+    let receipt = launched_receipt(&owner);
+    let plan = owner
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+    let foreign_host = super::HostInstanceId::new([0x44; 16]).unwrap();
+    let foreign_adapter = managed_adapter(false);
+    let foreign_leases = Rc::clone(&foreign_adapter.lease_acquisitions);
+    let foreign_creates = Rc::clone(&foreign_adapter.create_calls);
+    let foreign = super::CoreAuthority::new(
+        foreign_host,
+        super::ProcessTarget::new(foreign_host, super::SELF_PID, super::SELF_CREATION_TIME)
+            .unwrap(),
+        foreign_adapter,
+    );
+
+    assert!(matches!(
+        foreign.execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now())
+        ),
+        Err(ProcessRestartError::ExpiredReceipt)
+    ));
+    assert_eq!((foreign_leases.get(), foreign_creates.get()), (0, 0));
+
+    let retry = owner
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+    drop(retry);
+}
+
+#[test]
+fn restart_execution_reentrant_overlap_has_one_winner_and_zero_secondary_effects() {
+    let adapter = managed_adapter(false);
+    configure_force_success(&adapter);
+    {
+        let state = adapter.process.state.borrow_mut();
+        let mut process = state.processes.get(&42).unwrap().borrow_mut();
+        process.script.creation_times.push_back(Ok(99));
+        process
+            .script
+            .liveness
+            .push_back(Ok(super::Liveness::Alive));
+        process
+            .script
+            .protections
+            .push_back(Ok(ProcessProtection::new(false, false)));
+    }
+    let leases = Rc::clone(&adapter.lease_acquisitions);
+    let creates = Rc::clone(&adapter.create_calls);
+    let hook = Rc::clone(&adapter.on_acquire);
+    let authority = Rc::new(managed_authority(adapter));
+    let receipt = launched_receipt(&authority);
+    let winning = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+    let overlapping = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+    let nested_result = Rc::new(Cell::new(false));
+    let nested_result_for_hook = Rc::clone(&nested_result);
+    let authority_for_hook = Rc::clone(&authority);
+    hook.borrow_mut().replace(Box::new(move || {
+        let result = authority_for_hook.execute_restart_with_clock(
+            overlapping,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        );
+        nested_result_for_hook.set(match result {
+            Err(ProcessRestartError::RestartInProgress) => true,
+            _ => panic!("overlapping execution was not rejected"),
+        });
+    }));
+
+    let report = authority
+        .execute_restart_with_clock(
+            winning,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        )
+        .unwrap();
+
+    assert!(nested_result.get());
+    if !matches!(
+        report.completion(),
+        ProcessRestartCompletion::OldProcessExitedNewProcessCreated(_)
+    ) {
+        panic!("unexpected winning completion: {:?}", report.completion());
+    }
+    assert_eq!((leases.get(), creates.get()), (2, 2));
+}
+
+#[test]
+fn restart_execution_identity_unknown_consumes_receipt_without_retry() {
+    let adapter = managed_adapter(false);
+    configure_force_success(&adapter);
+    let authority = managed_authority(adapter);
+    let receipt = launched_receipt(&authority);
+    authority.adapter().identity_failure.set(true);
+    let plan = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+
+    let report = authority
+        .execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        report.completion(),
+        ProcessRestartCompletion::OldProcessExitedLaunchIdentityUnknown
+    ));
+    assert_eq!(
+        authority
+            .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+            .unwrap_err(),
+        ProcessRestartError::ReceiptConsumed
+    );
+}
+
+#[test]
+fn restart_execution_unwind_during_create_keeps_receipt_consumed() {
+    let adapter = managed_adapter(false);
+    configure_force_success(&adapter);
+    let authority = managed_authority(adapter);
+    let receipt = launched_receipt(&authority);
+    authority
+        .adapter()
+        .on_create
+        .borrow_mut()
+        .replace(Box::new(|| panic!("owned post-consume unwind")));
+    let plan = authority
+        .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+        .unwrap();
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = authority.execute_restart_with_clock(
+            plan,
+            &super::FakeMonotonicClock::at(std::time::Instant::now()),
+        );
+    }));
+
+    assert!(unwind.is_err());
+    assert_eq!(
+        authority
+            .plan_restart(receipt.target(), Some(&receipt), ProcessRestartMode::Force)
+            .unwrap_err(),
+        ProcessRestartError::ReceiptConsumed
+    );
 }

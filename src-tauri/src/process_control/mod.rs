@@ -35,6 +35,9 @@ pub(crate) type ProcessRestartMode = restart::ProcessRestartMode;
 pub(crate) type ProcessRestartPlan = restart::ProcessRestartPlan;
 pub(crate) type ProcessRestartPreview = restart::ProcessRestartPreview;
 pub(crate) type ProcessRestartError = restart::ProcessRestartError;
+pub(crate) type ProcessRestartCompletion = restart::ProcessRestartCompletion;
+pub(crate) type ProcessRestartReport = restart::ProcessRestartReport;
+pub(crate) type ProcessRestartStopError = restart::ProcessRestartStopError;
 
 #[cfg(windows)]
 pub(crate) struct ProcessAuthority {
@@ -111,6 +114,14 @@ impl ProcessAuthority {
     ) -> Result<ProcessRestartPlan, ProcessRestartError> {
         self.inner.plan_restart(target, receipt, mode)
     }
+
+    pub(crate) fn execute_restart(
+        &self,
+        plan: ProcessRestartPlan,
+    ) -> Result<ProcessRestartReport, ProcessRestartError> {
+        self.inner
+            .execute_restart_with_clock(plan, &operation::SystemMonotonicClock)
+    }
 }
 
 #[cfg(windows)]
@@ -182,6 +193,13 @@ impl ProcessAuthority {
         _receipt: Option<&ProcessLaunchReceipt>,
         _mode: ProcessRestartMode,
     ) -> Result<ProcessRestartPlan, ProcessRestartError> {
+        Err(ProcessRestartError::PlatformUnsupported)
+    }
+
+    pub(crate) fn execute_restart(
+        &self,
+        _plan: ProcessRestartPlan,
+    ) -> Result<ProcessRestartReport, ProcessRestartError> {
         Err(ProcessRestartError::PlatformUnsupported)
     }
 }

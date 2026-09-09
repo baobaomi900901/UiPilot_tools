@@ -976,9 +976,12 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(crate) type ProcessSnapshot = core::ProcessSnapshot",
             "pub(crate) type ProcessTarget = core::ProcessTarget",
             "pub(crate) type ProcessRestartError = restart::ProcessRestartError",
+            "pub(crate) type ProcessRestartCompletion = restart::ProcessRestartCompletion",
             "pub(crate) type ProcessRestartMode = restart::ProcessRestartMode",
             "pub(crate) type ProcessRestartPlan = restart::ProcessRestartPlan",
             "pub(crate) type ProcessRestartPreview = restart::ProcessRestartPreview",
+            "pub(crate) type ProcessRestartReport = restart::ProcessRestartReport",
+            "pub(crate) type ProcessRestartStopError = restart::ProcessRestartStopError",
             "pub(crate) type ProcessBatchError = batch::ProcessBatchError",
             "pub(crate) type ProcessBatchOmissions = batch::ProcessBatchOmissions",
             "pub(crate) type ProcessBatchOperation = batch::ProcessBatchOperation",
@@ -1013,6 +1016,8 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(crate) fn launch_managed(&self, _input: ManagedLaunchInput) -> Result<ManagedLaunchOutcome, ManagedLaunchError>",
             "pub(crate) fn plan_restart(&self, target: &ProcessTarget, receipt: Option<&ProcessLaunchReceipt>, mode: ProcessRestartMode) -> Result<ProcessRestartPlan, ProcessRestartError>",
             "pub(crate) fn plan_restart(&self, _target: &ProcessTarget, _receipt: Option<&ProcessLaunchReceipt>, _mode: ProcessRestartMode) -> Result<ProcessRestartPlan, ProcessRestartError>",
+            "pub(crate) fn execute_restart(&self, plan: ProcessRestartPlan) -> Result<ProcessRestartReport, ProcessRestartError>",
+            "pub(crate) fn execute_restart(&self, _plan: ProcessRestartPlan) -> Result<ProcessRestartReport, ProcessRestartError>",
         ])
     );
     for (marker, expected) in [

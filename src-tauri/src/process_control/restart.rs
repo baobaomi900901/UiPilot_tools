@@ -12,7 +12,7 @@ use std::{
 
 use super::{
     core::{CoreAuthority, HostInstanceId, ProcessError, ProcessIntent, ProcessTarget},
-    operation::ProcessOperationAdapter,
+    operation::{MonotonicClock, ProcessOperationAdapter, ProcessOperationError},
 };
 
 #[cfg(windows)]
@@ -369,6 +369,9 @@ pub(crate) enum ProcessRestartError {
     RestartInProgress,
     ReceiptConsumed,
     Target(ProcessError),
+    UnsupportedPath,
+    PathUnavailable,
+    PathChanged,
     PlatformUnsupported,
 }
 
@@ -381,12 +384,67 @@ impl fmt::Display for ProcessRestartError {
             Self::RestartInProgress => "RestartInProgress",
             Self::ReceiptConsumed => "ReceiptConsumed",
             Self::Target(_) => "TargetRejected",
+            Self::UnsupportedPath => "UnsupportedPath",
+            Self::PathUnavailable => "PathUnavailable",
+            Self::PathChanged => "PathChanged",
             Self::PlatformUnsupported => "PlatformUnsupported",
         })
     }
 }
 
 impl Error for ProcessRestartError {}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ProcessRestartStopError {
+    Admission(ProcessError),
+    Operation(ProcessOperationError),
+}
+
+pub(crate) enum ProcessRestartCompletion {
+    StopFailedLaunchNotAttempted(ProcessRestartStopError),
+    OldProcessExitedLaunchFailed,
+    OldProcessExitedNewProcessCreated(ProcessLaunchReceipt),
+    OldProcessExitedLaunchIdentityUnknown,
+}
+
+impl fmt::Debug for ProcessRestartCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StopFailedLaunchNotAttempted(error) => formatter
+                .debug_tuple("StopFailedLaunchNotAttempted")
+                .field(error)
+                .finish(),
+            Self::OldProcessExitedLaunchFailed => {
+                formatter.write_str("OldProcessExitedLaunchFailed")
+            }
+            Self::OldProcessExitedNewProcessCreated(_) => {
+                formatter.write_str("OldProcessExitedNewProcessCreated(..)")
+            }
+            Self::OldProcessExitedLaunchIdentityUnknown => {
+                formatter.write_str("OldProcessExitedLaunchIdentityUnknown")
+            }
+        }
+    }
+}
+
+pub(crate) struct ProcessRestartReport {
+    completion: ProcessRestartCompletion,
+}
+
+impl ProcessRestartReport {
+    pub(crate) fn completion(&self) -> &ProcessRestartCompletion {
+        &self.completion
+    }
+}
+
+impl fmt::Debug for ProcessRestartReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessRestartReport")
+            .field("completion", &self.completion)
+            .finish()
+    }
+}
 
 fn valid_utf16(value: &[u16]) -> bool {
     char::decode_utf16(value.iter().copied()).all(|item| item.is_ok())
@@ -490,6 +548,17 @@ fn map_adapter_error(error: RestartAdapterError) -> ManagedLaunchError {
     }
 }
 
+fn map_restart_adapter_error(error: RestartAdapterError) -> ProcessRestartError {
+    match error {
+        RestartAdapterError::UnsupportedPath => ProcessRestartError::UnsupportedPath,
+        RestartAdapterError::PathUnavailable => ProcessRestartError::PathUnavailable,
+        RestartAdapterError::PathChanged => ProcessRestartError::PathChanged,
+        RestartAdapterError::InvalidInput
+        | RestartAdapterError::CreationFailed
+        | RestartAdapterError::IdentityUnavailable => ProcessRestartError::PathUnavailable,
+    }
+}
+
 impl<A: ProcessRestartAdapter> CoreAuthority<A> {
     pub(super) fn launch_managed(
         &self,
@@ -570,6 +639,125 @@ impl<A: ProcessRestartAdapter> CoreAuthority<A> {
             environment: receipt.input.environment.clone(),
             executable_file_identity: receipt.executable_file_identity,
             attempt: Arc::clone(&receipt.attempt),
+        })
+    }
+
+    pub(super) fn execute_restart_with_clock<C: MonotonicClock>(
+        &self,
+        plan: ProcessRestartPlan,
+        clock: &C,
+    ) -> Result<ProcessRestartReport, ProcessRestartError> {
+        let target = plan.preview.target;
+        if target.host_instance_id() != self.host_instance_id() {
+            return Err(ProcessRestartError::ExpiredReceipt);
+        }
+        let attempt = AttemptGuard::acquire(&plan.attempt)?;
+
+        let paths = RestartPathInput::new(
+            plan.preview.executable.clone(),
+            plan.preview.working_directory.clone(),
+        );
+        let leases = self
+            .adapter()
+            .acquire_path_leases(&paths)
+            .map_err(map_restart_adapter_error)?;
+        self.adapter()
+            .revalidate_path_leases(&leases)
+            .map_err(map_restart_adapter_error)?;
+        if self
+            .adapter()
+            .path_lease_metadata(&leases)
+            .executable_file_identity()
+            != plan.executable_file_identity
+        {
+            return Err(ProcessRestartError::PathChanged);
+        }
+
+        let policy = self
+            .admit(&target, ProcessIntent::Restart)
+            .map_err(ProcessRestartError::Target)?;
+        let stop_intent = match plan.preview.mode {
+            ProcessRestartMode::Graceful => ProcessIntent::Terminate,
+            ProcessRestartMode::Force => ProcessIntent::ForceTerminate,
+        };
+        let stop_admission = match self.admit(&target, stop_intent) {
+            Ok(admission) => admission,
+            Err(error) => {
+                drop(policy);
+                return Ok(ProcessRestartReport {
+                    completion: ProcessRestartCompletion::StopFailedLaunchNotAttempted(
+                        ProcessRestartStopError::Admission(error),
+                    ),
+                });
+            }
+        };
+        drop(policy);
+        let stop = match plan.preview.mode {
+            ProcessRestartMode::Graceful => self.terminate_with_clock(stop_admission, clock),
+            ProcessRestartMode::Force => self.force_terminate_with_clock(stop_admission, clock),
+        };
+        if let Err(error) = stop {
+            return Ok(ProcessRestartReport {
+                completion: ProcessRestartCompletion::StopFailedLaunchNotAttempted(
+                    ProcessRestartStopError::Operation(error),
+                ),
+            });
+        }
+
+        let native = NativeLaunchInput::new(
+            {
+                let mut command_line = plan.preview.command_line;
+                command_line.push(0);
+                command_line
+            },
+            plan.environment,
+        );
+        attempt.consume();
+        let process = match self.adapter().create_process(&leases, &native) {
+            Ok(process) => process,
+            Err(_) => {
+                return Ok(ProcessRestartReport {
+                    completion: ProcessRestartCompletion::OldProcessExitedLaunchFailed,
+                });
+            }
+        };
+        let identity = match self.adapter().created_process_identity(&process) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Ok(ProcessRestartReport {
+                    completion: ProcessRestartCompletion::OldProcessExitedLaunchIdentityUnknown,
+                });
+            }
+        };
+        let replacement_target = match ProcessTarget::new(
+            self.host_instance_id(),
+            identity.pid(),
+            identity.creation_time(),
+        ) {
+            Ok(target) => target,
+            Err(_) => {
+                return Ok(ProcessRestartReport {
+                    completion: ProcessRestartCompletion::OldProcessExitedLaunchIdentityUnknown,
+                });
+            }
+        };
+        let metadata = self.adapter().path_lease_metadata(&leases);
+        Ok(ProcessRestartReport {
+            completion: ProcessRestartCompletion::OldProcessExitedNewProcessCreated(
+                ProcessLaunchReceipt {
+                    host_instance_id: self.host_instance_id(),
+                    target: replacement_target,
+                    input: FrozenLaunchInput {
+                        executable: metadata.executable().to_owned(),
+                        command_line: native.command_line()[..native.command_line().len() - 1]
+                            .to_vec(),
+                        working_directory: metadata.working_directory().to_owned(),
+                        environment: native.environment().to_vec(),
+                    },
+                    executable_file_identity: metadata.executable_file_identity(),
+                    attempt: Arc::new(AtomicU8::new(ATTEMPT_READY)),
+                },
+            ),
         })
     }
 }
