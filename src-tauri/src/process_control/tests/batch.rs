@@ -963,14 +963,22 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
         declaration_catalog(module_source, CatalogVisibility::Caller),
         expected_catalog(&[
             "pub(crate) type HostInstanceId = core::HostInstanceId",
+            "pub(crate) type ManagedLaunchError = restart::ManagedLaunchError",
+            "pub(crate) type ManagedLaunchInput = restart::ManagedLaunchInput",
+            "pub(crate) type ManagedLaunchOutcome = restart::ManagedLaunchOutcome",
             "pub(crate) type ProcessAuthorityInitError = core::ProcessAuthorityInitError",
             "pub(crate) type ProcessError = core::ProcessError",
             "pub(crate) type ProcessOmissions = core::ProcessOmissions",
             "pub(crate) type ProcessRecord = core::ProcessRecord",
             "pub(crate) type ProcessIntent = core::ProcessIntent",
+            "pub(crate) type ProcessLaunchReceipt = restart::ProcessLaunchReceipt",
             "pub(crate) type ProcessOperationError = operation::ProcessOperationError",
             "pub(crate) type ProcessSnapshot = core::ProcessSnapshot",
             "pub(crate) type ProcessTarget = core::ProcessTarget",
+            "pub(crate) type ProcessRestartError = restart::ProcessRestartError",
+            "pub(crate) type ProcessRestartMode = restart::ProcessRestartMode",
+            "pub(crate) type ProcessRestartPlan = restart::ProcessRestartPlan",
+            "pub(crate) type ProcessRestartPreview = restart::ProcessRestartPreview",
             "pub(crate) type ProcessBatchError = batch::ProcessBatchError",
             "pub(crate) type ProcessBatchOmissions = batch::ProcessBatchOmissions",
             "pub(crate) type ProcessBatchOperation = batch::ProcessBatchOperation",
@@ -1001,6 +1009,10 @@ fn batch_catalog_contract_is_opaque_redacted_and_side_effect_free() {
             "pub(crate) fn terminate(&self, _admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
             "pub(crate) fn force_terminate(&self, admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
             "pub(crate) fn force_terminate(&self, _admission: ProcessAdmission) -> Result<(), ProcessOperationError>",
+            "pub(crate) fn launch_managed(&self, input: ManagedLaunchInput) -> Result<ManagedLaunchOutcome, ManagedLaunchError>",
+            "pub(crate) fn launch_managed(&self, _input: ManagedLaunchInput) -> Result<ManagedLaunchOutcome, ManagedLaunchError>",
+            "pub(crate) fn plan_restart(&self, target: &ProcessTarget, receipt: Option<&ProcessLaunchReceipt>, mode: ProcessRestartMode) -> Result<ProcessRestartPlan, ProcessRestartError>",
+            "pub(crate) fn plan_restart(&self, _target: &ProcessTarget, _receipt: Option<&ProcessLaunchReceipt>, _mode: ProcessRestartMode) -> Result<ProcessRestartPlan, ProcessRestartError>",
         ])
     );
     for (marker, expected) in [

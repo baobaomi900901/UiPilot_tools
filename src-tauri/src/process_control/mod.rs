@@ -27,6 +27,14 @@ pub(crate) type ProcessBatchTargetOutcome = batch::ProcessBatchTargetOutcome;
 pub(crate) type ProcessBatchTargetResult = batch::ProcessBatchTargetResult;
 pub(crate) type ProcessBatchReport = batch::ProcessBatchReport;
 pub(crate) type ProcessBatchCompletion = batch::ProcessBatchCompletion;
+pub(crate) type ManagedLaunchInput = restart::ManagedLaunchInput;
+pub(crate) type ManagedLaunchOutcome = restart::ManagedLaunchOutcome;
+pub(crate) type ManagedLaunchError = restart::ManagedLaunchError;
+pub(crate) type ProcessLaunchReceipt = restart::ProcessLaunchReceipt;
+pub(crate) type ProcessRestartMode = restart::ProcessRestartMode;
+pub(crate) type ProcessRestartPlan = restart::ProcessRestartPlan;
+pub(crate) type ProcessRestartPreview = restart::ProcessRestartPreview;
+pub(crate) type ProcessRestartError = restart::ProcessRestartError;
 
 #[cfg(windows)]
 pub(crate) struct ProcessAuthority {
@@ -87,6 +95,22 @@ impl ProcessAuthority {
         self.inner
             .force_terminate_with_clock(admission._inner, &operation::SystemMonotonicClock)
     }
+
+    pub(crate) fn launch_managed(
+        &self,
+        input: ManagedLaunchInput,
+    ) -> Result<ManagedLaunchOutcome, ManagedLaunchError> {
+        self.inner.launch_managed(input)
+    }
+
+    pub(crate) fn plan_restart(
+        &self,
+        target: &ProcessTarget,
+        receipt: Option<&ProcessLaunchReceipt>,
+        mode: ProcessRestartMode,
+    ) -> Result<ProcessRestartPlan, ProcessRestartError> {
+        self.inner.plan_restart(target, receipt, mode)
+    }
 }
 
 #[cfg(windows)]
@@ -143,6 +167,22 @@ impl ProcessAuthority {
         _admission: ProcessAdmission,
     ) -> Result<(), ProcessOperationError> {
         Err(ProcessOperationError::PlatformUnsupported)
+    }
+
+    pub(crate) fn launch_managed(
+        &self,
+        _input: ManagedLaunchInput,
+    ) -> Result<ManagedLaunchOutcome, ManagedLaunchError> {
+        Err(ManagedLaunchError::PlatformUnsupported)
+    }
+
+    pub(crate) fn plan_restart(
+        &self,
+        _target: &ProcessTarget,
+        _receipt: Option<&ProcessLaunchReceipt>,
+        _mode: ProcessRestartMode,
+    ) -> Result<ProcessRestartPlan, ProcessRestartError> {
+        Err(ProcessRestartError::PlatformUnsupported)
     }
 }
 

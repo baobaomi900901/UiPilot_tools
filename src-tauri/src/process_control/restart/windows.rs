@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     ffi::{c_void, OsStr, OsString},
     mem::size_of,
     os::windows::ffi::{OsStrExt, OsStringExt},
@@ -10,6 +11,7 @@ use windows::{
     core::{PCWSTR, PWSTR},
     Win32::{
         Foundation::{CloseHandle, GENERIC_READ, HANDLE},
+        Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_LESS_THAN},
         Storage::FileSystem::{
             CreateFileW, FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandle,
             GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationW,
@@ -24,6 +26,19 @@ use windows::{
         },
     },
 };
+
+pub(super) fn compare_environment_names(left: &[u16], right: &[u16]) -> Result<Ordering, ()> {
+    let result = unsafe { CompareStringOrdinal(left, right, true) };
+    if result == CSTR_LESS_THAN {
+        Ok(Ordering::Less)
+    } else if result == CSTR_EQUAL {
+        Ok(Ordering::Equal)
+    } else if result.0 == 3 {
+        Ok(Ordering::Greater)
+    } else {
+        Err(())
+    }
+}
 
 use super::{
     CreatedProcessIdentity, LeasedPathMetadata, NativeLaunchInput, ProcessRestartAdapter,
