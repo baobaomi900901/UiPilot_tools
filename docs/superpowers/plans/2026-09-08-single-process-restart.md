@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-5 complete through 08737de; independent Task 5 review and targeted handshake cleanup recheck passed. Task 4 retains a non-blocking stop-admission coverage note; the Task 3 RED-evidence deviation was accepted on 2026-09-09. Task 6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-5 complete through 08737de; independent Task 5 review and targeted handshake cleanup recheck passed. Task 4 retains a non-blocking stop-admission coverage note; the Task 3 RED-evidence deviation was accepted on 2026-09-09. Task 6 evidence is complete at source/test revision 8961143595424172f88f934c6afd2855c2f107f0. The final original-source default normal-parallel suite passed, while an earlier same-source startup/snapshot timeout in an unchanged Stage 2B batch fixture remains an unresolved intermittent test risk with no fix or root-cause claim. Final independent review found specification PASS and quality PASS WITH CONCERNS, with no Critical or Important finding; it retained that intermittent risk and Task 4's missing focused fresh-stop-admission executor assertion as nonblocking concerns. Status: AWAITING USER ACCEPTANCE; Stage 2C is not accepted.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -160,11 +160,11 @@ only the Windows restart test file changed.
 **Files:** Create `docs/superpowers/verification/2026-09-08-single-process-restart.md`; update this plan's factual status/checks only.
 **Dependencies:** Tasks 1-5; design section 8 and accepted Stage 2B verification baseline.
 
-- [ ] Collect focused receipt/execution/path/Windows results, complete process_control and default full regression, standard-user environment, owned-fixture cleanup and exact tested revision.
-- [ ] Run rustfmt, all-features tests and both Clippy variants; keep inherited schema/12-library/13-library-test deviations explicitly red and prove zero new process_control diagnostics. Newly discovered restart regressions must be corrected within their owning task and reverified before this gate closes.
-- [ ] Verify unchanged Cargo, accepted stop/batch modules, frontend/Tauri/plugin contracts and existing application launch callers. Record only the authorized restart module/tests and evidence changes.
-- [ ] Disclose managed-only coverage, original-initial-context versus dynamic runtime state, path-policy limits, spawn-not-readiness, irreversible post-stop failures, no automatic recovery, PPL/non-Windows test limitations and any residual review Minor.
-- [ ] Obtain one concise independent final correctness/scope review and set the record to AWAITING USER ACCEPTANCE. Do not mark the stage accepted or start elevation/host-entry work before explicit user acceptance.
+- [x] Collect focused receipt/execution/path/Windows results, complete process_control and default full regression, standard-user environment, owned-fixture cleanup and exact tested revision. Focused restart passed 30/0 and serialized process_control passed 182/0/2 at `8961143595424172f88f934c6afd2855c2f107f0`; final original-source default parallel passed library 1156/0/4 plus integration 1/1. The initial same-source 1155/1/4 startup/snapshot timeout in unchanged `windows_batch_graceful_timeout_keeps_later_target_running` remains an unresolved intermittent test risk; no behavior fix or root cause is claimed.
+- [x] Run rustfmt, all-features tests and both Clippy variants; keep inherited schema/12-library/13-library-test deviations explicitly red and prove zero new process_control diagnostics. Newly discovered restart regressions must be corrected within their owning task and reverified before this gate closes.
+- [x] Verify unchanged Cargo, accepted stop/batch modules, frontend/Tauri/plugin contracts and existing application launch callers. Record only the authorized restart module/tests and evidence changes.
+- [x] Disclose managed-only coverage, original-initial-context versus dynamic runtime state, path-policy limits, spawn-not-readiness, irreversible post-stop failures, no automatic recovery, PPL/non-Windows test limitations and any residual review Minor.
+- [x] Obtain one concise independent final correctness/scope review and set the record to AWAITING USER ACCEPTANCE. Specification PASS and quality PASS WITH CONCERNS; no Critical or Important finding. Do not mark the stage accepted or start elevation/host-entry work before explicit user acceptance.
 
 **Verify:** Run the following final commands with exact results/revisions recorded; reuse a same-revision run where it already supplies the required evidence rather than repeating costly real tests without a reason.
 
@@ -188,6 +188,6 @@ Expected: scoped/default tests and format pass; no new module diagnostics; inher
 - [x] User approves this implementation plan before Task 1 experiments or code begin (2026-09-08).
 - [ ] User accepts final Stage 2C evidence before any later substage begins.
 
-The next authorized action after plan approval is Task 1 only. Failure of the
-path-policy experiment returns to the design decision; it never authorizes
-destructive restart with a weaker guarantee.
+The next authorized action is explicit user acceptance of the final Stage 2C
+evidence. Elevation, host-entry work, and later stages remain unauthorized until
+that decision.
