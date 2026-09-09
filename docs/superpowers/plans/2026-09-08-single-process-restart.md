@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-2 complete. Task 3 implemented at 9a15810 with passing tests and independent product/scope review; user decision on missing pre-implementation RED evidence is pending. Tasks 4-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-3 complete; the user accepted the disclosed Task 3 RED-evidence deviation by continuation on 2026-09-09. Task 4 is starting; Tasks 5-6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -106,8 +106,8 @@ All constructors/state transitions that mint or modify receipt authority are pri
 serialized process_control passed 169/0/2 ignored. Strict Clippy retained the
 inherited 12/13 external diagnostics. The independent reviewer found no product
 correctness or scope defect, but the required pre-implementation behavioral RED
-evidence was not captured. The user must decide whether to accept this documented
-process deviation before Task 4 begins; no retrospective RED is claimed. The
+evidence was not captured. The user accepted this documented process deviation
+by continuation on 2026-09-09; no retrospective RED is claimed. The
 implementation also required the narrow native environment comparator and legacy
 whole-facade expected-catalog synchronization, preserving existing behavior.
 
