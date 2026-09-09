@@ -2,9 +2,9 @@
 
 **Date:** 2026-09-09
 
-**Status:** AWAITING USER ACCEPTANCE
+**Status:** ACCEPTED WITH CONCERNS (conditional technical acceptance, 2026-09-09)
 
-**Verification outcome:** **READY FOR USER ACCEPTANCE WITH CONCERNS**.
+**Verification outcome:** **ACCEPTED WITH CONCERNS**.
 Focused restart, serialized complete `process_control`, final default full,
 format, scope, and cleanup evidence pass. An initial default run timed out in an
 unchanged accepted Stage 2B batch fixture; the diagnostic-only run and final
@@ -15,6 +15,20 @@ schema error and strict Clippy baselines remain explicitly red.
 
 This record adds no product or test behavior. It aggregates Tasks 1-5 at the
 final source/test revision and preserves the approval stop gate.
+
+The user offered conditional technical acceptance on 2026-09-09 and explicitly
+required the work to stay at this gate. That acceptance is recorded here; it does
+not waive any retained risk or authorize further work. Elevation, host-entry and
+all later roadmap stages remain on hold until separate explicit direction.
+
+## Open Stage 2C Follow-Ups
+
+- [GitHub Issue #1: investigate the intermittent batch-fixture snapshot timeout](https://github.com/baobaomi900901/UiPilot_tools/issues/1) — OPEN; root cause unconfirmed, no fix claimed. Closure requires evidence beyond a passing rerun.
+- [GitHub Issue #2: add the fresh stop-admission failure executor assertion](https://github.com/baobaomi900901/UiPilot_tools/issues/2) — OPEN; nonblocking test-evidence gap, not a claimed production defect.
+
+These issues are tracking records only. Their creation does not start a repair
+task or release the pause. The inherited all-features/Clippy debt remains red and
+outside these two narrowly scoped follow-ups.
 
 ## Revision And Environment
 
@@ -170,7 +184,7 @@ fresh-stop-admission executor assertion and the initial unchanged Stage 2B batch
 fixture's parallel snapshot timeout. The final original-source pass supports the
 gate but does not fix or explain that intermittent failure.
 
-The implementation and evidence are **READY FOR USER ACCEPTANCE WITH CONCERNS**.
-Status remains **AWAITING USER ACCEPTANCE**; this record does not claim user
-acceptance. Do not start elevation, host-entry work, or any later stage before
-the explicit user decision.
+The implementation and evidence are **ACCEPTED WITH CONCERNS** under the user's
+conditional technical acceptance. Both linked follow-ups remain open. The user
+explicitly requested a hold at this gate: do not start their fixes, elevation,
+host-entry work, or any later stage without separate explicit direction.

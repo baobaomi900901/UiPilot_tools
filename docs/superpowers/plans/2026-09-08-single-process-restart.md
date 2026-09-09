@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-5 complete through 08737de; independent Task 5 review and targeted handshake cleanup recheck passed. Task 4 retains a non-blocking stop-admission coverage note; the Task 3 RED-evidence deviation was accepted on 2026-09-09. Task 6 evidence is complete at source/test revision 8961143595424172f88f934c6afd2855c2f107f0. The final original-source default normal-parallel suite passed, while an earlier same-source startup/snapshot timeout in an unchanged Stage 2B batch fixture remains an unresolved intermittent test risk with no fix or root-cause claim. Final independent review found specification PASS and quality PASS WITH CONCERNS, with no Critical or Important finding; it retained that intermittent risk and Task 4's missing focused fresh-stop-admission executor assertion as nonblocking concerns. Status: AWAITING USER ACCEPTANCE; Stage 2C is not accepted.
+**Status:** COMPLETE - ACCEPTED WITH CONCERNS on 2026-09-09. Tasks 1-6 are complete; final tested source is 8961143. Open follow-ups are GitHub #1 and #2, linked in the verification record. The user explicitly holds work at this gate; conditional acceptance does not authorize fixes or later-stage work. All recorded deviations and inherited red gates remain visible.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -186,8 +186,8 @@ Expected: scoped/default tests and format pass; no new module diagnostics; inher
 
 - [x] Independent plan review confirms design coverage and bounded task scope (2026-09-08; no material findings).
 - [x] User approves this implementation plan before Task 1 experiments or code begin (2026-09-08).
-- [ ] User accepts final Stage 2C evidence before any later substage begins.
+- [x] User conditionally accepts final Stage 2C evidence (2026-09-09); explicit hold remains in force.
 
-The next authorized action is explicit user acceptance of the final Stage 2C
-evidence. Elevation, host-entry work, and later stages remain unauthorized until
-that decision.
+Remain at the current acceptance gate. Conditional technical acceptance is
+recorded, but issue repairs, elevation, host-entry work and later stages remain
+unauthorized until separate explicit user direction.
