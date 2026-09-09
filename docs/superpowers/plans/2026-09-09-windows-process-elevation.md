@@ -1,7 +1,7 @@
 # Stage 2D Windows Process Elevation Implementation Plan
 
 **Date:** 2026-09-09
-**Status:** APPROVED — accepted by the user on 2026-09-09. Issue 2 coverage follow-up completed. Task 1 inventory started; paused at packaging scope gate, no native experiment or production implementation started.
+**Status:** APPROVED — accepted by the user on 2026-09-09. Issue 2 coverage completed. Task 1 in progress: separately approved optional protected packaging implemented/built; full native feasibility and installation/UAC remain pending. Tasks 2–6 not started.
 **Approved design:** [Windows Process Elevation](../specs/2026-09-09-windows-process-elevation-design.md), accepted by user continuation after `bf38290`.
 
 Deliver one same-account, one-shot privileged stop workflow. The ordinary host
@@ -98,7 +98,8 @@ and external Clippy diagnostics as red; zero new process_control/elevation findi
 ### Task 1: Non-Destructive Deployment And Authentication Feasibility
 
 Inventory checkpoint: [packaging gap and proposed minimum expansion](../verification/2026-09-09-process-elevation-feasibility.md).
-Task 1 remains incomplete pending scope approval and actual feasibility evidence.
+Packaging expansion subsequently approved and implemented; Task 1 remains incomplete
+pending host/helper probe and actual installation/UAC feasibility evidence.
 
 **Files:** feasibility spike, feasibility PowerShell runner and feasibility evidence
 record from the file map. Read existing `src-tauri/tauri.conf.json`; do not modify it.

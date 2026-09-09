@@ -1,11 +1,11 @@
 # Stage 2D Task 1: Deployment And Authentication Feasibility
 
 **Date:** 2026-09-09
-**Status:** BLOCKED AT PACKAGING SCOPE GATE — inventory only; no native feasibility PASS.
+**Status:** IN PROGRESS — packaging expansion approved and optional profile implemented; actual installation/UAC and full Task 1 feasibility remain unverified.
 **Inspected revision:** `2a57db3a546113a7d36a9011ad833a9f0a96958a`.
 **Plan:** [Stage 2D Task 1](../plans/2026-09-09-windows-process-elevation.md).
 
-## Observed Evidence
+## Initial Inventory Evidence (Before Packaging Approval)
 
 - `src-tauri/tauri.conf.json` enables bundle targets `all`, but has no
   `bundle.windows.nsis.installMode`, custom installer template/hooks or external
@@ -29,8 +29,8 @@
 
 These observations do not prove effective ACLs of any installed application.
 No installer was built/run, no installed files were probed or changed, and no
-UAC/token/pipe/native-confirmation experiment was run. No Task 1 spike or runner
-has been created: the packaging prerequisite needs an explicit scope decision first.
+UAC/token/pipe/native-confirmation experiment was run. At that initial checkpoint
+no Task 1 spike or runner had been created; packaging scope approval was pending.
 
 ## Required Scope Decision
 
@@ -91,3 +91,64 @@ inventory/gate report. Confirmed tracked configuration and pinned default;
 older Everything design proposals are not implemented installer evidence.
 Confirmed the approved design/plan requires separate packaging-scope approval.
 Read-only review; no native tests, installation or UAC performed.
+
+## Approved Optional Packaging Implementation
+
+The user approved the minimum packaging expansion after `11abb19`. Added:
+
+- `src-tauri/tauri.elevation.conf.json`: opt-in x64 NSIS per-machine profile,
+  separate `UiPilot_tools Protected` product and `com.uipilot.launcher.protected`
+  identity. The base configuration is unchanged.
+- `spikes/process-elevation-feasibility`: currently a standalone read-only native
+  installation-directory checker, not yet the host/helper IPC/UI probe. Fixed
+  known-folder destination, NTFS, non-reparse ancestor/object handles, trusted
+  owner and conservative DACL write-grant checks. Reject unknown ACE types,
+  null DACL, unsafe ownership/grants and unreadable paths. It never repairs ACLs,
+  starts another process or provides a process-control operation.
+- `src-tauri/windows/elevation-installer-hooks.nsh`: embeds that checker into
+  install/upgrade and uninstall checks. Saves/restores OUTDIR; no shell command
+  fallback. Checked handles are released when the checker finishes, so this is
+  a package-directory check, not the future helper's runtime trust/lease protocol.
+- `scripts/build-process-elevation-package.ps1`: default Check mode inventories
+  configuration/resources without building or installing; explicit Build mode
+  builds the checker and protected installer and records exact installer/host/checker
+  SHA-256 values. No mode launches the installer. Inventory explicitly reports
+  `processElevationAvailable: false`; no runtime helper manifest is claimed.
+- `scripts/test-process-elevation-package.ps1` and the compile-only NSIS harness:
+  verify inventory, base-config preservation, alternate-directory rejection and
+  install/uninstall hook syntax.
+
+Checks completed:
+
+- Initial policy RED: two intended unsafe-write assertions failed against the
+  empty policy stub; after implementation all 4 Rust tests passed.
+- `cargo test --manifest-path spikes/process-elevation-feasibility/Cargo.toml --locked --offline`: 4 passed, 0 failed, including an owned user-writable-directory rejection.
+- `cargo fmt --manifest-path spikes/process-elevation-feasibility/Cargo.toml --check`: passed.
+- `cargo clippy --manifest-path spikes/process-elevation-feasibility/Cargo.toml --locked --offline --all-targets -- -D warnings`: passed after correcting one new comparison lint.
+- `powershell.exe -NoProfile -File scripts/test-process-elevation-package.ps1`: PROTECTED_PACKAGE_CHECK_PASS.
+- Cached NSIS `makensis.exe /V2 hook-compile-test.nsi`: compiled; test installer not run.
+- Read-only release checker `preinstall "C:\Program Files\UiPilot_tools Protected"`:
+  passed against this machine's current directory chain; no installation performed.
+- `npm.cmd ci --ignore-scripts` installed locked local build dependencies; existing
+  package locks unchanged. New isolated Rust package has its own lock.
+- Final `powershell.exe -NoProfile -File scripts/build-process-elevation-package.ps1 -Mode Build`:
+  succeeded with locked/offline Cargo arguments; produced
+  `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/UiPilot_tools Protected_0.3.4_x64-setup.exe`.
+  Installer SHA-256: `fd46ff865f931ed6f8a6ae35f3d34c100e427c7db42b5b6e5a7077df29474d81`.
+  Adjacent `protected-package-inventory.json` records all input resource hashes
+  and the exact host/checker hashes. Existing Vite chunk-size warning remains;
+  installer was not executed. Full default/all-features tests were not rerun for
+  this isolated packaging change; inherited baseline failures are not cleared.
+
+Independent `protected_packaging_review` found one uninstall working-directory
+defect; fixed and targeted recheck passed. The agent independently ran the 4 Rust
+tests and package script successfully; no remaining blocking finding in the
+reviewed preparatory changes.
+
+Limits: actual install/upgrade/uninstall, temporary checker extraction trust,
+and post-install directory ACLs have NOT been verified. Tauri CLI 2.11.4's generated
+template performs `SetOutPath $INSTDIR` before PREINSTALL; it can create a selected
+directory before rejection. No zero-filesystem-effects claim applies to an actual
+installer run. The helper IPC/token/UAC/native-confirmation probe remains pending;
+Task 1 is not complete and Task 2 has not started. The generated installer must not
+be installed merely because compilation passed.
