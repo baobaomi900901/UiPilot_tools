@@ -3,7 +3,7 @@
 > **For agentic workers:** Use subagent-driven-development or executing-plans. Execute dependent tasks serially. Checkboxes record implementation progress.
 
 **Date:** 2026-09-08
-**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-2 completed and independently reviewed through a694734; Task 2 supports fixed NTFS volumes, including executable/CWD on different volumes. Historical libtest handshake failures remain documented. Tasks 3-6 not started.
+**Status:** APPROVED - accepted by the user on 2026-09-08. Tasks 1-2 complete. Task 3 implemented at 9a15810 with passing tests and independent product/scope review; user decision on missing pre-implementation RED evidence is pending. Tasks 4-6 not started.
 **Approved design:** [Single-Process Restart](../specs/2026-09-08-single-process-restart-design.md), accepted 2026-09-08 at `d209c2a`.
 **Goal:** Deliver managed launch receipts and explicit single-process restart without stopping any process whose original launch context cannot be established.
 **Architecture:** Keep receipt ownership, planning and restart composition in a new private restart module. Its Windows adapter owns path leases and CreateProcessW resources; existing identity and single-target stop implementations retain their contracts.
@@ -93,14 +93,23 @@ All constructors/state transitions that mint or modify receipt authority are pri
 **Files:** Modify `restart.rs`, `mod.rs`, `tests/restart.rs`, `tests/restart/windows.rs` under process_control.
 **Dependencies:** Task 2; design sections 2-4, 6-7.
 
-- [ ] Validate complete ManagedLaunchInput, distinguish known empty arguments from unavailable context, validate UTF-16 string/environment structure and documented platform limits, and freeze the effective values used for initial creation.
-- [ ] Implement launch_managed with explicit creation/identity outcomes. Mint ProcessLaunchReceipt only from the returned exact identity and successful launch record; after creation succeeds, identity failure must return a created/unknown outcome without a retry or automatic kill.
-- [ ] Implement plan_restart with exact target/receipt/HostInstanceId checks, receipt availability and Restart-policy admission. Reject absent/mismatched/expired/consumed context without stopping. Freeze mode and confirmation values in a handle-free plan.
-- [ ] Implement shared Ready/Executing/Consumed attempt ownership and a private RAII attempt guard. Planning/canceling alone must not claim or consume the receipt; two plans borrow the same ownership state.
-- [ ] Add narrow facade aliases/forwarding and non-Windows rejection. Lock receipt/plan constructor, clone, serialization and mutation boundaries with proportional contract tests.
+- [x] Validate complete ManagedLaunchInput, distinguish known empty arguments from unavailable context, validate UTF-16 string/environment structure and documented platform limits, and freeze the effective values used for initial creation.
+- [x] Implement launch_managed with explicit creation/identity outcomes. Mint ProcessLaunchReceipt only from the returned exact identity and successful launch record; after creation succeeds, identity failure must return a created/unknown outcome without a retry or automatic kill.
+- [x] Implement plan_restart with exact target/receipt/HostInstanceId checks, receipt availability and Restart-policy admission. Reject absent/mismatched/expired/consumed context without stopping. Freeze mode and confirmation values in a handle-free plan.
+- [x] Implement shared Ready/Executing/Consumed attempt ownership and a private RAII attempt guard. Planning/canceling alone must not claim or consume the receipt; two plans borrow the same ownership state.
+- [x] Add narrow facade aliases/forwarding and non-Windows rejection. Lock receipt/plan constructor, clone, serialization and mutation boundaries with proportional contract tests.
 
 **Distinct test coverage:** Incomplete request; empty vs missing arguments; embedded NUL/invalid environment; frozen explicit environment rather than ambient reuse; receipt cannot attach arbitrary PID context; missing external-process receipt; target/host mismatch; plan cancellation and replanning; creation succeeded but identity unknown; same receipt shared across plans without publicly cloning it.
 **Verify:** `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline process_control::tests::restart::restart_receipt -- --nocapture`
+
+**Execution record (2026-09-09):** At `9a15810`, focused tests passed 8/0 and
+serialized process_control passed 169/0/2 ignored. Strict Clippy retained the
+inherited 12/13 external diagnostics. The independent reviewer found no product
+correctness or scope defect, but the required pre-implementation behavioral RED
+evidence was not captured. The user must decide whether to accept this documented
+process deviation before Task 4 begins; no retrospective RED is claimed. The
+implementation also required the narrow native environment comparator and legacy
+whole-facade expected-catalog synchronization, preserving existing behavior.
 
 ### Task 4: Single-Process Restart Composition
 
