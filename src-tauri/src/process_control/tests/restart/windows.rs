@@ -1,7 +1,7 @@
 use super::super::super::{
     restart::{
-        windows::created_process_identity_with, NativeLaunchInput, ProcessRestartAdapter,
-        RestartAdapterError, RestartPathInput,
+        windows::{created_process_identity_with, filesystem_is_supported},
+        NativeLaunchInput, ProcessRestartAdapter, RestartAdapterError, RestartPathInput,
     },
     windows::WindowsProcessAdapter,
 };
@@ -217,6 +217,14 @@ fn root(label: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("UiPilot {label} 雪 {} {n}", std::process::id()))
+}
+
+fn root_under(base: &Path, label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    base.join(format!("UiPilot {label} 雪 {} {nonce}", std::process::id()))
 }
 fn incompatible_rejected(path: &Path, directory: bool) {
     let p = wide(path.as_os_str());
@@ -452,4 +460,78 @@ fn restart_returned_handle_identity_failures_are_stable() {
         created_process_identity_with(41, || Ok(0)),
         Err(RestartAdapterError::IdentityUnavailable)
     );
+}
+
+#[test]
+fn restart_filesystem_admission_is_ntfs_only() {
+    assert!(filesystem_is_supported("NTFS"));
+    assert!(filesystem_is_supported("ntfs"));
+    for unsupported in ["FAT", "FAT32", "exFAT", "ReFS", "", "unknown"] {
+        assert!(!filesystem_is_supported(unsupported));
+    }
+}
+
+#[test]
+fn restart_distinct_fixed_ntfs_volumes_are_composed_when_available() {
+    let executable_base = std::env::current_dir()
+        .unwrap()
+        .join("src-tauri")
+        .join("target");
+    let cwd_base = std::env::temp_dir();
+    let executable_drive = executable_base
+        .to_string_lossy()
+        .get(..2)
+        .map(str::to_owned);
+    let cwd_drive = cwd_base.to_string_lossy().get(..2).map(str::to_owned);
+    if executable_drive == cwd_drive {
+        eprintln!("native cross-volume case unavailable: target and temp use the same volume");
+        return;
+    }
+
+    let executable_root = root_under(&executable_base, "restart cross volume executable");
+    let cwd_root = root_under(&cwd_base, "restart cross volume cwd");
+    let mut executable_tree = OwnedTree(Some(executable_root.clone()));
+    let mut cwd_tree = OwnedTree(Some(cwd_root.clone()));
+    fs::create_dir_all(&executable_root).unwrap();
+    fs::create_dir_all(&cwd_root).unwrap();
+    let executable = executable_root.join("cross volume child.exe");
+    compile_helper(&executable_root.join("cross volume helper.rs"), &executable);
+    let control = cwd_root.join("control");
+    fs::create_dir_all(&control).unwrap();
+
+    let adapter = WindowsProcessAdapter;
+    let leases = match adapter
+        .acquire_path_leases(&RestartPathInput::new(executable.clone(), cwd_root.clone()))
+    {
+        Ok(leases) => leases,
+        Err(RestartAdapterError::UnsupportedPath) => {
+            eprintln!("native cross-volume case unavailable: second fixed NTFS volume not present");
+            cwd_tree.cleanup_asserted();
+            executable_tree.cleanup_asserted();
+            return;
+        }
+        Err(error) => panic!("cross-volume acquisition failed unexpectedly: {error}"),
+    };
+    let metadata = adapter.path_lease_metadata(&leases);
+    let executable_root_name = metadata.executable().to_string_lossy()[..48].to_owned();
+    let cwd_root_name = metadata.working_directory().to_string_lossy()[..48].to_owned();
+    assert_ne!(executable_root_name, cwd_root_name);
+
+    let control_arg = format!("control={}", control.display());
+    let child = adapter
+        .create_process(
+            &leases,
+            &NativeLaunchInput::new(
+                command_line(&executable, &[&control_arg]),
+                environment_block(&control),
+            ),
+        )
+        .unwrap();
+    let mut cleanup = CleanupProcess::duplicate(&child);
+    drop(child);
+    drop(leases);
+    wait_report(&control.join("child-report.txt"), cleanup.handle);
+    cleanup.wait();
+    cwd_tree.cleanup_asserted();
+    executable_tree.cleanup_asserted();
 }

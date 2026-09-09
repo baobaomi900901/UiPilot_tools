@@ -12,7 +12,7 @@ use windows::{
         Foundation::{CloseHandle, GENERIC_READ, HANDLE},
         Storage::FileSystem::{
             CreateFileW, FileAttributeTagInfo, GetDriveTypeW, GetFileInformationByHandle,
-            GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+            GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationW,
             GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, BY_HANDLE_FILE_INFORMATION,
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
@@ -92,13 +92,6 @@ impl ProcessRestartAdapter for WindowsProcessAdapter {
     ) -> Result<Self::PathLeases, RestartAdapterError> {
         let executable = resolve_supported_path(input.executable())?;
         let working_directory = resolve_supported_path(input.working_directory())?;
-        if !executable
-            .guid_root
-            .eq_ignore_ascii_case(&working_directory.guid_root)
-        {
-            return Err(RestartAdapterError::UnsupportedPath);
-        }
-
         let mut components = Vec::new();
         let executable_identity = lease_resolved_path(&executable, false, &mut components)?;
         lease_resolved_path(&working_directory, true, &mut components)?;
@@ -262,6 +255,21 @@ fn resolve_supported_path(path: &Path) -> Result<ResolvedPath, RestartAdapterErr
     if unsafe { GetDriveTypeW(PCWSTR(nul_terminated(&guid_root).as_ptr())) } != 3 {
         return Err(RestartAdapterError::UnsupportedPath);
     }
+    let mut filesystem = vec![0u16; 64];
+    unsafe {
+        GetVolumeInformationW(
+            PCWSTR(nul_terminated(&guid_root).as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut filesystem),
+        )
+    }
+    .map_err(|_| RestartAdapterError::UnsupportedPath)?;
+    if !filesystem_is_supported(&from_nul(&filesystem)?) {
+        return Err(RestartAdapterError::UnsupportedPath);
+    }
     let relative_components = relative
         .split('\\')
         .filter(|component| !component.is_empty())
@@ -291,6 +299,10 @@ fn valid_guid(value: &str) -> bool {
                 byte.is_ascii_hexdigit()
             }
         })
+}
+
+pub(crate) fn filesystem_is_supported(name: &str) -> bool {
+    name.eq_ignore_ascii_case("NTFS")
 }
 
 fn lease_resolved_path(
