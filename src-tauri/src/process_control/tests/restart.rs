@@ -831,6 +831,65 @@ fn restart_execution_stop_failure_never_launches_and_receipt_can_be_replanned() 
 }
 
 #[test]
+fn restart_execution_stop_admission_failure_never_stops_or_launches_and_releases_resources() {
+    for mode in [ProcessRestartMode::Graceful, ProcessRestartMode::Force] {
+        let adapter = managed_adapter(false);
+        let process = adapter.process.clone();
+        let creates = Rc::clone(&adapter.create_calls);
+        let lease_drops = Rc::clone(&adapter.lease_drops);
+        let authority = managed_authority(adapter);
+        let receipt = launched_receipt(&authority);
+        let plan = authority
+            .plan_restart(receipt.target(), Some(&receipt), mode)
+            .unwrap();
+        // Execution's Restart policy admission succeeds; only its fresh stop
+        // admission fails. The final success permits a later explicit replan.
+        process
+            .state
+            .borrow_mut()
+            .processes
+            .get(&42)
+            .unwrap()
+            .borrow_mut()
+            .script
+            .open = vec![Ok(()), Err(ObservationFailure::AccessDenied), Ok(())].into();
+        let opened = process.opened();
+        let dropped = process.dropped();
+        let observations = process.requested_access().len();
+        let leases_released = lease_drops.get();
+        let initial_creates = creates.get();
+
+        let report = authority
+            .execute_restart_with_clock(
+                plan,
+                &super::FakeMonotonicClock::at(std::time::Instant::now()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            report.completion(),
+            ProcessRestartCompletion::StopFailedLaunchNotAttempted(
+                super::super::restart::ProcessRestartStopError::Admission(
+                    super::super::core::ProcessError::InspectionDenied
+                )
+            )
+        ));
+        assert_eq!(process.requested_access().len(), observations + 2);
+        assert_eq!(process.opened(), opened + 1);
+        assert_eq!(process.dropped(), dropped + 1);
+        assert_eq!(process.opened(), process.dropped());
+        assert_eq!(lease_drops.get(), leases_released + 1);
+        assert!(process.requested_operation_access().is_empty());
+        assert_eq!(process.post_close_calls(), 0);
+        assert_eq!(process.terminate_calls(), 0);
+        assert_eq!(creates.get(), initial_creates);
+        assert!(authority
+            .plan_restart(receipt.target(), Some(&receipt), mode)
+            .is_ok());
+    }
+}
+
+#[test]
 fn restart_execution_creation_failure_is_irreversible_and_consumes_old_receipt() {
     let adapter = managed_adapter(false);
     configure_force_success(&adapter);

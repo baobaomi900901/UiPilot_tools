@@ -188,3 +188,28 @@ The implementation and evidence are **ACCEPTED WITH CONCERNS** under the user's
 conditional technical acceptance. Both linked follow-ups remain open. The user
 explicitly requested a hold at this gate: do not start their fixes, elevation,
 host-entry work, or any later stage without separate explicit direction.
+
+## Separately Authorized Issue 2 Coverage Follow-up (2026-09-09)
+
+After accepting the Stage 2D plan, the user approved filling the fresh-stop-admission
+assertion gap separately. Added
+`restart_execution_stop_admission_failure_never_stops_or_launches_and_releases_resources`
+in `src-tauri/src/process_control/tests/restart.rs`. Production implementation unchanged.
+For Graceful and Force, Restart policy admission succeeds and the next observation
+open is denied. The executor must return Admission(InspectionDenied), open no
+operation handle, send no close/termination, create no replacement, release the
+policy handle and path leases once, and permit explicit receipt replanning.
+
+Validation on the follow-up test diff over `a2dff9e`:
+
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline restart_execution_stop_admission_failure -- --test-threads=1`: 1 passed, 0 failed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline restart_execution_ -- --test-threads=1`: 10 passed, 0 failed.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`: passed.
+
+This adds coverage for existing correct behavior; no failing-product RED or product
+fix is claimed. No real process effects, UAC, full-suite or lint reruns were needed
+for this test-only change. Issue 1 and inherited baseline failures remain unchanged.
+The historical Stage 2C acceptance evidence above is not retroactively rewritten.
+Independent review `stop_admission_assertion_review`: no blocking findings; confirmed
+the fresh-admission branch, both modes, no effects and resource/receipt assertions.
+GitHub Issue 2 has not been closed by this local change.

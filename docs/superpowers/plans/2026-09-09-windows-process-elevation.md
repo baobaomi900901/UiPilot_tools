@@ -1,7 +1,7 @@
 # Stage 2D Windows Process Elevation Implementation Plan
 
 **Date:** 2026-09-09
-**Status:** READY FOR USER PLAN ACCEPTANCE — independent review and targeted recheck passed; no implementation started.
+**Status:** APPROVED — accepted by the user on 2026-09-09. User also approved separately filling Issue 2 coverage first; Stage 2D implementation has not started.
 **Approved design:** [Windows Process Elevation](../specs/2026-09-09-windows-process-elevation-design.md), accepted by user continuation after `bf38290`.
 
 Deliver one same-account, one-shot privileged stop workflow. The ordinary host
@@ -23,6 +23,7 @@ entry, settings, Stage 3, unrelated lint repairs or Issue 1/2 fixes. Issue 1 rem
 open. Before implementation approval, user must explicitly choose whether to
 repair Issue 2 separately or retain its gap with justification. Recommendation:
 repair it as a separately authorized follow-up; this plan does not authorize it.
+Disposition update: the user subsequently approved that separate coverage follow-up.
 
 Installation/UAC and native interactive tests change the user's system or
 foreground experience. Prepare exact binaries, destination, file list, ACLs and
