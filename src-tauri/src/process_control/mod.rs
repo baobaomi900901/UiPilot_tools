@@ -1,6 +1,7 @@
 mod batch;
 mod core;
 mod operation;
+mod restart;
 
 #[cfg(windows)]
 mod windows;
