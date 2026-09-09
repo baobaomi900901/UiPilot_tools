@@ -1,15 +1,17 @@
 # Stage 2D Windows Process Elevation Design
 
 **Date:** 2026-09-09
-**Status:** READY FOR USER DESIGN ACCEPTANCE — architecture and scope agreed; independent review passed; detailed specification not yet accepted.
+**Status:** APPROVED — accepted by the user's continuation on 2026-09-09 after independent review. A separate implementation plan is now authorized, not implementation.
 
 ## 1. Authorization And Goal
 
 Stage 2C remains ACCEPTED WITH CONCERNS. The user has lifted its hold only for
 Windows elevation design, and approved same-account UAC plus a one-shot helper.
-This document does not authorize implementation, an implementation plan, repairs
+The initial design authorization did not authorize implementation, an implementation plan, repairs
 to Issues [1](https://github.com/baobaomi900901/UiPilot_tools/issues/1) or
 [2](https://github.com/baobaomi900901/UiPilot_tools/issues/2), or Stage 3.
+The subsequent design acceptance authorizes only preparation of the separate
+implementation plan; all other holds remain in force.
 
 Stage 2D is a substage of host process control, not the roadmap's Stage 3
 Capability model. Its goal is an explicitly confirmed privileged execution of
