@@ -412,3 +412,56 @@ constitute Stage 2D acceptance.
 Independent final check by `uac_deployment_review`: temporary directory absent,
 zero currently named probe processes, and cancellation-NOT-VERIFIED interpretation
 confirmed. No further UAC attempt was performed during that review.
+
+## Native Confirmation Specimen Prepared (2026-09-10)
+
+Added opt-in `confirmation-specimen` feature and a separate
+`uipilot-confirmation-specimen` binary. It contains only a synthetic preview and
+Win32 controls; no process catalog, transport, elevation or execution entry is
+connected. This prepares the Task 1 UI experiment, not Stage 2D Task 5 production UI.
+
+The frozen sample has 256 numbered synthetic targets and an explicit simulated
+incomplete-selection warning. Native LISTBOX provides vertical/horizontal access;
+a read-only multiline EDIT exposes the full selected text, including a long-path
+sample. Control/bidi characters in the dedicated sample are displayed as escapes.
+The window title/header and confirmation button explicitly label simulation.
+
+Model outcomes are Pending, Cancelled, ConfirmedSimulation and TimedOut. The first
+terminal decision is final. The window requests default/focused Cancel, handles
+Escape/close and a 120-second timer, and uses native dialog-message keyboard routing.
+The actual keyboard delivery has not yet been observed. The shared callback state
+uses a stable allocation; model borrows end before reentrant Windows calls.
+
+Light/Dark palettes use the semantic colors from `src/ui-theme.css`. Native stock
+font and OS GDI scaling follow the approved native-control exception. Windows
+high-contrast colors, sampled on launch, override the content palette; a theme or
+high-contrast change should be tested by reopening the sample. Standard control
+names and focus behavior are retained; owner-drawn buttons show danger outline,
+focus, pressed/hot and disabled branches. Native hover delivery, narrator naming,
+contrast and multi-monitor/scaling behavior still need actual UI verification.
+
+Preparation evidence over `dfdebd8`:
+
+- Initial model RED: 1 passed, 2 failed (control escaping and absorbing terminal
+  state). After implementation: 3 passed, 0 failed.
+- Independent `confirmation_specimen_review` ran the 3 model tests, then reviewed
+  state lifetime/reentrancy and identified missing button-state paint branches.
+  Those branches were added and passed targeted source recheck. Verdict: ready
+  for human validation, not runtime UI PASS.
+- Complete isolated `cargo test --manifest-path spikes/process-elevation-feasibility/Cargo.toml --locked --offline --all-features`:
+  3 specimen tests plus 13 other tests passed; 1 owned child entrypoint ignored.
+- All-target/all-feature strict Clippy passed; rustfmt applied.
+- Release static-CRT build succeeded. Binary SHA-256:
+  `a69585d2f7b8a507d928bf6cbd758bc757a5d9d0ba07216f6efd36ad5f804478`.
+
+Binary: `spikes/process-elevation-feasibility/target/release/uipilot-confirmation-specimen.exe`.
+It requires explicit `--show light` or `--show dark`; no arguments do not open UI.
+No window was displayed during preparation, and no screenshot/render/keyboard
+check is claimed. Neither UAC probe binary nor temporary installation was changed.
+
+Human checks still needed: initial Enter returns Cancelled; Escape/close cancels;
+Tab/Shift+Tab traverse visible controls; selecting row 256 exposes the complete
+long path; row 255 shows escaped controls; intentional confirmation returns only
+ConfirmedSimulation; Light/Dark, high contrast, scaling and accessible names are
+usable. A normal-token window does not prove a high-integrity UI integration.
+Task 1 remains incomplete; no Task 2 or Stage 3 work started.

@@ -6,6 +6,7 @@ rust-version = "1.96"
 publish = false
 
 [features]
+confirmation-specimen = ["windows/Win32_Graphics_Gdi", "windows/Win32_Graphics_Dwm", "windows/Win32_UI_WindowsAndMessaging", "windows/Win32_UI_Controls", "windows/Win32_UI_Accessibility", "windows/Win32_UI_HiDpi", "windows/Win32_UI_Input_KeyboardAndMouse", "windows/Win32_System_LibraryLoader"]
 uac-probe = ["windows/Win32_Security_Cryptography", "windows/Win32_System_IO", "windows/Win32_System_Pipes", "windows/Win32_System_Threading", "windows/Win32_System_RemoteDesktop", "windows/Win32_System_Registry", "windows/Win32_UI_WindowsAndMessaging"]
 
 [[bin]]
@@ -13,6 +14,11 @@ name = "uipilot-uac-probe"
 path = "src/bin/uac_probe.rs"
 required-features = ["uac-probe"]
 test = false
+
+[[bin]]
+name = "uipilot-confirmation-specimen"
+path = "src/bin/confirmation_specimen.rs"
+required-features = ["confirmation-specimen"]
 
 [dependencies]
 windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
