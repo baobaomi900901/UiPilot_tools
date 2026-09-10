@@ -194,3 +194,39 @@ observed; the remote-rejection flag was set, not tested with a remote client.
 No actual installation, UAC, elevated fixture or native confirmation was run.
 Remaining Task 1 work includes the protected host/helper probe, negative identity
 cases, cancellation/late-helper behavior and the approved manual experiment.
+
+### Ordinary-Token Rejection And Cancellation Follow-up (2026-09-10)
+
+On the diff over `9fb5691`, added four real owned-child scenarios:
+
+- Correct pipe, wrong expected parent PID: fixture requires ServerMismatch before
+  any challenge is supplied.
+- Correct PID, wrong expected creationTime: fixture requires ServerChanged before
+  any challenge is supplied.
+- Parent closes its endpoint, then releases the child's stdin start gate: the
+  late child cannot connect and requires ConnectDeadline. No sleep determines
+  this event order; the 100 ms connection budget starts inside the released child.
+- Client confirms host identity and sends a readiness marker; parent observes it
+  and closes the endpoint: the client requires PipeDisconnected, not ReadDeadline.
+
+The child asserts the exact expected error; an unrelated failure or success makes
+its test process fail. Happy-path launches explicitly clear the scenario/expected
+error environment variables. The parent observes child completion with a deadline;
+the existing owned-child guard remains responsible for failed-path cleanup.
+
+Initial focused run: 4 passed, 1 failed, 1 ignored in 15.30 seconds. The new
+disconnect case exposed read_frame retrying every native error until timeout.
+Changed only the test probe: BROKEN_PIPE/PIPE_NOT_CONNECTED return PipeDisconnected;
+NO_DATA/PIPE_LISTENING remain retryable; other errors return PipeReadFailed.
+Focused rerun: 5 passed, 0 failed, 1 ignored in 0.28 seconds. Strict all-target
+Clippy passed after removing a redundant unit expression; rustfmt applied.
+
+These tests validate ordinary-token expected-parent identity rejection and
+endpoint lifecycle, not UAC cancellation, privileged helper launch or production
+caller authentication. Protected image verification, wrong-account/session/token
+cases, elevated native confirmation and actual installation remain untested.
+
+Independent `pipe_negative_cases_review`: no blocking findings; full isolated
+package tests passed (9 passed, 0 failed, 1 ignored child entrypoint; 0.13 seconds).
+Nonblocking coverage caveat: disconnect asserts the stable classification, not
+an independent elapsed-time upper bound. No installation or UAC performed.

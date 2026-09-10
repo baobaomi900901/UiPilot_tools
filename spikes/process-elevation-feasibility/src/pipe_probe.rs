@@ -1,15 +1,19 @@
 //! Ordinary-token, owned-child experiment only. Never linked into the installer checker.
 use std::{
     ffi::c_void,
+    io::{Read, Write},
     os::windows::{ffi::OsStrExt, io::AsRawHandle},
     process::{Child, Command, Stdio},
     ptr, thread,
     time::{Duration, Instant},
 };
 use windows::{
-    core::{PCWSTR, PWSTR},
+    core::{HRESULT, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LocalFree, FILETIME, HANDLE, HLOCAL},
+        Foundation::{
+            CloseHandle, LocalFree, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_LISTENING,
+            ERROR_PIPE_NOT_CONNECTED, FILETIME, HANDLE, HLOCAL,
+        },
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -199,8 +203,18 @@ fn read_frame(pipe: HANDLE, deadline: Instant) -> Probe<[u8; 32]> {
     while offset < frame.len() {
         let mut count = 0;
         let result = unsafe { ReadFile(pipe, Some(&mut frame[offset..]), Some(&mut count), None) };
-        if result.is_ok() {
-            offset += count as usize;
+        match result {
+            Ok(()) => offset += count as usize,
+            Err(error)
+                if error.code() == HRESULT::from_win32(ERROR_BROKEN_PIPE.0)
+                    || error.code() == HRESULT::from_win32(ERROR_PIPE_NOT_CONNECTED.0) =>
+            {
+                return Err("PipeDisconnected");
+            }
+            Err(error)
+                if error.code() == HRESULT::from_win32(ERROR_NO_DATA.0)
+                    || error.code() == HRESULT::from_win32(ERROR_PIPE_LISTENING.0) => {}
+            Err(_) => return Err("PipeReadFailed"),
         }
         if offset == frame.len() {
             return Ok(frame);
@@ -269,7 +283,19 @@ fn child_fixture() {
             .map_err(|_| "FixtureInputMissing")?
             .parse()
             .map_err(|_| "FixtureInputInvalid")?;
-        let deadline = Instant::now() + TIMEOUT;
+        let scenario = std::env::var("UIPILOT_PIPE_PROBE_SCENARIO").unwrap_or_default();
+        if scenario == "late" {
+            let mut signal = [0u8];
+            std::io::stdin()
+                .read_exact(&mut signal)
+                .map_err(|_| "StartGateClosed")?;
+        }
+        let budget = if scenario == "late" {
+            Duration::from_millis(100)
+        } else {
+            TIMEOUT
+        };
+        let deadline = Instant::now() + budget;
         let pipe = open_client(&name, deadline)?;
         let mut pid = 0;
         unsafe { GetNamedPipeServerProcessId(pipe.0, &mut pid) }
@@ -284,6 +310,9 @@ fn child_fixture() {
         if created(parent.0)? != expected_time {
             return Err("ServerChanged");
         }
+        if scenario == "disconnect" {
+            write_frame(pipe.0, &[0x52; 32])?;
+        }
         let challenge = read_frame(pipe.0, deadline)?;
         write_frame(pipe.0, &challenge)?;
         if read_frame(pipe.0, deadline)? != challenge {
@@ -291,7 +320,13 @@ fn child_fixture() {
         }
         Ok(())
     }
-    assert_eq!(run(), Ok(()));
+    let expected = std::env::var("UIPILOT_PIPE_PROBE_EXPECT").unwrap_or_default();
+    let result = run();
+    if expected.is_empty() {
+        assert_eq!(result, Ok(()));
+    } else {
+        assert_eq!(result, Err(expected.as_str()));
+    }
 }
 
 #[test]
@@ -318,6 +353,8 @@ fn owned_cross_process_pipe_binds_peers_and_limits_impersonation() {
             Command::new(std::env::current_exe().map_err(|_| "FixtureExecutableUnavailable")?)
                 .args(["--exact", "pipe_probe::child_fixture", "--ignored"])
                 .env("UIPILOT_PIPE_PROBE_NAME", name_text)
+                .env("UIPILOT_PIPE_PROBE_SCENARIO", "")
+                .env("UIPILOT_PIPE_PROBE_EXPECT", "")
                 .env("UIPILOT_PIPE_PROBE_PID", std::process::id().to_string())
                 .env(
                     "UIPILOT_PIPE_PROBE_TIME",
@@ -370,4 +407,106 @@ fn owned_cross_process_pipe_binds_peers_and_limits_impersonation() {
         Ok(())
     }
     assert_eq!(run(), Ok(()));
+}
+
+fn rejected_fixture(scenario: &str, expected: &str) -> Probe<()> {
+    let mut nonce = [0u8; 32];
+    unsafe { BCryptGenRandom(None, &mut nonce, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+        .ok()
+        .map_err(|_| "RandomUnavailable")?;
+    let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    let name = format!(r"\\.\pipe\uipilot-rejected-probe-{suffix}");
+    let sddl = format!("D:P(A;;0x{ACCESS:08x};;;{})", logon_sid()?);
+    let pipe = server(&wide(&name), &sddl)?;
+    unsafe {
+        let _ = ConnectNamedPipe(pipe.0, None);
+    }
+    let pid = if scenario == "wrong_pid" {
+        0
+    } else {
+        std::process::id()
+    };
+    let creation = created(unsafe { GetCurrentProcess() })?;
+    let creation = if scenario == "wrong_time" {
+        creation ^ 1
+    } else {
+        creation
+    };
+    let child = Command::new(std::env::current_exe().map_err(|_| "FixtureExecutableUnavailable")?)
+        .args(["--exact", "pipe_probe::child_fixture", "--ignored"])
+        .env("UIPILOT_PIPE_PROBE_NAME", &name)
+        .env("UIPILOT_PIPE_PROBE_PID", pid.to_string())
+        .env("UIPILOT_PIPE_PROBE_TIME", creation.to_string())
+        .env("UIPILOT_PIPE_PROBE_SCENARIO", scenario)
+        .env("UIPILOT_PIPE_PROBE_EXPECT", expected)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "FixtureSpawnFailed")?;
+    let mut child = Fixture(child);
+    let deadline = Instant::now() + TIMEOUT + Duration::from_secs(2);
+    match scenario {
+        "late" => {
+            // Deterministic ordering: invalidate endpoint BEFORE allowing client open.
+            drop(pipe);
+            child
+                .0
+                .stdin
+                .take()
+                .ok_or("StartGateMissing")?
+                .write_all(&[1])
+                .map_err(|_| "StartGateClosed")?;
+        }
+        "disconnect" => {
+            // Client has checked the host identity before this readiness frame.
+            if read_frame(pipe.0, deadline)? != [0x52; 32] {
+                return Err("InvalidReadiness");
+            }
+            drop(pipe);
+        }
+        _ => {
+            // Keep the server alive while the client rejects its expected identity.
+            wait_fixture(&mut child, deadline)?;
+            drop(pipe);
+            return Ok(());
+        }
+    }
+    wait_fixture(&mut child, deadline)
+}
+
+fn wait_fixture(child: &mut Fixture, deadline: Instant) -> Probe<()> {
+    loop {
+        if let Some(status) = child.0.try_wait().map_err(|_| "FixtureWaitFailed")? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err("FixtureRejected")
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err("FixtureExitDeadline");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn wrong_parent_pid_is_rejected_before_challenge() {
+    assert_eq!(rejected_fixture("wrong_pid", "ServerMismatch"), Ok(()));
+}
+
+#[test]
+fn wrong_parent_creation_time_is_rejected_before_challenge() {
+    assert_eq!(rejected_fixture("wrong_time", "ServerChanged"), Ok(()));
+}
+
+#[test]
+fn cancelled_endpoint_rejects_late_client() {
+    assert_eq!(rejected_fixture("late", "ConnectDeadline"), Ok(()));
+}
+
+#[test]
+fn host_disconnect_after_authentication_is_reported_without_waiting_for_deadline() {
+    assert_eq!(rejected_fixture("disconnect", "PipeDisconnected"), Ok(()));
 }
