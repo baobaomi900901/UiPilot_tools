@@ -152,3 +152,45 @@ directory before rejection. No zero-filesystem-effects claim applies to an actua
 installer run. The helper IPC/token/UAC/native-confirmation probe remains pending;
 Task 1 is not complete and Task 2 has not started. The generated installer must not
 be installed merely because compilation passed.
+
+## Ordinary-Token Pipe Experiment (2026-09-10)
+
+Added `spikes/process-elevation-feasibility/src/pipe_probe.rs`, included only under
+`cfg(all(test, windows))`. Extra Windows APIs are dev-dependencies; the installer
+checker has no pipe/child-launch mode. This increment validates actual Win32 calls
+before constructing an elevated experiment, not production protocol code or Task 2.
+
+The experiment creates one local byte-mode named pipe using a random 256-bit name,
+an explicit current-logon-SID DACL with specific data/attribute/synchronize rights,
+first-instance exclusivity and remote-client rejection. It launches only its own
+test executable's ignored child fixture, with retained Child ownership. Both ends
+compare OS-reported peer PID and observed creation time; the host binds the peer
+to its owned child's process handle. A random challenge/echo/ack proves a complete
+exchange before the fixture exits.
+
+The client opens with identification-only SQOS. After reading its response, the
+server inspects the actual thread token under impersonation and requires
+SecurityIdentification, then reverts on every exit/unwind. A failure to revert
+aborts the test process rather than continuing under another identity. NOWAIT I/O,
+15-second polling deadline and owned-child cleanup bound the experiment's waits;
+cleanup never searches or terminates a process by name. Ordinary logs suppress
+fixture output and emit only stable failure classifications.
+
+Validation on the diff over `c0a9ec2`:
+
+- Focused `cargo test --manifest-path spikes/process-elevation-feasibility/Cargo.toml --locked --offline pipe_probe::owned_cross_process -- --test-threads=1`:
+  1 passed, 0 failed, 0.04 seconds test time.
+- Independent `ordinary_pipe_probe_review` ran the full isolated package suite:
+  5 passed, 0 failed, 1 ignored (the explicitly spawned child entrypoint).
+- Strict all-target Clippy passed; rustfmt applied. Independent review found no
+  actionable issue in the scoped ordinary-token experiment.
+
+This is native experimental evidence, not a fabricated test-first RED for an
+existing Windows API. No production implementation was added. It does not prove
+wrong-account or elevated-token rejection, image/package trust, hostile peer
+resistance, remote-session rejection, UAC behavior, or privileged impersonation
+failure against a protected resource. Only the identification token level was
+observed; the remote-rejection flag was set, not tested with a remote client.
+No actual installation, UAC, elevated fixture or native confirmation was run.
+Remaining Task 1 work includes the protected host/helper probe, negative identity
+cases, cancellation/late-helper behavior and the approved manual experiment.

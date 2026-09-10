@@ -14,6 +14,9 @@ fn unsafe_grant(mask: u32, sid: &str, ancestor: bool) -> bool {
 #[cfg(windows)]
 mod native;
 
+#[cfg(all(test, windows))]
+mod pipe_probe;
+
 fn main() {
     #[cfg(windows)]
     let result = native::run();

@@ -7,3 +7,6 @@ publish = false
 
 [dependencies]
 windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
+
+[dev-dependencies]
+windows = { version = "=0.61.3", features = ["Win32_Security_Cryptography", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
