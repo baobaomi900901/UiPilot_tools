@@ -329,3 +329,86 @@ blocker; independently ran feature tests (13 passed, 1 ignored), verified both
 safe release commands and confirmed the exact proposed binary SHA-256. No elevated
 command or installation was run by the reviewer. Awaiting explicit authorization
 for this concrete temporary deployment and UAC experiment.
+
+## Authorized Installed UAC Experiment (2026-09-10)
+
+The user explicitly authorized the concrete temporary deployment, handshake and
+cleanup after reviewing the inventory. Executed the already reviewed binary
+SHA-256 `5931eb64cc72d6da8a29deb71129938e2068c27206ecc29cbe46096aff753291`
+at source revision `326f3ef`; no product/probe code changes in this run.
+
+### Deployment And Independent Inspection
+
+The fixed source digest and absent destination were rechecked. A bounded
+PowerShell deployment script was independently reviewed before execution. It was
+passed as an in-memory encoded command to hidden elevated PowerShell, not loaded
+from a mutable script path by the elevated interpreter. Its copy used the same
+read-locked source stream that had matched the approved hash, CreateNew output,
+explicit Administrators ownership and the reviewed protected ACLs.
+
+- Deployment process returned `DEPLOY_EXIT=0`.
+- Installed binary hash matched the approved digest.
+- Directory SDDL: `O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`.
+- File SDDL: `O:BAG:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)`.
+- Installed `inspect` returned UAC_PROBE_COMMAND_PASS, exit 0.
+- Independent `uac_deployment_review` reread the installed hash/ACLs and ran only
+  `inspect`; all matched. The reviewer did not perform a UAC operation.
+
+The deployment uses an absence precheck plus directory creation, not an atomic
+create-only directory primitive. Trusted parent permissions and post-create
+owner/ACL validation constrain ordinary-user interference; this is not a proof
+against concurrent malicious administrators.
+
+### Actual Medium-to-High Handshake
+
+Executed the documented Verify command with the approved SHA-256. It returned
+two UAC_PROBE_COMMAND_PASS lines and exit 0 (installed inspection, then handshake).
+Under the reviewed executable's success conditions this demonstrates, on this
+machine and account:
+
+- ShellExecuteEx runas supplied a usable retained helper process handle.
+- Actual high-integrity enabled-admin helper and medium-integrity host had matching
+  TokenUser and local-console session; both could perform the required observations.
+- Both ends matched exact peer PID/creationTime and the fixed protected image.
+- The logon-SID pipe ACL allowed the elevated client without generic-write grants.
+- Nonce challenge/echo/ack completed; server observed SecurityIdentification SQOS.
+- Host observed helper exit and exit code 0 before returning success.
+
+This does not prove process-operation behavior, arbitrary high-process access,
+actual cross-account denial, or a protected-resource impersonation attempt. The
+probe has no such operations. No existing user/application process was terminated.
+
+### Cancellation Attempt: NOT VERIFIED
+
+The user-facing instruction requested cancellation for the next UAC invocation.
+That invocation instead returned UAC_PROBE_COMMAND_PASS and exit 0. Record it as a
+second successful handshake, not UacCancelled. No inference is made about which
+button was pressed or whether Windows policy displayed a consent prompt.
+No automatic retry or further cancellation attempt was made.
+
+Actual UAC cancellation, the 120-second launch-wait expiry/late-helper path and
+prompt dismissal remain unverified. Ordinary-token endpoint-cancellation tests
+above are separate evidence and cannot substitute for these Windows observations.
+
+### Cleanup
+
+The reviewed cleanup verified the fixed non-reparse directory, exact single-file
+contents and matching binary hash. It removed only that file and the empty owned
+directory; no recursive deletion or process-name termination was used.
+
+- Elevated cleanup returned `CLEANUP_EXIT=0`.
+- Parent `Test-Path -LiteralPath 'C:\Program Files\UiPilot Elevation Probe'` returned False.
+- Read-only process-name lookup returned no currently running probe; nothing was
+  killed through that lookup.
+- Workspace-built artifacts remain in ignored target directories for evidence;
+  the temporary Program Files installation is gone. No services, registry entries
+  or shortcuts were created by this experiment.
+
+Task 1 remains IN PROGRESS: native confirmation specimen and its human checks,
+actual UAC cancellation/late-helper evidence, and remaining rejection scenarios
+are not complete. This successful echo experiment does not authorize Task 2 or
+constitute Stage 2D acceptance.
+
+Independent final check by `uac_deployment_review`: temporary directory absent,
+zero currently named probe processes, and cancellation-NOT-VERIFIED interpretation
+confirmed. No further UAC attempt was performed during that review.
