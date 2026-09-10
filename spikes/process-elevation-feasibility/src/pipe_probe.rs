@@ -1,11 +1,23 @@
-//! Ordinary-token, owned-child experiment only. Never linked into the installer checker.
+//! Experimental transport shared by the owned tests and opt-in UAC probe, never the installer checker.
 use std::{
     ffi::c_void,
-    io::{Read, Write},
-    os::windows::{ffi::OsStrExt, io::AsRawHandle},
-    process::{Child, Command, Stdio},
+    os::windows::ffi::OsStrExt,
     ptr, thread,
     time::{Duration, Instant},
+};
+#[cfg(test)]
+use std::{
+    io::{Read, Write},
+    os::windows::io::AsRawHandle,
+    process::{Child, Command, Stdio},
+};
+#[cfg(test)]
+use windows::Win32::{
+    Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
+    System::{
+        Pipes::{ConnectNamedPipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
+        Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    },
 };
 use windows::{
     core::{HRESULT, PCWSTR, PWSTR},
@@ -18,7 +30,6 @@ use windows::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             },
-            Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
             GetTokenInformation, RevertToSelf, SecurityIdentification, TokenGroups,
             TokenImpersonationLevel, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
             SECURITY_IMPERSONATION_LEVEL, TOKEN_GROUPS, TOKEN_QUERY,
@@ -30,22 +41,22 @@ use windows::{
         },
         System::{
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
-                GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, SetNamedPipeHandleState,
-                PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+                CreateNamedPipeW, ImpersonateNamedPipeClient, SetNamedPipeHandleState, PIPE_NOWAIT,
+                PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
             },
             Threading::{
-                GetCurrentProcess, GetCurrentThread, GetProcessTimes, OpenProcess,
-                OpenProcessToken, OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
+                GetCurrentProcess, GetCurrentThread, GetProcessTimes, OpenProcessToken,
+                OpenThreadToken,
             },
         },
     },
 };
 
-type Probe<T> = Result<T, &'static str>;
+pub(super) type Probe<T> = Result<T, &'static str>;
 const ACCESS: u32 = 0x00100183; // Data read/write + attributes + synchronize; NOT create-instance.
+#[cfg(test)]
 const TIMEOUT: Duration = Duration::from_secs(15);
-struct Owned(HANDLE);
+pub(super) struct Owned(pub(super) HANDLE);
 impl Drop for Owned {
     fn drop(&mut self) {
         unsafe {
@@ -61,7 +72,9 @@ impl Drop for Allocation {
         }
     }
 }
+#[cfg(test)]
 struct Fixture(Child);
+#[cfg(test)]
 impl Drop for Fixture {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -79,13 +92,13 @@ impl Drop for Fixture {
     }
 }
 
-fn wide(value: &str) -> Vec<u16> {
+pub(super) fn wide(value: &str) -> Vec<u16> {
     std::ffi::OsStr::new(value)
         .encode_wide()
         .chain(Some(0))
         .collect()
 }
-fn created(handle: HANDLE) -> Probe<u64> {
+pub(super) fn created(handle: HANDLE) -> Probe<u64> {
     let mut times = [FILETIME::default(); 4];
     unsafe {
         GetProcessTimes(
@@ -100,7 +113,7 @@ fn created(handle: HANDLE) -> Probe<u64> {
     Ok((u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
 }
 
-fn logon_sid() -> Probe<String> {
+pub(super) fn logon_sid() -> Probe<String> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
         .map_err(|_| "TokenUnavailable")?;
@@ -138,7 +151,7 @@ fn logon_sid() -> Probe<String> {
     Err("LogonSidUnavailable")
 }
 
-fn server(name: &[u16], sddl: &str) -> Probe<Owned> {
+pub(super) fn server(name: &[u16], sddl: &str) -> Probe<Owned> {
     let mut sd = PSECURITY_DESCRIPTOR::default();
     let sddl = wide(sddl);
     unsafe {
@@ -172,7 +185,7 @@ fn server(name: &[u16], sddl: &str) -> Probe<Owned> {
     }
 }
 
-fn open_client(name: &[u16], deadline: Instant) -> Probe<Owned> {
+pub(super) fn open_client(name: &[u16], deadline: Instant) -> Probe<Owned> {
     loop {
         if let Ok(pipe) = unsafe {
             CreateFileW(
@@ -197,7 +210,7 @@ fn open_client(name: &[u16], deadline: Instant) -> Probe<Owned> {
     }
 }
 
-fn read_frame(pipe: HANDLE, deadline: Instant) -> Probe<[u8; 32]> {
+pub(super) fn read_frame(pipe: HANDLE, deadline: Instant) -> Probe<[u8; 32]> {
     let mut frame = [0u8; 32];
     let mut offset = 0;
     while offset < frame.len() {
@@ -226,7 +239,7 @@ fn read_frame(pipe: HANDLE, deadline: Instant) -> Probe<[u8; 32]> {
     }
     Ok(frame)
 }
-fn write_frame(pipe: HANDLE, frame: &[u8; 32]) -> Probe<()> {
+pub(super) fn write_frame(pipe: HANDLE, frame: &[u8; 32]) -> Probe<()> {
     let mut written = 0;
     unsafe { WriteFile(pipe, Some(frame), Some(&mut written), None) }.map_err(|_| "WriteFailed")?;
     if written != 32 {
@@ -235,7 +248,7 @@ fn write_frame(pipe: HANDLE, frame: &[u8; 32]) -> Probe<()> {
     Ok(())
 }
 
-fn assert_identification_only(pipe: HANDLE) -> Probe<()> {
+pub(super) fn assert_identification_only(pipe: HANDLE) -> Probe<()> {
     unsafe { ImpersonateNamedPipeClient(pipe) }.map_err(|_| "ImpersonationUnavailable")?;
     // Revert on every return/unwind, before any fixture cleanup or file operation.
     struct Revert;
@@ -409,6 +422,7 @@ fn owned_cross_process_pipe_binds_peers_and_limits_impersonation() {
     assert_eq!(run(), Ok(()));
 }
 
+#[cfg(test)]
 fn rejected_fixture(scenario: &str, expected: &str) -> Probe<()> {
     let mut nonce = [0u8; 32];
     unsafe { BCryptGenRandom(None, &mut nonce, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
@@ -475,6 +489,7 @@ fn rejected_fixture(scenario: &str, expected: &str) -> Probe<()> {
     wait_fixture(&mut child, deadline)
 }
 
+#[cfg(test)]
 fn wait_fixture(child: &mut Fixture, deadline: Instant) -> Probe<()> {
     loop {
         if let Some(status) = child.0.try_wait().map_err(|_| "FixtureWaitFailed")? {

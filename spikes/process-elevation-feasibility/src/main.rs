@@ -1,21 +1,16 @@
-const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
-
-fn trusted_writer(sid: &str) -> bool {
-    matches!(sid, "S-1-5-18" | "S-1-5-32-544") || sid == TRUSTED_INSTALLER
-}
-
-fn unsafe_grant(mask: u32, sid: &str, ancestor: bool) -> bool {
-    // WRITE_DATA/APPEND_DATA on an ancestor can create siblings, but cannot
-    // replace an existing protected child. DELETE_CHILD still must be denied.
-    let mutation = if ancestor { 0x500d0150 } else { 0x500d0156 };
-    !trusted_writer(sid) && mask & mutation != 0
-}
+mod policy;
+#[cfg(test)]
+use policy::TRUSTED_INSTALLER;
+use policy::{trusted_writer, unsafe_grant};
 
 #[cfg(windows)]
 mod native;
 
 #[cfg(all(test, windows))]
 mod pipe_probe;
+
+#[cfg(all(test, windows, feature = "uac-probe"))]
+mod uac_identity;
 
 fn main() {
     #[cfg(windows)]

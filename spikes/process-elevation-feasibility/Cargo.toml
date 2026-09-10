@@ -5,6 +5,15 @@ edition = "2021"
 rust-version = "1.96"
 publish = false
 
+[features]
+uac-probe = ["windows/Win32_Security_Cryptography", "windows/Win32_System_IO", "windows/Win32_System_Pipes", "windows/Win32_System_Threading", "windows/Win32_System_RemoteDesktop", "windows/Win32_System_Registry", "windows/Win32_UI_WindowsAndMessaging"]
+
+[[bin]]
+name = "uipilot-uac-probe"
+path = "src/bin/uac_probe.rs"
+required-features = ["uac-probe"]
+test = false
+
 [dependencies]
 windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
 

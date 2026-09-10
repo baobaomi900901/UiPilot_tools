@@ -25,7 +25,7 @@ use windows::{
 };
 
 type Check<T> = Result<T, &'static str>;
-struct Handle(HANDLE);
+pub(super) struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
@@ -137,13 +137,13 @@ fn inspect(path: &Path, ancestor: bool) -> Check<Handle> {
     Ok(handle)
 }
 
-fn expected_directory() -> Check<PathBuf> {
+fn program_files() -> Check<PathBuf> {
     unsafe {
         let value = SHGetKnownFolderPath(&FOLDERID_ProgramFilesX64, KF_FLAG_DEFAULT, None)
             .map_err(|_| "KnownFolderUnavailable")?;
         let text = value.to_string();
         CoTaskMemFree(Some(value.0.cast()));
-        Ok(PathBuf::from(text.map_err(|_| "InvalidPath")?).join("UiPilot_tools Protected"))
+        Ok(PathBuf::from(text.map_err(|_| "InvalidPath")?))
     }
 }
 
@@ -163,6 +163,7 @@ fn inspect_tree(path: &Path, leases: &mut Vec<Handle>) -> Check<()> {
     Ok(())
 }
 
+#[allow(dead_code, reason = "Shared with the opt-in probe binary")]
 pub(super) fn run() -> Check<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() != 2
@@ -173,12 +174,17 @@ pub(super) fn run() -> Check<()> {
     {
         return Err("InvalidArguments");
     }
-    let expected = expected_directory()?;
+    let expected = program_files()?.join("UiPilot_tools Protected");
     // Exact fixed destination prevents /D, relative, alternate stream and dot-path
     // variants. It intentionally does not accept arbitrary user-selected roots.
     if args[1] != expected.as_os_str() {
         return Err("UnexpectedInstallDirectory");
     }
+    verify_directory(&expected, args[0] == "preinstall")?;
+    Ok(())
+}
+
+fn verify_directory(expected: &Path, allow_missing: bool) -> Check<Vec<Handle>> {
     let mut ancestors: Vec<_> = expected.ancestors().skip(1).collect();
     ancestors.reverse();
     let root = ancestors.first().ok_or("InvalidPath")?;
@@ -205,12 +211,40 @@ pub(super) fn run() -> Check<()> {
     for path in ancestors {
         leases.push(inspect(path, true)?);
     }
-    match fs::symlink_metadata(&expected) {
-        Ok(_) => inspect_tree(&expected, &mut leases)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && args[0] == "preinstall" => (),
+    match fs::symlink_metadata(expected) {
+        Ok(_) => inspect_tree(expected, &mut leases)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => (),
         Err(_) => return Err("InstallDirectoryUnavailable"),
     }
-    Ok(())
+    Ok(leases)
+}
+
+#[cfg(feature = "uac-probe")]
+#[allow(dead_code, reason = "Used only by the opt-in probe binary")]
+pub(super) fn probe_installation() -> Check<(PathBuf, Vec<Handle>)> {
+    let directory = program_files()?.join("UiPilot Elevation Probe");
+    let executable = directory.join("uipilot-uac-probe.exe");
+    if std::env::current_exe().map_err(|_| "ExecutableUnavailable")? != executable {
+        return Err("UntrustedProbeLocation");
+    }
+    let mut leases = verify_directory(&directory, false)?;
+    let path = wide(executable.as_os_str())?;
+    // Hold the exact executable against write/delete through the whole handshake.
+    leases.push(Handle(
+        unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                0x20080,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|_| "ExecutableLeaseDenied")?,
+    ));
+    Ok((executable, leases))
 }
 
 #[cfg(test)]

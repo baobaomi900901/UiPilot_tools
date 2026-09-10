@@ -230,3 +230,102 @@ Independent `pipe_negative_cases_review`: no blocking findings; full isolated
 package tests passed (9 passed, 0 failed, 1 ignored child entrypoint; 0.13 seconds).
 Nonblocking coverage caveat: disconnect asserts the stable classification, not
 an independent elapsed-time upper bound. No installation or UAC performed.
+
+## Protected UAC Probe Prepared (2026-09-10)
+
+Prepared an opt-in `uipilot-uac-probe` executable under the isolated spike's
+`uac-probe` feature; it is not a shipped helper or a Stage 2 implementation.
+Its commands are `inspect`, `self-token-check`, `host`, and internal `helper`.
+Only `host` can request UAC, and only after its own executable is verified at the
+fixed protected installation location. The installed command is a nonce
+challenge/echo/ack experiment, with no process stop/restart, plugin or user command.
+It does not yet implement the native 256-row confirmation specimen.
+
+Changes:
+
+- `src/policy.rs` shares the existing ACL policy without algorithm changes.
+  `native.rs` shares directory verification and provides the separate fixed probe
+  location check; existing installer-check command behavior remains intact.
+- `src/bin/uac_probe.rs` holds directory leases and a no-write/no-delete executable
+  lease through the handshake; authenticates actual pipe peer PID/creationTime
+  and fixed image path. Host binds helper to the returned ShellExecuteEx HANDLE.
+- `src/uac_identity.rs` independently reads tokens: initiating host must be medium
+  integrity in the active local console session; helper must be high-integrity,
+  elevated, enabled Administrators member, same TokenUser and same session. SYSTEM,
+  alternate-account, remote/session mismatch and unavailable observations reject.
+- The existing pipe transport is shared with the opt-in binary; child fixtures
+  and fixture termination remain `cfg(test)` only. Installer checker has no new
+  runtime launch mode. Tests explicitly cover account/session/role rejection;
+  synthetic role tests are not actual alternate-account UAC evidence.
+- Launch runs on a COM-initialized worker with a 120-second coordinator wait.
+  Ownership transfers through a rendezvous channel; failed delivery closes the
+  worker's HANDLE. This timeout is not a cancellation of the OS UAC prompt or
+  ShellExecute operation. A late helper must fail without a valid host/pipe.
+- `scripts/test-process-elevation-feasibility.ps1` defaults to Check (read-only
+  inventory), supports Prepare (local build), and requires an explicit matching
+  ApprovedSha256 for Verify against the fixed installed file. Verify may request
+  UAC; it has not been run. No mode installs files or repairs existing ACLs.
+
+### Exact Proposed Experiment Inventory — Not Yet Authorized Or Executed
+
+Source binary:
+`spikes/process-elevation-feasibility/target/release/uipilot-uac-probe.exe`.
+
+SHA-256: `5931eb64cc72d6da8a29deb71129938e2068c27206ecc29cbe46096aff753291`.
+
+Fixed destination: `C:\Program Files\UiPilot Elevation Probe` (absent when checked).
+Single installed file: `uipilot-uac-probe.exe`. No services, registry entries,
+shortcuts, user data migration or changes to the installed UiPilot application.
+
+Directory security descriptor:
+`O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`.
+The new file must likewise be owned by Administrators, with SYSTEM/Administrators
+full access and Users read/execute only; no user-writable explicit ACE.
+
+After explicit experiment approval, the installation action must require the
+destination to remain absent, validate the existing non-reparse ancestor chain,
+create the protected directory with this descriptor, and copy the reviewed binary
+from a handle held against writes/deletion after hashing it against the approved
+digest. Set/verify file ownership and DACL; rehash the installed bytes. Abort if
+the destination already exists; never reuse or repair it. A deployment failure
+must report any created path and clean only this action's proven owned artifacts.
+
+Then run installed `inspect` and the ordinary-token runner:
+
+```text
+powershell.exe -NoProfile -File scripts/test-process-elevation-feasibility.ps1 -Mode Verify -ApprovedSha256 5931eb64cc72d6da8a29deb71129938e2068c27206ecc29cbe46096aff753291
+```
+
+The user must handle Windows UAC themselves. Successful consent and canceled
+consent are separate recorded observations; never automatically retry cancellation.
+No alternate account or extra administrator credentials are needed for the first
+same-account experiment. After helper/host exit, cleanup verifies the exact owned
+non-reparse directory and file/hash, deletes only the single installed file, then
+removes the empty directory. Do not recurse into unexpected contents or terminate
+processes by name. Preserve/report unexpected state rather than deleting it.
+
+### Preparation Evidence And Limits
+
+- Feature-enabled isolated tests: 13 passed, 0 failed, 1 ignored owned child entry.
+- Feature-enabled strict all-target Clippy passed; rustfmt applied.
+- Prepare built the release executable using `cargo rustc ... -- -C target-feature=+crt-static`.
+  Initial dynamic VCRUNTIME dependency was removed before proposing deployment.
+- `dumpbin /DEPENDENTS` on the final binary lists only shell32, ole32, kernel32,
+  advapi32, bcrypt, api-ms-win-core-synch-l1-2-0, oleaut32 and ntdll (kernel32 also
+  appears with uppercase spelling). No app-local VC runtime dependency remains.
+  This import-table inspection does not prove every possible dynamic OS load.
+- Final release `self-token-check`: exit 0, UAC_PROBE_COMMAND_PASS.
+- Final release `inspect` from the worktree: exit 1, UntrustedProbeLocation.
+- No actual `host`, `helper`, installed `Verify`, installation, elevation or native
+  confirmation was executed during preparation.
+
+Task 1 remains incomplete. Installed medium→high token inspection, protected image
+compatibility, ShellExecute returned-handle behavior, actual UAC cancellation/late
+helper exit and native confirmation still need evidence. A source review cannot
+substitute for these observations. Tasks 2–6 remain unstarted.
+
+Independent `uac_probe_preparation_review`: source/runner review found no confirmed
+blocker; independently ran feature tests (13 passed, 1 ignored), verified both
+safe release commands and confirmed the exact proposed binary SHA-256. No elevated
+command or installation was run by the reviewer. Awaiting explicit authorization
+for this concrete temporary deployment and UAC experiment.
