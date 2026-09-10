@@ -465,3 +465,30 @@ long path; row 255 shows escaped controls; intentional confirmation returns only
 ConfirmedSimulation; Light/Dark, high contrast, scaling and accessible names are
 usable. A normal-token window does not prove a high-integrity UI integration.
 Task 1 remains incomplete; no Task 2 or Stage 3 work started.
+
+### Human Keyboard Finding And Enter Routing Fix
+
+The user verified Light initial Enter closes with CONFIRMATION_SPECIMEN_Cancelled.
+The user then confirmed one Tab moves the visible focus rectangle to the simulation
+Confirm button, but Enter still returned Cancelled. Therefore initial Cancel and
+Tab focus movement were observed; focused-confirm activation failed.
+
+Source investigation found DM_GETDEFID always returned Cancel, while DM_SETDEFID
+was ignored. With the owner-drawn buttons this retained the Cancel action despite
+the focused Confirm. On the user's explicit repair request, changed only the
+specimen routing: DM_GETDEFID queries current focus and button enabled state,
+selecting Confirm only for the exact valid enabled Confirm HWND. All other focus
+states select Cancel. No sticky Confirm default is stored when focus leaves it.
+
+Added three regression cases for focused Confirm, initial/other focus and
+disabled/absent Confirm. The first run failed the focused-Confirm assertion
+(returned Cancel ID 2, expected Confirm ID 1); the other two passed. After the
+fix, all six specimen tests passed. Strict all-target Clippy for the specimen
+feature passed, and the static-CRT release binary was rebuilt at the original path.
+Rebuilt specimen SHA-256:
+`d76e9454ff78d5d4cfa9643eb7da7e11b804aad8c206c59791f179775ef7e613`.
+
+Independent `confirmation_enter_fix_review` found no actionable issue and reran
+all six tests successfully. No GUI or input synthesis was performed by the agent.
+Actual native Tab→Enter and retained initial-Enter behavior after this change
+still require human retest; unit policy checks do not establish runtime UI PASS.

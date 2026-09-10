@@ -17,7 +17,7 @@ use windows::{
             Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED},
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED},
-            Input::KeyboardAndMouse::SetFocus,
+            Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled, SetFocus},
             WindowsAndMessaging::*,
         },
     },
@@ -27,6 +27,13 @@ const LIST: usize = 100;
 const DETAIL: usize = 101;
 const CANCEL: usize = 2;
 const CONFIRM: usize = 1;
+fn enter_button(focus: HWND, confirm: HWND, confirm_enabled: bool) -> usize {
+    if !confirm.is_invalid() && focus == confirm && confirm_enabled {
+        CONFIRM
+    } else {
+        CANCEL
+    }
+}
 fn text(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
@@ -261,8 +268,17 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             info.ptMinTrackSize.y = 440;
             LRESULT(0)
         }
-        DM_GETDEFID => LRESULT(((DC_HASDEFID << 16) | CANCEL as u32) as isize),
-        DM_SETDEFID => LRESULT(1), // The default remains Cancel; focused button still works.
+        DM_GETDEFID => {
+            let id = enter_button(
+                GetFocus(),
+                app.confirm.get(),
+                IsWindowEnabled(app.confirm.get()).as_bool(),
+            );
+            LRESULT(((DC_HASDEFID << 16) | id as u32) as isize)
+        }
+        // Do not keep a sticky Confirm default after focus moves back to the list.
+        // DM_GETDEFID derives the safe action from the current focus each time.
+        DM_SETDEFID => LRESULT(1),
         WM_COMMAND => {
             let id = wp.0 & 0xffff;
             if id == CANCEL {
@@ -445,5 +461,34 @@ pub(super) fn show(dark: bool) -> Result<Outcome, &'static str> {
             return Err("UnexpectedWindowExit");
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn handle(value: usize) -> HWND {
+        HWND(std::ptr::without_provenance_mut(value))
+    }
+
+    #[test]
+    fn enter_routes_to_the_explicitly_focused_confirm_button() {
+        let confirm = handle(101);
+        assert_eq!(enter_button(confirm, confirm, true), CONFIRM);
+    }
+
+    #[test]
+    fn initial_and_non_confirm_focus_keep_cancel_as_default() {
+        let confirm = handle(101);
+        for focus in [HWND::default(), handle(102), handle(103), handle(104)] {
+            assert_eq!(enter_button(focus, confirm, true), CANCEL);
+        }
+    }
+
+    #[test]
+    fn disabled_or_absent_confirm_cannot_become_the_default() {
+        let confirm = handle(101);
+        assert_eq!(enter_button(confirm, confirm, false), CANCEL);
+        assert_eq!(enter_button(HWND::default(), HWND::default(), true), CANCEL);
     }
 }
