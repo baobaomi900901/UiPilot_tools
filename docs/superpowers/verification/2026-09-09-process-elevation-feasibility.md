@@ -543,3 +543,10 @@ and reported that text, button borders and the focus rectangle were clear. The
 specimen's launch-time high-contrast palette path therefore received a manual
 visual check. No UAC or process operation was involved. Narrator/accessibility
 tree, DPI scaling and theme-change-while-open remain unverified.
+
+## DPI Scaling Human Check (2026-09-11)
+
+The user tested the Dark confirmation specimen at Windows 150% display scaling
+and reported that the window, text, controls and long-path content were clear and
+as expected. This validates the observed specimen layout at that scale only;
+other DPI values and live scaling changes remain unverified.
