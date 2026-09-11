@@ -525,3 +525,13 @@ Read-only UAC policy inventory from this attempt: `EnableLUA=1`,
 prompt-for-consent for non-Windows binaries on the secure desktop. The automation
 environment still returned success without a distinguishable cancel result. No
 UAC registry value was changed.
+
+## Fresh Install Non-Reuse Check (2026-09-11)
+
+The reviewed single-file probe was deployed once to the fixed empty directory
+(`DEPLOY1_EXIT=0`). A second Deploy attempt against that existing directory
+returned `DEPLOY2_EXIT=1` through the `DestinationAlreadyExists` path before copy.
+Exact-file cleanup returned `CLEANUP_EXIT=0`, and the directory was absent.
+No upgrade, overwrite, ACL repair, recursive deletion or other process operation
+was performed. This validates fresh-install non-reuse and cleanup only; it is not
+an upgrade test of a released installer.
