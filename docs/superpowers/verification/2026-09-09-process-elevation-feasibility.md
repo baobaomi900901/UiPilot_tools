@@ -550,3 +550,12 @@ The user tested the Dark confirmation specimen at Windows 150% display scaling
 and reported that the window, text, controls and long-path content were clear and
 as expected. This validates the observed specimen layout at that scale only;
 other DPI values and live scaling changes remain unverified.
+
+## Narrator Human Check (2026-09-11)
+
+The user enabled Windows Narrator and navigated the Light specimen with the
+keyboard. Narrator correctly identified and navigated the synthetic target list,
+target details, Cancel button and simulation confirmation button. The user then
+closed the specimen and disabled Narrator. This validates the observed accessibility
+names and keyboard traversal for the specimen only; it does not validate a
+privileged helper or production host UI.
