@@ -29,6 +29,10 @@ mod native_attention;
 mod process_control;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+#[allow(dead_code, reason = "Task 2 supplies the private protocol boundary")]
+mod process_elevation;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
