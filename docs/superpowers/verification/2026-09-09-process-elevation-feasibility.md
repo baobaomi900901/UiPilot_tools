@@ -413,6 +413,22 @@ Independent final check by `uac_deployment_review`: temporary directory absent,
 zero currently named probe processes, and cancellation-NOT-VERIFIED interpretation
 confirmed. No further UAC attempt was performed during that review.
 
+## Human Native Confirmation Verification (2026-09-11)
+
+The user manually verified the rebuilt Light and Dark confirmation specimens.
+
+- Light: initial focus is Cancel; direct Enter returned
+  `CONFIRMATION_SPECIMEN_Cancelled`. After one Tab, the focus rectangle moved to
+  “仅确认模拟”; Enter returned `CONFIRMATION_SPECIMEN_ConfirmedSimulation`.
+  Escape returned `CONFIRMATION_SPECIMEN_Cancelled`.
+- Dark: text, buttons and focus rectangle were reported clear. The final synthetic
+  row (PID 50256) displayed its long path through `end.exe`; the user reported no
+  overlap in the detail area. The same Enter/Escape behavior was already verified
+  on the rebuilt specimen path.
+
+This is evidence for the synthetic UI specimen only. It does not mean privileged
+helper UI is implemented. The specimen has no real target, IPC request, or effect.
+
 ## Native Confirmation Specimen Prepared (2026-09-10)
 
 Added opt-in `confirmation-specimen` feature and a separate
