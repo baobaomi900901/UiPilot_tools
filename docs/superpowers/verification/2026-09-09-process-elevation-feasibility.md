@@ -535,3 +535,11 @@ Exact-file cleanup returned `CLEANUP_EXIT=0`, and the directory was absent.
 No upgrade, overwrite, ACL repair, recursive deletion or other process operation
 was performed. This validates fresh-install non-reuse and cleanup only; it is not
 an upgrade test of a released installer.
+
+## High-Contrast Human Check (2026-09-11)
+
+The user opened the Light specimen while a Windows high-contrast theme was active
+and reported that text, button borders and the focus rectangle were clear. The
+specimen's launch-time high-contrast palette path therefore received a manual
+visual check. No UAC or process operation was involved. Narrator/accessibility
+tree, DPI scaling and theme-change-while-open remain unverified.
