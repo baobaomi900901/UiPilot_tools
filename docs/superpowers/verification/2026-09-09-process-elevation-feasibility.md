@@ -518,3 +518,10 @@ result was observed; no inference is made about which UAC action occurred or
 whether a prompt was displayed. No retry followed. Exact-file cleanup returned
 `CLEANUP_EXIT=0` and removed the temporary directory. UAC cancellation and prompt
 dismissal remain unverified.
+
+Read-only UAC policy inventory from this attempt: `EnableLUA=1`,
+`ConsentPromptBehaviorAdmin=5`, `PromptOnSecureDesktop=1`, current user SID
+`S-1-5-21-1376216-3913106280-371338448-1000`. Microsoft documents value 5 as
+prompt-for-consent for non-Windows binaries on the secure desktop. The automation
+environment still returned success without a distinguishable cancel result. No
+UAC registry value was changed.
