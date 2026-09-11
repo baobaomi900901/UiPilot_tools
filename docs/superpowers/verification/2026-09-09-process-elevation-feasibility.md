@@ -508,3 +508,13 @@ Independent `confirmation_enter_fix_review` found no actionable issue and reran
 all six tests successfully. No GUI or input synthesis was performed by the agent.
 Actual native Tab→Enter and retained initial-Enter behavior after this change
 still require human retest; unit policy checks do not establish runtime UI PASS.
+
+## Second UAC Cancellation Attempt (2026-09-11)
+
+The reviewed binary was redeployed to the same empty fixed directory and `host`
+was launched once. The user was instructed to cancel the UAC prompt, but the
+process again returned `UAC_PROBE_COMMAND_PASS` with exit 0. No `UacCancelled`
+result was observed; no inference is made about which UAC action occurred or
+whether a prompt was displayed. No retry followed. Exact-file cleanup returned
+`CLEANUP_EXIT=0` and removed the temporary directory. UAC cancellation and prompt
+dismissal remain unverified.
