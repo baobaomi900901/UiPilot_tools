@@ -1,7 +1,7 @@
 # Stage 2D Windows Process Elevation Implementation Plan
 
 **Date:** 2026-09-09
-**Status:** APPROVED — accepted by the user on 2026-09-09. Issue 2 coverage completed. Task 1 in progress: separately approved optional protected packaging implemented/built; full native feasibility and installation/UAC remain pending. Tasks 2–6 not started.
+**Status:** IN PROGRESS — Task 1 remains partially accepted with documented manual gaps; user explicitly authorized proceeding to Task 2. Task 2 protocol/session implementation is complete and independently reviewed; Tasks 3–6 are not started.
 **Approved design:** [Windows Process Elevation](../specs/2026-09-09-windows-process-elevation-design.md), accepted by user continuation after `bf38290`.
 
 Deliver one same-account, one-shot privileged stop workflow. The ordinary host
@@ -131,6 +131,9 @@ The runner must require the approved deployment configuration and refuse default
 that install, elevate or change permissions without that configuration.
 
 ### Task 2: Private Shared Boundary And Strict Session Protocol
+
+Implementation checkpoint: isolated protocol/session modules are implemented;
+independent review passed with no blocking findings.
 
 **Files:** process_elevation `mod.rs`, `protocol.rs`, `session.rs`; helper package
 manifest/lock and `src/main.rs`; existing host manifest/lock and `lib.rs`.
