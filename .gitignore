@@ -84,6 +84,7 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+.task3-target/
 node_modules/
 .worktrees/
 artifacts/systemindex-spike/
