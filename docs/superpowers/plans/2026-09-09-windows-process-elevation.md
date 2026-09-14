@@ -1,7 +1,7 @@
 # Stage 2D Windows Process Elevation Implementation Plan
 
 **Date:** 2026-09-09
-**Status:** IN PROGRESS — Task 1 remains partially accepted with documented manual gaps; user explicitly authorized proceeding to Task 2. Task 2 protocol/session implementation is complete and independently reviewed; Tasks 3–6 are not started.
+**Status:** IN PROGRESS — user authorized proceeding despite the recorded Task 1 gaps. Task 2 shared host/helper boundary was independently reviewed. Task 3 native transport, launch and peer-observation work is in progress; full authenticated session integration is not complete. Tasks 4–6 have not started.
 **Approved design:** [Windows Process Elevation](../specs/2026-09-09-windows-process-elevation-design.md), accepted by user continuation after `bf38290`.
 
 Deliver one same-account, one-shot privileged stop workflow. The ordinary host
@@ -154,6 +154,10 @@ ID/version; second task after terminal; report budget rejection before effects.
 and `cargo check --manifest-path src-tauri/process-elevation-helper/Cargo.toml --locked --offline`.
 
 ### Task 3: Trusted Launch And Authenticated Local Transport
+
+Current checkpoint: [native peer observation evidence](../verification/2026-09-15-process-elevation-peer-observation.md).
+Observed PID/time/token account/session/image path is not package verification or
+authorization; the full trust and authenticated-session gate remains outstanding.
 
 **Files:** process_elevation `trust.rs`, `pipe.rs`, `launch.rs`, `mod.rs`, `session.rs`;
 helper `src/main.rs`; manifest/lock feature adjustments only as needed.

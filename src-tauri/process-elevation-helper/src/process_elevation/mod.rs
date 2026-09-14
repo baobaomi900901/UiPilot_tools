@@ -1,3 +1,6 @@
+#[cfg(windows)]
+#[path = "../../../src/process_elevation/peer.rs"]
+pub(crate) mod peer;
 #[path = "../../../src/process_elevation/pipe.rs"]
 pub(crate) mod pipe;
 #[path = "../../../src/process_elevation/protocol.rs"]

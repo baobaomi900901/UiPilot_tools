@@ -1,4 +1,6 @@
 mod launch;
+#[cfg(windows)]
+mod peer;
 mod pipe;
 mod protocol;
 mod session;
