@@ -10,7 +10,8 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, FILETIME, HANDLE},
+        System::Threading::{GetProcessId, GetProcessTimes},
         UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
     },
 };
@@ -134,6 +135,54 @@ pub(crate) fn launch_runas(
     Ok(ElevatedProcess(info.hProcess))
 }
 
+#[cfg(windows)]
+pub(crate) fn launch_helper(
+    coordinator: &LaunchCoordinator,
+    package: &crate::process_elevation::TrustPackage,
+    parameters: &str,
+) -> Result<ElevatedProcess, &'static str> {
+    let reservation = coordinator.reserve()?;
+    match launch_runas(package, parameters) {
+        Ok(process) => {
+            let pid = unsafe { GetProcessId(process.raw()) };
+            let mut times = [FILETIME::default(); 4];
+            if pid == 0
+                || unsafe {
+                    GetProcessTimes(
+                        process.raw(),
+                        &mut times[0],
+                        &mut times[1],
+                        &mut times[2],
+                        &mut times[3],
+                    )
+                }
+                .is_err()
+            {
+                let _ = reservation.complete(LaunchResult::LaunchFailed);
+                return Err("PeerIdentityUnavailable");
+            }
+            let creation_time =
+                (u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime);
+            if creation_time == 0 {
+                let _ = reservation.complete(LaunchResult::LaunchFailed);
+                return Err("PeerIdentityUnavailable");
+            }
+            let _ = reservation.complete(LaunchResult::Started { pid, creation_time });
+            Ok(process)
+        }
+        Err(error) => {
+            let result = match error {
+                "LaunchHandleMissing" => LaunchResult::LaunchFailed,
+                "LaunchFailed" => LaunchResult::LaunchFailed,
+                "UntrustedInstallation" | "InvalidLaunchArgument" => LaunchResult::LaunchFailed,
+                _ => LaunchResult::LaunchFailed,
+            };
+            let _ = reservation.complete(result);
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +248,23 @@ mod tests {
             launch_runas(&package, "bad\0arg"),
             Err("UntrustedInstallation")
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_launch_releases_reservation_when_pre_shell_validation_fails() {
+        use std::path::PathBuf;
+        let coordinator = LaunchCoordinator::default();
+        let package = crate::process_elevation::TrustPackage::new(
+            PathBuf::from(r"C:\safe"),
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+        .unwrap();
+        assert!(matches!(
+            launch_helper(&coordinator, &package, "bad\0arg"),
+            Err("UntrustedInstallation")
+        ));
+        assert!(!coordinator.is_pending());
     }
 }
