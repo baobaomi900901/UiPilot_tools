@@ -1,0 +1,72 @@
+use super::protocol::{decode_frame, encode_frame, MAX_FRAME};
+use std::io::{Read, Write};
+
+pub(crate) fn read_frame<R: Read, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<T, &'static str> {
+    let mut header = [0u8; 4];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| "ProtocolRejected")?;
+    let length = u32::from_le_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME - 4 {
+        return Err("ProtocolRejected");
+    }
+    let mut payload = vec![0u8; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|_| "ProtocolRejected")?;
+    let mut frame = Vec::with_capacity(MAX_FRAME.min(length + 4));
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&payload);
+    decode_frame(&frame)
+}
+
+pub(crate) fn write_frame<W: Write, T: serde::Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), &'static str> {
+    let frame = encode_frame(value)?;
+    writer
+        .write_all(&frame)
+        .map_err(|_| "TransportUnavailable")?;
+    writer.flush().map_err(|_| "TransportUnavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_elevation::protocol::RootSelector;
+    use crate::process_elevation::{Operation, Request, Scope};
+
+    fn request() -> Request {
+        Request {
+            version: 1,
+            request_id: "a".repeat(64),
+            scope: Scope::Single,
+            operation: Operation::Terminate,
+            root: RootSelector {
+                pid: 7,
+                creation_time: 11,
+            },
+        }
+    }
+    #[test]
+    fn bounded_reader_and_writer_round_trip_a_typed_frame() {
+        let value = request();
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &value).unwrap();
+        assert_eq!(
+            read_frame::<_, Request>(&mut bytes.as_slice()).unwrap(),
+            value
+        );
+    }
+    #[test]
+    fn rejects_declared_payload_before_allocating_it() {
+        let header = (MAX_FRAME as u32).to_le_bytes();
+        assert_eq!(
+            read_frame::<_, Request>(&mut header.as_slice()),
+            Err("ProtocolRejected")
+        );
+    }
+}

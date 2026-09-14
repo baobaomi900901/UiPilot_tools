@@ -1,6 +1,13 @@
+mod pipe;
 mod protocol;
 mod session;
+mod trust;
 
+#[allow(
+    unused_imports,
+    reason = "Task 3 wires transport and trust into the coordinator"
+)]
+pub(crate) use pipe::{read_frame, write_frame};
 #[allow(
     unused_imports,
     reason = "Task 3 wires the private boundary into the coordinator"
@@ -14,6 +21,11 @@ pub(crate) use protocol::{
     reason = "Task 3 wires the private boundary into the coordinator"
 )]
 pub(crate) use session::{Phase, Session};
+#[allow(
+    unused_imports,
+    reason = "Task 3 wires peer verification into the coordinator"
+)]
+pub(crate) use trust::{verify_peer, PeerIdentity, TrustPackage};
 
 #[cfg(test)]
 mod tests {
