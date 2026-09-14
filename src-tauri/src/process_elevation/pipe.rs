@@ -1,5 +1,24 @@
-use super::protocol::{decode_frame, encode_frame, MAX_FRAME};
+use super::protocol::{decode_frame, encode_frame, validate_request, Request, MAX_FRAME};
 use std::io::{Read, Write};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalPipeName(String);
+
+impl LocalPipeName {
+    pub(crate) fn from_nonce(nonce: &str) -> Result<Self, &'static str> {
+        if nonce.len() != 64
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("ProtocolRejected");
+        }
+        Ok(Self(format!(r"\\.\pipe\uipilot-elevation-{nonce}")))
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 pub(crate) fn read_frame<R: Read, T: serde::de::DeserializeOwned>(
     reader: &mut R,
@@ -31,6 +50,12 @@ pub(crate) fn write_frame<W: Write, T: serde::Serialize>(
         .write_all(&frame)
         .map_err(|_| "TransportUnavailable")?;
     writer.flush().map_err(|_| "TransportUnavailable")
+}
+
+pub(crate) fn read_validated_request<R: Read>(reader: &mut R) -> Result<Request, &'static str> {
+    let request: Request = read_frame(reader)?;
+    validate_request(&request)?;
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -66,6 +91,37 @@ mod tests {
         let header = (MAX_FRAME as u32).to_le_bytes();
         assert_eq!(
             read_frame::<_, Request>(&mut header.as_slice()),
+            Err("ProtocolRejected")
+        );
+    }
+
+    #[test]
+    fn pipe_name_is_local_and_nonce_bound() {
+        let name = LocalPipeName::from_nonce(&"a".repeat(64)).unwrap();
+        assert_eq!(
+            name.as_str(),
+            r"\\.\pipe\uipilot-elevation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(LocalPipeName::from_nonce(&"A".repeat(64)).is_err());
+        assert!(LocalPipeName::from_nonce(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn request_reader_applies_semantic_validation_before_returning() {
+        let invalid = Request {
+            version: 1,
+            request_id: "a".repeat(64),
+            scope: Scope::Single,
+            operation: Operation::Terminate,
+            root: RootSelector {
+                pid: 0,
+                creation_time: 11,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &invalid).unwrap();
+        assert_eq!(
+            read_validated_request(&mut bytes.as_slice()),
             Err("ProtocolRejected")
         );
     }
