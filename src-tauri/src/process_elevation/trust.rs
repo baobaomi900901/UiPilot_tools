@@ -47,6 +47,9 @@ impl TrustPackage {
     pub(crate) fn helper_digest(&self) -> &str {
         &self.helper_digest
     }
+    pub(crate) fn helper_path(&self) -> std::path::PathBuf {
+        self.root.join("uipilot-process-elevation-helper.exe")
+    }
 }
 
 pub(crate) fn verify_peer(
