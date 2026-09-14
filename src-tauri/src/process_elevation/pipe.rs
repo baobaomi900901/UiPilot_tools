@@ -6,18 +6,19 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 #[cfg(windows)]
 use windows::{
-    core::PCWSTR,
+    core::{HRESULT, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE},
         Security::{
             Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
             PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
         },
+        Storage::FileSystem::{ReadFile, WriteFile},
         Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
         System::Pipes::{
-            CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-            SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-            PIPE_TYPE_BYTE,
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+            GetNamedPipeServerProcessId, SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_READMODE_BYTE,
+            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
         },
     },
 };
@@ -43,6 +44,9 @@ impl LocalPipeName {
 
 #[cfg(windows)]
 pub(crate) struct LocalPipeServer(HANDLE);
+
+#[cfg(windows)]
+pub(crate) struct PipeStream(HANDLE);
 
 #[cfg(windows)]
 impl LocalPipeServer {
@@ -111,10 +115,64 @@ impl LocalPipeServer {
     pub(crate) fn raw(&self) -> HANDLE {
         self.0
     }
+    pub(crate) fn connect(&self) -> Result<(), &'static str> {
+        match unsafe { ConnectNamedPipe(self.0, None) } {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => Ok(()),
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_LISTENING.0) => {
+                Err("PipeConnectionPending")
+            }
+            Err(_) => Err("PipeConnectionFailed"),
+        }
+    }
+    pub(crate) fn disconnect(&self) -> Result<(), &'static str> {
+        unsafe { DisconnectNamedPipe(self.0) }.map_err(|_| "PipeDisconnectFailed")
+    }
+    pub(crate) fn into_stream(self) -> PipeStream {
+        let handle = self.0;
+        std::mem::forget(self);
+        PipeStream(handle)
+    }
 }
 
 #[cfg(windows)]
 impl Drop for LocalPipeServer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Read for PipeStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        unsafe { ReadFile(self.0, Some(buffer), Some(&mut count), None) }
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe read failed"))?;
+        Ok(count as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Write for PipeStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let mut count = 0;
+        unsafe { WriteFile(self.0, Some(buffer), Some(&mut count), None) }.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe write failed")
+        })?;
+        Ok(count as usize)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PipeStream {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.0);
