@@ -1,8 +1,14 @@
+mod launch;
 mod pipe;
 mod protocol;
 mod session;
 mod trust;
 
+#[allow(
+    unused_imports,
+    reason = "Task 3 wires launch lifecycle into the coordinator"
+)]
+pub(crate) use launch::{LaunchCoordinator, LaunchReservation, LaunchResult};
 #[allow(
     unused_imports,
     reason = "Task 3 wires transport and trust into the coordinator"
