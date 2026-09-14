@@ -1,15 +1,8 @@
-#[path = "../../src/process_elevation/protocol.rs"]
 #[allow(
     dead_code,
-    reason = "Task 3 wires protocol handling into this fail-closed shell"
+    reason = "Task 3 helper compiles the same private transport boundary"
 )]
-mod protocol;
-#[path = "../../src/process_elevation/session.rs"]
-#[allow(
-    dead_code,
-    reason = "Task 3 wires lifecycle handling into this fail-closed shell"
-)]
-mod session;
+mod process_elevation;
 
 fn main() {
     // Task 2 deliberately ships a fail-closed helper shell. Task 3 owns launch,
