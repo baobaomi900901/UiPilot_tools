@@ -13,7 +13,7 @@ pub(crate) use launch::{LaunchCoordinator, LaunchReservation, LaunchResult};
     unused_imports,
     reason = "Task 3 wires transport and trust into the coordinator"
 )]
-pub(crate) use pipe::{read_frame, write_frame};
+pub(crate) use pipe::{read_frame, read_validated_request, write_frame};
 #[allow(
     unused_imports,
     reason = "Task 3 wires the private boundary into the coordinator"
