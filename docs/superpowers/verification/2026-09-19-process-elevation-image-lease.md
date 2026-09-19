@@ -65,3 +65,7 @@ sharing, file identity and RAII. No concrete blocker remained. Actual volume-GUI
 ShellExecute/UAC compatibility and returned elevated-process verification were
 NOT exercised; the current-process test does not substitute for that integration.
 No installation, UAC, GUI or target-process operation was performed.
+
+Follow-up: [held-object permission checks](./2026-09-19-process-elevation-held-permissions.md)
+now run before the helper image lease reaches the launcher. Manifest/version,
+dependency trust and actual GUID-path UAC compatibility remain separate gates.

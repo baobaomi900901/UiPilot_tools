@@ -52,7 +52,9 @@ impl TrustPackage {
     }
     #[cfg(windows)]
     pub(crate) fn lease_helper_image(&self) -> Result<super::image::ImageLease, &'static str> {
-        super::image::ImageLease::acquire(&self.helper_path(), &self.helper_digest)
+        let image = super::image::ImageLease::acquire(&self.helper_path(), &self.helper_digest)?;
+        image.verify_installation_permissions()?;
+        Ok(image)
     }
 }
 

@@ -3,6 +3,8 @@ mod image;
 mod launch;
 #[cfg(windows)]
 mod peer;
+#[cfg(windows)]
+mod permissions;
 mod pipe;
 mod protocol;
 mod session;

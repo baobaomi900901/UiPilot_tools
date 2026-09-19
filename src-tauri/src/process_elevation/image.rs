@@ -25,7 +25,7 @@ type ImageResult<T> = Result<T, &'static str>;
 
 pub(crate) struct ImageLease {
     file: File,
-    _directories: Vec<File>,
+    directories: Vec<File>,
     path: PathBuf,
     identity: (u32, u64),
 }
@@ -68,6 +68,18 @@ impl ImageLease {
     }
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+    pub(crate) fn verify_installation_permissions(&self) -> ImageResult<()> {
+        use super::permissions::{verify_held_file, ObjectRole};
+        for (index, directory) in self.directories.iter().enumerate() {
+            let role = if index + 1 == self.directories.len() {
+                ObjectRole::PackageDirectory
+            } else {
+                ObjectRole::Ancestor
+            };
+            verify_held_file(directory, role)?;
+        }
+        verify_held_file(&self.file, ObjectRole::Image)
     }
     pub(crate) fn verify_process_image(&self, process: HANDLE) -> ImageResult<()> {
         if unsafe { WaitForSingleObject(process, 0) } != WAIT_TIMEOUT {
@@ -146,7 +158,7 @@ fn open_component(path: &str, directory: bool) -> ImageResult<File> {
     let file = OpenOptions::new()
         .read(true)
         .access_mode(if directory {
-            FILE_READ_ATTRIBUTES.0
+            FILE_READ_ATTRIBUTES.0 | 0x00020000 // READ_CONTROL for held-handle ACL inspection.
         } else {
             GENERIC_READ.0
         })
@@ -219,7 +231,7 @@ fn lock_path(path: &Path) -> ImageResult<ImageLease> {
             let identity = identity(&file)?;
             return Ok(ImageLease {
                 file,
-                _directories: directories,
+                directories,
                 path: current.into(),
                 identity,
             });
@@ -259,7 +271,11 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             for dir in ["sub", "moved"] {
-                for file in ["helper.exe", "renamed.exe"] {
+                for file in [
+                    "helper.exe",
+                    "renamed.exe",
+                    "uipilot-process-elevation-helper.exe",
+                ] {
                     let _ = fs::remove_file(self.0.join(dir).join(file));
                 }
                 let _ = fs::remove_dir(self.0.join(dir));
@@ -290,6 +306,25 @@ mod tests {
             Err("ImageDigestMismatch")
         ));
         fs::rename(fixture.0.join("sub"), fixture.0.join("moved")).unwrap();
+    }
+
+    #[test]
+    fn matching_digest_in_user_owned_package_is_rejected_before_launch() {
+        let fixture = Fixture::new();
+        let helper = fixture.0.join("sub/uipilot-process-elevation-helper.exe");
+        fs::rename(fixture.path(), &helper).unwrap();
+        let package = crate::process_elevation::trust::TrustPackage::new(
+            fixture.0.join("sub"),
+            ABC.into(),
+            ABC.into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            package.lease_helper_image(),
+            Err("UntrustedOwner" | "UntrustedWriteGrant")
+        ));
+        // Even the digest was correct; rejection must release the previously held file.
+        fs::write(&helper, b"released").unwrap();
     }
 
     #[test]

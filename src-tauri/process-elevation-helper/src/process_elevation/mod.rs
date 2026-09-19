@@ -4,12 +4,17 @@ pub(crate) mod image;
 #[cfg(windows)]
 #[path = "../../../src/process_elevation/peer.rs"]
 pub(crate) mod peer;
+#[cfg(windows)]
+#[path = "../../../src/process_elevation/permissions.rs"]
+pub(crate) mod permissions;
 #[path = "../../../src/process_elevation/pipe.rs"]
 pub(crate) mod pipe;
 #[path = "../../../src/process_elevation/protocol.rs"]
 pub(crate) mod protocol;
 #[path = "../../../src/process_elevation/session.rs"]
 pub(crate) mod session;
+#[path = "../../../src/process_elevation/trust.rs"]
+pub(crate) mod trust;
 #[allow(
     unused_imports,
     reason = "Task 3 wires these exports into the helper session"
