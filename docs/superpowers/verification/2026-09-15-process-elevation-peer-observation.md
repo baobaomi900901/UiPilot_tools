@@ -57,3 +57,14 @@ Independent `native_peer_observation_review` reviewed buffer bounds, identity
 ordering, RAII and scope, independently ran the helper suite, and found no
 blocking issue. Actual UAC/package-trust acceptance and prior manual gaps are
 unchanged; this is not Task 3 or Stage 2D final acceptance.
+
+## Image Digest Preparation Note
+
+The next trust increment adds a SHA-256 helper that streams an absolute path and
+rejects parent-directory components, malformed digests and mismatched bytes. Its
+focused tests pass. It is deliberately not re-exported or called by the launch
+wrapper yet: pathname hashing alone does not prevent reparse/junction resolution
+or a concurrent replacement between hashing and `ShellExecuteExW`. The eventual
+launch gate must hold a no-reparse file handle and bind the verified file identity
+to the launched helper. This limitation is recorded as an open Task 3 integration
+condition; the digest helper is not evidence of completed package trust.

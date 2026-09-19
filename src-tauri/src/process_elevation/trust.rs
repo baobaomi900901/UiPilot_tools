@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +74,29 @@ pub(crate) fn verify_peer(
     Ok(())
 }
 
+pub(crate) fn verify_image_digest(path: &Path, expected: &str) -> Result<(), &'static str> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        || !valid_digest(expected)
+    {
+        return Err("UntrustedInstallation");
+    }
+    let mut file = std::fs::File::open(path).map_err(|_| "ImageUnavailable")?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest).map_err(|_| "ImageUnavailable")?;
+    let actual = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual != expected {
+        return Err("ImageDigestMismatch");
+    }
+    Ok(())
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -137,6 +161,19 @@ mod tests {
                 "a".into(),
                 "b".into()
             ),
+            Err("UntrustedInstallation")
+        );
+    }
+
+    #[test]
+    fn image_digest_rejects_parent_paths_and_wrong_digest() {
+        let path = std::env::current_exe().unwrap();
+        assert_eq!(
+            verify_image_digest(&path, &"0".repeat(64)),
+            Err("ImageDigestMismatch")
+        );
+        assert_eq!(
+            verify_image_digest(Path::new(r"C:\workspace\..\helper.exe"), &"0".repeat(64)),
             Err("UntrustedInstallation")
         );
     }
