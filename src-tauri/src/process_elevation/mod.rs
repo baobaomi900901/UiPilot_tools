@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod image;
 mod launch;
 #[cfg(windows)]
 mod peer;

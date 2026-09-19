@@ -65,12 +65,15 @@ impl Drop for LaunchReservation {
 }
 
 #[cfg(windows)]
-pub(crate) struct ElevatedProcess(HANDLE);
+pub(crate) struct ElevatedProcess {
+    handle: HANDLE,
+    image: super::image::ImageLease,
+}
 
 #[cfg(windows)]
 impl ElevatedProcess {
     pub(crate) fn raw(&self) -> HANDLE {
-        self.0
+        self.handle
     }
 }
 
@@ -78,7 +81,7 @@ impl ElevatedProcess {
 impl Drop for ElevatedProcess {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseHandle(self.0);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -112,10 +115,17 @@ pub(crate) fn launch_runas(
     {
         return Err("UntrustedInstallation");
     }
+    let image = package.lease_helper_image()?;
     let verb = wide(OsStr::new("runas"))?;
-    let file = wide(executable.as_os_str())?;
+    let file = wide(image.path().as_os_str())?;
     let params = wide(OsStr::new(parameters))?;
-    let cwd = wide(directory.as_os_str())?;
+    let cwd = wide(
+        image
+            .path()
+            .parent()
+            .ok_or("UntrustedInstallation")?
+            .as_os_str(),
+    )?;
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -132,7 +142,12 @@ pub(crate) fn launch_runas(
     if info.hProcess.is_invalid() {
         return Err("LaunchHandleMissing");
     }
-    Ok(ElevatedProcess(info.hProcess))
+    let process = ElevatedProcess {
+        handle: info.hProcess,
+        image,
+    };
+    process.image.verify_process_image(process.raw())?;
+    Ok(process)
 }
 
 #[cfg(windows)]

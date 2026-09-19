@@ -68,3 +68,8 @@ or a concurrent replacement between hashing and `ShellExecuteExW`. The eventual
 launch gate must hold a no-reparse file handle and bind the verified file identity
 to the launched helper. This limitation is recorded as an open Task 3 integration
 condition; the digest helper is not evidence of completed package trust.
+
+Update: the path-only helper has now been replaced by a held image/ancestor
+lease; see [2026-09-19 image lease evidence](./2026-09-19-process-elevation-image-lease.md).
+Package ACL/manifest trust and actual GUID-path UAC compatibility remain separate
+outstanding requirements.
