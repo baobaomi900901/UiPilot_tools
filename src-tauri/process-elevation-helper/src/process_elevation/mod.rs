@@ -13,6 +13,9 @@ pub(crate) mod pipe;
 pub(crate) mod protocol;
 #[path = "../../../src/process_elevation/session.rs"]
 pub(crate) mod session;
+#[cfg(windows)]
+#[path = "../../../src/process_elevation/token.rs"]
+pub(crate) mod token;
 #[path = "../../../src/process_elevation/trust.rs"]
 pub(crate) mod trust;
 #[allow(

@@ -8,6 +8,8 @@ mod permissions;
 mod pipe;
 mod protocol;
 mod session;
+#[cfg(windows)]
+mod token;
 mod trust;
 
 #[allow(

@@ -4,15 +4,11 @@ use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 use windows::{
     core::PWSTR,
     Win32::{
-        Foundation::{CloseHandle, LocalFree, FILETIME, HANDLE, HLOCAL, WAIT_TIMEOUT},
-        Security::{
-            Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenSessionId, TokenUser,
-            TOKEN_QUERY, TOKEN_USER,
-        },
+        Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_TIMEOUT},
         System::{
             Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
             Threading::{
-                GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+                GetCurrentProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
                 WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
                 PROCESS_SYNCHRONIZE,
             },
@@ -89,26 +85,9 @@ impl ObservedPeer {
             return Err("PeerChanged");
         }
         ensure_live(process.0)?;
-        let mut token = HANDLE::default();
-        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }
-            .map_err(|_| "PeerTokenUnavailable")?;
-        let token = OwnedHandle(token);
-        let user_sid = token_user(token.0)?;
-        let mut session_id = 0u32;
-        let mut size = 0;
-        unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenSessionId,
-                Some((&mut session_id as *mut u32).cast()),
-                std::mem::size_of::<u32>() as u32,
-                &mut size,
-            )
-        }
-        .map_err(|_| "PeerTokenUnavailable")?;
-        if size != std::mem::size_of::<u32>() as u32 {
-            return Err("PeerTokenUnavailable");
-        }
+        let token = super::token::observe(process.0)?;
+        let user_sid = token.user_sid;
+        let session_id = token.session_id;
         let mut path = vec![0u16; 32768];
         let mut length = path.len() as u32;
         unsafe {
@@ -148,6 +127,20 @@ impl ObservedPeer {
     pub(crate) fn check_live(&self) -> Result<(), &'static str> {
         ensure_live(self.process.0)
     }
+    pub(crate) fn check_account_and_role(
+        &self,
+        role: super::token::PeerRole,
+    ) -> Result<(), &'static str> {
+        self.check_live()?;
+        let local = super::token::observe(unsafe { GetCurrentProcess() })?;
+        let peer = super::token::observe(self.process.0)?;
+        if peer.user_sid != self.facts.user_sid || peer.session_id != self.facts.session_id {
+            return Err("PeerChanged");
+        }
+        super::token::verify_pair(&local, &peer, role)?;
+        super::token::verify_local_console(local.session_id)?;
+        self.check_live()
+    }
 }
 
 fn ensure_live(process: HANDLE) -> Result<(), &'static str> {
@@ -168,58 +161,6 @@ fn pipe_pid(pipe: HANDLE, end: PeerEnd) -> Result<u32, &'static str> {
         return Err("PeerUnavailable");
     }
     Ok(pid)
-}
-
-fn token_user(token: HANDLE) -> Result<String, &'static str> {
-    let mut size = 0u32;
-    unsafe {
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut size);
-    }
-    if (size as usize) < std::mem::size_of::<TOKEN_USER>() || size > 65536 {
-        return Err("PeerTokenUnavailable");
-    }
-    let capacity = size;
-    let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
-    unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buffer.as_mut_ptr().cast()),
-            capacity,
-            &mut size,
-        )
-    }
-    .map_err(|_| "PeerTokenUnavailable")?;
-    if (size as usize) < std::mem::size_of::<TOKEN_USER>() || size > capacity {
-        return Err("PeerTokenUnavailable");
-    }
-    // Validate that the variable SID lies within this aligned token buffer before
-    // passing it to Win32. A SID header is 8 bytes plus four per subauthority.
-    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    let offset = (sid.0 as usize)
-        .checked_sub(buffer.as_ptr() as usize)
-        .ok_or("PeerTokenUnavailable")?;
-    if offset.checked_add(8).is_none_or(|end| end > size as usize) {
-        return Err("PeerTokenUnavailable");
-    }
-    let sid_bytes = sid.0.cast::<u8>();
-    let revision = unsafe { *sid_bytes };
-    let count = unsafe { *sid_bytes.add(1) };
-    if revision != 1 || count > 15 || offset + 8 + usize::from(count) * 4 > size as usize {
-        return Err("PeerTokenUnavailable");
-    }
-    let mut text = PWSTR::null();
-    unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(|_| "PeerTokenUnavailable")?;
-    struct SidText(PWSTR);
-    impl Drop for SidText {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = LocalFree(Some(HLOCAL(self.0 .0.cast())));
-            }
-        }
-    }
-    let text = SidText(text);
-    unsafe { text.0.to_string() }.map_err(|_| "PeerTokenUnavailable")
 }
 
 #[cfg(test)]
@@ -298,6 +239,15 @@ mod tests {
             assert!(peer.facts().session_id > 0);
             assert_eq!(peer.facts().image_path, std::env::current_exe().unwrap());
             assert_eq!(peer.check_live(), Ok(()));
+            // One actual process cannot be both the ordinary host and high helper.
+            assert_eq!(
+                peer.check_account_and_role(super::super::token::PeerRole::Helper),
+                Err("PeerRoleRejected")
+            );
+            assert_eq!(
+                peer.check_account_and_role(super::super::token::PeerRole::Host),
+                Err("PeerRoleRejected")
+            );
         }
     }
 
