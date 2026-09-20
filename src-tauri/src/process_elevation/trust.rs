@@ -132,6 +132,12 @@ impl TrustPackage {
     pub(crate) fn version(&self) -> &str {
         &self.version
     }
+    pub(crate) fn verify_version(&self, actual: &str) -> Result<(), &'static str> {
+        if !valid_version(actual) || actual != self.version {
+            return Err("PeerRejected");
+        }
+        Ok(())
+    }
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -262,6 +268,9 @@ mod tests {
         let bytes = br#"{"version":"0.3.4+build.1","host_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","helper_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
         let package = TrustPackage::from_manifest(root.clone(), bytes).unwrap();
         assert_eq!(package.version(), "0.3.4+build.1");
+        assert_eq!(package.verify_version("0.3.4+build.1"), Ok(()));
+        assert_eq!(package.verify_version("0.3.5"), Err("PeerRejected"));
+        assert_eq!(package.verify_version(""), Err("PeerRejected"));
         assert_eq!(
             TrustPackage::from_manifest(PathBuf::from(r"relative\..\package"), bytes),
             Err("UntrustedInstallation")
