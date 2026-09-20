@@ -68,6 +68,7 @@ pub(crate) struct PeerIdentity {
     pub(crate) user_sid: String,
     pub(crate) session_id: u32,
     pub(crate) image_digest: String,
+    pub(crate) package_version: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,7 +180,10 @@ pub(crate) fn verify_peer(
     if expected != actual {
         return Err("PeerRejected");
     }
-    if !valid_digest(&actual.image_digest) || !valid_sid(&actual.user_sid) || actual.session_id == 0
+    if !valid_digest(&actual.image_digest)
+        || !valid_sid(&actual.user_sid)
+        || !valid_version(&actual.package_version)
+        || actual.session_id == 0
     {
         return Err("PeerRejected");
     }
@@ -222,6 +226,7 @@ mod tests {
             user_sid: "S-1-5-21-1".into(),
             session_id: 1,
             image_digest: "a".repeat(64),
+            package_version: "0.3.4".into(),
         }
     }
     #[test]
@@ -241,6 +246,9 @@ mod tests {
             };
             assert_eq!(verify_peer(&peer(), &actual), Err("PeerRejected"));
         }
+        let mut version = peer();
+        version.package_version = "0.3.5".into();
+        assert_eq!(verify_peer(&peer(), &version), Err("PeerRejected"));
     }
     #[test]
     fn package_root_parent_escape_and_digest_shape_reject() {
