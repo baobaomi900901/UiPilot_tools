@@ -32,6 +32,7 @@ pub(crate) struct LaunchCoordinator {
 #[derive(Debug)]
 pub(crate) struct LaunchReservation {
     pending: Arc<AtomicBool>,
+    cancel_requested: bool,
 }
 
 impl LaunchCoordinator {
@@ -41,6 +42,7 @@ impl LaunchCoordinator {
             .map_err(|_| "LaunchAlreadyPending")?;
         Ok(LaunchReservation {
             pending: Arc::clone(&self.pending),
+            cancel_requested: false,
         })
     }
     pub(crate) fn is_pending(&self) -> bool {
@@ -48,7 +50,12 @@ impl LaunchCoordinator {
     }
 }
 impl LaunchReservation {
-    pub(crate) fn cancel_wait(&mut self) {}
+    pub(crate) fn cancel_wait(&mut self) {
+        self.cancel_requested = true;
+    }
+    pub(crate) fn cancel_requested(&self) -> bool {
+        self.cancel_requested
+    }
     pub(crate) fn complete(self, result: LaunchResult) -> LaunchResult {
         result
     }
@@ -212,6 +219,7 @@ mod tests {
         let coordinator = LaunchCoordinator::default();
         let mut reservation = coordinator.reserve().unwrap();
         reservation.cancel_wait();
+        assert!(reservation.cancel_requested());
         assert_eq!(
             reservation.complete(LaunchResult::LaunchExpired),
             LaunchResult::LaunchExpired
