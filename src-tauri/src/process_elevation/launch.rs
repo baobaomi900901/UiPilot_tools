@@ -32,7 +32,6 @@ pub(crate) struct LaunchCoordinator {
 #[derive(Debug)]
 pub(crate) struct LaunchReservation {
     pending: Arc<AtomicBool>,
-    returned: bool,
 }
 
 impl LaunchCoordinator {
@@ -42,7 +41,6 @@ impl LaunchCoordinator {
             .map_err(|_| "LaunchAlreadyPending")?;
         Ok(LaunchReservation {
             pending: Arc::clone(&self.pending),
-            returned: false,
         })
     }
     pub(crate) fn is_pending(&self) -> bool {
@@ -51,16 +49,15 @@ impl LaunchCoordinator {
 }
 impl LaunchReservation {
     pub(crate) fn cancel_wait(&mut self) {}
-    pub(crate) fn complete(mut self, result: LaunchResult) -> LaunchResult {
-        self.returned = true;
+    pub(crate) fn complete(self, result: LaunchResult) -> LaunchResult {
         result
     }
 }
 impl Drop for LaunchReservation {
     fn drop(&mut self) {
-        if self.returned {
-            self.pending.store(false, Ordering::Release);
-        }
+        // Dropping the reservation means its native launch call is no longer
+        // owned by this coordinator. Never strand the single pending slot.
+        self.pending.store(false, Ordering::Release);
     }
 }
 
@@ -208,7 +205,7 @@ mod tests {
         assert!(coordinator.is_pending());
         assert_eq!(coordinator.reserve().unwrap_err(), "LaunchAlreadyPending");
         drop(reservation);
-        assert!(coordinator.is_pending());
+        assert!(!coordinator.is_pending());
     }
     #[test]
     fn completion_releases_slot_after_success_or_failure() {
