@@ -166,24 +166,11 @@ fn pipe_pid(pipe: HANDLE, end: PeerEnd) -> Result<u32, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_elevation::pipe::{LocalPipeName, LocalPipeServer};
-    use std::{
-        ffi::OsStr,
-        os::windows::ffi::OsStrExt,
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    use windows::{
-        core::PCWSTR,
-        Win32::{
-            Storage::FileSystem::{
-                CreateFileW, FILE_SHARE_MODE, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-                SECURITY_SQOS_PRESENT,
-            },
-            System::Threading::{GetCurrentProcess, GetCurrentProcessId},
-        },
-    };
+    use crate::process_elevation::pipe::{LocalPipeName, LocalPipeServer, PipeStream};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
-    fn pipe_pair() -> (LocalPipeServer, OwnedHandle, u32, u64) {
+    fn pipe_pair() -> (LocalPipeServer, PipeStream, u32, u64) {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let pid = unsafe { GetCurrentProcessId() };
         let name = LocalPipeName::from_nonce(&format!(
@@ -193,24 +180,7 @@ mod tests {
         .unwrap();
         // This fixture uses owner-only permissions and no external process.
         let server = LocalPipeServer::create(&name, "D:P(A;;GA;;;OW)").unwrap();
-        let path: Vec<u16> = OsStr::new(name.as_str())
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let client = OwnedHandle(
-            unsafe {
-                CreateFileW(
-                    PCWSTR(path.as_ptr()),
-                    0x00100183,
-                    FILE_SHARE_MODE(0),
-                    None,
-                    OPEN_EXISTING,
-                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                    None,
-                )
-            }
-            .unwrap(),
-        );
+        let client = PipeStream::open_client(&name).unwrap();
         let mut times = [FILETIME::default(); 4];
         unsafe {
             GetProcessTimes(
@@ -230,7 +200,10 @@ mod tests {
     #[test]
     fn actual_pipe_peers_are_observed_through_pinned_process_handles() {
         let (server, client, pid, created) = pipe_pair();
-        for (pipe, end) in [(server.raw(), PeerEnd::Client), (client.0, PeerEnd::Server)] {
+        for (pipe, end) in [
+            (server.raw(), PeerEnd::Client),
+            (client.raw(), PeerEnd::Server),
+        ] {
             let peer = ObservedPeer::from_pipe(pipe, end, pid, created)
                 .unwrap_or_else(|code| panic!("{code}"));
             assert_eq!(peer.facts().pid, pid);
@@ -280,22 +253,9 @@ mod tests {
     #[ignore = "Child entrypoint launched explicitly by the owned peer test"]
     fn owned_peer_fixture() {
         use std::io::Read;
-        let name = std::env::var("UIPILOT_PEER_FIXTURE_PIPE").expect("fixture input");
-        let path: Vec<u16> = OsStr::new(&name).encode_wide().chain(Some(0)).collect();
-        let _pipe = OwnedHandle(
-            unsafe {
-                CreateFileW(
-                    PCWSTR(path.as_ptr()),
-                    0x00100183,
-                    FILE_SHARE_MODE(0),
-                    None,
-                    OPEN_EXISTING,
-                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                    None,
-                )
-            }
-            .expect("fixture connection"),
-        );
+        let nonce = std::env::var("UIPILOT_PEER_FIXTURE_NONCE").expect("fixture input");
+        let name = LocalPipeName::from_nonce(&nonce).expect("fixture nonce");
+        let _pipe = PipeStream::open_client(&name).expect("fixture connection");
         let mut release = [0];
         std::io::stdin()
             .read_exact(&mut release)
@@ -338,7 +298,7 @@ mod tests {
                     "process_elevation::peer::tests::owned_peer_fixture",
                     "--ignored",
                 ])
-                .env("UIPILOT_PEER_FIXTURE_PIPE", name.as_str())
+                .env("UIPILOT_PEER_FIXTURE_NONCE", &nonce)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

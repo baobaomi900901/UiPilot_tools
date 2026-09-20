@@ -49,6 +49,46 @@ pub(crate) struct LocalPipeServer(HANDLE);
 pub(crate) struct PipeStream(HANDLE);
 
 #[cfg(windows)]
+impl PipeStream {
+    /// Opens an unauthenticated transport once. The caller must verify the peer
+    /// before sending a request; this never waits for or retries a busy endpoint.
+    pub(crate) fn open_client(name: &LocalPipeName) -> Result<Self, &'static str> {
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_MODE,
+            FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+            SECURITY_SQOS_PRESENT, SYNCHRONIZE,
+        };
+        let name: Vec<u16> = OsStr::new(name.as_str())
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // Specific rights exclude FILE_CREATE_PIPE_INSTANCE (also FILE_APPEND_DATA).
+        let access = FILE_READ_DATA
+            | FILE_WRITE_DATA
+            | FILE_READ_ATTRIBUTES
+            | FILE_WRITE_ATTRIBUTES
+            | SYNCHRONIZE;
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                access.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                None,
+            )
+        }
+        .map_err(|_| "PipeConnectionFailed")?;
+        Ok(Self(handle))
+    }
+
+    pub(crate) fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
 impl LocalPipeServer {
     pub(crate) fn create(name: &LocalPipeName, sddl: &str) -> Result<Self, &'static str> {
         if sddl.is_empty() || sddl.contains('\0') || sddl.len() > 4096 {
@@ -223,6 +263,107 @@ mod tests {
     use super::*;
     use crate::process_elevation::protocol::RootSelector;
     use crate::process_elevation::{Operation, Request, Scope};
+
+    #[cfg(windows)]
+    fn client_test_name() -> LocalPipeName {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        LocalPipeName::from_nonce(&format!(
+            "{:032x}{:032x}",
+            std::process::id(),
+            0xc100_0000 + NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_client_is_duplex_noninheritable_and_identification_only() {
+        use windows::Win32::{
+            Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT},
+            Security::{
+                GetTokenInformation, RevertToSelf, SecurityIdentification, TokenImpersonationLevel,
+                SECURITY_IMPERSONATION_LEVEL, TOKEN_QUERY,
+            },
+            System::{
+                Pipes::ImpersonateNamedPipeClient,
+                Threading::{GetCurrentThread, OpenThreadToken},
+            },
+        };
+        let name = client_test_name();
+        let server = LocalPipeServer::create(&name, "D:P(A;;GA;;;OW)").unwrap();
+        server.set_nonblocking().unwrap();
+        let mut client = PipeStream::open_client(&name).expect("production client connection");
+        server.connect().unwrap();
+        for handle in [server.raw(), client.raw()] {
+            let mut flags = 0;
+            unsafe { GetHandleInformation(handle, &mut flags) }.unwrap();
+            assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+        }
+        let mut server = server.into_stream();
+        client.write_all(b"request").unwrap();
+        let mut bytes = [0; 7];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"request");
+
+        // Observe the actual token produced by this client's SQOS, not its flags.
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                if unsafe { RevertToSelf() }.is_err() {
+                    std::process::abort();
+                }
+            }
+        }
+        unsafe { ImpersonateNamedPipeClient(server.raw()) }.unwrap();
+        let revert = Revert;
+        let mut token = HANDLE::default();
+        unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) }.unwrap();
+        let token = PipeStream(token); // Same CloseHandle ownership for this test token.
+        let mut level = SECURITY_IMPERSONATION_LEVEL::default();
+        let mut returned = 0;
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenImpersonationLevel,
+                Some((&mut level as *mut SECURITY_IMPERSONATION_LEVEL).cast()),
+                std::mem::size_of_val(&level) as u32,
+                &mut returned,
+            )
+        }
+        .unwrap();
+        assert_eq!(returned as usize, std::mem::size_of_val(&level));
+        assert_eq!(level, SecurityIdentification);
+        drop(token);
+        drop(revert);
+
+        server.write_all(b"reply").unwrap();
+        let mut reply = [0; 5];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"reply");
+        drop(client);
+        assert!(server.read(&mut bytes).is_err());
+        drop(server);
+        assert!(PipeStream::open_client(&name).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_client_rejects_missing_and_busy_endpoints_without_retry() {
+        let name = client_test_name();
+        assert!(matches!(
+            PipeStream::open_client(&name),
+            Err("PipeConnectionFailed")
+        ));
+        let server = LocalPipeServer::create(&name, "D:P(A;;GA;;;OW)").unwrap();
+        server.set_nonblocking().unwrap();
+        let _client = PipeStream::open_client(&name).expect("first connection");
+        server.connect().unwrap();
+        assert!(matches!(
+            PipeStream::open_client(&name),
+            Err("PipeConnectionFailed")
+        ));
+    }
 
     fn request() -> Request {
         Request {
