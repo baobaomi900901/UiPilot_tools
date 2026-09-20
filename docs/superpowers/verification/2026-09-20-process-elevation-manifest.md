@@ -12,7 +12,9 @@ helper digests are validated as lowercase SHA-256-shaped values.
 
 The first independent review found duplicate-field acceptance and discarded
 version metadata. Both were fixed; focused tests cover duplicate fields and the
-retained version accessor. The manifest parser is currently preparatory: no
+retained version accessor. A follow-up review then found that manifest
+construction bypassed the package-root invariant; `new_with_version` now shares
+the absolute/no-parent root check and the regression test covers it. The manifest parser is currently preparatory: no
 production launch path reads it from disk yet, and it does not by itself prove
 protected installation provenance or host/helper version equality.
 

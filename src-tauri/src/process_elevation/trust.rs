@@ -101,11 +101,7 @@ impl TrustPackage {
         host_digest: String,
         helper_digest: String,
     ) -> Result<Self, &'static str> {
-        if !root.is_absolute()
-            || root
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
+        if !valid_root(&root) {
             return Err("UntrustedInstallation");
         }
         if !valid_digest(&host_digest) || !valid_digest(&helper_digest) {
@@ -119,7 +115,10 @@ impl TrustPackage {
         host_digest: String,
         helper_digest: String,
     ) -> Result<Self, &'static str> {
-        if !valid_version(&version) || !valid_digest(&host_digest) || !valid_digest(&helper_digest)
+        if !valid_root(&root)
+            || !valid_version(&version)
+            || !valid_digest(&host_digest)
+            || !valid_digest(&helper_digest)
         {
             return Err("UntrustedInstallation");
         }
@@ -151,6 +150,13 @@ impl TrustPackage {
         image.verify_installation_permissions()?;
         Ok(image)
     }
+}
+
+fn valid_root(root: &Path) -> bool {
+    root.is_absolute()
+        && !root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 pub(crate) fn verify_peer(
@@ -256,6 +262,10 @@ mod tests {
         let bytes = br#"{"version":"0.3.4+build.1","host_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","helper_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
         let package = TrustPackage::from_manifest(root.clone(), bytes).unwrap();
         assert_eq!(package.version(), "0.3.4+build.1");
+        assert_eq!(
+            TrustPackage::from_manifest(PathBuf::from(r"relative\..\package"), bytes),
+            Err("UntrustedInstallation")
+        );
         for invalid in [
             br#"{"version":"","host_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","helper_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"# as &[u8],
             br#"{"version":"0.3.4","host_digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","helper_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"# as &[u8],
