@@ -28,6 +28,15 @@ impl BoundSession {
     pub(crate) fn state(&self) -> Phase {
         self.state.phase()
     }
+    #[cfg(windows)]
+    pub(crate) fn authenticate(
+        &mut self,
+        _proof: crate::process_elevation::peer::AuthenticationProof,
+    ) -> Result<(), &'static str> {
+        self.state.authenticate()
+    }
+
+    #[cfg(not(windows))]
     pub(crate) fn authenticate(&mut self) -> Result<(), &'static str> {
         self.state.authenticate()
     }
@@ -169,7 +178,9 @@ mod tests {
         let mut input = Vec::new();
         crate::process_elevation::write_frame(&mut input, &request).unwrap();
         let mut session = BoundSession::new();
-        session.authenticate().unwrap();
+        session
+            .authenticate(crate::process_elevation::peer::AuthenticationProof::test_only())
+            .unwrap();
         assert_eq!(
             session.receive_request(&mut input.as_slice()).unwrap(),
             request
@@ -219,7 +230,9 @@ mod tests {
         let mut input = Vec::new();
         crate::process_elevation::write_frame(&mut input, &request).unwrap();
         let mut session = BoundSession::new();
-        session.authenticate().unwrap();
+        session
+            .authenticate(crate::process_elevation::peer::AuthenticationProof::test_only())
+            .unwrap();
         session.receive_request(&mut input.as_slice()).unwrap();
         session.mark_planned().unwrap();
         session.confirm().unwrap();

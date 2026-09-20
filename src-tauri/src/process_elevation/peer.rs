@@ -38,6 +38,18 @@ pub(crate) struct ObservedPeer {
     facts: PeerFacts,
 }
 
+/// Opaque proof owned by native peer verification.
+pub(crate) struct AuthenticationProof {
+    _private: (),
+}
+
+impl AuthenticationProof {
+    #[cfg(test)]
+    pub(crate) fn test_only() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum PeerEnd {
     Client,
@@ -140,6 +152,14 @@ impl ObservedPeer {
         super::token::verify_pair(&local, &peer, role)?;
         super::token::verify_local_console(local.session_id)?;
         self.check_live()
+    }
+
+    pub(crate) fn authenticate_as(
+        &self,
+        role: super::token::PeerRole,
+    ) -> Result<AuthenticationProof, &'static str> {
+        self.check_account_and_role(role)?;
+        Ok(AuthenticationProof { _private: () })
     }
 }
 
