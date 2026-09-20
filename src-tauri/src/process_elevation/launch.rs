@@ -35,6 +35,72 @@ pub(crate) struct LaunchReservation {
     cancel_requested: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BootstrapArgs {
+    pub(crate) version: String,
+    pub(crate) request_id: String,
+    pub(crate) pipe_nonce: String,
+    pub(crate) host_pid: u32,
+    pub(crate) host_creation_time: u64,
+}
+
+impl BootstrapArgs {
+    pub(crate) fn parse(value: &str) -> Result<Self, &'static str> {
+        let mut fields = value.split(';');
+        let version = field(&mut fields, "v")?;
+        let request_id = field(&mut fields, "id")?;
+        let pipe_nonce = field(&mut fields, "nonce")?;
+        let host_pid = field(&mut fields, "pid")?
+            .parse::<u32>()
+            .map_err(|_| "InvalidLaunchArgument")?;
+        let host_creation_time = field(&mut fields, "ct")?
+            .parse::<u64>()
+            .map_err(|_| "InvalidLaunchArgument")?;
+        if fields.next().is_some()
+            || !valid_token(&version, 64, false)
+            || request_id.len() != 64
+            || pipe_nonce.len() != 64
+            || !valid_token(&request_id, 64, true)
+            || !valid_token(&pipe_nonce, 64, true)
+            || host_pid == 0
+            || host_creation_time == 0
+        {
+            return Err("InvalidLaunchArgument");
+        }
+        Ok(Self {
+            version,
+            request_id,
+            pipe_nonce,
+            host_pid,
+            host_creation_time,
+        })
+    }
+}
+
+fn field<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    expected: &str,
+) -> Result<String, &'static str> {
+    let value = fields.next().ok_or("InvalidLaunchArgument")?;
+    let (key, value) = value.split_once('=').ok_or("InvalidLaunchArgument")?;
+    if key != expected || value.is_empty() {
+        return Err("InvalidLaunchArgument");
+    }
+    Ok(value.to_owned())
+}
+
+fn valid_token(value: &str, max: usize, hex: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value.bytes().all(|byte| {
+            if hex {
+                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+            } else {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
+            }
+        })
+}
+
 impl LaunchCoordinator {
     pub(crate) fn reserve(&self) -> Result<LaunchReservation, &'static str> {
         self.pending
@@ -105,6 +171,8 @@ pub(crate) fn launch_runas(
     package: &crate::process_elevation::TrustPackage,
     parameters: &str,
 ) -> Result<ElevatedProcess, &'static str> {
+    let bootstrap = BootstrapArgs::parse(parameters)?;
+    package.verify_version(&bootstrap.version)?;
     let executable = package.helper_path();
     let directory = package.root().to_path_buf();
     if !executable.is_absolute()
@@ -205,6 +273,22 @@ pub(crate) fn launch_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_metadata_is_strict_and_exact() {
+        let encoded = "v=legacy;id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;nonce=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;pid=7;ct=11";
+        let args = BootstrapArgs::parse(encoded).unwrap();
+        assert_eq!(args.version, "legacy");
+        assert_eq!(args.host_pid, 7);
+        assert_eq!(args.host_creation_time, 11);
+        for invalid in [
+            "v=legacy;id=a;nonce=b;pid=7;ct=11",
+            "v=legacy;id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;nonce=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;pid=0;ct=11",
+            "v=legacy;id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;nonce=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;pid=7;ct=11;extra=x",
+        ] {
+            assert!(BootstrapArgs::parse(invalid).is_err());
+        }
+    }
     #[test]
     fn only_one_reservation_until_native_call_returns() {
         let coordinator = LaunchCoordinator::default();
@@ -266,7 +350,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             launch_runas(&package, "bad\0arg"),
-            Err("UntrustedInstallation")
+            Err("InvalidLaunchArgument")
         ));
     }
 
@@ -283,7 +367,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             launch_helper(&coordinator, &package, "bad\0arg"),
-            Err("UntrustedInstallation")
+            Err("InvalidLaunchArgument")
         ));
         assert!(!coordinator.is_pending());
     }
