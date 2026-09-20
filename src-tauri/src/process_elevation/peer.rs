@@ -161,6 +161,14 @@ impl ObservedPeer {
         self.check_account_and_role(role)?;
         Ok(AuthenticationProof { _private: () })
     }
+
+    pub(crate) fn bind_session(
+        &self,
+        role: super::token::PeerRole,
+    ) -> Result<super::session::BoundSession, &'static str> {
+        let proof = self.authenticate_as(role)?;
+        Ok(super::session::BoundSession::from_native_peer(proof))
+    }
 }
 
 fn ensure_live(process: HANDLE) -> Result<(), &'static str> {
@@ -239,6 +247,11 @@ mod tests {
             );
             assert_eq!(
                 peer.check_account_and_role(super::super::token::PeerRole::Host),
+                Err("PeerRoleRejected")
+            );
+            assert_eq!(
+                peer.bind_session(super::super::token::PeerRole::Helper)
+                    .map(|_| ()),
                 Err("PeerRoleRejected")
             );
         }

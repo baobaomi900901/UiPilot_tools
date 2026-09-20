@@ -25,6 +25,16 @@ impl BoundSession {
             state: Session::new(),
         }
     }
+
+    #[cfg(windows)]
+    pub(super) fn from_native_peer(proof: super::peer::AuthenticationProof) -> Self {
+        let mut session = Self::new();
+        // The proof is consumed at the only transition into the request phase.
+        session
+            .authenticate(proof)
+            .expect("fresh session must authenticate");
+        session
+    }
     pub(crate) fn state(&self) -> Phase {
         self.state.phase()
     }
