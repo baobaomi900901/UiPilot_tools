@@ -66,10 +66,10 @@
 
 **Dependencies:** Task 3；设计 §6、§6.1、§6.2 的全部时序；§9 C/C2/D。
 
-- [ ] secret准备与提交拆分；准备失败不取消，进入transition后取消旧请求并保持running槽直到settle/deadline，成功提交后统一核验再开authority。
-- [ ] service统一协调settings保存与同一Runtime网络开关；网络开关保留原窗口行为、真实变化retire并结算、no-op不取消。settings DTO验证、普通settings no-op、secret多key和部分失败，收集并结算全部retired contexts/submission tokens；真实变更/取消才teardown窗口。
-- [ ] 修正bootstrap busy释放和complete顺序，旧finally不覆盖下一handler；不合作旧handler沿既有timeout重建。
-- [ ] 所有Some(authority)生产发布走checked helper；核对当前durable bundle身份/grants与实际secret记录，timeout replacement增加mutation保护；confirmed bundle查询在book锁内重查terminal并拒绝任意未清除reservation，成功state/bundle发布后才checked重开，恢复不得绕过state reservation。
+- [x] secret准备与提交拆分；准备失败不取消，进入transition后取消旧请求并保持running槽直到settle/deadline，成功提交后统一核验再开authority。
+- [x] service统一协调settings保存与同一Runtime网络开关；网络开关保留原窗口行为、真实变化retire并结算、no-op不取消。settings DTO验证、普通settings no-op、secret多key和部分失败，收集并结算全部retired contexts/submission tokens；真实变更/取消才teardown窗口。
+- [x] 修正bootstrap busy释放和complete顺序，旧finally不覆盖下一handler；不合作旧handler沿既有timeout重建。
+- [x] 所有Some(authority)生产发布走checked helper；核对当前durable bundle身份/grants与实际secret记录，timeout replacement增加mutation保护；confirmed bundle查询在book锁内重查terminal并拒绝任意未清除reservation，成功state/bundle发布后才checked重开，恢复不得绕过state reservation。
 
 **Distinct test coverage:** secret-only、全空、普通值相同、普通值变化、混合、第二key失败；旧running保留、新命令只排队，waiting token结算，旧complete accepted=false后新handler正常派发；不合作handler超时重建。网络开关在旧handler执行中改变授权后旧请求失效而running保留、waiting结算、后续命令正常派发；无变化开关不取消。准备失败旧请求继续；提交失败旧请求取消且本次关闭，实际旧/新有效record、缺失、坏record分别经启动/安装启用/网络授权/卸载恢复/timeout恢复入口核验，只有新请求恢复。屏障停在Unknown关闭gate后、reservation Drop前，并发尝试重开仍拒绝；RESERVED/COMMITTING/DURABLE各阶段都不可使用旧bundle。屏障卡于transport开始、redirect前、response deliver前，分别替换/清除secret及既有禁用/升级/卸载/关闭，旧请求不再redirect/deliver；不声称撤回已发送字节。
 
