@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令实施计划
 
-状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；M2-A 尚未实现。
+状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Tasks 2–8 待执行，M2-A 尚未完成。
 
 > **For agentic workers:** 使用 `subagent-driven-development`；单写者顺序实施，每任务通过独立 Spec 与 Quality 双门禁后才可开始下一任务。
 
@@ -43,10 +43,10 @@
 
 **Dependencies:** readiness gate；设计 §3–4、§13 的声明元数据规则及 §16.1–2。此任务不改变 Host current/CLI target。
 
-- [ ] 实现互斥 wire 形态、逐项严格解析和完整规范化命令视图，保留 legacy/new wire 来源；仅校验通过后暴露集合。保留现有 legacy 结构和模式语义，禁止给旧 command 增 id。新形态没有可被旧消费者误用的合成标量 command。
-- [ ] 同步更新所有直接字段读取和构造 fixture；现有 legacy 路径显式取 default/验证 legacy 模式，集合语义路径按真实条目遍历。当前生产版本拒绝新形态，因此不得在此任务为了让单命令 state/route 工作而临时投影任一新命令；尚待 Task 2–3 的集合调用者保留明确的模式边界。
-- [ ] Rust/CLI 应用相同能力常量及完整语义校验。CLI 公共 manifest 类型变动时同步 `validate.ts` 的聚合 metadata 构造，commands 报告固定 mainResult 并按声明顺序保留 commands，不从首项读取；legacy metadata 的 key 集合不变。详细 issue 定位/人类渲染由 Task 6 完成。
-- [ ] 用 Rust generator、CLI schema sync 与 standalone validator generator 再生制品，不手改生成代码；共享 fixtures 由 Rust 和独立 CLI 读取，明确 schema 与语义校验分别负责的拒绝分类。
+- [x] 实现互斥 wire 形态、逐项严格解析和完整规范化命令视图，保留 legacy/new wire 来源；仅校验通过后暴露集合。保留现有 legacy 结构和模式语义，禁止给旧 command 增 id。新形态没有可被旧消费者误用的合成标量 command。
+- [x] 同步更新所有直接字段读取和构造 fixture；现有 legacy 路径显式取 default/验证 legacy 模式，集合语义路径按真实条目遍历。当前生产版本拒绝新形态，因此不得在此任务为了让单命令 state/route 工作而临时投影任一新命令；尚待 Task 2–3 的集合调用者保留明确的模式边界。
+- [x] Rust/CLI 应用相同能力常量及完整语义校验。CLI 公共 manifest 类型变动时同步 `validate.ts` 的聚合 metadata 构造，commands 报告固定 mainResult 并按声明顺序保留 commands，不从首项读取；legacy metadata 的 key 集合不变。详细 issue 定位/人类渲染由 Task 6 完成。
+- [x] 用 Rust generator、CLI schema sync 与 standalone validator generator 再生制品，不手改生成代码；共享 fixtures 由 Rust 和独立 CLI 读取，明确 schema 与语义校验分别负责的拒绝分类。
 
 **Distinct test coverage:** 两 wire 互斥/缺失/null、1/16 接受与 0/17 拒绝；所有非法/重复 ID、重复 defaultName、逐项 summary/input 规则、禁用模式/字段/权限；constructor 有效；0.4.0 minimum 拒绝、显式 0.5.0 Host 接受、未来 minimum 不兼容；legacy panel/window 与凭据门槛不变。新形态 schema-valid 的失败可有声明 metadata，schema-invalid 无 metadata；单项数组仍输出 commands，重排仅改变报告顺序。生产 current 0.4.0 不接纳任何 commands 包。
 
