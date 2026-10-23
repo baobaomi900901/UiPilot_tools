@@ -83,15 +83,15 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.demo-panel')
-  assert.equal(manifest.version, '1.0.2')
-  assert.equal(manifest.minimumHostVersion, '0.3.1')
+  assert.equal(manifest.version, '1.0.5')
+  assert.equal(manifest.minimumHostVersion, '0.3.3')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'panel')
   assert.deepEqual(manifest.supportedPlatforms, ['windows'])
   assert.deepEqual(manifest.permissions, ['ui.panel'])
   assert.deepEqual(manifest.panel, {
     entry: 'dist/panel.html',
-    hostKeys: ['ArrowDown', 'ArrowUp', 'Primary+N'],
+    hostKeys: ['ArrowDown', 'ArrowUp', 'Primary+N', 'Tab', 'Shift+Tab'],
   })
   assert.equal('window' in manifest, false)
 })

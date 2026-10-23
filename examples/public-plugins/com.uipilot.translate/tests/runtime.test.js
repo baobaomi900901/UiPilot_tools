@@ -90,7 +90,7 @@ test('manifest declares the translate main-result network contract', async () =>
 test('strict package root contains only installable plugin files', async () => {
   const rootFiles = (await requiredDirectory(packageRoot)).sort()
   const distFiles = (await requiredDirectory(new URL('dist/', packageRoot))).sort()
-  assert.deepEqual(rootFiles, ['dist', 'plugin.json'])
+  assert.deepEqual(rootFiles, ['dist', 'icon.png', 'plugin.json'])
   assert.deepEqual(distFiles, ['runtime.js'])
 })
 
