@@ -139,6 +139,46 @@ pub(crate) struct PublicPanelV1 {
 pub(crate) struct PublicNetworkV1 {
     #[schemars(schema_with = "network_https_hosts_schema")]
     pub(crate) https_hosts: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_credentials",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "credentials_schema")]
+    pub(crate) credentials: Option<Vec<PluginNetworkCredential>>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PluginNetworkCredentialType {
+    Bearer,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PluginNetworkCredential {
+    #[schemars(regex(pattern = "^[a-z][a-z0-9.-]{0,63}$"))]
+    pub(crate) id: String,
+    #[schemars(regex(pattern = "^[a-z][a-z0-9.-]{0,63}$"))]
+    pub(crate) setting_key: String,
+    #[schemars(regex(pattern = "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"))]
+    pub(crate) host: String,
+    pub(crate) r#type: PluginNetworkCredentialType,
+}
+
+fn deserialize_present_credentials<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<PluginNetworkCredential>>, D::Error> {
+    Vec::<PluginNetworkCredential>::deserialize(deserializer).map(Some)
+}
+
+fn credentials_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Vec::<PluginNetworkCredential>::json_schema(generator);
+    schema.insert("minItems".into(), 1.into());
+    schema.insert("maxItems".into(), 8.into());
+    schema
 }
 
 fn deserialize_present_network<'de, D>(deserializer: D) -> Result<Option<PublicNetworkV1>, D::Error>
@@ -384,6 +424,9 @@ pub(super) fn parse_manifest(
     validate_manifest(&manifest, host)?;
     if let Some(network) = &mut manifest.network {
         network.https_hosts.sort_unstable();
+        if let Some(credentials) = &mut network.credentials {
+            credentials.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        }
     }
     if let Some(panel) = &mut manifest.panel {
         panel.host_keys.sort_unstable();
@@ -453,6 +496,27 @@ fn validate_manifest(
             .contains(&PublicPermission::NetworkHttps)
     {
         return Err(PublicPackageError::InvalidPackage);
+    }
+
+    if let Some(network) = &manifest.network {
+        if let Some(credentials) = &network.credentials {
+            if credentials.is_empty()
+                || credentials.len() > 8
+                || has_duplicates(credentials.iter().map(|c| c.id.as_str()))
+                || credentials.iter().any(|c| {
+                    !valid_setting_key(&c.id)
+                        || !valid_setting_key(&c.setting_key)
+                        || !valid_https_host(&c.host)
+                        || !network.https_hosts.contains(&c.host)
+                        || !manifest
+                            .settings
+                            .iter()
+                            .any(|s| s.key() == c.setting_key && s.is_secret())
+                })
+            {
+                return Err(PublicPackageError::InvalidPackage);
+            }
+        }
     }
 
     match manifest.command.output_mode {
@@ -529,6 +593,14 @@ fn validate_manifest(
     if manifest.api_version != 1
         || manifest.api_version != host.api_version
         || minimum_host > host.version
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest
+        .network
+        .as_ref()
+        .is_some_and(|n| n.credentials.is_some())
+        && minimum_host < [0, 4, 0]
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -1285,5 +1357,100 @@ mod schema_tests {
                 fixture["name"].as_str().unwrap()
             );
         }
+    }
+    #[test]
+    fn credential_manifest_contract() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.4.0");
+        value["permissions"] = serde_json::json!(["network.https"]);
+        value["settings"] =
+            serde_json::json!([{ "type": "secret", "key": "api-token", "label": "Token" }]);
+        let a = serde_json::json!({ "id": "a", "settingKey": "api-token", "host": "api.example.com", "type": "bearer" });
+        let mut b = a.clone();
+        b["id"] = serde_json::json!("b");
+        value["network"] = serde_json::json!({ "httpsHosts": ["api.example.com"], "credentials": [b.clone(), a.clone()] });
+        let mut host = PublicPluginHost::current(PublicPlatform::Windows);
+        host.version = [0, 4, 0];
+        let parse_new = |v: &Value| parse_manifest(&serde_json::to_vec(v).unwrap(), &host);
+        let canonical = parse_new(&value).unwrap();
+        assert_eq!(
+            serde_json::to_value(&canonical).unwrap()["network"]["credentials"][0]["id"],
+            "a"
+        );
+        value["network"]["credentials"] = serde_json::json!([a.clone(), b]);
+        assert_eq!(parse_new(&value).unwrap(), canonical);
+        assert_eq!(parse(&value), Err(PublicPackageError::IncompatibleApi));
+        for invalid in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([a.clone(), a.clone()]),
+            serde_json::json!(vec![a.clone(); 9]),
+        ] {
+            let mut v = value.clone();
+            v["network"]["credentials"] = invalid;
+            assert_eq!(parse_new(&v), Err(PublicPackageError::InvalidPackage));
+        }
+        for (field, invalid) in [
+            ("id", "A"),
+            ("id", ""),
+            ("id", " a"),
+            ("settingKey", "missing"),
+            ("host", "other.example.com"),
+            ("host", "https://api.example.com"),
+            ("type", "basic"),
+            ("unknown", "value"),
+        ] {
+            let mut v = value.clone();
+            v["network"]["credentials"][0][field] = serde_json::json!(invalid);
+            assert_eq!(
+                parse_new(&v),
+                Err(PublicPackageError::InvalidPackage),
+                "{field}: {invalid}"
+            );
+        }
+        let mut absent = value.clone();
+        absent["network"]
+            .as_object_mut()
+            .unwrap()
+            .remove("credentials");
+        assert!(
+            serde_json::to_value(parse_new(&absent).unwrap()).unwrap()["network"]
+                .get("credentials")
+                .is_none()
+        );
+        let mut eight = value.clone();
+        eight["network"]["credentials"] = serde_json::json!((0..8)
+            .map(|i| {
+                let mut c = a.clone();
+                c["id"] = serde_json::json!(format!("token-{i}"));
+                c
+            })
+            .collect::<Vec<_>>());
+        assert!(parse_new(&eight).is_ok());
+        let mut missing = value.clone();
+        missing["network"]["credentials"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("host");
+        assert_eq!(parse_new(&missing), Err(PublicPackageError::InvalidPackage));
+        let mut long_id = value.clone();
+        long_id["network"]["credentials"][0]["id"] = serde_json::json!("a".repeat(65));
+        assert_eq!(parse_new(&long_id), Err(PublicPackageError::InvalidPackage));
+        let mut ordinary = value.clone();
+        ordinary["settings"][0]["type"] = serde_json::json!("text");
+        assert_eq!(
+            parse_new(&ordinary),
+            Err(PublicPackageError::InvalidPackage)
+        );
+        let mut low = value.clone();
+        low["minimumHostVersion"] = serde_json::json!("0.3.4");
+        assert_eq!(parse_new(&low), Err(PublicPackageError::IncompatibleApi));
+        let raw = serde_json::to_string(&value)
+            .unwrap()
+            .replace("\"id\":\"a\"", "\"id\":\"a\",\"id\":\"a\"");
+        assert_eq!(
+            parse_manifest(raw.as_bytes(), &host),
+            Err(PublicPackageError::InvalidPackage)
+        );
     }
 }

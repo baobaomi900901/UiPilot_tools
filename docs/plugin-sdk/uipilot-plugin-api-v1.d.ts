@@ -17,11 +17,21 @@ export type PluginNetworkRequestBody =
   | Readonly<{ type: 'text'; value: string }>
   | Readonly<{ type: 'form'; value: Readonly<Record<string, string>> }>
 
+/** Manifest metadata only; the Host never exposes the token. */
+export interface PluginNetworkCredential {
+  readonly id: string
+  readonly settingKey: string
+  readonly host: string
+  readonly type: 'bearer'
+}
+
 export interface PluginNetworkRequest {
   readonly url: string
   readonly method: 'GET' | 'POST'
   readonly headers?: Readonly<Record<string, string>>
   readonly body?: PluginNetworkRequestBody
+  /** Credential ID declared for this host (Host 0.4.0+). The service receives the token and may echo it in its response. */
+  readonly credential?: string
 }
 
 export interface PluginNetworkResponse {

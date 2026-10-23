@@ -409,3 +409,51 @@ describe('validateManifest', () => {
     }
   })
 })
+
+function credentialManifest() {
+  const value = timerManifest()
+  return { ...value, minimumHostVersion: '0.4.0', permissions: ['network.https'],
+    command: { defaultName: 'credentials', activationMode: 'submit', outputMode: 'mainResult', inputRequired: false },
+    window: undefined, settings: [{ type: 'secret', key: 'api-token', label: 'Token' }],
+    network: { httpsHosts: ['api.example.com'], credentials: [
+      { id: 'b', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' },
+      { id: 'a', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' },
+    ] } }
+}
+
+describe('credential manifest contract', () => {
+  const future = (v: unknown) => validateManifest(Buffer.from(JSON.stringify(v)), 'windows', [0, 4, 0])
+  it('accepts and canonicalizes on an explicit 0.4.0 host, preserving the production version gate', () => {
+    const v = credentialManifest()
+    const result = future(v)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.manifest.network?.credentials?.map(x => x.id)).toEqual(['a', 'b'])
+    expect(validate(v)).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+    v.network.credentials.reverse()
+    expect(future(v)).toEqual(result)
+  })
+  it.each([
+    ['null', (v: any) => v.network.credentials = null],
+    ['empty', (v: any) => v.network.credentials = []],
+    ['too many', (v: any) => v.network.credentials = Array(9).fill(v.network.credentials[0])],
+    ['duplicate id', (v: any) => v.network.credentials[1].id = 'b'],
+    ['unknown key', (v: any) => v.network.credentials[0].extra = true],
+    ['missing key', (v: any) => delete v.network.credentials[0].id],
+    ['newline id', (v: any) => v.network.credentials[0].id = 'token\n'],
+    ['newline host', (v: any) => { v.network.httpsHosts = ['api.example.com\n']; v.network.credentials.forEach((c: any) => c.host = 'api.example.com\n') }],
+    ['invalid id', (v: any) => v.network.credentials[0].id = ' A'],
+    ['long id', (v: any) => v.network.credentials[0].id = 'a'.repeat(65)],
+    ['missing secret', (v: any) => v.network.credentials[0].settingKey = 'missing'],
+    ['ordinary setting', (v: any) => v.settings[0].type = 'text'],
+    ['other host', (v: any) => v.network.credentials[0].host = 'other.example.com'],
+    ['invalid host', (v: any) => v.network.credentials[0].host = 'https://api.example.com'],
+    ['wrong type', (v: any) => v.network.credentials[0].type = 'basic'],
+    ['old minimum', (v: any) => v.minimumHostVersion = '0.3.4'],
+  ])('rejects %s', (_, mutate) => {
+    const v = credentialManifest(); mutate(v); expect(future(v).ok).toBe(false)
+  })
+  it('rejects duplicate JSON keys', () => {
+    const raw = JSON.stringify(credentialManifest()).replace('"id":"a"', '"id":"a","id":"a"')
+    expect(validateManifest(Buffer.from(raw), 'windows', [0, 4, 0])).toMatchObject({ ok: false, issues: [{ code: 'MANIFEST_JSON_INVALID' }] })
+  })
+})

@@ -18,6 +18,39 @@
       ],
       "type": "string"
     },
+    "PluginNetworkCredential": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9.-]{0,63}$",
+          "type": "string"
+        },
+        "settingKey": {
+          "pattern": "^[a-z][a-z0-9.-]{0,63}$",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/PluginNetworkCredentialType"
+        }
+      },
+      "required": [
+        "id",
+        "settingKey",
+        "host",
+        "type"
+      ],
+      "type": "object"
+    },
+    "PluginNetworkCredentialType": {
+      "enum": [
+        "bearer"
+      ],
+      "type": "string"
+    },
     "PublicActivationMode": {
       "enum": [
         "live",
@@ -66,6 +99,14 @@
     "PublicNetworkV1": {
       "additionalProperties": false,
       "properties": {
+        "credentials": {
+          "items": {
+            "$ref": "#/$defs/PluginNetworkCredential"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
         "httpsHosts": {
           "items": {
             "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$",

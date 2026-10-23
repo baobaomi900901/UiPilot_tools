@@ -1,5 +1,6 @@
 import type {
   PluginNetworkErrorName,
+  PluginNetworkCredential,
   PluginNetworkRequest,
   PluginNetworkResponse,
   UiPilotPluginApiV1,
@@ -53,3 +54,15 @@ function narrowNetworkError(error: unknown): PluginNetworkErrorName | null {
 
 void requestAll
 void narrowNetworkError
+
+const credential: PluginNetworkCredential = { id: 'token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' }
+const credentialRequest: PluginNetworkRequest = { url: 'https://api.example.com', method: 'GET', credential: credential.id }
+// @ts-expect-error Only bearer metadata is supported.
+const invalidCredential: PluginNetworkCredential = { ...credential, type: 'basic' }
+// @ts-expect-error Runtime submits an ID, never credential metadata.
+const invalidCredentialRequest: PluginNetworkRequest = { ...credentialRequest, credential }
+// @ts-expect-error Null is not an absent credential.
+const nullCredentialRequest: PluginNetworkRequest = { ...credentialRequest, credential: null }
+void invalidCredential
+void invalidCredentialRequest
+void nullCredentialRequest

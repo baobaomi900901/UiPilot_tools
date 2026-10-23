@@ -1,7 +1,7 @@
 import validateSchema, { type StandaloneValidationError } from './generated/manifest-validator.mjs'
 import { normalizeNfc } from './unicode.js'
 import { StrictJsonError, parseStrictJson } from './strict-json.js'
-import type { PluginPlatform, PluginValidationIssueCode } from './contracts.js'
+import { PLUGIN_CLI_HOST_VERSION, type PluginPlatform, type PluginValidationIssueCode } from './contracts.js'
 
 export type PublicPermission =
   | 'ui.window'
@@ -20,8 +20,16 @@ export type PublicPermission =
 export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter'
 export type PanelHostKeyFocus = 'content' | 'host'
 
+export interface PluginNetworkCredential {
+  readonly id: string
+  readonly settingKey: string
+  readonly host: string
+  readonly type: 'bearer'
+}
+
 export interface PublicNetworkV1 {
   httpsHosts: string[]
+  credentials?: PluginNetworkCredential[]
 }
 
 export interface PublicManifestV1 {
@@ -272,6 +280,23 @@ function semanticValid(manifest: PublicManifestV1): boolean {
   ) {
     return false
   }
+  if (manifest.network?.credentials) {
+    const credentials = manifest.network.credentials
+    if (
+      credentials.length === 0 ||
+      credentials.length > 8 ||
+      duplicates(credentials.map((credential) => credential.id)) ||
+      credentials.some((credential) =>
+        !validSettingKey(credential.id) ||
+        !validSettingKey(credential.settingKey) ||
+        !validHttpsHost(credential.host) ||
+        !manifest.network!.httpsHosts.includes(credential.host) ||
+        !settings.some((setting) => setting.key === credential.settingKey && setting.type === 'secret'),
+      )
+    ) {
+      return false
+    }
+  }
   if ((manifest.network != null) !== permissions.includes('network.https')) return false
   if (manifest.command.outputMode === 'window') {
     if (
@@ -348,7 +373,11 @@ function permissionAvailable(permission: PublicPermission, platform: PluginPlatf
   )
 }
 
-export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): ManifestValidationResult {
+export function validateManifest(
+  bytes: Uint8Array,
+  platform: PluginPlatform,
+  hostVersion: readonly [number, number, number] = canonicalVersion(PLUGIN_CLI_HOST_VERSION)!,
+): ManifestValidationResult {
   let value: unknown
   try {
     value = parseStrictJson(bytes)
@@ -384,7 +413,7 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
-    versionGreater(minimumHost, [0, 3, 4]) ||
+    versionGreater(minimumHost, hostVersion) ||
     (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
     ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost)) ||
     ((manifest.panel?.hostKeys ?? []).some((key) => key === 'Tab' || key === 'Shift+Tab' || key === 'Enter') &&
@@ -393,6 +422,7 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
     ((manifest.permissions.includes('clipboard.history.read') ||
       manifest.permissions.includes('clipboard.history.paste')) &&
       versionGreater([0, 3, 3], minimumHost)) ||
+    (manifest.network?.credentials !== undefined && versionGreater([0, 4, 0], minimumHost)) ||
     (manifest.network != null && versionGreater([0, 3, 2], minimumHost))
   ) {
     issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })
@@ -402,6 +432,9 @@ export function validateManifest(bytes: Uint8Array, platform: PluginPlatform): M
   }
   if (issues.length > 0) return { ok: false, manifest, issues }
   if (manifest.panel?.hostKeys) manifest.panel.hostKeys = canonicalPanelHostKeys(manifest.panel.hostKeys)
-  if (manifest.network) manifest.network.httpsHosts = canonicalHttpsHosts(manifest.network.httpsHosts)
+  if (manifest.network) {
+    manifest.network.httpsHosts = canonicalHttpsHosts(manifest.network.httpsHosts)
+    manifest.network.credentials?.sort((a, b) => Buffer.from(a.id).compare(Buffer.from(b.id)))
+  }
   return { ok: true, manifest, issues: [] }
 }
