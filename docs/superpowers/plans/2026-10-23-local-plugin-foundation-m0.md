@@ -27,7 +27,7 @@
 
 ### Task 2: 统一本地验证与开发入口
 
-**Files:** 新增 `scripts/verify-local-foundation.mjs`、`scripts/verify-local-foundation.test.mjs`、`README.md`；修改根 `package.json`。必要的 Windows npm runner 保持在新脚本内或同责任的小模块。
+**Files:** 新增 `scripts/verify-local-foundation.mjs`、`scripts/verify-local-foundation.test.mjs`、`README.md`；修改根 `package.json`；如确认 Windows checkout 的 CRLF 导致严格 schema 检查误报，在 `.gitattributes` 为生成 schema 固定 LF（不改变 schema 语义或放宽比较）；同步 `examples/public-plugins/com.uipilot.notes/tests/sdk-contract.ts` 中已过期的 Host Key 联合断言，不改 production SDK。必要的 Windows npm runner 保持在新脚本内或同责任的小模块。
 
 **Dependencies:** Task 1；设计 `M0 设计合同 / 验证协调器` 和 `文档与验证`。
 

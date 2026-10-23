@@ -10,7 +10,7 @@ M0 全仓门禁完成后执行本计划。Task 1 -> Task 2；每项聚焦 TDD、
 
 ### Task 1: 确定性归档与无覆盖输出
 
-**Files:** 新建 `packages/plugin-cli/src/archive-writer.ts`、`packages/plugin-cli/src/pack.ts`、`packages/plugin-cli/tests/archive-writer.test.ts`、`packages/plugin-cli/tests/pack.test.ts`；扩展 `packages/plugin-cli/src/contracts.ts` 的 pack 类型。
+**Files:** 新建 `packages/plugin-cli/src/archive-writer.ts`、`packages/plugin-cli/src/pack.ts`、`packages/plugin-cli/tests/archive-writer.test.ts`、`packages/plugin-cli/tests/pack.test.ts`；扩展 `packages/plugin-cli/src/contracts.ts` 的 pack 类型；`src-tauri/src/public_plugins/tests.rs` 添加 Rust staging 兼容测试；新增 `tests/fixtures/public-plugin-pack/roundtrip.uipilot-plugin` 与该目录 README。
 
 **Dependencies:** M0；设计 `数据流`、`ZIP 格式` 和 `目标与接口`。
 
@@ -19,9 +19,9 @@ M0 全仓门禁完成后执行本计划。Task 1 -> Task 2；每项聚焦 TDD、
 - [ ] 输出普通父目录校验、源目录外约束、独占临时文件及原子无覆盖发布。
 - [ ] 结构化错误与确定性 SHA-256，未知错误留给 CLI_INTERNAL。
 
-**Distinct test coverage:** 字节/mtime/源路径无关、目录与 WAV/icon 资源归档往返、归档含头超限；坏包无写入、现有目的路径不覆盖、目的路径被抢占、源内输出拒绝、链接拒绝、写入失败只清理自身临时文件。文件系统测试用临时目录，外部 Windows 句柄可注入最小发布故障而不改生产策略。
+**Distinct test coverage:** 字节/mtime/源路径无关、目录与 WAV/icon 资源归档往返、归档含头超限；坏包无写入、现有目的路径不覆盖、目的路径被抢占、源内输出拒绝、链接拒绝、写入失败只清理自身临时文件。发布成功后临时文件清理失败仍为 created:true 并带 warning；静态祖先链接和规范路径包含关系；固定 ZIP fixture 与 writer 字节一致且 Rust staging 读取空目录/嵌套目录成功。文件系统测试用临时目录，外部 Windows 句柄可注入最小发布故障而不改生产策略。
 
-**Verify:** `npm test --workspace=@uipilot/plugin-cli -- archive-writer.test.ts pack.test.ts`；`npm run check --workspace=@uipilot/plugin-cli`。
+**Verify:** `npm test --workspace=@uipilot/plugin-cli -- archive-writer.test.ts pack.test.ts`；`npm run check --workspace=@uipilot/plugin-cli`；`cargo test --manifest-path src-tauri/Cargo.toml --lib --offline cli_pack_fixture`。
 
 ### Task 2: CLI 接线、分发 smoke 与本地教程
 
