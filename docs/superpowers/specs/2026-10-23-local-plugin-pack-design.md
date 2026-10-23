@@ -37,3 +37,7 @@ pack 成功退出 0，非法包或输出操作的预期失败退出 1，参数�
 - hard link 发布成功后 unlink 临时文件失败：最终文件保持正确，created:true、退出 0、带清理 warning；通过故障注入验证。
 - CLI 缺少/重复参数、未知 flag、--json 与退出码符合合同；既有 validate 输出不变。
 - 包装后的 npm tarball 在无网络 consumer 中实际执行 pack/validate smoke 成功，输出文件名不靠 shell 拼接。
+
+## 分发 smoke 的权限边界
+
+既有 validate smoke 保持仅临时目录（Windows 另含系统目录）的读取权限。pack 的真实祖先 lstat/realpath 检查会走到磁盘根；Node permission model 不能仅授权目录元数据读取。因此 pack smoke 可使用更广的读取权限，但写权限只授予本次临时输出目录，并保留离线 npm consumer、本地 tarball 安装和 network trap。不得宣称 pack smoke 阻止了仓库读取；无需仓库依赖由独立安装产物运行和既有 bundle 审计共同验证。不得放宽仓库写权限，不为测试创建系统卷映射或引入特权 helper。
