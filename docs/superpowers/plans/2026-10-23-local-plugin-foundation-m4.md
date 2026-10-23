@@ -22,9 +22,9 @@
 
 **Dependencies:** 正式设计评审通过；设计 §2、§3 的类型定义、§8 版本边界。
 
-- [ ] 添加严格凭据声明、canonical 元数据类型及跨字段校验；Rust、JSON schema、CLI 对齐。
-- [ ] 用现有生成脚本同步 CLI schema/validator；只增加类型声明，不开放 Runtime 请求消费。
-- [ ] 保持旧插件兼容；0.3.4 拒绝新合同，显式 0.4.0 host 接受。
+- [x] 添加严格凭据声明、canonical 元数据类型及跨字段校验；Rust、JSON schema、CLI 对齐。
+- [x] 用现有生成脚本同步 CLI schema/validator；只增加类型声明，不开放 Runtime 请求消费。
+- [x] 保持旧插件兼容；0.3.4 拒绝新合同，显式 0.4.0 host 接受。
 
 **Distinct test coverage:** 缺失允许，null/空数组/超8项/未知和重复JSON key拒绝；ID语法和唯一性、secret引用、host成员、bearer类型、minimumHostVersion；相同集合重排 canonical 相同。SDK credential 元数据和请求字段类型通过正反例。
 
