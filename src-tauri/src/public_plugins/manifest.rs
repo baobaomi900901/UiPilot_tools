@@ -86,6 +86,38 @@ pub(crate) struct PublicCommandV1 {
     pub(crate) input_placeholder: Option<String>,
 }
 
+pub(crate) const MULTI_COMMAND_MIN_HOST: [u32; 3] = [0, 5, 0];
+pub(crate) const MAX_PUBLIC_COMMANDS: usize = 16;
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PublicNamedCommandV1 {
+    #[schemars(regex(pattern = "^[a-z][a-z0-9-]{0,31}$"))]
+    pub(crate) id: String,
+    #[serde(flatten)]
+    pub(crate) command: PublicCommandV1,
+}
+
+fn deserialize_present_command<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PublicCommandV1>, D::Error> {
+    PublicCommandV1::deserialize(deserializer).map(Some)
+}
+fn present_command_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<PublicCommandV1>()
+}
+fn deserialize_present_commands<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<PublicNamedCommandV1>>, D::Error> {
+    Vec::<PublicNamedCommandV1>::deserialize(deserializer).map(Some)
+}
+fn present_commands_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = generator.subschema_for::<Vec<PublicNamedCommandV1>>();
+    schema.insert("minItems".into(), 1.into());
+    schema.insert("maxItems".into(), MAX_PUBLIC_COMMANDS.into());
+    schema
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicRuntimeV1 {
@@ -393,11 +425,24 @@ pub(crate) struct PublicManifestV1 {
     #[serde(default)]
     pub(crate) description: Option<String>,
     pub(crate) supported_platforms: Vec<PublicPlatform>,
-    pub(crate) command: PublicCommandV1,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_command",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_command_schema")]
+    command: Option<PublicCommandV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_commands",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_commands_schema")]
+    commands: Option<Vec<PublicNamedCommandV1>>,
     pub(crate) runtime: PublicRuntimeV1,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window: Option<PublicWindowV1>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) panel: Option<PublicPanelV1>,
     #[serde(
         default,
@@ -411,14 +456,65 @@ pub(crate) struct PublicManifestV1 {
     pub(crate) settings: Vec<PublicSettingV1>,
 }
 
+impl PublicManifestV1 {
+    /// A legacy boundary: never projects a new commands package to one scalar command.
+    pub(crate) fn legacy_command(&self) -> Option<&PublicCommandV1> {
+        if self.commands.is_none() {
+            self.command_by_id("default")
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn is_multi_command(&self) -> bool {
+        self.commands.is_some()
+    }
+
+    /// Validated commands in declaration order; identity never depends on array position.
+    pub(crate) fn normalized_commands(&self) -> impl Iterator<Item = (&str, &PublicCommandV1)> {
+        self.command
+            .iter()
+            .map(|command| ("default", command))
+            .chain(
+                self.commands
+                    .iter()
+                    .flatten()
+                    .map(|command| (command.id.as_str(), &command.command)),
+            )
+    }
+
+    pub(crate) fn command_by_id(&self, id: &str) -> Option<&PublicCommandV1> {
+        self.normalized_commands()
+            .find_map(|(candidate, command)| (candidate == id).then_some(command))
+    }
+}
+
 pub(crate) fn public_manifest_v1_schema() -> schemars::Schema {
-    schemars::schema_for!(PublicManifestV1)
+    let mut schema = schemars::schema_for!(PublicManifestV1);
+    schema.insert("oneOf".into(), serde_json::json!([
+        {"required": ["command"], "properties": {"command": true}, "not": {"required": ["commands"], "properties": {"commands": true}}},
+        {"required": ["commands"], "not": {"anyOf": [
+            {"required": ["command"], "properties": {"command": true}}, {"required": ["window"], "properties": {"window": true}}, {"required": ["panel"], "properties": {"panel": true}}
+        ]}, "properties": {"commands": true, "permissions": {"type": "array", "not": {"contains": {"enum": [
+            "ui.window", "ui.panel", "timer.control", "clipboard.history.read", "clipboard.history.paste"
+        ]}}}}}
+    ]));
+    schema.as_object_mut().unwrap().get_mut("$defs").unwrap()["PublicNamedCommandV1"]
+        ["properties"]["outputMode"] = serde_json::json!({"const": "mainResult"});
+    schema
 }
 
 pub(super) fn parse_manifest(
     bytes: &[u8],
     host: &PublicPluginHost,
 ) -> Result<PublicManifestV1, PublicPackageError> {
+    let wire: Value =
+        serde_json::from_slice(bytes).map_err(|_| PublicPackageError::InvalidPackage)?;
+    if wire.get("commands").is_some()
+        && (wire.get("window").is_some() || wire.get("panel").is_some())
+    {
+        return Err(PublicPackageError::InvalidPackage);
+    }
     let mut manifest: PublicManifestV1 =
         serde_json::from_slice(bytes).map_err(|_| PublicPackageError::InvalidPackage)?;
     validate_manifest(&manifest, host)?;
@@ -434,6 +530,17 @@ pub(super) fn parse_manifest(
     Ok(manifest)
 }
 
+fn valid_command(command: &PublicCommandV1) -> bool {
+    valid_command_name(&command.default_name)
+        && command.summary.as_deref().is_none_or(valid_command_summary)
+        && (!command.input_required
+            || command
+                .input_placeholder
+                .as_deref()
+                .is_some_and(nonempty_plain_text))
+        && command.input_placeholder.as_deref().is_none_or(plain_text)
+}
+
 fn validate_manifest(
     manifest: &PublicManifestV1,
     host: &PublicPluginHost,
@@ -445,23 +552,32 @@ fn validate_manifest(
         || !manifest.description.as_deref().is_none_or(plain_text)
         || manifest.supported_platforms.is_empty()
         || has_duplicates(manifest.supported_platforms.iter().copied())
-        || !valid_command_name(&manifest.command.default_name)
-        || !manifest
-            .command
-            .summary
-            .as_deref()
-            .is_none_or(valid_command_summary)
-        || (manifest.command.input_required
-            && !manifest
-                .command
-                .input_placeholder
-                .as_deref()
-                .is_some_and(nonempty_plain_text))
-        || !manifest
-            .command
-            .input_placeholder
-            .as_deref()
-            .is_none_or(plain_text)
+        || (manifest.command.is_some() == manifest.commands.is_some())
+        || manifest
+            .normalized_commands()
+            .any(|(_, command)| !valid_command(command))
+        || manifest.commands.as_ref().is_some_and(|commands| {
+            commands.is_empty()
+                || commands.len() > MAX_PUBLIC_COMMANDS
+                || commands.iter().any(|c| {
+                    !valid_command_name(&c.id)
+                        || c.command.output_mode != PublicOutputMode::MainResult
+                })
+                || has_duplicates(commands.iter().map(|c| c.id.as_str()))
+                || has_duplicates(commands.iter().map(|c| c.command.default_name.as_str()))
+                || manifest.window.is_some()
+                || manifest.panel.is_some()
+                || manifest.permissions.iter().any(|p| {
+                    matches!(
+                        p,
+                        PublicPermission::UiWindow
+                            | PublicPermission::UiPanel
+                            | PublicPermission::TimerControl
+                            | PublicPermission::ClipboardHistoryRead
+                            | PublicPermission::ClipboardHistoryPaste
+                    )
+                })
+        })
         || !valid_entry(&manifest.runtime.entry, "js")
         || manifest
             .window
@@ -519,70 +635,72 @@ fn validate_manifest(
         }
     }
 
-    match manifest.command.output_mode {
-        PublicOutputMode::Window
-            if manifest.command.activation_mode != PublicActivationMode::Submit
-                || manifest.window.is_none()
-                || manifest.panel.is_some()
-                || !manifest.permissions.contains(&PublicPermission::UiWindow)
-                || manifest.permissions.contains(&PublicPermission::UiPanel) =>
-        {
-            return Err(PublicPackageError::InvalidPackage);
-        }
-        PublicOutputMode::Panel
-            if manifest.command.activation_mode != PublicActivationMode::Submit
-                || manifest.panel.is_none()
-                || manifest.window.is_some()
-                || !manifest.permissions.contains(&PublicPermission::UiPanel)
-                || manifest.permissions.contains(&PublicPermission::UiWindow)
-                || manifest
-                    .permissions
-                    .contains(&PublicPermission::TimerControl) =>
-        {
-            return Err(PublicPackageError::InvalidPackage);
-        }
-        PublicOutputMode::MainResult
-            if manifest.window.is_some()
-                || manifest.panel.is_some()
-                || manifest.permissions.contains(&PublicPermission::UiWindow)
-                || manifest.permissions.contains(&PublicPermission::UiPanel) =>
-        {
-            return Err(PublicPackageError::InvalidPackage);
-        }
-        _ => {}
-    }
-
-    if manifest
-        .permissions
-        .contains(&PublicPermission::TimerControl)
-        && (manifest.command.activation_mode != PublicActivationMode::Submit
-            || manifest.command.output_mode != PublicOutputMode::Window
-            || manifest.window.is_none()
-            || manifest.panel.is_some()
-            || !manifest.permissions.contains(&PublicPermission::UiWindow)
-            || manifest.permissions.contains(&PublicPermission::UiPanel)
-            || !manifest
-                .permissions
-                .contains(&PublicPermission::NotificationsPublish))
-    {
-        return Err(PublicPackageError::InvalidPackage);
-    }
     let has_clipboard_history_read = manifest
         .permissions
         .contains(&PublicPermission::ClipboardHistoryRead);
     let has_clipboard_history_paste = manifest
         .permissions
         .contains(&PublicPermission::ClipboardHistoryPaste);
-    if (has_clipboard_history_read || has_clipboard_history_paste)
-        && (manifest.command.activation_mode != PublicActivationMode::Submit
-            || manifest.command.output_mode != PublicOutputMode::Panel
-            || manifest.panel.is_none()
-            || manifest.window.is_some()
-            || !manifest.permissions.contains(&PublicPermission::UiPanel)
-            || manifest.permissions.contains(&PublicPermission::UiWindow)
-            || (has_clipboard_history_paste && !has_clipboard_history_read))
-    {
-        return Err(PublicPackageError::InvalidPackage);
+    if let Some(command) = manifest.legacy_command() {
+        match command.output_mode {
+            PublicOutputMode::Window
+                if command.activation_mode != PublicActivationMode::Submit
+                    || manifest.window.is_none()
+                    || manifest.panel.is_some()
+                    || !manifest.permissions.contains(&PublicPermission::UiWindow)
+                    || manifest.permissions.contains(&PublicPermission::UiPanel) =>
+            {
+                return Err(PublicPackageError::InvalidPackage);
+            }
+            PublicOutputMode::Panel
+                if command.activation_mode != PublicActivationMode::Submit
+                    || manifest.panel.is_none()
+                    || manifest.window.is_some()
+                    || !manifest.permissions.contains(&PublicPermission::UiPanel)
+                    || manifest.permissions.contains(&PublicPermission::UiWindow)
+                    || manifest
+                        .permissions
+                        .contains(&PublicPermission::TimerControl) =>
+            {
+                return Err(PublicPackageError::InvalidPackage);
+            }
+            PublicOutputMode::MainResult
+                if manifest.window.is_some()
+                    || manifest.panel.is_some()
+                    || manifest.permissions.contains(&PublicPermission::UiWindow)
+                    || manifest.permissions.contains(&PublicPermission::UiPanel) =>
+            {
+                return Err(PublicPackageError::InvalidPackage);
+            }
+            _ => {}
+        }
+
+        if manifest
+            .permissions
+            .contains(&PublicPermission::TimerControl)
+            && (command.activation_mode != PublicActivationMode::Submit
+                || command.output_mode != PublicOutputMode::Window
+                || manifest.window.is_none()
+                || manifest.panel.is_some()
+                || !manifest.permissions.contains(&PublicPermission::UiWindow)
+                || manifest.permissions.contains(&PublicPermission::UiPanel)
+                || !manifest
+                    .permissions
+                    .contains(&PublicPermission::NotificationsPublish))
+        {
+            return Err(PublicPackageError::InvalidPackage);
+        }
+        if (has_clipboard_history_read || has_clipboard_history_paste)
+            && (command.activation_mode != PublicActivationMode::Submit
+                || command.output_mode != PublicOutputMode::Panel
+                || manifest.panel.is_none()
+                || manifest.window.is_some()
+                || !manifest.permissions.contains(&PublicPermission::UiPanel)
+                || manifest.permissions.contains(&PublicPermission::UiWindow)
+                || (has_clipboard_history_paste && !has_clipboard_history_read))
+        {
+            return Err(PublicPackageError::InvalidPackage);
+        }
     }
 
     if !manifest.supported_platforms.contains(&host.platform) {
@@ -596,6 +714,9 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.is_multi_command() && minimum_host < MULTI_COMMAND_MIN_HOST {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest
         .network
         .as_ref()
@@ -607,7 +728,11 @@ fn validate_manifest(
     if manifest.network.is_some() && minimum_host < [0, 3, 2] {
         return Err(PublicPackageError::IncompatibleApi);
     }
-    if manifest.command.output_mode == PublicOutputMode::Panel && minimum_host < [0, 3, 0] {
+    if manifest
+        .legacy_command()
+        .is_some_and(|command| command.output_mode == PublicOutputMode::Panel)
+        && minimum_host < [0, 3, 0]
+    {
         return Err(PublicPackageError::IncompatibleApi);
     }
     if manifest.panel.as_ref().is_some_and(|panel| {

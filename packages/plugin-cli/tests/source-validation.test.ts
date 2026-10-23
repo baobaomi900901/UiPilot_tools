@@ -127,3 +127,30 @@ describe('validatePackage', () => {
     ).rejects.toThrow(TypeError)
   })
 })
+
+
+it('preserves new declared metadata across directory and archive sources while production rejects it', async () => {
+  const base = await root()
+  const value = JSON.parse(manifest().toString('utf8'))
+  value.minimumHostVersion = '0.5.0'
+  value.commands = [{ id: 'constructor', ...value.command }]
+  delete value.command
+  const bytes = Buffer.from(JSON.stringify(value))
+  const directory = join(base, 'package')
+  await mkdir(join(directory, 'dist'), { recursive: true })
+  await writeFile(join(directory, 'plugin.json'), bytes)
+  await writeFile(join(directory, 'dist/runtime.js'), 'export {}')
+  const archive = join(base, 'multi.uipilot-plugin')
+  await writeFile(archive, createZip([
+    { name: 'plugin.json', data: bytes, method: 8 },
+    { name: 'dist/runtime.js', data: Buffer.from('export {}'), method: 8 },
+  ]))
+  const directoryReport = await validatePackage({ source: directory, platform: 'windows' }, { hostPlatform: 'linux' })
+  const archiveReport = await validatePackage({ source: archive, platform: 'windows' }, { hostPlatform: 'linux' })
+  expect(directoryReport.valid).toBe(false)
+  expect(directoryReport.issues.map((issue) => issue.code)).toEqual(['API_INCOMPATIBLE'])
+  expect(archiveReport.plugin).toEqual(directoryReport.plugin)
+  expect(directoryReport.plugin).toEqual({ pluginId: value.pluginId, version: '1.0.0', outputMode: 'mainResult',
+    commands: [{ commandId: 'constructor', defaultName: 'result', activationMode: 'submit', outputMode: 'mainResult' }],
+  })
+})

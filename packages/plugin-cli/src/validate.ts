@@ -154,7 +154,13 @@ export function validateSnapshot(
           plugin: {
             pluginId: manifest.pluginId,
             version: manifest.version,
-            outputMode: manifest.command.outputMode,
+            outputMode: manifest.commands !== undefined ? 'mainResult' : manifest.command.outputMode,
+            ...(manifest.commands !== undefined ? { commands: manifest.commands.map((command) => ({
+              commandId: command.id,
+              defaultName: command.defaultName,
+              activationMode: command.activationMode,
+              outputMode: 'mainResult' as const,
+            })) } : {}),
           },
         }
       : {}),

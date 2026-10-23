@@ -1,0 +1,2963 @@
+[
+  {
+    "name": "two-commands",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "single-command",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "sixteen",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "c-0",
+          "defaultName": "c-0",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-1",
+          "defaultName": "c-1",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-2",
+          "defaultName": "c-2",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-3",
+          "defaultName": "c-3",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-4",
+          "defaultName": "c-4",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-5",
+          "defaultName": "c-5",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-6",
+          "defaultName": "c-6",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-7",
+          "defaultName": "c-7",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-8",
+          "defaultName": "c-8",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-9",
+          "defaultName": "c-9",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-10",
+          "defaultName": "c-10",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-11",
+          "defaultName": "c-11",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-12",
+          "defaultName": "c-12",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-13",
+          "defaultName": "c-13",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-14",
+          "defaultName": "c-14",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-15",
+          "defaultName": "c-15",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "constructor",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "constructor",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "without-default",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "upper",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "reordered",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "production-host-rejects",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.4.0",
+    "schemaValid": true,
+    "rustError": "IncompatibleApi",
+    "cliCode": "API_INCOMPATIBLE"
+  },
+  {
+    "name": "low-minimum",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.4.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "IncompatibleApi",
+    "cliCode": "API_INCOMPATIBLE"
+  },
+  {
+    "name": "future-minimum",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.6.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "IncompatibleApi",
+    "cliCode": "API_INCOMPATIBLE"
+  },
+  {
+    "name": "both",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "command": {
+        "id": "default",
+        "defaultName": "upper",
+        "activationMode": "live",
+        "outputMode": "mainResult",
+        "inputRequired": true,
+        "inputPlaceholder": "Input"
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "neither",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "null-command",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "command": null
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "null-commands",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": null,
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "empty",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "seventeen",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "c-0",
+          "defaultName": "c-0",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-1",
+          "defaultName": "c-1",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-2",
+          "defaultName": "c-2",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-3",
+          "defaultName": "c-3",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-4",
+          "defaultName": "c-4",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-5",
+          "defaultName": "c-5",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-6",
+          "defaultName": "c-6",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-7",
+          "defaultName": "c-7",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-8",
+          "defaultName": "c-8",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-9",
+          "defaultName": "c-9",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-10",
+          "defaultName": "c-10",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-11",
+          "defaultName": "c-11",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-12",
+          "defaultName": "c-12",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-13",
+          "defaultName": "c-13",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-14",
+          "defaultName": "c-14",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-15",
+          "defaultName": "c-15",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        },
+        {
+          "id": "c-16",
+          "defaultName": "c-16",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "missing-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "unknown-item",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input",
+          "unknown": true
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "window-mode",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "window",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "panel-mode",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "panel",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "window-field",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "window": {
+        "entry": "dist/window.html"
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "panel-field",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "panel": {
+        "entry": "dist/panel.html"
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "null-window-field",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "window": null
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "null-panel-field",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "panel": null
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "bad-activation",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "invalid",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-''",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'A'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "A",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-' a'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": " a",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'a '",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "a ",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'1a'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "1a",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'a.b'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "a.b",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'a_b'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "a_b",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "invalid-id-'__proto__'",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "__proto__",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "forbidden-ui.window",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "ui.window"
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "forbidden-ui.panel",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "ui.panel"
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "forbidden-timer.control",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "timer.control"
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "forbidden-clipboard.history.read",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "clipboard.history.read"
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "forbidden-clipboard.history.paste",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "clipboard.history.paste"
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "duplicate-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "default",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "duplicate-name",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "upper",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "bad-name",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "Bad",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "empty-summary",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input",
+          "summary": " "
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "long-summary",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input",
+          "summary": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "control-summary",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input",
+          "summary": "a\nb"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "required-input",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": ""
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "control-input",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "\u0007"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "legacy-mainResult",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.4.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "command": {
+        "defaultName": "lower",
+        "activationMode": "submit",
+        "outputMode": "mainResult",
+        "inputRequired": false
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "legacy-panel",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.4.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "ui.panel"
+      ],
+      "command": {
+        "defaultName": "lower",
+        "activationMode": "submit",
+        "outputMode": "panel",
+        "inputRequired": false
+      },
+      "panel": {
+        "entry": "dist/panel.html"
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "legacy-window",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.4.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "ui.window"
+      ],
+      "command": {
+        "defaultName": "lower",
+        "activationMode": "submit",
+        "outputMode": "window",
+        "inputRequired": false
+      },
+      "window": {
+        "entry": "dist/window.html"
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "legacy-id-forbidden",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "command": {
+        "id": "default",
+        "defaultName": "upper",
+        "activationMode": "live",
+        "outputMode": "mainResult",
+        "inputRequired": true,
+        "inputPlaceholder": "Input"
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "root-unknown",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [],
+      "unknown": true
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "null-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": null,
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "number-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": 1,
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "null-item",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        null
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "missing-name",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "missing-output",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "missing-input-required",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult"
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "unknown-nested",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false,
+          "command": {}
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "leading-hyphen-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "-a",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "unicode-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "中",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "newline-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "a\n",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": false,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SCHEMA_INVALID"
+  },
+  {
+    "name": "max-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "trailing-hyphen-id",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "a-",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "second-summary-invalid",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false,
+          "summary": "bad\nsummary"
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "second-input-invalid",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": null
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "InvalidPackage",
+    "cliCode": "MANIFEST_SEMANTIC_INVALID"
+  },
+  {
+    "name": "summary-at-limit",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input",
+          "summary": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": []
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "shared-runtime-network",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "network.https"
+      ],
+      "network": {
+        "httpsHosts": [
+          "api.example.com"
+        ]
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "reserved-permission",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "clipboard.read"
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "UnsupportedPermission",
+    "cliCode": "PERMISSION_UNSUPPORTED"
+  },
+  {
+    "name": "multi-credentials",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.5.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "commands": [
+        {
+          "id": "default",
+          "defaultName": "upper",
+          "activationMode": "live",
+          "outputMode": "mainResult",
+          "inputRequired": true,
+          "inputPlaceholder": "Input"
+        },
+        {
+          "id": "lower",
+          "defaultName": "lower",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false
+        }
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "network.https"
+      ],
+      "network": {
+        "httpsHosts": [
+          "api.example.com"
+        ],
+        "credentials": [
+          {
+            "id": "token",
+            "settingKey": "token",
+            "host": "api.example.com",
+            "type": "bearer"
+          }
+        ]
+      },
+      "settings": [
+        {
+          "type": "secret",
+          "key": "token",
+          "label": "Token"
+        }
+      ]
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "legacy-credentials",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.4.0",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "network.https"
+      ],
+      "network": {
+        "httpsHosts": [
+          "api.example.com"
+        ],
+        "credentials": [
+          {
+            "id": "token",
+            "settingKey": "token",
+            "host": "api.example.com",
+            "type": "bearer"
+          }
+        ]
+      },
+      "settings": [
+        {
+          "type": "secret",
+          "key": "token",
+          "label": "Token"
+        }
+      ],
+      "command": {
+        "defaultName": "lower",
+        "activationMode": "submit",
+        "outputMode": "mainResult",
+        "inputRequired": false
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": null,
+    "cliCode": null
+  },
+  {
+    "name": "legacy-credential-threshold",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.multi",
+      "version": "1.0.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.3.4",
+      "name": "Multi",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "permissions": [
+        "network.https"
+      ],
+      "network": {
+        "httpsHosts": [
+          "api.example.com"
+        ],
+        "credentials": [
+          {
+            "id": "token",
+            "settingKey": "token",
+            "host": "api.example.com",
+            "type": "bearer"
+          }
+        ]
+      },
+      "settings": [
+        {
+          "type": "secret",
+          "key": "token",
+          "label": "Token"
+        }
+      ],
+      "command": {
+        "defaultName": "lower",
+        "activationMode": "submit",
+        "outputMode": "mainResult",
+        "inputRequired": false
+      }
+    },
+    "hostVersion": "0.5.0",
+    "schemaValid": true,
+    "rustError": "IncompatibleApi",
+    "cliCode": "API_INCOMPATIBLE"
+  }
+]

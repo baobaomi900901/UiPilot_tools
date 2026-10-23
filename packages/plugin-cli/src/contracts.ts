@@ -36,6 +36,7 @@ export interface PluginValidationIssue {
   path?: string
   location?: PluginIssueLocation
   message: string
+  commandId?: string
 }
 
 export interface PluginValidationReportV1 {
@@ -54,6 +55,12 @@ export interface PluginValidationReportV1 {
     pluginId: string
     version: string
     outputMode: PluginOutputMode
+    commands?: Array<{
+      commandId: string
+      defaultName: string
+      activationMode: 'live' | 'submit'
+      outputMode: 'mainResult'
+    }>
   }
   truncated: boolean
   issues: PluginValidationIssue[]

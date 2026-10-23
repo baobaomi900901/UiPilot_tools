@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-import { validateManifest } from '../src/manifest.js'
+import { normalizedCommands, validateManifest } from '../src/manifest.js'
 
 function timerManifest(): Record<string, unknown> {
   return {
@@ -465,4 +465,43 @@ it('validates the credential reference example on 0.4.0 and rejects 0.3.4', asyn
   expect(validateManifest(bytes, 'windows', [0, 3, 4])).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
   expect(validateManifest(bytes, 'windows', [0, 4, 0]).ok).toBe(true)
   expect(validateManifest(bytes, 'windows').ok).toBe(true)
+})
+
+
+describe('multi-command shared manifest contract', () => {
+  it('matches Rust/schema classification on every shared fixture', async () => {
+    const fixtures = JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json'), 'utf8'))
+    for (const fixture of fixtures) {
+      const result = validateManifest(Buffer.from(JSON.stringify(fixture.manifest)), 'windows', fixture.hostVersion.split('.').map(Number))
+      expect(result.ok, fixture.name).toBe(fixture.cliCode === null)
+      if (!result.ok) expect(result.issues.map((issue) => issue.code), fixture.name).toContain(fixture.cliCode)
+      expect(result.manifest !== undefined, fixture.name).toBe(fixture.schemaValid)
+    }
+  })
+})
+
+
+it('preserves normalized command IDs and new wire without a default or prototype fallback', async () => {
+  const fixtures = JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json'), 'utf8'))
+  for (const fixture of fixtures.filter((item: any) => item.cliCode === null)) {
+    const result = validateManifest(Buffer.from(JSON.stringify(fixture.manifest)), 'windows', [0, 5, 0])
+    expect(result.ok, fixture.name).toBe(true)
+    if (!result.ok) continue
+    expect(normalizedCommands(result.manifest).map((item) => item.commandId)).toEqual(
+      fixture.manifest.commands?.map((item: any) => item.id) ?? ['default'],
+    )
+    expect(Object.hasOwn(result.manifest, 'command')).toBe(!Object.hasOwn(fixture.manifest, 'commands'))
+  }
+})
+
+
+it('rejects duplicate JSON command fields before schema/normalization', async () => {
+  const fixtures = JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json'), 'utf8'))
+  const raw = JSON.stringify(fixtures[0].manifest)
+  for (const [from, to] of [['"id":"default"', '"id":"default","id":"other"'],
+    ['"defaultName":"upper"', '"defaultName":"upper","defaultName":"other"']]) {
+    expect(validateManifest(Buffer.from(raw.replace(from, to)), 'windows', [0, 5, 0])).toMatchObject({
+      ok: false, issues: [{ code: 'MANIFEST_JSON_INVALID' }],
+    })
+  }
 })

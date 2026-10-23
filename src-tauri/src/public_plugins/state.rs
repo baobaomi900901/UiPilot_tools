@@ -320,6 +320,9 @@ impl PluginStateStore {
         {
             return Err(PluginStateError::InvalidPlugin);
         }
+        let command = manifest
+            .legacy_command()
+            .ok_or(PluginStateError::InvalidPlugin)?;
         let mut declared = manifest
             .permissions
             .iter()
@@ -346,9 +349,7 @@ impl PluginStateStore {
             return Err(PluginStateError::InvalidPlugin);
         }
         let override_name = previous.and_then(|stored| stored.document.name_override.clone());
-        let effective_name = override_name
-            .as_deref()
-            .unwrap_or(&manifest.command.default_name);
+        let effective_name = override_name.as_deref().unwrap_or(&command.default_name);
         self.ensure_name_available(&state, &manifest.plugin_id, effective_name)?;
         let revision = next_revision(state.revision)?;
         let settings = reconcile_settings(
@@ -368,7 +369,7 @@ impl PluginStateStore {
             schema: 1,
             plugin_id: manifest.plugin_id.clone(),
             version: manifest.version.clone(),
-            default_name: manifest.command.default_name.clone(),
+            default_name: command.default_name.clone(),
             name_override: override_name,
             installed: true,
             enabled,

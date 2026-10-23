@@ -96,6 +96,49 @@
       ],
       "type": "object"
     },
+    "PublicNamedCommandV1": {
+      "additionalProperties": false,
+      "properties": {
+        "activationMode": {
+          "$ref": "#/$defs/PublicActivationMode"
+        },
+        "defaultName": {
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "type": "string"
+        },
+        "inputPlaceholder": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inputRequired": {
+          "type": "boolean"
+        },
+        "outputMode": {
+          "const": "mainResult"
+        },
+        "summary": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "defaultName",
+        "activationMode",
+        "outputMode",
+        "inputRequired"
+      ],
+      "type": "object"
+    },
     "PublicNetworkV1": {
       "additionalProperties": false,
       "properties": {
@@ -391,6 +434,74 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "oneOf": [
+    {
+      "not": {
+        "properties": {
+          "commands": true
+        },
+        "required": [
+          "commands"
+        ]
+      },
+      "properties": {
+        "command": true
+      },
+      "required": [
+        "command"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "properties": {
+              "command": true
+            },
+            "required": [
+              "command"
+            ]
+          },
+          {
+            "properties": {
+              "window": true
+            },
+            "required": [
+              "window"
+            ]
+          },
+          {
+            "properties": {
+              "panel": true
+            },
+            "required": [
+              "panel"
+            ]
+          }
+        ]
+      },
+      "properties": {
+        "commands": true,
+        "permissions": {
+          "not": {
+            "contains": {
+              "enum": [
+                "ui.window",
+                "ui.panel",
+                "timer.control",
+                "clipboard.history.read",
+                "clipboard.history.paste"
+              ]
+            }
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "commands"
+      ]
+    }
+  ],
   "properties": {
     "apiVersion": {
       "format": "uint32",
@@ -399,6 +510,14 @@
     },
     "command": {
       "$ref": "#/$defs/PublicCommandV1"
+    },
+    "commands": {
+      "items": {
+        "$ref": "#/$defs/PublicNamedCommandV1"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "type": "array"
     },
     "description": {
       "default": null,
@@ -424,8 +543,7 @@
         {
           "type": "null"
         }
-      ],
-      "default": null
+      ]
     },
     "permissions": {
       "items": {
@@ -468,8 +586,7 @@
         {
           "type": "null"
         }
-      ],
-      "default": null
+      ]
     }
   },
   "required": [
@@ -480,7 +597,6 @@
     "minimumHostVersion",
     "name",
     "supportedPlatforms",
-    "command",
     "runtime",
     "permissions"
   ],

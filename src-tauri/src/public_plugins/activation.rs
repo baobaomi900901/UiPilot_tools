@@ -908,7 +908,10 @@ impl PublicPluginManager {
             || snapshot.generation != generation
             || bundle.activation_id != activation_id
             || bundle.admission_epoch != admission_epoch
-            || snapshot.manifest.command.output_mode != PublicOutputMode::Panel
+            || snapshot
+                .manifest
+                .legacy_command()
+                .is_none_or(|command| command.output_mode != PublicOutputMode::Panel)
             || !snapshot
                 .manifest
                 .permissions
@@ -2438,13 +2441,17 @@ impl PublicPluginManager {
                     }
                 })
                 .collect::<Result<Vec<_>, PublicPluginManagementError>>()?;
+            let command = snapshot
+                .manifest
+                .legacy_command()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             items.push(PublicPluginInventoryItem {
                 plugin_id: config.plugin_id.clone(),
                 name: snapshot.manifest.name.clone(),
                 description: snapshot.manifest.description.clone(),
                 version: config.version,
                 source: "localPackage",
-                default_name: snapshot.manifest.command.default_name.clone(),
+                default_name: command.default_name.clone(),
                 effective_name: config.effective_name,
                 enabled: config.enabled,
                 fault: config.fault,
@@ -2528,7 +2535,10 @@ impl PublicPluginManager {
             {
                 continue;
             }
-            let command = &snapshot.manifest.command;
+            let command = snapshot
+                .manifest
+                .legacy_command()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             return Ok(Some(PublicPluginRoute {
                 plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
@@ -2596,7 +2606,10 @@ impl PublicPluginManager {
             {
                 continue;
             }
-            let command = &snapshot.manifest.command;
+            let command = snapshot
+                .manifest
+                .legacy_command()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             if command.output_mode != PublicOutputMode::Panel
                 || command.activation_mode != PublicActivationMode::Submit
             {
@@ -2662,15 +2675,19 @@ impl PublicPluginManager {
             {
                 continue;
             }
+            let command = snapshot
+                .manifest
+                .legacy_command()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             suggestions.push(PublicCommandSuggestion {
                 plugin_id: config.plugin_id.clone(),
                 effective_name: config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
-                summary: snapshot.manifest.command.summary.clone(),
+                summary: command.summary.clone(),
                 icon_url: snapshot.icon_url(),
                 favorite: config.favorite,
-                input_required: snapshot.manifest.command.input_required,
-                output_mode: snapshot.manifest.command.output_mode,
+                input_required: command.input_required,
+                output_mode: command.output_mode,
             });
         }
         suggestions.sort_by(|left, right| {
@@ -2702,15 +2719,19 @@ impl PublicPluginManager {
             {
                 continue;
             }
+            let command = snapshot
+                .manifest
+                .legacy_command()
+                .ok_or(PublicPluginManagementError::Unavailable)?;
             suggestions.push(PublicCommandSuggestion {
                 plugin_id: config.plugin_id.clone(),
                 effective_name: config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
-                summary: snapshot.manifest.command.summary.clone(),
+                summary: command.summary.clone(),
                 icon_url: snapshot.icon_url(),
                 favorite: config.favorite,
-                input_required: snapshot.manifest.command.input_required,
-                output_mode: snapshot.manifest.command.output_mode,
+                input_required: command.input_required,
+                output_mode: command.output_mode,
             });
         }
         suggestions.sort_by(|left, right| {
@@ -2882,7 +2903,10 @@ impl PublicPluginManager {
             || !config.enabled
             || config.fault.is_some()
             || config.active_generation != snapshot.generation
-            || snapshot.manifest.command.output_mode != output_mode
+            || snapshot
+                .manifest
+                .legacy_command()
+                .is_none_or(|command| command.output_mode != output_mode)
             || !snapshot.manifest.permissions.contains(&permission)
         {
             return None;
@@ -2944,7 +2968,10 @@ impl PublicPluginManager {
                 let shell_allowed = active_bundle.is_some()
                     && config.enabled
                     && config.fault.is_none()
-                    && snapshot.manifest.command.output_mode == PublicOutputMode::Window
+                    && snapshot
+                        .manifest
+                        .legacy_command()
+                        .is_some_and(|command| command.output_mode == PublicOutputMode::Window)
                     && snapshot
                         .manifest
                         .permissions
@@ -2980,7 +3007,10 @@ impl PublicPluginManager {
         {
             return Err(PublicPluginManagementError::Unavailable);
         }
-        if snapshot.manifest.command.output_mode != PublicOutputMode::Window
+        if snapshot
+            .manifest
+            .legacy_command()
+            .is_none_or(|command| command.output_mode != PublicOutputMode::Window)
             || !snapshot
                 .manifest
                 .permissions

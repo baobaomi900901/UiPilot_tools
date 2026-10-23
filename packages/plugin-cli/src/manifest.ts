@@ -32,7 +32,7 @@ export interface PublicNetworkV1 {
   credentials?: PluginNetworkCredential[]
 }
 
-export interface PublicManifestV1 {
+interface PublicManifestBase {
   schemaVersion: number
   pluginId: string
   version: string
@@ -41,14 +41,6 @@ export interface PublicManifestV1 {
   name: string
   description?: string | null
   supportedPlatforms: PluginPlatform[]
-  command: {
-    defaultName: string
-    summary?: string | null
-    activationMode: 'live' | 'submit'
-    outputMode: 'mainResult' | 'window' | 'panel'
-    inputRequired: boolean
-    inputPlaceholder?: string | null
-  }
   runtime: { entry: string }
   window?: { entry: string } | null
   panel?: {
@@ -59,6 +51,34 @@ export interface PublicManifestV1 {
   network?: PublicNetworkV1
   permissions: PublicPermission[]
   settings?: PublicSettingV1[]
+}
+
+export interface PublicCommandV1 {
+  defaultName: string
+  summary?: string | null
+  activationMode: 'live' | 'submit'
+  outputMode: 'mainResult' | 'window' | 'panel'
+  inputRequired: boolean
+  inputPlaceholder?: string | null
+}
+
+export interface PublicNamedCommandV1 extends PublicCommandV1 {
+  id: string
+  outputMode: 'mainResult'
+}
+
+export type PublicManifestV1 = PublicManifestBase & (
+  | { command: PublicCommandV1; commands?: never }
+  | { command?: never; commands: PublicNamedCommandV1[] }
+)
+
+export const MULTI_COMMAND_MIN_HOST = [0, 5, 0] as const
+export const MAX_PUBLIC_COMMANDS = 16
+
+export function normalizedCommands(manifest: PublicManifestV1): ReadonlyArray<{ commandId: string; command: PublicCommandV1 }> {
+  return manifest.commands !== undefined
+    ? manifest.commands.map((command) => ({ commandId: command.id, command }))
+    : [{ commandId: 'default', command: manifest.command }]
 }
 
 type PublicSettingV1 =
@@ -93,6 +113,7 @@ export interface ManifestValidationIssue {
     | 'PERMISSION_UNSUPPORTED'
   >
   message: string
+  commandId?: string
   location?: { kind: 'jsonPointer' | 'byteOffset' | 'name'; value: string }
 }
 
@@ -244,6 +265,13 @@ function validSetting(setting: PublicSettingV1): boolean {
   )
 }
 
+function validCommand(command: PublicCommandV1): boolean {
+  return /^[a-z][a-z0-9-]{0,31}$/u.test(command.defaultName) &&
+    (command.summary == null || (command.summary.trim().length > 0 && [...command.summary].length <= 512 && !/\p{Cc}/u.test(command.summary))) &&
+    (!command.inputRequired || !!command.inputPlaceholder?.trim()) &&
+    (command.inputPlaceholder == null || plainText(command.inputPlaceholder))
+}
+
 function semanticValid(manifest: PublicManifestV1): boolean {
   const settings = manifest.settings ?? []
   const permissions = manifest.permissions
@@ -257,13 +285,15 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     (manifest.description != null && !plainText(manifest.description)) ||
     manifest.supportedPlatforms.length === 0 ||
     duplicates(manifest.supportedPlatforms) ||
-    !/^[a-z][a-z0-9-]{0,31}$/u.test(manifest.command.defaultName) ||
-    (manifest.command.summary != null &&
-      (manifest.command.summary.trim().length === 0 ||
-        [...manifest.command.summary].length > 512 ||
-        /\p{Cc}/u.test(manifest.command.summary))) ||
-    (manifest.command.inputRequired && !manifest.command.inputPlaceholder?.trim()) ||
-    (manifest.command.inputPlaceholder != null && !plainText(manifest.command.inputPlaceholder)) ||
+    normalizedCommands(manifest).some(({ command }) => !validCommand(command)) ||
+    (manifest.commands !== undefined && (
+      manifest.commands.length < 1 || manifest.commands.length > MAX_PUBLIC_COMMANDS ||
+      manifest.commands.some((command) => !/^[a-z][a-z0-9-]{0,31}$/u.test(command.id) || command.outputMode !== 'mainResult') ||
+      duplicates(manifest.commands.map((command) => command.id)) ||
+      duplicates(manifest.commands.map((command) => command.defaultName)) ||
+      Object.hasOwn(manifest, 'window') || Object.hasOwn(manifest, 'panel') ||
+      permissions.some((permission) => ['ui.window', 'ui.panel', 'timer.control', 'clipboard.history.read', 'clipboard.history.paste'].includes(permission))
+    )) ||
     !validEntry(manifest.runtime.entry, 'js') ||
     (manifest.window != null && !validEntry(manifest.window.entry, 'html')) ||
     (manifest.panel != null && !validEntry(manifest.panel.entry, 'html')) ||
@@ -298,58 +328,61 @@ function semanticValid(manifest: PublicManifestV1): boolean {
     }
   }
   if ((manifest.network != null) !== permissions.includes('network.https')) return false
-  if (manifest.command.outputMode === 'window') {
-    if (
-      manifest.command.activationMode !== 'submit' ||
-      manifest.window == null ||
+  const command = manifest.command
+  if (command) {
+    if (command.outputMode === 'window') {
+      if (
+        command.activationMode !== 'submit' ||
+        manifest.window == null ||
+        manifest.panel != null ||
+        !permissions.includes('ui.window') ||
+        permissions.includes('ui.panel')
+      ) {
+        return false
+      }
+    } else if (command.outputMode === 'panel') {
+      if (
+        command.activationMode !== 'submit' ||
+        manifest.panel == null ||
+        manifest.window != null ||
+        !permissions.includes('ui.panel') ||
+        permissions.includes('ui.window') ||
+        permissions.includes('timer.control')
+      ) {
+        return false
+      }
+    } else if (
+      manifest.window != null ||
       manifest.panel != null ||
-      !permissions.includes('ui.window') ||
+      permissions.includes('ui.window') ||
       permissions.includes('ui.panel')
     ) {
       return false
     }
-  } else if (manifest.command.outputMode === 'panel') {
     if (
-      manifest.command.activationMode !== 'submit' ||
-      manifest.panel == null ||
-      manifest.window != null ||
-      !permissions.includes('ui.panel') ||
-      permissions.includes('ui.window') ||
-      permissions.includes('timer.control')
+      permissions.includes('timer.control') &&
+      (command.activationMode !== 'submit' ||
+        command.outputMode !== 'window' ||
+        manifest.window == null ||
+        manifest.panel != null ||
+        !permissions.includes('ui.window') ||
+        permissions.includes('ui.panel') ||
+        !permissions.includes('notifications.publish'))
     ) {
       return false
     }
-  } else if (
-    manifest.window != null ||
-    manifest.panel != null ||
-    permissions.includes('ui.window') ||
-    permissions.includes('ui.panel')
-  ) {
-    return false
-  }
-  if (
-    permissions.includes('timer.control') &&
-    (manifest.command.activationMode !== 'submit' ||
-      manifest.command.outputMode !== 'window' ||
-      manifest.window == null ||
-      manifest.panel != null ||
-      !permissions.includes('ui.window') ||
-      permissions.includes('ui.panel') ||
-      !permissions.includes('notifications.publish'))
-  ) {
-    return false
-  }
-  if (
-    (hasClipboardHistoryRead || hasClipboardHistoryPaste) &&
-    (manifest.command.activationMode !== 'submit' ||
-      manifest.command.outputMode !== 'panel' ||
-      manifest.panel == null ||
-      manifest.window != null ||
-      !permissions.includes('ui.panel') ||
-      permissions.includes('ui.window') ||
-      (hasClipboardHistoryPaste && !hasClipboardHistoryRead))
-  ) {
-    return false
+    if (
+      (hasClipboardHistoryRead || hasClipboardHistoryPaste) &&
+      (command.activationMode !== 'submit' ||
+        command.outputMode !== 'panel' ||
+        manifest.panel == null ||
+        manifest.window != null ||
+        !permissions.includes('ui.panel') ||
+        permissions.includes('ui.window') ||
+        (hasClipboardHistoryPaste && !hasClipboardHistoryRead))
+    ) {
+      return false
+    }
   }
   return true
 }
@@ -414,7 +447,8 @@ export function validateManifest(
     manifest.apiVersion !== 1 ||
     !minimumHost ||
     versionGreater(minimumHost, hostVersion) ||
-    (manifest.command.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
+    (manifest.commands !== undefined && versionGreater(MULTI_COMMAND_MIN_HOST, minimumHost)) ||
+    (manifest.command?.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||
     ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost)) ||
     ((manifest.panel?.hostKeys ?? []).some((key) => key === 'Tab' || key === 'Shift+Tab' || key === 'Enter') &&
       versionGreater([0, 3, 3], minimumHost)) ||

@@ -663,7 +663,7 @@ fn accepts_archive_and_directory_packages() {
             );
         }
         assert_eq!(
-            prepared.manifest.command.output_mode,
+            prepared.manifest.legacy_command().unwrap().output_mode,
             match mode {
                 "window" => PublicOutputMode::Window,
                 "panel" => PublicOutputMode::Panel,
@@ -1348,8 +1348,14 @@ fn repository_demo_examples_stage_as_independently_removable_public_plugins() {
         )
         .unwrap();
         assert_eq!(prepared.manifest.plugin_id, plugin_id);
-        assert_eq!(prepared.manifest.command.default_name, command);
-        assert_eq!(prepared.manifest.command.output_mode, output_mode);
+        assert_eq!(
+            prepared.manifest.legacy_command().unwrap().default_name,
+            command
+        );
+        assert_eq!(
+            prepared.manifest.legacy_command().unwrap().output_mode,
+            output_mode
+        );
         let serialized = serde_json::to_value(&prepared.manifest).unwrap();
         assert_eq!(serialized["version"], version);
         assert_eq!(serialized["command"]["summary"], summary);
@@ -1401,7 +1407,7 @@ fn repository_credential_demo_stages_on_0_4_0_and_rejects_0_3_4_without_cli_buil
         vec![PublicPermission::NetworkHttps]
     );
     assert_eq!(
-        prepared.manifest.command.output_mode,
+        prepared.manifest.legacy_command().unwrap().output_mode,
         PublicOutputMode::MainResult
     );
     let manifest = serde_json::to_value(&prepared.manifest).unwrap();
@@ -1443,9 +1449,12 @@ fn repository_demo_panel_stages_with_the_panel_only_contract() {
     .unwrap();
 
     assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-panel");
-    assert_eq!(prepared.manifest.command.default_name, "demo-panel");
     assert_eq!(
-        prepared.manifest.command.output_mode,
+        prepared.manifest.legacy_command().unwrap().default_name,
+        "demo-panel"
+    );
+    assert_eq!(
+        prepared.manifest.legacy_command().unwrap().output_mode,
         PublicOutputMode::Panel
     );
     assert_eq!(
@@ -1497,7 +1506,7 @@ fn clipboard_history_host_fixture_stages_with_final_panel_contract() {
         "com.uipilot.clipboard-history-host-fixture"
     );
     assert_eq!(
-        prepared.manifest.command.output_mode,
+        prepared.manifest.legacy_command().unwrap().output_mode,
         PublicOutputMode::Panel
     );
     assert_eq!(
@@ -1597,4 +1606,127 @@ fn cli_pack_fixture_stages_empty_and_nested_directories() {
         .next()
         .is_none());
     assert_eq!(prepared.revalidate(), Ok(()));
+}
+
+#[test]
+fn multi_command_manifest_shared_fixtures() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json"
+    ))
+    .unwrap();
+    for fixture in fixtures.as_array().unwrap() {
+        let parts = fixture["hostVersion"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .map(|s| s.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        let host = PublicPluginHost {
+            platform: PublicPlatform::Windows,
+            version: [parts[0], parts[1], parts[2]],
+            api_version: 1,
+        };
+        let result = super::manifest::parse_manifest(
+            &serde_json::to_vec(&fixture["manifest"]).unwrap(),
+            &host,
+        );
+        let actual = result.err().map(|e| format!("{e:?}"));
+        assert_eq!(
+            actual.as_deref(),
+            fixture["rustError"].as_str(),
+            "{}",
+            fixture["name"]
+        );
+    }
+}
+
+#[test]
+fn multi_command_normalization_preserves_wire_and_identity() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json"
+    ))
+    .unwrap();
+    let host = PublicPluginHost {
+        platform: PublicPlatform::Windows,
+        version: [0, 5, 0],
+        api_version: 1,
+    };
+    for fixture in fixtures
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rustError"].is_null())
+    {
+        let manifest = super::manifest::parse_manifest(
+            &serde_json::to_vec(&fixture["manifest"]).unwrap(),
+            &host,
+        )
+        .unwrap();
+        let expected = fixture["manifest"]["commands"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["default"]);
+        assert_eq!(
+            manifest
+                .normalized_commands()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            manifest.is_multi_command(),
+            fixture["manifest"].get("commands").is_some()
+        );
+        assert_eq!(
+            manifest.legacy_command().is_some(),
+            !manifest.is_multi_command()
+        );
+        for (id, command) in manifest.normalized_commands() {
+            assert_eq!(manifest.command_by_id(id), Some(command));
+        }
+        assert!(manifest.command_by_id("missing").is_none());
+        let serialized = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            serialized.get("command").is_some(),
+            !manifest.is_multi_command()
+        );
+        assert_eq!(
+            super::manifest::parse_manifest(&serde_json::to_vec(&serialized).unwrap(), &host)
+                .unwrap(),
+            manifest
+        );
+    }
+}
+
+#[test]
+fn multi_command_manifest_rejects_duplicate_json_fields() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json"
+    ))
+    .unwrap();
+    let raw = serde_json::to_string(&fixtures[0]["manifest"]).unwrap();
+    let host = PublicPluginHost {
+        platform: PublicPlatform::Windows,
+        version: [0, 5, 0],
+        api_version: 1,
+    };
+    for (from, to) in [
+        ("\"id\":\"default\"", "\"id\":\"default\",\"id\":\"other\""),
+        (
+            "\"defaultName\":\"upper\"",
+            "\"defaultName\":\"upper\",\"defaultName\":\"other\"",
+        ),
+    ] {
+        let invalid = raw.replace(from, to);
+        assert_ne!(invalid, raw);
+        assert_eq!(
+            super::manifest::parse_manifest(invalid.as_bytes(), &host),
+            Err(PublicPackageError::InvalidPackage)
+        );
+    }
 }

@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import { SnapshotBuilder } from '../src/package-policy.js'
@@ -98,4 +100,26 @@ describe('validateSnapshot', () => {
     const report = validateSnapshot(builder.finish(), 'result-package', 'windows')
     expect(report.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining(['RESOURCE_INVALID', 'ENTRY_MISSING']))
   })
+})
+
+
+it('reports declared commands in order with fixed aggregate mode even on compatibility and semantic failure', async () => {
+  const fixtures = JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json'), 'utf8'))
+  for (const name of ['two-commands', 'single-command', 'reordered', 'constructor', 'duplicate-name', 'empty']) {
+    const fixture = fixtures.find((item: any) => item.name === name)
+    const builder = new SnapshotBuilder('directory')
+    builder.addFile('plugin.json', Buffer.from(JSON.stringify(fixture.manifest)))
+    builder.addFile('dist/runtime.js', Buffer.from('export {}'))
+    const report = validateSnapshot(builder.finish(), 'multi-package', 'windows')
+    expect(report.valid, name).toBe(false)
+    expect(report.target.hostVersion).toBe('0.4.0')
+    if (fixture.schemaValid) {
+      expect(report.plugin).toEqual({ pluginId: fixture.manifest.pluginId, version: fixture.manifest.version,
+        outputMode: 'mainResult', commands: fixture.manifest.commands.map((command: any) => ({
+          commandId: command.id, defaultName: command.defaultName, activationMode: command.activationMode, outputMode: 'mainResult',
+        })),
+      })
+      expect(report.issues.map((issue) => issue.code)).toContain('API_INCOMPATIBLE')
+    } else expect(report.plugin).toBeUndefined()
+  }
 })
