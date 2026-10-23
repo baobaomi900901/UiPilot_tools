@@ -1282,3 +1282,32 @@ fn demo_packaging_script_writes_both_installable_archives() {
         assert_eq!(prepared.resources.len(), resource_count);
     }
 }
+
+#[test]
+fn cli_pack_fixture_stages_empty_and_nested_directories() {
+    let root = TestRoot::new("cli-pack-fixture");
+    let archive = root.0.join("roundtrip.uipilot-plugin");
+    fs::write(
+        &archive,
+        include_bytes!("../../../tests/fixtures/public-plugin-pack/roundtrip.uipilot-plugin"),
+    )
+    .unwrap();
+    let prepared = package::stage(PublicPackageSource::Archive(archive), &root.staging(), &host())
+        .unwrap();
+    assert_eq!(prepared.manifest.plugin_id, "com.example.cli-pack");
+    assert_eq!(
+        fs::read(prepared.package_root.join("dist/runtime.js")).unwrap(),
+        b"export {}\n"
+    );
+    assert!(prepared.package_root.join("empty").is_dir());
+    assert!(prepared.package_root.join("nested/empty").is_dir());
+    assert!(fs::read_dir(prepared.package_root.join("empty"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert!(fs::read_dir(prepared.package_root.join("nested/empty"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(prepared.revalidate(), Ok(()));
+}

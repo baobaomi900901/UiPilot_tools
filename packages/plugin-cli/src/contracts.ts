@@ -73,3 +73,37 @@ export interface ValidationRequest {
 }
 
 export type ValidatePackage = (request: ValidationRequest) => Promise<PluginValidationReportV1>
+
+export interface PackRequest extends ValidationRequest {
+  output: string
+}
+
+export type PluginPackErrorCode =
+  | 'SOURCE_INVALID'
+  | 'PACKAGE_INVALID'
+  | 'OUTPUT_INVALID'
+  | 'OUTPUT_EXISTS'
+  | 'OUTPUT_WRITE_FAILED'
+
+export interface PluginPackWarning {
+  code: 'TEMP_CLEANUP_FAILED'
+  message: string
+}
+
+export type PluginPackReportV1 =
+  | {
+      schemaVersion: 1
+      created: true
+      output: { path: string; sha256: string }
+      validation: PluginValidationReportV1
+      warnings?: PluginPackWarning[]
+    }
+  | {
+      schemaVersion: 1
+      created: false
+      output: { path: string }
+      validation?: PluginValidationReportV1
+      error: { code: PluginPackErrorCode; message: string }
+    }
+
+export type PackPackage = (request: PackRequest) => Promise<PluginPackReportV1>
