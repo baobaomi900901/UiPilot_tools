@@ -98,15 +98,31 @@ test('--list runs no process and resolves root independently of cwd', async t =>
   assert.ok(path.isAbsolute(repositoryRoot));
 });
 
-test('schema failure never rewrites tracked schema', async t => {
+test('schema check failure never runs the generator or later stages', async t => {
   const root = fixture(t);
-  const schema = path.join(root, 'schema.json');
+  const schema = path.join(root, 'docs/plugin-sdk/uipilot-plugin-v1.schema.json');
+  mkdirSync(path.dirname(schema), { recursive: true });
   writeFileSync(schema, 'original');
-  const stages = buildStages(root, discover(root), { npmCli: '/npm-cli.js' });
-  await assert.rejects(runStages(stages, (_command, args) => ({
-    status: args.includes('--check') ? 1 : 0,
-  }), () => {}), /schema/);
+  const calls = [];
+  const result = await main([], {
+    root,
+    spawn: (command, args, options) => {
+      calls.push({ command, args, options });
+      const isSchemaGenerator = args.includes('generate_public_plugin_schema');
+      if (isSchemaGenerator && !args.includes('--check')) {
+        writeFileSync(schema, 'generated');
+        return { status: 0 };
+      }
+      return { status: isSchemaGenerator ? 1 : 0 };
+    },
+    log: () => {},
+  });
+  assert.equal(result, 1);
   assert.equal(readFileSync(schema, 'utf8'), 'original');
+  assert.equal(calls.length, 5);
+  assert.ok(calls[4].args.includes('generate_public_plugin_schema'));
+  assert.ok(calls[4].args.includes('--check'));
+  assert.ok(calls.every(call => !call.args.includes('plugin-cli/dist/cli.mjs')));
 });
 
 test('actual entry --list works from another cwd without running checks', t => {
