@@ -126,7 +126,7 @@ state.prepare_set_network_access、prepare_activation 和所有授权清理路�
 
 ## 5. 安装、详情与设置 UI
 
-扩展 src/public-plugin-panel.tsx 的安装网络区域：逐项显示 ID、secret setting label/key、目标 host 和“Bearer”。
+扩展 src/public-plugin-panel.tsx 的安装网络区域：逐项显示 ID、secret settingKey、目标 host 和“Bearer”；详情页从当前inventory.settings显示label与key。prepare摘要不新增仅为label服务的冗余字段，也不借用旧安装版本的label展示候选升级。
 新/改绑定标“新增或变更”，固定说明“此凭据会发送给该服务；服务响应可能包含其回显。”
 不展示凭据内容或掩码前后缀。空凭据是可安装状态，配置后才能调用；授权UI不读取secret，提交后的Host activation按6.2核验已存在记录。
 详情页展示相同绑定与网络授权状态；增加网络开关，开启需先展示这些绑定并显式确认，关闭直接撤销。
