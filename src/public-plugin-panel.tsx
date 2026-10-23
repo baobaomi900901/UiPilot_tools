@@ -451,7 +451,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
         {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
       </div>
       <Modal className="public-plugin-confirmation" destroyOnHidden title="开启网络访问" open={networkConsent !== null} onCancel={cancelNetworkConsent}
-        focusTriggerAfterClose={false} afterClose={() => afterDialogClose('network')}
+        focusable={{ focusTriggerAfterClose: false }} afterClose={() => afterDialogClose('network')}
         onOk={() => setNetworkAccess(true)} okText="确认开启" cancelText="取消"
         okButtonProps={{ 'aria-label': '确认开启网络访问', disabled: busy }}>
         <p>确认允许 UiPilot Host 访问以下 HTTPS 主机和完整凭据绑定：</p>
@@ -459,7 +459,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
         <CredentialBindings credentials={networkConsent?.plugin.network?.credentials ?? []} settings={networkConsent?.plugin.settings} />
       </Modal>
       <Modal className="public-plugin-confirmation" destroyOnHidden title="清除凭据" open={clearKey !== null} onCancel={cancelClear}
-        focusTriggerAfterClose={false} afterClose={() => afterDialogClose('clear')}
+        focusable={{ focusTriggerAfterClose: false }} afterClose={() => afterDialogClose('clear')}
         onOk={() => { if (clearKey) saveSecret(clearKey, null) }} okText="清除" cancelText="取消"
         okButtonProps={{ danger: true, disabled: busy, 'aria-label': `确认清除 ${secretSettings.find(({ definition }) => definition.key === clearKey)?.definition.label ?? ''}` }}>
         <p>清除后，需要重新配置此凭据才能使用相关请求。</p>

@@ -793,7 +793,7 @@ uipilot-plugin validate .\package --platform windows --json
 
 使用 `timer.control` 时，CLI 会检查完整的 Windows `submit + window` 权限组合，以及唯一固定文件 `assets/sounds/timer-alarm.wav`。缺少/多带 WAV、使用其他 WAV 路径、非规范 RIFF/WAVE、错误声道/采样率/位深、超过 2 MiB 或 15 秒都会返回 `RESOURCE_INVALID`。CLI 通过后仍应在目标平台用 UiPilot 做最终安装和交互验收。
 
-使用 `network.https` 时，CLI 只验证 Manifest 的 Windows 平台、`minimumHostVersion >= 0.3.2`、权限配对和精确主机语法；CLI 自身不会联网，也不会验证第三方服务或凭据。
+使用 `network.https` 时，CLI 会静态验证 Manifest 的 Windows 平台、权限配对和精确主机语法；普通 HTTPS 要求 `minimumHostVersion >= 0.3.2`。声明 `network.credentials` 时，还要求 `minimumHostVersion >= 0.4.0`，并验证凭据引用元数据：数组含 1–8 项、每项仅含规定字段、`id` 唯一、`id` / `settingKey` 语法合法、`settingKey` 精确引用 secret 设置、`host` 是 `httpsHosts` 的精确成员、`type` 为 `bearer`。CLI 不读取已保存的 secret 值、不验证 token 能否通过第三方服务认证，也不发送网络请求。
 
 使用 `clipboard.history.read` / `clipboard.history.paste` 时，CLI 只验证 Windows `submit + panel + ui.panel`、`minimumHostVersion >= 0.3.3`、`paste` 依赖 `read`、以及 `clipboard.read` 不能作为别名；真实剪贴板采集、持久化、粘贴和焦点恢复仍以 UiPilot 宿主验收为准。
 
