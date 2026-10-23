@@ -96,9 +96,9 @@
 
 **Dependencies:** Tasks 1–5；设计 §7–§9；示例遵守public-plugin-developer-guide及ui-guidelines，参考demo-http。
 
-- [ ] 完整SDK消费/错误/授权/取消/失败非回滚/回显合同；合成凭据示例和离线fakeprovider测试、人工Host步骤。
-- [ ] 完成闭环后同步Host及CLI目标0.4.0；CLI包版本维持0.1.0，历史minimumHostVersion和其他依赖版本不变。
-- [ ] 全仓门禁及独立全批评审，修正发现；更新路线图/进度与未执行的人工检查，不把mock通过称为真实Host验收。
+- [x] 完整SDK消费/错误/授权/取消/失败非回滚/回显合同；合成凭据示例和离线fakeprovider测试、人工Host步骤。
+- [x] 完成闭环后同步Host及CLI目标0.4.0；CLI包版本维持0.1.0，历史minimumHostVersion和其他依赖版本不变。
+- [x] 全仓门禁及独立全批评审，修正发现；更新路线图/进度与未执行的人工检查，不把mock通过称为真实Host验收。
 
 **Distinct test coverage:** 0.3.4拒绝/0.4.0接受新示例；isolated CLI pack/validate新示例，Host staging兼容；demo无真实token或公网依赖；SDK声明与Runtime实际字段/错误一致，版本源一致。
 
