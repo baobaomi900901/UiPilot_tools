@@ -5,8 +5,8 @@ use std::{
 
 use super::{
     super::{
-        manifest::valid_https_host, scheduler::PluginContextAccessError, PluginRequestContext,
-        PluginRequestScheduler,
+        manifest::valid_https_host, scheduler::PluginContextAccessError,
+        secrets::PluginSecretStore, PluginRequestContext, PluginRequestScheduler,
     },
     broker::{
         PendingPluginNetworkResponse, PluginHttpsBroker, PluginNetworkErrorCode,
@@ -175,6 +175,27 @@ impl PluginNetworkAuthorityGate {
             context,
             scheduler,
             request,
+            None,
+            || {},
+        )
+    }
+
+    pub(crate) fn admit_with_secrets(
+        &self,
+        caller_plugin_id: &str,
+        caller_generation: u64,
+        context: &PluginRequestContext,
+        scheduler: &PluginRequestScheduler,
+        request: PluginNetworkRequest,
+        secrets: &PluginSecretStore,
+    ) -> Result<PreparedPluginNetworkCall, PluginNetworkErrorCode> {
+        self.admit_inner(
+            caller_plugin_id,
+            caller_generation,
+            context,
+            scheduler,
+            request,
+            Some(secrets),
             || {},
         )
     }
@@ -186,6 +207,7 @@ impl PluginNetworkAuthorityGate {
         context: &PluginRequestContext,
         scheduler: &PluginRequestScheduler,
         request: PluginNetworkRequest,
+        secrets: Option<&PluginSecretStore>,
         hook: impl FnOnce(),
     ) -> Result<PreparedPluginNetworkCall, PluginNetworkErrorCode> {
         let state = self.lock()?;
@@ -205,8 +227,20 @@ impl PluginNetworkAuthorityGate {
                     && authority.admission_epoch == current.admission_epoch
             })
             .ok_or(PluginNetworkErrorCode::PermissionDenied)?;
-        hook();
-        self.broker.admit(&current, &authority.https_hosts, request)
+        self.broker.admit_with_credentials(
+            &current,
+            &authority.https_hosts,
+            &authority.credentials,
+            request,
+            |binding| {
+                secrets
+                    .ok_or(PluginNetworkErrorCode::CredentialUnavailable)?
+                    .read_bearer(caller_plugin_id, &binding.setting_key)
+                    .map_err(|_| PluginNetworkErrorCode::CredentialUnavailable)?
+                    .ok_or(PluginNetworkErrorCode::CredentialUnavailable)
+            },
+            hook,
+        )
     }
 
     #[cfg(test)]
@@ -225,6 +259,7 @@ impl PluginNetworkAuthorityGate {
             context,
             scheduler,
             request,
+            None,
             hook,
         )
     }
@@ -256,13 +291,15 @@ impl PluginNetworkAuthorityGate {
         context: &PluginRequestContext,
         scheduler: Arc<PluginRequestScheduler>,
         request: PluginNetworkRequest,
+        secrets: &PluginSecretStore,
     ) -> Result<PluginNetworkResponse, PluginNetworkErrorCode> {
-        let prepared = self.admit(
+        let prepared = self.admit_with_secrets(
             caller_plugin_id,
             caller_generation,
             context,
             scheduler.as_ref(),
             request,
+            secrets,
         )?;
         let pending = self
             .broker
@@ -591,6 +628,7 @@ mod tests {
             method: PluginNetworkRequestMethod::Get,
             headers: None,
             body: None,
+            credential: None,
         }
     }
 
@@ -768,5 +806,272 @@ mod tests {
             pending.await.unwrap().err(),
             Some(PluginNetworkErrorCode::ExpiredRequest)
         );
+    }
+
+    struct SecretFixture {
+        root: std::path::PathBuf,
+        store: crate::public_plugins::secrets::PluginSecretStore,
+    }
+
+    impl SecretFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "uipilot-credential-gate-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let store = crate::public_plugins::secrets::PluginSecretStore::load(&root).unwrap();
+            Self { root, store }
+        }
+    }
+    impl Drop for SecretFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn bearer_snapshot() -> PluginNetworkAuthoritySnapshot {
+        use crate::public_plugins::{PublicPlatform, PublicPluginHost};
+        let manifest = serde_json::json!({
+            "schemaVersion":1,"pluginId":"com.example.network","version":"1.0.0","apiVersion":1,
+            "minimumHostVersion":"0.4.0","name":"Credential Test","supportedPlatforms":["windows"],
+            "command":{"defaultName":"credential","activationMode":"submit","outputMode":"mainResult","inputRequired":false},
+            "runtime":{"entry":"dist/runtime.js"},"permissions":["network.https"],
+            "settings":[{"type":"secret","key":"api-token","label":"Token"}],
+            "network":{"httpsHosts":["api.example.com"],"credentials":[{"id":"service-token","settingKey":"api-token","host":"api.example.com","type":"bearer"}]}
+        });
+        let host = PublicPluginHost {
+            version: [0, 4, 0],
+            ..PublicPluginHost::current(PublicPlatform::Windows)
+        };
+        let manifest = crate::public_plugins::manifest::parse_manifest(
+            &serde_json::to_vec(&manifest).unwrap(),
+            &host,
+        )
+        .unwrap();
+        let mut authority = snapshot(1, 2, 3);
+        authority.credentials = manifest.network.unwrap().credentials.unwrap();
+        authority
+    }
+
+    fn bearer_request() -> PluginNetworkRequest {
+        PluginNetworkRequest {
+            credential: Some("service-token".into()),
+            ..request()
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_dpapi_to_fake_transport_redacts_and_preserves_redirect_snapshot_and_echo() {
+        let fixture = SecretFixture::new();
+        fixture
+            .store
+            .write("com.example.network", "api-token", "synthetic-token-M4")
+            .unwrap();
+        fixture
+            .store
+            .write("com.example.other", "api-token", "other-synthetic-token")
+            .unwrap();
+        let transport = Arc::new(DeterministicHttpsTransport::new(vec![
+            Ok(NativeHttpsResponse {
+                status: 302,
+                headers: vec![("location".into(), b"/next".to_vec())],
+                body: vec![],
+            }),
+            Ok(NativeHttpsResponse {
+                status: 200,
+                headers: vec![],
+                body: b"server echo: synthetic-token-M4".to_vec(),
+            }),
+        ]));
+        let broker = Arc::new(PluginHttpsBroker::with_dependencies(
+            PluginNetworkRequestRegistry::default(),
+            resolver(),
+            transport.clone(),
+        ));
+        let gate = Arc::new(PluginNetworkAuthorityGate::with_broker(broker.clone()));
+        let (scheduler, context) = scheduler(1, 2, 3);
+        gate.publish(Some(bearer_snapshot())).unwrap();
+        let prepared = gate
+            .admit_with_secrets(
+                "com.example.network",
+                1,
+                &context,
+                &scheduler,
+                bearer_request(),
+                &fixture.store,
+            )
+            .unwrap();
+        // A redirect reuses its admitted snapshot even if the underlying record changes.
+        // Production mutation additionally revokes this context (Task4).
+        fixture
+            .store
+            .write(
+                "com.example.network",
+                "api-token",
+                "updated-synthetic-token",
+            )
+            .unwrap();
+        let pending = broker
+            .execute(prepared, gate.redirect_authority(scheduler.clone()))
+            .await
+            .unwrap();
+        let response = gate.deliver(pending, &scheduler).unwrap();
+        assert_eq!(response.body, "server echo: synthetic-token-M4");
+        assert!(response.headers.is_empty());
+        let sent = transport.take_requests();
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            assert!(!format!("{request:?}").contains("synthetic-token"));
+            assert!(request
+                .headers
+                .iter()
+                .all(|(name, _)| name != "authorization"));
+            assert_eq!(request.sensitive_headers.len(), 1);
+            let (name, value) = &request.sensitive_headers[0];
+            assert_eq!(name, "authorization");
+            assert!(value.is_sensitive());
+            assert_eq!(value.as_bytes(), b"Bearer synthetic-token-M4");
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_read_then_register_gate_blocks_revoke_and_cancels_old_delivery() {
+        let fixture = Arc::new(SecretFixture::new());
+        fixture
+            .store
+            .write(
+                "com.example.network",
+                "api-token",
+                "synthetic-barrier-token",
+            )
+            .unwrap();
+        let broker = Arc::new(PluginHttpsBroker::with_dependencies(
+            PluginNetworkRequestRegistry::default(),
+            resolver(),
+            Arc::new(DeterministicHttpsTransport::new(vec![])),
+        ));
+        let gate = Arc::new(PluginNetworkAuthorityGate::with_broker(broker));
+        let (scheduler, context) = scheduler(1, 2, 3);
+        gate.publish(Some(bearer_snapshot())).unwrap();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let admission = thread::spawn({
+            let gate = gate.clone();
+            let scheduler = scheduler.clone();
+            let context = context.clone();
+            let fixture = fixture.clone();
+            move || {
+                gate.admit_inner(
+                    "com.example.network",
+                    1,
+                    &context,
+                    &scheduler,
+                    bearer_request(),
+                    Some(&fixture.store),
+                    || {
+                        // This hook runs only after DPAPI and sensitive header preparation, before registration.
+                        assert_eq!(gate.global_active_for_test(), 0);
+                        entered.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    },
+                )
+            }
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (transitioned, transitioned_rx) = mpsc::channel();
+        let transition = thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.publish_plugin("com.example.network", None).unwrap();
+                transitioned.send(()).unwrap();
+            }
+        });
+        assert!(transitioned_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        release.send(()).unwrap();
+        let prepared = admission.join().unwrap().unwrap();
+        transition.join().unwrap();
+        assert!(prepared.is_cancelled_for_test());
+        assert_eq!(
+            gate.execute_for_test(prepared, scheduler).await,
+            Err(PluginNetworkErrorCode::ExpiredRequest)
+        );
+    }
+
+    #[test]
+    fn credential_missing_invalid_records_and_tokens_have_one_fixed_error() {
+        let fixture = SecretFixture::new();
+        let gate = PluginNetworkAuthorityGate::with_broker(Arc::new(
+            PluginHttpsBroker::with_dependencies(
+                PluginNetworkRequestRegistry::default(),
+                resolver(),
+                Arc::new(DeterministicHttpsTransport::new(vec![])),
+            ),
+        ));
+        let (scheduler, context) = scheduler(1, 2, 3);
+        gate.publish(Some(bearer_snapshot())).unwrap();
+        let consume = || {
+            gate.admit_with_secrets(
+                "com.example.network",
+                1,
+                &context,
+                &scheduler,
+                bearer_request(),
+                &fixture.store,
+            )
+            .err()
+        };
+        assert_eq!(
+            consume(),
+            Some(PluginNetworkErrorCode::CredentialUnavailable)
+        );
+        for token in ["", "Bearer wrong", "contains space", "valid-token"] {
+            fixture
+                .store
+                .write("com.example.network", "api-token", token)
+                .unwrap();
+            if token == "valid-token" {
+                let path = std::fs::read_dir(fixture.root.join("com.example.network"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::write(path, b"corrupt synthetic record").unwrap();
+            }
+            assert_eq!(
+                consume(),
+                Some(PluginNetworkErrorCode::CredentialUnavailable)
+            );
+        }
+        fixture
+            .store
+            .write("com.example.network", "api-token", "valid-token")
+            .unwrap();
+        let path = std::fs::read_dir(fixture.root.join("com.example.network"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(path, bytes).unwrap();
+        assert_eq!(
+            consume(),
+            Some(PluginNetworkErrorCode::CredentialUnavailable)
+        );
+        let wire = serde_json::to_value(
+            crate::public_plugins::runtime::PluginNetworkCommandError::from(
+                PluginNetworkErrorCode::CredentialUnavailable,
+            ),
+        )
+        .unwrap();
+        assert_eq!(wire, serde_json::json!({"code":"credentialUnavailable"}));
+        gate.publish_plugin("com.example.network", None).unwrap();
+        assert_eq!(consume(), Some(PluginNetworkErrorCode::PermissionDenied));
     }
 }

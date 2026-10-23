@@ -145,13 +145,19 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     }
   };
   const snapshotNetworkRequest = (input) => {
-    const source = ownData(input, new SetConstructor(['url', 'method', 'headers', 'body']));
+    const source = ownData(input, new SetConstructor(['url', 'method', 'headers', 'body', 'credential']));
     if (typeof source.url !== 'string' || (source.method !== 'GET' && source.method !== 'POST')) {
       throw invalidNetworkRequest();
     }
     const output = objectCreate(null);
     output.url = source.url;
     output.method = source.method;
+    if (objectHasOwn(source, 'credential')) {
+      if (typeof source.credential !== 'string' || !regexpTest(/^[a-z][a-z0-9.-]{0,63}$/, source.credential)) {
+        throw invalidNetworkRequest();
+      }
+      output.credential = source.credential;
+    }
     if (objectHasOwn(source, 'headers')) output.headers = copyStringRecord(source.headers);
     if (objectHasOwn(source, 'body')) {
       const body = ownData(source.body, new SetConstructor(['type', 'value']));
@@ -171,6 +177,7 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     networkTargetDenied: 'NetworkTargetDeniedError',
     networkTimeout: 'NetworkTimeoutError',
     networkFailure: 'NetworkFailureError',
+    credentialUnavailable: 'CredentialUnavailableError',
     networkResponseTooLarge: 'NetworkResponseTooLargeError',
     networkResponseInvalid: 'NetworkResponseInvalidError',
     networkLimitExceeded: 'NetworkLimitExceededError',

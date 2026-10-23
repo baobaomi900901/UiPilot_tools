@@ -3292,6 +3292,7 @@ impl PublicPluginManager {
                 &input.context,
                 Arc::clone(&self.scheduler),
                 input.request,
+                self.secrets.as_ref(),
             )
             .await
     }
@@ -4693,6 +4694,7 @@ mod tests {
             method: PluginNetworkRequestMethod::Get,
             headers: None,
             body: None,
+            credential: None,
         }
     }
 
@@ -7953,5 +7955,76 @@ mod tests {
         let disk: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(disk.get("networkCredentialsGrant").is_none());
         assert_eq!(disk["permissionGrants"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn credential_manager_network_request_uses_host_secret_store_before_fake_transport() {
+        let dir = TestDir::new("credential-network-read");
+        write_credential_package(
+            &dir.source(),
+            "1.0.0",
+            json!([
+                {"id":"service", "settingKey":"token", "host":"api.example.com", "type":"bearer"}
+            ]),
+        );
+        let (gate, started) = PluginNetworkAuthorityGate::blocking_for_test();
+        let manager = Arc::new(
+            PublicPluginManager::load_with_timer_and_network_dependencies(
+                dir.path(),
+                PublicPluginHost {
+                    version: [0, 4, 0],
+                    ..PublicPluginHost::current(PublicPlatform::Windows)
+                },
+                ["find".into(), "math".into()],
+                Arc::new(MessageCenterService::load(dir.path())),
+                Arc::new(TestClock::default()),
+                Arc::new(TestPublisher::successful()),
+                gate.clone(),
+            )
+            .unwrap(),
+        );
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let scheduled = dispatch_network_scheduled(&manager);
+        let caller = PluginRuntimeIdentity {
+            plugin_id: scheduled.context.plugin_id.clone(),
+            generation: scheduled.context.plugin_generation,
+        };
+        let input = PluginNetworkCommandInput {
+            context: scheduled.context.clone(),
+            request: PluginNetworkRequest {
+                credential: Some("service".into()),
+                ..network_request()
+            },
+        };
+        assert_eq!(
+            manager.request_network(caller.clone(), input.clone()).await,
+            Err(PluginNetworkErrorCode::CredentialUnavailable)
+        );
+        manager
+            .secrets
+            .write("com.example.network", "token", "synthetic-manager-token")
+            .unwrap();
+        let pending = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.request_network(caller, input).await }
+        });
+        tokio::time::timeout(Duration::from_millis(500), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(gate.close_plugin("com.example.network"), 1);
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(PluginNetworkErrorCode::ExpiredRequest)
+        );
     }
 }

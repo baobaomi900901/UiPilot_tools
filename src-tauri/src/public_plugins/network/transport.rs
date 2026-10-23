@@ -148,6 +148,7 @@ pub(super) struct NativeHttpsRequest {
     pub(super) method: Method,
     pub(super) path_and_query: String,
     pub(super) headers: Vec<(String, Vec<u8>)>,
+    pub(super) sensitive_headers: Vec<(HeaderName, HeaderValue)>,
     pub(super) body: Vec<u8>,
     pub(super) max_response_body_bytes: usize,
     pub(super) deadline: Instant,
@@ -281,6 +282,10 @@ impl NativeHttpsTransport {
                 .map_err(|_| NativeTransportError::InvalidRequest)?;
             let value = HeaderValue::from_bytes(&value)
                 .map_err(|_| NativeTransportError::InvalidRequest)?;
+            outgoing.headers_mut().append(name, value);
+        }
+
+        for (name, value) in request.sensitive_headers {
             outgoing.headers_mut().append(name, value);
         }
 
@@ -447,7 +452,7 @@ mod tests {
     ) -> (
         SocketAddr,
         Vec<u8>,
-        tokio_mpsc::UnboundedReceiver<()>,
+        tokio_mpsc::UnboundedReceiver<Vec<u8>>,
         tokio::task::JoinHandle<()>,
     ) {
         spawn_tls_server_with_certificate(
@@ -463,7 +468,7 @@ mod tests {
     ) -> (
         SocketAddr,
         Vec<u8>,
-        tokio_mpsc::UnboundedReceiver<()>,
+        tokio_mpsc::UnboundedReceiver<Vec<u8>>,
         tokio::task::JoinHandle<()>,
     ) {
         let CertifiedKey { cert, signing_key } = certified_key;
@@ -492,7 +497,7 @@ mod tests {
                     }
                     request.extend_from_slice(&chunk[..read]);
                 }
-                let _ = request_seen.send(());
+                let _ = request_seen.send(request);
                 tokio::time::sleep(reply.delay).await;
                 for chunk in reply.chunks {
                     if stream.write_all(&chunk).await.is_err() {
@@ -513,6 +518,7 @@ mod tests {
             method: Method::GET,
             path_and_query: "/translate?q=test".to_owned(),
             headers: Vec::new(),
+            sensitive_headers: Vec::new(),
             body: Vec::new(),
             max_response_body_bytes: 1024 * 1024,
             deadline: Instant::now() + Duration::from_secs(3),
@@ -1075,5 +1081,34 @@ mod tests {
             HttpsTransport::execute(&transport, input.clone(), &CancellationToken::new()).await;
         assert_eq!(result, Ok(expected));
         assert_eq!(transport.take_requests(), vec![input]);
+    }
+
+    #[tokio::test]
+    async fn native_https_transport_sends_sensitive_bearer_only_to_fake_tls_service() {
+        use hyper::header::{HeaderValue, AUTHORIZATION};
+        let (address, root, mut seen, server) = spawn_tls_server(
+            "api.example.com",
+            vec![ServerReply {
+                delay: Duration::ZERO,
+                chunks: vec![
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+                ],
+            }],
+        )
+        .await;
+        let transport = NativeHttpsTransport::with_test_root(&root).unwrap();
+        let mut input = request(address, "api.example.com");
+        let mut header = HeaderValue::from_static("Bearer synthetic-tls-token");
+        header.set_sensitive(true);
+        input.sensitive_headers.push((AUTHORIZATION, header));
+        assert!(!format!("{input:?}").contains("synthetic-tls-token"));
+        let result = transport
+            .execute(input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.body, b"ok");
+        let received = String::from_utf8(seen.recv().await.unwrap()).unwrap();
+        assert!(received.contains("authorization: Bearer synthetic-tls-token\r\n"));
+        server.await.unwrap();
     }
 }

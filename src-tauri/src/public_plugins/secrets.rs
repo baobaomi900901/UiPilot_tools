@@ -1,5 +1,6 @@
 use std::{
     fmt, fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -8,12 +9,11 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::{LocalFree, HLOCAL},
-        Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
+        Security::Cryptography::{
+            CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
     },
 };
-
-#[cfg(test)]
-use windows::Win32::Security::Cryptography::CryptUnprotectData;
 
 use crate::atomic_file::replace_current;
 
@@ -25,6 +25,50 @@ use super::{
 
 const RECORD_MAGIC: &[u8] = b"UIPILOT-SECRET-V1\0";
 const MAX_SECRET_BYTES: usize = 64 * 1024;
+// DPAPI adds a small fixed envelope; never allocate from an untrusted record length.
+const MAX_RECORD_BYTES: usize = MAX_SECRET_BYTES + 4096;
+
+pub(crate) struct SensitiveBytes(Vec<u8>);
+
+impl SensitiveBytes {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SensitiveBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SensitiveBytes([REDACTED])")
+    }
+}
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            // Volatile writes prevent the compiler from eliding the wipe.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn valid_bearer(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > 8192 {
+        return false;
+    }
+    let token_end = bytes
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(bytes.len());
+    token_end != 0
+        && bytes[..token_end]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._~+/-".contains(byte))
+        && bytes[token_end..].iter().all(|byte| *byte == b'=')
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PluginSecretError {
@@ -94,12 +138,78 @@ impl PluginSecretStore {
     ) -> Result<bool, PluginSecretError> {
         authorize_plugin_scope(scope, plugin_id).map_err(|_| PluginSecretError::InvalidScope)?;
         validate_identity(plugin_id, key)?;
-        let path = secret_path(&self.owner_root(plugin_id)?, key);
-        match fs::read(path) {
-            Ok(bytes) => Ok(decode_record(&bytes).is_some()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err(PluginSecretError::Storage),
+        Ok(self
+            .read_record(plugin_id, key)?
+            .is_some_and(|bytes| decode_record(&bytes).is_some()))
+    }
+
+    // Host-only: identity and key come from an admitted authority, never from a Runtime path.
+    // Missing records are distinguishable here for checked authority reopening; the broker
+    // deliberately maps every consumption failure to CredentialUnavailable.
+    pub(crate) fn read_bearer(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> Result<Option<SensitiveBytes>, PluginSecretError> {
+        validate_identity(plugin_id, key)?;
+        let Some(record) = self.read_record(plugin_id, key)? else {
+            return Ok(None);
+        };
+        let ciphertext = decode_record(&record).ok_or(PluginSecretError::Storage)?;
+        let plaintext = unprotect(ciphertext, &entropy(plugin_id, key))?;
+        if !valid_bearer(plaintext.as_bytes()) {
+            return Err(PluginSecretError::Storage);
         }
+        Ok(Some(plaintext))
+    }
+
+    fn read_record(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, PluginSecretError> {
+        if !ordinary_directory(&self.root) {
+            return Err(PluginSecretError::Storage);
+        }
+        let owner = self.owner_root(plugin_id)?;
+        match fs::symlink_metadata(&owner) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {}
+            _ => return Err(PluginSecretError::Storage),
+        }
+        let path = secret_path(&owner, key);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(metadata)
+                if metadata.is_file()
+                    && !is_reparse_point(&metadata)
+                    && metadata.len() <= MAX_RECORD_BYTES as u64 => {}
+            _ => return Err(PluginSecretError::Storage),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+        }
+        let file = options.open(path).map_err(|_| PluginSecretError::Storage)?;
+        let metadata = file.metadata().map_err(|_| PluginSecretError::Storage)?;
+        if !metadata.is_file()
+            || is_reparse_point(&metadata)
+            || metadata.len() > MAX_RECORD_BYTES as u64
+        {
+            return Err(PluginSecretError::Storage);
+        }
+        let mut bytes = Vec::new();
+        file.take((MAX_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| PluginSecretError::Storage)?;
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(PluginSecretError::Storage);
+        }
+        Ok(Some(bytes))
     }
 
     pub(crate) fn remove(&self, plugin_id: &str, key: &str) -> Result<(), PluginSecretError> {
@@ -136,7 +246,7 @@ impl PluginSecretStore {
         let record = fs::read(secret_path(&self.owner_root(plugin_id)?, key))
             .map_err(|_| PluginSecretError::Storage)?;
         let ciphertext = decode_record(&record).ok_or(PluginSecretError::Storage)?;
-        unprotect(ciphertext, &entropy(plugin_id, key))
+        unprotect(ciphertext, &entropy(plugin_id, key)).map(|value| value.as_bytes().to_vec())
     }
 
     #[cfg(test)]
@@ -193,8 +303,7 @@ fn protect(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, PluginSecretErro
     take_output(output)
 }
 
-#[cfg(test)]
-fn unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, PluginSecretError> {
+fn unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<SensitiveBytes, PluginSecretError> {
     let input = blob(ciphertext)?;
     let entropy = blob(entropy)?;
     let mut output = CRYPT_INTEGER_BLOB::default();
@@ -210,7 +319,7 @@ fn unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, PluginSecretE
         )
     }
     .map_err(|_| PluginSecretError::ProtectFailed)?;
-    take_output(output)
+    take_output(output).map(SensitiveBytes::new)
 }
 
 fn blob(bytes: &[u8]) -> Result<CRYPT_INTEGER_BLOB, PluginSecretError> {
@@ -221,20 +330,24 @@ fn blob(bytes: &[u8]) -> Result<CRYPT_INTEGER_BLOB, PluginSecretError> {
 }
 
 fn take_output(output: CRYPT_INTEGER_BLOB) -> Result<Vec<u8>, PluginSecretError> {
-    let result = if output.cbData == 0 {
+    let mut result = SensitiveBytes::new(if output.cbData == 0 {
         Vec::new()
     } else if output.pbData.is_null() {
         return Err(PluginSecretError::ProtectFailed);
     } else {
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec()
-    };
+    });
     if !output.pbData.is_null() {
+        for offset in 0..output.cbData as usize {
+            unsafe { std::ptr::write_volatile(output.pbData.add(offset), 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
         let freed = unsafe { LocalFree(Some(HLOCAL(output.pbData.cast()))) };
         if !freed.is_invalid() {
             return Err(PluginSecretError::ProtectFailed);
         }
     }
-    Ok(result)
+    Ok(std::mem::take(&mut result.0))
 }
 
 fn encode_record(ciphertext: &[u8]) -> Result<Vec<u8>, PluginSecretError> {

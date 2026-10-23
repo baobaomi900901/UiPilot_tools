@@ -5522,6 +5522,7 @@ mod tests {
                 method: crate::public_plugins::PluginNetworkRequestMethod::Get,
                 headers: None,
                 body: None,
+                credential: None,
             },
         };
         for label in [

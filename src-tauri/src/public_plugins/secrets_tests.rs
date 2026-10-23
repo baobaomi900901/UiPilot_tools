@@ -86,3 +86,83 @@ fn uninstall_can_retain_or_delete_secrets() {
     assert!(!store.is_configured(&scope, plugin_id, key).unwrap());
     assert!(!dir.path().join(plugin_id).exists());
 }
+
+#[test]
+fn host_bearer_reader_validates_format_boundaries_and_redacts() {
+    let dir = TestDir::new("bearer");
+    let store = PluginSecretStore::load(dir.path()).unwrap();
+    let plugin = "com.example.secret";
+    assert!(store.read_bearer(plugin, "token").unwrap().is_none());
+    for value in ["a", "abc._~+/-==", &"x".repeat(8192)] {
+        store.write(plugin, "token", value).unwrap();
+        let token = store.read_bearer(plugin, "token").unwrap().unwrap();
+        assert_eq!(token.as_bytes(), value.as_bytes());
+        assert_eq!(format!("{token:?}"), "SensitiveBytes([REDACTED])");
+    }
+    for value in [
+        "",
+        " ",
+        "Bearer abc",
+        "abc\r\n",
+        "\u{4f60}\u{597d}",
+        "a=b",
+        "=",
+        &"x".repeat(8193),
+    ] {
+        store.write(plugin, "token", value).unwrap();
+        assert!(store.read_bearer(plugin, "token").is_err());
+    }
+}
+
+#[test]
+fn host_bearer_reader_is_bounded_and_checks_records_and_owner() {
+    let dir = TestDir::new("bounded");
+    let store = PluginSecretStore::load(dir.path()).unwrap();
+    let plugin = "com.example.secret";
+    store.write(plugin, "token", "synthetic-token").unwrap();
+    let path = store.record_path_for_test(plugin, "token").unwrap();
+    for bytes in [
+        b"broken".to_vec(),
+        encode_record(b"not-dpapi").unwrap(),
+        vec![b'x'; 128 * 1024],
+    ] {
+        fs::write(&path, bytes).unwrap();
+        assert!(store.read_bearer(plugin, "token").is_err());
+    }
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(store.read_bearer(plugin, "token").is_err());
+    fs::remove_dir(&path).unwrap();
+    store.write(plugin, "token", "synthetic-token").unwrap();
+    let other = "com.example.other";
+    store
+        .write(other, "token", "other-synthetic-token")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_bearer(other, "token")
+            .unwrap()
+            .unwrap()
+            .as_bytes(),
+        b"other-synthetic-token"
+    );
+    fs::copy(&path, store.record_path_for_test(other, "token").unwrap()).unwrap();
+    assert!(store.read_bearer(other, "token").is_err());
+}
+
+#[test]
+fn generic_secret_limit_remains_64k_while_bearer_is_8192() {
+    let dir = TestDir::new("generic-limit");
+    let store = PluginSecretStore::load(dir.path()).unwrap();
+    let plugin = "com.example.secret";
+    let scope = PluginDataScope::new(plugin).unwrap();
+    store
+        .write(plugin, "token", &"x".repeat(64 * 1024))
+        .unwrap();
+    assert!(store.is_configured(&scope, plugin, "token").unwrap());
+    assert!(store.read_bearer(plugin, "token").is_err());
+    assert_eq!(
+        store.write(plugin, "token", &"x".repeat(64 * 1024 + 1)),
+        Err(PluginSecretError::ValueTooLarge)
+    );
+}

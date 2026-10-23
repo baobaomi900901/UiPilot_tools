@@ -4,7 +4,14 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
-use hyper::{header::HeaderName, Method};
+use super::super::{
+    manifest::{valid_setting_key, PluginNetworkCredential},
+    secrets::SensitiveBytes,
+};
+use hyper::{
+    header::{HeaderName, HeaderValue, AUTHORIZATION},
+    Method,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -72,6 +79,18 @@ pub(crate) struct PluginNetworkRequest {
     pub(crate) headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub(crate) body: Option<PluginNetworkRequestBody>,
+    #[serde(default, deserialize_with = "deserialize_credential")]
+    pub(crate) credential: Option<String>,
+}
+
+fn deserialize_credential<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    if !valid_setting_key(&id) {
+        return Err(serde::de::Error::custom("invalid credential reference"));
+    }
+    Ok(Some(id))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -90,6 +109,7 @@ pub(crate) enum PluginNetworkErrorCode {
     NetworkTargetDenied,
     NetworkTimeout,
     NetworkFailure,
+    CredentialUnavailable,
     NetworkResponseTooLarge,
     NetworkResponseInvalid,
     NetworkLimitExceeded,
@@ -110,6 +130,7 @@ struct ValidatedRequest {
     hostname: String,
     method: PluginNetworkRequestMethod,
     plugin_headers: Vec<(String, Vec<u8>)>,
+    sensitive_headers: Vec<(HeaderName, HeaderValue)>,
     body: Vec<u8>,
     content_type: Option<&'static str>,
     authorized_hosts: BTreeSet<String>,
@@ -205,11 +226,74 @@ impl PluginHttpsBroker {
         authorized_hosts: &BTreeSet<String>,
         request: PluginNetworkRequest,
     ) -> Result<PreparedPluginNetworkCall, PluginNetworkErrorCode> {
+        self.admit_with_credentials(
+            context,
+            authorized_hosts,
+            &[],
+            request,
+            |_| Err(PluginNetworkErrorCode::PermissionDenied),
+            || {},
+        )
+    }
+
+    pub(super) fn admit_with_credentials(
+        &self,
+        context: &PluginNetworkContextIdentity,
+        authorized_hosts: &BTreeSet<String>,
+        credentials: &[PluginNetworkCredential],
+        request: PluginNetworkRequest,
+        read_secret: impl FnOnce(
+            &PluginNetworkCredential,
+        ) -> Result<SensitiveBytes, PluginNetworkErrorCode>,
+        before_register: impl FnOnce(),
+    ) -> Result<PreparedPluginNetworkCall, PluginNetworkErrorCode> {
         let attempt = self
             .registry
             .reserve_attempt(context)
             .map_err(map_registry_error)?;
-        let request = validate_request(request, authorized_hosts)?;
+        let credential = request.credential.clone();
+        let mut request = validate_request(request, authorized_hosts)?;
+        if let Some(id) = credential {
+            if !valid_setting_key(&id) {
+                return Err(PluginNetworkErrorCode::InvalidNetworkRequest);
+            }
+            let binding = credentials
+                .iter()
+                .find(|binding| binding.id == id)
+                .ok_or(PluginNetworkErrorCode::PermissionDenied)?;
+            if request.hostname != binding.host {
+                return Err(PluginNetworkErrorCode::NetworkTargetDenied);
+            }
+            if request
+                .plugin_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(PluginNetworkErrorCode::InvalidNetworkRequest);
+            }
+            let token = read_secret(binding)?;
+            let mut bytes = Vec::with_capacity(7 + token.as_bytes().len());
+            bytes.extend_from_slice(b"Bearer ");
+            bytes.extend_from_slice(token.as_bytes());
+            let bytes = SensitiveBytes::new(bytes);
+            let mut value = HeaderValue::from_bytes(bytes.as_bytes())
+                .map_err(|_| PluginNetworkErrorCode::CredentialUnavailable)?;
+            value.set_sensitive(true);
+            let total = request
+                .plugin_headers
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
+                + AUTHORIZATION.as_str().len()
+                + value.as_bytes().len();
+            if request.plugin_headers.len() + 1 > MAX_REQUEST_HEADER_FIELDS
+                || total > MAX_REQUEST_HEADER_BYTES
+            {
+                return Err(PluginNetworkErrorCode::InvalidNetworkRequest);
+            }
+            request.sensitive_headers.push((AUTHORIZATION, value));
+        }
+        before_register();
         let call = self
             .registry
             .register(attempt)
@@ -283,6 +367,7 @@ impl PluginHttpsBroker {
                 method: method.as_hyper(),
                 path_and_query: path_and_query(&url),
                 headers: transport_headers(&request.plugin_headers, &body, content_type),
+                sensitive_headers: request.sensitive_headers.clone(),
                 body: body.clone(),
                 max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
                 deadline: request.deadline,
@@ -389,6 +474,7 @@ impl PluginNetworkErrorCode {
             Self::NetworkTargetDenied => "target-denied",
             Self::NetworkTimeout => "timeout",
             Self::NetworkFailure => "network-failure",
+            Self::CredentialUnavailable => "credential-unavailable",
             Self::NetworkResponseTooLarge => "response-too-large",
             Self::NetworkResponseInvalid => "response-invalid",
             Self::NetworkLimitExceeded => "limit-exceeded",
@@ -410,6 +496,7 @@ fn validate_request(
         hostname,
         method: request.method,
         plugin_headers,
+        sensitive_headers: Vec::new(),
         body,
         content_type,
         authorized_hosts: authorized_hosts.clone(),
@@ -830,6 +917,7 @@ mod tests {
             method,
             headers: None,
             body: None,
+            credential: None,
         }
     }
 
@@ -1319,5 +1407,239 @@ mod tests {
             pending.await.unwrap().err(),
             Some(PluginNetworkErrorCode::ExpiredRequest)
         );
+    }
+
+    fn credential() -> crate::public_plugins::manifest::PluginNetworkCredential {
+        serde_json::from_value(json!({"id":"service-token","settingKey":"api-token","host":"api.example.com","type":"bearer"})).unwrap()
+    }
+
+    #[test]
+    fn credential_dto_is_present_only_strict_and_validated() {
+        let base = json!({"url":"https://api.example.com/", "method":"GET"});
+        assert!(serde_json::from_value::<PluginNetworkRequest>(base.clone()).is_ok());
+        for value in [
+            json!(null),
+            json!(""),
+            json!({}),
+            json!("Bad"),
+            json!("a".repeat(65)),
+        ] {
+            let mut input = base.clone();
+            input["credential"] = value;
+            assert!(serde_json::from_value::<PluginNetworkRequest>(input).is_err());
+        }
+        let mut input = base;
+        input["credential"] = json!("service-token");
+        assert_eq!(
+            serde_json::from_value::<PluginNetworkRequest>(input)
+                .unwrap()
+                .credential
+                .as_deref(),
+            Some("service-token")
+        );
+    }
+
+    #[test]
+    fn credentials_reject_before_read_and_failed_reads_consume_attempts() {
+        use std::cell::Cell;
+        let (broker, _) = broker(Vec::new());
+        let binding = credential();
+        let reads = Cell::new(0);
+        let read = |_: &crate::public_plugins::manifest::PluginNetworkCredential| {
+            reads.set(reads.get() + 1);
+            Err(PluginNetworkErrorCode::CredentialUnavailable)
+        };
+        let identity = context("credential-attempts");
+        let mut request = request(PluginNetworkRequestMethod::Get);
+        request.credential = Some("service-token".into());
+        assert_eq!(
+            broker
+                .admit_with_credentials(
+                    &context("credential-not-granted"),
+                    &hosts(),
+                    &[],
+                    request.clone(),
+                    &read,
+                    || {}
+                )
+                .err(),
+            Some(PluginNetworkErrorCode::PermissionDenied)
+        );
+        assert_eq!(reads.get(), 0);
+        let mut unknown = request.clone();
+        unknown.credential = Some("unknown".into());
+        assert_eq!(
+            broker
+                .admit_with_credentials(
+                    &identity,
+                    &hosts(),
+                    &[binding.clone()],
+                    unknown,
+                    &read,
+                    || {}
+                )
+                .err(),
+            Some(PluginNetworkErrorCode::PermissionDenied)
+        );
+        let mut wrong_host = binding.clone();
+        wrong_host.host = "other.example.com".into();
+        assert_eq!(
+            broker
+                .admit_with_credentials(
+                    &identity,
+                    &hosts(),
+                    &[wrong_host],
+                    request.clone(),
+                    &read,
+                    || {}
+                )
+                .err(),
+            Some(PluginNetworkErrorCode::NetworkTargetDenied)
+        );
+        let mut conflict = request.clone();
+        conflict.headers = Some([("aUtHoRiZaTiOn".into(), "anything".into())].into());
+        assert_eq!(
+            broker
+                .admit_with_credentials(
+                    &identity,
+                    &hosts(),
+                    &[binding.clone()],
+                    conflict,
+                    &read,
+                    || {}
+                )
+                .err(),
+            Some(PluginNetworkErrorCode::InvalidNetworkRequest)
+        );
+        assert_eq!(reads.get(), 0);
+        for _ in 0..5 {
+            assert_eq!(
+                broker
+                    .admit_with_credentials(
+                        &identity,
+                        &hosts(),
+                        &[binding.clone()],
+                        request.clone(),
+                        &read,
+                        || {}
+                    )
+                    .err(),
+                Some(PluginNetworkErrorCode::CredentialUnavailable)
+            );
+        }
+        assert_eq!(reads.get(), 5);
+        assert_eq!(
+            broker
+                .admit_with_credentials(&identity, &hosts(), &[binding], request, &read, || {})
+                .err(),
+            Some(PluginNetworkErrorCode::NetworkLimitExceeded)
+        );
+        assert_eq!(reads.get(), 5);
+        assert_eq!(broker.global_active_for_test(), 0);
+    }
+
+    #[test]
+    fn injected_authorization_counts_towards_final_header_limits() {
+        let (broker, _) = broker(Vec::new());
+        let binding = credential();
+        let identity = context("credential-headers");
+        let make = |headers| PluginNetworkRequest {
+            credential: Some("service-token".into()),
+            headers: Some(headers),
+            ..request(PluginNetworkRequestMethod::Get)
+        };
+        let token =
+            || crate::public_plugins::secrets::SensitiveBytes::new(b"synthetic-token".to_vec());
+        for (count, expected) in [
+            (31, None),
+            (32, Some(PluginNetworkErrorCode::InvalidNetworkRequest)),
+        ] {
+            let input = make((0..count).map(|i| (format!("x-{i}"), "v".into())).collect());
+            assert_eq!(
+                broker
+                    .admit_with_credentials(
+                        &identity,
+                        &hosts(),
+                        &[binding.clone()],
+                        input,
+                        |_| Ok(token()),
+                        || {}
+                    )
+                    .err(),
+                expected
+            );
+        }
+        let overhead = "authorization".len() + b"Bearer synthetic-token".len() + "x".len();
+        for (length, expected) in [
+            (16 * 1024 - overhead, None),
+            (
+                16 * 1024 - overhead + 1,
+                Some(PluginNetworkErrorCode::InvalidNetworkRequest),
+            ),
+        ] {
+            let input = make([("x".into(), "x".repeat(length))].into());
+            assert_eq!(
+                broker
+                    .admit_with_credentials(
+                        &identity,
+                        &hosts(),
+                        &[binding.clone()],
+                        input,
+                        |_| Ok(token()),
+                        || {}
+                    )
+                    .err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn secret_read_does_not_hold_registry_lock_and_registration_follows_preparation() {
+        let (broker, _) = broker(Vec::new());
+        let mut input = request(PluginNetworkRequestMethod::Get);
+        input.credential = Some("service-token".into());
+        let call = broker
+            .admit_with_credentials(
+                &context("registry-release"),
+                &hosts(),
+                &[credential()],
+                input,
+                |_| {
+                    assert_eq!(broker.global_active_for_test(), 0);
+                    Ok(crate::public_plugins::secrets::SensitiveBytes::new(
+                        b"synthetic-token".to_vec(),
+                    ))
+                },
+                || {
+                    assert_eq!(broker.global_active_for_test(), 0);
+                },
+            )
+            .unwrap();
+        assert_eq!(broker.global_active_for_test(), 1);
+        drop(call);
+        assert_eq!(broker.global_active_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_authorization_remains_supported_without_credential_reference() {
+        let (broker, transport) = broker(vec![Ok(response(200, vec![], b"ok"))]);
+        let input = PluginNetworkRequest {
+            headers: Some([("Authorization".into(), "Bearer plugin-owned-legacy".into())].into()),
+            ..request(PluginNetworkRequestMethod::Get)
+        };
+        broker
+            .request_for_test(&context("legacy-authorization"), &hosts(), input)
+            .await
+            .unwrap();
+        let sent = transport.take_requests();
+        assert!(
+            sent[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization"
+                    && value == b"Bearer plugin-owned-legacy")
+        );
+        assert!(sent[0].sensitive_headers.is_empty());
     }
 }

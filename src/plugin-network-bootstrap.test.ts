@@ -375,3 +375,44 @@ describe('public plugin Runtime network bootstrap', () => {
     expect(runtime.invoke.mock.calls.filter(([command]) => command === 'plugin_network_request')).toHaveLength(before)
   })
 })
+
+
+describe('credential reference snapshot', () => {
+  it('copies a credential ID and maps unavailable without provider detail', async () => {
+    let failure = ''
+    const input = { url: 'https://api.example.com/', method: 'GET', credential: 'service-token' }
+    const runtime = await executeRuntimeBootstrap(true, async (_invocation, api) => {
+      const pending = api.network!.request(input)
+      input.credential = 'changed'
+      try { await pending } catch (error) { failure = (error as Error).name }
+      return { requestId: context.requestId, results: [] }
+    }, async () => { throw { code: 'credentialUnavailable' } })
+    await runtime.dispatch()
+    expect(runtime.invoke).toHaveBeenCalledWith('plugin_network_request', {
+      input: { context, request: { url: input.url, method: 'GET', credential: 'service-token' } },
+    })
+    expect(failure).toBe('CredentialUnavailableError')
+  })
+
+  it('rejects null, malformed IDs, getters, symbols and prototype keys without reading values', async () => {
+    const getter = vi.fn(() => 'service-token')
+    const base = { url: 'https://api.example.com/', method: 'GET' }
+    const inputs = [
+      ...[null, {}, '', 'Bad', 'has space', 'a'.repeat(65)].map(credential => ({ ...base, credential })),
+      Object.defineProperty({ ...base }, 'credential', { get: getter, enumerable: true }),
+      { ...base, credential: 'service-token', [Symbol('extra')]: true },
+      Object.defineProperty({ ...base, credential: 'service-token' }, '__proto__', { value: 'bad' }),
+    ]
+    const failures: string[] = []
+    const runtime = await executeRuntimeBootstrap(true, async (_invocation, api) => {
+      for (const input of inputs) {
+        try { await api.network!.request(input) } catch (error) { failures.push((error as Error).name) }
+      }
+      return { requestId: context.requestId, results: [] }
+    })
+    await runtime.dispatch()
+    expect(failures).toEqual(inputs.map(() => 'InvalidNetworkRequestError'))
+    expect(getter).not.toHaveBeenCalled()
+    expect(runtime.invoke.mock.calls.filter(([command]) => command === 'plugin_network_request')).toEqual([])
+  })
+})

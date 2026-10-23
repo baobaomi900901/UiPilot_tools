@@ -50,6 +50,7 @@ export type PluginNetworkErrorName =
   | 'NetworkTargetDeniedError'
   | 'NetworkTimeoutError'
   | 'NetworkFailureError'
+  | 'CredentialUnavailableError'
   | 'NetworkResponseTooLargeError'
   | 'NetworkResponseInvalidError'
   | 'NetworkLimitExceededError'

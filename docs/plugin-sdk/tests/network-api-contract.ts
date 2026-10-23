@@ -42,6 +42,7 @@ function narrowNetworkError(error: unknown): PluginNetworkErrorName | null {
     'NetworkTargetDeniedError',
     'NetworkTimeoutError',
     'NetworkFailureError',
+    'CredentialUnavailableError',
     'NetworkResponseTooLargeError',
     'NetworkResponseInvalidError',
     'NetworkLimitExceededError',
