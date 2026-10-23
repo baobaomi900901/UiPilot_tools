@@ -474,7 +474,6 @@
       },
       "permissions": [],
       "command": {
-        "id": "default",
         "defaultName": "upper",
         "activationMode": "live",
         "outputMode": "mainResult",
