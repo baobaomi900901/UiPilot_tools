@@ -205,8 +205,67 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
   const [notice, setNotice] = useState('')
   const [name, setName] = useState(plugin.effectiveName)
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
-  const [networkConsent, setNetworkConsent] = useState<{ plugin: PublicPluginInventoryItem; revision: string } | null>(null)
+  const [networkConsent, setNetworkConsent] = useState<{ plugin: PublicPluginInventoryItem; revision: string; origin: HTMLElement } | null>(null)
   const [clearKey, setClearKey] = useState<string | null>(null)
+  const clearOrigin = useRef<HTMLElement | null>(null)
+  const focusReturn = useRef<{
+    origin: HTMLElement
+    fallback: HTMLElement | null
+    dialog: 'network' | 'clear' | null
+    dialogElement: Element | null
+    dialogClosed: boolean
+    moved: boolean
+  } | null>(null)
+  const [closedDialog, setClosedDialog] = useState(0)
+
+  const rememberFocus = (origin: HTMLElement, fallback: HTMLElement | null, dialog: 'network' | 'clear' | null) => {
+    focusReturn.current = {
+      origin, fallback, dialog,
+      dialogElement: dialog ? document.activeElement?.closest('[role="dialog"]') ?? null : null,
+      dialogClosed: dialog === null,
+      moved: false,
+    }
+  }
+
+  useEffect(() => {
+    const onFocus = (event: FocusEvent) => {
+      const pending = focusReturn.current
+      const target = event.target
+      if (!pending || !(target instanceof HTMLElement) || target === document.body
+        || target === pending.origin || target === pending.fallback || pending.dialogElement?.contains(target)) return
+      pending.moved = true
+    }
+    document.addEventListener('focusin', onFocus)
+    return () => document.removeEventListener('focusin', onFocus)
+  }, [])
+
+  useEffect(() => {
+    const pending = focusReturn.current
+    if (busy || !pending?.dialogClosed) return
+    focusReturn.current = null
+    const active = document.activeElement
+    if (pending.moved || (active && active !== document.body && active !== pending.origin
+      && active !== pending.fallback && !pending.dialogElement?.contains(active))) return
+    // The modal and disabled state must both settle before returning keyboard position.
+    const target = pending.origin.isConnected && !pending.origin.matches(':disabled') ? pending.origin : pending.fallback
+    if (target?.isConnected && !target.matches(':disabled')) target.focus()
+  }, [busy, closedDialog])
+
+  const afterDialogClose = (dialog: 'network' | 'clear') => {
+    if (focusReturn.current?.dialog !== dialog) return
+    focusReturn.current.dialogClosed = true
+    setClosedDialog((version) => version + 1)
+  }
+
+  const cancelNetworkConsent = () => {
+    if (networkConsent) rememberFocus(networkConsent.origin, null, 'network')
+    setNetworkConsent(null)
+  }
+
+  const cancelClear = () => {
+    if (clearOrigin.current) rememberFocus(clearOrigin.current, null, 'clear')
+    setClearKey(null)
+  }
   const networkPermission = plugin.permissions.find(({ permission }) => permission === 'network.https')
   const secretSettings = plugin.settings.filter(({ definition }) => definition.type === 'secret')
 
@@ -234,8 +293,13 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
     }
   }
 
-  const saveSecret = (key: string, value: string | null) => {
-    if (value !== null && !value.trim()) return
+  const saveSecret = (key: string, value: string | null, form?: HTMLFormElement) => {
+    if (operationPending.current || (value !== null && !value.trim())) return
+    const input = (form ?? clearOrigin.current?.closest('form'))?.querySelector<HTMLInputElement>('input[type="password"]') ?? null
+    const active = document.activeElement
+    const origin = value === null ? clearOrigin.current
+      : active instanceof HTMLElement && form?.contains(active) ? active : input
+    if (origin) rememberFocus(origin, input, value === null ? 'clear' : null)
     setClearKey(null)
     void mutate(
       () => client.savePublicPluginSettings({ input: { pluginId: plugin.pluginId, settings: {}, secrets: { [key]: value } } }),
@@ -247,8 +311,11 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
     )
   }
 
-  const setNetworkAccess = (granted: boolean) => {
+  const setNetworkAccess = (granted: boolean, origin?: HTMLElement) => {
+    if (operationPending.current) return
     const consent = networkConsent
+    if (consent) rememberFocus(consent.origin, null, 'network')
+    else if (origin) rememberFocus(origin, null, null)
     setNetworkConsent(null)
     if (granted && !consent) return
     const expectedInventoryRevision = consent ? parseU64Decimal(consent.revision) : null
@@ -340,7 +407,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
             <dd>
               <div className="public-network-access-header">
                 <Switch aria-label="网络访问" checked={networkPermission.granted} disabled={busy || !networkPermission.supported}
-                  onChange={(granted) => granted ? setNetworkConsent({ plugin, revision: inventoryRevision }) : setNetworkAccess(false)} />
+                  onChange={(granted, event) => granted ? setNetworkConsent({ plugin, revision: inventoryRevision, origin: event.currentTarget }) : setNetworkAccess(false, event.currentTarget)} />
                 <span>{networkPermission.supported ? (networkPermission.granted ? '已授权' : '未授权') : '不支持'}</span>
               </div>
               <CredentialBindings credentials={plugin.network.credentials} settings={plugin.settings} />
@@ -355,17 +422,18 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
               <div className="public-secret-settings">
                 {secretSettings.map(({ definition, secretConfigured }) => {
                   const statusId = `public-secret-${definition.key}-status`
+                  const draft = Object.prototype.hasOwnProperty.call(secretDrafts, definition.key) ? secretDrafts[definition.key]! : ''
                   return (
-                    <form key={definition.key} className="public-secret-setting" onSubmit={(event) => { event.preventDefault(); saveSecret(definition.key, secretDrafts[definition.key] ?? '') }}>
+                    <form key={definition.key} className="public-secret-setting" onSubmit={(event) => { event.preventDefault(); saveSecret(definition.key, draft, event.currentTarget) }}>
                       <label htmlFor={`public-secret-${definition.key}`}>{definition.label} <code>{definition.key}</code></label>
                       <span id={statusId} className="public-secret-status">{secretConfigured ? '已配置' : '未配置'}</span>
                       <Input id={`public-secret-${definition.key}`} type="password" aria-label={definition.label} aria-describedby={statusId}
                         placeholder="输入新凭据" autoComplete="new-password" readOnly={busy}
-                        value={secretDrafts[definition.key] ?? ''}
+                        value={draft}
                         onChange={(event) => setSecretDrafts((drafts) => ({ ...drafts, [definition.key]: event.target.value }))} />
                       <div className="public-secret-actions">
-                        <Button htmlType="submit" type="primary" aria-label={`保存 ${definition.label}`} disabled={!(secretDrafts[definition.key] ?? '').trim()} aria-disabled={busy}>保存</Button>
-                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy} onClick={() => setClearKey(definition.key)}>清除</Button>
+                        <Button htmlType="submit" type="primary" aria-label={`保存 ${definition.label}`} disabled={!draft.trim()} aria-disabled={busy}>保存</Button>
+                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy} onClick={(event) => { clearOrigin.current = event.currentTarget; setClearKey(definition.key) }}>清除</Button>
                       </div>
                     </form>
                   )
@@ -382,14 +450,16 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
         {notice ? <span role="status">{notice}</span> : null}
         {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
       </div>
-      <Modal className="public-plugin-confirmation" destroyOnHidden title="开启网络访问" open={networkConsent !== null} onCancel={() => setNetworkConsent(null)}
+      <Modal className="public-plugin-confirmation" destroyOnHidden title="开启网络访问" open={networkConsent !== null} onCancel={cancelNetworkConsent}
+        focusTriggerAfterClose={false} afterClose={() => afterDialogClose('network')}
         onOk={() => setNetworkAccess(true)} okText="确认开启" cancelText="取消"
         okButtonProps={{ 'aria-label': '确认开启网络访问', disabled: busy }}>
         <p>确认允许 UiPilot Host 访问以下 HTTPS 主机和完整凭据绑定：</p>
         <ul className="public-plugin-detail-items">{networkConsent?.plugin.network?.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}</ul>
         <CredentialBindings credentials={networkConsent?.plugin.network?.credentials ?? []} settings={networkConsent?.plugin.settings} />
       </Modal>
-      <Modal className="public-plugin-confirmation" destroyOnHidden title="清除凭据" open={clearKey !== null} onCancel={() => setClearKey(null)}
+      <Modal className="public-plugin-confirmation" destroyOnHidden title="清除凭据" open={clearKey !== null} onCancel={cancelClear}
+        focusTriggerAfterClose={false} afterClose={() => afterDialogClose('clear')}
         onOk={() => { if (clearKey) saveSecret(clearKey, null) }} okText="清除" cancelText="取消"
         okButtonProps={{ danger: true, disabled: busy, 'aria-label': `确认清除 ${secretSettings.find(({ definition }) => definition.key === clearKey)?.definition.label ?? ''}` }}>
         <p>清除后，需要重新配置此凭据才能使用相关请求。</p>

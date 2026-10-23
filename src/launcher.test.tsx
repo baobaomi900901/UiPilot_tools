@@ -9056,13 +9056,13 @@ describe('credential consent and settings', () => {
       { definition: { type: 'secret' as const, key: 'other-token', label: 'Other token' }, secretConfigured: true },
     ],
   }
-  async function setup(dark = false) {
+  async function setup(dark = false, plugin = item) {
     const computedStyle = window.getComputedStyle
     const styleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => computedStyle(element))
     installMatchMedia(dark)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
-    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '41', items: [item] })
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '41', items: [plugin] })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -9146,6 +9146,84 @@ describe('credential consent and settings', () => {
     } finally { await ui.cleanup() }
   })
 
+  it('supports the legal constructor secret key through draft, save and clear without affecting another draft', async () => {
+    const ui = await setup(false, { ...item, settings: [
+      { definition: { type: 'secret', key: 'constructor', label: 'Constructor token' }, secretConfigured: false },
+      item.settings[1]!,
+    ] })
+    try {
+      await ui.open()
+      const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Constructor token"]')!
+      const other = ui.host.querySelector<HTMLInputElement>('input[aria-label="Other token"]')!
+      expect(input.value).toBe('')
+      expect(button('保存 Constructor token').disabled).toBe(true)
+      await enter(other, 'other-unsaved-draft')
+      await enter(input, 'synthetic-constructor-token')
+      await act(async () => button('保存 Constructor token').click())
+      expect(ui.client.savePublicPluginSettings).toHaveBeenLastCalledWith({ input: { pluginId: item.pluginId, settings: {}, secrets: { constructor: 'synthetic-constructor-token' } } })
+      expect(input.value).toBe('')
+      expect(other.value).toBe('other-unsaved-draft')
+      await enter(input, 'unsaved-constructor-draft')
+      await act(async () => button('清除 Constructor token').click())
+      await act(async () => button('确认清除 Constructor token').click())
+      expect(ui.client.savePublicPluginSettings).toHaveBeenLastCalledWith({ input: { pluginId: item.pluginId, settings: {}, secrets: { constructor: null } } })
+      expect(input.value).toBe('')
+      expect(other.value).toBe('other-unsaved-draft')
+    } finally { await ui.cleanup() }
+  })
+
+  it.each(['network success', 'network failure', 'clear success', 'clear failure'] as const)('restores the confirmation origin after the dialog closes and mutation settles: %s', async (scenario) => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const network = scenario.startsWith('network')
+      const origin = button(network ? '网络访问' : '清除 Other token')
+      const pending = deferred<void>()
+      if (network) vi.mocked(ui.client.setPublicPluginNetworkAccess).mockReturnValueOnce(pending.promise)
+      else vi.mocked(ui.client.savePublicPluginSettings).mockReturnValueOnce(pending.promise)
+      await act(async () => { origin.focus(); origin.click() })
+      const confirm = button(network ? '确认开启网络访问' : '确认清除 Other token')
+      await act(async () => { confirm.focus(); confirm.click() })
+      expect(origin.disabled).toBe(true)
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull())
+      // Model native blur when the focused modal disappears; jsdom alone does not enforce disabled-focus behavior.
+      await act(async () => (document.activeElement as HTMLElement).blur())
+      expect(document.activeElement).toBe(document.body)
+      await act(async () => scenario.endsWith('failure') ? pending.reject(new Error('synthetic failure')) : pending.resolve())
+      expect(origin.disabled).toBe(false)
+      expect(document.activeElement).toBe(origin)
+    } finally { await ui.cleanup() }
+  })
+
+  it.each([false, true])('does not restore an operation origin after a deliberate focus move, then blur=%s', async (blur) => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
+      const other = ui.host.querySelector<HTMLInputElement>('input[aria-label="Other token"]')!
+      await enter(input, 'synthetic-token')
+      const pending = deferred<void>()
+      vi.mocked(ui.client.savePublicPluginSettings).mockReturnValueOnce(pending.promise)
+      await act(async () => { button('保存 Current API token').focus(); button('保存 Current API token').click() })
+      await act(async () => { other.focus(); if (blur) other.blur() })
+      await act(async () => pending.resolve())
+      expect(document.activeElement).toBe(blur ? document.body : other)
+    } finally { await ui.cleanup() }
+  })
+
+  it('returns successful button save to its password input even when the mutation settles immediately', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
+      await enter(input, 'synthetic-token')
+      const save = button('保存 Current API token')
+      await act(async () => { save.focus(); save.click() })
+      expect(save.disabled).toBe(true)
+      expect(document.activeElement).toBe(input)
+    } finally { await ui.cleanup() }
+  })
+
   it('saves only the edited key, prevents duplicate saves, clears successful input and keeps focus on refresh', async () => {
     const ui = await setup()
     try {
@@ -9166,7 +9244,8 @@ describe('credential consent and settings', () => {
       expect(input.value).toBe('')
       expect(other.value).toBe('other-unsaved-draft')
       expect(ui.host.textContent).toContain('已保存')
-      expect(document.activeElement).toBe(save)
+      expect(save.disabled).toBe(true)
+      expect(document.activeElement).toBe(input)
       expect(ui.host.textContent).not.toContain('synthetic-token')
     } finally { await ui.cleanup() }
   })
@@ -9204,6 +9283,27 @@ describe('credential consent and settings', () => {
       expect(ui.host.querySelector('.public-plugin-detail')).not.toBeNull()
       expect(ui.client.setPublicPluginNetworkAccess).not.toHaveBeenCalled()
       expect(document.activeElement).toBe(toggle)
+    } finally { await ui.cleanup() }
+  })
+
+  it.each(['network cancel', 'network Escape', 'clear cancel', 'clear Escape'] as const)('returns to the correct confirmation origin without a mutation: %s', async (scenario) => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const origin = button(scenario.startsWith('network') ? '网络访问' : '清除 Other token')
+      await act(async () => { origin.focus(); origin.click() })
+      const modal = document.querySelector<HTMLElement>('.ant-modal-wrap')!
+      if (scenario.endsWith('Escape')) {
+        await act(async () => modal.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true })))
+      } else {
+        const cancel = Array.from(modal.querySelectorAll<HTMLButtonElement>('button')).find((candidate) => candidate.textContent?.replace(/\s/g, '') === '取消')!
+        await act(async () => { cancel.focus(); cancel.click() })
+      }
+      expect(document.querySelector('[role="dialog"]')).toBeNull()
+      expect(ui.host.querySelector('.public-plugin-detail')).not.toBeNull()
+      expect(ui.client.setPublicPluginNetworkAccess).not.toHaveBeenCalled()
+      expect(ui.client.savePublicPluginSettings).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(origin)
     } finally { await ui.cleanup() }
   })
 
