@@ -1,6 +1,6 @@
 # UiPilot
 
-Windows x64 启动器与本地公开插件宿主（当前版本 0.3.4）。宿主为 Tauri 2、React 和 Rust；公开插件使用受控的 v1 Runtime / Panel / Window API。
+Windows x64 启动器与本地公开插件宿主（当前版本 0.4.0）。宿主为 Tauri 2、React 和 Rust；公开插件使用受控的 v1 Runtime / Panel / Window API。
 
 ## 工具链与开发
 
@@ -67,3 +67,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plu
 在 UiPilot 插件设置中选择 `package` 目录或生成的 `.uipilot-plugin` 产物进行本地安装。`pack` 必须显式指定源目录外的输出路径，后缀严格为 `.uipilot-plugin`，父目录须已存在且祖先无链接或 reparse point；输出文件系统须支持硬链接（Windows 通常为 NTFS）。已有目标不会覆盖，没有 `--force`，再次打包请换文件名。第三方开发者可安装提供的 npm tarball，使用同样的 `uipilot-plugin pack` / `validate` 命令，详见 [CLI README](packages/plugin-cli/README.md)。运行示例自身 Node 测试与 SDK contract 检查后，在真实宿主确认权限提示、打开/关闭/重载和数据持久化。
 
 本仓库路线以本地包为范围；在线商店、在线发布、自动下载和云同步不属于当前基座。真实凭据请求、系统安装和服务变更需要单独的人工验收环境。
+
+Windows Host `0.4.0+` 支持将已授权的 secret 作为精确 HTTPS host 的 bearer 引用消费，Runtime 仅提交 credential ID。参见 [credential demo](examples/public-plugins/com.uipilot.demo-credentials/README.md) 与 [SDK 合同](docs/plugin-sdk/public-plugin-v1.md#host-managed-https)。示例测试仅使用合成值和离线 fake provider；服务端回显、配置保存失败的非回滚与后续核验恢复边界必须按合同处理。CLI npm 包版本独立保持 `0.1.0`，校验目标 Host 为 `0.4.0`。

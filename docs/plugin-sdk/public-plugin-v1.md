@@ -58,13 +58,36 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 
 `httpsHosts` contains one to eight unique canonical lowercase ASCII DNS hosts and is serialized in ASCII order. Each host is at most 253 bytes, has at least two valid DNS labels, and excludes IP literals, ports, schemes, paths, wildcards, raw Unicode/IDN, `localhost`, `.localhost`, and `.local`. Unknown fields, `network: null`, invalid values, and macOS validation fail closed. Installation shows the complete sorted host list and requires explicit consent. Adding hosts on update requires new consent; removing hosts narrows authority without new consent. Settings can revoke access immediately or regrant it only after confirming the current complete host list.
 
+Windows Host `0.4.0+` also accepts optional `network.credentials` for Host-managed bearer consumption (ordinary HTTPS keeps its `0.3.2` minimum):
+
+```json
+{
+  "minimumHostVersion": "0.4.0",
+  "supportedPlatforms": ["windows"],
+  "permissions": ["network.https"],
+  "network": {
+    "httpsHosts": ["api.example.com"],
+    "credentials": [
+      { "id": "service-token", "settingKey": "api-token", "host": "api.example.com", "type": "bearer" }
+    ]
+  },
+  "settings": [{ "type": "secret", "key": "api-token", "label": "API token" }]
+}
+```
+
+These are related fields, not a complete Manifest. When present, `credentials` must contain 1–8 entries; `null` and an empty array are invalid. Each entry contains exactly the four required fields shown above. `id` and `settingKey` match `^[a-z][a-z0-9.-]{0,63}$`; IDs are unique within the plugin, case-sensitive, and never trimmed. `settingKey` must reference a declared secret setting, `host` must be an exact member of `httpsHosts`, and `type` is only `bearer`. Different IDs may share a setting or host; binding one secret to two hosts requires two declarations. Unknown fields and duplicate JSON keys fail closed. The metadata type `PluginNetworkCredential` provides no token accessor.
+
+The Host canonicalizes credentials by ID and grants complete `(id, settingKey, host, type)` tuples. Installation displays every binding and warns that the service receives the credential and may echo it. Adding or changing any tuple requires consent to the complete candidate network declaration; reordering does not. Removal narrows the grant; adding it again requires consent. An unchanged upgrade preserves a prior revocation. Cancelling installation/upgrade preserves the installed version. Old host-only grants never imply credential grants. The durable `networkCredentialsGrant` contains metadata only; reload requires exact agreement with current declarations. Invalid grants and backup recovery revoke network before publication; failure to persist revocation keeps network closed.
+
+The installation prepare summary includes sorted `httpsHosts`, `addedHttpsHosts`, full `credentials` (always an array), `addedCredentialIds`, and `requiresNetworkConsent`. Its token binds the displayed candidate and previous configuration; commit accepts only that token and permission grants, not caller-supplied credential tuples. Inventory also exposes full credential metadata. Re-enabling credential network access requires the current displayed `expectedInventoryRevision`; stale/missing revisions fail and require a reload and fresh consent. Revocation is immediate and clears both host and credential grants.
+
 Installation and reload use staging. Static validation and Runtime readiness must succeed before the generation becomes active. A failed upgrade leaves the previous generation usable.
 
 ## Runtime Contract
 
 The Runtime entry is an ES module exporting `onCommand` with the `PluginHandler` type from [uipilot-plugin-api-v1.d.ts](./uipilot-plugin-api-v1.d.ts). Each invocation and API object is new, deeply frozen, and bound to an immutable plugin ID, generation, and request ID. On Windows, a plugin that declares and receives `notifications.publish` may submit one notification action during that request: immediate `api.notifications.publish({ content })` or delayed `api.notifications.schedule({ content, delayMs })`. A Manifest declaring `network.https` receives the optional frozen `api.network` facade; all authority is still revalidated by the Host for every call.
 
-`invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage, reads of declared non-secret settings, the request-bound Windows message operation when granted, and bounded Host-managed HTTPS when declared and authorized. Runtime code cannot access Tauri, Shell, files, native input, another plugin, secret plaintext, raw sockets, or browser/WebView networking.
+`invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage, reads of declared non-secret settings, the request-bound Windows message operation when granted, and bounded Host-managed HTTPS when declared and authorized. Runtime code cannot access Tauri, Shell, files, native input, another plugin, direct secret plaintext getters, raw sockets, or browser/WebView networking.
 
 Context errors are stable:
 
@@ -87,13 +110,13 @@ Both notification methods are request-bound. `publish()` resolves at the atomic 
 
 ### Host-Managed HTTPS
 
-`api.network?.request(input)` is Windows-only in Host `0.3.2`. It is available only to a Runtime whose Manifest declares `network.https`; the optional TypeScript property lets plugins detect an older or unavailable Host surface. It accepts:
+`api.network?.request(input)` is Windows-only since Host `0.3.2`; the optional `credential` field requires Host `0.4.0+`. It is available only to a Runtime whose Manifest declares `network.https`; the optional TypeScript property lets plugins detect an older or unavailable Host surface. It accepts:
 
 ```ts
 api.network.request({
   url: 'https://api.example.com/translate',
   method: 'POST',
-  headers: { authorization: 'Bearer test-token' },
+  credential: 'service-token', // requires the 0.4.0 Manifest binding above
   body: { type: 'json', value: { text: invocation.input } },
 })
 ```
@@ -101,6 +124,10 @@ api.network.request({
 `method` is exactly `GET` or `POST`. GET rejects a body. POST may omit the body or use `{ type: 'json' | 'text' | 'form', value }`; the Host encodes compact UTF-8 JSON, UTF-8 plain text, or sorted `application/x-www-form-urlencoded` data and owns `Content-Type`. JSON rejects cycles, functions, BigInt, undefined object members, and non-finite numbers. Form values must be strings.
 
 Request headers are an optional string map. Custom provider headers including `authorization`, `accept`, and `accept-language` are allowed. The Host rejects protected or connection-sensitive headers, including `host`, `content-length`, `content-type`, cookies, origin/referrer, user-agent, accept-encoding, hop-by-hop headers, proxy headers, every `sec-*`, `forwarded`, `via`, and every `x-forwarded-*`. Header names are case-insensitive and duplicates after lowercase normalization are invalid.
+
+`credential`, when present, is one non-empty valid credential ID string, not a token, setting key, or object. `null`, extra arguments, accessors, symbols, prototype keys, and unknown fields are rejected. The ID must be in the current exact durable grant, and the normalized request host must equal that binding's host. Combining it with any case-insensitive user `Authorization` header is invalid, even with the same value. Omitting `credential` preserves ordinary requests, including an explicitly supplied Authorization header.
+
+For an admitted reference, the Host reads only that plugin's declared secret and injects `Authorization: Bearer <token>` internally. Tokens must match ASCII `^[A-Za-z0-9._~+/-]+=*$`, contain 1–8192 bytes, and are never trimmed or Base64-converted. Do not include the `Bearer ` prefix, whitespace, CR/LF, or Unicode. Secret storage still accepts up to 64 KiB, so a saved value may be unsuitable for bearer use. The injected header counts toward the existing header budget. Every request reads the actual record; redirects use that admitted token snapshot and still require current authority.
 
 The URL must use HTTPS, exact port 443, no credentials or fragment, and one currently granted exact host. HTTP, IP literals, localhost/private/special-use DNS answers, environment/system proxies, and TLS verification bypass are denied. Redirects are manual, limited to three, and must remain on the original exact host even if another host is declared. TLS uses the Windows trust store and TLS 1.2 or newer. The WebView CSP remains network-closed and no generic `fetch` proxy is exposed.
 
@@ -125,9 +152,10 @@ The Promise rejects with an `Error` whose exact `name` is one of:
 
 | Error name | Meaning |
 | --- | --- |
-| `InvalidNetworkRequestError` | Invalid URL, method, headers, body, encoding, or request-size limit |
-| `PermissionDeniedError` | Permission absent/revoked/unsupported, or no exact durable host grant |
-| `NetworkTargetDeniedError` | Scheme, host, address, port, DNS answer, or redirect target denied |
+| `InvalidNetworkRequestError` | Invalid URL/method/headers/body/credential shape, Authorization conflict, encoding, or request-size limit (including the injected header) |
+| `PermissionDeniedError` | Permission absent/revoked/unsupported, unknown or ungranted credential ID, mismatched grants, or authority closed after record validation |
+| `NetworkTargetDeniedError` | Scheme, credential-bound host, address, port, DNS answer, or redirect target denied |
+| `CredentialUnavailableError` | Declared secret missing, unreadable/undecryptable, or unsuitable for bearer use; internal causes are intentionally indistinguishable |
 | `NetworkTimeoutError` | Total ten-second deadline elapsed |
 | `NetworkFailureError` | DNS, TLS, connect, write, or read failure without a narrower policy error |
 | `NetworkResponseTooLargeError` | Response header or body limit exceeded |
@@ -137,7 +165,13 @@ The Promise rejects with an `Error` whose exact `name` is one of:
 
 Errors are deliberately redacted: they expose no URL, query, request/response headers, body, resolved address, certificate, provider payload, or native-library message. Disabling, uninstalling, upgrading, revoking permission, replacing/expiring the command, Runtime teardown, and Host shutdown cancel matching in-flight requests and discard stale responses. Calls do not survive the command context and cannot be used as background work.
 
-Bundled test credentials are ordinary plugin code and can be inspected. API v1 still exposes only `settings.isSecretConfigured()` for secret settings; it does not let Runtime read or inject secret plaintext into a network request. Production secret consumption is deferred to a later, separately versioned Host contract.
+Secret replacement or deletion cancels the plugin's outstanding network contexts, including ordinary requests, and discards stale responses. Old request IDs never revive; only a later command can use a newly verified value. The running handler keeps its scheduler slot until completion or the existing deadline, so a new command waits instead of overlapping it. Preparation failures leave prior requests unchanged; once cancellation has occurred, a save failure does not undo cancellation.
+
+Settings saves are not atomic across keys or ordinary/secret files. Failure does not promise rollback: disk may contain the old or new value, and earlier keys may already be committed. A failed secret commit keeps network closed for that call. This is not a persistent failure latch: later startup, enable, explicit network grant, or Runtime recovery/replacement can reopen only after checking actual durable grants and records. A valid old/new value or missing record can permit ordinary network access; an existing invalid record keeps it closed. A missing record is a valid unconfigured state, so an otherwise authorized credential request returns `CredentialUnavailableError`. A closed authority returns `PermissionDeniedError` before secret consumption. Successful reconfiguration never revives an expired command. To revoke reliably, obtain a successful clear or network-disable result; a failed save is not confirmation of revocation.
+
+Cancellation cannot recall bytes already sent or delivered results, and offers no remote transaction rollback. The destination service receives the token and can echo it, including encoded forms, in normal response headers/body; those responses retain the ordinary API contract and are not silently rewritten. Never display/log provider responses if your application cannot trust that boundary. Host errors, Debug output, and logs do not include secret values; the Host does not automatically copy request headers into responses. Sensitive values exist transiently during HTTPS processing; complete zeroization of every library copy is not guaranteed.
+
+Runtime and content WebViews have no plaintext getter. Runtime can ask only `settings.isSecretConfigured()` (presence, not validity) or submit a declared credential ID to the Host; content cannot use the Runtime network API. Bundled tokens remain inspectable ordinary code, so do not ship production credentials. OAuth, refresh, signing, arbitrary credential-header templates, and raw secret access are unsupported. See the offline [credential reference demo](../../examples/public-plugins/com.uipilot.demo-credentials/README.md).
 
 ## Responses
 
@@ -195,7 +229,7 @@ The complete serialized response budget is 64 KiB. Unknown fields, duplicate key
 - Content ready and update acknowledgement each have a 5 second timeout.
 - Three consecutive runtime faults within five minutes persistently disable the plugin; a successful request or manual enable resets the relevant fault state.
 
-Settings support `text`, `secret`, `number`, `boolean`, and `select`. Keys match `^[a-z][a-z0-9.-]{0,63}$` and remain stable across upgrades. Secrets have no default and Runtime code can only ask whether one is configured.
+Settings support `text`, `secret`, `number`, `boolean`, and `select`. Keys match `^[a-z][a-z0-9.-]{0,63}$` and remain stable across upgrades. Secrets have no default. Runtime can ask only whether one is configured; Windows Host `0.4.0+` may consume an explicitly declared, authorized bearer reference without exposing a plaintext getter. Host settings provide per-key password save and explicit clear actions; blank unedited inputs do not delete secrets. Saving/clearing can cancel current plugin requests; a failure requires refreshed status and carries the partial-commit/recovery rules above.
 
 ## Permissions
 
@@ -221,6 +255,7 @@ The fixed-output reference packages are:
 - `examples/public-plugins/com.uipilot.demo-win`: Windows-only `submit + window` with `ui.window` and a 10-second host-owned delayed message.
 - `examples/public-plugins/com.uipilot.demo-return`: `submit + mainResult` with `clipboard.write`.
 - `examples/public-plugins/com.uipilot.demo-panel`: Windows-only `submit + panel` with `ui.panel`, Host key routing, `focusHostInput()`, and `requestHide()`.
+- `examples/public-plugins/com.uipilot.demo-credentials`: Windows-only Host `0.4.0+` bearer reference with synthetic offline provider tests, presence-only status, and manual Host acceptance steps.
 - `examples/public-plugins/com.uipilot.demo-http`: Windows-only `submit + mainResult` with Host-managed `network.https` requests to `httpbin.org`.
 - `examples/public-plugins/com.uipilot.pomodoro`: Windows-only `submit + window` with the three-permission host timer, pause/resume/reset, message-center completion, and a plugin-supplied finite alarm validated and played by the host.
 

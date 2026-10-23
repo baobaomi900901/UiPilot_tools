@@ -1371,6 +1371,66 @@ fn repository_demo_examples_stage_as_independently_removable_public_plugins() {
 }
 
 #[test]
+fn repository_credential_demo_stages_on_0_4_0_and_rejects_0_3_4_without_cli_build() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let source = workspace.join("examples/public-plugins/com.uipilot.demo-credentials/package");
+    let old_root = TestRoot::new("credential-demo-old-host");
+    let old_host = PublicPluginHost {
+        version: [0, 3, 4],
+        ..host()
+    };
+    assert!(matches!(
+        stage_public_package(
+            PublicPackageSource::DevelopmentDirectory(source.clone()),
+            &old_root.staging(),
+            &old_host
+        ),
+        Err(PublicPackageError::IncompatibleApi)
+    ));
+    let root = TestRoot::new("credential-demo-current-host");
+    assert_eq!(host().version, [0, 4, 0]);
+    let prepared = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source.clone()),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-credentials");
+    assert_eq!(
+        prepared.manifest.permissions,
+        vec![PublicPermission::NetworkHttps]
+    );
+    assert_eq!(
+        prepared.manifest.command.output_mode,
+        PublicOutputMode::MainResult
+    );
+    let manifest = serde_json::to_value(&prepared.manifest).unwrap();
+    assert_eq!(
+        manifest["network"],
+        json!({"httpsHosts":["api.example.com"],"credentials":[
+            {"id":"service-token","settingKey":"api-token","host":"api.example.com","type":"bearer"}
+        ]})
+    );
+    assert_eq!(
+        manifest["settings"],
+        json!([{"key":"api-token","label":"Synthetic API token","type":"secret"}])
+    );
+    assert_eq!(
+        prepared
+            .resources
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["dist/runtime.js", "plugin.json"]
+    );
+    assert_eq!(
+        fs::read(prepared.package_root.join("dist/runtime.js")).unwrap(),
+        fs::read(source.join("dist/runtime.js")).unwrap()
+    );
+    assert_eq!(prepared.revalidate(), Ok(()));
+}
+
+#[test]
 fn repository_demo_panel_stages_with_the_panel_only_contract() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let root = TestRoot::new("demo-panel-reference");

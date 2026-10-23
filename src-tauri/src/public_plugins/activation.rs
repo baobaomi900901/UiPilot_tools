@@ -9112,6 +9112,132 @@ mod tests {
     }
 
     #[test]
+    fn credential_successful_tuple_updates_persist_exact_grants_across_restart() {
+        for change in ["settingKey", "host", "id", "reorder"] {
+            let dir = TestDir::new(&format!("credential-successful-update-{change}"));
+            let manager = credential_manager(&dir);
+            let now = Instant::now();
+            let mut next = json!([
+                {"id":"a", "settingKey":"token", "host":"api.example.com", "type":"bearer"},
+                {"id":"b", "settingKey":"token", "host":"api.example.com", "type":"bearer"}
+            ]);
+            write_credential_package(&dir.source(), "1.0.0", next.clone());
+            let initial = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &initial.token,
+                    BTreeSet::from([PublicPermission::NetworkHttps]),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+            let initial_generation = manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap()
+                .active_generation;
+            match change {
+                "settingKey" => next[0]["settingKey"] = json!("other"),
+                "host" => next[0]["host"] = json!("auth.example.com"),
+                "id" => next[0]["id"] = json!("c"),
+                "reorder" => next.as_array_mut().unwrap().reverse(),
+                _ => unreachable!(),
+            }
+            // Build expected order independently of manifest/state canonicalization.
+            let mut expected_json = next.as_array().unwrap().clone();
+            expected_json.sort_by(|a, b| a["id"].as_str().unwrap().cmp(b["id"].as_str().unwrap()));
+            let expected: Vec<super::super::manifest::PluginNetworkCredential> =
+                serde_json::from_value(json!(expected_json)).unwrap();
+            let hosts =
+                BTreeSet::from(["api.example.com".to_owned(), "auth.example.com".to_owned()]);
+            write_credential_package(&dir.source(), "1.1.0", next);
+            let update = manager.prepare("main", source(&dir.source()), now).unwrap();
+            let network = update.network.as_ref().unwrap();
+            assert_eq!(network.requires_network_consent, change != "reorder");
+            assert_eq!(
+                network.added_credential_ids,
+                match change {
+                    "id" => vec!["c".to_owned()],
+                    "reorder" => vec![],
+                    _ => vec!["a".to_owned()],
+                }
+            );
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &update.token,
+                    BTreeSet::from([PublicPermission::NetworkHttps]),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+            let check = |current: &PublicPluginManager| {
+                let config = current
+                    .state
+                    .config("com.example.network")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(config.version, "1.1.0", "{change}");
+                assert_eq!(
+                    config.permission_grants,
+                    BTreeSet::from([PublicPermission::NetworkHttps])
+                );
+                assert_eq!(config.network_https_hosts_grant, hosts);
+                assert_eq!(config.network_credentials_grant, expected);
+                let manifest = current.installed_manifest(&config).unwrap();
+                let grant = config.network_grant_snapshot(&manifest).unwrap();
+                assert_eq!(grant.credentials, expected);
+                assert_eq!(grant.https_hosts, hosts);
+                let running = dispatch_network_scheduled(current);
+                // Missing records permit ordinary HTTPS admission; no secret or transport I/O.
+                assert!(current
+                    .network_authority
+                    .admit(
+                        "com.example.network",
+                        running.context.plugin_generation,
+                        &running.context,
+                        &current.scheduler,
+                        network_request()
+                    )
+                    .is_ok());
+                config
+            };
+            let committed = check(&manager);
+            assert!(committed.active_generation > initial_generation);
+            let disk: Value = serde_json::from_slice(
+                &fs::read(
+                    dir.path()
+                        .join("public-plugins/state/com.example.network/state.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(disk["version"], "1.1.0");
+            assert_eq!(disk["permissionGrants"], json!(["network.https"]));
+            assert_eq!(
+                disk["networkHttpsHostsGrant"],
+                json!(["api.example.com", "auth.example.com"])
+            );
+            assert_eq!(disk["networkCredentialsGrant"], json!(expected_json));
+            drop(manager);
+            let restarted = credential_manager(&dir);
+            let reloaded = check(&restarted);
+            assert_eq!(reloaded.version, committed.version);
+            assert_eq!(reloaded.permission_grants, committed.permission_grants);
+            assert_eq!(
+                reloaded.network_https_hosts_grant,
+                committed.network_https_hosts_grant
+            );
+            assert_eq!(
+                reloaded.network_credentials_grant,
+                committed.network_credentials_grant
+            );
+        }
+    }
+
+    #[test]
     fn credential_manifest_semantic_mismatch_on_restart_is_durably_revoked() {
         let dir = TestDir::new("credential-semantic-restart");
         write_credential_package(

@@ -1334,7 +1334,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 3, 4]
+            [0, 4, 0]
         );
     }
 
@@ -1379,7 +1379,15 @@ mod schema_tests {
         );
         value["network"]["credentials"] = serde_json::json!([a.clone(), b]);
         assert_eq!(parse_new(&value).unwrap(), canonical);
-        assert_eq!(parse(&value), Err(PublicPackageError::IncompatibleApi));
+        let old_host = PublicPluginHost {
+            version: [0, 3, 4],
+            ..host
+        };
+        assert_eq!(
+            parse_manifest(&serde_json::to_vec(&value).unwrap(), &old_host),
+            Err(PublicPackageError::IncompatibleApi)
+        );
+        assert_eq!(parse(&value).unwrap(), canonical);
         for invalid in [
             Value::Null,
             serde_json::json!([]),

@@ -97,7 +97,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.4.0'
+    tooNewHost.minimumHostVersion = '0.4.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -423,12 +423,13 @@ function credentialManifest() {
 
 describe('credential manifest contract', () => {
   const future = (v: unknown) => validateManifest(Buffer.from(JSON.stringify(v)), 'windows', [0, 4, 0])
-  it('accepts and canonicalizes on an explicit 0.4.0 host, preserving the production version gate', () => {
+  it('accepts on current 0.4.0 and rejects explicit 0.3.4 while canonicalizing', () => {
     const v = credentialManifest()
     const result = future(v)
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.manifest.network?.credentials?.map(x => x.id)).toEqual(['a', 'b'])
-    expect(validate(v)).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+    expect(validateManifest(Buffer.from(JSON.stringify(v)), 'windows', [0, 3, 4])).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+    expect(validate(v)).toEqual(result)
     v.network.credentials.reverse()
     expect(future(v)).toEqual(result)
   })
@@ -456,4 +457,12 @@ describe('credential manifest contract', () => {
     const raw = JSON.stringify(credentialManifest()).replace('"id":"a"', '"id":"a","id":"a"')
     expect(validateManifest(Buffer.from(raw), 'windows', [0, 4, 0])).toMatchObject({ ok: false, issues: [{ code: 'MANIFEST_JSON_INVALID' }] })
   })
+})
+
+// Exercise the actual shipped example, including the independent historical boundary.
+it('validates the credential reference example on 0.4.0 and rejects 0.3.4', async () => {
+  const bytes = await readFile(resolve(process.cwd(), '../../examples/public-plugins/com.uipilot.demo-credentials/package/plugin.json'))
+  expect(validateManifest(bytes, 'windows', [0, 3, 4])).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+  expect(validateManifest(bytes, 'windows', [0, 4, 0]).ok).toBe(true)
+  expect(validateManifest(bytes, 'windows').ok).toBe(true)
 })

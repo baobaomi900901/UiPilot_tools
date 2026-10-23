@@ -17,7 +17,7 @@ export type PluginNetworkRequestBody =
   | Readonly<{ type: 'text'; value: string }>
   | Readonly<{ type: 'form'; value: Readonly<Record<string, string>> }>
 
-/** Manifest metadata only; the Host never exposes the token. */
+/** Manifest metadata only; no token getter. The destination service may echo a consumed token. */
 export interface PluginNetworkCredential {
   readonly id: string
   readonly settingKey: string
@@ -41,6 +41,10 @@ export interface PluginNetworkResponse {
 }
 
 export interface PluginNetworkApi {
+  /** Request-bound. Secret saves cancel old contexts; failures do not promise rollback or permanently disable recovery.
+   * The service receives an injected bearer token and may echo it in ordinary response headers/body.
+   * Fixed rejection names are PluginNetworkErrorName; CredentialUnavailableError hides record/format causes.
+   */
   request(input: Readonly<PluginNetworkRequest>): Promise<Readonly<PluginNetworkResponse>>
 }
 
@@ -65,6 +69,7 @@ export interface UiPilotPluginApiV1 {
   }
   readonly settings: {
     get(key: string): Promise<JsonValue | null>
+    /** Presence only, not bearer validity or network consent. No plaintext getter exists. */
     isSecretConfigured(key: string): Promise<boolean>
   }
   readonly notifications: {

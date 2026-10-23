@@ -13,6 +13,7 @@
 - [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：主界面结果与复制。
 - [`com.uipilot.demo-win`](../../examples/public-plugins/com.uipilot.demo-win)：单例子窗口。
 - [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)：启动器内嵌面板。
+- [`com.uipilot.demo-credentials`](../../examples/public-plugins/com.uipilot.demo-credentials)：Windows Host `0.4.0+` 的 bearer 凭据引用与离线假服务测试。
 - [`com.uipilot.demo-http`](../../examples/public-plugins/com.uipilot.demo-http)：Host 托管 HTTPS 请求。
 - [`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)：窗口隐藏后仍由宿主计时的番茄钟。
 
@@ -246,7 +247,6 @@ export async function onCommand(invocation, api) {
       url: 'https://api.example.com/translate',
       method: 'POST',
       headers: {
-        authorization: 'Bearer development-only-token',
         accept: 'application/json',
       },
       body: {
@@ -293,7 +293,52 @@ Host 自己设置 `Host`、`Content-Length`、`Content-Type`、`User-Agent` 和 
 
 命令过期或被新命令替换，以及权限撤销、停用、升级、卸载、Runtime teardown 和 Host 退出，都会中止尚未完成的请求并丢弃过期响应。不要把它当作后台任务接口。
 
-开发阶段可以暂时把测试凭据打进插件包，但插件包和 Runtime 源码都可被用户检查，不能视为安全存储。当前 `secret` 设置只允许 Runtime 查询 `isSecretConfigured()`，不能读取明文，也不能把 secret 注入网络请求；正式生产密钥消费能力留待后续独立 Host 合同，MVP 不提供变通接口。
+### 4.2 使用 Host bearer 凭据引用（Windows `0.4.0+`）
+
+生产密钥通过 Host 设置保存，不能写进包中。沿用 `network.https`，将最低宿主升到 `0.4.0`，为每个精确目标声明绑定：
+
+```json
+{
+  "minimumHostVersion": "0.4.0",
+  "supportedPlatforms": ["windows"],
+  "permissions": ["network.https"],
+  "network": {
+    "httpsHosts": ["api.example.com"],
+    "credentials": [
+      { "id": "service-token", "settingKey": "api-token", "host": "api.example.com", "type": "bearer" }
+    ]
+  },
+  "settings": [{ "type": "secret", "key": "api-token", "label": "API token" }]
+}
+```
+
+这是相关字段片段。`credentials` 可省略；出现时必须有 1–8 项，不可为 `null` 或空数组。每项只能含这四个字段，`id` 唯一，`id` / `settingKey` 都匹配 `^[a-z][a-z0-9.-]{0,63}$`，不修剪、不忽略大小写；`settingKey` 精确引用 secret，`host` 是 `httpsHosts` 的精确成员，`type` 只能为 `bearer`。一个 secret 发给两个 host 需要两个声明。
+
+Runtime 只提交 ID：
+
+```js
+const response = await api.network.request({
+  url: 'https://api.example.com/v1/items',
+  method: 'GET',
+  credential: 'service-token',
+})
+```
+
+`credential` 不接受 token 对象、settingKey、空串、`null` 或额外参数。不要同时传任何大小写的 `Authorization` 头；Host 会内部注入 `Authorization: Bearer <token>`，并将其计入请求头限额。目标必须精确匹配绑定 host，重定向仍只能留在同一 host。未传 `credential` 时保留旧请求行为，包括普通 Authorization 头。
+
+保存的 bearer 值必须是 1–8192 字节 ASCII，匹配 `^[A-Za-z0-9._~+/-]+=*$`；不要加 `Bearer ` 前缀、空白、换行或 Unicode，Host 不 trim 或转换 Base64。secret 存储上限仍为 64 KiB，能保存不代表可作 bearer。`api.settings.isSecretConfigured('api-token')` 只表示已配置，不表示格式有效或网络已授权；没有明文 getter，Panel / Window 也不能读取或消费 secret。
+
+安装/升级提示展示完整 `(id, settingKey, host, type)` 绑定并单独确认。新增或修改任一四元组需重新同意完整候选网络；重排无需确认，移除后重加需确认，普通旧 host 授权不自动获得 credential 授权。取消升级保留旧版，同声明升级保留撤销状态。设置关闭网络会清空两类授权；重新开启必须确认当前完整绑定，Host UI 带上所展示的 inventory revision，陈旧状态先刷新、再由用户确认。
+
+增加并处理 `CredentialUnavailableError`：缺失、读取/解密失败或 bearer 格式不适用均映射为这个固定错误，不区分内部原因。未知/未授权 ID 或因坏记录关闭的 authority 是 `PermissionDeniedError`；形状/Authorization 冲突/注入后超限是 `InvalidNetworkRequestError`；绑定目标不符是 `NetworkTargetDeniedError`。`ExpiredRequestError` 表示当前请求已结束或因配置变更取消。完整错误表见 [API v1](./public-plugin-v1.md#host-managed-https)；不要展示原始异常文字。
+
+Host 设置逐 key 使用 password 输入保存/显式清除；空白未编辑输入不表示删除。保存/删除会取消整个插件当前网络上下文，旧 requestId 永不恢复；后续新命令才可用新值，旧 handler 尚未完成时新命令等待。取消前准备失败不影响旧请求，取消后的提交失败仍保留取消效果。多 key 和普通/secret 文件不是批次原子事务：错误不承诺回滚，已提交 key 可保留，磁盘也可能是旧值或新值。失败后先刷新状态，不把“保存失败”当作成功撤销。
+
+提交失败本次关闭网络，但不是永久锁存。后续启动、启用、显式授权或 Runtime 恢复/替换必须检查实际磁盘与当前完整授权；有效旧/新值或缺失文件可恢复普通网络，已有坏记录仍关闭。缺失是合法的未配置状态，带引用请求会返回 `CredentialUnavailableError`。要可靠撤销，应等到清除或关闭网络成功；任何恢复都不复活旧请求。
+
+服务会收到凭据并可能在正常响应 header/body 原样或编码回显。Host 不静默改写合法响应、不自动回填请求头；错误/Debug/日志不含 secret，但插件必须按目标服务的信任边界决定是否展示响应。取消不能追回已发送字节或已投递结果，不提供远端事务回滚。HTTPS 库可能持有临时明文副本，不承诺所有内存副本彻底清零。OAuth、刷新、签名、自定义凭据头模板与明文 getter 均不支持。
+
+完整最小实现见 [demo-credentials](../../examples/public-plugins/com.uipilot.demo-credentials/README.md)。它只含占位目标和离线 fake provider；测试使用合成 token，不请求公网，不将 mock 通过称为真实 Host 验收。
 
 ## 5. 分支 A：返回主界面结果
 
@@ -881,9 +926,9 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] `version` 已提高，`minimumHostVersion` 合理。
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
 - [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`，扩展 Host 按键和剪贴板历史要求 `0.3.3+`，显式 Host Key 焦点策略要求 `0.3.4+`。
-- [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和九种固定错误名。
+- [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和固定错误名（包括 `CredentialUnavailableError`）。
 - [ ] 使用剪贴板历史时，仅面向 Windows Host `0.3.3+`，同时声明 `ui.panel` 和 `clipboard.history.read`，需要粘贴时再声明 `clipboard.history.paste`，并处理六种固定 `Error.name`。
-- [ ] 网络插件未记录凭据、签名字段或完整请求体；了解内置测试凭据可被检查，正式 secret 消费尚未开放。
+- [ ] 网络插件未记录凭据或完整请求；生产 token 不打包，使用 bearer 引用时要求 Windows `0.4.0+`、完整绑定授权，并理解服务端回显、取消不能撤回远端请求、保存失败不回滚且后续核验可恢复网络的边界。
 - [ ] Runtime 始终原样返回 `requestId`。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。

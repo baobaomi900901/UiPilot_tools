@@ -132,6 +132,7 @@ try {
     'com.uipilot.demo-return',
     'com.uipilot.demo-win',
     'com.uipilot.demo-panel',
+    'com.uipilot.demo-credentials',
     'com.uipilot.pomodoro',
   ]
   for (const name of examples) {
@@ -146,7 +147,7 @@ try {
   for (const source of examples.map((name) => join(fixturesDirectory, name))) {
     validateWithArtifact(cli, trap, source, 0)
   }
-  for (const name of ['com.uipilot.demo-return', 'com.uipilot.demo-panel', 'com.uipilot.pomodoro']) {
+  for (const name of ['com.uipilot.demo-return', 'com.uipilot.demo-panel', 'com.uipilot.pomodoro', 'com.uipilot.demo-credentials']) {
     const source = join(fixturesDirectory, name)
     const output = join(outputDirectory, name + ' local.uipilot-plugin')
     const packedReport = packWithArtifact(cli, trap, source, output)

@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.demo-credentials",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.4.0",
+  "name": "Credential Reference Demo",
+  "description": "Synthetic bearer credential reference fixture; no bundled token or live provider.",
+  "supportedPlatforms": [
+    "windows"
+  ],
+  "command": {
+    "defaultName": "demo-credentials",
+    "summary": "Exercise a Host-managed bearer reference",
+    "activationMode": "submit",
+    "outputMode": "mainResult",
+    "inputRequired": false,
+    "inputPlaceholder": "request | status"
+  },
+  "runtime": {
+    "entry": "dist/runtime.js"
+  },
+  "permissions": [
+    "network.https"
+  ],
+  "network": {
+    "httpsHosts": [
+      "api.example.com"
+    ],
+    "credentials": [
+      {
+        "id": "service-token",
+        "settingKey": "api-token",
+        "host": "api.example.com",
+        "type": "bearer"
+      }
+    ]
+  },
+  "settings": [
+    {
+      "type": "secret",
+      "key": "api-token",
+      "label": "Synthetic API token"
+    }
+  ]
+}
