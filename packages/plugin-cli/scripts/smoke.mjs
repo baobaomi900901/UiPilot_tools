@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -12,6 +12,7 @@ const packDirectory = join(temporaryRoot, 'pack')
 const projectDirectory = join(temporaryRoot, 'consumer')
 const cacheDirectory = join(temporaryRoot, 'empty-cache')
 const fixturesDirectory = join(temporaryRoot, 'fixtures')
+const outputDirectory = join(temporaryRoot, 'packed output')
 
 function npmInvocation(args) {
   const npmCli = process.env.npm_execpath
@@ -46,70 +47,6 @@ function run(executable, args, options = {}) {
   return result
 }
 
-const crcTable = new Uint32Array(256)
-for (let index = 0; index < crcTable.length; index += 1) {
-  let value = index
-  for (let bit = 0; bit < 8; bit += 1) value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1
-  crcTable[index] = value >>> 0
-}
-
-function crc32(bytes) {
-  let value = 0xffffffff
-  for (const byte of bytes) value = crcTable[(value ^ byte) & 0xff] ^ (value >>> 8)
-  return (value ^ 0xffffffff) >>> 0
-}
-
-async function listFiles(root, current = root) {
-  const files = []
-  for (const entry of await readdir(current, { withFileTypes: true })) {
-    const absolute = join(current, entry.name)
-    if (entry.isDirectory()) files.push(...(await listFiles(root, absolute)))
-    else if (entry.isFile()) files.push(relative(root, absolute).replaceAll('\\', '/'))
-    else throw new Error(`Smoke fixture contains a non-ordinary entry: ${absolute}`)
-  }
-  return files.sort()
-}
-
-async function createStoredZip(root) {
-  const localParts = []
-  const centralParts = []
-  let localOffset = 0
-  for (const file of await listFiles(root)) {
-    const name = Buffer.from(file, 'utf8')
-    const data = await readFile(join(root, ...file.split('/')))
-    const checksum = crc32(data)
-    const local = Buffer.alloc(30)
-    local.writeUInt32LE(0x04034b50, 0)
-    local.writeUInt16LE(20, 4)
-    local.writeUInt16LE(0x800, 6)
-    local.writeUInt32LE(checksum, 14)
-    local.writeUInt32LE(data.length, 18)
-    local.writeUInt32LE(data.length, 22)
-    local.writeUInt16LE(name.length, 26)
-    const central = Buffer.alloc(46)
-    central.writeUInt32LE(0x02014b50, 0)
-    central.writeUInt16LE(20, 4)
-    central.writeUInt16LE(20, 6)
-    central.writeUInt16LE(0x800, 8)
-    central.writeUInt32LE(checksum, 16)
-    central.writeUInt32LE(data.length, 20)
-    central.writeUInt32LE(data.length, 24)
-    central.writeUInt16LE(name.length, 28)
-    central.writeUInt32LE(localOffset, 42)
-    localParts.push(local, name, data)
-    centralParts.push(central, name)
-    localOffset += local.length + name.length + data.length
-  }
-  const central = Buffer.concat(centralParts)
-  const end = Buffer.alloc(22)
-  end.writeUInt32LE(0x06054b50, 0)
-  end.writeUInt16LE(centralParts.length / 2, 8)
-  end.writeUInt16LE(centralParts.length / 2, 10)
-  end.writeUInt32LE(central.length, 12)
-  end.writeUInt32LE(localOffset, 16)
-  return Buffer.concat([...localParts, central, end])
-}
-
 function cliArguments(cli, trap, source, platform = 'windows') {
   const args = [
     '--experimental-permission',
@@ -120,6 +57,21 @@ function cliArguments(cli, trap, source, platform = 'windows') {
   }
   args.push('--import', pathToFileURL(trap).href, cli, 'validate', source, '--platform', platform, '--json')
   return args
+}
+
+// Pack checks metadata all the way to the filesystem root. Node cannot grant
+// metadata-only reads, so pack has broad reads but can write only its output directory.
+// Validate retains the narrower read-only sandbox above.
+function packWithArtifact(cli, trap, source, output, expectedExitCode = 0) {
+  const args = ['--experimental-permission', '--allow-fs-read=*', '--allow-fs-write=' + outputDirectory]
+  if (process.platform === 'win32') args.push('--allow-child-process')
+  args.push('--import', pathToFileURL(trap).href, cli, 'pack', source, '--output', output, '--platform', 'windows', '--json')
+  const result = run(process.execPath, args)
+  assert.equal(result.status, expectedExitCode, result.stdout + '\n' + result.stderr)
+  const report = JSON.parse(result.stdout)
+  assert.equal(report.schemaVersion, 1)
+  assert.equal(report.created, expectedExitCode === 0)
+  return report
 }
 
 function validateWithArtifact(cli, trap, source, expectedExitCode, platform = 'windows') {
@@ -137,6 +89,7 @@ try {
     mkdir(projectDirectory, { recursive: true }),
     mkdir(cacheDirectory, { recursive: true }),
     mkdir(fixturesDirectory, { recursive: true }),
+    mkdir(outputDirectory, { recursive: true }),
     writeFile(join(temporaryRoot, '.npmrc'), '', 'utf8'),
   ])
   await writeFile(join(projectDirectory, 'package.json'), '{"private":true}\n', 'utf8')
@@ -173,6 +126,7 @@ try {
   const binHelp = run(bin, ['--help'], { shell: process.platform === 'win32' })
   assert.equal(binHelp.status, 0, `${binHelp.stdout}\n${binHelp.stderr}`)
   assert.match(binHelp.stdout, /Usage: uipilot-plugin/u)
+  assert.match(binHelp.stdout, /uipilot-plugin pack/u)
 
   const examples = [
     'com.uipilot.demo-return',
@@ -185,14 +139,27 @@ try {
       recursive: true,
     })
   }
-  const archive = join(fixturesDirectory, 'demo-return.uipilot-plugin')
-  await writeFile(archive, await createStoredZip(join(fixturesDirectory, 'com.uipilot.demo-return')))
   const trap = join(temporaryRoot, 'network-trap.mjs')
   await cp(join(packageRoot, 'scripts', 'network-trap.mjs'), trap)
   const cli = join(projectDirectory, 'node_modules', '@uipilot', 'plugin-cli', 'dist', 'cli.mjs')
 
-  for (const source of [...examples.map((name) => join(fixturesDirectory, name)), archive]) {
+  for (const source of examples.map((name) => join(fixturesDirectory, name))) {
     validateWithArtifact(cli, trap, source, 0)
+  }
+  for (const name of ['com.uipilot.demo-return', 'com.uipilot.demo-panel', 'com.uipilot.pomodoro']) {
+    const source = join(fixturesDirectory, name)
+    const output = join(outputDirectory, name + ' local.uipilot-plugin')
+    const packedReport = packWithArtifact(cli, trap, source, output)
+    assert.equal(packedReport.output.path, output)
+    assert.match(packedReport.output.sha256, /^[a-f0-9]{64}$/u)
+    assert.equal(packedReport.validation.valid, true)
+    validateWithArtifact(cli, trap, output, 0)
+    if (name === 'com.uipilot.demo-return') {
+      const before = await readFile(output)
+      const repeated = packWithArtifact(cli, trap, source, output, 1)
+      assert.equal(repeated.error.code, 'OUTPUT_EXISTS')
+      assert.deepEqual(await readFile(output), before)
+    }
   }
   validateWithArtifact(cli, trap, join(fixturesDirectory, 'com.uipilot.pomodoro'), 1, 'macos')
 

@@ -46,7 +46,7 @@ npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uip
 | --- | --- |
 | `src/` | React 启动器、设置及前端状态 |
 | `src-tauri/src/` | Rust 宿主、系统集成与公开插件运行时 |
-| `packages/plugin-cli/` | 独立静态插件校验 CLI |
+| `packages/plugin-cli/` | 独立本地插件打包与静态校验 CLI |
 | `examples/public-plugins/` | 可测试的本地插件参考包 |
 | `docs/plugin-sdk/` | 公开插件教程、API、类型和 Schema |
 | `docs/ui-guidelines.md` | 宿主及插件 UI 规范 |
@@ -59,9 +59,11 @@ npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uip
 ```powershell
 npm run build --workspace @uipilot/plugin-cli
 node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.demo-panel/package --platform windows
+node packages/plugin-cli/dist/cli.mjs pack examples/public-plugins/com.uipilot.demo-panel/package --output ./demo-panel.uipilot-plugin --platform windows
+node packages/plugin-cli/dist/cli.mjs validate ./demo-panel.uipilot-plugin --platform windows
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plugin.ps1 -PluginId com.uipilot.demo-return
 ```
 
-在 UiPilot 插件设置中选择 `package` 目录进行本地安装；已有 `.uipilot-plugin` 产物也可本地安装。打包脚本参数与各示例 README 以实际插件为准。当前 CLI 提供静态 `validate`，通用 CLI pack 属于后续工作。运行示例自身 Node 测试与 SDK contract 检查后，在真实宿主确认权限提示、打开/关闭/重载和数据持久化。
+在 UiPilot 插件设置中选择 `package` 目录或生成的 `.uipilot-plugin` 产物进行本地安装。`pack` 必须显式指定源目录外的输出路径，后缀严格为 `.uipilot-plugin`，父目录须已存在且祖先无链接或 reparse point；输出文件系统须支持硬链接（Windows 通常为 NTFS）。已有目标不会覆盖，没有 `--force`，再次打包请换文件名。第三方开发者可安装提供的 npm tarball，使用同样的 `uipilot-plugin pack` / `validate` 命令，详见 [CLI README](packages/plugin-cli/README.md)。运行示例自身 Node 测试与 SDK contract 检查后，在真实宿主确认权限提示、打开/关闭/重载和数据持久化。
 
 本仓库路线以本地包为范围；在线商店、在线发布、自动下载和云同步不属于当前基座。真实凭据请求、系统安装和服务变更需要单独的人工验收环境。

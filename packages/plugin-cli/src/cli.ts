@@ -1,4 +1,5 @@
 import type {
+  PackPackage,
   PluginCliErrorV1,
   PluginPlatform,
   PluginValidationReportV1,
@@ -9,6 +10,7 @@ export type ParsedCli =
   | { kind: 'help' }
   | { kind: 'error'; message: string }
   | { kind: 'validate'; source: string; platform: PluginPlatform; json: boolean }
+  | { kind: 'pack'; source: string; output: string; platform: PluginPlatform; json: boolean }
 
 export interface CliResult {
   exitCode: 0 | 1 | 2
@@ -18,6 +20,10 @@ export interface CliResult {
 export const HELP_TEXT = `Usage: uipilot-plugin validate <source> [--platform windows|macos] [--json]
 
 Validate a UiPilot public plugin directory or .uipilot-plugin archive.
+
+       uipilot-plugin pack <source-directory> --output <file.uipilot-plugin> [--platform windows|macos] [--json]
+
+Create a validated local plugin archive without overwriting an existing path.
 `
 
 function defaultPlatform(platform: NodeJS.Platform): PluginPlatform | undefined {
@@ -28,14 +34,26 @@ function defaultPlatform(platform: NodeJS.Platform): PluginPlatform | undefined 
 
 export function parseCli(argv: readonly string[], hostPlatform: NodeJS.Platform): ParsedCli {
   if (argv.length === 1 && (argv[0] === '--help' || argv[0] === '-h')) return { kind: 'help' }
-  if (argv[0] !== 'validate') return { kind: 'error', message: HELP_TEXT.trimEnd() }
+  const command = argv[0]
+  if (command !== 'validate' && command !== 'pack') return { kind: 'error', message: HELP_TEXT.trimEnd() }
 
   let source: string | undefined
+  let output: string | undefined
   let selectedPlatform: PluginPlatform | undefined
   let json = false
 
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index]
+    if (value === '--output' && command === 'pack') {
+      if (output !== undefined) return { kind: 'error', message: 'The --output option may be used only once.' }
+      const destination = argv[index + 1]
+      if (!destination || destination.startsWith('-')) {
+        return { kind: 'error', message: 'Provide an output path after --output.' }
+      }
+      output = destination
+      index += 1
+      continue
+    }
     if (value === '--json') {
       if (json) return { kind: 'error', message: 'The --json option may be used only once.' }
       json = true
@@ -56,6 +74,7 @@ export function parseCli(argv: readonly string[], hostPlatform: NodeJS.Platform)
   }
 
   if (!source) return { kind: 'error', message: 'Provide exactly one source.' }
+  if (command === 'pack' && output === undefined) return { kind: 'error', message: 'Provide an explicit --output path.' }
   const platform = selectedPlatform ?? defaultPlatform(hostPlatform)
   if (!platform) {
     return {
@@ -63,6 +82,7 @@ export function parseCli(argv: readonly string[], hostPlatform: NodeJS.Platform)
       message: 'Use --platform windows or --platform macos on this operating system.',
     }
   }
+  if (command === 'pack' && output !== undefined) return { kind: 'pack', source, output, platform, json }
   return { kind: 'validate', source, platform, json }
 }
 
@@ -93,6 +113,7 @@ export async function runCli(
   argv: readonly string[],
   hostPlatform: NodeJS.Platform,
   validatePackage: ValidatePackage,
+  packPackage?: PackPackage,
 ): Promise<CliResult> {
   const parsed = parseCli(argv, hostPlatform)
   const wantsJson = argv.includes('--json')
@@ -102,6 +123,18 @@ export async function runCli(
   }
 
   try {
+    if (parsed.kind === 'pack') {
+      if (!packPackage) throw new Error('Pack dependency is unavailable.')
+      const report = await packPackage({ source: parsed.source, output: parsed.output, platform: parsed.platform })
+      let text: string
+      if (parsed.json) text = JSON.stringify(report)
+      else if (!report.created) text = report.error.code + ': ' + report.error.message
+      else {
+        text = 'Created ' + report.output.path + '\nSHA-256: ' + report.output.sha256
+        for (const warning of report.warnings ?? []) text += '\nWarning: ' + warning.code + ': ' + warning.message
+      }
+      return { exitCode: report.created ? 0 : 1, stdout: text + '\n' }
+    }
     const report = await validatePackage({ source: parsed.source, platform: parsed.platform })
     return {
       exitCode: report.valid ? 0 : 1,
@@ -110,7 +143,7 @@ export async function runCli(
   } catch {
     return {
       exitCode: 2,
-      stdout: `${renderCliError('CLI_INTERNAL', 'Validation failed.', parsed.json)}\n`,
+      stdout: `${renderCliError('CLI_INTERNAL', parsed.kind === 'pack' ? 'Packing failed.' : 'Validation failed.', parsed.json)}\n`,
     }
   }
 }

@@ -719,7 +719,7 @@ node --test examples/public-plugins/com.uipilot.pomodoro/tests/runtime.test.js
 
 ## 10. 使用独立 CLI 验证
 
-UiPilot 提供纯 TypeScript 的 `@uipilot/plugin-cli`。第三方开发者只需要 Node.js 20 或更高版本和已提供的 npm `.tgz`，不需要安装 Rust、UiPilot 或下载 UiPilot 源码。CLI 只读取并验证包，不安装插件、不运行 Runtime/窗口代码、不联网，也不修改源目录。
+UiPilot 提供纯 TypeScript 的 `@uipilot/plugin-cli`。第三方开发者只需要 Node.js 20 或更高版本和已提供的 npm `.tgz`，不需要安装 Rust、UiPilot 或下载 UiPilot 源码。CLI 提供本地 pack 与静态 validate，不安装插件、不运行 Runtime/窗口代码、不联网，也不修改源目录；validate 只读，pack 写入指定归档及同目录临时文件。
 
 当前包尚未发布到 npm Registry。取得 `.tgz` 后，可在本机或 CI 工作目录安装：
 
@@ -784,43 +784,21 @@ uipilot-plugin validate .\package --platform windows --json
 
 ## 12. 打包 `.uipilot-plugin`
 
-`.uipilot-plugin` 是 ZIP 内容，归档根目录必须直接包含 `plugin.json`，不能再包一层 `package/`。
-
-在插件项目根目录运行：
+在插件项目根目录使用已安装的独立 CLI。输出目录应在源 `package` 目录外，并事先存在：
 
 ```powershell
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-$packageRoot = (Resolve-Path '.\package').Path
-$output = Join-Path $PWD 'com.example.hello-return.uipilot-plugin'
-$temporary = "$output.$([Guid]::NewGuid().ToString('N')).tmp"
-
-try {
-  [System.IO.Compression.ZipFile]::CreateFromDirectory(
-    $packageRoot,
-    $temporary,
-    [System.IO.Compression.CompressionLevel]::Optimal,
-    $false
-  )
-  Move-Item -LiteralPath $temporary -Destination $output -Force
-} finally {
-  if (Test-Path -LiteralPath $temporary) {
-    Remove-Item -LiteralPath $temporary
-  }
-}
-
-$output
+uipilot-plugin validate .\package --platform windows
+uipilot-plugin pack .\package --output .\com.example.hello-return.uipilot-plugin --platform windows
+uipilot-plugin validate .\com.example.hello-return.uipilot-plugin --platform windows
 ```
 
-把输出文件名改成自己的 `pluginId`。在发布前，用 UiPilot 的“选择插件包”重新安装该文件做最终验证。
+`pack` 从同一份经过校验的目录快照生成确定性 ZIP 归档，根目录直接包含 `plugin.json`，不会多包一层 `package/`。成功时显示绝对输出路径和 SHA-256。将文件名换成自己的 `pluginId`；CLI 不会执行或安装插件。
 
-仓库内固定输出 Demo 可使用现有脚本打包；番茄钟示例可直接选择其 `package` 开发目录安装：
+必须显式提供 `--output`，后缀严格为 `.uipilot-plugin`。父目录和祖先路径不能是符号链接或 Windows reparse point，输出不能位于源目录内。已有文件、目录或链接一律拒绝覆盖，没有 `--force`；再次打包请选择新文件名。输出文件系统须支持硬链接（Windows 通常为 NTFS），FAT/exFAT 等不支持的文件系统会返回 `OUTPUT_WRITE_FAILED`。
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plugin.ps1 -PluginId com.uipilot.demo-return
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plugin.ps1 -PluginId com.uipilot.demo-win
-```
+`--platform` 与 validate 一致：Windows/macOS 默认当前平台，其他系统必须显式选择。可加 `--json` 获取 `{schemaVersion:1,created:true,output:{path,sha256},validation,warnings?}`；预期失败为 `{schemaVersion:1,created:false,output:{path},validation?,error:{code,message}}`。成功退出 `0`，包无效或预期输出失败退出 `1`，参数错误或未知内部异常退出 `2`。`TEMP_CLEANUP_FAILED` 表示有效归档已生成但临时文件清理失败，仍退出 `0`，应保留并验证生成的归档。
+
+最后在 UiPilot 的 **设置 > 插件 > 公开插件** 点击“选择插件包”，选择生成的归档，检查权限并确认本地安装。在真实宿主验证交互、焦点、双主题和数据持久化；CLI 通过不能替代这些人工检查。本流程不包含在线发布。
 
 ## 13. 可选：插件私有状态与设置
 
