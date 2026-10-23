@@ -18,8 +18,8 @@
 
 **Dependencies:** 设计 `M0 设计合同 / 参考包断言`。
 
-- [ ] 重现两个现存失败，仅同步已提交 manifest 和包根的精确断言。
-- [ ] 保留 strict 包文件集合及权限/输出模式断言，不更改 Runtime 或 manifest。
+- [x] 重现两个现存失败，仅同步已提交 manifest 和包根的精确断言。
+- [x] 保留 strict 包文件集合及权限/输出模式断言，不更改 Runtime 或 manifest。
 
 **Distinct test coverage:** 当前 demo-panel 固定版本/最低宿主/5 个 Host Keys 全部正确；translate 严格包含 icon.png 且无意外资源。
 
@@ -31,10 +31,10 @@
 
 **Dependencies:** Task 1；设计 `M0 设计合同 / 验证协调器` 和 `文档与验证`。
 
-- [ ] 实现可测试的发现/阶段构造/顺序执行；导入模块不能触发检查。
-- [ ] 新增 verify/verify:local 入口与只读 --list；保留 npm test 原语义。
-- [ ] 串联完整九类门禁，失败准确传播，不补下载、不自动修生成物。
-- [ ] 根 README 提供真实命令、源码导航、本地插件流程和人工验收边界。
+- [x] 实现可测试的发现/阶段构造/顺序执行；导入模块不能触发检查。
+- [x] 新增 verify/verify:local 入口与只读 --list；保留 npm test 原语义。
+- [x] 串联完整九类门禁，失败准确传播，不补下载、不自动修生成物。
+- [x] 根 README 提供真实命令、源码导航、本地插件流程和人工验收边界。
 
 **Distinct test coverage:** 稳定排序；带空格路径以独立 argv 传递；入口 cwd 独立；缺目录、空包/测试/合同集合、符号链接均 fail-closed；首个阶段失败阻止后续；spawn error 清晰退出；--list 无进程启动；Schema 检查失败不自动更新文件。
 
@@ -42,7 +42,7 @@
 
 ## 完成验收
 
-- [ ] 两个任务规格与质量评审通过。
-- [ ] verify:local 全流程真实通过，报告各阶段结果与保留 warning。
-- [ ] Git 仅含本计划任务文件；原工作区 dirty 文件未动。
-- [ ] 全局路线图保留 M1-M7 未交付状态。
+- [x] 两个任务规格与质量评审通过。
+- [x] verify:local 全流程真实通过，报告各阶段结果与保留 warning。
+- [x] Git 仅含本计划任务文件；原工作区 dirty 文件未动。
+- [x] 全局路线图保留 M1-M7 未交付状态。
