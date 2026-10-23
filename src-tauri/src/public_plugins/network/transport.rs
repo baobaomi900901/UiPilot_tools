@@ -141,7 +141,7 @@ fn validate_dns_answers(
         .collect())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct NativeHttpsRequest {
     pub(super) hostname: String,
     pub(super) addresses: Vec<SocketAddr>,
@@ -152,6 +152,34 @@ pub(super) struct NativeHttpsRequest {
     pub(super) body: Vec<u8>,
     pub(super) max_response_body_bytes: usize,
     pub(super) deadline: Instant,
+}
+
+impl std::fmt::Debug for NativeHttpsRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name, "<redacted>"))
+            .collect::<Vec<_>>();
+        let sensitive_headers = self
+            .sensitive_headers
+            .iter()
+            .map(|(name, _)| (name, "<redacted>"))
+            .collect::<Vec<_>>();
+
+        formatter
+            .debug_struct("NativeHttpsRequest")
+            .field("hostname", &self.hostname)
+            .field("addresses", &self.addresses)
+            .field("method", &self.method)
+            .field("path_and_query", &self.path_and_query)
+            .field("headers", &headers)
+            .field("sensitive_headers", &sensitive_headers)
+            .field("body", &self.body)
+            .field("max_response_body_bytes", &self.max_response_body_bytes)
+            .field("deadline", &self.deadline)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,6 +551,32 @@ mod tests {
             max_response_body_bytes: 1024 * 1024,
             deadline: Instant::now() + Duration::from_secs(3),
         }
+    }
+
+    #[test]
+    fn native_https_request_debug_redacts_ordinary_and_injected_authorization() {
+        let mut request = request(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+            "api.example.com",
+        );
+        let legacy_token = "Bearer legacy-debug-token";
+        let legacy_bytes = format!("{:?}", legacy_token.as_bytes());
+        request.headers.push((
+            "aUtHoRiZaTiOn".to_owned(),
+            legacy_token.as_bytes().to_vec(),
+        ));
+        request.sensitive_headers.push((
+            hyper::header::HeaderName::from_static("authorization"),
+            hyper::header::HeaderValue::from_static("Bearer injected-debug-token"),
+        ));
+
+        let debug = format!("{request:?}");
+
+        assert!(!debug.contains(legacy_token));
+        assert!(!debug.contains(&legacy_bytes));
+        assert!(!debug.contains("Bearer injected-debug-token"));
+        assert!(debug.contains("aUtHoRiZaTiOn"));
+        assert!(debug.contains("<redacted>"));
     }
 
     fn public_answer(port: u16) -> Vec<SocketAddr> {
