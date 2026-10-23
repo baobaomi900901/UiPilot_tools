@@ -51,10 +51,10 @@
 
 **Dependencies:** Tasks 1–2；设计 §3、§6 正常请求路径、§7。
 
-- [ ] 实现 bounded普通文件/目录记录读取与 Host-only DPAPI 解密；敏感容器和DPAPI输出清零、Debug脱敏。
-- [ ] Runtime安全快照和Rust严格请求DTO支持 credential；保留每context attempt reservation先于请求校验/secret I/O且立即释放registry锁；验证当前授权/目标/header冲突后在gate内读取并注入内部prepared headers，随后登记call再释放gate。
-- [ ] 复用当前deadline、取消、redirect与deliver；redirect保持同一token快照。固定CredentialUnavailable错误与JS映射，敏感HeaderValue标记。
-- [ ] 保留无credential的现有Authorization行为；最终header总预算含注入值。
+- [x] 实现 bounded普通文件/目录记录读取与 Host-only DPAPI 解密；敏感容器和DPAPI输出清零、Debug脱敏。
+- [x] Runtime安全快照和Rust严格请求DTO支持 credential；保留每context attempt reservation先于请求校验/secret I/O且立即释放registry锁；验证当前授权/目标/header冲突后在gate内读取并注入内部prepared headers，随后登记call再释放gate。
+- [x] 复用当前deadline、取消、redirect与deliver；redirect保持同一token快照。固定CredentialUnavailable错误与JS映射，敏感HeaderValue标记。
+- [x] 保留无credential的现有Authorization行为；最终header总预算含注入值。
 
 **Distinct test coverage:** fake token DPAPI roundtrip到fake TLS/transport正确header；不同插件同key隔离，未知ID、未授权、host不匹配在读secret前拒绝；缺失/坏record/DPAPI失败/非法bearer固定错误；失败消费attempt预算、预算耗尽无secret I/O；8192边界和最终header数/大小；DTO null/getter/symbol/未知键拒绝；Debug/log/错误无token；fake服务回显按正常响应返回，Host自身不回填header。屏障卡在gate读取后、注册前并并发撤权：先完成admission再取消，旧响应不能deliver，无死锁。
 
