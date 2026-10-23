@@ -8,3 +8,7 @@ src-tauri/Cargo.toml text eol=lf
 # Pinned Unicode hashes and generated checks are byte-exact in the TypeScript CLI.
 packages/plugin-cli/unicode-data/*.txt text eol=lf
 packages/plugin-cli/src/generated/** text eol=lf
+
+# Rust schema generation uses an exact LF comparison.
+docs/plugin-sdk/uipilot-plugin-v1.schema.json text eol=lf
+packages/plugin-cli/schema/uipilot-plugin-v1.schema.json text eol=lf

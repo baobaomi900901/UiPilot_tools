@@ -1,0 +1,168 @@
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { discover, buildStages, runStages, main, repositoryRoot } from './verify-local-foundation.mjs';
+
+function fixture(t) {
+  const root = mkdtempSync(path.join(tmpdir(), 'verify foundation '));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const name of ['z plugin', 'a plugin']) {
+    const base = path.join(root, 'examples/public-plugins', name);
+    mkdirSync(path.join(base, 'package'), { recursive: true });
+    mkdirSync(path.join(base, 'tests'));
+    writeFileSync(path.join(base, 'package/plugin.json'), '{}');
+    writeFileSync(path.join(base, 'tests/runtime.test.js'), '');
+    writeFileSync(path.join(base, 'tests/sdk-contract.ts'), '');
+  }
+  return root;
+}
+
+test('discovery sorts all collections and preserves spaced paths as argv', t => {
+  const root = fixture(t);
+  const found = discover(root);
+  assert.equal(found.packages.length, 2);
+  for (const items of Object.values(found)) assert.ok(items[0].includes('a plugin'));
+  const stages = buildStages(root, found, { npmCli: 'C:/npm cli/npm-cli.js' });
+  assert.deepEqual(stages.map(stage => stage.name), [
+    'coordinator tests', 'frontend tests', 'frontend build', 'Rust library tests',
+    'manifest schema check', 'CLI verify', 'public plugin tests', 'SDK contracts',
+    'reference package validation',
+  ]);
+  assert.deepEqual(stages[6].args.slice(1), found.tests);
+  assert.deepEqual(stages[7].args.slice(-2), found.contracts);
+  assert.equal(stages[3].args.at(-1), '--offline');
+  assert.equal(stages[4].args.at(-1), '--check');
+  assert.equal(stages[1].command, process.execPath);
+  assert.equal(stages[1].args[0], 'C:/npm cli/npm-cli.js');
+  assert.deepEqual(stages[8].commands.map(item => item.args[2]), found.packages);
+});
+
+test('missing root and empty collections fail closed', t => {
+  const root = fixture(t);
+  rmSync(path.join(root, 'examples'), { recursive: true });
+  assert.throws(() => discover(root), /discover/i);
+  mkdirSync(path.join(root, 'examples/public-plugins'), { recursive: true });
+  assert.throws(() => discover(root), /empty/i);
+});
+
+for (const collection of ['package', 'tests', 'contracts']) {
+  test(`empty ${collection} fails closed`, t => {
+    const root = fixture(t);
+    for (const name of ['a plugin', 'z plugin']) {
+      const base = path.join(root, 'examples/public-plugins', name);
+      if (collection === 'contracts') {
+        rmSync(path.join(base, 'tests/sdk-contract.ts'));
+      } else {
+        rmSync(path.join(base, collection), { recursive: true });
+      }
+    }
+    assert.throws(() => discover(root), /empty/i);
+  });
+}
+
+test('links fail closed', t => {
+  const root = fixture(t);
+  symlinkSync(root, path.join(root, 'examples/public-plugins/link'), 'junction');
+  assert.throws(() => discover(root), /link|ordinary/i);
+});
+
+test('first failure stops later stages and spawn errors identify stage', async () => {
+  const stages = [
+    { name: 'schema', command: 'cargo', args: ['--check'], cwd: repositoryRoot },
+    { name: 'later', commands: [] },
+  ];
+  let calls = 0;
+  await assert.rejects(runStages(stages, () => {
+    calls++;
+    return { status: 7 };
+  }, () => {}), /schema.*7/);
+  assert.equal(calls, 1);
+  await assert.rejects(runStages(stages, () => ({ error: new Error('ENOENT') }), () => {}), /schema.*ENOENT/);
+});
+
+test('--list runs no process and resolves root independently of cwd', async t => {
+  const root = fixture(t);
+  let calls = 0;
+  const output = [];
+  const result = await main(['--list'], {
+    root,
+    spawn: () => { calls++; },
+    log: message => output.push(message),
+  });
+  assert.equal(result, 0);
+  assert.equal(calls, 0);
+  assert.match(output.join('\n'), /2 tests/);
+  assert.ok(path.isAbsolute(repositoryRoot));
+});
+
+test('schema failure never rewrites tracked schema', async t => {
+  const root = fixture(t);
+  const schema = path.join(root, 'schema.json');
+  writeFileSync(schema, 'original');
+  const stages = buildStages(root, discover(root), { npmCli: '/npm-cli.js' });
+  await assert.rejects(runStages(stages, (_command, args) => ({
+    status: args.includes('--check') ? 1 : 0,
+  }), () => {}), /schema/);
+  assert.equal(readFileSync(schema, 'utf8'), 'original');
+});
+
+test('actual entry --list works from another cwd without running checks', t => {
+  const root = fixture(t);
+  const result = spawnSync(process.execPath, [
+    path.join(repositoryRoot, 'scripts/verify-local-foundation.mjs'), '--list',
+  ], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /9\. reference package validation/);
+  assert.doesNotMatch(result.stdout, /TAP version|Compiling|vitest run/);
+});
+
+test('import is inert', () => {
+  const url = new URL('./verify-local-foundation.mjs', import.meta.url).href;
+  const result = spawnSync(process.execPath, [
+    '--input-type=module', '-e', `await import(${JSON.stringify(url)})`,
+  ], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '');
+});
+
+test('empty package directory is rejected', t => {
+  const root = fixture(t);
+  rmSync(path.join(root, 'examples/public-plugins/a plugin/package/plugin.json'));
+  assert.throws(() => discover(root), /invalid package/);
+});
+
+test('thrown spawn error is attributed and stops execution', async () => {
+  await assert.rejects(runStages([
+    { name: 'launch', command: 'missing', args: [] },
+  ], () => { throw new Error('ENOENT'); }, () => {}), /launch.*ENOENT/);
+});
+
+test('entry reports spawn failure as nonzero without running later stages', async t => {
+  const root = fixture(t);
+  const output = [];
+  let calls = 0;
+  const result = await main([], {
+    root,
+    spawn: (_command, _args, options) => {
+      calls++;
+      assert.equal(options.shell, false);
+      assert.equal(options.cwd, root);
+      return { error: new Error('ENOENT') };
+    },
+    log: message => output.push(message),
+  });
+  assert.equal(result, 1);
+  assert.equal(calls, 1);
+  assert.match(output.join('\n'), /FAILED: coordinator tests: spawn failed: ENOENT/);
+});
+
+test('a file in place of the discovery root fails closed', t => {
+  const root = fixture(t);
+  const directory = path.join(root, 'examples/public-plugins');
+  rmSync(directory, { recursive: true });
+  writeFileSync(directory, 'not a directory');
+  assert.throws(() => discover(root), /ordinary directory/);
+});
