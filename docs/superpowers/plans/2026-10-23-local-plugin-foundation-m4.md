@@ -77,11 +77,11 @@
 
 ### Task 5: 凭据授权与设置界面
 
-**Files:** `src/public-plugin-panel.tsx`、现有styles、`protocol.ts`、`main.ts`、`launcher-browser-preview.tsx`、相关launcher/plugin UI tests。
+**Files:** `src/public-plugin-panel.tsx`、`launcher-view.tsx`、现有styles、`protocol.ts`、`main.ts`、`launcher-browser-preview.tsx`、相关launcher/plugin UI tests。
 
 **Dependencies:** Task 4；设计 §5，`docs/ui-guidelines.md`；复用已有secret设置通路，缺失时在详情页补齐。
 
-- [ ] 安装与详情列出ID、secret label/key、host、Bearer，标新/变更绑定与服务端回显说明。
+- [ ] 安装列出ID、候选settingKey、host、Bearer；详情补充当前secret label/key，标新/变更绑定与服务端回显说明。
 - [ ] 开启网络先明确确认完整绑定，所有开启调用带展示revision；陈旧失败重载不自动重授权，关闭直接执行。
 - [ ] 声明secret的password单key保存/显式清除，状态与busy/错误可访问，成功清空输入；错误刷新状态并解释部分提交边界。
 - [ ] Light/Dark、紧凑布局与键盘操作验证；不新增Tauri capability，不复制原目录未提交UI。
