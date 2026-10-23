@@ -172,6 +172,7 @@ fn plugin_network_grant_is_exact_durable_and_can_be_revoked_and_regranted() {
             plugin_id: plugin.plugin_id.clone(),
             generation: installed.active_generation,
             https_hosts: installed.network_https_hosts_grant.clone(),
+            credentials: vec![],
         })
     );
 
@@ -685,4 +686,246 @@ fn legacy_state_without_favorite_loads_false_and_next_write_is_canonical() {
         .unwrap();
     let canonical = serde_json::from_slice::<Value>(&fs::read(state_path).unwrap()).unwrap();
     assert_eq!(canonical["favorite"], false);
+}
+
+#[test]
+fn credential_grant_round_trip_and_revocation() {
+    let dir = TestDir::new("credential-grant");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let mut plugin = network_manifest("1.0.0", &["api.example.com"]);
+    let credential: super::super::manifest::PluginNetworkCredential = serde_json::from_value(
+        json!({"id":"token", "settingKey":"token", "host":"api.example.com", "type":"bearer"}),
+    )
+    .unwrap();
+    plugin.network.as_mut().unwrap().credentials = Some(vec![credential.clone()]);
+    let installed = store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    assert_eq!(installed.network_credentials_grant, vec![credential]);
+    assert!(installed.network_grant_snapshot(&plugin).is_some());
+    let mut changed = plugin.clone();
+    changed
+        .network
+        .as_mut()
+        .unwrap()
+        .credentials
+        .as_mut()
+        .unwrap()[0]
+        .setting_key = "other".into();
+    assert!(installed.network_grant_snapshot(&changed).is_none());
+
+    let restored = PluginStateStore::load(dir.path(), []).unwrap();
+    assert_eq!(
+        restored.config(&plugin.plugin_id).unwrap().unwrap(),
+        installed
+    );
+    let prepared = restored
+        .prepare_set_network_access(
+            &plugin.plugin_id,
+            installed.network_https_hosts_grant.clone(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        restored.persist_prepared(&prepared),
+        DurableStateOutcome::Committed
+    );
+    assert!(restored
+        .publish_prepared(prepared)
+        .unwrap()
+        .network_credentials_grant
+        .is_empty());
+}
+
+#[test]
+fn credential_uninstall_retention_clears_both_grants_and_keeps_empty_field_omitted() {
+    let dir = TestDir::new("credential-uninstall");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let mut plugin = network_manifest("1.0.0", &["api.example.com"]);
+    plugin.network.as_mut().unwrap().credentials = Some(
+        serde_json::from_value(json!([
+            {"id":"token","settingKey":"token","host":"api.example.com","type":"bearer"}
+        ]))
+        .unwrap(),
+    );
+    store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    let prepared = store
+        .prepare_uninstall(&plugin.plugin_id, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.persist_prepared(&prepared),
+        DurableStateOutcome::Committed
+    );
+    let config = store.publish_prepared(prepared).unwrap();
+    assert!(!config.installed);
+    assert!(config.network_credentials_grant.is_empty());
+    assert!(config.network_https_hosts_grant.is_empty());
+    let raw: Value = serde_json::from_slice(
+        &fs::read(dir.path().join(&plugin.plugin_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(raw.get("networkCredentialsGrant").is_none());
+}
+
+#[test]
+fn strong_credential_structure_corruption_falls_back_and_revokes_backup() {
+    for bad in [
+        json!("bad"),
+        json!([{"id":"token"}]),
+        json!([
+            {"id":"token","settingKey":"token","host":"api.example.com","type":"oauth"}
+        ]),
+    ] {
+        let dir = TestDir::new("credential-structure");
+        let store = PluginStateStore::load(dir.path(), []).unwrap();
+        let plugin = network_manifest("1.0.0", &["api.example.com"]);
+        store
+            .install_or_upgrade(&plugin, network_permission_grants())
+            .unwrap();
+        let owner = dir.path().join(&plugin.plugin_id);
+        let paths = AtomicPaths::new(&owner, "state.json");
+        let original = fs::read(paths.current()).unwrap();
+        fs::write(paths.backup(), &original).unwrap();
+        let mut doc: Value = serde_json::from_slice(&original).unwrap();
+        doc["networkCredentialsGrant"] = bad;
+        doc["settings"] = json!({"latest":"not-in-backup"});
+        fs::write(paths.current(), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let restored = PluginStateStore::load(dir.path(), []).unwrap();
+        let config = restored.config(&plugin.plugin_id).unwrap().unwrap();
+        assert!(!config.settings.contains_key("latest"));
+        assert!(config.network_https_hosts_grant.is_empty());
+        assert!(config.network_credentials_grant.is_empty());
+        assert_eq!(
+            restored.lock().unwrap().by_plugin[&plugin.plugin_id].raw,
+            fs::read(paths.current()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn backup_recovery_revokes_network_durably_before_publish() {
+    let dir = TestDir::new("backup-revoke");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let plugin = network_manifest("1.0.0", &["api.example.com"]);
+    store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    let path = dir.path().join(&plugin.plugin_id).join("state.json");
+    let backup = path.with_file_name("state.json.backup");
+    fs::copy(&path, &backup).unwrap();
+    fs::remove_file(&path).unwrap();
+    let restored = PluginStateStore::load(dir.path(), []).unwrap();
+    let config = restored.config(&plugin.plugin_id).unwrap().unwrap();
+    assert!(config.network_https_hosts_grant.is_empty());
+    assert!(path.exists());
+    let raw: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(raw["permissionGrants"], json!([]));
+    assert_eq!(
+        PluginStateStore::load(dir.path(), [])
+            .unwrap()
+            .config(&plugin.plugin_id)
+            .unwrap()
+            .unwrap(),
+        config
+    );
+}
+
+#[test]
+fn recovery_of_missing_truncated_and_bad_structure_current_never_restores_backup_authority() {
+    for current in [
+        None,
+        Some(b"{".as_slice()),
+        Some(b"{\"networkCredentialsGrant\":\"bad\"}".as_slice()),
+    ] {
+        let dir = TestDir::new("recovery-matrix");
+        let store = PluginStateStore::load(dir.path(), []).unwrap();
+        let plugin = network_manifest("1.0.0", &["api.example.com"]);
+        store
+            .install_or_upgrade(&plugin, network_permission_grants())
+            .unwrap();
+        let owner = dir.path().join(&plugin.plugin_id);
+        let paths = AtomicPaths::new(&owner, "state.json");
+        fs::copy(paths.current(), paths.backup()).unwrap();
+        match current {
+            Some(raw) => fs::write(paths.current(), raw).unwrap(),
+            None => fs::remove_file(paths.current()).unwrap(),
+        }
+        let restored = PluginStateStore::load(dir.path(), []).unwrap();
+        let config = restored.config(&plugin.plugin_id).unwrap().unwrap();
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::NetworkHttps));
+        let raw = fs::read(paths.current()).unwrap();
+        assert_eq!(
+            restored.lock().unwrap().by_plugin[&plugin.plugin_id].raw,
+            raw
+        );
+        assert!(config.network_credentials_grant.is_empty());
+    }
+}
+
+#[test]
+fn semantic_credential_corruption_preserves_current_settings_and_cannot_fall_back_to_grants() {
+    for credentials in [
+        json!([{"id":"token","settingKey":"token","host":"other.example.com","type":"bearer"}]),
+        json!([
+            {"id":"token","settingKey":"token","host":"api.example.com","type":"bearer"},
+            {"id":"token","settingKey":"token","host":"api.example.com","type":"bearer"}
+        ]),
+    ] {
+        let dir = TestDir::new("semantic-grants");
+        let plugin = network_manifest("1.0.0", &["api.example.com"]);
+        let store = PluginStateStore::load(dir.path(), []).unwrap();
+        store
+            .install_or_upgrade(&plugin, network_permission_grants())
+            .unwrap();
+        let owner = dir.path().join(&plugin.plugin_id);
+        let paths = AtomicPaths::new(&owner, "state.json");
+        let original = fs::read(paths.current()).unwrap();
+        fs::write(paths.backup(), &original).unwrap();
+        let mut doc: Value = serde_json::from_slice(&original).unwrap();
+        doc["settings"] = json!({"preserve":"latest"});
+        doc["networkCredentialsGrant"] = credentials;
+        fs::write(paths.current(), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let restored = PluginStateStore::load(dir.path(), []).unwrap();
+        let config = restored.config(&plugin.plugin_id).unwrap().unwrap();
+        assert_eq!(config.settings["preserve"], json!("latest"));
+        assert!(config.network_https_hosts_grant.is_empty());
+        assert!(config.network_credentials_grant.is_empty());
+        assert_eq!(fs::read(paths.backup()).unwrap(), original);
+        let durable: Value = serde_json::from_slice(&fs::read(paths.current()).unwrap()).unwrap();
+        assert!(durable.get("networkCredentialsGrant").is_none());
+        assert_eq!(
+            PluginStateStore::load(dir.path(), [])
+                .unwrap()
+                .config(&plugin.plugin_id)
+                .unwrap()
+                .unwrap(),
+            config
+        );
+    }
+}
+
+#[test]
+fn recovery_persistence_failure_publishes_no_config_and_preserves_source() {
+    let dir = TestDir::new("recovery-write-fail");
+    let plugin = network_manifest("1.0.0", &["api.example.com"]);
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    let owner = dir.path().join(&plugin.plugin_id);
+    let paths = AtomicPaths::new(&owner, "state.json");
+    let source = fs::read(paths.current()).unwrap();
+    fs::write(paths.backup(), &source).unwrap();
+    fs::remove_file(paths.current()).unwrap();
+    let outcome = load_owner_with_recovery(&owner, &plugin.plugin_id, |_, _| {
+        Err(AtomicFileError::CandidateWrite)
+    });
+    assert!(matches!(outcome, Err(PluginStateError::Storage)));
+    assert_eq!(fs::read(paths.backup()).unwrap(), source);
+    assert!(!paths.current().exists());
 }

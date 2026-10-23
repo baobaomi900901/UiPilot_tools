@@ -210,12 +210,21 @@ export interface PublicSettingView {
   secretConfigured?: boolean
 }
 
+export interface PluginNetworkCredential {
+  readonly id: string
+  readonly settingKey: string
+  readonly host: string
+  readonly type: 'bearer'
+}
+
 export interface PublicPluginInventoryNetwork {
+  readonly credentials: readonly PluginNetworkCredential[]
   readonly httpsHosts: readonly string[]
 }
 
 export interface PublicPluginPrepareNetwork extends PublicPluginInventoryNetwork {
   readonly addedHttpsHosts: readonly string[]
+  readonly addedCredentialIds: readonly string[]
   readonly requiresNetworkConsent: boolean
 }
 
@@ -376,7 +385,7 @@ export interface LauncherClient {
   commitPublicPlugin(input: { input: { token: string; permissionGrants: readonly PublicPermission[] } }): Promise<void>
   cancelPublicPlugin(input: { token: string }): Promise<void>
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
-  setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean }): Promise<void>
+  setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean; expectedInventoryRevision?: U64Decimal }): Promise<void>
   setPublicPluginFavorite(input: { pluginId: string; favorite: boolean }): Promise<void>
   setBuiltinFeatureFavorite(input: { feature: BuiltinFeature; favorite: boolean }): Promise<void>
   setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
@@ -905,6 +914,8 @@ export function parsePublicPluginPrepareSummary(value: unknown): PublicPluginPre
   if (network !== null && !summary.isUpdate) {
     if (!network.requiresNetworkConsent || network.addedHttpsHosts.length !== network.httpsHosts.length) return null
     if (network.addedHttpsHosts.some((host, index) => host !== network.httpsHosts[index])) return null
+    if (network.addedCredentialIds.length !== network.credentials.length
+      || network.addedCredentialIds.some((id, index) => id !== network.credentials[index].id)) return null
   }
   return { ...(summary as unknown as PublicPluginPrepareSummary), network, permissions }
 }
@@ -959,24 +970,44 @@ function parseHttpsHosts(value: unknown, allowEmpty = false): string[] | null {
   return hosts
 }
 
+function parseNetworkCredentials(value: unknown, hosts: readonly string[]): PluginNetworkCredential[] | null {
+  if (!Array.isArray(value) || !exactDenseArray(value) || value.length > 8) return null
+  const credentials: PluginNetworkCredential[] = []
+  for (const item of value) {
+    const c = plainRecord(item)
+    if (!c || !exactKeys(c, ['host', 'id', 'settingKey', 'type'])
+      || typeof c.id !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(c.id)
+      || typeof c.settingKey !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(c.settingKey)
+      || typeof c.host !== 'string' || !hosts.includes(c.host) || c.type !== 'bearer'
+      || (credentials.length > 0 && credentials[credentials.length - 1].id >= c.id)) return null
+    credentials.push({ id: c.id, settingKey: c.settingKey, host: c.host, type: 'bearer' })
+  }
+  return credentials
+}
+
 function parseInventoryNetwork(value: unknown): PublicPluginInventoryNetwork | null | undefined {
   if (value === null) return null
   const network = plainRecord(value)
-  if (!network || !exactKeys(network, ['httpsHosts'])) return undefined
+  if (!network || !exactKeys(network, ['credentials', 'httpsHosts'])) return undefined
   const httpsHosts = parseHttpsHosts(network.httpsHosts)
-  return httpsHosts ? { httpsHosts } : undefined
+  const credentials = httpsHosts && parseNetworkCredentials(network.credentials, httpsHosts)
+  return httpsHosts && credentials ? { httpsHosts, credentials } : undefined
 }
 
 function parsePrepareNetwork(value: unknown): PublicPluginPrepareNetwork | null | undefined {
   if (value === null) return null
   const network = plainRecord(value)
-  if (!network || !exactKeys(network, ['addedHttpsHosts', 'httpsHosts', 'requiresNetworkConsent'])) return undefined
+  if (!network || !exactKeys(network, ['addedCredentialIds', 'addedHttpsHosts', 'credentials', 'httpsHosts', 'requiresNetworkConsent'])) return undefined
   const httpsHosts = parseHttpsHosts(network.httpsHosts)
   const addedHttpsHosts = parseHttpsHosts(network.addedHttpsHosts, true)
   if (!httpsHosts || !addedHttpsHosts || typeof network.requiresNetworkConsent !== 'boolean') return undefined
+  const credentials = parseNetworkCredentials(network.credentials, httpsHosts)
+  const addedCredentialIds = network.addedCredentialIds
+  if (!credentials || !Array.isArray(addedCredentialIds) || !exactDenseArray(addedCredentialIds)
+    || addedCredentialIds.some((id, i) => typeof id !== 'string' || !credentials.some((c) => c.id === id) || (i > 0 && addedCredentialIds[i - 1] >= id))) return undefined
   if (addedHttpsHosts.some((host) => !httpsHosts.includes(host))) return undefined
-  if (network.requiresNetworkConsent !== (addedHttpsHosts.length > 0)) return undefined
-  return { httpsHosts, addedHttpsHosts, requiresNetworkConsent: network.requiresNetworkConsent }
+  if (network.requiresNetworkConsent !== (addedHttpsHosts.length > 0 || addedCredentialIds.length > 0)) return undefined
+  return { httpsHosts, credentials, addedHttpsHosts, addedCredentialIds, requiresNetworkConsent: network.requiresNetworkConsent }
 }
 
 export function parsePluginPanelCommandResult(value: unknown): PluginPanelCommandResult | null {

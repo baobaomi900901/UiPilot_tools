@@ -77,7 +77,7 @@ const previewPublicPlugins: PublicPluginInventory = {
       fault: null,
       generation: 2,
       iconUrl: null,
-      network: { httpsHosts: ['api.example.com', 'translate.example.com'] },
+      network: { httpsHosts: ['api.example.com', 'translate.example.com'], credentials: [] },
       permissions: [
         { permission: 'clipboard.read', supported: true, granted: true },
         { permission: 'clipboard.write', supported: true, granted: true },

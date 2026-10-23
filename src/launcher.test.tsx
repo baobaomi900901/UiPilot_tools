@@ -7671,7 +7671,7 @@ describe('React view and accessibility', () => {
         source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
-        network: { httpsHosts: ['api.example.com'] },
+        network: { httpsHosts: ['api.example.com'], credentials: [] },
         permissions: [
           { permission: 'network.https', supported: true, granted: false },
           { permission: 'clipboard.history.read', supported: true, granted: true },
@@ -7959,8 +7959,8 @@ describe('React view and accessibility', () => {
       sourceVerified: false,
       iconUrl: null,
       network: {
-        httpsHosts: ['api.example.com', 'auth.example.com'],
-        addedHttpsHosts: ['auth.example.com'],
+        httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [],
+        addedHttpsHosts: ['auth.example.com'], addedCredentialIds: [],
         requiresNetworkConsent: true,
       },
     })
@@ -8013,8 +8013,8 @@ describe('React view and accessibility', () => {
         version: '1.0.0',
         isUpdate: false,
         network: {
-          httpsHosts: ['api.example.com', 'auth.example.com'],
-          addedHttpsHosts: ['api.example.com', 'auth.example.com'],
+          httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [],
+          addedHttpsHosts: ['api.example.com', 'auth.example.com'], addedCredentialIds: [],
           requiresNetworkConsent: true,
         },
       })
@@ -8024,8 +8024,8 @@ describe('React view and accessibility', () => {
         version: '1.1.0',
         isUpdate: true,
         network: {
-          httpsHosts: ['api.example.com'],
-          addedHttpsHosts: [],
+          httpsHosts: ['api.example.com'], credentials: [],
+          addedHttpsHosts: [], addedCredentialIds: [],
           requiresNetworkConsent: false,
         },
       })
@@ -8062,7 +8062,7 @@ describe('React view and accessibility', () => {
       pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
       source: 'localPackage' as const, defaultName: 'network', effectiveName: 'network', enabled: true,
       fault: null, generation: 1, iconUrl: null,
-      network: { httpsHosts: ['api.example.com', 'auth.example.com'] },
+      network: { httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [] },
       permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
       settings: [],
     }

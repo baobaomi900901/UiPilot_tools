@@ -51,6 +51,7 @@ pub(crate) struct PluginNetworkAuthoritySnapshot {
     pub(crate) activation_id: u64,
     pub(crate) admission_epoch: u64,
     pub(crate) https_hosts: BTreeSet<String>,
+    pub(crate) credentials: Vec<super::super::manifest::PluginNetworkCredential>,
 }
 
 impl PluginNetworkAuthoritySnapshot {
@@ -77,6 +78,7 @@ impl PluginNetworkAuthoritySnapshot {
             activation_id,
             admission_epoch,
             https_hosts,
+            credentials: Vec::new(),
         })
     }
 

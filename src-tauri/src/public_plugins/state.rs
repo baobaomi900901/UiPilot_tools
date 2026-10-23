@@ -16,7 +16,7 @@ use super::{
     authorize_plugin_scope,
     manifest::{
         parse_canonical_version, valid_command_name, valid_https_host, valid_plugin_id,
-        valid_setting_key, PublicPermission, PublicSettingV1,
+        valid_setting_key, PluginNetworkCredential, PublicPermission, PublicSettingV1,
     },
     valid_json_value, PluginDataScope, PublicManifestV1,
 };
@@ -40,6 +40,7 @@ pub(crate) struct EffectivePluginConfig {
     pub(crate) fault: Option<PublicPluginFault>,
     pub(crate) permission_grants: BTreeSet<PublicPermission>,
     pub(crate) network_https_hosts_grant: BTreeSet<String>,
+    pub(crate) network_credentials_grant: Vec<PluginNetworkCredential>,
     pub(crate) inventory_revision: u64,
     pub(crate) active_generation: u64,
     pub(crate) package_digest: Option<String>,
@@ -51,6 +52,7 @@ pub(crate) struct PluginNetworkGrantSnapshot {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
     pub(crate) https_hosts: BTreeSet<String>,
+    pub(crate) credentials: Vec<PluginNetworkCredential>,
 }
 
 impl EffectivePluginConfig {
@@ -74,12 +76,14 @@ impl EffectivePluginConfig {
             && self
                 .permission_grants
                 .contains(&PublicPermission::NetworkHttps)
-            && self.network_https_hosts_grant == declared_hosts)
-            .then(|| PluginNetworkGrantSnapshot {
-                plugin_id: self.plugin_id.clone(),
-                generation: self.active_generation,
-                https_hosts: declared_hosts,
-            })
+            && self.network_https_hosts_grant == declared_hosts
+            && self.network_credentials_grant == manifest_credentials(manifest))
+        .then(|| PluginNetworkGrantSnapshot {
+            plugin_id: self.plugin_id.clone(),
+            generation: self.active_generation,
+            https_hosts: declared_hosts,
+            credentials: self.network_credentials_grant.clone(),
+        })
     }
 }
 
@@ -126,6 +130,8 @@ struct PluginStateDocument {
     permission_grants: BTreeSet<PublicPermission>,
     #[serde(default)]
     network_https_hosts_grant: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    network_credentials_grant: Vec<PluginNetworkCredential>,
     inventory_revision: u64,
     #[serde(default)]
     active_generation: u64,
@@ -151,6 +157,7 @@ impl PluginStateDocument {
             fault: self.fault,
             permission_grants: self.permission_grants.clone(),
             network_https_hosts_grant: self.network_https_hosts_grant.clone(),
+            network_credentials_grant: self.network_credentials_grant.clone(),
             inventory_revision: self.inventory_revision,
             active_generation: self.active_generation,
             package_digest: self.package_digest.clone(),
@@ -369,6 +376,11 @@ impl PluginStateStore {
             fault,
             permission_grants,
             network_https_hosts_grant,
+            network_credentials_grant: if network_granted {
+                manifest_credentials(manifest)
+            } else {
+                Vec::new()
+            },
             inventory_revision: revision,
             active_generation: generation,
             package_digest,
@@ -613,12 +625,31 @@ impl PluginStateStore {
         declared_hosts: BTreeSet<String>,
         granted: bool,
     ) -> Result<PreparedStateCommit, PluginStateError> {
+        self.prepare_set_network_access_with_credentials(
+            plugin_id,
+            declared_hosts,
+            Vec::new(),
+            granted,
+        )
+    }
+
+    pub(crate) fn prepare_set_network_access_with_credentials(
+        &self,
+        plugin_id: &str,
+        declared_hosts: BTreeSet<String>,
+        mut credentials: Vec<PluginNetworkCredential>,
+        granted: bool,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        if !valid_credential_grants(&credentials, &declared_hosts) {
+            return Err(PluginStateError::InvalidPermissions);
+        }
         if declared_hosts.is_empty()
             || declared_hosts.len() > 8
             || declared_hosts.iter().any(|host| !valid_https_host(host))
         {
             return Err(PluginStateError::InvalidPermissions);
         }
+        credentials.sort_by(|a, b| a.id.cmp(&b.id));
         let state = self.lock()?;
         let previous = state
             .by_plugin
@@ -633,11 +664,13 @@ impl PluginStateStore {
                 .permission_grants
                 .insert(PublicPermission::NetworkHttps);
             document.network_https_hosts_grant = declared_hosts;
+            document.network_credentials_grant = credentials;
         } else {
             document
                 .permission_grants
                 .remove(&PublicPermission::NetworkHttps);
             document.network_https_hosts_grant.clear();
+            document.network_credentials_grant.clear();
         }
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, false)
@@ -696,6 +729,10 @@ impl PluginStateStore {
         document.fault = Some(fault);
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, false)
+    }
+
+    pub(crate) fn inventory_revision(&self) -> Result<u64, PluginStateError> {
+        Ok(self.lock()?.revision)
     }
 
     pub(crate) fn configs(&self) -> Result<Vec<EffectivePluginConfig>, PluginStateError> {
@@ -757,6 +794,7 @@ impl PluginStateStore {
                 .permission_grants
                 .remove(&PublicPermission::NetworkHttps);
             document.network_https_hosts_grant.clear();
+            document.network_credentials_grant.clear();
             document.inventory_revision = revision;
             self.persist_revision(revision)?;
             let stored = self.persist(&document, Some(previous))?;
@@ -791,6 +829,7 @@ impl PluginStateStore {
             .permission_grants
             .remove(&PublicPermission::NetworkHttps);
         document.network_https_hosts_grant.clear();
+        document.network_credentials_grant.clear();
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, !retain_data)
             .map(Some)
@@ -1040,12 +1079,38 @@ fn load_inventory_revision(root: &Path) -> Result<u64, PluginStateError> {
 }
 
 fn load_owner(owner: &Path, plugin_id: &str) -> Result<Option<StoredState>, PluginStateError> {
+    load_owner_with_recovery(owner, plugin_id, |paths, raw| {
+        commit_with_backup(paths, None, raw)
+    })
+}
+
+fn load_owner_with_recovery(
+    owner: &Path,
+    plugin_id: &str,
+    persist: impl Fn(&AtomicPaths, &[u8]) -> Result<(), AtomicFileError>,
+) -> Result<Option<StoredState>, PluginStateError> {
     let paths = AtomicPaths::new(owner, "state.json");
-    for path in [paths.current(), paths.backup()] {
+    for (index, path) in [paths.current(), paths.backup()].into_iter().enumerate() {
         let Some(bytes) = read_optional(path).map_err(|_| PluginStateError::Storage)? else {
             continue;
         };
-        if let Some(document) = parse_document(&bytes, plugin_id) {
+        if let Some(mut document) = parse_document(&bytes, plugin_id) {
+            // Backup data never carries authority across recovery. Semantic repair must
+            // also become durable before the normalized configuration can be published.
+            let original = serde_json::from_slice::<PluginStateDocument>(&bytes)
+                .map_err(|_| PluginStateError::Storage)?;
+            if index != 0 {
+                document
+                    .permission_grants
+                    .remove(&PublicPermission::NetworkHttps);
+                document.network_https_hosts_grant.clear();
+                document.network_credentials_grant.clear();
+            }
+            if index != 0 || document != original {
+                let raw = serde_json::to_vec(&document).map_err(|_| PluginStateError::Storage)?;
+                persist(&paths, &raw).map_err(|_| PluginStateError::Storage)?;
+                return Ok(Some(StoredState { document, raw }));
+            }
             return Ok(Some(StoredState {
                 document,
                 raw: bytes,
@@ -1054,6 +1119,32 @@ fn load_owner(owner: &Path, plugin_id: &str) -> Result<Option<StoredState>, Plug
         quarantine_invalid(path).map_err(|_| PluginStateError::Storage)?;
     }
     Ok(None)
+}
+
+pub(super) fn manifest_credentials(manifest: &PublicManifestV1) -> Vec<PluginNetworkCredential> {
+    let mut credentials = manifest
+        .network
+        .as_ref()
+        .and_then(|n| n.credentials.clone())
+        .unwrap_or_default();
+    credentials.sort_by(|a, b| a.id.cmp(&b.id));
+    credentials
+}
+
+fn valid_credential_grants(
+    credentials: &[PluginNetworkCredential],
+    hosts: &BTreeSet<String>,
+) -> bool {
+    credentials.len() <= 8
+        && credentials.iter().all(|c| {
+            valid_setting_key(&c.id) && valid_setting_key(&c.setting_key) && hosts.contains(&c.host)
+        })
+        && credentials
+            .iter()
+            .map(|c| &c.id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == credentials.len()
 }
 
 fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> {
@@ -1067,13 +1158,21 @@ fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> 
     if !(document
         .permission_grants
         .contains(&PublicPermission::NetworkHttps)
-        && network_grant_valid)
+        && network_grant_valid
+        && valid_credential_grants(
+            &document.network_credentials_grant,
+            &document.network_https_hosts_grant,
+        ))
     {
         document
             .permission_grants
             .remove(&PublicPermission::NetworkHttps);
         document.network_https_hosts_grant.clear();
+        document.network_credentials_grant.clear();
     }
+    document
+        .network_credentials_grant
+        .sort_by(|a, b| a.id.cmp(&b.id));
     (document.schema == 1
         && document.plugin_id == plugin_id
         && valid_plugin_id(&document.plugin_id)

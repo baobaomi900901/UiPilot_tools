@@ -1405,9 +1405,14 @@ pub(crate) fn set_public_plugin_network_access(
     service: State<'_, Arc<PublicPluginService>>,
     plugin_id: String,
     granted: bool,
+    expected_inventory_revision: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
-    Ok(service.manager()?.set_network_access(&plugin_id, granted)?)
+    Ok(service.manager()?.set_network_access_with_revision(
+        &plugin_id,
+        granted,
+        expected_inventory_revision.as_deref(),
+    )?)
 }
 
 #[tauri::command]
@@ -5572,7 +5577,8 @@ mod tests {
         let command = &tail[..end];
         let first = command[command.find('{').unwrap() + 1..].trim_start();
         assert!(first.starts_with("require_main_window(&window)?;"));
-        assert!(command.contains("set_network_access(&plugin_id, granted)"));
+        assert!(command.contains("set_network_access_with_revision("));
+        assert!(command.contains("expected_inventory_revision.as_deref()"));
         assert!(!command.contains("https_hosts"));
         assert!(!command.contains("httpsHosts"));
     }

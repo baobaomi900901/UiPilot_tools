@@ -102,6 +102,8 @@ pub(crate) struct PublicPluginPrepareSummary {
 pub(crate) struct PublicPluginPrepareNetwork {
     pub(crate) https_hosts: Vec<String>,
     pub(crate) added_https_hosts: Vec<String>,
+    pub(crate) credentials: Vec<super::manifest::PluginNetworkCredential>,
+    pub(crate) added_credential_ids: Vec<String>,
     pub(crate) requires_network_consent: bool,
 }
 
@@ -144,6 +146,7 @@ pub(crate) struct PublicPluginInventoryItem {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicPluginInventoryNetwork {
     pub(crate) https_hosts: Vec<String>,
+    pub(crate) credentials: Vec<super::manifest::PluginNetworkCredential>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -481,6 +484,7 @@ struct PendingActivation {
     icon: Option<Vec<u8>>,
     previous_config: Option<EffectivePluginConfig>,
     previous_declared_https_hosts: BTreeSet<String>,
+    previous_declared_credentials: Vec<super::manifest::PluginNetworkCredential>,
     requires_network_consent: bool,
 }
 
@@ -1017,6 +1021,20 @@ impl PublicPluginManager {
             .map_or_else(BTreeSet::new, |network| {
                 network.https_hosts.into_iter().collect()
             });
+        let previous_declared_credentials = previous_config
+            .as_ref()
+            .filter(|config| config.installed)
+            .map(|config| self.installed_manifest(config))
+            .transpose()?
+            .as_ref()
+            .map(super::state::manifest_credentials)
+            .unwrap_or_default();
+        let credentials = super::state::manifest_credentials(&prepared.manifest);
+        let added_credential_ids = credentials
+            .iter()
+            .filter(|credential| !previous_declared_credentials.contains(credential))
+            .map(|credential| credential.id.clone())
+            .collect::<Vec<_>>();
         let candidate_https_hosts = prepared
             .manifest
             .network
@@ -1031,8 +1049,8 @@ impl PublicPluginManager {
         let is_update = previous_config
             .as_ref()
             .is_some_and(|config| config.installed);
-        let requires_network_consent =
-            !candidate_https_hosts.is_empty() && (!is_update || !added_https_hosts.is_empty());
+        let requires_network_consent = !candidate_https_hosts.is_empty()
+            && (!is_update || !added_https_hosts.is_empty() || !added_credential_ids.is_empty());
         let network =
             prepared
                 .manifest
@@ -1041,6 +1059,8 @@ impl PublicPluginManager {
                 .map(|network| PublicPluginPrepareNetwork {
                     https_hosts: network.https_hosts.clone(),
                     added_https_hosts,
+                    credentials,
+                    added_credential_ids,
                     requires_network_consent,
                 });
         let token_number = self
@@ -1076,6 +1096,7 @@ impl PublicPluginManager {
                 icon,
                 previous_config,
                 previous_declared_https_hosts,
+                previous_declared_credentials,
                 requires_network_consent,
             },
         );
@@ -1159,13 +1180,24 @@ impl PublicPluginManager {
             }
             let current_declared_https_hosts = previous_config
                 .as_ref()
+                .filter(|config| config.installed)
                 .map(|config| self.installed_manifest(config))
                 .transpose()?
                 .and_then(|manifest| manifest.network)
                 .map_or_else(BTreeSet::new, |network| {
                     network.https_hosts.into_iter().collect()
                 });
-            if current_declared_https_hosts != pending.previous_declared_https_hosts {
+            let current_declared_credentials = previous_config
+                .as_ref()
+                .filter(|config| config.installed)
+                .map(|config| self.installed_manifest(config))
+                .transpose()?
+                .as_ref()
+                .map(super::state::manifest_credentials)
+                .unwrap_or_default();
+            if current_declared_credentials != pending.previous_declared_credentials
+                || current_declared_https_hosts != pending.previous_declared_https_hosts
+            {
                 return Err(PublicPluginManagementError::Unavailable);
             }
             let previous_network_granted = previous_config.as_ref().is_some_and(|config| {
@@ -1174,6 +1206,7 @@ impl PublicPluginManager {
                     .contains(&PublicPermission::NetworkHttps)
                     && !pending.previous_declared_https_hosts.is_empty()
                     && config.network_https_hosts_grant == pending.previous_declared_https_hosts
+                    && config.network_credentials_grant == pending.previous_declared_credentials
             });
             let mut effective_permission_grants = declared;
             if pending.prepared.manifest.network.is_some()
@@ -1694,6 +1727,15 @@ impl PublicPluginManager {
         plugin_id: &str,
         granted: bool,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        self.set_network_access_with_revision(plugin_id, granted, None)
+    }
+
+    pub(crate) fn set_network_access_with_revision(
+        &self,
+        plugin_id: &str,
+        granted: bool,
+        expected_inventory_revision: Option<&str>,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
         let (bundle, reservation, prepared_state) = {
             let _mutation = self.lock_mutation()?;
             let config = self
@@ -1702,6 +1744,14 @@ impl PublicPluginManager {
                 .filter(|config| config.installed)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             let manifest = self.installed_manifest(&config)?;
+            let credentials = super::state::manifest_credentials(&manifest);
+            if granted
+                && !credentials.is_empty()
+                && expected_inventory_revision
+                    != Some(self.state.inventory_revision()?.to_string().as_str())
+            {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
             let declared_hosts = manifest
                 .network
                 .ok_or(PublicPluginManagementError::PermissionDenied)?
@@ -1711,15 +1761,19 @@ impl PublicPluginManager {
             let currently_granted = config
                 .permission_grants
                 .contains(&PublicPermission::NetworkHttps)
-                && config.network_https_hosts_grant == declared_hosts;
+                && config.network_https_hosts_grant == declared_hosts
+                && config.network_credentials_grant == credentials;
             if currently_granted == granted {
                 return Ok(mutation_from_config(&config));
             }
             let bundle = self.bundles.bundle(plugin_id)?;
             let reservation = self.bundles.reserve(plugin_id)?;
-            let prepared_state =
-                self.state
-                    .prepare_set_network_access(plugin_id, declared_hosts, granted)?;
+            let prepared_state = self.state.prepare_set_network_access_with_credentials(
+                plugin_id,
+                declared_hosts,
+                credentials,
+                granted,
+            )?;
             (bundle, reservation, prepared_state)
         };
         self.make_state_durable(&reservation, &prepared_state)?;
@@ -2157,6 +2211,7 @@ impl PublicPluginManager {
     }
 
     pub(crate) fn inventory(&self) -> Result<PublicPluginInventory, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
         let configs = self.state.configs()?;
         let active = self
             .bundles
@@ -2165,11 +2220,7 @@ impl PublicPluginManager {
             .map(|bundle| (bundle.config.plugin_id.clone(), bundle))
             .collect::<HashMap<_, _>>();
         let data = self.lock_data()?;
-        let revision = configs
-            .iter()
-            .map(|config| config.inventory_revision)
-            .max()
-            .unwrap_or(0);
+        let revision = self.state.inventory_revision()?;
         let mut items = Vec::new();
         for stored_config in configs.into_iter().filter(|config| config.installed) {
             let active_bundle = active.get(&stored_config.plugin_id);
@@ -2241,6 +2292,7 @@ impl PublicPluginManager {
                 network: snapshot.manifest.network.as_ref().map(|network| {
                     PublicPluginInventoryNetwork {
                         https_hosts: network.https_hosts.clone(),
+                        credentials: super::state::manifest_credentials(&snapshot.manifest),
                     }
                 }),
             });
@@ -3763,13 +3815,18 @@ fn network_authorization_matches(
                 .contains(&PublicPermission::NetworkHttps) =>
         {
             config.network_https_hosts_grant == declared_hosts
+                && config.network_credentials_grant == super::state::manifest_credentials(manifest)
         }
-        Some(_) => config.network_https_hosts_grant.is_empty(),
+        Some(_) => {
+            config.network_https_hosts_grant.is_empty()
+                && config.network_credentials_grant.is_empty()
+        }
         None => {
             !config
                 .permission_grants
                 .contains(&PublicPermission::NetworkHttps)
                 && config.network_https_hosts_grant.is_empty()
+                && config.network_credentials_grant.is_empty()
         }
     }
 }
@@ -3802,7 +3859,10 @@ fn network_authority_snapshot(
         admission_epoch,
         grant.https_hosts,
     )
-    .map(Some)
+    .map(|mut snapshot| {
+        snapshot.credentials = grant.credentials;
+        Some(snapshot)
+    })
     .map_err(|_| PublicPluginManagementError::Unavailable)
 }
 
@@ -4689,6 +4749,8 @@ mod tests {
         assert_eq!(
             cancelled.network,
             Some(PublicPluginPrepareNetwork {
+                credentials: vec![],
+                added_credential_ids: vec![],
                 https_hosts: vec!["api.example.com".into(), "auth.example.com".into()],
                 added_https_hosts: vec!["api.example.com".into(), "auth.example.com".into()],
                 requires_network_consent: true,
@@ -4742,6 +4804,8 @@ mod tests {
         assert_eq!(
             narrowed.network,
             Some(PublicPluginPrepareNetwork {
+                credentials: vec![],
+                added_credential_ids: vec![],
                 https_hosts: vec!["api.example.com".into()],
                 added_https_hosts: Vec::new(),
                 requires_network_consent: false,
@@ -4777,6 +4841,7 @@ mod tests {
         assert_eq!(
             inventory.items[0].network,
             Some(PublicPluginInventoryNetwork {
+                credentials: vec![],
                 https_hosts: vec!["api.example.com".into()]
             })
         );
@@ -7608,5 +7673,285 @@ mod tests {
             ),
             Err(WindowStorageError::InvalidOperation)
         );
+    }
+
+    fn credential_manager(dir: &TestDir) -> PublicPluginManager {
+        PublicPluginManager::load_with_timer_dependencies(
+            dir.path(),
+            PublicPluginHost {
+                version: [0, 4, 0],
+                ..PublicPluginHost::current(PublicPlatform::Windows)
+            },
+            ["find".into(), "math".into()],
+            Arc::new(MessageCenterService::load(dir.path())),
+            Arc::new(TestClock::default()),
+            Arc::new(TestPublisher::successful()),
+        )
+        .unwrap()
+    }
+
+    fn write_credential_package(root: &Path, version: &str, credentials: Value) {
+        write_network_package(root, version, &["api.example.com", "auth.example.com"]);
+        let path = root.join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["minimumHostVersion"] = json!("0.4.0");
+        manifest["settings"] = json!([
+            {"key":"token", "label":"Token", "type":"secret"},
+            {"key":"other", "label":"Other", "type":"secret"}
+        ]);
+        if credentials != Value::Null {
+            manifest["network"]["credentials"] = credentials;
+        }
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn credential_install_consent_revision_and_unchanged_upgrade_preserve_revocation() {
+        let dir = TestDir::new("credential-consent");
+        let manager = credential_manager(&dir);
+        let now = Instant::now();
+        let credentials = json!([{"id":"service", "settingKey":"token", "host":"api.example.com", "type":"bearer"}]);
+        write_credential_package(&dir.source(), "1.0.0", credentials.clone());
+        let cancelled = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert_eq!(
+            cancelled.network.as_ref().unwrap().added_credential_ids,
+            ["service"]
+        );
+        manager.cancel("main", &cancelled.token, now).unwrap();
+        assert!(manager.inventory().unwrap().items.is_empty());
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let inventory = manager.inventory().unwrap();
+        assert_eq!(
+            inventory.items[0].network.as_ref().unwrap().credentials[0].setting_key,
+            "token"
+        );
+        // Revision is mandatory even for an already-granted no-op.
+        assert!(manager
+            .set_network_access("com.example.network", true)
+            .is_err());
+        manager
+            .set_network_access("com.example.network", false)
+            .unwrap();
+        assert!(manager
+            .set_network_access_with_revision(
+                "com.example.network",
+                true,
+                Some(&inventory.revision)
+            )
+            .is_err());
+        let revision = manager.inventory().unwrap().revision;
+        manager
+            .set_network_access_with_revision("com.example.network", true, Some(&revision))
+            .unwrap();
+        manager
+            .set_network_access("com.example.network", false)
+            .unwrap();
+        write_credential_package(&dir.source(), "1.1.0", credentials);
+        let unchanged = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert!(!unchanged.network.as_ref().unwrap().requires_network_consent);
+        manager
+            .commit_with_readiness(
+                "main",
+                &unchanged.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let config = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(config.network_credentials_grant.is_empty());
+        assert!(config.network_https_hosts_grant.is_empty());
+        let revision = manager.inventory().unwrap().revision;
+        manager
+            .set_network_access_with_revision("com.example.network", true, Some(&revision))
+            .unwrap();
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap()
+                .network_credentials_grant
+                .len(),
+            1
+        );
+        manager.uninstall("com.example.network", true).unwrap();
+        let reinstalled = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert!(!reinstalled.is_update);
+        assert_eq!(
+            reinstalled.network.as_ref().unwrap().added_credential_ids,
+            ["service"]
+        );
+        manager
+            .commit_with_readiness(
+                "main",
+                &reinstalled.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap()
+                .network_credentials_grant
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn credential_updates_compare_full_tuples_and_current_declarations_and_bind_previous_config() {
+        for change in ["settingKey", "host", "id", "reorder", "remove"] {
+            let dir = TestDir::new(&format!("credential-update-{change}"));
+            let manager = credential_manager(&dir);
+            let now = Instant::now();
+            let initial = json!([
+                {"id":"a", "settingKey":"token", "host":"api.example.com", "type":"bearer"},
+                {"id":"b", "settingKey":"token", "host":"api.example.com", "type":"bearer"}
+            ]);
+            write_credential_package(&dir.source(), "1.0.0", initial.clone());
+            let first = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &first.token,
+                    BTreeSet::from([PublicPermission::NetworkHttps]),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+            let mut next = initial.clone();
+            match change {
+                "settingKey" => next[0]["settingKey"] = json!("other"),
+                "host" => next[0]["host"] = json!("auth.example.com"),
+                "id" => next[0]["id"] = json!("c"),
+                "reorder" => next.as_array_mut().unwrap().reverse(),
+                "remove" => {
+                    next.as_array_mut().unwrap().remove(0);
+                }
+                _ => unreachable!(),
+            }
+            write_credential_package(&dir.source(), "1.1.0", next);
+            let update = manager.prepare("main", source(&dir.source()), now).unwrap();
+            let network = update.network.as_ref().unwrap();
+            assert_eq!(
+                network.requires_network_consent,
+                !matches!(change, "reorder" | "remove")
+            );
+            assert_eq!(
+                network.added_credential_ids.len(),
+                usize::from(!matches!(change, "reorder" | "remove"))
+            );
+            if change == "remove" {
+                manager
+                    .commit_with_readiness(
+                        "main",
+                        &update.token,
+                        BTreeSet::from([PublicPermission::NetworkHttps]),
+                        now,
+                        |_| true,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    manager
+                        .state
+                        .config("com.example.network")
+                        .unwrap()
+                        .unwrap()
+                        .network_credentials_grant
+                        .len(),
+                    1
+                );
+                write_credential_package(&dir.source(), "1.2.0", initial);
+                let readded = manager.prepare("main", source(&dir.source()), now).unwrap();
+                assert_eq!(
+                    readded.network.as_ref().unwrap().added_credential_ids,
+                    ["a"]
+                );
+                manager.cancel("main", &readded.token, now).unwrap();
+            } else {
+                manager
+                    .set_network_access("com.example.network", false)
+                    .unwrap();
+                assert!(matches!(
+                    manager.commit_with_readiness(
+                        "main",
+                        &update.token,
+                        BTreeSet::from([PublicPermission::NetworkHttps]),
+                        now,
+                        |_| true
+                    ),
+                    Err(PublicPluginManagementError::Unavailable)
+                ));
+                assert_eq!(
+                    manager
+                        .state
+                        .config("com.example.network")
+                        .unwrap()
+                        .unwrap()
+                        .version,
+                    "1.0.0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn credential_manifest_semantic_mismatch_on_restart_is_durably_revoked() {
+        let dir = TestDir::new("credential-semantic-restart");
+        write_credential_package(
+            &dir.source(),
+            "1.0.0",
+            json!([
+                {"id":"service", "settingKey":"token", "host":"api.example.com", "type":"bearer"}
+            ]),
+        );
+        let manager = credential_manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        drop(manager);
+        let path = dir
+            .path()
+            .join("public-plugins/state/com.example.network/state.json");
+        let mut document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["networkCredentialsGrant"][0]["settingKey"] = json!("other");
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let restarted = credential_manager(&dir);
+        let config = restarted
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(config.network_credentials_grant.is_empty());
+        assert!(config.network_https_hosts_grant.is_empty());
+        let disk: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(disk.get("networkCredentialsGrant").is_none());
+        assert_eq!(disk["permissionGrants"], json!([]));
     }
 }

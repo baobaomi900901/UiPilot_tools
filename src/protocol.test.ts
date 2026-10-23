@@ -111,7 +111,7 @@ describe('public plugin timer protocol', () => {
       fault: null,
       generation: 1,
       iconUrl: null,
-      network: { httpsHosts: ['api.example.com', 'auth.example.com'] },
+      network: { httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [] },
       permissions: [{ permission: 'network.https', supported: true, granted: true }],
       settings: [],
     }
@@ -120,13 +120,13 @@ describe('public plugin timer protocol', () => {
       items: [item],
     })
     for (const network of [
-      { httpsHosts: ['auth.example.com', 'api.example.com'] },
-      { httpsHosts: ['api.example.com', 'api.example.com'] },
-      { httpsHosts: ['https://api.example.com'] },
-      { httpsHosts: ['127.0.0.1'] },
-      { httpsHosts: ['xn--bcher-kva.example'] },
-      { httpsHosts: ['api.example.com'], extra: true },
-      { httpsHosts: [] },
+      { httpsHosts: ['auth.example.com', 'api.example.com'], credentials: [] },
+      { httpsHosts: ['api.example.com', 'api.example.com'], credentials: [] },
+      { httpsHosts: ['https://api.example.com'], credentials: [] },
+      { httpsHosts: ['127.0.0.1'], credentials: [] },
+      { httpsHosts: ['xn--bcher-kva.example'], credentials: [] },
+      { httpsHosts: ['api.example.com'], credentials: [], extra: true },
+      { httpsHosts: [], credentials: [] },
     ]) {
       expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, network }] })).toBeNull()
     }
@@ -141,23 +141,34 @@ describe('public plugin timer protocol', () => {
       sourceVerified: false,
       iconUrl: null,
       network: {
-        httpsHosts: ['api.example.com', 'auth.example.com'],
-        addedHttpsHosts: ['auth.example.com'],
+        httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [],
+        addedHttpsHosts: ['auth.example.com'], addedCredentialIds: [],
         requiresNetworkConsent: true,
       },
     }
     expect(parsePublicPluginPrepareSummary(prepared)).toEqual(prepared)
+    const credential = { id: 'service', settingKey: 'token', host: 'api.example.com', type: 'bearer' }
+    const credentialNetwork = { ...prepared.network, addedHttpsHosts: [], credentials: [credential], addedCredentialIds: ['service'] }
+    expect(parsePublicPluginPrepareSummary({ ...prepared, network: credentialNetwork })).not.toBeNull()
+    for (const credentials of [null, 'bad', [credential, credential], [{ ...credential, type: 'oauth' }],
+      [{ ...credential, host: 'other.example.com' }], [{ ...credential, secret: 'forbidden' }], [{ ...credential, settingKey: '' }]]) {
+      expect(parsePublicPluginPrepareSummary({ ...prepared, network: { ...credentialNetwork, credentials } })).toBeNull()
+    }
+    expect(parsePublicPluginPrepareSummary({ ...prepared, network: { ...credentialNetwork, addedCredentialIds: ['unknown'] } })).toBeNull()
+    expect(parsePublicPluginPrepareSummary({ ...prepared, isUpdate: false, network: { ...credentialNetwork,
+      addedHttpsHosts: credentialNetwork.httpsHosts, addedCredentialIds: [] } })).toBeNull()
+
     expect(parsePublicPluginPrepareSummary({ ...prepared, permissions: [], network: null })).not.toBeNull()
     expect(parsePublicPluginPrepareSummary({
       ...prepared,
       isUpdate: false,
-      network: { ...prepared.network, addedHttpsHosts: ['auth.example.com'] },
+      network: { ...prepared.network, addedHttpsHosts: ['auth.example.com'], addedCredentialIds: [] },
     })).toBeNull()
     for (const network of [
-      { ...prepared.network, addedHttpsHosts: ['other.example.com'] },
-      { ...prepared.network, addedHttpsHosts: [], requiresNetworkConsent: true },
+      { ...prepared.network, addedHttpsHosts: ['other.example.com'], addedCredentialIds: [] },
+      { ...prepared.network, addedHttpsHosts: [], addedCredentialIds: [], requiresNetworkConsent: true },
       { ...prepared.network, requiresNetworkConsent: false },
-      { ...prepared.network, httpsHosts: ['auth.example.com', 'api.example.com'] },
+      { ...prepared.network, httpsHosts: ['auth.example.com', 'api.example.com'], credentials: [] },
       { ...prepared.network, extra: true },
     ]) {
       expect(parsePublicPluginPrepareSummary({ ...prepared, network })).toBeNull()
