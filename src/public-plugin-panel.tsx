@@ -1,22 +1,26 @@
-import { Button, Input, Popconfirm, Spin, Switch, Tooltip } from 'antd'
+import { Button, Input, Modal, Popconfirm, Spin, Switch, Tooltip } from 'antd'
 import { FolderOpen, RefreshCw, Undo2, Upload } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { parseU64Decimal } from './protocol'
 import { PluginIcon } from './plugin-icon'
 import type {
   LauncherClient,
   PublicPermission,
   PublicPluginInventory,
+  PluginNetworkCredential,
+  PublicSettingView,
   PublicPluginInventoryItem,
   PublicPluginPrepareSummary,
 } from './protocol'
 
 interface PublicPluginPanelProps {
   client: LauncherClient
-  onOpenDetails?: (plugin: PublicPluginInventoryItem) => void
+  onOpenDetails?: (plugin: PublicPluginInventoryItem, revision: string) => void
 }
 
 const CLEANUP_PENDING_MESSAGE = '插件已卸载，数据清理将在下次启动时重试'
+const CREDENTIAL_NOTICE = '此凭据会发送给该服务；服务响应可能包含其回显。'
 const PLUGIN_FILTER_DEBOUNCE_MS = 150
 const CLIPBOARD_HISTORY_NOTICE = '授权后，UiPilot 运行、插件启用且权限有效期间，会在本机记录该插件可用的剪贴板历史摘要；不会自动识别密码或敏感来源。'
 
@@ -164,18 +168,104 @@ function permissionText({ permission, supported, granted }: PublicPluginInventor
   return `${permissionSummary(permission)} · ${supported ? (granted ? '已授权' : '未授权') : '不支持'}`
 }
 
-export function PublicPluginDetail({
-  client,
-  plugin,
-  reload = async () => undefined,
-}: {
+function CredentialBindings({ credentials, settings = [], addedIds = [] }: {
+  credentials: readonly PluginNetworkCredential[]
+  settings?: readonly PublicSettingView[]
+  addedIds?: readonly string[]
+}) {
+  if (!credentials.length) return null
+  return (
+    <div className="public-credential-bindings">
+      <ul className="public-plugin-detail-items">
+        {credentials.map((credential) => {
+          const setting = settings.find(({ definition }) => definition.type === 'secret' && definition.key === credential.settingKey)
+          return (
+            <li key={credential.id}>
+              <code>{credential.id}</code> · {setting ? `${setting.definition.label} · ` : ''}<code>{credential.settingKey}</code>
+              {' → '}<code>{credential.host}</code> · Bearer
+              {addedIds.includes(credential.id) ? <span className="public-network-added"> 新增或变更</span> : null}
+            </li>
+          )
+        })}
+      </ul>
+      <p className="public-clipboard-history-notice">{CREDENTIAL_NOTICE}</p>
+    </div>
+  )
+}
+
+export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
-  reload?: () => Promise<void>
+  inventoryRevision: string
+  reload: () => Promise<void>
 }) {
   const [busy, setBusy] = useState(false)
+  const operationPending = useRef(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [name, setName] = useState(plugin.effectiveName)
+  const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
+  const [networkConsent, setNetworkConsent] = useState<{ plugin: PublicPluginInventoryItem; revision: string } | null>(null)
+  const [clearKey, setClearKey] = useState<string | null>(null)
+  const networkPermission = plugin.permissions.find(({ permission }) => permission === 'network.https')
+  const secretSettings = plugin.settings.filter(({ definition }) => definition.type === 'secret')
+
+  const mutate = async (operation: () => Promise<void>, success: () => void, failure: string) => {
+    if (operationPending.current) return
+    operationPending.current = true
+    setBusy(true)
+    setError('')
+    setNotice('')
+    let committed = false
+    try {
+      await operation()
+      committed = true
+      success()
+    } catch {
+      setError(failure)
+    }
+    try {
+      await reload()
+    } catch {
+      setError(`${committed ? '操作已完成。' : failure} 无法刷新当前状态，请返回列表刷新后核对。`)
+    } finally {
+      operationPending.current = false
+      setBusy(false)
+    }
+  }
+
+  const saveSecret = (key: string, value: string | null) => {
+    if (value !== null && !value.trim()) return
+    setClearKey(null)
+    void mutate(
+      () => client.savePublicPluginSettings({ input: { pluginId: plugin.pluginId, settings: {}, secrets: { [key]: value } } }),
+      () => {
+        setSecretDrafts((drafts) => ({ ...drafts, [key]: '' }))
+        setNotice(value === null ? '已清除' : '已保存')
+      },
+      '保存未完成，落盘值可能已改变；已提交的更改不会回滚。本次操作失败后网络可能关闭，后续恢复可能使用实际落盘值；旧请求不会恢复。',
+    )
+  }
+
+  const setNetworkAccess = (granted: boolean) => {
+    const consent = networkConsent
+    setNetworkConsent(null)
+    if (granted && !consent) return
+    const expectedInventoryRevision = consent ? parseU64Decimal(consent.revision) : null
+    if (granted && !expectedInventoryRevision) {
+      setError('无法确认当前插件状态，请返回列表刷新后重试。')
+      return
+    }
+    void mutate(
+      () => client.setPublicPluginNetworkAccess({
+        pluginId: plugin.pluginId,
+        granted,
+        ...(granted ? { expectedInventoryRevision: expectedInventoryRevision! } : {}),
+      }),
+      () => setNotice(granted ? '网络访问已开启' : '网络访问已关闭'),
+      '无法更改网络授权。已刷新当前状态；开启前请重新核对绑定并确认，不会自动重试。',
+    )
+  }
 
   const saveName = async (nameOverride: string | null) => {
     if (busy) return
@@ -195,7 +285,7 @@ export function PublicPluginDetail({
   }
 
   return (
-    <section className="public-plugin-detail" aria-labelledby="public-plugin-detail-title">
+    <section className="public-plugin-detail" aria-labelledby="public-plugin-detail-title" aria-busy={busy}>
       <dl className="public-plugin-detail-list">
         <dt className="public-detail-name-term">启动键</dt>
         <dd className="public-detail-name-value">
@@ -216,7 +306,6 @@ export function PublicPluginDetail({
               />
             </Tooltip>
           </div>
-          {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
         </dd>
         <dt>版本号</dt>
         <dd>{plugin.version}</dd>
@@ -245,9 +334,66 @@ export function PublicPluginDetail({
             </ul>
           ) : '无'}
         </dd>
+        {networkPermission && plugin.network ? (
+          <>
+            <dt>网络访问</dt>
+            <dd>
+              <div className="public-network-access-header">
+                <Switch aria-label="网络访问" checked={networkPermission.granted} disabled={busy || !networkPermission.supported}
+                  onChange={(granted) => granted ? setNetworkConsent({ plugin, revision: inventoryRevision }) : setNetworkAccess(false)} />
+                <span>{networkPermission.supported ? (networkPermission.granted ? '已授权' : '未授权') : '不支持'}</span>
+              </div>
+              <CredentialBindings credentials={plugin.network.credentials} settings={plugin.settings} />
+            </dd>
+          </>
+        ) : null}
+        {secretSettings.length ? (
+          <>
+            <dt>凭据设置</dt>
+            <dd>
+              <p className="public-secret-help">仅显示配置状态，不代表可用于 Bearer 请求。留空不会删除已存凭据。</p>
+              <div className="public-secret-settings">
+                {secretSettings.map(({ definition, secretConfigured }) => {
+                  const statusId = `public-secret-${definition.key}-status`
+                  return (
+                    <form key={definition.key} className="public-secret-setting" onSubmit={(event) => { event.preventDefault(); saveSecret(definition.key, secretDrafts[definition.key] ?? '') }}>
+                      <label htmlFor={`public-secret-${definition.key}`}>{definition.label} <code>{definition.key}</code></label>
+                      <span id={statusId} className="public-secret-status">{secretConfigured ? '已配置' : '未配置'}</span>
+                      <Input id={`public-secret-${definition.key}`} type="password" aria-label={definition.label} aria-describedby={statusId}
+                        placeholder="输入新凭据" autoComplete="new-password" readOnly={busy}
+                        value={secretDrafts[definition.key] ?? ''}
+                        onChange={(event) => setSecretDrafts((drafts) => ({ ...drafts, [definition.key]: event.target.value }))} />
+                      <div className="public-secret-actions">
+                        <Button htmlType="submit" type="primary" aria-label={`保存 ${definition.label}`} disabled={!(secretDrafts[definition.key] ?? '').trim()} aria-disabled={busy}>保存</Button>
+                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy} onClick={() => setClearKey(definition.key)}>清除</Button>
+                      </div>
+                    </form>
+                  )
+                })}
+              </div>
+            </dd>
+          </>
+        ) : null}
         <dt>插件所在目录</dt>
         <dd>暂未提供插件目录</dd>
       </dl>
+      <div className="public-detail-feedback" aria-live="polite">
+        {busy ? <span role="status">正在保存…</span> : null}
+        {notice ? <span role="status">{notice}</span> : null}
+        {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
+      </div>
+      <Modal className="public-plugin-confirmation" destroyOnHidden title="开启网络访问" open={networkConsent !== null} onCancel={() => setNetworkConsent(null)}
+        onOk={() => setNetworkAccess(true)} okText="确认开启" cancelText="取消"
+        okButtonProps={{ 'aria-label': '确认开启网络访问', disabled: busy }}>
+        <p>确认允许 UiPilot Host 访问以下 HTTPS 主机和完整凭据绑定：</p>
+        <ul className="public-plugin-detail-items">{networkConsent?.plugin.network?.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}</ul>
+        <CredentialBindings credentials={networkConsent?.plugin.network?.credentials ?? []} settings={networkConsent?.plugin.settings} />
+      </Modal>
+      <Modal className="public-plugin-confirmation" destroyOnHidden title="清除凭据" open={clearKey !== null} onCancel={() => setClearKey(null)}
+        onOk={() => { if (clearKey) saveSecret(clearKey, null) }} okText="清除" cancelText="取消"
+        okButtonProps={{ danger: true, disabled: busy, 'aria-label': `确认清除 ${secretSettings.find(({ definition }) => definition.key === clearKey)?.definition.label ?? ''}` }}>
+        <p>清除后，需要重新配置此凭据才能使用相关请求。</p>
+      </Modal>
     </section>
   )
 }
@@ -400,6 +546,7 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
                   </li>
                 ))}
               </ul>
+              <CredentialBindings credentials={prepared.network.credentials} addedIds={prepared.network.addedCredentialIds} />
               <p>仅允许由 UiPilot Host 代理访问以上 HTTPS 主机，不会开放插件 WebView 的通用网络访问。</p>
             </div>
           ) : null}
@@ -419,7 +566,7 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
           plugin={plugin}
           reload={reload}
           onCleanupPending={handleCleanupPending}
-          onDetails={() => onOpenDetails?.(plugin)}
+          onDetails={() => onOpenDetails?.(plugin, inventory!.revision)}
         />
       ))}
     </section>

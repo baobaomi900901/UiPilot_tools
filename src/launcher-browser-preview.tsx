@@ -7,6 +7,7 @@ import {
   type LauncherClient,
   type PluginInventorySnapshot,
   type PublicPluginInventory,
+  type PublicPluginInventoryItem,
   type QuicklinkView,
   type ResultItem,
   type SearchResponse,
@@ -41,8 +42,8 @@ const previewQuicklinks: QuicklinkView[] = [
     updatedAt: '2026-08-31T00:00:00Z',
   },
 ]
-const previewPublicPlugins: PublicPluginInventory = {
-  revision: 'preview-public-plugins',
+let previewPublicPlugins: PublicPluginInventory = {
+  revision: '1',
   items: [
     {
       pluginId: 'com.uipilot.notes',
@@ -102,8 +103,32 @@ const previewPublicPlugins: PublicPluginInventory = {
     },
   ],
 }
+// Synthetic metadata only: preview saves retain configuration flags, never entered values.
+const credentialPreviewPlugin: PublicPluginInventoryItem = {
+  pluginId: 'com.uipilot.credential-demo', name: 'Credential Demo',
+  description: '合成凭据设置与网络授权预览，不连接真实服务。', version: '0.1.0', source: 'localPackage',
+  defaultName: 'credential-demo', effectiveName: 'credential-demo', enabled: true,
+  fault: null, generation: 1, iconUrl: null,
+  network: { httpsHosts: ['api.example.com'], credentials: [
+    { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' },
+  ] },
+  permissions: [{ permission: 'network.https', supported: true, granted: false }],
+  settings: [
+    { definition: { type: 'secret', key: 'api-token', label: 'API Token' }, secretConfigured: false },
+    { definition: { type: 'secret', key: 'backup-token', label: 'Backup Token' }, secretConfigured: true },
+  ],
+}
+previewPublicPlugins = { ...previewPublicPlugins, items: [...previewPublicPlugins.items, credentialPreviewPlugin] }
+let previewScenarioPending = true
+function updatePreviewPlugin(pluginId: string, update: (plugin: PublicPluginInventoryItem) => PublicPluginInventoryItem) {
+  previewPublicPlugins = {
+    revision: String(BigInt(previewPublicPlugins.revision) + 1n),
+    items: previewPublicPlugins.items.map((plugin) => plugin.pluginId === pluginId ? update(plugin) : plugin),
+  }
+}
+
 const previewLegacyPlugins: PluginInventorySnapshot = {
-  revision: 'preview-legacy-plugins',
+  revision: '1',
   items: [
     {
       key: 'preview-installed-notes',
@@ -286,16 +311,49 @@ const client: LauncherClient = {
   commitPluginWindowTransfer: async () => undefined,
   listPublicPlugins: async () => previewPublicPlugins,
   selectPublicPluginArchive: async () => null,
-  selectPublicPluginDirectory: async () => null,
-  preparePublicPlugin: async () => { throw new Error('Preview does not install plugins') },
-  commitPublicPlugin: async () => undefined,
+  selectPublicPluginDirectory: async () => 'synthetic-credential-preview',
+  preparePublicPlugin: async () => ({
+    token: 'synthetic-credential-preview', pluginId: credentialPreviewPlugin.pluginId,
+    name: 'Credential Demo', version: '0.2.0', permissions: ['network.https'], isUpdate: true,
+    sourceVerified: false, iconUrl: null,
+    network: { httpsHosts: ['api.example.com'], addedHttpsHosts: [],
+      credentials: [{ id: 'service-token', settingKey: 'candidate-token', host: 'api.example.com', type: 'bearer' }],
+      addedCredentialIds: ['service-token'], requiresNetworkConsent: true },
+  }),
+  commitPublicPlugin: async () => {
+    updatePreviewPlugin(credentialPreviewPlugin.pluginId, (plugin) => ({
+      ...plugin, version: '0.2.0', network: { httpsHosts: ['api.example.com'], credentials: [
+        { id: 'service-token', settingKey: 'candidate-token', host: 'api.example.com', type: 'bearer' },
+      ] }, permissions: [{ permission: 'network.https', supported: true, granted: true }],
+      settings: [{ definition: { type: 'secret', key: 'candidate-token', label: 'Candidate Token' }, secretConfigured: false }],
+    }))
+  },
   cancelPublicPlugin: async () => undefined,
-  setPublicPluginEnabled: async () => undefined,
-  setPublicPluginNetworkAccess: async () => undefined,
+  setPublicPluginEnabled: async ({ pluginId, enabled }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, enabled })) },
+  setPublicPluginNetworkAccess: async ({ pluginId, granted, expectedInventoryRevision }) => {
+    if (granted && previewScenarioPending && previewParameters.get('credentialScenario') === 'stale') {
+      previewScenarioPending = false
+      updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, description: '合成并发更新：请重新核对绑定后授权。' }))
+    }
+    if (granted && expectedInventoryRevision !== previewPublicPlugins.revision) throw new Error('Synthetic stale inventory')
+    updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin,
+      permissions: plugin.permissions.map((permission) => permission.permission === 'network.https' ? { ...permission, granted } : permission),
+    }))
+  },
   setPublicPluginFavorite: async () => undefined,
   setBuiltinFeatureFavorite: async () => undefined,
-  setPublicPluginEffectiveName: async () => undefined,
-  savePublicPluginSettings: async () => undefined,
+  setPublicPluginEffectiveName: async ({ pluginId, nameOverride }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, effectiveName: nameOverride ?? plugin.defaultName })) },
+  savePublicPluginSettings: async ({ input }) => {
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
+    updatePreviewPlugin(input.pluginId, (plugin) => ({ ...plugin, settings: plugin.settings.map((setting) =>
+      Object.prototype.hasOwnProperty.call(input.secrets, setting.definition.key)
+        ? { ...setting, secretConfigured: input.secrets[setting.definition.key] !== null } : setting),
+    }))
+    if (previewScenarioPending && previewParameters.get('credentialScenario') === 'save-error') {
+      previewScenarioPending = false
+      throw new Error('Synthetic partial save failure')
+    }
+  },
   uninstallPublicPlugin: async () => undefined,
   listPlugins: async () => previewLegacyPlugins,
   installPlugin: async () => ({ revision: '1' }),

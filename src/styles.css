@@ -2738,3 +2738,81 @@ label,
     transition: none;
   }
 }
+
+.public-credential-bindings {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.public-secret-settings {
+  display: grid;
+  gap: 16px;
+  max-width: 420px;
+}
+
+.public-secret-setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.public-secret-setting label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.public-secret-setting label code,
+.public-secret-status,
+.public-secret-help {
+  color: var(--uipilot-ui-muted-foreground);
+  font-size: 12px;
+}
+
+.public-secret-help {
+  margin: 0 0 12px;
+}
+
+.public-secret-setting .ant-input {
+  grid-column: 1 / -1;
+  background: var(--uipilot-ui-surface-elevated);
+}
+
+.public-secret-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 8px;
+}
+
+.public-detail-feedback {
+  min-height: 24px;
+  padding-block: 8px;
+  color: var(--uipilot-ui-icon-green);
+  font-size: 12px;
+}
+
+.public-detail-feedback [role='alert'] {
+  color: var(--uipilot-ui-destructive);
+}
+
+.public-plugin-confirmation .ant-modal-container {
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: 10px;
+  background: var(--uipilot-ui-surface);
+  box-shadow: none;
+}
+
+.public-plugin-confirmation .ant-modal-header {
+  background: transparent;
+}
+
+.public-plugin-confirmation .ant-modal-title {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.public-secret-actions [aria-disabled='true'] {
+  opacity: 0.6;
+  cursor: wait;
+}

@@ -437,7 +437,8 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
-  const [selectedPublicPlugin, setSelectedPublicPlugin] = useState<PublicPluginInventoryItem | null>(null)
+  const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string } | null>(null)
+  const selectedPublicPlugin = publicPluginDetail?.plugin ?? null
   const [quicklinksStatus, setQuicklinksStatus] = useState<QuicklinksUiStatus | null>(null)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
   const queryRef = useRef<HTMLInputElement | null>(null)
@@ -478,13 +479,14 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }, [colorScheme])
 
   useEffect(() => {
-    if (snapshot.view !== 'settings') setSelectedPublicPlugin(null)
+    if (snapshot.view !== 'settings') setPublicPluginDetail(null)
   }, [snapshot.view])
 
+  const selectedPublicPluginId = selectedPublicPlugin?.pluginId
   useLayoutEffect(() => {
-    if (snapshot.view !== 'settings' || !selectedPublicPlugin) return
+    if (snapshot.view !== 'settings' || !selectedPublicPluginId) return
     publicPluginDetailRef.current?.focus()
-  }, [selectedPublicPlugin, snapshot.view])
+  }, [selectedPublicPluginId, snapshot.view])
 
   useLayoutEffect(() => {
     if (!restoreSettingsTabFocus.current) return
@@ -1955,12 +1957,12 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
   const closePublicPluginDetail = () => {
     restoreSettingsTabFocus.current = true
-    setSelectedPublicPlugin(null)
+    setPublicPluginDetail(null)
   }
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} onOpenDetails={setSelectedPublicPlugin} />
+        <PublicPluginPanel client={core.client} onOpenDetails={(plugin, revision) => setPublicPluginDetail({ plugin, revision })} />
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2095,7 +2097,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       aria-label={`${selectedPublicPlugin.name} 插件详情`}
       tabIndex={-1}
       onKeyDown={(event) => {
-        if (event.key !== 'Escape' || composing(event)) return
+        if (event.key !== 'Escape' || composing(event) || !event.currentTarget.contains(event.target as Node)) return
         event.preventDefault()
         closePublicPluginDetail()
       }}
@@ -2120,7 +2122,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         <div className="settings-scroll-content">
           <PublicPluginDetail
             client={core.client}
+            key={selectedPublicPlugin.pluginId}
             plugin={selectedPublicPlugin}
+            inventoryRevision={publicPluginDetail!.revision}
+            reload={async () => {
+              const inventory = await core.client.listPublicPlugins()
+              setPublicPluginDetail((current) => {
+                if (current?.plugin.pluginId !== selectedPublicPlugin.pluginId) return current
+                const plugin = inventory.items.find(({ pluginId }) => pluginId === current.plugin.pluginId)
+                return plugin ? { plugin, revision: inventory.revision } : null
+              })
+            }}
           />
         </div>
       </OverlayScrollbarsComponent>

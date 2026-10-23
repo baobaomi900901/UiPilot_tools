@@ -9042,3 +9042,200 @@ describe.skip('retired embedded file preview preference', () => {
     await mounted.unmount()
   })
 })
+
+describe('credential consent and settings', () => {
+  const credential = { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' as const }
+  const item = {
+    pluginId: 'com.example.credentials', name: 'Credentials', description: null, version: '1.0.0',
+    source: 'localPackage' as const, defaultName: 'credentials', effectiveName: 'credentials', enabled: true,
+    fault: null, generation: 1, iconUrl: null,
+    network: { httpsHosts: ['api.example.com'], credentials: [credential] },
+    permissions: [{ permission: 'network.https' as const, supported: true, granted: false }],
+    settings: [
+      { definition: { type: 'secret' as const, key: 'api-token', label: 'Current API token' }, secretConfigured: false },
+      { definition: { type: 'secret' as const, key: 'other-token', label: 'Other token' }, secretConfigured: true },
+    ],
+  }
+  async function setup(dark = false) {
+    const computedStyle = window.getComputedStyle
+    const styleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => computedStyle(element))
+    installMatchMedia(dark)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '41', items: [item] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('credentials-ui', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    const open = async () => {
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click())
+    }
+    return { ...fake, ...mounted, core, open, async cleanup() { await mounted.unmount(); core.destroy(); styleSpy.mockRestore() } }
+  }
+  const button = (label: string) => document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!
+  async function enter(input: HTMLInputElement, value: string) {
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+
+  it('shows candidate binding keys and change markers; cancel preserves the installed version', async () => {
+    const ui = await setup()
+    try {
+      vi.mocked(ui.client.selectPublicPluginDirectory).mockResolvedValue('synthetic-candidate')
+      vi.mocked(ui.client.preparePublicPlugin).mockResolvedValue({ token: 'candidate', pluginId: item.pluginId, name: item.name, version: '2.0.0', permissions: ['network.https'], isUpdate: true, sourceVerified: false, iconUrl: null,
+        network: { ...item.network, credentials: [{ ...credential, settingKey: 'candidate-token' }], addedHttpsHosts: [], addedCredentialIds: ['service-token'], requiresNetworkConsent: true } })
+      await act(async () => button('选择开发目录').click())
+      const consent = ui.host.querySelector('.public-network-consent')!
+      expect(consent.textContent).toContain('candidate-token')
+      expect(consent.textContent).toContain('service-token')
+      expect(consent.textContent).toContain('Bearer')
+      expect(consent.textContent).toContain('新增或变更')
+      expect(consent.textContent).toContain('此凭据会发送给该服务；服务响应可能包含其回显。')
+      expect(consent.textContent).not.toContain('Current API token')
+      await act(async () => button('取消安装').click())
+      expect(ui.client.commitPublicPlugin).not.toHaveBeenCalled()
+      expect(ui.host.querySelector('.public-plugin-item')?.textContent).toContain('1.0.0')
+    } finally { await ui.cleanup() }
+  })
+
+  it.each([false, true])('renders declared bindings and empty password controls with accessible configuration status, dark=%s', async (dark) => {
+    const ui = await setup(dark)
+    try {
+      await ui.open()
+      expect(ui.host.textContent).toContain('service-token')
+      expect(ui.host.textContent).toContain('Current API token')
+      expect(ui.host.textContent).toContain('api-token')
+      expect(ui.host.textContent).toContain('Bearer')
+      expect(ui.host.textContent).toContain('不代表可用于 Bearer 请求')
+      const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
+      expect(input?.type).toBe('password')
+      expect(input.value).toBe('')
+      expect(input.getAttribute('aria-describedby')).toBeTruthy()
+      expect(ui.host.textContent).not.toMatch(/\*{3}|•••/)
+      expect(button('保存 Current API token').disabled).toBe(true)
+      await enter(input, '   ')
+      expect(button('保存 Current API token').disabled).toBe(true)
+    } finally { await ui.cleanup() }
+  })
+
+  it('requires explicit network consent, passes displayed revision, refreshes stale errors without retry and disables directly', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      await act(async () => button('网络访问').click())
+      expect(ui.client.setPublicPluginNetworkAccess).not.toHaveBeenCalled()
+      expect(document.querySelector('[role="dialog"]')?.textContent).toContain('service-token')
+      vi.mocked(ui.client.setPublicPluginNetworkAccess).mockRejectedValueOnce({ code: 'staleInventory', message: 'private detail' })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, network: { ...item.network, credentials: [{ ...credential, host: 'new.example.com' }] } }] })
+      await act(async () => button('确认开启网络访问').click())
+      expect(ui.client.setPublicPluginNetworkAccess).toHaveBeenCalledExactlyOnceWith({ pluginId: item.pluginId, granted: true, expectedInventoryRevision: '41' })
+      expect(ui.host.textContent).toContain('new.example.com')
+      expect(ui.host.querySelector('[role="alert"]')).not.toBeNull()
+      expect(ui.host.textContent).not.toContain('private detail')
+      expect(document.querySelector('[role="dialog"]')).toBeNull()
+      await act(async () => button('网络访问').click())
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '43', items: [{ ...item, permissions: [{ permission: 'network.https', supported: true, granted: true }] }] })
+      await act(async () => button('确认开启网络访问').click())
+      expect(ui.client.setPublicPluginNetworkAccess).toHaveBeenLastCalledWith({ pluginId: item.pluginId, granted: true, expectedInventoryRevision: '42' })
+      await act(async () => button('网络访问').click())
+      expect(ui.client.setPublicPluginNetworkAccess).toHaveBeenLastCalledWith({ pluginId: item.pluginId, granted: false })
+      expect(document.querySelector('[role="dialog"]')).toBeNull()
+    } finally { await ui.cleanup() }
+  })
+
+  it('saves only the edited key, prevents duplicate saves, clears successful input and keeps focus on refresh', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
+      const other = ui.host.querySelector<HTMLInputElement>('input[aria-label="Other token"]')!
+      await enter(other, 'other-unsaved-draft')
+      await enter(input, 'synthetic-token')
+      const pending = deferred<void>()
+      vi.mocked(ui.client.savePublicPluginSettings).mockReturnValueOnce(pending.promise)
+      const save = button('保存 Current API token')
+      await act(async () => { save.focus(); save.click(); save.click() })
+      expect(ui.client.savePublicPluginSettings).toHaveBeenCalledExactlyOnceWith({ input: { pluginId: item.pluginId, settings: {}, secrets: { 'api-token': 'synthetic-token' } } })
+      expect(ui.host.querySelector('.public-plugin-detail')?.getAttribute('aria-busy')).toBe('true')
+      expect(input.readOnly).toBe(true)
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: true })) }] })
+      await act(async () => pending.resolve())
+      expect(input.value).toBe('')
+      expect(other.value).toBe('other-unsaved-draft')
+      expect(ui.host.textContent).toContain('已保存')
+      expect(document.activeElement).toBe(save)
+      expect(ui.host.textContent).not.toContain('synthetic-token')
+    } finally { await ui.cleanup() }
+  })
+
+  it('clears explicitly with null and refreshes partial failures without claiming rollback or permanent revocation', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      vi.mocked(ui.client.savePublicPluginSettings).mockRejectedValueOnce(new Error('private token'))
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: false })) }] })
+      await act(async () => button('清除 Other token').click())
+      expect(ui.client.savePublicPluginSettings).not.toHaveBeenCalled()
+      await act(async () => button('确认清除 Other token').click())
+      expect(ui.client.savePublicPluginSettings).toHaveBeenCalledExactlyOnceWith({ input: { pluginId: item.pluginId, settings: {}, secrets: { 'other-token': null } } })
+      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(2)
+      expect(ui.host.textContent).toContain('落盘值可能已改变')
+      expect(ui.host.textContent).toContain('后续恢复可能使用实际落盘值')
+      expect(ui.host.textContent).not.toContain('private token')
+      expect(button('清除 Other token').disabled).toBe(false)
+    } finally { await ui.cleanup() }
+  })
+  it('allows explicit cleanup when configuration is absent, and cancels keyboard consent without closing details', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      expect(button('清除 Current API token').disabled).toBe(false)
+      await act(async () => button('清除 Current API token').click())
+      await act(async () => button('确认清除 Current API token').click())
+      expect(ui.client.savePublicPluginSettings).toHaveBeenCalledExactlyOnceWith({ input: { pluginId: item.pluginId, settings: {}, secrets: { 'api-token': null } } })
+      expect(ui.host.textContent).toContain('已清除')
+      const toggle = button('网络访问')
+      await act(async () => { toggle.focus(); toggle.click() })
+      const modal = document.querySelector<HTMLElement>('.ant-modal-wrap')!
+      await act(async () => modal.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true })))
+      expect(ui.host.querySelector('.public-plugin-detail')).not.toBeNull()
+      expect(ui.client.setPublicPluginNetworkAccess).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(toggle)
+    } finally { await ui.cleanup() }
+  })
+
+  it('also sends the displayed global revision when enabling a network plugin without credentials', async () => {
+    const ui = await setup()
+    try {
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '57', items: [{ ...item, network: { ...item.network, credentials: [] } }] })
+      await act(async () => button('刷新').click())
+      await ui.open()
+      await act(async () => button('网络访问').click())
+      await act(async () => button('确认开启网络访问').click())
+      expect(ui.client.setPublicPluginNetworkAccess).toHaveBeenCalledExactlyOnceWith({ pluginId: item.pluginId, granted: true, expectedInventoryRevision: '57' })
+    } finally { await ui.cleanup() }
+  })
+
+  it('refreshes a failed password save, keeps unsaved input and does not retry', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
+      await enter(input, 'synthetic-failed-draft')
+      vi.mocked(ui.client.savePublicPluginSettings).mockRejectedValueOnce(new Error('synthetic-failed-draft'))
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: true })) }] })
+      await act(async () => input.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })))
+      expect(ui.client.savePublicPluginSettings).toHaveBeenCalledOnce()
+      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(2)
+      expect(input.value).toBe('synthetic-failed-draft')
+      expect(ui.host.textContent).not.toContain('synthetic-failed-draft')
+      expect(ui.host.textContent).not.toContain('已保存')
+      expect(ui.host.querySelector(`#${input.getAttribute('aria-describedby')}`)?.textContent).toBe('已配置')
+      expect(ui.host.querySelector('.public-plugin-detail')?.getAttribute('aria-busy')).toBe('false')
+    } finally { await ui.cleanup() }
+  })
+
+})
