@@ -36,10 +36,10 @@
 
 **Dependencies:** Task 1；设计 §4（完整合同）、§6.2 中 durable state 边界。
 
-- [ ] 持久化完整 credential grant，所有授权、升级、禁用、卸载保留数据路径同步处理；不从旧 host grant 推导授权。
-- [ ] prepare/inventory 返回凭据列表与变更 ID；token绑定旧配置和旧声明；开启凭据网络要求所展示的 inventory revision。
-- [ ] backup 恢复一律撤权后持久化；可解析的语义坏 grant保留普通状态并撤权，不回退旧授权；强类型结构损坏沿原 quarantine/fallback。
-- [ ] 为后续 authority 注入传递完整已授权元数据；当前运行目标仍拒绝生产凭据 manifest。
+- [x] 持久化完整 credential grant，所有授权、升级、禁用、卸载保留数据路径同步处理；不从旧 host grant 推导授权。
+- [x] prepare/inventory 返回凭据列表与变更 ID；token绑定旧配置和旧声明；开启凭据网络要求所展示的 inventory revision。
+- [x] backup 恢复一律撤权后持久化；可解析的语义坏 grant保留普通状态并撤权，不回退旧授权；强类型结构损坏沿原 quarantine/fallback。
+- [x] 为后续 authority 注入传递完整已授权元数据；当前运行目标仍拒绝生产凭据 manifest。
 
 **Distinct test coverage:** 新装同意/取消、四元组变更/重排/删除再添加、撤权后同声明升级不复活、prepare后配置变化拒绝、陈旧/缺失revision开启拒绝而关闭兼容；current缺失/截断/坏结构+旧backup先撤权落盘，写失败不激活；语义损坏不回退backup，其他设置保留；序列化空grant省略、raw与落盘一致、重启不能恢复旧grant。
 
