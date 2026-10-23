@@ -501,6 +501,12 @@ struct TimerClaimDispatch {
     audio: Option<TimerAudioCompletion>,
 }
 
+#[derive(Default)]
+pub(crate) struct ManagementEffects {
+    pub(crate) retired: Vec<(PluginRequestContext, String)>,
+    pub(crate) changed: bool,
+}
+
 pub(crate) struct PublicPluginManager {
     host: PublicPluginHost,
     #[cfg(test)]
@@ -524,6 +530,10 @@ pub(crate) struct PublicPluginManager {
     owner_cleanup: Arc<PluginOwnerCleanupStore>,
     bundles: Arc<ActivationReservationBook>,
     mutation: Mutex<()>,
+    #[cfg(test)]
+    after_uncertain_close: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_state_durable: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     data: Mutex<ActivationData>,
     runtime_faults: Mutex<HashMap<(String, u64), RuntimeFaultWindow>>,
     next_token: AtomicU64,
@@ -702,14 +712,20 @@ impl PublicPluginManager {
                             &config.plugin_id,
                             Some((config.active_generation, activation_id, admission_epoch)),
                         );
-                        let authority = network_authority_snapshot(
+                        let mut transition = network_authority
+                            .begin_transition()
+                            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                        let authority = checked_network_authority_snapshot(
+                            &bundles,
+                            &state,
+                            &secrets,
                             &config,
                             &runtime,
                             activation_id,
                             admission_epoch,
                         )?;
-                        network_authority
-                            .publish_plugin(&config.plugin_id, authority)
+                        transition
+                            .set_plugin_authority(&config.plugin_id, authority)
                             .map_err(|_| PublicPluginManagementError::Unavailable)?;
                     }
                     active_by_plugin.insert(config.plugin_id, runtime);
@@ -745,6 +761,10 @@ impl PublicPluginManager {
             owner_cleanup,
             bundles,
             mutation: Mutex::new(()),
+            #[cfg(test)]
+            after_uncertain_close: Mutex::new(None),
+            #[cfg(test)]
+            after_state_durable: Mutex::new(None),
             data: Mutex::new(ActivationData {
                 active_by_plugin,
                 ..ActivationData::default()
@@ -1382,7 +1402,10 @@ impl PublicPluginManager {
             data.active_by_plugin
                 .insert(runtime.plugin_id.clone(), Arc::clone(&staged.runtime));
         }
-        let authority = network_authority_snapshot(
+        let authority = checked_network_authority_snapshot(
+            &self.bundles,
+            &self.state,
+            &self.secrets,
             &config,
             &candidate.runtime,
             runtime.activation_id,
@@ -1564,7 +1587,10 @@ impl PublicPluginManager {
         self.clear_runtime_faults(plugin_id)?;
         let config = self.state.publish_prepared(prepared_state)?;
         reservation.publish(Some(candidate.bundle(config.clone())))?;
-        let authority = network_authority_snapshot(
+        let authority = checked_network_authority_snapshot(
+            &self.bundles,
+            &self.state,
+            &self.secrets,
             &config,
             &candidate.runtime,
             runtime.activation_id,
@@ -1722,6 +1748,7 @@ impl PublicPluginManager {
         Ok(mutation_from_config(&config))
     }
 
+    #[cfg(test)]
     pub(crate) fn set_network_access(
         &self,
         plugin_id: &str,
@@ -1730,11 +1757,27 @@ impl PublicPluginManager {
         self.set_network_access_with_revision(plugin_id, granted, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_network_access_with_revision(
         &self,
         plugin_id: &str,
         granted: bool,
         expected_inventory_revision: Option<&str>,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        self.set_network_access_with_effects(
+            plugin_id,
+            granted,
+            expected_inventory_revision,
+            &mut ManagementEffects::default(),
+        )
+    }
+
+    pub(crate) fn set_network_access_with_effects(
+        &self,
+        plugin_id: &str,
+        granted: bool,
+        expected_inventory_revision: Option<&str>,
+        effects: &mut ManagementEffects,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
         let (bundle, reservation, prepared_state) = {
             let _mutation = self.lock_mutation()?;
@@ -1776,54 +1819,121 @@ impl PublicPluginManager {
             )?;
             (bundle, reservation, prepared_state)
         };
-        self.make_state_durable(&reservation, &prepared_state)?;
-        let _mutation = self.lock_mutation()?;
-        let mut network_transition = self
-            .network_authority
-            .begin_transition()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let expired = self
-            .scheduler
-            .invalidate_plugin(plugin_id, None)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        if let Some(expired) = expired.as_ref() {
-            network_transition.invalidate_context(expired);
+        self.make_state_durable_with_effects(&reservation, &prepared_state, Some(effects))?;
+        let result = (|| {
+            let _mutation = self.lock_mutation()?;
+            let mut network_transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            effects.retired.extend(
+                self.scheduler
+                    .retire_plugin_requests(plugin_id)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?,
+            );
+            effects.changed = true;
+            network_transition
+                .set_plugin_authority(plugin_id, None)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let config = self.state.publish_prepared(prepared_state)?;
+            let next_bundle = bundle.map(|bundle| bundle.with_config(config.clone()));
+            reservation.publish(next_bundle.clone())?;
+            let authority = next_bundle
+                .as_ref()
+                .map(|bundle| {
+                    checked_network_authority_snapshot(
+                        &self.bundles,
+                        &self.state,
+                        &self.secrets,
+                        &config,
+                        &bundle.runtime,
+                        bundle.activation_id,
+                        bundle.admission_epoch,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            network_transition
+                .set_plugin_authority(plugin_id, authority)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            Ok(mutation_from_config(&config))
+        })();
+        if result.is_err() {
+            // Durable state may already differ even if reacquiring mutation or
+            // publishing fails. Close after all transition guards have dropped.
+            self.close_network_authority_with_effects(plugin_id, Some(effects));
         }
-        network_transition
-            .set_plugin_authority(plugin_id, None)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let config = self.state.publish_prepared(prepared_state)?;
-        let next_bundle = bundle.map(|bundle| bundle.with_config(config.clone()));
-        let authority = next_bundle
-            .as_ref()
-            .map(|bundle| {
-                network_authority_snapshot(
-                    &config,
-                    &bundle.runtime,
-                    bundle.activation_id,
-                    bundle.admission_epoch,
-                )
-            })
-            .transpose()?
-            .flatten();
-        reservation.publish(next_bundle)?;
-        network_transition
-            .set_plugin_authority(plugin_id, authority)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        Ok(mutation_from_config(&config))
+        result
     }
 
+    pub(crate) fn validate_settings_save(
+        &self,
+        plugin_id: &str,
+        updates: &BTreeMap<String, Value>,
+        secrets: &BTreeMap<String, Option<String>>,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(plugin_id)?
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        validate_settings_updates(&bundle.runtime.manifest.settings, updates)?;
+        for key in secrets.keys() {
+            if !bundle
+                .runtime
+                .manifest
+                .settings
+                .iter()
+                .any(|definition| definition.key() == key && definition.is_secret())
+            {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+        }
+        Ok(mutation_from_config(&bundle.config))
+    }
+
+    #[cfg(test)]
     pub(crate) fn save_settings(
         &self,
         plugin_id: &str,
         updates: &BTreeMap<String, Value>,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        self.save_settings_with_effects(plugin_id, updates, &mut ManagementEffects::default())
+    }
+
+    pub(crate) fn save_settings_with_effects(
+        &self,
+        plugin_id: &str,
+        updates: &BTreeMap<String, Value>,
+        effects: &mut ManagementEffects,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
         let (bundle, reservation, prepared_state) = {
             let _mutation = self.lock_mutation()?;
             let bundle = self
                 .bundles
-                .bundle(plugin_id)?
+                .confirmed_bundle(plugin_id)?
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            validate_settings_updates(&bundle.runtime.manifest.settings, updates)?;
+            if updates.iter().all(|(key, value)| {
+                bundle
+                    .config
+                    .settings
+                    .get(key)
+                    .cloned()
+                    .or_else(|| {
+                        bundle
+                            .runtime
+                            .manifest
+                            .settings
+                            .iter()
+                            .find(|definition| definition.key() == key)
+                            .and_then(|definition| definition.default_value())
+                    })
+                    .as_ref()
+                    == Some(value)
+            }) {
+                return Ok(mutation_from_config(&bundle.config));
+            }
             let reservation = self.bundles.reserve(plugin_id)?;
             let prepared_state = self.state.prepare_save_settings(
                 plugin_id,
@@ -1832,49 +1942,112 @@ impl PublicPluginManager {
             )?;
             (bundle, reservation, prepared_state)
         };
-        self.make_state_durable(&reservation, &prepared_state)?;
-        let _mutation = self.lock_mutation()?;
-        let network_transition = self
-            .network_authority
-            .begin_transition()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let expired = self
-            .scheduler
-            .invalidate_plugin(plugin_id, None)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        if let Some(expired) = expired.as_ref() {
-            network_transition.invalidate_context(expired);
+        self.make_state_durable_with_effects(&reservation, &prepared_state, Some(effects))?;
+        let result = (|| {
+            let _mutation = self.lock_mutation()?;
+            let mut network_transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            effects.retired.extend(
+                self.scheduler
+                    .retire_plugin_requests(plugin_id)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?,
+            );
+            effects.changed = true;
+            network_transition
+                .set_plugin_authority(plugin_id, None)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let config = self.state.publish_prepared(prepared_state)?;
+            reservation.publish(Some(bundle.with_config(config.clone())))?;
+            let authority = checked_network_authority_snapshot(
+                &self.bundles,
+                &self.state,
+                &self.secrets,
+                &config,
+                &bundle.runtime,
+                bundle.activation_id,
+                bundle.admission_epoch,
+            )?;
+            network_transition
+                .set_plugin_authority(plugin_id, authority)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            Ok(mutation_from_config(&config))
+        })();
+        if result.is_err() {
+            // Durable state may already differ even if reacquiring mutation or
+            // publishing fails. Close after all transition guards have dropped.
+            self.close_network_authority_with_effects(plugin_id, Some(effects));
         }
-        let config = self.state.publish_prepared(prepared_state)?;
-        reservation.publish(Some(bundle.with_config(config.clone())))?;
-        Ok(mutation_from_config(&config))
+        result
     }
 
+    #[cfg(test)]
     pub(crate) fn save_secret(
         &self,
         plugin_id: &str,
         key: &str,
         value: Option<&str>,
     ) -> Result<(), PublicPluginManagementError> {
+        self.save_secret_with_effects(plugin_id, key, value, &mut ManagementEffects::default())
+    }
+
+    pub(crate) fn save_secret_with_effects(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: Option<&str>,
+        effects: &mut ManagementEffects,
+    ) -> Result<(), PublicPluginManagementError> {
         let _mutation = self.lock_mutation()?;
-        let manifest = self.active_manifest(plugin_id)?;
-        if !manifest
+        let bundle = self
+            .bundles
+            .confirmed_bundle(plugin_id)?
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        if !bundle
+            .runtime
+            .manifest
             .settings
             .iter()
             .any(|setting| setting.key() == key && setting.is_secret())
         {
             return Err(PublicPluginManagementError::Unavailable);
         }
-        match value {
-            Some(value) => self
-                .secrets
-                .write(plugin_id, key, value)
-                .map_err(|_| PublicPluginManagementError::Unavailable),
-            None => self
-                .secrets
-                .remove(plugin_id, key)
-                .map_err(|_| PublicPluginManagementError::Unavailable),
+        let prepared = value
+            .map(|value| self.secrets.prepare_write(plugin_id, key, value))
+            .transpose()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let mut transition = self
+            .network_authority
+            .begin_transition()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        effects.retired.extend(
+            self.scheduler
+                .retire_plugin_requests(plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?,
+        );
+        effects.changed = true;
+        transition
+            .set_plugin_authority(plugin_id, None)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        match prepared {
+            Some(prepared) => self.secrets.commit_write(prepared),
+            None => self.secrets.remove(plugin_id, key),
         }
+        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let authority = checked_network_authority_snapshot(
+            &self.bundles,
+            &self.state,
+            &self.secrets,
+            &bundle.config,
+            &bundle.runtime,
+            bundle.activation_id,
+            bundle.admission_epoch,
+        )?;
+        transition
+            .set_plugin_authority(plugin_id, authority)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        Ok(())
     }
 
     pub(crate) fn begin_uninstall(
@@ -2605,9 +2778,12 @@ impl PublicPluginManager {
             .network_authority
             .begin_transition()
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let Some(bundle) = self.bundles.bundle(&candidate.plugin_id)? else {
+        let Some(bundle) = self.bundles.confirmed_bundle(&candidate.plugin_id)? else {
             return Ok(false);
         };
+        if self.state.config(&candidate.plugin_id)?.as_ref() != Some(&bundle.config) {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         if !bundle.runtime_recovery_needed
             || bundle.runtime.generation != candidate.generation
             || bundle.activation_id != candidate.activation_id
@@ -2622,7 +2798,10 @@ impl PublicPluginManager {
         self.lock_data()?
             .active_by_plugin
             .insert(candidate.plugin_id.clone(), Arc::clone(&bundle.runtime));
-        let authority = network_authority_snapshot(
+        let authority = checked_network_authority_snapshot(
+            &self.bundles,
+            &self.state,
+            &self.secrets,
             &bundle.config,
             &bundle.runtime,
             bundle.activation_id,
@@ -3355,29 +3534,33 @@ impl PublicPluginManager {
         admission_epoch: u64,
         now: Instant,
     ) -> Result<Option<ScheduledPluginRequest>, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
         let mut network_transition = self
             .network_authority
             .begin_transition()
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let next = self
-            .scheduler
-            .runtime_replaced(plugin_id, generation, activation_id, admission_epoch, now)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let bundle = self
             .bundles
-            .bundle(plugin_id)?
+            .confirmed_bundle(plugin_id)?
             .filter(|bundle| {
                 bundle.runtime.generation == generation
                     && bundle.activation_id == activation_id
                     && bundle.admission_epoch == admission_epoch
             })
             .ok_or(PublicPluginManagementError::Unavailable)?;
-        let authority = network_authority_snapshot(
+        let authority = checked_network_authority_snapshot(
+            &self.bundles,
+            &self.state,
+            &self.secrets,
             &bundle.config,
             &bundle.runtime,
             activation_id,
             admission_epoch,
         )?;
+        let next = self
+            .scheduler
+            .runtime_replaced(plugin_id, generation, activation_id, admission_epoch, now)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         network_transition
             .set_plugin_authority(plugin_id, authority)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
@@ -3657,16 +3840,6 @@ impl PublicPluginManager {
         }
     }
 
-    fn active_manifest(
-        &self,
-        plugin_id: &str,
-    ) -> Result<PublicManifestV1, PublicPluginManagementError> {
-        self.bundles
-            .bundle(plugin_id)?
-            .map(|bundle| bundle.runtime.manifest.clone())
-            .ok_or(PublicPluginManagementError::Unavailable)
-    }
-
     fn installed_manifest(
         &self,
         config: &EffectivePluginConfig,
@@ -3723,21 +3896,76 @@ impl PublicPluginManager {
         reservation: &ActivationReservation,
         prepared: &PreparedStateCommit,
     ) -> Result<(), PublicPluginManagementError> {
+        self.make_state_durable_with_effects(reservation, prepared, None)
+    }
+
+    fn make_state_durable_with_effects(
+        &self,
+        reservation: &ActivationReservation,
+        prepared: &PreparedStateCommit,
+        mut effects: Option<&mut ManagementEffects>,
+    ) -> Result<(), PublicPluginManagementError> {
         reservation.begin_committing()?;
         match self.state.persist_prepared(prepared) {
-            DurableStateOutcome::Committed => reservation.mark_durable().map_err(Into::into),
+            DurableStateOutcome::Committed => {
+                reservation.mark_durable()?;
+                #[cfg(test)]
+                if let Some(hook) = self.after_state_durable.lock().unwrap().clone() {
+                    hook();
+                }
+                Ok(())
+            }
             DurableStateOutcome::NotCommitted => {
                 if !self.state.revalidate_previous(prepared) {
-                    self.close_network_authority(prepared.plugin_id());
+                    self.close_network_authority_with_effects(
+                        prepared.plugin_id(),
+                        effects.as_deref_mut(),
+                    );
                     return Err(PublicPluginManagementError::Unavailable);
                 }
                 reservation.rollback_not_committed()?;
                 Err(PublicPluginManagementError::Unavailable)
             }
             DurableStateOutcome::Unknown => {
-                self.close_network_authority(prepared.plugin_id());
+                self.close_network_authority_with_effects(
+                    prepared.plugin_id(),
+                    effects.as_deref_mut(),
+                );
                 Err(PublicPluginManagementError::Unavailable)
             }
+        }
+    }
+
+    fn close_network_authority_with_effects(
+        &self,
+        plugin_id: &str,
+        effects: Option<&mut ManagementEffects>,
+    ) {
+        if let Some(effects) = effects {
+            // A poisoned mutation mutex must not prevent fail-closed cleanup.
+            let _mutation = self
+                .mutation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Ok(mut transition) = self.network_authority.begin_transition() {
+                if let Ok(retired) = self.scheduler.retire_plugin_requests(plugin_id) {
+                    effects.retired.extend(retired);
+                }
+                effects.changed = true;
+                let _ = transition.set_plugin_authority(plugin_id, None);
+            } else {
+                effects.changed = true;
+                if let Ok(retired) = self.scheduler.retire_plugin_requests(plugin_id) {
+                    effects.retired.extend(retired);
+                }
+                self.close_network_authority(plugin_id);
+            }
+        } else {
+            self.close_network_authority(plugin_id);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_uncertain_close.lock().unwrap().clone() {
+            hook();
         }
     }
 
@@ -3841,17 +4069,58 @@ fn clipboard_history_is_authorized(config: &EffectivePluginConfig) -> bool {
             .contains(&PublicPermission::ClipboardHistoryRead)
 }
 
-fn network_authority_snapshot(
+fn validate_settings_updates(
+    definitions: &[PublicSettingV1],
+    updates: &BTreeMap<String, Value>,
+) -> Result<(), PublicPluginManagementError> {
+    for (key, value) in updates {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.key() == key)
+            .ok_or(PluginStateError::InvalidSetting)?;
+        if definition.is_secret() || !definition.accepts_value(value) {
+            return Err(PluginStateError::InvalidSetting.into());
+        }
+    }
+    Ok(())
+}
+
+fn checked_network_authority_snapshot(
+    bundles: &ActivationReservationBook,
+    state: &PluginStateStore,
+    secrets: &PluginSecretStore,
     config: &EffectivePluginConfig,
     runtime: &RuntimeSnapshot,
     activation_id: u64,
     admission_epoch: u64,
 ) -> Result<Option<PluginNetworkAuthoritySnapshot>, PublicPluginManagementError> {
+    let Some(bundle) = bundles.confirmed_bundle(&config.plugin_id)? else {
+        return Ok(None);
+    };
+    if bundle.config != *config
+        || state.config(&config.plugin_id)?.as_ref() != Some(config)
+        || bundle.runtime.generation != runtime.generation
+        || bundle.runtime.digest != runtime.digest
+        || bundle.activation_id != activation_id
+        || bundle.admission_epoch != admission_epoch
+        || config.package_digest.as_deref() != Some(runtime.digest.as_str())
+    {
+        return Err(PublicPluginManagementError::Unavailable);
+    }
     let Some(grant) = config.network_grant_snapshot(&runtime.manifest) else {
         return Ok(None);
     };
     if grant.generation != runtime.generation {
         return Err(PublicPluginManagementError::Unavailable);
+    }
+    for key in super::state::manifest_credentials(&runtime.manifest)
+        .iter()
+        .map(|credential| credential.setting_key.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        if secrets.read_bearer(&config.plugin_id, key).is_err() {
+            return Ok(None);
+        }
     }
     PluginNetworkAuthoritySnapshot::new(
         &grant.plugin_id,
@@ -4145,7 +4414,10 @@ mod tests {
     use crate::public_plugins::{
         delayed_messages::{DelayedMessageRegistration, ScheduledPluginMessage},
         network::{PluginNetworkErrorCode, PluginNetworkRequest, PluginNetworkRequestMethod},
-        scheduler::{PluginRequestCandidate, PluginScheduleOutcome, PluginSubmissionOwner},
+        scheduler::{
+            PluginContextStatus, PluginRequestCandidate, PluginScheduleOutcome,
+            PluginSubmissionOwner,
+        },
         timers::{Clock, PluginTimerPhase, PluginTimerStartInput, TimerKey},
         PublicPlatform,
     };
@@ -4931,6 +5203,13 @@ mod tests {
         manager
             .set_network_access("com.example.network", true)
             .unwrap();
+        assert!(
+            !manager
+                .scheduler
+                .complete(&old_context, now)
+                .unwrap()
+                .accepted
+        );
         let new_context = dispatch_network_request(&manager);
         let admitted = manager.network_authority.admit(
             "com.example.network",
@@ -7705,6 +7984,923 @@ mod tests {
             manifest["network"]["credentials"] = credentials;
         }
         fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn installed_credential_manager(dir: &TestDir) -> PublicPluginManager {
+        write_credential_package(
+            &dir.source(),
+            "1.0.0",
+            json!([
+                {"id":"service", "settingKey":"token", "host":"api.example.com", "type":"bearer"}
+            ]),
+        );
+        let manager = credential_manager(dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        manager
+    }
+
+    fn mutate_network_for_barrier(manager: &PublicPluginManager, dir: &TestDir, mutation: &str) {
+        match mutation {
+            "replace" => manager
+                .save_secret("com.example.network", "token", Some("synthetic-next"))
+                .unwrap(),
+            "clear" => manager
+                .save_secret("com.example.network", "token", None)
+                .unwrap(),
+            "revoke" => {
+                manager
+                    .set_network_access("com.example.network", false)
+                    .unwrap();
+            }
+            "disable" => {
+                manager
+                    .set_enabled_with_readiness("com.example.network", false, |_| true)
+                    .unwrap();
+            }
+            "upgrade" => {
+                write_credential_package(
+                    &dir.source(),
+                    "1.1.0",
+                    json!([{"id":"service","settingKey":"token","host":"api.example.com","type":"bearer"}]),
+                );
+                let now = Instant::now();
+                let update = manager.prepare("main", source(&dir.source()), now).unwrap();
+                manager
+                    .commit_with_readiness(
+                        "main",
+                        &update.token,
+                        BTreeSet::from([PublicPermission::NetworkHttps]),
+                        now,
+                        |_| true,
+                    )
+                    .unwrap();
+            }
+            "uninstall" => {
+                manager.uninstall("com.example.network", true).unwrap();
+            }
+            "shutdown" => {
+                manager.shutdown_network();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_lifecycle_barriers_cancel_transport_redirect_and_delivery() {
+        for stage in ["transport", "redirect", "deliver"] {
+            for mutation in [
+                "replace",
+                "clear",
+                "revoke",
+                "disable",
+                "upgrade",
+                "uninstall",
+                "shutdown",
+            ] {
+                let dir = TestDir::new("credential-lifecycle-barrier");
+                write_credential_package(
+                    &dir.source(),
+                    "1.0.0",
+                    json!([{"id":"service","settingKey":"token","host":"api.example.com","type":"bearer"}]),
+                );
+                let (gate, barrier) =
+                    PluginNetworkAuthorityGate::paused_response_for_test(if stage == "redirect" {
+                        302
+                    } else {
+                        200
+                    });
+                let manager = Arc::new(
+                    PublicPluginManager::load_with_timer_and_network_dependencies(
+                        dir.path(),
+                        PublicPluginHost {
+                            version: [0, 4, 0],
+                            ..PublicPluginHost::current(PublicPlatform::Windows)
+                        },
+                        [],
+                        Arc::new(MessageCenterService::load(dir.path())),
+                        Arc::new(TestClock::default()),
+                        Arc::new(TestPublisher::successful()),
+                        gate.clone(),
+                    )
+                    .unwrap(),
+                );
+                let now = Instant::now();
+                let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+                manager
+                    .commit_with_readiness(
+                        "main",
+                        &prepared.token,
+                        BTreeSet::from([PublicPermission::NetworkHttps]),
+                        now,
+                        |_| true,
+                    )
+                    .unwrap();
+                manager
+                    .secrets
+                    .write("com.example.network", "token", "synthetic-admitted")
+                    .unwrap();
+                let running = dispatch_network_scheduled(&manager);
+                let call = gate
+                    .admit_with_secrets(
+                        "com.example.network",
+                        running.context.plugin_generation,
+                        &running.context,
+                        &manager.scheduler,
+                        PluginNetworkRequest {
+                            credential: Some("service".into()),
+                            ..network_request()
+                        },
+                        &manager.secrets,
+                    )
+                    .unwrap();
+                if stage == "deliver" {
+                    barrier.release.notify_one();
+                    let result = gate
+                        .execute_before_delivery_for_test(call, manager.scheduler.clone(), || {
+                            // The full response is now pending; deliver has not acquired the gate.
+                            mutate_network_for_barrier(&manager, &dir, mutation);
+                        })
+                        .await;
+                    assert!(
+                        matches!(result, Err(PluginNetworkErrorCode::ExpiredRequest)),
+                        "{stage}/{mutation}: {result:?}"
+                    );
+                } else {
+                    let pending = tokio::spawn({
+                        let gate = gate.clone();
+                        let scheduler = manager.scheduler.clone();
+                        async move { gate.execute_for_test(call, scheduler).await }
+                    });
+                    tokio::time::timeout(Duration::from_secs(2), barrier.reached.notified())
+                        .await
+                        .unwrap();
+                    // Fake transport has started and holds its response before redirect processing.
+                    mutate_network_for_barrier(&manager, &dir, mutation);
+                    barrier.release.notify_one();
+                    let result = tokio::time::timeout(Duration::from_secs(2), pending)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        matches!(result, Err(PluginNetworkErrorCode::ExpiredRequest)),
+                        "{stage}/{mutation}: {result:?}"
+                    );
+                }
+                assert_eq!(
+                    barrier.sends.load(Ordering::SeqCst),
+                    1,
+                    "{stage}/{mutation}: no redirect send"
+                );
+                assert_eq!(gate.global_active_for_test(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn credential_uninstall_retained_data_abort_rebuilds_with_new_identity() {
+        let dir = TestDir::new("credential-retained-abort");
+        let manager = installed_credential_manager(&dir);
+        let old = dispatch_network_scheduled(&manager);
+        let transaction = manager
+            .begin_uninstall("com.example.network", true)
+            .unwrap()
+            .unwrap();
+        let recovery = manager
+            .abort_uninstall_before_commit(transaction)
+            .expect("retained-data abort must recover")
+            .unwrap();
+        assert_ne!(recovery.activation_id, old.candidate.activation_id);
+        assert_ne!(recovery.admission_epoch, old.candidate.admission_epoch);
+        assert_eq!(recovery.generation, old.context.plugin_generation);
+        assert!(manager.finish_runtime_recovery(&recovery).unwrap());
+        assert_eq!(
+            manager.scheduler.context_status(&old.context),
+            PluginContextStatus::Expired
+        );
+    }
+
+    #[test]
+    fn credential_service_second_key_commit_failure_keeps_first_write_and_settles_waiter() {
+        let dir = TestDir::new("credential-second-commit-failure");
+        let manager = Arc::new(installed_credential_manager(&dir));
+        let service = super::super::PublicPluginService::default();
+        assert!(service.manager.set(manager.clone()).is_ok());
+        let now = Instant::now();
+        let first = service
+            .schedule_command(
+                manager.route("/network first").unwrap().unwrap(),
+                1,
+                "/network first".into(),
+                now,
+            )
+            .unwrap();
+        let running = first.dispatch.unwrap();
+        let waiting = service
+            .schedule_command(
+                manager.route("/network waiting").unwrap().unwrap(),
+                2,
+                "/network waiting".into(),
+                now,
+            )
+            .unwrap();
+        // A directory at the second record path forces atomic replace to fail after preparation.
+        fs::create_dir_all(
+            manager
+                .secrets
+                .record_path_for_test("com.example.network", "token")
+                .unwrap(),
+        )
+        .unwrap();
+        let outcome = service.save_settings(
+            "com.example.network",
+            &BTreeMap::new(),
+            &BTreeMap::from([
+                ("other".into(), Some("synthetic-first".into())),
+                ("token".into(), Some("synthetic-second".into())),
+            ]),
+        );
+        assert!(outcome.result.is_err());
+        assert!(outcome.changed);
+        assert_eq!(
+            manager
+                .secrets
+                .read_bearer("com.example.network", "other")
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            b"synthetic-first"
+        );
+        assert_eq!(
+            waiting.receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(None)
+        );
+        let next = service
+            .schedule_command(
+                manager.route("/network next").unwrap().unwrap(),
+                3,
+                "/network next".into(),
+                now,
+            )
+            .unwrap();
+        assert!(next.dispatch.is_none());
+        let completed = manager.scheduler.complete(&running.context, now).unwrap();
+        assert!(!completed.accepted);
+        let next = completed.next.unwrap();
+        assert!(matches!(
+            manager.network_authority.admit(
+                "com.example.network",
+                next.context.plugin_generation,
+                &next.context,
+                &manager.scheduler,
+                network_request()
+            ),
+            Err(PluginNetworkErrorCode::PermissionDenied)
+        ));
+    }
+
+    #[test]
+    fn credential_successful_rotation_and_clear_reopen_only_for_fresh_requests() {
+        let dir = TestDir::new("credential-successful-rotation");
+        let manager = installed_credential_manager(&dir);
+        manager
+            .save_secret("com.example.network", "token", Some("synthetic-old"))
+            .unwrap();
+        for replacement in [Some("synthetic-new"), None] {
+            let old = dispatch_network_scheduled(&manager);
+            let call = manager
+                .network_authority
+                .admit_with_secrets(
+                    "com.example.network",
+                    old.context.plugin_generation,
+                    &old.context,
+                    &manager.scheduler,
+                    PluginNetworkRequest {
+                        credential: Some("service".into()),
+                        ..network_request()
+                    },
+                    &manager.secrets,
+                )
+                .unwrap();
+            manager
+                .save_secret("com.example.network", "token", replacement)
+                .unwrap();
+            assert!(call.is_cancelled_for_test());
+            assert!(
+                !manager
+                    .scheduler
+                    .complete(&old.context, Instant::now())
+                    .unwrap()
+                    .accepted
+            );
+            let current = dispatch_network_scheduled(&manager);
+            assert!(manager
+                .network_authority
+                .admit(
+                    "com.example.network",
+                    current.context.plugin_generation,
+                    &current.context,
+                    &manager.scheduler,
+                    network_request()
+                )
+                .is_ok());
+            let credential = manager.network_authority.admit_with_secrets(
+                "com.example.network",
+                current.context.plugin_generation,
+                &current.context,
+                &manager.scheduler,
+                PluginNetworkRequest {
+                    credential: Some("service".into()),
+                    ..network_request()
+                },
+                &manager.secrets,
+            );
+            if let Some(value) = replacement {
+                assert!(credential.is_ok());
+                assert_eq!(
+                    manager
+                        .secrets
+                        .read_bearer("com.example.network", "token")
+                        .unwrap()
+                        .unwrap()
+                        .as_bytes(),
+                    value.as_bytes()
+                );
+            } else {
+                assert!(matches!(
+                    credential,
+                    Err(PluginNetworkErrorCode::CredentialUnavailable)
+                ));
+                assert!(manager
+                    .secrets
+                    .read_bearer("com.example.network", "token")
+                    .unwrap()
+                    .is_none());
+            }
+            manager
+                .scheduler
+                .complete(&current.context, Instant::now())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn credential_prepare_failure_preserves_current_request_and_record() {
+        let dir = TestDir::new("credential-protect-failure");
+        let manager = installed_credential_manager(&dir);
+        manager
+            .secrets
+            .write("com.example.network", "token", "synthetic-old")
+            .unwrap();
+        let running = dispatch_network_scheduled(&manager);
+        let call = manager
+            .network_authority
+            .admit(
+                "com.example.network",
+                running.context.plugin_generation,
+                &running.context,
+                &manager.scheduler,
+                network_request(),
+            )
+            .unwrap();
+        manager
+            .secrets
+            .fail_next_for_test(super::super::secrets::SecretTestFault::Protect);
+        let mut effects = ManagementEffects::default();
+        assert!(manager
+            .save_secret_with_effects(
+                "com.example.network",
+                "token",
+                Some("synthetic-new"),
+                &mut effects
+            )
+            .is_err());
+        assert!(!effects.changed);
+        assert!(effects.retired.is_empty());
+        assert!(!call.is_cancelled_for_test());
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Current
+        );
+        assert_eq!(
+            manager
+                .secrets
+                .read_bearer("com.example.network", "token")
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            b"synthetic-old"
+        );
+    }
+
+    #[test]
+    fn credential_failed_commit_recovery_checks_disk_on_every_publication_entry() {
+        use super::super::secrets::SecretTestFault;
+        for entry in [
+            "startup",
+            "install",
+            "upgrade",
+            "enable",
+            "grant",
+            "uninstall-abort",
+            "timeout",
+        ] {
+            for disk in ["old", "new", "missing", "bad"] {
+                let dir = TestDir::new("credential-recovery-matrix");
+                let mut manager = installed_credential_manager(&dir);
+                manager
+                    .secrets
+                    .write("com.example.network", "token", "synthetic-old")
+                    .unwrap();
+                let old = dispatch_network_scheduled(&manager);
+                let call = manager
+                    .network_authority
+                    .admit(
+                        "com.example.network",
+                        old.context.plugin_generation,
+                        &old.context,
+                        &manager.scheduler,
+                        network_request(),
+                    )
+                    .unwrap();
+                manager.secrets.fail_next_for_test(if disk == "new" {
+                    SecretTestFault::AfterCommit
+                } else {
+                    SecretTestFault::BeforeCommit
+                });
+                let mut effects = ManagementEffects::default();
+                assert!(manager
+                    .save_secret_with_effects(
+                        "com.example.network",
+                        "token",
+                        Some("synthetic-new"),
+                        &mut effects
+                    )
+                    .is_err());
+                assert!(effects.changed);
+                assert_eq!(effects.retired[0].0, old.context);
+                assert!(call.is_cancelled_for_test());
+                if entry != "timeout" {
+                    assert!(
+                        !manager
+                            .scheduler
+                            .complete(&old.context, Instant::now())
+                            .unwrap()
+                            .accepted
+                    );
+                }
+                match disk {
+                    "missing" => manager
+                        .secrets
+                        .remove("com.example.network", "token")
+                        .unwrap(),
+                    "bad" => fs::write(
+                        manager
+                            .secrets
+                            .record_path_for_test("com.example.network", "token")
+                            .unwrap(),
+                        b"broken-record",
+                    )
+                    .unwrap(),
+                    _ => assert_eq!(
+                        manager
+                            .secrets
+                            .read_bearer("com.example.network", "token")
+                            .unwrap()
+                            .unwrap()
+                            .as_bytes(),
+                        if disk == "old" {
+                            b"synthetic-old"
+                        } else {
+                            b"synthetic-new"
+                        }
+                    ),
+                }
+                // The failed operation never reopens, even when the disk holds a valid value.
+                if entry != "timeout" {
+                    let closed = dispatch_network_scheduled(&manager);
+                    assert!(matches!(
+                        manager.network_authority.admit(
+                            "com.example.network",
+                            closed.context.plugin_generation,
+                            &closed.context,
+                            &manager.scheduler,
+                            network_request()
+                        ),
+                        Err(PluginNetworkErrorCode::PermissionDenied)
+                    ));
+                    manager
+                        .scheduler
+                        .complete(&closed.context, Instant::now())
+                        .unwrap();
+                }
+                match entry {
+                    "startup" => {
+                        drop(manager);
+                        manager = credential_manager(&dir);
+                    }
+                    "install" | "upgrade" => {
+                        if entry == "install" {
+                            manager.uninstall("com.example.network", true).unwrap();
+                        }
+                        write_credential_package(
+                            &dir.source(),
+                            "1.1.0",
+                            json!([{"id":"service","settingKey":"token","host":"api.example.com","type":"bearer"}]),
+                        );
+                        let now = Instant::now();
+                        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+                        manager
+                            .commit_with_readiness(
+                                "main",
+                                &prepared.token,
+                                BTreeSet::from([PublicPermission::NetworkHttps]),
+                                now,
+                                |_| true,
+                            )
+                            .unwrap();
+                    }
+                    "enable" => {
+                        manager
+                            .set_enabled_with_readiness("com.example.network", false, |_| true)
+                            .unwrap();
+                        manager
+                            .set_enabled_with_readiness("com.example.network", true, |_| true)
+                            .unwrap();
+                    }
+                    "grant" => {
+                        manager
+                            .set_network_access("com.example.network", false)
+                            .unwrap();
+                        let revision = manager.inventory().unwrap().revision;
+                        manager
+                            .set_network_access_with_revision(
+                                "com.example.network",
+                                true,
+                                Some(&revision),
+                            )
+                            .unwrap();
+                    }
+                    "uninstall-abort" => {
+                        let transaction = manager
+                            .begin_uninstall("com.example.network", true)
+                            .unwrap()
+                            .unwrap();
+                        let recovery = manager
+                            .abort_uninstall_before_commit(transaction)
+                            .unwrap_or_else(|error| panic!("{entry}/{disk} abort: {error:?}"))
+                            .unwrap();
+                        assert!(manager
+                            .finish_runtime_recovery(&recovery)
+                            .unwrap_or_else(|error| panic!("{entry}/{disk} finish: {error:?}")));
+                    }
+                    "timeout" => {
+                        let replacement = manager
+                            .expire_network_timeouts(old.deadline)
+                            .unwrap()
+                            .pop()
+                            .unwrap();
+                        assert!(!replacement.counts_as_fault);
+                        let candidate = manager
+                            .replace_runtime_generation(
+                                &replacement.plugin_id,
+                                replacement.previous_generation,
+                                replacement.new_generation,
+                            )
+                            .unwrap();
+                        manager
+                            .finish_runtime_replacement(
+                                &candidate.plugin_id,
+                                candidate.generation,
+                                candidate.activation_id,
+                                candidate.admission_epoch,
+                                Instant::now(),
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let current = dispatch_network_scheduled(&manager);
+                // A fresh process owns a fresh scheduler namespace; old IPC cannot survive startup.
+                if entry != "startup" {
+                    assert_ne!(current.context, old.context);
+                }
+                let result = manager.network_authority.admit(
+                    "com.example.network",
+                    current.context.plugin_generation,
+                    &current.context,
+                    &manager.scheduler,
+                    network_request(),
+                );
+                assert_eq!(result.is_ok(), disk != "bad", "{entry}/{disk}");
+                if entry != "startup" {
+                    assert!(!matches!(
+                        manager.scheduler.context_status(&old.context),
+                        PluginContextStatus::Current
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn credential_unknown_close_barrier_refuses_secret_and_timeout_reopening_before_reservation_drop(
+    ) {
+        let dir = TestDir::new("credential-unknown-barrier");
+        let manager = Arc::new(installed_credential_manager(&dir));
+        let old = dispatch_network_scheduled(&manager);
+        let waiting = manager.scheduler.reserve(old.candidate.clone()).unwrap();
+        manager
+            .scheduler
+            .enqueue_reserved(waiting, Instant::now())
+            .unwrap();
+        let replacement = manager
+            .expire_network_timeouts(old.deadline)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let candidate = manager
+            .replace_runtime_generation(
+                &replacement.plugin_id,
+                replacement.previous_generation,
+                replacement.new_generation,
+            )
+            .unwrap();
+        let current = dir
+            .path()
+            .join("public-plugins/state/com.example.network/state.json");
+        fs::remove_file(&current).unwrap();
+        fs::create_dir(&current).unwrap();
+        let closed = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *manager.after_uncertain_close.lock().unwrap() = Some(Arc::new({
+            let closed = closed.clone();
+            let release = release.clone();
+            move || {
+                closed.wait();
+                release.wait();
+            }
+        }));
+        let worker = thread::spawn({
+            let manager = manager.clone();
+            move || {
+                let mut effects = ManagementEffects::default();
+                let result = manager.set_network_access_with_effects(
+                    "com.example.network",
+                    false,
+                    None,
+                    &mut effects,
+                );
+                (result, effects)
+            }
+        });
+        closed.wait(); // Exact boundary: Unknown closed the gate; reservation owner has not returned/dropped.
+        assert!(!manager.bundles.is_terminal());
+        assert!(manager
+            .bundles
+            .bundle("com.example.network")
+            .unwrap()
+            .is_some());
+        assert!(manager
+            .bundles
+            .confirmed_bundle("com.example.network")
+            .is_err());
+        assert!(manager
+            .save_secret("com.example.network", "token", Some("synthetic-blocked"))
+            .is_err());
+        assert!(manager
+            .secrets
+            .read_bearer("com.example.network", "token")
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .finish_runtime_replacement(
+                &candidate.plugin_id,
+                candidate.generation,
+                candidate.activation_id,
+                candidate.admission_epoch,
+                Instant::now()
+            )
+            .is_err());
+        release.wait();
+        let (result, effects) = worker.join().unwrap();
+        assert!(result.is_err());
+        assert!(effects.changed);
+        assert!(manager.bundles.is_terminal());
+        assert!(manager
+            .finish_runtime_replacement(
+                &candidate.plugin_id,
+                candidate.generation,
+                candidate.activation_id,
+                candidate.admission_epoch,
+                Instant::now()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn credential_post_durable_lock_failure_still_retires_and_closes_authority() {
+        let dir = TestDir::new("credential-durable-lock-failure");
+        let manager = Arc::new(installed_credential_manager(&dir));
+        let running = dispatch_network_scheduled(&manager);
+        let call = manager
+            .network_authority
+            .admit(
+                "com.example.network",
+                running.context.plugin_generation,
+                &running.context,
+                &manager.scheduler,
+                network_request(),
+            )
+            .unwrap();
+        *manager.after_state_durable.lock().unwrap() = Some(Arc::new({
+            let weak = Arc::downgrade(&manager);
+            move || {
+                let manager = weak.upgrade().unwrap();
+                let _ = thread::spawn(move || {
+                    let _guard = manager.mutation.lock().unwrap();
+                    panic!("synthetic mutation poison");
+                })
+                .join();
+            }
+        }));
+        let mut effects = ManagementEffects::default();
+        assert!(manager
+            .set_network_access_with_effects("com.example.network", false, None, &mut effects)
+            .is_err());
+        assert!(call.is_cancelled_for_test());
+        assert!(effects.changed);
+        assert_eq!(effects.retired[0].0, running.context);
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Expired
+        );
+    }
+
+    #[test]
+    fn credential_unknown_state_commit_carries_retirement_effects() {
+        let dir = TestDir::new("credential-unknown-effects");
+        let manager = installed_credential_manager(&dir);
+        let running = dispatch_network_scheduled(&manager);
+        let current = dir
+            .path()
+            .join("public-plugins/state/com.example.network/state.json");
+        fs::remove_file(&current).unwrap();
+        fs::create_dir(&current).unwrap(); // Atomic current replace fails after candidate/backup write: Unknown.
+        let mut effects = ManagementEffects::default();
+        assert!(manager
+            .set_network_access_with_effects("com.example.network", false, None, &mut effects)
+            .is_err());
+        assert!(effects.changed);
+        assert_eq!(effects.retired[0].0, running.context);
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Expired
+        );
+    }
+
+    #[test]
+    fn credential_save_cancels_old_request_and_keeps_running_slot() {
+        let dir = TestDir::new("credential-secret-retire");
+        let manager = installed_credential_manager(&dir);
+        let running = dispatch_network_scheduled(&manager);
+        manager
+            .save_secret("com.example.network", "token", Some("synthetic-next"))
+            .unwrap();
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Expired
+        );
+        assert!(matches!(
+            manager
+                .scheduler
+                .enqueue(running.candidate.clone(), Instant::now())
+                .unwrap(),
+            PluginScheduleOutcome::Waiting { .. }
+        ));
+        let completion = manager
+            .scheduler
+            .complete(&running.context, Instant::now())
+            .unwrap();
+        assert!(!completion.accepted);
+        assert!(completion.next.is_some());
+    }
+
+    #[test]
+    fn credential_save_rejects_every_unconfirmed_reservation_phase_before_mutation() {
+        for phase in 0..3 {
+            let dir = TestDir::new("credential-save-unconfirmed");
+            let manager = installed_credential_manager(&dir);
+            let running = dispatch_network_scheduled(&manager);
+            let reservation = manager.bundles.reserve("com.example.network").unwrap();
+            if phase >= 1 {
+                reservation.begin_committing().unwrap();
+            }
+            if phase >= 2 {
+                reservation.mark_durable().unwrap();
+            }
+            assert!(manager
+                .save_secret("com.example.network", "token", Some("synthetic-next"))
+                .is_err());
+            assert!(manager
+                .secrets
+                .read_bearer("com.example.network", "token")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                manager.scheduler.context_status(&running.context),
+                PluginContextStatus::Current
+            );
+        }
+    }
+
+    #[test]
+    fn credential_restart_checks_actual_secret_record_before_authority_publication() {
+        for value in [
+            None,
+            Some("synthetic-valid"),
+            Some("invalid bearer with spaces"),
+        ] {
+            let dir = TestDir::new("credential-restart-check");
+            let manager = installed_credential_manager(&dir);
+            if let Some(value) = value {
+                manager
+                    .secrets
+                    .write("com.example.network", "token", value)
+                    .unwrap();
+            }
+            drop(manager);
+            let restarted = credential_manager(&dir);
+            let running = dispatch_network_scheduled(&restarted);
+            let result = restarted.network_authority.admit(
+                "com.example.network",
+                running.context.plugin_generation,
+                &running.context,
+                &restarted.scheduler,
+                network_request(),
+            );
+            assert_eq!(result.is_ok(), value != Some("invalid bearer with spaces"));
+        }
+    }
+
+    #[test]
+    fn credential_save_retires_without_releasing_running_and_empty_settings_are_noop() {
+        let dir = TestDir::new("credential-save-retire");
+        write_credential_package(
+            &dir.source(),
+            "1.0.0",
+            json!([
+                {"id":"service", "settingKey":"token", "host":"api.example.com", "type":"bearer"}
+            ]),
+        );
+        let manager = credential_manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let running = dispatch_network_scheduled(&manager);
+        let revision = manager.inventory().unwrap().revision;
+        manager
+            .save_settings("com.example.network", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(manager.inventory().unwrap().revision, revision);
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Current
+        );
+        manager
+            .save_secret("com.example.network", "token", Some("synthetic-next"))
+            .unwrap();
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Expired
+        );
+        assert!(matches!(
+            manager
+                .scheduler
+                .enqueue(running.candidate.clone(), now)
+                .unwrap(),
+            PluginScheduleOutcome::Waiting { .. }
+        ));
+        let completion = manager.scheduler.complete(&running.context, now).unwrap();
+        assert!(!completion.accepted);
+        assert!(completion.next.is_some());
     }
 
     #[test]

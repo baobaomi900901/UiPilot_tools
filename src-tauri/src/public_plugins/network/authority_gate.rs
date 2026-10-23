@@ -44,6 +44,40 @@ impl HttpsTransport for LifecycleBlockingTransport {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct LifecycleNetworkBarrier {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+    pub(crate) sends: std::sync::atomic::AtomicUsize,
+    status: u16,
+}
+
+#[cfg(test)]
+impl HttpsTransport for LifecycleNetworkBarrier {
+    fn execute<'a>(
+        &'a self,
+        _request: NativeHttpsRequest,
+        _cancellation: &'a tokio_util::sync::CancellationToken,
+    ) -> HttpsTransportFuture<'a> {
+        Box::pin(async move {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = super::transport::NativeHttpsResponse {
+                status: self.status,
+                headers: if self.status == 302 {
+                    vec![("location".into(), "/redirected".into())]
+                } else {
+                    vec![]
+                },
+                body: b"synthetic-response".to_vec(),
+            };
+            self.reached.notify_one();
+            self.release.notified().await;
+            // Deliberately ignore cancellation to exercise Host redirect/delivery checks.
+            Ok(response)
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginNetworkAuthoritySnapshot {
     pub(crate) plugin_id: String,
@@ -130,6 +164,7 @@ impl PluginNetworkAuthorityGate {
         &self.broker
     }
 
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         snapshot: Option<PluginNetworkAuthoritySnapshot>,
@@ -139,6 +174,7 @@ impl PluginNetworkAuthorityGate {
         self.publish_plugin(&plugin_id, Some(snapshot))
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_plugin(
         &self,
         plugin_id: &str,
@@ -346,6 +382,42 @@ impl PluginNetworkAuthorityGate {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.by_plugin.remove(plugin_id);
         self.broker.publish_plugin_authority(plugin_id, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paused_response_for_test(
+        status: u16,
+    ) -> (Arc<Self>, Arc<LifecycleNetworkBarrier>) {
+        let barrier = Arc::new(LifecycleNetworkBarrier {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            sends: std::sync::atomic::AtomicUsize::new(0),
+            status,
+        });
+        let resolver = BoundedDnsResolver::with_lookup(1, 2, |_host, port| {
+            Ok(vec![std::net::SocketAddr::from(([8, 8, 8, 8], port))])
+        });
+        let broker = Arc::new(PluginHttpsBroker::with_dependencies(
+            PluginNetworkRequestRegistry::default(),
+            resolver,
+            barrier.clone(),
+        ));
+        (Arc::new(Self::with_broker(broker)), barrier)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_before_delivery_for_test(
+        self: &Arc<Self>,
+        prepared: PreparedPluginNetworkCall,
+        scheduler: Arc<PluginRequestScheduler>,
+        before_delivery: impl FnOnce(),
+    ) -> Result<PluginNetworkResponse, PluginNetworkErrorCode> {
+        let pending = self
+            .broker
+            .execute(prepared, self.redirect_authority(scheduler.clone()))
+            .await?;
+        before_delivery();
+        self.deliver(pending, &scheduler)
     }
 
     #[cfg(test)]

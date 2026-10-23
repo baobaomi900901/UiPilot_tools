@@ -537,6 +537,29 @@ impl PluginRequestScheduler {
             .transpose()
     }
 
+    // Retire logical ownership while the Runtime still owns its execution slot.
+    pub(crate) fn retire_plugin_requests(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<(PluginRequestContext, String)>, PluginScheduleError> {
+        let mut state = self.lock()?;
+        let Some(queue) = state.by_plugin.get_mut(plugin_id) else {
+            return Ok(Vec::new());
+        };
+        let mut retired = Vec::new();
+        if let Some(running) = queue.running.as_mut() {
+            running.current = false;
+            retired.push((
+                running.request.context.clone(),
+                running.request.candidate.owner.submission_token.clone(),
+            ));
+        }
+        if let Some(waiting) = queue.waiting.take() {
+            retired.push((waiting.context, waiting.candidate.owner.submission_token));
+        }
+        Ok(retired)
+    }
+
     pub(crate) fn invalidate_plugin(
         &self,
         plugin_id: &str,
@@ -555,13 +578,10 @@ impl PluginRequestScheduler {
             }
             return Ok(None);
         };
-        let expired = queue.running.take().map(|running| running.request.context);
-        queue.waiting = None;
-        queue.rebuilding = false;
         if let Some((generation, activation_id, admission_epoch)) = next_activation {
             if generation == 0
                 || activation_id == 0
-                || generation <= queue.generation
+                || generation < queue.generation
                 || activation_id == queue.activation_id
                 || admission_epoch == 0
                 || admission_epoch == queue.admission_epoch
@@ -572,6 +592,9 @@ impl PluginRequestScheduler {
             queue.activation_id = activation_id;
             queue.admission_epoch = admission_epoch;
         }
+        let expired = queue.running.take().map(|running| running.request.context);
+        queue.waiting = None;
+        queue.rebuilding = false;
         Ok(expired)
     }
 
@@ -656,6 +679,103 @@ mod tests {
             input: value.into(),
             owner: owner(value),
         }
+    }
+
+    #[test]
+    fn recovery_accepts_same_generation_only_with_both_new_identity_parts() {
+        let scheduler = PluginRequestScheduler::default();
+        let now = Instant::now();
+        let PluginScheduleOutcome::Dispatched(old) = scheduler
+            .enqueue(candidate("old", 2, PublicActivationMode::Submit), now)
+            .unwrap()
+        else {
+            panic!()
+        };
+        scheduler
+            .invalidate_plugin("com.example.scheduler", Some((2, 18, 24)))
+            .unwrap();
+        assert_eq!(
+            scheduler.context_status(&old.context),
+            PluginContextStatus::Expired
+        );
+        let mut new = candidate("new", 2, PublicActivationMode::Submit);
+        new.activation_id = 18;
+        new.admission_epoch = 24;
+        assert!(matches!(
+            scheduler.enqueue(new, now).unwrap(),
+            PluginScheduleOutcome::Dispatched(_)
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_old_identity_or_lower_generation_without_losing_running() {
+        for identity in [(1, 18, 24), (2, 17, 24), (2, 18, 23)] {
+            let scheduler = PluginRequestScheduler::default();
+            let now = Instant::now();
+            let PluginScheduleOutcome::Dispatched(old) = scheduler
+                .enqueue(candidate("old", 2, PublicActivationMode::Submit), now)
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                scheduler.invalidate_plugin("com.example.scheduler", Some(identity)),
+                Err(PluginScheduleError::GenerationMismatch)
+            );
+            assert_eq!(
+                scheduler.context_status(&old.context),
+                PluginContextStatus::Current
+            );
+        }
+    }
+
+    #[test]
+    fn retired_running_keeps_deadline_until_timeout_and_then_dispatches_waiter() {
+        let scheduler = PluginRequestScheduler::default();
+        let now = Instant::now();
+        let PluginScheduleOutcome::Dispatched(old) = scheduler
+            .enqueue(candidate("old", 1, PublicActivationMode::Submit), now)
+            .unwrap()
+        else {
+            panic!()
+        };
+        scheduler
+            .enqueue(candidate("discarded", 1, PublicActivationMode::Submit), now)
+            .unwrap();
+        let retired = scheduler
+            .retire_plugin_requests("com.example.scheduler")
+            .unwrap();
+        assert_eq!(retired.len(), 2);
+        assert_eq!(retired[0].1, "submission-old");
+        assert_eq!(retired[1].1, "submission-discarded");
+        assert!(matches!(
+            scheduler
+                .enqueue(candidate("next", 1, PublicActivationMode::Submit), now)
+                .unwrap(),
+            PluginScheduleOutcome::Waiting { .. }
+        ));
+        assert!(scheduler
+            .expire_timeouts(old.deadline - Duration::from_millis(1))
+            .unwrap()
+            .is_empty());
+        let replacement = scheduler
+            .expire_timeouts(old.deadline)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(!replacement.counts_as_fault);
+        let next = scheduler
+            .runtime_replaced(
+                "com.example.scheduler",
+                replacement.new_generation,
+                18,
+                24,
+                old.deadline,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.candidate.owner.submission_token, "submission-next");
+        assert_eq!(next.context.plugin_generation, 2);
     }
 
     #[test]

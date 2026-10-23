@@ -1408,11 +1408,7 @@ pub(crate) fn set_public_plugin_network_access(
     expected_inventory_revision: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
-    Ok(service.manager()?.set_network_access_with_revision(
-        &plugin_id,
-        granted,
-        expected_inventory_revision.as_deref(),
-    )?)
+    Ok(service.set_network_access(&plugin_id, granted, expected_inventory_revision.as_deref())?)
 }
 
 #[tauri::command]
@@ -1454,13 +1450,22 @@ pub(crate) fn save_plugin_settings(
     input: SavePublicPluginSettingsInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
-    let manager = service.manager()?;
-    for (key, value) in &input.secrets {
-        manager.save_secret(&input.plugin_id, key, value.as_deref())?;
+    let plugin_id = input.plugin_id.clone();
+    save_plugin_settings_with(service.inner().as_ref(), input, || {
+        plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
+    })
+}
+
+fn save_plugin_settings_with(
+    service: &PublicPluginService,
+    input: SavePublicPluginSettingsInput,
+    teardown: impl FnOnce(),
+) -> Result<PublicPluginMutation, CommandError> {
+    let outcome = service.save_settings(&input.plugin_id, &input.settings, &input.secrets);
+    if outcome.changed {
+        teardown();
     }
-    let mutation = manager.save_settings(&input.plugin_id, &input.settings)?;
-    plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &input.plugin_id);
-    Ok(mutation)
+    Ok(outcome.result?)
 }
 
 #[tauri::command]
@@ -5493,6 +5498,97 @@ mod tests {
     use tauri_plugin_global_shortcut::Shortcut;
 
     #[test]
+    fn save_plugin_settings_tears_down_only_after_real_effects_including_partial_failure() {
+        use std::time::Instant;
+        for case in [
+            "empty",
+            "same",
+            "ordinary",
+            "secret",
+            "mixed",
+            "second-failure",
+            "invalid-dto",
+        ] {
+            crate::public_plugins::with_settings_service_for_test(|service, manager| {
+                let now = Instant::now();
+                let first = service
+                    .schedule_command(
+                        manager.route("/demo first").unwrap().unwrap(),
+                        1,
+                        "/demo first".into(),
+                        now,
+                    )
+                    .unwrap();
+                let running = first.dispatch.unwrap();
+                let waiting = service
+                    .schedule_command(
+                        manager.route("/demo waiting").unwrap().unwrap(),
+                        2,
+                        "/demo waiting".into(),
+                        now,
+                    )
+                    .unwrap();
+                let settings = match case {
+                    "same" => BTreeMap::from([("flag".into(), serde_json::json!(false))]),
+                    "ordinary" | "mixed" => {
+                        BTreeMap::from([("flag".into(), serde_json::json!(true))])
+                    }
+                    "invalid-dto" => {
+                        BTreeMap::from([("flag".into(), serde_json::json!("invalid"))])
+                    }
+                    _ => BTreeMap::new(),
+                };
+                let secrets = match case {
+                    "secret" | "mixed" | "invalid-dto" => {
+                        BTreeMap::from([("first".into(), Some("synthetic-first".into()))])
+                    }
+                    "second-failure" => BTreeMap::from([
+                        ("first".into(), Some("synthetic-first".into())),
+                        ("second".into(), Some("x".repeat(65537))),
+                    ]),
+                    _ => BTreeMap::new(),
+                };
+                let teardown = Cell::new(0);
+                let result = super::save_plugin_settings_with(
+                    service,
+                    super::SavePublicPluginSettingsInput {
+                        plugin_id: "com.uipilot.demo".into(),
+                        settings,
+                        secrets,
+                    },
+                    || {
+                        teardown.set(teardown.get() + 1);
+                        // Settlement is complete before the command tears down its window.
+                        assert_eq!(waiting.receiver.try_recv(), Ok(None));
+                    },
+                );
+                let changed = matches!(case, "ordinary" | "secret" | "mixed" | "second-failure");
+                assert_eq!(teardown.get(), usize::from(changed), "{case}");
+                assert_eq!(
+                    result.is_err(),
+                    matches!(case, "second-failure" | "invalid-dto"),
+                    "{case}"
+                );
+                let next = service
+                    .schedule_command(
+                        manager.route("/demo next").unwrap().unwrap(),
+                        3,
+                        "/demo next".into(),
+                        now,
+                    )
+                    .unwrap();
+                assert!(next.dispatch.is_none(), "{case}");
+                let completion = manager.scheduler().complete(&running.context, now).unwrap();
+                assert!(!completion.accepted);
+                assert_eq!(
+                    completion.next.unwrap().candidate.owner.submission_token,
+                    next.token
+                );
+            });
+        }
+    }
+
+    #[test]
     fn find_thumbnail_command_is_find_only_and_opaque_id_based() {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         let marker = ["pub(crate) async fn load_find_", "thumbnail("].concat();
@@ -5578,7 +5674,7 @@ mod tests {
         let command = &tail[..end];
         let first = command[command.find('{').unwrap() + 1..].trim_start();
         assert!(first.starts_with("require_main_window(&window)?;"));
-        assert!(command.contains("set_network_access_with_revision("));
+        assert!(command.contains("service.set_network_access("));
         assert!(command.contains("expected_inventory_revision.as_deref()"));
         assert!(!command.contains("https_hosts"));
         assert!(!command.contains("httpsHosts"));

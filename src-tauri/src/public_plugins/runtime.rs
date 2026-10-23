@@ -262,16 +262,21 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
         });
       }
       const api = deepFreeze(apiShape);
+      let completion;
       try {
         const response = await handler(deepFreeze(dispatch.invocation), api);
-        current = false;
-        await invoke('complete_plugin_command', { completion: { context: requestContext, response } });
+        completion = { context: requestContext, response };
       } catch (_) {
-        current = false;
-        await invoke('complete_plugin_command', { completion: { context: requestContext, failed: true } });
-      } finally {
-        current = false;
-        busy = false;
+        completion = { context: requestContext, failed: true };
+      }
+      current = false;
+      busy = false;
+      // The Host may synchronously dispatch the next command during this IPC.
+      // This handler must never clear the next handler's busy slot afterward.
+      try {
+        await invoke('complete_plugin_command', { completion });
+      } catch (_) {
+        // Completion transport failure is not another handler completion.
       }
     });
     reflectDeleteProperty(window, '__TAURI_INTERNALS__');

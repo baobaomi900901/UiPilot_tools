@@ -98,6 +98,38 @@ async function executeRuntimeBootstrap(
 }
 
 describe('public plugin Runtime network bootstrap', () => {
+  it('dispatches the next handler during completion IPC without clearing its busy slot', async () => {
+    let release: (() => void) | undefined
+    const handler = vi.fn(async () => {
+      if (handler.mock.calls.length === 2) {
+        await new Promise<void>((resolve) => { release = resolve })
+      }
+      return { requestId: context.requestId, results: [] }
+    })
+    const runtime = await executeRuntimeBootstrap(true, handler)
+    const original = runtime.invoke.getMockImplementation()!
+    runtime.invoke.mockImplementation(async (command, args) => {
+      if (command === 'complete_plugin_command' && handler.mock.calls.length === 1) {
+        void runtime.dispatch()
+      }
+      return original(command, args)
+    })
+    await runtime.dispatch()
+    expect(handler).toHaveBeenCalledTimes(2)
+    await runtime.dispatch()
+    expect(handler).toHaveBeenCalledTimes(2)
+    release!()
+  })
+
+  it('reports completion once even when completion IPC rejects', async () => {
+    const runtime = await executeRuntimeBootstrap(true, async () => ({ results: [] }))
+    runtime.invoke.mockRejectedValueOnce(new Error('host unavailable'))
+    await runtime.dispatch().catch(() => undefined)
+    expect(
+      runtime.invoke.mock.calls.filter(([command]) => command === 'complete_plugin_command'),
+    ).toHaveLength(1)
+  })
+
   it('exposes a frozen network API only for a declaring Runtime and snapshots input', async () => {
     let undeclaredApi: BootstrapRuntimeApi | undefined
     const undeclared = await executeRuntimeBootstrap(false, async (_invocation, api) => {

@@ -94,6 +94,13 @@ pub(crate) enum PublicPluginResponse {
     Panel(PublicPanelResponse),
 }
 
+#[cfg(test)]
+pub(crate) fn with_settings_service_for_test(
+    operation: impl FnOnce(&PublicPluginService, &PublicPluginManager),
+) {
+    tests::with_settings_service_for_test(operation);
+}
+
 pub(crate) type PublicSubmissionResult = Result<PublicPluginResponse, PluginRuntimeError>;
 
 struct PendingPublicSubmission {
@@ -127,6 +134,11 @@ struct RuntimeRecoveryAttempt {
 #[derive(Default)]
 struct RuntimeRecoveryState {
     by_plugin: HashMap<String, RuntimeRecoveryAttempt>,
+}
+
+pub(crate) struct SettingsSaveOutcome {
+    pub(crate) result: Result<PublicPluginMutation, PublicPluginManagementError>,
+    pub(crate) changed: bool,
 }
 
 #[derive(Default)]
@@ -197,6 +209,59 @@ impl PublicPluginService {
         self.manager
             .get()
             .ok_or(PublicPluginManagementError::Unavailable)
+    }
+
+    pub(crate) fn save_settings(
+        &self,
+        plugin_id: &str,
+        settings: &BTreeMap<String, serde_json::Value>,
+        secrets: &BTreeMap<String, Option<String>>,
+    ) -> SettingsSaveOutcome {
+        let mut effects = activation::ManagementEffects::default();
+        let result = (|| {
+            let manager = self.manager()?;
+            let initial = manager.validate_settings_save(plugin_id, settings, secrets)?;
+            for (key, value) in secrets {
+                manager.save_secret_with_effects(plugin_id, key, value.as_deref(), &mut effects)?;
+            }
+            if settings.is_empty() {
+                return Ok(initial);
+            }
+            manager.save_settings_with_effects(plugin_id, settings, &mut effects)
+        })();
+        self.settle_management_effects(&effects);
+        SettingsSaveOutcome {
+            result,
+            changed: effects.changed,
+        }
+    }
+
+    pub(crate) fn set_network_access(
+        &self,
+        plugin_id: &str,
+        granted: bool,
+        expected_inventory_revision: Option<&str>,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let mut effects = activation::ManagementEffects::default();
+        let result = self.manager().and_then(|manager| {
+            manager.set_network_access_with_effects(
+                plugin_id,
+                granted,
+                expected_inventory_revision,
+                &mut effects,
+            )
+        });
+        self.settle_management_effects(&effects);
+        result
+    }
+
+    fn settle_management_effects(&self, effects: &activation::ManagementEffects) {
+        // Waiting submissions may never have been bound to a request. Settle the
+        // exact token as well as its context, never a plugin-wide moving target.
+        for (context, token) in &effects.retired {
+            self.settle_request(context, None);
+            self.settle_submission(token, None);
+        }
     }
 
     pub(crate) fn shutdown(&self) {

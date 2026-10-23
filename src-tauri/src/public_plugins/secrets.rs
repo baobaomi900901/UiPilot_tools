@@ -95,8 +95,24 @@ impl fmt::Display for PluginSecretError {
 
 impl std::error::Error for PluginSecretError {}
 
+pub(crate) struct PreparedSecretWrite {
+    plugin_id: String,
+    key: String,
+    record: Vec<u8>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum SecretTestFault {
+    Protect,
+    BeforeCommit,
+    AfterCommit,
+}
+
 pub(crate) struct PluginSecretStore {
     root: PathBuf,
+    #[cfg(test)]
+    fault: std::sync::Mutex<Option<SecretTestFault>>,
 }
 
 impl PluginSecretStore {
@@ -107,27 +123,82 @@ impl PluginSecretStore {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            #[cfg(test)]
+            fault: std::sync::Mutex::new(None),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn write(
         &self,
         plugin_id: &str,
         key: &str,
         plaintext: &str,
     ) -> Result<(), PluginSecretError> {
+        self.commit_write(self.prepare_write(plugin_id, key, plaintext)?)
+    }
+
+    pub(crate) fn prepare_write(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        plaintext: &str,
+    ) -> Result<PreparedSecretWrite, PluginSecretError> {
         validate_identity(plugin_id, key)?;
         if plaintext.len() > MAX_SECRET_BYTES {
             return Err(PluginSecretError::ValueTooLarge);
         }
+        #[cfg(test)]
+        if self.take_fault(SecretTestFault::Protect) {
+            return Err(PluginSecretError::ProtectFailed);
+        }
         let ciphertext = protect(plaintext.as_bytes(), &entropy(plugin_id, key))?;
-        let record = encode_record(&ciphertext)?;
-        let owner = self.owner_root(plugin_id)?;
+        Ok(PreparedSecretWrite {
+            plugin_id: plugin_id.into(),
+            key: key.into(),
+            record: encode_record(&ciphertext)?,
+        })
+    }
+
+    pub(crate) fn commit_write(
+        &self,
+        prepared: PreparedSecretWrite,
+    ) -> Result<(), PluginSecretError> {
+        #[cfg(test)]
+        if self.take_fault(SecretTestFault::BeforeCommit) {
+            return Err(PluginSecretError::Storage);
+        }
+        if !ordinary_directory(&self.root) {
+            return Err(PluginSecretError::Storage);
+        }
+        let owner = self.owner_root(&prepared.plugin_id)?;
         fs::create_dir_all(&owner).map_err(|_| PluginSecretError::Storage)?;
         if !ordinary_directory(&owner) {
             return Err(PluginSecretError::Storage);
         }
-        replace_current(&secret_path(&owner, key), &record).map_err(|_| PluginSecretError::Storage)
+        replace_current(&secret_path(&owner, &prepared.key), &prepared.record)
+            .map_err(|_| PluginSecretError::Storage)?;
+        #[cfg(test)]
+        if self.take_fault(SecretTestFault::AfterCommit) {
+            return Err(PluginSecretError::Storage);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_for_test(&self, fault: SecretTestFault) {
+        *self.fault.lock().unwrap() = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn take_fault(&self, fault: SecretTestFault) -> bool {
+        let mut current = self.fault.lock().unwrap();
+        if *current == Some(fault) {
+            current.take();
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn is_configured(
@@ -250,7 +321,7 @@ impl PluginSecretStore {
     }
 
     #[cfg(test)]
-    fn record_path_for_test(
+    pub(crate) fn record_path_for_test(
         &self,
         plugin_id: &str,
         key: &str,

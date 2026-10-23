@@ -245,6 +245,28 @@ impl ActivationReservationBook {
             })
     }
 
+    // Callers hold manager mutation through authority publication. A RESERVED
+    // owner can start committing outside mutation, so no phase is confirmed.
+    pub(super) fn confirmed_bundle(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<Arc<ActivationBundle>>, ReservationError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReservationError::Unavailable)?;
+        if self.is_terminal() {
+            return Err(ReservationError::Terminal);
+        }
+        let Some(slot) = state.slots.get(plugin_id) else {
+            return Ok(None);
+        };
+        if slot.reservation.is_some() {
+            return Err(ReservationError::Busy);
+        }
+        Ok(slot.bundle.clone())
+    }
+
     pub(super) fn bundles(&self) -> Result<Vec<Arc<ActivationBundle>>, ReservationError> {
         if self.is_terminal() {
             return Err(ReservationError::Terminal);

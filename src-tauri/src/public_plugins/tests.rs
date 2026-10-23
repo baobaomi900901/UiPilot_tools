@@ -26,6 +26,229 @@ use crate::plugins::{PluginCatalog, Version};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+fn settings_service(root: &TestRoot) -> (Arc<PublicPluginService>, Arc<PublicPluginManager>) {
+    let source = root.package();
+    let mut value = manifest("mainResult");
+    value["minimumHostVersion"] = json!("0.3.4");
+    value["settings"] = json!([
+        {"key":"flag", "label":"Flag", "type":"boolean", "default":false},
+        {"key":"first", "label":"First", "type":"secret"},
+        {"key":"second", "label":"Second", "type":"secret"}
+    ]);
+    value["permissions"] = json!(["network.https"]);
+    value["network"] = json!({"httpsHosts":["api.example.com"]});
+    write_package(&source, &value);
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            PublicPluginHost::current(PublicPlatform::Windows),
+            [],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let prepared = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness(
+            "main",
+            &prepared.token,
+            BTreeSet::from([PublicPermission::NetworkHttps]),
+            now,
+            |_| true,
+        )
+        .unwrap();
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(manager.clone()).is_ok());
+    (service, manager)
+}
+
+pub(super) fn with_settings_service_for_test(
+    operation: impl FnOnce(&PublicPluginService, &PublicPluginManager),
+) {
+    let root = TestRoot::new("settings-command");
+    let (service, manager) = settings_service(&root);
+    operation(&service, &manager);
+}
+
+#[test]
+fn save_plugin_settings_service_settles_exact_tokens_and_preserves_execution_slot() {
+    use std::collections::BTreeMap;
+    for case in [
+        "empty",
+        "same",
+        "ordinary",
+        "secret",
+        "mixed",
+        "second-failure",
+        "invalid-dto",
+    ] {
+        let root = TestRoot::new(case);
+        let (service, manager) = settings_service(&root);
+        let now = Instant::now();
+        let first = service
+            .schedule_command(
+                manager.route("/demo first").unwrap().unwrap(),
+                1,
+                "/demo first".into(),
+                now,
+            )
+            .unwrap();
+        let running = first.dispatch.as_ref().unwrap().clone();
+        let waiting = service
+            .schedule_command(
+                manager.route("/demo waiting").unwrap().unwrap(),
+                2,
+                "/demo waiting".into(),
+                now,
+            )
+            .unwrap();
+        assert!(waiting.dispatch.is_none());
+        let untouched = service
+            .prepare_command(
+                manager.route("/demo later").unwrap().unwrap(),
+                3,
+                "/demo later".into(),
+            )
+            .unwrap();
+        let settings = match case {
+            "same" => BTreeMap::from([("flag".into(), json!(false))]),
+            "ordinary" | "mixed" => BTreeMap::from([("flag".into(), json!(true))]),
+            "invalid-dto" => BTreeMap::from([("flag".into(), json!("wrong"))]),
+            _ => BTreeMap::new(),
+        };
+        let secrets = match case {
+            "secret" | "mixed" | "invalid-dto" => {
+                BTreeMap::from([("first".into(), Some("synthetic-first".into()))])
+            }
+            "second-failure" => BTreeMap::from([
+                ("first".into(), Some("synthetic-first".into())),
+                ("second".into(), Some("x".repeat(65537))),
+            ]),
+            _ => BTreeMap::new(),
+        };
+        let revision = manager.inventory().unwrap().revision;
+        let outcome = service.save_settings("com.uipilot.demo", &settings, &secrets);
+        let changed = matches!(case, "ordinary" | "secret" | "mixed" | "second-failure");
+        assert_eq!(outcome.changed, changed, "{case}");
+        assert_eq!(
+            outcome.result.is_err(),
+            matches!(case, "second-failure" | "invalid-dto"),
+            "{case}"
+        );
+        if changed {
+            assert_eq!(
+                waiting.receiver.recv_timeout(Duration::from_secs(1)),
+                Ok(None),
+                "{case}"
+            );
+            assert!(!service
+                .lock_submissions()
+                .unwrap()
+                .by_token
+                .contains_key(&waiting.token));
+        } else {
+            assert_eq!(manager.inventory().unwrap().revision, revision, "{case}");
+            assert!(service
+                .lock_submissions()
+                .unwrap()
+                .by_token
+                .contains_key(&waiting.token));
+        }
+        assert!(service
+            .lock_submissions()
+            .unwrap()
+            .by_token
+            .contains_key(&untouched.token));
+        let next = service
+            .schedule_command(
+                manager.route("/demo next").unwrap().unwrap(),
+                4,
+                "/demo next".into(),
+                now,
+            )
+            .unwrap();
+        assert!(
+            next.dispatch.is_none(),
+            "{case}: old handler must keep running"
+        );
+        let completed = manager.scheduler().complete(&running.context, now).unwrap();
+        assert!(!completed.accepted);
+        assert_eq!(
+            completed.next.unwrap().candidate.owner.submission_token,
+            next.token
+        );
+    }
+}
+
+#[test]
+fn save_plugin_network_toggle_settles_waiting_but_noop_preserves_it() {
+    let root = TestRoot::new("network-toggle-retire");
+    let (service, manager) = settings_service(&root);
+    let now = Instant::now();
+    let first = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    let running = first.dispatch.unwrap();
+    service
+        .set_network_access("com.uipilot.demo", true, None)
+        .unwrap();
+    assert_eq!(
+        manager.scheduler().context_status(&running.context),
+        super::PluginContextStatus::Current
+    );
+    let waiting = service
+        .schedule_command(
+            manager.route("/demo waiting").unwrap().unwrap(),
+            2,
+            "/demo waiting".into(),
+            now,
+        )
+        .unwrap();
+    service
+        .set_network_access("com.uipilot.demo", true, None)
+        .unwrap();
+    assert!(service
+        .lock_submissions()
+        .unwrap()
+        .by_token
+        .contains_key(&waiting.token));
+    service
+        .set_network_access("com.uipilot.demo", false, None)
+        .unwrap();
+    assert_eq!(
+        waiting.receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(None)
+    );
+    let next = service
+        .schedule_command(
+            manager.route("/demo next").unwrap().unwrap(),
+            3,
+            "/demo next".into(),
+            now,
+        )
+        .unwrap();
+    assert!(next.dispatch.is_none());
+    let completed = manager.scheduler().complete(&running.context, now).unwrap();
+    assert!(!completed.accepted);
+    assert_eq!(
+        completed.next.unwrap().candidate.owner.submission_token,
+        next.token
+    );
+}
+
 #[test]
 fn public_plugin_icon_protocol_rejects_query_parameters() {
     let service = PublicPluginService::default();
@@ -1292,8 +1515,12 @@ fn cli_pack_fixture_stages_empty_and_nested_directories() {
         include_bytes!("../../../tests/fixtures/public-plugin-pack/roundtrip.uipilot-plugin"),
     )
     .unwrap();
-    let prepared = package::stage(PublicPackageSource::Archive(archive), &root.staging(), &host())
-        .unwrap();
+    let prepared = package::stage(
+        PublicPackageSource::Archive(archive),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
     assert_eq!(prepared.manifest.plugin_id, "com.example.cli-pack");
     assert_eq!(
         fs::read(prepared.package_root.join("dist/runtime.js")).unwrap(),
