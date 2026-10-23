@@ -81,10 +81,10 @@
 
 **Dependencies:** Task 4；设计 §5，`docs/ui-guidelines.md`；复用已有secret设置通路，缺失时在详情页补齐。
 
-- [ ] 安装列出ID、候选settingKey、host、Bearer；详情补充当前secret label/key，标新/变更绑定与服务端回显说明。
-- [ ] 开启网络先明确确认完整绑定，所有开启调用带展示revision；陈旧失败重载不自动重授权，关闭直接执行。
-- [ ] 声明secret的password单key保存/显式清除，状态与busy/错误可访问，成功清空输入；错误刷新状态并解释部分提交边界。
-- [ ] Light/Dark、紧凑布局与键盘操作验证；不新增Tauri capability，不复制原目录未提交UI。
+- [x] 安装列出ID、候选settingKey、host、Bearer；详情补充当前secret label/key，标新/变更绑定与服务端回显说明。
+- [x] 开启网络先明确确认完整绑定，所有开启调用带展示revision；陈旧失败重载不自动重授权，关闭直接执行。
+- [x] 声明secret的password单key保存/显式清除，状态与busy/错误可访问，成功清空输入；错误刷新状态并解释部分提交边界。
+- [x] Light/Dark、紧凑布局与键盘操作验证；不新增Tauri capability，不复制原目录未提交UI。
 
 **Distinct test coverage:** 安装取消保持旧版、变更标记、无值/掩码泄漏、revision随确认传递、陈旧拒绝不重试；保存仅编辑key、空白不删除、clear=null、busy防双击、成功清输入、错误刷新；键盘焦点/aria与双主题渲染。
 
