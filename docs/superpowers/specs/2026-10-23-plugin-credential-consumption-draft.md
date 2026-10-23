@@ -1,7 +1,7 @@
-# M4 凭据消费设计草案
+# M4 凭据消费设计
 
-状态：架构问题已复核，待正式设计评审与实施计划；不是已批准的实现合同，也不是实现完成声明。日期：2026-10-23。
-本文属于后续阶段准备；当前交付批次为 M0/M1。
+状态：独立规格评审通过，网络开关调度与attempt预算意见已纳入；作为M4实现合同，不代表实现完成。日期：2026-10-23。
+M0/M1已完成；当前执行M4，实施计划见 ../plans/2026-10-23-local-plugin-foundation-m4.md。文件保留原draft路径以维持已有引用。
 基线：docs/superpowers/specs/2026-10-23-local-plugin-foundation-design.md。
 本文路径均相对仓库根目录；实现不得读取真实凭据或发送真实认证请求。
 
@@ -141,11 +141,11 @@ save_plugin_settings 现有多 key 保存不具全批原子性；UI 单 key 提�
 
 扩展现有 PluginNetworkAuthoritySnapshot 保存已授权完整凭据元数据；不保存 token，不增加 revision/凭据状态机。
 Host 构造 current snapshot 时核对 manifest、durable grants、generation、activation_id、admission_epoch；重开时的具体规则见6.2，当前代码并没有自动secret核验。
-正常网络路径锁序：authority gate -> scheduler（短暂检查后释放）-> secret bounded read/DPAPI -> registry admission。
+正常网络路径锁序：authority gate -> scheduler（短暂检查后释放）-> registry attempt reservation（短暂后释放）-> secret bounded read/DPAPI -> registry registration。
 不得从持有 scheduler/data_gate/state 锁的回调反向获取 authority gate；继续沿既有 lock order。
 manager 管理路径：mutation -> authority gate -> scheduler（短暂）-> registry；持锁状态只做有界同步磁盘/DPAPI操作，不 await。
 凭据读取/解密必须在 gate admission 临界区内，来源是 Host plugin identity + 当前声明 settingKey，不是客户端 pluginId/key。
-先校验调用上下文、授权、目标和 header 冲突，再读取/解密，最后注册 prepared call。
+先校验调用上下文和授权，保留broker现有每context attempt reservation在请求校验/secret I/O之前的顺序（其registry锁立即释放）；再校验目标和header冲突、读取/解密，最后注册prepared call。缺失/无效secret及请求校验失败同样消耗既有attempt预算；预算耗尽时不得读盘或DPAPI。attempt reservation不等于call注册，不在secret I/O期间持registry锁。
 DPAPI读取采用上限读取并核验普通文件/目录与记录格式；不得由 manifest 或请求提供磁盘路径。
 网络 DNS/TLS/send/read 全部在释放 gate 后执行，仍用既有取消 token、10 秒 deadline、同 host redirect 和返回前 deliver 复验。
 注入值属于内部 prepared call 的 sensitive headers，不写回 PluginNetworkRequest、IPC response、state 或缓存。
@@ -181,6 +181,7 @@ secret-only请求（settings={}）绝不进入普通 save_settings；两个map�
 不改变Runtime generation的保存不得移除running槽；换代/卸载等原有destroy/rebuild路径仍可使用invalidate_plugin。
 窗口teardown仅在已产生真实改动/取消效果时按现有策略执行，partial failure同样处理；全no-op不关闭窗口。保存结果/错误仍保留现有外部DTO。
 补command集成测试：secret-only、settings空、普通值相同、普通值改变、混合、第二key失败；断言running保留、tokens结算、无新命令被busy丢弃。
+同一Runtime内的网络授权开关也遵守以上retire与service结算合同：set_public_plugin_network_access经service协调，manager不能继续invalidate_plugin删除running。真实授权变化在transition内retire并关闭旧calls，成功或部分失败均将effects交service结算；无变化请求保持no-op（开启凭据网络仍先校验expectedInventoryRevision）。旧handler未结束时后续命令排队，完成后accepted=false并正常派发next。网络开关仅变更网络权限，不扩大为关闭插件窗口；窗口处理仍沿既有网络开关行为。
 
 ### 6.2 全部网络authority发布与恢复
 
@@ -199,7 +200,7 @@ abort_uninstall_before_commit自身仅发布None；它随后进入finish_runtime
 已存在但读取失败、损坏、不可解密或非bearer格式的记录令此次authority为None，保留本地Runtime可用；不得自动退用旧secret或其他key。
 每次credential admission仍重新读取/核验，重开检查不是长期授权token或明文缓存。成功保存之后也必须重新核验实际最终文件。
 保存失败后未来启动/启用/授权/恢复可使用核验通过的实际旧值或新值；没有永久失败锁存承诺，也不新增第三种authority状态。用户要撤销必须收到清除或关闭网络成功。
-父级已选择上述非锁存最小方案：失败本次fail closed，后续既有重建或显式管理操作经统一核验可恢复；不增加sticky持久阻断。本文仍为草案，正式M4实现前必须另做独立规格评审。
+父级已选择上述非锁存最小方案：失败本次fail closed，后续既有重建或显式管理操作经统一核验可恢复；不增加sticky持久阻断。独立规格评审已完成；实现阶段仍需逐任务及全批代码评审。
 
 ## 7. 内存、错误和服务端回显
 
